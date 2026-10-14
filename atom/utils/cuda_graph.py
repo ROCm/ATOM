@@ -338,16 +338,33 @@ class StableOutputs:
     op sits inside PIECEWISE, whether or not anything was ever captured.
     """
 
-    def __init__(self):
+    def __init__(self, *, capacity: int = 0, token_dim: int = 0):
         self._slots: dict = {}
+        self.capacity, self.token_dim = capacity, token_dim
 
     def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
-        """This key's persistent buffer, shaped from `sample` on first use."""
+        """Return a stable slot, optionally a view into fixed token capacity.
+
+        Capacity never grows: captured graphs retain these addresses. Roles
+        share token prefixes only when the caller opts into a fixed capacity.
+        """
+        if self.capacity:
+            shape = list(sample.shape)
+            tokens = shape[self.token_dim]
+            if tokens > self.capacity:
+                raise ValueError(
+                    f"Buffer needs {tokens} tokens, capacity {self.capacity}"
+                )
+            shape[self.token_dim] = self.capacity
+            key = (key, tuple(shape), sample.dtype, sample.device)
         buf = self._slots.get(key)
         if buf is None:
-            buf = torch.empty_like(sample)
+            buf = sample.new_empty(shape) if self.capacity else torch.empty_like(sample)
             self._slots[key] = buf
-        return buf
+        return buf.narrow(self.token_dim, 0, tokens) if self.capacity else buf
+
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in self._slots.values())
 
     def deliver(self, key, out: torch.Tensor) -> torch.Tensor:
         """Copy an eagerly computed `out` into its slot and return the slot."""

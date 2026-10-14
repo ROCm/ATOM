@@ -28,7 +28,6 @@ from .bounded_replay import (
 from .config import validate_tbo_parallelism
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
-from .piecewise_buffers import TokenBuffers
 
 logger = logging.getLogger("atom")
 
@@ -100,10 +99,8 @@ def _piecewise_slot(layer_name, kind, output):
     slots = layer.__dict__.get("_piecewise_outputs")
     if slots is None:
         capacity = getattr(layer, "piecewise_buffer_tokens", 0)
-        slots = layer._piecewise_outputs = (
-            TokenBuffers(capacity, token_dim=1) if capacity else StableOutputs()
-        )
-    if isinstance(slots, TokenBuffers):
+        slots = layer._piecewise_outputs = StableOutputs(capacity=capacity, token_dim=1)
+    if slots.capacity:
         return slots.slot(kind, output)
     key = (kind, tuple(output.shape), output.dtype, output.device)
     return slots.slot(key, output)
@@ -318,7 +315,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             else 0
         )
         self._late_input_buffers = (
-            TokenBuffers(buffer_tokens, token_dim=0) if buffer_tokens else None
+            StableOutputs(capacity=buffer_tokens) if buffer_tokens else None
         )
         for i, layer in enumerate(self.layers):
             layer.piecewise = self.piecewise

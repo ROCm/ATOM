@@ -30,9 +30,9 @@ def _runner(mode):
 def test_token_buffers_share_capacity_without_growing_recorded_storage(
     token_dim, shape
 ):
-    from atom.models.deepseek_v41.piecewise_buffers import TokenBuffers
+    from atom.utils.cuda_graph import StableOutputs
 
-    buffers = TokenBuffers(8, token_dim)
+    buffers = StableOutputs(capacity=8, token_dim=token_dim)
     small = torch.zeros(shape, dtype=torch.bfloat16)
     large_shape = list(shape)
     large_shape[token_dim] = 8
@@ -49,9 +49,9 @@ def test_token_buffers_share_capacity_without_growing_recorded_storage(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 def test_token_views_replay_with_separate_bucket_graph_pools():
-    from atom.models.deepseek_v41.piecewise_buffers import TokenBuffers
+    from atom.utils.cuda_graph import StableOutputs
 
-    buffers = TokenBuffers(8, token_dim=0)
+    buffers = StableOutputs(capacity=8)
     graphs, outputs = {}, {}
     for tokens in (8, 3):
         view = buffers.slot("attention", torch.ones(tokens, 4, device="cuda"))

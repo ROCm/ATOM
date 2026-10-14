@@ -11,6 +11,7 @@ from dataclasses import replace
 import torch
 
 from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
+from atom.utils.graph_holders import register_graph_holder
 
 
 def _signature(tensor):
@@ -57,7 +58,7 @@ def _tensor_tree(tree):
     return tensors, signature, bind
 
 
-class SharedAttentionInputs(CudagraphCaptureRunner):
+class SharedAttentionInputs(StableOutputs):
     """Fixed metadata addresses shared by layers, refreshed once per live step.
 
     Graph holders release this storage with the attention graphs. Memoization
@@ -67,30 +68,28 @@ class SharedAttentionInputs(CudagraphCaptureRunner):
 
     def __init__(self):
         super().__init__()
-        self.buffers = {}
+        register_graph_holder(self)
 
     def release_graphs(self):
-        self.buffers.clear()
-        return super().release_graphs()
+        self._slots.clear()
+        return 0
 
     def prepare(self, tensors, step, *, zero_copy_hidden):
         staged = {}
         for name, source in tensors.items():
-            if name == ".hidden" and zero_copy_hidden:
+            hidden = name == ".hidden"
+            if hidden and zero_copy_hidden:
                 staged[name] = source
                 continue
             signature = _signature(source)
             key = (name, signature, source.device)
             memo = (key, source.data_ptr())
-            if name != ".hidden" and memo in step.af_inputs:
+            if not hidden and memo in step.af_inputs:
                 staged[name] = step.af_inputs[memo]
                 continue
-            buffer = self.buffers.get(key)
-            if buffer is None:
-                buffer = self.buffers[key] = torch.empty_like(source)
-            buffer.copy_(source)
+            buffer = self.slot(key, source).copy_(source)
             staged[name] = buffer
-            if name != ".hidden":
+            if not hidden:
                 step.af_inputs[memo] = buffer
         return staged
 
@@ -129,9 +128,8 @@ class AttentionGraphs(CudagraphCaptureRunner):
             "swa_replay_start",
             "swa_cached_until",
         )
-        return {
-            "hidden": hidden,
-            "step": {name: getattr(step, name) for name in fields},
+        metadata = {
+            **{name: getattr(step, name) for name in fields},
             "visible": {ratio: step.visible[ratio]} if ratio else {},
             "indptrs": {ratio: step.indptrs[ratio]},
             "selected": (
@@ -144,6 +142,16 @@ class AttentionGraphs(CudagraphCaptureRunner):
                 if spec.candidate_source is not None
                 else {}
             ),
+            "planned": {
+                k: v for k, v in step.planned.items() if k.endswith(f"_{ratio}")
+            },
+            "planned_host": {
+                k: v for k, v in step.planned_host.items() if k.endswith(f"_{ratio}")
+            },
+        }
+        return {
+            "hidden": hidden,
+            "step": metadata,
             "plan": (
                 None
                 if plan is None
@@ -156,12 +164,6 @@ class AttentionGraphs(CudagraphCaptureRunner):
                     )
                 }
             ),
-            "planned": {
-                k: v for k, v in step.planned.items() if k.endswith(f"_{ratio}")
-            },
-            "planned_host": {
-                k: v for k, v in step.planned_host.items() if k.endswith(f"_{ratio}")
-            },
             "queries": (
                 None
                 if queries is None
@@ -169,8 +171,10 @@ class AttentionGraphs(CudagraphCaptureRunner):
                     "rows": queries.rows,
                     "positions": queries.positions,
                     "ptr_rows": queries.ptr_rows,
-                    "batch_ids": queries.index.batch_ids,
-                    "indptrs": {ratio: queries.index.indptrs[ratio]},
+                    "index": {
+                        "batch_ids": queries.index.batch_ids,
+                        "indptrs": {ratio: queries.index.indptrs[ratio]},
+                    },
                 }
             ),
         }
@@ -241,17 +245,11 @@ class AttentionGraphs(CudagraphCaptureRunner):
             frozen = replace(
                 step,
                 **values["step"],
-                visible=values["visible"],
-                indptrs=values["indptrs"],
-                selected=values["selected"],
-                candidates=values["candidates"],
                 plans=(
                     {}
                     if values["plan"] is None
                     else {ratio: replace(step.plans[ratio], **values["plan"])}
                 ),
-                planned=values["planned"],
-                planned_host=values["planned_host"],
                 tiles={},
                 candidate_blocks={},
                 group_indices={},
@@ -259,21 +257,11 @@ class AttentionGraphs(CudagraphCaptureRunner):
                 af_inputs={},
             )
             query = values["queries"]
-            frozen_queries = (
-                None
-                if query is None
-                else replace(
-                    queries,
-                    rows=query["rows"],
-                    positions=query["positions"],
-                    ptr_rows=query["ptr_rows"],
-                    index=replace(
-                        frozen, batch_ids=query["batch_ids"], indptrs=query["indptrs"]
-                    ),
-                )
-            )
+            if query is not None:
+                query["index"] = replace(frozen, **query["index"])
+                query = replace(queries, **query)
             output = attention(
-                values["hidden"], None, cache, frozen, rope, queries=frozen_queries
+                values["hidden"], None, cache, frozen, rope, queries=query
             )
             layer = attention.spec.layer_id
             produced = (
@@ -285,20 +273,17 @@ class AttentionGraphs(CudagraphCaptureRunner):
             return output
 
         # Match V4's zero-copy policy: these are producer-owned fixed inputs.
-        read_from, refresh = self.input_buffers(
-            inputs, tuple(inputs), frozenset(inputs)
-        )
         current = torch.cuda.current_stream()
         self.capture_stream.wait_stream(current)
         with torch.cuda.stream(self.capture_stream):
-            warm = compute(**read_from)
+            warm = compute(**inputs)
             warm_produced = produced
             slot = slot_for(warm)
-            self.capture(key, read_from, refresh, compute, slot)
+            self.capture(key, inputs, {}, compute, slot)
             self._graphs[key]["published"] = produced
             # Keep producer buffers alive for all graph replays. The graph runner
             # otherwise only retains COPIED inputs in its refresh dictionary.
-            self._graphs[key]["read_from"] = read_from
+            self._graphs[key]["read_from"] = inputs
             slot.copy_(warm)
         current.wait_stream(self.capture_stream)
         self._publish(step, warm_produced)
