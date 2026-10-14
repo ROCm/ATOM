@@ -1048,7 +1048,7 @@ def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
     worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
     worker.model = nn.Sequential(nn.Linear(2, 2), _mla_attention(monkeypatch)())
 
-    with pytest.raises(RuntimeError, match="MLAAttention"):
+    with pytest.raises(RuntimeError, match="through MLA"):
         worker.init_rdma_weight_group(
             "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
         )
@@ -1059,6 +1059,38 @@ def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
         "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
     )
     assert joined == [1]
+
+
+def _attention(*, use_mla=None, kv_b_proj=False):
+    """An attention module as a model defines one, with no MLAAttention in it."""
+    from torch import nn
+
+    module = type("DeepseekV2MLAAttention", (nn.Module,), {})()
+    if use_mla is not None:
+        module.use_mla = use_mla
+    if kv_b_proj:
+        module.kv_b_proj = nn.Linear(2, 2)
+    return module
+
+
+@pytest.mark.parametrize(
+    "layer",
+    [{"kv_b_proj": True}, {"use_mla": True}],
+    ids=["its-own-kv_b_proj", "attention-built-with-use_mla"],
+)
+def test_an_mla_model_is_known_by_its_layers_not_one_class(layer):
+    """Each model defines its own MLA attention module, and an
+    Attention(use_mla=True) may be given an impl other than MLAAttention: the
+    check looked for MLAAttention alone, and would have let such a model take
+    a reload its derived W_K and W_V do not follow."""
+    from torch import nn
+
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker.model = nn.Sequential(_attention(**layer))
+    assert "through MLA" in worker._rdma_reload_refusal()
+
+    worker.model = nn.Sequential(_attention(use_mla=False))
+    assert worker._rdma_reload_refusal() is None
 
 
 def test_a_repeated_init_reuses_its_group_only_for_the_same_join(monkeypatch):

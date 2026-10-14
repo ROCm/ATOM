@@ -199,13 +199,26 @@ def _workers_per_engine(config) -> int:
 
 
 def _has_mla_attention(model) -> bool:
-    """Whether *model* decodes through MLAAttention. Looked up, not imported:
-    importing it pulls in aiter, and no instance exists unless it was loaded."""
-    mla = getattr(sys.modules.get("atom.model_ops.attention_mla"), "MLAAttention", None)
+    """Whether *model* attends through MLA, whose decode reads W_K and W_V
+    derived from ``kv_b_proj`` at load.
+
+    By what an MLA layer has, not by one class: each model defines its own
+    attention module around a ``kv_b_proj`` -- DeepseekV2MLAAttention,
+    Glm5NextMLAAttention and others -- and reaches MLAAttention only as the
+    impl ``Attention(use_mla=True)`` builds, which a model may replace.
+    MLAAttention is looked up, not imported: importing it pulls in aiter, and
+    no instance exists unless it was loaded.
+    """
     modules = getattr(model, "modules", None)
-    if mla is None or not callable(modules):
+    if not callable(modules):
         return False
-    return any(isinstance(module, mla) for module in modules())
+    mla = getattr(sys.modules.get("atom.model_ops.attention_mla"), "MLAAttention", None)
+    return any(
+        hasattr(module, "kv_b_proj")
+        or getattr(module, "use_mla", False) is True
+        or (mla is not None and isinstance(module, mla))
+        for module in modules()
+    )
 
 
 def _alone(ballot: int, began: bool) -> tuple[int, bool]:
@@ -592,10 +605,10 @@ class RDMAWeightReceiverMixin:
             )
         if _has_mla_attention(getattr(self, "model", None)):
             return (
-                "the model decodes through MLAAttention, which derives W_K and "
-                "W_V from kv_b_proj once, at load. A reload rewrites kv_b_proj "
-                "and leaves them as they were, so the engine would serve old "
-                "and new weights together."
+                "the model attends through MLA, whose decode reads W_K and W_V "
+                "derived from kv_b_proj once, at load. A reload rewrites "
+                "kv_b_proj and leaves them as they were, so the engine would "
+                "serve old and new weights together."
             )
         return None
 
