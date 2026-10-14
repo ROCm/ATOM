@@ -97,14 +97,23 @@ def test_split_graph_replays_with_live_batch_state_and_engram(monkeypatch):
         calls.append("begin")
         context.attn_metadata.step.selected.clear()
 
-    def attention(hidden, *args):
+    def attention(hidden, *args, queries=None):
         step = context.attn_metadata.step
         assert not step.selected
         step.selected[0] = step.offset
         calls.append(("attention", len(step.requests)))
         return hidden + step.offset
 
-    layer = SimpleNamespace(attn=attention, engram=Engram())
+    outputs = cuda_graph.StableOutputs(token_dim=1)
+    layer = SimpleNamespace(
+        layer_name="test.layer",
+        attn=attention,
+        engram=Engram(),
+        piecewise_outputs=outputs,
+        attention_graphs=runtime.AttentionGraphs(outputs),
+        af_piecewise=False,
+        af_zero_copy_hidden=True,
+    )
     step = SimpleNamespace(
         requests=[1], width=8, offset=1.0, begin_forward=begin, selected={}
     )

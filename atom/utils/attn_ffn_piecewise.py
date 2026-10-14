@@ -152,6 +152,7 @@ def piecewise_core(
     max_tokens: int | None = None,
     copy_per_step: tuple[str, ...] = (),
     capture_prefill: bool = False,
+    token_dim: int = 0,
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
@@ -161,7 +162,9 @@ def piecewise_core(
     permits live prefill capture: callers must stage dynamic metadata and pass
     a complete ``capture_key``. Warmup executes once on a side stream; its
     result is returned after recording, preserving the core's state effects.
-    ``output_slot`` can bind the result to a model-owned boundary buffer.
+    ``token_dim`` identifies the token axis of the tensor inputs. An optional
+    per-call ``prepare`` context manager supplies fresh non-tensor arguments
+    for each execution and records their Python-side effects after execution.
     ``max_tokens`` is an OPTIONAL extra cap on the rows
     a captured graph covers -- a memory lever, off by default. It used to be 512
     and to be the only gate, which silently excluded every decode bucket above
@@ -214,27 +217,31 @@ def piecewise_core(
         @functools.wraps(fn)
         def wrapper(
             layer,
-            *,
-            piecewise,
+            *args,
+            piecewise=False,
             capture=False,
             runner=None,
             outputs=None,
             forward_context=None,
             capture_key=None,
-            output_slot=None,
+            prepare=None,
             **inputs,
         ):
             # FULL / eager: the body runs directly, so a caller on that path only
             # states `piecewise=False` and none of the capture collaborators.
             if not piecewise:
-                return fn(layer, **inputs)
+                return fn(layer, *args, **inputs)
+
+            if args:
+                bound = inspect.signature(fn).bind(layer, *args, **inputs)
+                inputs = dict(list(bound.arguments.items())[1:])
 
             layer_name = getattr(layer, "layer_name", id(layer))
             # Row count off the first input the caller actually passed. A core
             # whose signature covers several call shapes leaves the inputs of the
             # shapes it is not in as None -- declaration order still decides
             # which one anchors, but a None one is skipped rather than crashing.
-            # Every tensor input is [num_tokens, ...], so any of them will do.
+            # The first present tensor supplies the configured token axis.
             anchor = next(
                 (inputs[n] for n in input_names if inputs.get(n) is not None), None
             )
@@ -244,10 +251,14 @@ def piecewise_core(
                     "the runner has no way to size the graph. Inputs are "
                     f"{list(input_names)}."
                 )
-            num_tokens = int(anchor.shape[0])
-            # One output slot per (layer, flat row count): the address the dense
-            # piece downstream was captured reading.
-            out_key = (layer_name, num_tokens)
+            num_tokens = int(anchor.shape[token_dim])
+            # Fixed capacity shares one layer slot across token prefixes;
+            # otherwise each token count gets its own stable output address.
+            out_key = (
+                layer_name
+                if getattr(outputs, "capacity", 0)
+                else (layer_name, num_tokens)
+            )
             # Config args are not graph inputs: bind them into the compute so they
             # are baked at capture, and hand the runner only the tensor inputs.
             # EVERY declared input, None included. A core whose signature spans
@@ -259,6 +270,12 @@ def piecewise_core(
             core = functools.partial(
                 fn, layer, **{n: inputs[n] for n in passthrough_names if n in inputs}
             )
+            if prepare is not None:
+                body = core
+
+                def core(**values):
+                    with prepare() as overrides:
+                        return body(**values, **overrides)
 
             context = getattr(forward_context, "context", None)
             # `capture` off (plain PIECEWISE) short-circuits to the deliver tail
@@ -293,13 +310,6 @@ def piecewise_core(
             if eligible and on_demand and capture_key is None:
                 raise ValueError("Live prefill capture requires a complete capture_key")
 
-            def slot_for(result):
-                return (
-                    output_slot(result)
-                    if output_slot is not None
-                    else outputs.slot(out_key, result)
-                )
-
             if graph_key is not None:
                 if (capturing or on_demand) and not runner.has_graph(graph_key):
                     read_from, refresh = runner.input_buffers(
@@ -307,10 +317,14 @@ def piecewise_core(
                     )
                     if on_demand:
                         return runner.capture_on_demand(
-                            graph_key, read_from, refresh, core, slot_for
+                            graph_key,
+                            read_from,
+                            refresh,
+                            core,
+                            functools.partial(outputs.slot, out_key),
                         )
                     warm = core(**read_from)
-                    out_slot = None if warm is None else slot_for(warm)
+                    out_slot = None if warm is None else outputs.slot(out_key, warm)
                     runner.capture(graph_key, read_from, refresh, core, out_slot)
                 elif runner.has_graph(graph_key) and not capturing:
                     return runner.replay(graph_key, tensor_inputs)
@@ -318,11 +332,7 @@ def piecewise_core(
             result = core(**tensor_inputs)
             if result is None:
                 return None
-            if output_slot is None:
-                return outputs.deliver(out_key, result)
-            slot = slot_for(result)
-            slot.copy_(result)
-            return slot
+            return outputs.deliver(out_key, result)
 
         wrapper.input_names = input_names
         wrapper.passthrough_names = passthrough_names

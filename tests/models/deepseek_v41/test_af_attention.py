@@ -9,25 +9,54 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
 from atom.models.deepseek_v41.af_attention import AttentionGraphs
+from atom.models.deepseek_v41.model import Block
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 
 
+def _forward(
+    graphs,
+    attention,
+    hidden,
+    cache,
+    step,
+    rope,
+    queries=None,
+    *,
+    zero_copy_hidden=False,
+):
+    """Use the same decorated model entry as the runtime splitting op."""
+    metadata = SimpleNamespace(cache=cache, step=step, queries=queries, dummy=False)
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        in_hipgraph=False,
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=metadata,
+    )
+    block = SimpleNamespace(attn=attention, layer_name=f"test.af.{id(graphs)}")
+    with graphs.bind(
+        attention,
+        hidden,
+        metadata,
+        context,
+        capture=True,
+        zero_copy_hidden=zero_copy_hidden,
+    ) as arguments:
+        return Block.attention_forward(block, rope=rope, **arguments)
+
+
 def test_capture_admits_indexing_and_subset_but_excludes_dummy():
-    attn = SimpleNamespace(compressor=None, indexer=None)
     md = SimpleNamespace(queries=None, step=SimpleNamespace(requests=[1]), dummy=False)
     fc = SimpleNamespace(in_hipgraph=False, context=SimpleNamespace(is_dummy_run=False))
-    assert AttentionGraphs.eligible(attn, md, fc)
-    attn.indexer = object()
-    assert AttentionGraphs.eligible(attn, md, fc)
-    attn.indexer = None
+    assert AttentionGraphs.eligible(md, fc)
     md.queries = object()
-    assert AttentionGraphs.eligible(attn, md, fc)
+    assert AttentionGraphs.eligible(md, fc)
     md.queries = None
     fc.in_hipgraph = True
-    assert not AttentionGraphs.eligible(attn, md, fc)
+    assert not AttentionGraphs.eligible(md, fc)
 
 
 @cuda
@@ -73,7 +102,7 @@ def test_refreshes_metadata_and_applies_state_effect_once_per_call():
         )
         hidden = torch.full((1, 4, 2), float(i), device=device)
         step.indptrs = {0: (step.cu_seqlens_q, None, 0)}
-        actual = graphs.forward(Core(), hidden, cache, step, None)
+        actual = _forward(graphs, Core(), hidden, cache, step, None)
         expected = hidden + step.positions[None, :, None] + slot
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert cache.pool.item() == i
@@ -151,8 +180,8 @@ def test_real_window_attention_matches_eager_outputs_and_kv_across_steps(subset)
                     torch.cat((rows, rows.new_tensor([step.width]))),
                 )
         expected = attn(hidden, None, caches[0], steps[0], rope, queries=queries[0])
-        actual = graphs.forward(
-            attn, hidden, caches[1], steps[1], rope, queries=queries[1]
+        actual = _forward(
+            graphs, attn, hidden, caches[1], steps[1], rope, queries=queries[1]
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(caches[1].backing, caches[0].backing, rtol=0, atol=0)
@@ -281,7 +310,7 @@ def test_indexed_graph_matches_eager_compression_selection_and_reindex(
         hidden = torch.randn(1, offset, 512, device="cuda", dtype=torch.bfloat16)
         for attn, graph in zip(layers, graphs):
             expected = attn(hidden, None, caches[0], steps[0], rope)
-            actual = graph.forward(attn, hidden, caches[1], steps[1], rope)
+            actual = _forward(graph, attn, hidden, caches[1], steps[1], rope)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             layer = attn.spec.layer_id
             torch.testing.assert_close(
@@ -341,7 +370,7 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once():
             indptrs={2: (torch.arange(count + 1, device="cuda"), None, 2)},
         )
         hidden = torch.full((1, count, 2), i * 3.0, device="cuda")
-        actual = graph.forward(Core(), hidden, cache, step, None)
+        actual = _forward(graph, Core(), hidden, cache, step, None)
         selected = hidden + i * 3
         torch.testing.assert_close(
             actual, selected + step.positions[None, :, None] + i % 2, rtol=0, atol=0
@@ -381,7 +410,6 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
     cache = SimpleNamespace(pool=torch.zeros(1, device="cuda"))
     source = torch.zeros(1, 4, 2, device="cuda")
     hidden = torch.empty_like(source)
-    destination = torch.empty_like(source)
     consumer_output = torch.empty_like(source)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -389,9 +417,6 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
         producer = torch.cuda.CUDAGraph()
         with torch.cuda.graph(producer):
             hidden.copy_(source * 2)
-        consumer = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(consumer):
-            consumer_output.copy_(destination + 100)
     torch.cuda.current_stream().wait_stream(stream)
     graphs = AttentionGraphs()
     for i in range(1, 5):
@@ -401,15 +426,23 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
         step.slots.fill_(i % 2)
         source.fill_(i)
         producer.replay()
-        out = graphs.forward(
+        out = _forward(
+            graphs,
             Core(),
             hidden,
             cache,
             step,
             None,
-            output_slot=lambda sample: destination,
             zero_copy_hidden=True,
         )
+        if i == 1:
+            destination = out
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                consumer = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(consumer):
+                    consumer_output.copy_(destination + 100)
+            torch.cuda.current_stream().wait_stream(stream)
         assert out.data_ptr() == destination.data_ptr()
         consumer.replay()
         torch.testing.assert_close(consumer_output, source * 2 + i * 10 + i % 2 + 100)
@@ -418,13 +451,13 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
     # A changed producer address is a distinct graph, never a stale replay.
     moved = hidden + 7
     step.begin_forward()
-    out = graphs.forward(
+    out = _forward(
+        graphs,
         Core(),
         moved,
         cache,
         step,
         None,
-        output_slot=lambda sample: destination,
         zero_copy_hidden=True,
     )
     torch.testing.assert_close(

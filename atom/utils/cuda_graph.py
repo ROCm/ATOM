@@ -357,6 +357,8 @@ class StableOutputs:
                 )
             shape[self.token_dim] = self.capacity
             key = (key, tuple(shape), sample.dtype, sample.device)
+        else:
+            key = (key, tuple(sample.shape), sample.dtype, sample.device)
         buf = self._slots.get(key)
         if buf is None:
             buf = sample.new_empty(shape) if self.capacity else torch.empty_like(sample)

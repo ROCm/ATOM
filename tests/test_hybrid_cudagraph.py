@@ -368,7 +368,15 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
             cache.pool.add_(1)
             return hidden + step.positions[None, :, None]
 
-    layer = SimpleNamespace(attn=Core(), af_piecewise=True, af_zero_copy_hidden=True)
+    outputs = cuda_graph.StableOutputs(capacity=8, token_dim=1)
+    layer = SimpleNamespace(
+        layer_name="hybrid.layer",
+        attn=Core(),
+        af_piecewise=True,
+        af_zero_copy_hidden=True,
+        piecewise_outputs=outputs,
+        attention_graphs=runtime.AttentionGraphs(outputs),
+    )
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
         batch_descriptor=None,
@@ -426,7 +434,7 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
         with torch.cuda.graph(full):
             destination.copy_(compiled(hidden))
     torch.cuda.current_stream().wait_stream(stream)
-    assert not hasattr(layer, "_af_attention")
+    assert not layer.attention_graphs._graphs
     context.in_hipgraph = False
     cache.pool.zero_()
     for i, use_full in enumerate([True, False, True, False], 1):
@@ -441,7 +449,47 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
             actual = compiled(hidden)
         torch.testing.assert_close(actual, torch.full_like(hidden, 12 * i + 3))
         assert cache.pool.item() == i
-    assert len(layer._af_attention._graphs) == 1
-    layer._af_attention.release_graphs()
+    assert len(layer.attention_graphs._graphs) == 1
+    layer.attention_graphs.release_graphs()
     for piece in pieces:
         piece.release_graphs()
+
+
+@pytest.mark.parametrize("capacity", [0, 8])
+def test_model_core_uses_token_axis_and_fixed_output_capacity(capacity):
+    from atom.models.deepseek_v41.model import Block
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs(capacity=capacity, token_dim=1)
+    layer = SimpleNamespace(
+        layer_name="test.capacity",
+        attn=lambda x, *args, **kwargs: x + 1,
+    )
+    step = SimpleNamespace(requests=[1])
+    pointers = {}
+    for n, value in [(3, 1.0), (8, 2.0), (3, 3.0)]:
+        result = Block.attention_forward(
+            layer,
+            torch.full((1, n, 2), value),
+            None,
+            step,
+            None,
+            piecewise=True,
+            outputs=outputs,
+        )
+        torch.testing.assert_close(result, torch.full((1, n, 2), value + 1))
+        assert result.data_ptr() == pointers.setdefault(n, result.data_ptr())
+    assert len(outputs._slots) == (1 if capacity else 2)
+    assert (pointers[3] == pointers[8]) == bool(capacity)
+
+
+def test_stable_output_role_keeps_different_shapes_separate():
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs(token_dim=1)
+    small = outputs.deliver("engram", torch.ones(1, 3, 2))
+    large = outputs.deliver("engram", torch.full((1, 8, 2), 5.0))
+    assert small.shape == (1, 3, 2)
+    assert large.shape == (1, 8, 2)
+    assert small.data_ptr() != large.data_ptr()
+    torch.testing.assert_close(small, torch.ones_like(small))

@@ -17,7 +17,7 @@ from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
 
-from .af_attention import AttentionGraphs
+from .af_attention import AttentionGraphs, SharedAttentionInputs
 from .bounded_replay import (
     build_replay_plan,
     carry_selections,
@@ -91,58 +91,29 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     return Block.engram_forward(layer, residual, embeddings, metadata.image_mask)
 
 
-def _piecewise_slot(layer_name, kind, output):
-    """An eager boundary must publish to the address its consumer captured."""
-    context = get_forward_context()
-    if context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE:
-        return output
-    layer, _ = context.no_compile_layers[layer_name]
-    slots = layer.__dict__.get("_piecewise_outputs")
-    if slots is None:
-        capacity = getattr(layer, "piecewise_buffer_tokens", 0)
-        slots = layer._piecewise_outputs = StableOutputs(capacity=capacity, token_dim=1)
-    if slots.capacity:
-        return slots.slot(kind, output)
-    key = (kind, tuple(output.shape), output.dtype, output.device)
-    return slots.slot(key, output)
-
-
-def _piecewise_output(layer_name, kind, output):
-    buffer = _piecewise_slot(layer_name, kind, output)
-    if buffer is not output:
-        buffer.copy_(output)
-    return buffer
-
-
 @mark_spliting_op(is_custom=True, gen_fake=_fake_layer_output)
 def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     layer, rope = context.no_compile_layers[layer_name]
-    metadata = context.attn_metadata
-    if (
-        getattr(layer, "af_piecewise", False)
-        and context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-        and AttentionGraphs.eligible(layer.attn, metadata, context)
-    ):
-        if not hasattr(layer, "_af_attention"):
-            layer._af_attention = AttentionGraphs()
-        return layer._af_attention.forward(
-            layer.attn,
-            hidden,
-            metadata.cache,
-            metadata.step,
-            rope,
-            queries=metadata.queries,
-            output_slot=lambda value: _piecewise_slot(layer_name, "attention", value),
-            zero_copy_hidden=layer.af_zero_copy_hidden,
-            forward_context=context,
-        )
-    return _piecewise_output(layer_name, "attention", v41_attention(hidden, layer_name))
+    with layer.attention_graphs.bind(
+        layer.attn,
+        hidden,
+        context.attn_metadata,
+        context,
+        capture=layer.af_piecewise,
+        zero_copy_hidden=layer.af_zero_copy_hidden,
+    ) as arguments:
+        return Block.attention_forward(layer, rope=rope, **arguments)
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_fake_layer_output)
 def v41_piecewise_engram(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
-    return _piecewise_output(layer_name, "engram", v41_engram(hidden, layer_name))
+    output = v41_engram(hidden, layer_name)
+    context = get_forward_context()
+    if context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+        layer, _ = context.no_compile_layers[layer_name]
+        return layer.piecewise_outputs.deliver("engram", output)
+    return output
 
 
 @mark_spliting_op(is_custom=True, gen_fake=lambda hidden: None, mutates_args=["hidden"])
@@ -313,9 +284,16 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self._late_input_buffers = (
             StableOutputs(capacity=buffer_tokens) if buffer_tokens else None
         )
+        attention_inputs = SharedAttentionInputs() if self.piecewise else None
         for i, layer in enumerate(self.layers):
             layer.piecewise = self.piecewise
-            layer.piecewise_buffer_tokens = buffer_tokens
+            if self.piecewise:
+                layer.piecewise_outputs = StableOutputs(
+                    capacity=buffer_tokens, token_dim=1
+                )
+                layer.attention_graphs = AttentionGraphs(
+                    layer.piecewise_outputs, attention_inputs
+                )
             layer.af_piecewise = (
                 self.piecewise
                 and config.compilation_config.cudagraph_mode

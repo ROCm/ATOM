@@ -3,7 +3,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
@@ -25,12 +25,19 @@ from atom.models.deepseek_v4 import (
     make_v4_quant_config,
 )
 from atom.utils import envs
+from atom.utils.attn_ffn_piecewise import piecewise_core
 from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
 from .config import build_attention_topology
 from .layers import native_quant_config
 from .moe import MoE
+
+if TYPE_CHECKING:
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+
+    from .bounded_replay import QueryRows
 
 
 class Block(nn.Module):
@@ -100,9 +107,19 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
-    def attention_forward(self, normed, cache, step, rope):
+    @piecewise_core(capture_prefill=True, token_dim=1)
+    def attention_forward(
+        self,
+        normed: torch.Tensor,
+        cache: "PagedAttentionCache",
+        step: "BatchStep",
+        rope: RotaryEmbedding,
+        queries: "QueryRows | None" = None,
+    ) -> torch.Tensor:
         """Run attention on its seam's normed BF16 input."""
-        return self.attn(normed, None, cache, step, rope)
+        if not step.requests:
+            return torch.zeros_like(normed)
+        return self.attn(normed, None, cache, step, rope, queries=queries)
 
     def engram_forward(self, residual, embeddings, image_mask):
         if embeddings is None:
