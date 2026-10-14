@@ -36,6 +36,7 @@ import sys
 import time
 import traceback
 from collections import Counter
+from collections.abc import Callable
 from datetime import timedelta
 from itertools import pairwise
 
@@ -55,17 +56,23 @@ _HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 _MAX_METADATA_BYTES = 64 << 20
 _MAX_PAYLOAD_BYTES = 1 << 40
 
+# A rank's ballot at each vote on a stream; a vote's outcome is the least
+# ballot any rank cast. See receive_weight_stream.
+_BROKEN_OFF = 0  # cannot follow the stream any further, or cannot commit it
+_PREPARED = 1  # at the end marker, with this rank's commit prepared
+_RECEIVING = 2  # can receive the frame just announced
+
 
 class RDMAStreamOutOfStep(RuntimeError):
     """This rank can no longer follow the stream.
 
     A broadcast is received whole, into a buffer of the size it was sent with,
-    so a frame this rank cannot allocate for is one it cannot take part in --
-    and the sender, already broadcasting it, cannot be told. A broadcast that
-    failed, typically because a peer left, puts the group in the same place.
-    Nothing more can ride it: ``receive_weights_rdma`` tears down this rank's
-    end, and the sender and any peer still in a broadcast are released by the
-    group's timeout.
+    so a frame one receiver cannot allocate for is one none of them can take
+    part in -- and the sender, already broadcasting it, cannot be told. A
+    broadcast that failed, typically because a peer left, puts the group in the
+    same place. Nothing more can ride it: this rank's end is torn down, and the
+    sender and any peer still in a broadcast are released when their side of
+    it fails, or by the group's timeout.
     """
 
 
@@ -182,21 +189,21 @@ def _has_mla_attention(model) -> bool:
     return any(isinstance(module, mla) for module in modules())
 
 
-def _alone(ready: bool, began: bool) -> tuple[bool, bool]:
-    """The decision on a stream this rank took by itself."""
-    return ready, began
+def _alone(ballot: int, began: bool) -> tuple[int, bool]:
+    """The outcome of a vote this rank took by itself."""
+    return ballot, began
 
 
-def vote_on_stream(group, ready: bool, began: bool) -> tuple[bool, bool]:
-    """The decision on a stream every rank of *group* took.
+def vote_on_stream(group, ballot: int, began: bool) -> tuple[int, bool]:
+    """One vote on a stream, by every rank of *group*.
 
-    Each rank says whether it can commit, and whether it began the stream at
-    all; the answer is whether every rank can commit, and whether any began.
-    *group* is a CPU one: the ballot is two integers.
+    Each rank casts ``_RECEIVING``, ``_PREPARED`` or ``_BROKEN_OFF``, and says
+    whether it began the stream at all; the outcome is the least ballot cast,
+    and whether any rank began. *group* is a CPU one: a vote is two integers.
     """
-    ballot = torch.tensor([int(ready), -int(began)], dtype=torch.int64)
-    dist.all_reduce(ballot, op=dist.ReduceOp.MIN, group=group)
-    return bool(ballot[0].item()), ballot[1].item() < 0
+    votes = torch.tensor([int(ballot), -int(began)], dtype=torch.int64)
+    dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
+    return int(votes[0].item()), votes[1].item() < 0
 
 
 @torch.no_grad()
@@ -207,6 +214,7 @@ def receive_weight_stream(
     device: torch.device,
     expected_version: int,
     agree=_alone,
+    leave: Callable[[], object] | None = None,
 ) -> dict[str, float]:
     """Consume one weight stream and apply it as a single transaction.
 
@@ -217,20 +225,30 @@ def receive_weight_stream(
     unless a peer took it.
 
     *agree* is how the ranks taking one stream decide on it; see
-    ``vote_on_stream``. One rank's version alone would serve the engine mixed,
-    so each rank prepares its commit and then votes, and commits only if every
-    rank can. If the vote fails and any rank began the stream, every rank ends
-    fenced. Each rank votes once per stream, whatever happened to it, or a peer
-    already in the vote would wait for it until its group timed out.
+    ``vote_on_stream``. They vote on every frame's header before any of them
+    enters the frame's broadcasts, so a frame one rank cannot receive is
+    broken off by all of them there, rather than leaving the others in a
+    broadcast it never joined. And they vote at the end marker: one rank's
+    version alone would serve the engine mixed, so each prepares its commit
+    and commits only if every rank can. If that fails and any rank began the
+    stream, every rank ends fenced. The first vote with any ballot below
+    ``_RECEIVING`` is every rank's last, so each casts as many as its peers
+    whatever happened to it; a peer already in a vote would otherwise wait for
+    it until its group timed out.
 
     A failure on this rank does not end its part in the stream. The trainer and
     every other rank are still in the broadcasts, and one rank leaving early
     hangs all of them in the next one -- the orchestrator then sees a timeout
     naming nobody instead of this rank's error. So the rest of the stream is
     received and discarded, the header's sizes being all that is needed to stay
-    in step, and the failure is raised once the end marker arrives. Anything
-    that breaks the stream off before then -- a frame this rank cannot allocate
-    for, a broadcast that fails -- raises ``RDMAStreamOutOfStep``.
+    in step, and the failure is raised once the end marker arrives. What breaks
+    the stream off before then -- a frame some rank cannot receive, a broadcast
+    that fails -- raises ``RDMAStreamOutOfStep``.
+
+    *leave* tears down this rank's end of *group*. A rank whose broadcast
+    failed calls it before its last vote: a peer still in that broadcast is
+    released only once this rank's end is gone, and the vote would wait for
+    that peer until then.
     """
     total_bytes = 0
     total_weights = 0
@@ -239,6 +257,7 @@ def receive_weight_stream(
     failure: Exception | None = None
     drained = 0
     began = False
+    any_began = False
     ended = False
     voted = False
 
@@ -290,26 +309,35 @@ def receive_weight_stream(
                 f"command={command} metadata_bytes={metadata_bytes} "
                 f"payload_bytes={payload_bytes}"
             )
-            # Checked before anything is allocated: an allocation that fails
-            # here takes this rank out of the broadcast the sender has begun.
+            # Decided by every rank before any enters the frame's broadcasts.
+            # Free memory differs between them, and one that could not
+            # allocate, leaving alone, left its peers in a broadcast it never
+            # joined while it waited for them in the vote.
             reason = _unreceivable(device, metadata_bytes, payload_bytes)
-            if reason is not None:
+            if reason is None:
+                try:
+                    metadata_tensor = torch.empty(
+                        metadata_bytes, dtype=torch.uint8, device=device
+                    )
+                    payload = torch.empty(
+                        payload_bytes, dtype=torch.uint8, device=device
+                    )
+                except RuntimeError as exc:  # out of memory, within the bounds
+                    metadata_tensor = payload = None
+                    reason = str(exc)
+            outcome, any_began = agree(
+                _RECEIVING if reason is None else _BROKEN_OFF, began
+            )
+            if outcome != _RECEIVING:
+                voted = True
                 raise RDMAStreamOutOfStep(
-                    f"RDMA weight frame cannot be received: {frame} ({reason})"
+                    f"RDMA weight frame cannot be received: {frame} "
+                    f"({reason or 'not by every rank taking the stream'})"
                 )
 
             # Every frame but the end marker is followed by these two
             # broadcasts, so they are received before the frame is judged: one
             # this rank cannot use still has to keep it in step.
-            try:
-                metadata_tensor = torch.empty(
-                    metadata_bytes, dtype=torch.uint8, device=device
-                )
-                payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
-            except RuntimeError as exc:  # out of memory, within the bounds
-                raise RDMAStreamOutOfStep(
-                    f"RDMA weight frame cannot be received: {frame} ({exc})"
-                ) from exc
             dist.broadcast(metadata_tensor, src=0, group=group)
             dist.broadcast(payload, src=0, group=group)
             if failure is None and (
@@ -349,9 +377,9 @@ def receive_weight_stream(
                 torch.cuda.synchronize(device)
             except Exception as exc:  # noqa: BLE001 - voted on, then raised
                 failure = exc
-        all_ready, any_began = agree(failure is None, began)
+        outcome, any_began = agree(_PREPARED if failure is None else _BROKEN_OFF, began)
         voted = True
-        if failure is None and not all_ready:
+        if failure is None and outcome != _PREPARED:
             failure = RuntimeError(
                 f"RDMA weight stream v{expected_version} not committed: another "
                 f"rank taking it could not"
@@ -369,8 +397,20 @@ def receive_weight_stream(
         manifest = runner.finish_weight_commit(expected_version)
     except Exception as exc:
         if not voted:
+            # Broken off between votes, in a broadcast a peer may still be in.
+            # That peer is released only once this rank's end is gone, so it
+            # goes first: voting first would wait for the peer until the group
+            # timed out, with nothing left to tear the group down.
+            if leave is not None:
+                try:
+                    leave()
+                except Exception:  # noqa: BLE001 - the stream's own failure is raised
+                    logger.exception(
+                        "RDMA weight stream v%d: leaving its group failed",
+                        expected_version,
+                    )
             try:
-                _, any_began = agree(False, began)
+                _, any_began = agree(_BROKEN_OFF, began)
             except Exception:  # noqa: BLE001 - the stream's own failure is raised
                 any_began = True  # unknown, so take it that a peer began
         if began:
@@ -518,7 +558,7 @@ class RDMAWeightReceiverMixin:
             )
         return None
 
-    def _vote_with_engine_peers(self, ready: bool, began: bool) -> tuple[bool, bool]:
+    def _vote_with_engine_peers(self, ballot: int, began: bool) -> tuple[int, bool]:
         """The stream's decision across this engine's workers, every one of
         which takes it: one worker's yes is not enough to serve it.
 
@@ -530,7 +570,7 @@ class RDMAWeightReceiverMixin:
         """
         workers = _workers_per_engine(getattr(self, "config", None))
         if workers <= 1:
-            return ready, began
+            return ballot, began
         from aiter.dist.parallel_state import get_world_group
 
         world = get_world_group()
@@ -541,7 +581,7 @@ class RDMAWeightReceiverMixin:
                 f"cannot decide the RDMA stream: the process world has "
                 f"{world.world_size} rank(s), the engine {workers} worker(s)"
             )
-        return vote_on_stream(world.cpu_group, ready, began)
+        return vote_on_stream(world.cpu_group, ballot, began)
 
     def receive_weights_rdma(
         self,
@@ -576,6 +616,7 @@ class RDMAWeightReceiverMixin:
                 device=self.device,
                 expected_version=int(version),
                 agree=self._vote_with_engine_peers,
+                leave=lambda: self.destroy_rdma_weight_group(group_name),
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(

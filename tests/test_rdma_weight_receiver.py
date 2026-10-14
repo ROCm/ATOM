@@ -333,22 +333,36 @@ def _receive(
     synchronize=lambda *a, **k: None,
     version=1,
     agree=receiver._alone,
+    leave=None,
 ):
     import torch
 
     monkeypatch.setattr(receiver, "dist", SimpleNamespace(broadcast=trainer.broadcast))
     monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
     return receiver.receive_weight_stream(
-        None, runner, device=torch.device("cpu"), expected_version=version, agree=agree
+        None,
+        runner,
+        device=torch.device("cpu"),
+        expected_version=version,
+        agree=agree,
+        leave=leave,
     )
 
 
-def _peers_decide(all_ready, any_began):
-    """Peers whose vote comes out as given; records the ballots this rank cast."""
+def _peers_decide(all_ready, any_began, *, take_frames=None):
+    """Peers that take every frame, or the first *take_frames* of them, and
+    then decide as given; records the ballots this rank cast."""
 
-    def agree(ready, began):
-        agree.ballots.append((ready, began))
-        return all_ready, any_began
+    def agree(ballot, began):
+        agree.ballots.append((ballot, began))
+        frames = sum(cast == receiver._RECEIVING for cast, _ in agree.ballots)
+        if ballot == receiver._RECEIVING and (
+            take_frames is None or frames <= take_frames
+        ):
+            return receiver._RECEIVING, any_began
+        if ballot == receiver._PREPARED and all_ready:
+            return receiver._PREPARED, any_began
+        return receiver._BROKEN_OFF, any_began
 
     agree.ballots = []
     return agree
@@ -687,7 +701,7 @@ def test_a_device_fault_keeps_the_stream_from_being_committed(monkeypatch):
         _receive(monkeypatch, trainer, runner, synchronize=fault, agree=agree)
 
     assert runner.events[-2:] == ["prepare", "abort: device fault"]
-    assert agree.ballots == [(False, True)]
+    assert agree.ballots[-1] == (receiver._BROKEN_OFF, True)
 
 
 # ── the ranks taking one stream decide on it together ──────────────────────
@@ -703,7 +717,9 @@ def test_a_rank_that_could_commit_does_not_when_a_peer_cannot(monkeypatch):
     with pytest.raises(RuntimeError, match="another rank taking it could not"):
         _receive(monkeypatch, trainer, runner, agree=agree)
 
-    assert agree.ballots == [(True, True)]
+    assert agree.ballots == [(receiver._RECEIVING, True)] * 3 + [
+        (receiver._PREPARED, True)
+    ]
     assert "commit" not in runner.events
     assert runner.events[-1].startswith("abort")
 
@@ -719,7 +735,7 @@ def test_a_rank_that_refused_what_its_peers_took_is_fenced(monkeypatch):
     with pytest.raises(RuntimeError, match="must increase"):
         _receive(monkeypatch, trainer, runner, agree=agree)
 
-    assert agree.ballots == [(False, False)]
+    assert agree.ballots[-1] == (receiver._BROKEN_OFF, False)
     assert runner.events[0] == "begin" and runner.events[-1].startswith("fence")
 
 
@@ -735,8 +751,8 @@ def test_a_stream_every_rank_refused_fences_none_of_them(monkeypatch):
 
 
 def test_a_rank_that_breaks_off_still_votes(monkeypatch):
-    """A peer that reached the end marker waits in the vote; without this
-    rank's ballot it waited until its group timed out."""
+    """A peer waits in the vote on the frame; without this rank's ballot it
+    waited until its group timed out."""
     import torch
 
     trainer = _Trainer([torch.tensor([_CMD_BUCKET, -1, 8, 1])])
@@ -746,7 +762,63 @@ def test_a_rank_that_breaks_off_still_votes(monkeypatch):
     with pytest.raises(receiver.RDMAStreamOutOfStep):
         _receive(monkeypatch, trainer, runner, agree=agree)
 
-    assert agree.ballots == [(False, True)]
+    assert agree.ballots == [(receiver._BROKEN_OFF, True)]
+
+
+def test_a_frame_a_peer_cannot_receive_is_broken_off_here_too(monkeypatch):
+    """Free memory differs between ranks. One that could not allocate for a
+    frame broke off alone, and its peers went on into the frame's broadcasts,
+    held there for it while it waited for them in the vote."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner()
+    agree = _peers_decide(False, True, take_frames=1)
+    left = []
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="not by every rank"):
+        _receive(
+            monkeypatch, trainer, runner, agree=agree, leave=lambda: left.append(1)
+        )
+
+    assert agree.ballots == [(receiver._RECEIVING, True)] * 2
+    assert len(trainer.frames) == 6, "the frame's broadcasts were entered"
+    assert runner.events[:2] == ["begin", "apply1"]
+    assert runner.events[-1].startswith("abort")
+    # Every rank left at that vote, so none is in a broadcast to release.
+    assert left == []
+
+
+def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
+    monkeypatch,
+):
+    """A peer may still be in the broadcast that failed here, held there until
+    this rank's end of the group is gone. Voting first, this rank waited for
+    that peer until the group timed out, with nothing left to tear it down."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    calls, order = [], []
+
+    def failing(tensor, src=0, group=None):
+        calls.append(1)
+        if len(calls) == 5:  # the second frame's metadata
+            raise RuntimeError("broadcast timed out")
+        trainer.broadcast(tensor, src=src, group=group)
+
+    peers = _peers_decide(False, True)
+
+    def agree(ballot, began):
+        order.append("vote")
+        return peers(ballot, began)
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="broadcast timed out"):
+        _receive(
+            monkeypatch,
+            SimpleNamespace(broadcast=failing),
+            _Runner(),
+            agree=agree,
+            leave=lambda: order.append("leave"),
+        )
+
+    assert order == ["vote", "vote", "leave", "vote"]
+    assert peers.ballots[-1] == (receiver._BROKEN_OFF, True)
 
 
 def test_a_broadcast_that_fails_puts_the_rank_out_of_step(monkeypatch):

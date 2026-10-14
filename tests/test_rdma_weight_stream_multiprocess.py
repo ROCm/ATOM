@@ -34,12 +34,15 @@ _SNAPSHOT = Path(__file__).parent / "fixtures" / "lumenrl_rdma_sender.txt"
 # Every rank finishes in seconds once started; past this a stream has hung.
 _DEADLINE_S = 180
 
-# (name, rank whose first bucket is rejected, rank whose begin is refused).
-# Streamed one after another over the same groups, so each later one also
-# shows the groups are still in step after a rank failed and drained.
-_CLEAN = ("clean", None, None)
-_ONE_RANK_FAILS = ("one rank fails", 2, None)
-_ONE_RANK_REFUSES = ("one rank refuses", None, 2)
+# (name, rank whose first bucket is rejected, rank whose begin is refused,
+# rank that cannot allocate for the second frame). Streamed one after another
+# over the same groups, so each later one also shows the groups are still in
+# step after a rank failed and drained.
+_CLEAN = ("clean", None, None, None)
+_ONE_RANK_FAILS = ("one rank fails", 2, None, None)
+_ONE_RANK_REFUSES = ("one rank refuses", None, 2, None)
+# Breaks the stream off, which leaves its groups unusable: streamed alone.
+_ONE_RANK_STARVED = ("one rank cannot take a frame", None, None, 2)
 
 
 def _checkpoint() -> dict[str, torch.Tensor]:
@@ -93,6 +96,20 @@ def _receiving_runner(device: torch.device, rejects_buckets: bool, refuses: bool
     return _Runner()
 
 
+def _starve_second_frame(receiver) -> None:
+    """As if this rank's GPU had too little free memory for the second frame."""
+    real = receiver._unreceivable
+    frames = []
+
+    def unreceivable(device, metadata_bytes, payload_bytes):
+        frames.append(None)
+        if len(frames) == 2:
+            return "no memory for the second frame on this rank"
+        return real(device, metadata_bytes, payload_bytes)
+
+    receiver._unreceivable = unreceivable
+
+
 def _send(group, device: torch.device, backend: str, version: int) -> None:
     import json
 
@@ -134,10 +151,7 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
     import torch.distributed as dist
 
     with stubbed_aiter():
-        from atom.rollout.rdma_weight_receiver import (
-            receive_weight_stream,
-            vote_on_stream,
-        )
+        import atom.rollout.rdma_weight_receiver as receiver
     from atom.utils.independent_process_group import init_independent_process_group
 
     if backend == "nccl":
@@ -175,7 +189,9 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
             results.put((scenario, rank, "raised", detail, None))
         return
     try:
-        for version, (scenario, failing, refusing) in enumerate(scenarios, start=1):
+        for version, (scenario, failing, refusing, starved) in enumerate(
+            scenarios, start=1
+        ):
             if rank == 0:
                 try:
                     _send(group, device, backend, version)
@@ -185,13 +201,17 @@ def _rank_main(rank, world_size, ports, backend, scenarios, results):
                     results.put((scenario, rank, "raised", detail, None))
                 continue
             runner = _receiving_runner(device, rank == failing, rank == refusing)
+            if rank == starved:
+                _starve_second_frame(receiver)
             try:
-                receive_weight_stream(
+                receiver.receive_weight_stream(
                     group,
                     runner,
                     device=device,
                     expected_version=version,
-                    agree=lambda ready, began: vote_on_stream(tp, ready, began),
+                    agree=lambda ballot, began: receiver.vote_on_stream(
+                        tp, ballot, began
+                    ),
                 )
                 state, detail = "committed", runner.weights()
             except Exception as exc:  # noqa: BLE001 - the parent reports it
@@ -296,6 +316,22 @@ def test_a_rank_that_refuses_a_stream_leaves_no_rank_serving_it(gloo_reports):
     state, detail, serving = reports[2]
     assert (state, serving) == ("raised", False), reports
     assert "must increase" in detail, reports
+
+
+def test_a_frame_one_rank_cannot_take_is_broken_off_by_every_rank():
+    """The rank that could not allocate broke off alone and waited for its
+    peer in the vote, while the peer went on into the frame's broadcasts --
+    over RCCL, held there until the group timed out."""
+    scenarios = (_ONE_RANK_STARVED,)
+    reports = _streams(world_size=3, backend="gloo", scenarios=scenarios)
+    reports = reports[_ONE_RANK_STARVED[0]]
+
+    state, detail, serving = reports[2]
+    assert (state, serving) == ("raised", False), reports
+    assert "no memory for the second frame" in detail, reports
+    state, detail, serving = reports[1]
+    assert (state, serving) == ("raised", False), reports
+    assert "not by every rank taking the stream" in detail, reports
 
 
 @pytest.mark.skipif(
