@@ -631,6 +631,7 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         self._max_pending_saves = max_pending_saves(
             getattr(config, "kv_transfer_config", None) or {},
             envs.OFFLOAD_COPY_WORKERS,
+            pp_size=int(getattr(config, "pipeline_parallel_size", 1) or 1),
         )
         self._save_inflight_since: dict[object, float] = {}
         self._save_stalled = False
