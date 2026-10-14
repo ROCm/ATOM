@@ -82,9 +82,11 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do DP attention and padded steps: DP's MoE collectives are
-    sized by every rank's token count, even when a rank needs no padding,
-    and a rank-local tail would change those counts.
+    row, and so do padded steps. Under DP attention a prefill replays only
+    when the group can agree on each stage's token counts
+    (`dp_stage_sync_enabled`): DP's MoE collectives are sized by every rank's
+    token count, which a rank-local tail changes, so the ranks first share
+    their decoder and last-layer counts (`sync_dp_stage_tokens`).
     """
     context, metadata = forward.context, forward.attn_metadata
     if (
@@ -93,7 +95,10 @@ def replayable(forward, num_tokens: int) -> bool:
         or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
-        or getattr(forward, "dp_metadata", None) is not None
+    ):
+        return False
+    if getattr(forward, "dp_metadata", None) is not None and not (
+        dp_stage_sync_enabled(forward)
     ):
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
@@ -109,6 +114,150 @@ def replayable(forward, num_tokens: int) -> bool:
         or num_tokens != step.width
         or step.width != step.scheduled
     )
+
+
+def dp_stage_sync_enabled(forward) -> bool:
+    """Whether the DP group shares per-stage token counts this forward.
+
+    Agreed by every rank: each condition is a group decision -- an eager,
+    variable-length step (`running_tokens_are_unified` is off on all ranks
+    once any rank prefills) that TBO did not split. A decode-only step pads
+    every rank to one height and never replays; a TBO-split step runs
+    microbatches, which compute every row.
+    """
+    context = forward.context
+    if (
+        context is None
+        or getattr(forward, "dp_metadata", None) is None
+        or context.running_tokens_are_unified
+        or forward.ubatch_slices is not None
+    ):
+        return False
+    from atom.utils.tbo.ubatching import tbo_active
+
+    return not tbo_active()
+
+
+@dataclass(frozen=True)
+class DPStageTokens:
+    """The DP group's plan for the layers past the decoder's KV source.
+
+    ``decoder`` and ``last_layer``: every rank's MoE token count, in DP order,
+    for layers 20..38 (layer 20's FFN onward) and for layer 39. A rank that
+    does not replay runs all its tokens through both.
+
+    ``decoder_active``: whether any rank has decoder work -- a tail of its
+    own, or all its rows because it does not replay. When none does, every
+    rank skips the decoder; otherwise a replaying rank without a tail joins
+    each collective on placeholder tokens."""
+
+    decoder: tuple[int, ...]
+    last_layer: tuple[int, ...]
+    decoder_active: bool = True
+
+
+def sync_dp_stage_tokens(
+    forward,
+    decoder_tokens: int,
+    last_layer_tokens: int,
+    *,
+    replaying: bool,
+    decoder_active: bool,
+) -> DPStageTokens | None:
+    """Share this rank's decoder and last-layer token counts with the DP group.
+
+    One CPU all_reduce of ``4 x dp_size`` int32, issued by every rank of a
+    forward for which `dp_stage_sync_enabled` holds (decode ranks and dummy
+    runs of a prefill step included). Besides the counts each rank reports
+    whether it replays and whether it has decoder work, so the group decides
+    from explicit flags rather than from whether the counts changed (a
+    placeholder count can equal a rank's own).
+
+    None when no rank replays: the caller keeps the step's own DP table.
+    """
+    import torch.distributed as dist
+
+    num_ranks = len(forward.dp_metadata.get_sizes_across_dp())
+    # The slot `DPMetadata.num_tokens_across_dp` fills, so the tables line up.
+    rank = _data_parallel_rank()
+    table = torch.zeros((4, num_ranks), dtype=torch.int32)
+    table[:, rank] = torch.tensor(
+        [decoder_tokens, last_layer_tokens, int(replaying), int(decoder_active)],
+        dtype=torch.int32,
+    )
+    dist.all_reduce(table, group=_dp_cpu_group())
+    if not bool(table[2].any()):
+        return None
+    return DPStageTokens(
+        tuple(table[0].tolist()),
+        tuple(table[1].tolist()),
+        decoder_active=bool(table[3].any()),
+    )
+
+
+@contextlib.contextmanager
+def placeholder_rows_of(metadata, rows):
+    """A request-less step over ``rows`` of the forward while this block runs.
+
+    For a rank that joins its peers' decoder collectives without work of its
+    own: attention sees no requests (`v41_attention` returns zeros and writes
+    no cache), there are no layer-39 queries, and the image mask -- which the
+    MoE router reads row for row -- is cut to the same rows."""
+    outer = metadata.step, metadata.queries, metadata.image_mask
+    metadata.step, metadata.queries = replace(outer[0], requests=()), None
+    if outer[2] is not None:
+        metadata.image_mask = outer[2].index_select(1, rows)
+    try:
+        yield
+    finally:
+        metadata.step, metadata.queries, metadata.image_mask = outer
+
+
+def _dp_cpu_group():
+    from aiter.dist.parallel_state import get_dp_group
+
+    return get_dp_group().cpu_group
+
+
+def _data_parallel_rank() -> int:
+    from atom.config import get_current_atom_config
+
+    return get_current_atom_config().parallel_config.data_parallel_rank
+
+
+@contextlib.contextmanager
+def dp_token_counts(forward, counts: tuple[int, ...] | None):
+    """Size the forward's DP MoE collectives for ``counts`` while this block
+    runs: the variable-length gather reads every rank's count from
+    ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``."""
+    if counts is None:
+        yield
+        return
+    from atom.config import get_current_atom_config
+    from atom.utils.forward_context import DPMetadata
+
+    context = forward.context
+    own = counts[_data_parallel_rank()]
+    outer = (
+        forward.dp_metadata,
+        context.scheduled_tokens,
+        context.running_tokens_across_dp,
+    )
+    forward.dp_metadata = DPMetadata.make(
+        get_current_atom_config().parallel_config,
+        own,
+        torch.tensor(counts, dtype=torch.int32),
+    )
+    context.scheduled_tokens = own
+    context.running_tokens_across_dp = counts
+    try:
+        yield
+    finally:
+        (
+            forward.dp_metadata,
+            context.scheduled_tokens,
+            context.running_tokens_across_dp,
+        ) = outer
 
 
 @dataclass(frozen=True)
