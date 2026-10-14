@@ -5,6 +5,25 @@
 
 set -euo pipefail
 
+if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+  PD_LAUNCH_EVIDENCE_ROLE=batch
+  [[ "${1:-}" != --spur-worker ]] || PD_LAUNCH_EVIDENCE_ROLE=worker
+  # Emit before external commands or shared-directory setup. These markers do
+  # not depend on a working artifact path and are not filtered by the CI stream.
+  printf '[pd.launch] time=%(%Y-%m-%dT%H:%M:%S%z)T phase=script-entry role=%s job=%s host=%s rank=%s pid=%s\n' \
+    -1 "${PD_LAUNCH_EVIDENCE_ROLE}" "${SLURM_JOB_ID:-${SPUR_JOB_ID:-unknown}}" \
+    "${HOSTNAME:-unknown}" "${SPUR_TASK_OFFSET:-${SLURM_PROCID:-unknown}}" "$$" >&2 || true
+  pd_record_early_exit() {
+    local rc="$1"
+    printf '[pd.launch] phase=early-shell-exit rc=%s role=%s job=%s host=%s\n' \
+      "${rc}" "${PD_LAUNCH_EVIDENCE_ROLE}" "${SLURM_JOB_ID:-${SPUR_JOB_ID:-unknown}}" \
+      "${HOSTNAME:-unknown}" >&2 || true
+  }
+  # The existing workload cleanup trap replaces this once cleanup is ready.
+  # Successful exec srun keeps its original process and exit-code semantics.
+  trap 'pd_record_early_exit "$?"' EXIT
+fi
+
 # Docker uses the allocated host daemon even when Spur isolates the job PIDs.
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 export DOCKER_HOST=unix:///var/run/docker.sock
@@ -644,6 +663,10 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
   echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
+  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+    printf '[pd.launch] phase=worker-dispatch job=%s host=%s nodes=%s\n' \
+      "${JOB_ID}" "${HOSTNAME:-unknown}" "${NUM_NODES}" >&2 || true
+  fi
   exec srun \
     --nodes="${NUM_NODES}" \
     --ntasks="${NUM_NODES}" \

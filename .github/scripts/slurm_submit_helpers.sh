@@ -130,6 +130,23 @@ slurm_state_is_active() {
   esac
 }
 
+record_slurm_controller_evidence() {
+  local job_id="$1" output="$2" evidence
+  [[ "${SLURM_CAPTURE_LAUNCH_EVIDENCE:-0}" == "1" ]] || return 0
+  if ! evidence="$(python3 "${BASH_SOURCE[0]%/*}/slurm_job_evidence.py" \
+      --job-id "${job_id}" <<< "${output}")"; then
+    echo "WARNING: could not format controller evidence for job ${job_id}" >&2
+    return 0
+  fi
+  printf '[slurm.controller] %s\n' "${evidence}" >&2 || true
+  if [[ -n "${SLURM_CONTROLLER_EVIDENCE_FILE:-}" ]]; then
+    printf '%s\n' "${evidence}" >> "${SLURM_CONTROLLER_EVIDENCE_FILE}" || \
+      echo "WARNING: could not archive controller evidence for job ${job_id}" >&2
+  fi
+  # Diagnostics must not replace the scheduler result, including on write failure.
+  return 0
+}
+
 query_slurm_controller_job() {
   local job_id="$1" output
   local -a cmd=(scontrol)
@@ -140,6 +157,7 @@ query_slurm_controller_job() {
     echo "ERROR: scontrol query failed for job ${job_id}" >&2
     return 2
   fi
+  record_slurm_controller_evidence "${job_id}" "${output}" || true
   awk -v id="${job_id}" '
     /JobId=/ { selected = 0 }
     {
@@ -477,6 +495,7 @@ monitor_slurm_job() {
   local job_id="$1"
   local job_line result state current_job_id elapsed nodes reason
   local missing_queries=0 unknown_since=0 now
+  local last_evidence_state=""
   SLURM_CONFIRMED_RESULT=""
   OUT_LINE=0
   ERR_LINE=0
@@ -489,6 +508,13 @@ monitor_slurm_job() {
     if job_line="$(query_slurm_job "${job_id}")" && [[ -n "${job_line}" ]]; then
       IFS='|' read -r current_job_id state elapsed nodes reason <<< "${job_line}"
       echo "[slurm] job=${current_job_id} state=${state} elapsed=${elapsed} nodes=${nodes} reason=${reason}"
+      if [[ "${SLURM_CAPTURE_LAUNCH_EVIDENCE:-0}" == "1" &&
+            "${state}" != PENDING && "${state}" != "${last_evidence_state}" ]]; then
+        # Capture launch/completion evidence before the controller drops the job.
+        # The existing query timeout applies; this snapshot never changes state.
+        query_slurm_controller_job "${job_id}" >/dev/null || true
+        last_evidence_state="${state}"
+      fi
     else
       echo "WARNING: job ${job_id} absent from queue or queue query failed (${missing_queries}); verifying controller/accounting" >&2
       if result="$(query_slurm_result "${job_id}")" && [[ -n "${result}" ]]; then

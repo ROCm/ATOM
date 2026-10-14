@@ -381,10 +381,115 @@ class SlurmMonitoringTest(unittest.TestCase):
         path.write_text("#!/bin/sh\nexec sleep 30\n")
         path.chmod(0o755)
         result = self.run_script(
-            "query_slurm_controller_job 831", {}, SLURM_QUERY_TIMEOUT_SECONDS="0.1"
+            "query_slurm_controller_job 831", {}, SLURM_QUERY_TIMEOUT_SECONDS="0.1",
+            SLURM_CAPTURE_LAUNCH_EVIDENCE="1",
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("scontrol query failed", result.stderr)
+
+    def test_controller_evidence_retains_reason_without_changing_result(self):
+        evidence = self.root / "controller.jsonl"
+        result = self.run_script(
+            'result="$(query_slurm_controller_job 831)"; printf "%s\\n" "$result"',
+            {"scontrol": [{"out": (
+                "JobId=999 JobState=FAILED Reason=other-job ExitCode=9:0\n"
+                "JobId=831 JobName=private-job-name\n"
+                "   JobState=FAILED Reason=Failed to launch batch task ExitCode=1:0\n"
+                "   BatchHost=fixture-host NodeList=fixture-[1,2]\n"
+                "   Command=secret-command Environment=secret-environment\n"
+                "JobId=832 JobState=COMPLETED Reason=other-job ExitCode=0:0\n"
+            )}]},
+            SLURM_CAPTURE_LAUNCH_EVIDENCE="1",
+            SLURM_CONTROLLER_EVIDENCE_FILE=str(evidence),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "FAILED|1:0")
+        self.assertIn("Failed to launch batch task", result.stderr)
+        record = json.loads(evidence.read_text())
+        self.assertEqual(record["fields"]["JobId"], "831")
+        self.assertEqual(record["fields"]["Reason"], "Failed to launch batch task")
+        self.assertEqual(record["fields"]["BatchHost"], "fixture-host")
+        for private in ("secret-command", "secret-environment", "private-job-name", "other-job"):
+            self.assertNotIn(private, result.stderr + evidence.read_text())
+
+    def test_transition_evidence_does_not_replace_scheduler_result(self):
+        evidence = self.root / "controller.jsonl"
+        result = self.run_script(
+            'monitor_slurm_job 831; read_slurm_exit_code 831; echo "result=$SLURM_STATE|$SLURM_JOB_RC"',
+            {
+                "squeue": [
+                    {"out": "831|PENDING|0:00|2|(Resources)"},
+                    {"out": "831|COMPLETING|0:01|2|fixture-[1,2]"},
+                    {"out": "831|COMPLETING|0:01|2|fixture-[1,2]"},
+                    {},
+                ],
+                "scontrol": [
+                    {"out": "JobId=831 JobState=COMPLETING Reason=launch-failed ExitCode=0:0"},
+                    {"out": "JobId=831 JobState=FAILED Reason=launch-failed ExitCode=1:0"},
+                ],
+            },
+            SLURM_CAPTURE_LAUNCH_EVIDENCE="1",
+            SLURM_CONTROLLER_EVIDENCE_FILE=str(evidence),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("result=FAILED|1", result.stdout)
+        self.assertEqual(len(self.calls("scontrol")), 2)
+        self.assertFalse(self.calls("scancel"))
+        records = [json.loads(line) for line in evidence.read_text().splitlines()]
+        self.assertEqual([r["fields"]["JobState"] for r in records], ["COMPLETING", "FAILED"])
+
+    def test_evidence_write_failure_preserves_query_result(self):
+        result = self.run_script(
+            'query_slurm_controller_job 831',
+            {"scontrol": [{"out": "JobId=831 JobState=FAILED Reason=launch-failed ExitCode=7:0"}]},
+            SLURM_CAPTURE_LAUNCH_EVIDENCE="1",
+            SLURM_CONTROLLER_EVIDENCE_FILE=str(self.root),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "FAILED|7:0")
+        self.assertIn("launch-failed", result.stderr)
+
+    def test_early_pd_failure_emits_entry_and_preserves_exit_status(self):
+        script = HELPERS.parent / "atomesh/pd_slurm_job.sh"
+        for args, role in (([], "batch"), (["--spur-worker"], "worker")):
+            with self.subTest(role=role):
+                result = subprocess.run(
+                    ["bash", str(script), *args],
+                    env={
+                        "PATH": os.environ["PATH"],
+                        "ATOMESH_ENV_ATOMESH_C48_CASE": "V-Q",
+                        "SPUR_JOB_ID": "831",
+                        "SPUR_TASK_OFFSET": "1",
+                        "HOSTNAME": "fixture-host",
+                        "NCCL_IB_GID_INDEX": "invalid-fixture",
+                    },
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f"role={role}", result.stderr)
+                self.assertIn("phase=script-entry", result.stderr)
+                self.assertIn("phase=early-shell-exit rc=2", result.stderr)
+
+    def test_launch_evidence_preserves_srun_exec_and_failure_code(self):
+        srun = self.bin / "srun"
+        srun.write_text('#!/bin/sh\nprintf "fixture srun failed\\n" >&2\nexit 7\n')
+        srun.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(HELPERS.parent / "atomesh/pd_slurm_job.sh")],
+            env={
+                "PATH": str(self.bin) + os.pathsep + os.environ["PATH"],
+                "ATOMESH_ENV_ATOMESH_C48_CASE": "V-Q",
+                "SPUR_JOB_ID": "831", "NUM_NODES": "2", "BACKEND": "vllm",
+                "LOG_ROOT": str(self.root), "HOSTNAME": "fixture-host",
+            },
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("phase=script-entry role=batch", result.stderr)
+        self.assertIn("phase=worker-dispatch job=831", result.stderr)
+        self.assertIn("fixture srun failed", result.stderr)
+        # exec replaces the batch shell: no extra EXIT handler wraps srun.
+        self.assertNotIn("phase=early-shell-exit", result.stderr)
 
 
 class SlurmNodeSelectionTest(unittest.TestCase):

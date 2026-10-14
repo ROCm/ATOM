@@ -536,6 +536,10 @@ write_slurm_cancel_helper "${JOB_ID}"
 set_slurm_job_log_paths "${JOB_ID}"
 SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
 SLURM_STATUS_RANKS="${NUM_NODES}"
+if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+  SLURM_CAPTURE_LAUNCH_EVIDENCE=1
+  SLURM_CONTROLLER_EVIDENCE_FILE="${LOG_ROOT}/controller-job-${JOB_ID}.jsonl"
+fi
 monitor_slurm_job "${JOB_ID}"
 
 # Fall back to published results if accounting has no final state.
