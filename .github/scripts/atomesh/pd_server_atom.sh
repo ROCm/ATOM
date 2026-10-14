@@ -251,6 +251,11 @@ AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTA
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
+# Empty keeps each turn's recorded output length. Set, it replaces
+# max_completion_tokens on every request, subagent turns included, which
+# --synthesis-max-osl does not reach; the scenario's forced ignore_eos then makes
+# every request generate exactly this many tokens.
+AIPERF_MAX_OUTPUT_TOKENS="${AIPERF_MAX_OUTPUT_TOKENS:-}"
 # Torch profiler window inside the aiperf Profiling phase; off while DURATION is
 # 0. START counts from the phase start rather than from aiperf launch, so a
 # warmup of any length does not move the window. Once every rank's trace is on
@@ -1406,11 +1411,12 @@ run_aiperf_agentic_benchmark() {
     conc="${conc//[[:space:]]/}"
     [[ -n "${conc}" ]] || continue
     local out_dir="${RUN_DIR}/benchmark_results/aiperf-${safe_model}-${TOPOLOGY}-c${conc}"
-    local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${AIPERF_MAX_CONTEXT_LENGTH}-osl1024-conc${conc}-${RANDOM_RANGE_RATIO}.json"
+    local result_file="pd-${BACKEND}-${safe_model}-${TOPOLOGY}-isl${AIPERF_MAX_CONTEXT_LENGTH}-osl${AIPERF_MAX_OUTPUT_TOKENS:-1024}-conc${conc}-${RANDOM_RANGE_RATIO}.json"
     local aiperf_json="${out_dir}/profile_export_aiperf.json"
     local dashboard_json="${RUN_DIR}/benchmark_results/${result_file}"
     local -a unsafe_args=()
     local -a chat_template_args=()
+    local -a output_tokens_args=()
     if (( AIPERF_BENCHMARK_DURATION < 900 )) \
       || [[ "${AIPERF_UNSAFE_OVERRIDE}" == "1" || "${AIPERF_UNSAFE_OVERRIDE}" == "true" ]]; then
       unsafe_args+=(--unsafe-override)
@@ -1418,6 +1424,9 @@ run_aiperf_agentic_benchmark() {
     if [[ "${AIPERF_APPLY_CHAT_TEMPLATE}" == "1" \
       || "${AIPERF_APPLY_CHAT_TEMPLATE}" == "true" ]]; then
       chat_template_args+=(--apply-chat-template)
+    fi
+    if [[ -n "${AIPERF_MAX_OUTPUT_TOKENS}" ]]; then
+      output_tokens_args+=(--extra-inputs "max_completion_tokens:${AIPERF_MAX_OUTPUT_TOKENS}")
     fi
 
     echo "[aiperf] ${result_file}"
@@ -1467,6 +1476,7 @@ run_aiperf_agentic_benchmark() {
       --tokenizer "${MODEL_PATH}" \
       --tokenizer-trust-remote-code \
       "${chat_template_args[@]}" \
+      "${output_tokens_args[@]}" \
       --max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}" \
       --num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}" \
       --slice-duration "${AIPERF_SLICE_DURATION}" \

@@ -76,7 +76,7 @@ def dashboard_summary(data, src, conc, env, *, single_node=False):
         "random_input_len": int(
             data.get("max_context_length") or env.get("AIPERF_MAX_CONTEXT_LENGTH") or 0
         ),
-        "random_output_len": 1024,
+        "random_output_len": int(env.get("AIPERF_MAX_OUTPUT_TOKENS") or 1024),
         "max_concurrency": conc,
         "random_range_ratio": "",
         "request_throughput": avg("request_throughput"),

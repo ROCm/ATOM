@@ -693,7 +693,7 @@ models:
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
-            benchmark:
+            benchmark: &kimi_k3_agentic_aiperf
               <<: *agentic_1m_aiperf
               aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
             run_eval: false
@@ -829,7 +829,8 @@ models:
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_agentic_agg_dcp8
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
           topology: agg
           display_topology: AGG-TP8-DCP8
@@ -935,7 +936,8 @@ models:
         # The PP8 and PP4xTP2 cells with FULL cudagraphs: each stage replays its
         # own layers' decode graph per microbatch, with the TP8 cells' compile
         # settings.
-        - <<: *kimi_k3_agentic_agg_pp8
+        - &kimi_k3_agentic_agg_pp8_cg
+          <<: *kimi_k3_agentic_agg_pp8
           name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72
           display_topology: AGG-PP8-TP1-CG
           decode:
@@ -956,6 +958,24 @@ models:
             cudagraph_mode: FULL
             compilation_level: 3
             extra_args: "--pipeline-parallel-size 4"
+
+        # Pure-prefill twins of the aggregated TP8xDCP8 and PP8 FULL-graph cells:
+        # the same trace replay, but every request generates a single token, so
+        # throughput and TTFT measure prefill capacity rather than a decode-bound
+        # mix. With no decode running, the PrefillDelayer knobs never hold.
+        - <<: *kimi_k3_agentic_agg_dcp8
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72-osl1
+          display_topology: AGG-TP8-DCP8-OSL1
+          benchmark:
+            <<: *kimi_k3_agentic_aiperf
+            max_output_tokens: 1
+
+        - <<: *kimi_k3_agentic_agg_pp8_cg
+          name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1
+          display_topology: AGG-PP8-TP1-CG-OSL1
+          benchmark:
+            <<: *kimi_k3_agentic_aiperf
+            max_output_tokens: 1
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark

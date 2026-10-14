@@ -180,6 +180,7 @@ exports = {
         "service_profile_configure_timeout", ""
     ),
     "AIPERF_UNSAFE_OVERRIDE": benchmark.get("unsafe_override", ""),
+    "AIPERF_MAX_OUTPUT_TOKENS": benchmark.get("max_output_tokens", ""),
     "WAIT_SERVER_TIMEOUT": cell["wait_server_timeout"],
     "WAIT_ROUTER_TIMEOUT": cell["wait_router_timeout"],
     "PREFILL_WORKERS": prefill.get("workers", 1),
