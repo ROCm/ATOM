@@ -55,28 +55,6 @@ def _compress_plan_buffer_names(ratio):
     }
 
 
-def _staging_advances(staged) -> bool:
-    """Whether this step's Engram staging will advance the cursor itself.
-
-    The advance has to happen exactly once, down one path or the other.
-    `EngramStaging._advance_cursor` does it on the way past, and stands down on
-    a step carrying candidate cursors -- a verify step's cursor is the accepted
-    prefix's, which only the sampler knows.
-
-    Takes the `EngramStep`, which is the object that answers both halves. An
-    earlier version of this took the batch step instead and asked it for
-    `candidates`: both types carry that name, but the batch step's is the
-    indexer's per-layer block ids, a `dict` with a `default_factory`, so
-    `is None` was false for every step ever built. The gate was a constant,
-    and what it silently dropped was the `staged is None` test it had
-    replaced -- leaving the caller to advance a cursor the staging was about
-    to advance too.
-    """
-    if staged is None:
-        return False
-    return staged.candidates is None
-
-
 class DeepseekV41Backend(AttentionBackend):
     @staticmethod
     def get_name():
@@ -1113,23 +1091,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
 
     def prepare_model_inputs(self, input_ids, metadata):
-        """One CSA2 step's host-side work: Engram rows, state, cursor.
-
-        Called by the metadata builder, before the forward and outside any
-        capture, which is what lets this model be captured at all. None of
-        this can be replayed from a graph -- the Engram row staging hashes
-        token ids, `prepare_state` resets the
-        slots this batch recycled, and `advance_cursor` writes the committed
-        position -- and it has to happen once, in order, per step.
-
-        It meets the decorator's contract without restructuring: it returns no
-        tensor and writes only into `forward_vars` buffers that were reserved
-        once and never reallocated, precisely so a replay (which reruns no host
-        code) finds the addresses its kernels recorded. See `_reserve_indptrs`.
-
-        Outside a capture context the decorator is identity, so the native
-        engine's path is unchanged.
-        """
         step, cache = metadata.step, metadata.cache
         # The rows the requests own, not the rows the forward runs: the padding
         # tail is zeroed inside `run_model`, after this, so what stands there
@@ -1184,17 +1145,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif (
-            not metadata.dummy and not step.tentative and not _staging_advances(staged)
-        ):
-            # Owed to `EngramStaging.start` only when there is a staging to do
-            # it. The condition used to be `staged is None`, which assumed the
-            # two always travel together -- and where they did not, the step
-            # advanced nothing at all: no error, no trace, the request simply
-            # one behind its own position for the rest of its life. Measured
-            # under FULL_AND_PIECEWISE at 64 concurrent requests, where every
-            # step deferred to staging and the ones without it leaked an
-            # advance each ("needs state at 828, found 818").
+        elif staged is None and not metadata.dummy and not step.tentative:
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True

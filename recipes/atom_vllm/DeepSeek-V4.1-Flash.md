@@ -6,11 +6,10 @@ vLLM plugin backend. For background on the plugin backend, see
 model itself and its native ATOM path, see the
 [DeepSeek-V4.1-Flash recipe](../DeepSeek-V4.1-Flash.md).
 
-The plugin path serves the **text backbone only**. Vision, prefix caching and
-KV-transfer connectors are refused at startup rather than silently degraded —
-run the native ATOM engine for those. DSpark speculation and CUDA graphs are
-supported, both behind an explicit flag. The reasons, and what each refusal
-costs, are in
+The plugin path serves the **text backbone only**, without prefix caching or
+KV-transfer connectors. Do not configure a connector: startup rejection does
+not cover every connector name. DSpark speculation and CUDA graphs are
+supported, both behind an explicit flag. The scope and restrictions are in
 [What the plugin path does not do](#what-the-plugin-path-does-not-do).
 
 ## Step 1: Launch vLLM Server
@@ -68,8 +67,9 @@ Feature flags:
   halves the bytes a cached token costs. The fp8 spellings are rejected: V4.1
   has no fp8 main pool, and silently downgrading would leave vLLM's allocation
   and the kernels' geometry describing different bytes.
-- Expert parallelism (`--enable-expert-parallel`) and the usual parallel
-  options behave as they do for any other ATOM plugin model.
+- This integration targets the **V2 model runner**. The validated deployment
+  is TP4 with pipeline, decode-context and prefill-context parallel sizes all
+  equal to 1; other parallel layouts are not covered by this recipe.
 
 ## Step 2: Performance Benchmark
 
@@ -108,18 +108,14 @@ lm_eval \
   --num_fewshot 5
 ```
 
-The native TP4 reference is GSM8K `0.9204` over 1,319 questions
-(see the [model recipe](../DeepSeek-V4.1-Flash.md)). The plugin path runs the
-same backbone against the same weights, so it is judged against that number.
-Measured on the plugin path at TP4, BF16 pool, `--max-model-len 8192`:
-`0.9242 +/- 0.0073` over the same 1,319 questions (strict-match and
-flexible-extract agree) -- **on the tree this work was first written against,
-not on this one.** That run predates a rebase onto a newer `main` that moved
-three things on the numerical path: the aiter the kernels come from, the
-`workspace` argument `PagedAttentionCache` now takes (the bridge hands it the
-builder's own scorer scratch, as the native path does), and the `index_fp4`
-field the pool geometry gained. Treat the number as the expectation to confirm,
-not as this tree's result, until it is re-measured here.
+Historical reference: ATOM `2a89e29135`, based on main `661ef7661`, with
+vLLM `db9527a46`, V2 TP4, BF16 pool, DSpark5 and FULL_AND_PIECEWISE graphs
+scored `0.9219105383` on all 1,319 GSM8K questions (5-shot, concurrency 32,
+`--max-model-len 8192`, `max_gen_toks=256`; strict and flexible extraction
+agree). The sampling standard error was `0.00739065`, not a measured
+run-to-run variation. This result predates the review fixes to STATE ownership,
+FULL plan capacities and H2D publication; it does not validate those changes.
+Re-run the same configuration when evaluating a newer tree.
 
 Pass `tokenizer_backend=none` as well if you point `lm_eval` at a local
 checkpoint directory: with no HF `tokenizer.json` beside the weights, the
@@ -142,10 +138,16 @@ the STATE tail's worth of block *ids* from the scheduler, while leaving the
 allocation's byte size alone. The profiled memory budget is therefore
 unchanged; what shrinks is how many of those blocks may hold history.
 
-The tail costs `--max-num-seqs` STATE entries. If it does not leave room for a
-single `--max-model-len` request, the server fails at startup with a message
-naming both numbers — raise `--gpu-memory-utilization`, or lower
-`--max-num-seqs` or `--max-model-len`.
+The tail reserves **twice `--max-num-seqs`** STATE entries: one half for real
+requests and one for synthetic warmup/capture steps. Real requests use V2's
+persistent `idx_mapping_np` indices, not an LRU over the scheduled subset;
+a live but temporarily unscheduled request keeps its state. Position-zero
+recomputation uses the cache's existing reset path.
+
+The target has one proxy KV group; DSpark also introduces draft KV storage.
+Available history capacity must leave room for all those groups, the STATE
+tail, and the shared null block. Do not estimate concurrent-request capacity
+from target proxy pages alone.
 
 ## What the plugin path does not do
 
@@ -156,15 +158,14 @@ naming both numbers — raise `--gpu-memory-utilization`, or lower
 | Image requests | Refused — text only |
 | DSpark speculative decoding | Supported — 5 draft tokens, fixed by the model's own config gate; the draft is the target checkpoint's `mtp.*` stages, so there is no separate draft model to pass |
 | Prefix caching | Refused — a block-table hit restores the compressed pages but not the per-request window ring, compressor rings or Engram cursor that CSA2 attention reads alongside them |
-| KV transfer / offload connectors | Refused — V4.1's cached prefix is PAGE bytes *and* a per-request STATE image, and no connector on this path carries the second; a PAGE prefix restored without its STATE is a dead engine, not a degraded answer |
-| CUDA graphs | Supported behind `ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1` — the host-side step work and attention each run in an eager break, so the rest of the forward is captured. See [CUDA graphs](#cuda-graphs) |
+| KV transfer / offload connectors | Unsupported in this integration — restoring PAGE bytes without the matching per-request STATE is unsafe. Do not rely on every connector alias being rejected at startup |
+| CUDA graphs | Opt-in with both graph flags; FULL and PIECEWISE use different staging boundaries. See [CUDA graphs](#cuda-graphs) |
 
-Each refusal above is made by `enforce_deepseek_v41_constraints` -- which the
-worker applies to the config it is about to run, ahead of cudagraph capture and
-the first forward -- or by
-`atom.models.deepseek_v41.config.validate_runtime_config`, with a message
-naming the flag to drop. Use the
-[native ATOM engine](../DeepSeek-V4.1-Flash.md) for any of them.
+Existing refusals are made by `enforce_deepseek_v41_constraints` or
+`atom.models.deepseek_v41.config.validate_runtime_config`. These checks are not
+a complete connector admission gate. For capabilities outside this recipe,
+consult the [native ATOM recipe](../DeepSeek-V4.1-Flash.md) for its supported
+configuration rather than bypassing a plugin refusal.
 
 ## CUDA graphs
 
@@ -180,24 +181,19 @@ architectures; without ATOM's own second condition, a vLLM upgrade that adds
 V4.1 to that list would change this path's behaviour with nothing in the log.
 `tests/plugin/test_vllm_deepseek_v41_cudagraph_mode.py` holds that shut.
 
-Measured on TP4, GSM8K 20-shot, the full 1319 questions:
-
-| Arm | Accuracy |
-|---|---|
-| Graphs off, no speculation | 0.9280 |
-| Graphs on (FULL + PIECEWISE), no speculation | 0.9280 FULL / 0.9325 PIECEWISE |
-| Graphs on, DSpark 5 tokens | 0.9295 ± 0.0071, mean acceptance 3.55–3.58 |
-
-A V4.1 serving run captures a mix: 47 FULL graphs and 110 PIECEWISE in the
-DSpark configuration above, with no capture failures.
+See [Accuracy validation](#step-3-accuracy-validation) for the revision-pinned
+historical result. Graph counts depend on vLLM's descriptors and configuration;
+record them for each run rather than treating a previous count as a contract.
+Successful capture or aggregate accuracy alone does not prove that an inactive
+compression branch was recorded or that padded replay rows were cleared.
 
 ### How a V4.1 forward gets captured at all
 
 A V4.1 step does host-side work every forward that no captured graph can
 replay -- Engram staging, state reset, cursor advance -- and its attention
 kernels are launched with per-step host values, including the batch's longest
-KV extent, which a capture would freeze at whatever length it recorded. Three
-things make it work, and each is load-bearing:
+KV extent, which a capture would freeze at whatever length it recorded. The
+PIECEWISE path handles these boundaries in three ways:
 
 - **The step work moved out of the forward.** The metadata builder stages the
   step before the model is called (`_v41_stage_outside_forward` in
@@ -219,29 +215,35 @@ things make it work, and each is load-bearing:
   `_finish_prefetch`. Standing the fork down instead also works and costs the
   overlap between a largely-UVA gather and the layers consuming it.
 
-Under FULL the picture differs in one way worth knowing: `eager_break_during_capture`
-returns the function unwrapped, so there is no break. The Engram fork is
-therefore joined immediately on that path rather than left open across layers
-(`_v41_join_covers_the_layers`), which keeps FULL correct at the cost of that
-overlap.
+Under FULL there is no eager break. The metadata builder joins Engram before
+capture/replay and the consumer skips a duplicate external-event wait. V2
+passes runtime mode `NONE` while preparing a FULL capture, so the explicit
+capture flag must take precedence over the mode. This path gives up Engram's
+layer overlap; PIECEWISE retains the per-layer eager waits.
 
-### Dead ends, so they are not re-walked
+FULL compression plans use both the padded request capacity and fixed query
+width. A ratio-2 step with no active compression rows still needs a nonzero
+capture capacity; replay initializes inactive rows with `position=-1`. This
+is separate from whether the graph can be captured without an exception.
 
-Each of these was measured, and none of them is the explanation for a capture
-that will not finish: the compressor/indexer side streams
-(`ATOM_DSV41_SIDE_STREAMS=0`); `in_hipgraph` opening ATOM's fork gate under a
-foreign capture; the MoE's dual-stream overlap
-(`ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD=0`, verified to take effect); an
-exception inside an eager-break body; unsynchronised staging left on another
-stream; the cudagraph mode and the path that sets it; and 0.31's wrapper
-nesting sharing one `_capturing` flag.
+### Host buffers and scratch lifetime
 
-Two notes on reading a failure here. `capture_end()` reporting
-`hipErrorStreamCaptureWrongThread` names a thread that is not the problem: the
-first `_end_segment` raises inside `capture_end()` before it reaches
-`self._capturing = False`, so the context manager's `__exit__` ends an
-already-dead graph and reports *that*, hiding the first failure. And a capture
-that completes is not a capture that is correct -- an early arm captured and
-served without raising while the answers degenerated into noise after the
-first few tokens (8/8 prompts, greedy, against an eager arm answering all 8).
-Check accuracy, not the absence of an exception.
+The snapshot keeps exact device-to-host reads for sequence lengths and PAGE
+tables. V2's `seq_lens_cpu_upper_bound` is not an exact replacement during
+asynchronous speculation. This path is not synchronization-free.
+
+Metadata and cache-owned cursor/reset/tentative H2D sources have publication
+owners: before reusing pinned host storage they wait for its previous transfer;
+partial preparation failures poison the owner rather than allow unsafe reuse.
+Tentative host prefixes remain in the same epoch through sampler commit.
+The separate D2H state probe still defaults to blocking; H2D ownership does not
+prove that deferred probe mode is safe.
+
+Capture scratch is retained only when the effective model configuration enables
+graphs. `--enforce-eager` and mode `NONE` use shape-sized temporary scratch,
+even if ROCm sets `VLLM_USE_BREAKABLE_CUDAGRAPH=1`. Storage already referenced
+by a captured graph is not released on a later temporary-cache request.
+
+For a capture failure, retain the first exception as well as any teardown
+exception: a second `capture_end()` failure can obscure the original one.
+Check targeted replay writes and end-to-end accuracy, not just startup.

@@ -15,7 +15,7 @@ and the layers consuming it is the whole point, and upstream's own V4.1 keeps
 its side stream and puts the orderings in eager breaks instead.
 
 Core carries none of this: `atom/model_ops/engram/device/staging.py` is
-untouched by this PR, and the plugin replaces three methods on the class.
+untouched by this PR, and the plugin replaces six methods on the class.
 These tests pin the two properties that make that replacement correct --
 the fork survives, and `start` does not fold the snapshot or the cursor
 advance into the broken-out region, where a replay would re-run them and
@@ -24,6 +24,8 @@ advance the cursor twice.
 
 import ast
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -86,14 +88,47 @@ def test_the_three_boundaries_are_wrapped():
         assert hasattr(mod.VllmEngramStaging, name)
 
 
-def test_installing_is_idempotent_and_replaces_the_class_methods():
+def test_installing_is_idempotent_and_replaces_the_class_methods(monkeypatch):
     from atom.model_ops.engram.device.staging import EngramStaging
-    from atom.plugin.vllm.v41_core_overrides import (
-        VllmEngramStaging,
-        install_vllm_engram_staging,
-    )
+    from atom.plugin.vllm import v41_core_overrides as mod
 
-    install_vllm_engram_staging()
-    install_vllm_engram_staging()
-    assert EngramStaging.start is VllmEngramStaging.start
-    assert EngramStaging.consume is VllmEngramStaging.consume
+    names = ("start", "consume", "join", "_prefetch", "_await_layer", "_await_fork")
+    original = dict(vars(EngramStaging))
+    target = type("Staging", (), {name: object() for name in names[:3]})
+    monkeypatch.setattr(mod, "EngramStaging", target)
+    mod.install_vllm_engram_staging()
+    wrapped = [getattr(target, name) for name in names]
+    mod.install_vllm_engram_staging()
+    assert [getattr(target, name) for name in names] == wrapped
+    assert wrapped == [getattr(mod.VllmEngramStaging, name) for name in names]
+    assert getattr(target, mod._STAGING_MARKER)
+    assert dict(vars(EngramStaging)) == original
+
+
+def test_join_is_once_per_stage_and_consume_does_not_repeat_external_wait():
+    from atom.plugin.vllm.v41_core_overrides import VllmEngramStaging
+
+    staging = VllmEngramStaging.__new__(VllmEngramStaging)
+    staging.host = SimpleNamespace(_tp_group=None)
+    staging.done = {0: object()}
+    for name in (
+        "_snapshot",
+        "_advance_cursor",
+        "_prefetch",
+        "_await_layer",
+        "_await_fork",
+    ):
+        setattr(staging, name, Mock())
+    staging.start(4)
+    staging.consume(0, 4)
+    staging._await_layer.assert_called_once_with(staging.done[0])
+    staging.join()
+    staging.join()
+    staging.consume(0, 4)
+    staging._await_fork.assert_called_once_with()
+    staging._await_layer.assert_called_once()
+    staging.start(2)
+    staging.consume(0, 2)
+    assert staging._await_layer.call_count == 2
+    assert staging._snapshot.call_count == staging._advance_cursor.call_count == 2
+    assert staging._prefetch.call_count == 2

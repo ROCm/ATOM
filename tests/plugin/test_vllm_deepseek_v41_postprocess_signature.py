@@ -45,9 +45,8 @@ PP_PAYLOAD = {
 }
 
 
-@pytest.fixture(scope="module")
-def patched_runners():
-    patch_v41_speculative_commit()
+@pytest.fixture
+def patched_runners(monkeypatch):
     runners = [
         cls
         for cls in gpu_model_runner_classes()
@@ -55,6 +54,9 @@ def patched_runners():
     ]
     if not runners:
         pytest.skip("this vLLM has no runner with postprocess_sampled")
+    for cls in runners:
+        monkeypatch.setattr(cls, "postprocess_sampled", cls.postprocess_sampled)
+    patch_v41_speculative_commit()
     return runners
 
 

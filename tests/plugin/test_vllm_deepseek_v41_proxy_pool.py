@@ -31,7 +31,6 @@ from atom.plugin.vllm.deepseek_v41_bridge import (
     v41_proxy_page_size_bytes,
     v41_proxy_state_reserve_blocks,
 )
-from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
 
 # Shaped like the shipped Flash geometry: `paged_bytes` a multiple of 512 (so
 # the proxy `head_size` is exact rather than rounded up) and a STATE entry
@@ -240,18 +239,40 @@ class TestBatchSnapshot:
         assert [len(row) for row in snapshot.block_rows] == [3, 5, 2]
         assert snapshot.block_rows[0] == (100, 101, 102)
 
-    def test_snapshot_keys_slots_on_a_lifetime_stable_id(self):
-        # Without the pass-through patch there is no `req_id`, so the slot key
-        # falls back to the request's first block -- which vLLM holds for the
-        # request's lifetime, which is all the allocator needs.
+    def test_missing_v2_mapping_cannot_allocate_real_state(self):
         snapshot = snapshot_v41_batch(_common_attn_metadata([4, 4], [0, 0]))
-        assert snapshot.req_ids == [row[0] for row in snapshot.block_rows]
+        with pytest.raises(ValueError, match="idx_mapping_np"):
+            bridge._v41_request_state_slots(snapshot, _vllm_config())
+
+    def test_v2_snapshot_keeps_exact_lengths_and_persistent_indices(self, monkeypatch):
+        from atom.plugin.vllm import req_id_passthrough_patch as passthrough
+
+        batch = SimpleNamespace(
+            num_reqs=2,
+            num_reqs_after_padding=4,
+            req_ids=["B", "A"],
+            idx_mapping_np=np.asarray([5, 2], dtype=np.int32),
+            num_computed_tokens_np=np.asarray([999, 999], dtype=np.int32),
+        )
+        monkeypatch.setattr(passthrough, "get_current_input_batch", lambda: batch)
+        common = _common_attn_metadata([1, 1, 0, 0], [30, 20, 0, 0])
+        common.max_query_len = 1
+        common.seq_lens_cpu_upper_bound = torch.tensor([1000, 1000, 0, 0])
+        snapshot = snapshot_v41_batch(common)
+        batch.idx_mapping_np[:] = 0
+
+        assert snapshot.num_reqs == 2
+        assert snapshot.num_reqs_padded == 4
+        assert snapshot.max_query_len == 1
+        assert snapshot.req_ids == ["B", "A"]
+        assert snapshot.state_slots.tolist() == [5, 2]
+        assert snapshot.num_computed.tolist() == [30, 20]
 
     def test_scheduled_batch_fields_line_up_row_for_row(self):
         snapshot = snapshot_v41_batch(
             _common_attn_metadata([600, 1, 257], [0, 1024, 255])
         )
-        batch = _v41_scheduled_batch(snapshot, StateSlotAllocator(8))
+        batch = _v41_scheduled_batch(snapshot, slots=np.asarray([5, 2, 7]))
 
         assert batch.is_dummy_run is False
         assert batch.total_seqs_num == snapshot.num_reqs
@@ -265,12 +286,11 @@ class TestBatchSnapshot:
         assert len(set(batch.state_slots_committed)) == snapshot.num_reqs
 
     def test_a_resumed_request_keeps_its_state_slot(self):
-        allocator = StateSlotAllocator(8)
         first = _v41_scheduled_batch(
-            snapshot_v41_batch(_common_attn_metadata([600], [0])), allocator
+            snapshot_v41_batch(_common_attn_metadata([600], [0])), slots=[5]
         )
         second = _v41_scheduled_batch(
-            snapshot_v41_batch(_common_attn_metadata([1], [600])), allocator
+            snapshot_v41_batch(_common_attn_metadata([1], [600])), slots=[5]
         )
         assert list(second.state_slots_committed) == list(first.state_slots_committed)
 
@@ -481,7 +501,7 @@ def test_the_profile_cache_patch_installs_without_a_v4_model():
     # it is the belt and this is the braces.
 
 
-def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds():
+def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds(monkeypatch):
     """vLLM has two unrelated `GPUModelRunner` classes; patch both.
 
     `GPUWorker` picks between `vllm.v1.worker.gpu_model_runner` and the V2
@@ -500,6 +520,10 @@ def test_the_profile_cache_patch_reaches_the_runner_the_worker_builds():
 
     classes = gpu_model_runner_classes()
     assert classes, "no vLLM GPUModelRunner class resolved"
+    for runner_cls in classes:
+        monkeypatch.setattr(
+            runner_cls, "initialize_kv_cache", runner_cls.initialize_kv_cache
+        )
     apply_vllm_v4_profile_cache_patch()
     for runner_cls in classes:
         assert getattr(

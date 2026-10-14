@@ -30,7 +30,7 @@ import pathlib
 import pytest
 
 NEWLINE = chr(10)
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
@@ -123,7 +123,6 @@ def test_the_copy_still_covers_both_dispatch_arms():
     """Cheap structural check beside the digest: the copy must still carry
     the four kernel paths, so a merge that drops one is caught even if the
     digest was refreshed."""
-    pytest.importorskip("vllm")
     copy = PLUGIN.read_text()
     for name in (
         "packed_decode",
@@ -133,3 +132,53 @@ def test_the_copy_still_covers_both_dispatch_arms():
         "rope_quant_window",
     ):
         assert name in copy, f"the attention copy lost {name}"
+
+
+@pytest.mark.parametrize(
+    "path,class_name,methods,expected",
+    [
+        (
+            "atom/models/deepseek_v41/model.py",
+            "DeepseekV41ForCausalLM",
+            ("forward_hidden",),
+            "e5d8ebd181754862",
+        ),
+        (
+            "atom/model_ops/engram/device/staging.py",
+            "EngramStaging",
+            ("start", "consume", "join"),
+            "7d1dcc8553e48b9d",
+        ),
+    ],
+)
+def test_copied_model_and_staging_sources_have_not_drifted(
+    path, class_name, methods, expected
+):
+    source = (ROOT / path).read_text()
+    cls = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    selected = [
+        next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        for name in methods
+    ]
+    body = "\n".join(
+        "\n".join(
+            line.rstrip()
+            for line in source.split("\n")[node.lineno - 1 : node.end_lineno]
+            if line.strip() and not line.strip().startswith("#")
+        )
+        for node in selected
+    )
+    digest = hashlib.sha256(body.encode()).hexdigest()[:16]
+    assert digest == expected, (
+        f"{path} {methods} changed. Audit and port the relevant behavior into "
+        "the vLLM plugin copy before updating this source digest. "
+        f"Observed digest: {digest}"
+    )

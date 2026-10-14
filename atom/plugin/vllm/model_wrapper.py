@@ -1198,15 +1198,11 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
             builder = self._deepseek_v41_builder
             ready = bind_deepseek_v41_proxy_cache(self.model, builder, self.vllm_config)
-            slot_allocator = (
-                getattr(self.model, "_atom_v41_slot_allocator", None) if ready else None
-            )
             with atom_deepseek_v41_forward_context(
                 atom_config=self.atom_config,
                 builder=builder,
                 input_ids=input_ids,
                 positions=positions,
-                slot_allocator=slot_allocator,
                 vllm_config=self.vllm_config,
                 force_dummy=not ready,
             ) as atom_positions:

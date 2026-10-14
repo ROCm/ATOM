@@ -17,6 +17,8 @@ address on every replay.
 """
 
 import logging
+from contextlib import contextmanager
+from functools import wraps
 
 import numpy as np
 import torch
@@ -34,66 +36,104 @@ from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
 from atom.model_ops.engram.device.uva import uva_gather_into
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
-from atom.plugin.vllm.vllm_runtime import breakable_capture_enabled
 
 logger = logging.getLogger("atom")
 
 
+def _v41_publication_owner(variables, device):
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.h2d import PublicationOwner
+
+    event = torch.cuda.Event() if torch.device(device).type == "cuda" else None
+    owner = PublicationOwner(device, event)
+    members = {}
+    for name, buffer in variables.items():
+        if isinstance(buffer, CpuGpuBuffer):
+            binding = owner.bind(buffer, name, unit=buffer.publication_unit)
+            if buffer.publication_group:
+                members.setdefault(buffer.publication_group, []).append(binding)
+    groups = {name: owner.group(name, bindings) for name, bindings in members.items()}
+    # Constructor uploads precede the first source reuse, too.
+    if event is not None:
+        event.record()
+    return owner, groups
+
+
+@contextmanager
+def _v41_publication_epoch(owner, *, resume=False):
+    if resume:
+        owner.resume()
+    else:
+        owner.begin()
+    try:
+        yield
+    except BaseException:
+        owner.fail()
+        raise
+    else:
+        owner.finish()
+
+
+def _publish_v41_metadata(prepare):
+    @wraps(prepare)
+    def publish(self, *args, **kwargs):
+        runner = self.model_runner
+        if not hasattr(runner, "h2d_owner"):
+            owner, groups = _v41_publication_owner(runner.forward_vars, self.device)
+            for name, names in self.h2d_group_members.items():
+                groups[name] = owner.group(
+                    name, [runner.forward_vars[item]._publication for item in names]
+                )
+            runner.h2d_owner, runner.h2d_groups = owner, groups
+        with _v41_publication_epoch(runner.h2d_owner):
+            return prepare(self, *args, **kwargs)
+
+    return publish
+
+
 # ---------------------------------------------------------------------------
-# The metadata builder: one dummy cache a capture can hold on to
+# Metadata publication and scratch storage retained only for enabled graphs
 # ---------------------------------------------------------------------------
-# Core allocates a dummy batch's scratch cache per call and frees it with the
-# call, which is right for ATOM's own engine: its capture entry fabricates a
-# batch with `is_dummy_run=False` against the serving cache, so no recorded
-# kernel ever holds a scratch address, and its only dummy batches come from
-# `warmup_model`, outside any capture.
-#
-# This path does capture dummy batches. `v41_stage_step` falls back to a
-# fabricated dummy batch whenever a step arrives without a snapshot, without a
-# slot allocator, or before the proxy pool is bound -- which includes vLLM's
-# memory-profiling forward -- and under breakable capture a graph can be
-# recording while that happens. A scratch cache freed when the capture returns
-# leaves the recorded kernels pointing at freed memory, read back on the first
-# replay as an illegal access reported asynchronously somewhere else entirely.
-#
-# So while capture is possible, hand out one cache, allocated once at the
-# capture ceiling and kept alive on the builder. Every bucket's dummy batch
-# fits inside it -- its page, slot and token counts are caps and the batch
-# indexes from zero -- so one allocation serves them all rather than one per
-# bucket (the STATE side alone is ~5 MiB per slot).
 
 
 class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
-    """The builder ATOM ships, with this path's two answers."""
+    """V2's publication boundary and capture-owned scratch cache."""
 
-    # The deferred stale-state verdict is wrong under concurrency here, and
-    # wrong in the direction that takes the engine down -- it refuses correct
-    # state. `DeepseekV41MetadataBuilder._state_probe_blocking` carries the
-    # measurement; this is where this path says it wants the blocking one.
+    # Keep the measured workaround; explicit H2D ownership alone has not proved
+    # that the deferred stale-state probe is safe on this frontend.
     _state_probe_blocking_default = True
 
+    def prepare_model_inputs(self, input_ids, metadata):
+        cache = metadata.cache
+        if not hasattr(cache, "_vllm_h2d_owner"):
+            variables = {
+                name: getattr(cache, name)
+                for name in (
+                    "_cursor_staging",
+                    "tentative_staging",
+                    "_reset_slots",
+                    "_reset_histories",
+                )
+            }
+            cache._vllm_h2d_owner, _ = _v41_publication_owner(variables, self.device)
+        with _v41_publication_epoch(cache._vllm_h2d_owner):
+            super().prepare_model_inputs(input_ids, metadata)
+
+    def commit_speculative_state(self, metadata, last_token_indices):
+        if metadata.cache.pending is not None:
+            # Host tentative prefixes are written during preparation, but read
+            # by H2D only after sampling. Keep the same epoch through that read.
+            with _v41_publication_epoch(metadata.cache._vllm_h2d_owner, resume=True):
+                super().commit_speculative_state(metadata, last_token_indices)
+
     def _capture_dummy_cache(self, pages, slots, running_tokens):
-        """One scratch cache, kept alive for as long as a capture may run.
+        """Keep captured addresses alive; eager profiling uses only its own shape.
 
-        Core allocates a dummy batch's scratch per call and frees it with the
-        call, which is right for ATOM's own engine: its capture entry
-        fabricates a batch with ``is_dummy_run=False`` against the serving
-        cache, so no recorded kernel ever holds a scratch address.
-
-        This path does capture dummy batches -- `v41_stage_step` falls back
-        to a fabricated one whenever a step arrives before the proxy pool is
-        bound, which includes vLLM's memory-profiling forward -- and a
-        scratch freed when the capture returns leaves the recorded kernels
-        pointing at freed memory, read back on the first replay as an illegal
-        access reported asynchronously somewhere else entirely.
-
-        Allocated once at the capture ceiling and kept on the builder. Every
-        bucket's dummy batch fits inside it -- its page, slot and token counts
-        are caps and the batch indexes from zero -- so one allocation serves
-        them all rather than one per bucket (the STATE side alone is ~5 MiB
-        per slot).
+        ROCm can enable breakable capture in the environment even for an eager
+        model. The effective model configuration, not that environment flag,
+        determines whether scratch must survive the forward.
         """
-        if not breakable_capture_enabled():
+        if not self.model_runner.v41_graphs_enabled:
             return PagedAttentionCache(
                 self.geometry,
                 pages,
@@ -118,6 +158,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
             self._capture_dummy = cached
         return cached
 
+    @_publish_v41_metadata
     def _prepare(
         self,
         batch,
@@ -245,27 +286,13 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
         super().__init__(*args, **kwargs)
 
     def prepare_state(self, step, *, histories=True):
-        """Always render this step's stale-slot verdict now, never later.
+        """Keep the blocking probe workaround on this frontend by default.
 
-        `histories=False` lets core ship the cursor rows without waiting and
-        judge them on the next call, which takes one blocking D2H (~58 us) off
-        each decode step. That deferred verdict is wrong under concurrency on
-        this path, and wrong in the direction that costs most: it refuses
-        correct state and takes the engine down with it. Measured,
-        FULL_AND_PIECEWISE, 64 concurrent GSM8K requests, no KV connector:
-
-            needs state at 952, found 951
-
-        while the state-row dump for that same request, printed beside it,
-        reads `computed 953, cursor 953` -- self-consistent. The verdict is
-        rendered against a claim from one step and a `_probe` buffer that
-        later steps have already reused, so the two describe different
-        moments.
-
-        A guard, not a fix: the register slip in the deferred probe is still
-        not understood, and a check that fails closed on correct state is
-        worse than the microseconds it saves. Native keeps the saving, since
-        that is where the fault was never seen.
+        A concurrent FULL_AND_PIECEWISE run reported stale state with the
+        deferred probe while the later cursor dump was consistent. Those are
+        different observation times, not proof that the probe buffer raced.
+        Explicit metadata publication does not establish the probe's safety;
+        keep this workaround until a separate test does.
 
         `ATOM_V41_BLOCKING_STATE_PROBE=0` opts back out.
         """
@@ -333,7 +360,7 @@ class VllmBackedPagedAttentionCache(PagedAttentionCache):
 # Both of those are facts about this frontend, so the region lives here as a
 # copy of `Attention.forward` rather than as a split in the shared model.
 # What that copy must track is `atom/models/deepseek_v41/attention.py` --
-# `tests/plugin/test_vllm_deepseek_v41_attention_copy.py` fails when core's
+# `tests/test_vllm_deepseek_v41_attention_copy.py` fails when core's
 # version moves, which is the only warning available for a copy whose drift
 # is arithmetic rather than a crash.
 #
@@ -564,6 +591,7 @@ class VllmEngramStaging(EngramStaging):
     # 8 x hipErrorStreamCaptureUnjoined. Upstream decorates its own
     # `_start_prefetch` for the same reason.
     def start(self, width):
+        self._vllm_prefetch_joined = False
         self._snapshot(width)
         # Past the fork on purpose: the side stream reads the snapshot, not
         # the cursor, so the cursor may be advanced before the gather runs.
@@ -572,7 +600,10 @@ class VllmEngramStaging(EngramStaging):
 
     def consume(self, layer, width):
         host = self.host
-        self._await_layer(self.done[layer])
+        # FULL preparation already joined outside the graph. Repeating even
+        # that satisfied external-event wait inside ordinary capture is invalid.
+        if not getattr(self, "_vllm_prefetch_joined", False):
+            self._await_layer(self.done[layer])
         if host._tp_group is not None and self.collective is None:
             out = self.flat[layer][:width]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
@@ -581,7 +612,9 @@ class VllmEngramStaging(EngramStaging):
 
     def join(self):
         # Close the fork even if a partial forward did not consume every layer.
-        self._await_fork()
+        if not getattr(self, "_vllm_prefetch_joined", False):
+            self._await_fork()
+            self._vllm_prefetch_joined = True
 
 
 def _prefetch(self, width):

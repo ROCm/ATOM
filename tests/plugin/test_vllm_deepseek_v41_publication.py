@@ -1,0 +1,245 @@
+# SPDX-License-Identifier: MIT
+"""V2 preparation with real CPU metadata, cache state and publication owners."""
+
+import ast
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import numpy as np
+import pytest
+import torch
+
+from atom.plugin.vllm import deepseek_v41_bridge as bridge
+from atom.plugin.vllm.v41_core_overrides import VllmDeepseekV41MetadataBuilder
+from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.utils.h2d import PublicationError
+from tests.attentions.deepseek_v41.helpers import metadata_buffers
+
+
+@pytest.fixture
+def builder():
+    builder = VllmDeepseekV41MetadataBuilder.__new__(VllmDeepseekV41MetadataBuilder)
+    builder.geometry = V41PoolGeometry(
+        2, ((0, 1), (1, 2)), 32, 4, 512, 32, speculative_tokens=2
+    )
+    builder.cache = PagedAttentionCache(builder.geometry, 16, 4, "cpu", max_tokens=12)
+    builder.block_size, builder.device = 32, "cpu"
+    builder.max_bs, builder.max_num_batched_tokens = 4, 12
+    buffers = metadata_buffers(4, 12, 4, "cpu", builder.geometry)
+    for name in ("positions", "batch_id_per_q_token"):
+        buffers[name].publication_group = "v41_step"
+    buffers["cu_seqlens_q"].publication_group = "early"
+    buffers["block_tables"].publication_group = "prefill"
+    builder.model_runner = SimpleNamespace(
+        forward_vars=buffers, v41_graphs_enabled=False
+    )
+    builder.config = SimpleNamespace(
+        engram_layer_ids=(0,),
+        engram_max_ngram_size=3,
+        engram_n_heads=2,
+        engram_head_dim=4,
+    )
+    builder.engram = None
+    return builder
+
+
+def snapshot(ids=("A", "B"), slots=(2, 0), start=0, width=1):
+    count = len(ids)
+    return SimpleNamespace(
+        num_reqs=count,
+        num_reqs_padded=4,
+        max_query_len=width,
+        full_graph=True,
+        req_ids=list(ids),
+        state_slots=np.asarray(slots, dtype=np.int32),
+        query_lens=np.full(count, width, dtype=np.int32),
+        num_computed=np.full(count, start, dtype=np.int64),
+        ends=np.full(count, start + width, dtype=np.int64),
+        block_rows=[(int(slot) + 1,) for slot in slots],
+        total_tokens=count * width,
+    )
+
+
+def test_real_preparation_reuses_metadata_and_publishes_cursor_once(builder):
+    pointers = {
+        name: buf.gpu.data_ptr()
+        for name, buf in builder.model_runner.forward_vars.items()
+    }
+    for step_snapshot in (
+        snapshot(),
+        snapshot(start=1),
+        snapshot(("A",), (2,), start=2),
+    ):
+        batch = bridge._v41_scheduled_batch(
+            step_snapshot, slots=step_snapshot.state_slots
+        )
+        metadata, positions = builder._prepare(batch, 4, 4, max_q_len=1)
+        builder.prepare_model_inputs(torch.zeros(4, dtype=torch.int32), metadata)
+        count = step_snapshot.num_reqs
+        assert metadata.step.slots.tolist() == list(step_snapshot.state_slots) + [0] * (
+            4 - count
+        )
+        assert positions[:count].tolist() == step_snapshot.num_computed.tolist()
+        assert (
+            builder.cache.cursor[step_snapshot.state_slots, 0].tolist()
+            == step_snapshot.ends.tolist()
+        )
+        for ratio, plan in metadata.step.plans.items():
+            assert plan.compress_plan_gpu.shape[0] == 4
+            assert (plan.compress_plan_gpu[plan.num_compress :, 2] == -1).all()
+        assert builder.model_runner.h2d_owner._state == "sealed"
+        assert builder.cache._vllm_h2d_owner._state == "sealed"
+    assert pointers == {
+        name: buf.gpu.data_ptr()
+        for name, buf in builder.model_runner.forward_vars.items()
+    }
+
+
+def test_tentative_host_prefixes_share_epoch_until_sampler_commit(builder):
+    initial = snapshot()
+    batch = bridge._v41_scheduled_batch(initial, slots=initial.state_slots)
+    metadata, _ = builder._prepare(batch, 4, 4, max_q_len=1)
+    builder.prepare_model_inputs(torch.zeros(4, dtype=torch.int32), metadata)
+    verify = snapshot(start=1, width=3)
+    metadata, _ = builder._prepare(
+        bridge._v41_scheduled_batch(verify, slots=verify.state_slots),
+        4,
+        12,
+        max_q_len=3,
+        tentative=True,
+    )
+    builder.prepare_model_inputs(torch.zeros(12, dtype=torch.int32), metadata)
+    owner = builder.cache._vllm_h2d_owner
+    epoch = owner.epoch
+    builder.commit_speculative_state(metadata, torch.tensor([0, 4]))
+    assert owner.epoch == epoch and owner._state == "sealed"
+    assert builder.cache.pending is None
+    assert builder.cache.cursor[[2, 0], 0].tolist() == [2, 3]
+
+
+def test_partial_preparation_failure_poison_prevents_reuse(builder):
+    bad = snapshot()
+    bad.block_rows = [(), ()]
+    batch = bridge._v41_scheduled_batch(bad, slots=bad.state_slots)
+    with pytest.raises(ValueError, match="PAGE table"):
+        builder._prepare(batch, 4, 4, max_q_len=1)
+    assert builder.model_runner.h2d_owner._state == "failed"
+    with pytest.raises(PublicationError, match="failed"):
+        builder._prepare(batch, 4, 4, max_q_len=1)
+
+
+def test_outside_forward_and_fallback_both_publish_full_capacity(builder, monkeypatch):
+    config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=4))
+    inputs = torch.zeros(4, dtype=torch.int32)
+    monkeypatch.setattr(bridge, "_v41_step_input_ids", lambda _width: inputs)
+    monkeypatch.setattr(bridge, "_v41_staged_running_tokens", lambda: 4)
+    prepared = bridge._v41_stage_outside_forward(
+        builder, None, config, snapshot(), capturing=False
+    )
+    assert prepared.running_bs == 4
+    assert prepared.metadata.step.scheduled_bs == 2
+    assert prepared.metadata.staged_outside_forward
+    common = SimpleNamespace(atom_v41_snapshot=snapshot(start=1))
+    monkeypatch.setattr(
+        bridge,
+        "get_deepseek_v41_proxy_metadata_from_vllm_context",
+        lambda _name: common,
+    )
+    monkeypatch.setattr(bridge, "_v41_publish_metadata", lambda _metadata: None)
+    metadata, _, running_bs, _, _ = bridge.v41_stage_step(
+        builder, inputs, "proxy", False, config
+    )
+    assert running_bs == 4 and metadata.step.scheduled_bs == 2
+    assert metadata.step.plans[2].compress_plan_gpu.shape[0] == 4
+    assert builder.cache.cursor[[2, 0], 0].tolist() == [2, 2]
+
+
+@pytest.mark.parametrize("graphs_enabled", [False, True])
+def test_capture_scratch_lifetime_follows_effective_mode(
+    builder, monkeypatch, graphs_enabled
+):
+    from atom.plugin.vllm import v41_core_overrides as overrides
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    builder.model_runner.v41_graphs_enabled = graphs_enabled
+    builder.score_workspace = object()
+    allocated = []
+
+    def allocate(geometry, pages, slots, device, *, max_tokens, workspace):
+        cache = SimpleNamespace(pages=pages, slots=slots, max_tokens=max_tokens)
+        allocated.append(cache)
+        return cache
+
+    monkeypatch.setattr(overrides, "PagedAttentionCache", allocate)
+    first = builder._capture_dummy_cache(1, 1, 1)
+    second = builder._capture_dummy_cache(1, 2, 6)
+    if graphs_enabled:
+        assert first is second and len(allocated) == 1
+        assert (first.pages, first.slots, first.max_tokens) == (1, 4, 12)
+        # Changing mode must not drop storage that an existing graph references.
+        builder.model_runner.v41_graphs_enabled = False
+        assert builder._capture_dummy_cache(1, 1, 1) is not first
+        assert builder._capture_dummy is first
+    else:
+        assert first is not second and len(allocated) == 2
+        assert not hasattr(builder, "_capture_dummy")
+        assert (first.slots, first.max_tokens) == (1, 1)
+        assert (second.slots, second.max_tokens) == (2, 6)
+
+
+def test_outside_staging_is_not_repeated_by_forward_boundaries(builder, monkeypatch):
+    from atom.model_ops.engram.device.staging import EngramStagedRows
+
+    inputs = torch.zeros(4, dtype=torch.int32)
+    staging = SimpleNamespace(
+        host=SimpleNamespace(buffers={}), start=Mock(), join=Mock()
+    )
+    rows = EngramStagedRows(staging, 4)
+    original = builder.prepare_model_inputs
+
+    def prepare(input_ids, metadata):
+        original(input_ids, metadata)
+        metadata.engram_embeddings = rows
+
+    monkeypatch.setattr(builder, "prepare_model_inputs", prepare)
+    monkeypatch.setattr(bridge, "_v41_step_input_ids", lambda _width: inputs)
+    monkeypatch.setattr(bridge, "_v41_staged_running_tokens", lambda: 4)
+    monkeypatch.setattr(bridge, "_v41_join_covers_the_layers", lambda **_: False)
+    prepared = bridge._v41_stage_outside_forward(
+        builder,
+        None,
+        SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=4)),
+        snapshot(),
+        capturing=False,
+    )
+    staging.start.assert_called_once_with(4)
+    staging.join.assert_called_once_with()
+
+    # Execute the actual guarded function bodies without invoking custom-op
+    # registration, compilation, or the heavyweight model import on this CPU test.
+    source = Path(__file__).resolve().parents[2] / "atom/models/deepseek_v41/runtime.py"
+    functions = [
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("v41_begin_forward", "v41_end_forward")
+    ]
+    assert len(functions) == 2
+    for node in functions:
+        node.decorator_list = []
+    namespace = {
+        "torch": torch,
+        "EngramStagedRows": EngramStagedRows,
+        "get_forward_context": lambda: SimpleNamespace(attn_metadata=prepared.metadata),
+    }
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    hidden = torch.zeros(1, 4, 2)
+    namespace["v41_begin_forward"](hidden)
+    namespace["v41_end_forward"](hidden)
+    staging.start.assert_called_once_with(4)
+    staging.join.assert_called_once_with()

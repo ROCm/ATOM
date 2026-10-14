@@ -23,7 +23,7 @@ import pathlib
 
 import pytest
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "atom/model_ops/attentions/deepseek_v41/backend.py"
 BRIDGE = ROOT / "atom/plugin/vllm/deepseek_v41_bridge.py"
 
