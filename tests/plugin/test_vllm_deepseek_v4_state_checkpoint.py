@@ -11,6 +11,8 @@ import torch
 
 pytest.importorskip("aiter", reason="the V4 bridge reaches AITER dtypes")
 
+from aiter.jit.utils import chip_info
+
 from atom.plugin.vllm.deepseek_v4_bridge import (
     ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     _proxy_carve_source,
@@ -36,6 +38,17 @@ from atom.plugin.vllm.paged_state_checkpoint import (
 )
 
 RATIOS = [0, 0, 4, 128, 4, 128, 4, 0]
+
+_HOST_GET_GFX = chip_info.get_gfx
+
+
+@pytest.fixture(autouse=True)
+def _gfx950(monkeypatch):
+    # `_v4_kv_fp8` grants the fp8 layout these configs ask for only on gfx950 /
+    # gfx1250, so pin the chip; on gfx942, or when the probe fails, every fp8
+    # config would size and route as bf16. Tests that need another chip set it
+    # through `gfx`.
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
 
 
 def _vcfg(max_num_seqs=4):
@@ -442,8 +455,11 @@ def test_draft_proxy_carves_its_slots_from_its_own_withheld_tail():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_state_checkpoint_round_trip_through_the_plugin_carve():
+def test_state_checkpoint_round_trip_through_the_plugin_carve(monkeypatch):
+    monkeypatch.setattr(chip_info, "get_gfx", _HOST_GET_GFX)
     vc = _vcfg()
+    if not _v4_kv_fp8(vc):
+        pytest.skip("this GPU does not run the fp8 KV layout (gfx950 / gfx1250 only)")
     s = v4_state_checkpoint_sizing(vc)
     tensor_blocks = -(-s.num_slots * s.slot_bytes // s.page_bytes) + 6 * s.k + 8
     usable = s.usable_blocks(tensor_blocks)
