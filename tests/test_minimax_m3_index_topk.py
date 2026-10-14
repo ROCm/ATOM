@@ -28,6 +28,7 @@ import pytest
 import torch
 
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
+pytest.importorskip("aiter", reason="the scorers and dtypes below are aiter's")
 
 # `aiter.dtypes.fp8` rather than a hardcoded `float8_e4m3fn`: the two ROCm archs
 # disagree on which flavour is native, and these tests must build the container

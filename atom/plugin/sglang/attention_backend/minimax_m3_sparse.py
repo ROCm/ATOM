@@ -781,6 +781,18 @@ def _ensure_side_caches(
     )
     index_shape = (num_blocks, page_size, layer.idx_head_dim)
 
+    # The fourth place an index cache's dtype gets decided, and the only one
+    # that takes it straight from the producer rather than from the config.
+    # No scorer serves bf16, so it is refused here too -- the pool shim is a
+    # path a plugin launch can reach without going through either resolver.
+    from atom.model_ops.minimax_m3.index_topk import (
+        _FP8_DTYPES,
+        INDEX_CACHE_MUST_BE_FP8,
+    )
+
+    if index_key.dtype not in _FP8_DTYPES:
+        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_key.dtype}.")
+
     index_cache = getattr(layer, "_sglang_m3_index_cache", None)
     if (
         index_cache is None

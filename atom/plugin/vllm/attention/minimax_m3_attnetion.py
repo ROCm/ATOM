@@ -87,37 +87,30 @@ def minimax_m3_sparse_attention(
 
 
 def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
-    """Torch dtype for the MiniMax-M3 index cache.
+    """Torch dtype for the MiniMax-M3 index cache: fp8, or a refusal.
 
-    Everything except fp8 is vLLM's own mapping. fp8 is the exception, and it
-    belongs here rather than in ``kv_cache_dtype_str_to_dtype``: that table is
-    vLLM's, it is shared by every layer of every model, and its ``fp8 ->
-    torch.uint8`` entry is deliberate -- vLLM's kernels take an fp8 KV cache as
-    a byte buffer and reinterpret it, and so do the aiter paged kernels behind
-    ATOM's main sparse and dense caches (see
-    ``_page16_shuffle_cache_for_sparse_kernel``, which does the ``.view()``
-    itself). Relabelling fp8 globally would change those caches too.
+    fp8 does not go through vLLM's ``kv_cache_dtype_str_to_dtype``. That table
+    is shared by every layer of every model and its ``fp8 -> torch.uint8``
+    entry is deliberate: vLLM's kernels take an fp8 KV cache as a byte buffer
+    and reinterpret it, and so do the aiter paged kernels behind ATOM's main
+    caches. The index cache is read by a kernel that dispatches on the tensor
+    instead, so a uint8 label sends it down the bf16 branch and dots bf16
+    against uint8. ``dtypes.d_dtypes`` is the same handle the native server
+    resolves this cache through (`aiter_attention._resolve_index_cache_dtype`),
+    which keeps both paths on one arch-correct fp8 dtype. The element is one
+    byte either way, so vLLM's page-size accounting is unchanged.
 
-    The index cache is read by a kernel that dispatches on the tensor instead:
-    ``_index_block_score_kernel`` branches on ``k.dtype.is_fp8()``, so a
-    uint8-labelled cache goes down the bf16 branch and dots bf16 against uint8
-    (a Triton compile error on the first request). The bytes there are already
-    fp8 -- aiter's ``fused_qknorm_idxrqknorm`` writes them under
-    ``kv_cache_dtype="fp8"`` -- so only the label was wrong. ``dtypes.d_dtypes``
-    is the same handle the native server resolves this cache through
-    (``atom.model_ops.attentions.aiter_attention._resolve_index_cache_dtype``),
-    which keeps the two paths on one arch-correct fp8 dtype instead of a
-    hard-coded ``torch.float8_e4m3fn``.
-
-    The element stays one byte either way, so vLLM's page-size accounting is
-    unchanged, and vLLM already allows a real fp8 dtype in this position -- its
-    own ``fp8_inc`` entry maps to ``torch.float8_e4m3fn``.
+    Anything that is not fp8 would be bf16, which no scorer serves, so it is
+    refused here where the layer is constructed rather than by aiter at the
+    first decode.
     """
-    from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-
     if str(kv_cache_dtype).startswith("fp8"):
         return dtypes.d_dtypes["fp8"]
-    return kv_cache_dtype_str_to_dtype(kv_cache_dtype, model_config)
+    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+
+    # The raw string, not what vLLM would map it to: resolving it first would
+    # put a second thing that can fail inside the error path.
+    raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {kv_cache_dtype!r}.")
 
 
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
