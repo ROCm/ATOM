@@ -2736,6 +2736,15 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
