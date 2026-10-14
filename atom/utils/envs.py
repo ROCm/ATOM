@@ -510,10 +510,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # overwrite the scratch rows a decode request's pending verify reads --
     # 200 MiB + 400 MiB fp32 at --max-num-seqs 64, V=163840, T=5, plus one
     # ~50 MiB index_copy_ per propose. The draft step also de-fuses, trading
-    # step latency for acceptance. Measured in isolation on MI355X, the sampling
-    # op costs about +36 us per call over the greedy one, at both bs=1 and
-    # bs=64; the end-to-end step cost under graph replay has NOT been measured
-    # on this revision. Temperature-0 is unaffected either way: an all-greedy
+    # step latency for acceptance. Measured under CUDAGRAPH REPLAY on MI355X --
+    # which is what the engine does -- the sampled block costs +27 us at bs=1,
+    # +78 at bs=16, +191 at bs=32 and +233 at bs=64 over the greedy one. Total
+    # flag-on overhead across draft and verify is ~+272 us/step at bs=16, about
+    # 0.4% of a ~62 ms engine step at concurrency 16. Measure this EAGERLY and
+    # you get a misleading flat ~36 us: python dispatch, ~21 us a launch, masks
+    # the GPU signal. Temperature-0 is unaffected either way: an all-greedy
     # batch keeps
     # the exact-match accept kernel, and a greedy ROW inside a mixed batch draws
     # a delta q that makes the ratio rule degenerate to exact match.
