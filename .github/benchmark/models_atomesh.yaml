@@ -999,6 +999,24 @@ models:
             max_output_tokens: 1
           run_eval: false
 
+        # The PP8 pure-prefill cell at 64 pending saves. A PP save waits behind
+        # the forwards queued at each stage, several seconds at long context,
+        # and the default 16 still fills during bursts.
+        - <<: *kimi_k3_agentic_agg_pp8_cg
+          name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1-saves64
+          display_topology: AGG-PP8-TP1-CG-OSL1-SAVES64
+          benchmark:
+            <<: *kimi_k3_agentic_aiperf
+            max_output_tokens: 1
+          run_eval: false
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: *kimi_k3_agentic_agg_pp8_decode_env
+              OFFLOAD_MAX_PENDING_SAVES: "64"
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
