@@ -40,6 +40,8 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
     StateTransfer,
+    midstep_target_ok,
+    snap_midstep_position,
 )
 from atom.utils import envs
 
@@ -317,6 +319,7 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
+                readable_midstep=state_runtime.transfer.readable_midstep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -334,6 +337,17 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        # Where a readable backend can snapshot inside a forward; see
+        # `midstep_target_ok`. Zero for a backend that cannot.
+        self.midstep_grid = state_runtime.transfer.midstep_grid
+        self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
+        if self.paged_state_checkpoints is not None:
+            # A PAGE midstep checkpoint is copied into a scratch slot from
+            # this pool, then stored from there. The runner stages two copies
+            # per sequence (`AttentionMetadataBuilder._checkpoint_staging`).
+            self.paged_state_checkpoints.attach_midstep_scratch(
+                self.state, 2 * int(getattr(config, "max_num_seqs", 0) or 0)
+            )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
         # up — the ladder would checkpoint into a void. The interval defaults to
@@ -464,6 +478,11 @@ class BlockManager:
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
         self.chunks_cut_for_end: int = 0
+        # Ladder, demand or anchor positions a forward covered but could not
+        # snapshot even after moving back onto its grid: too close to the
+        # forward's start for the conv window, or the forward started off the
+        # block grid. Each is a checkpoint the cutting ladder would have kept.
+        self.midstep_positions_unreadable: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
@@ -1178,10 +1197,9 @@ class BlockManager:
         # argument, and `_record_checkpoint_end` derives its position from
         # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
         #
-        # Which makes it free today: the call returns at its first line while
-        # no backend declares `readable_midstep` (see
-        # `GDNStateMixin.state_transfer`). Kept in place, and in the right
-        # place, because that is a policy decision and this is not.
+        # Free unless a backend declares `readable_midstep`: the call returns
+        # at its first line otherwise. Qwen GDN does under
+        # `ATOM_GDN_STATE_MIDSTEP=1`, and then every admission pays it.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
@@ -2400,7 +2418,7 @@ class BlockManager:
         blocks the forward just finished, and this would be a hash pass over the
         whole prompt on every admission, spent on nothing.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             seq.block_hashes = []
             return
         # The continuation itself -- resume from the last APPENDED hash (on a
@@ -2445,29 +2463,76 @@ class BlockManager:
         one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
         behavior end to end rather than the check.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             return []
         interval = self.state_checkpoint_interval_tokens
         hbs = self.hash_block_size
+        grid, min_offset = self.midstep_grid, self.midstep_min_offset
         hashes = seq.block_hashes
         rung = 0
         if limit := self.checkpoint_limit(seq):
             rung = min(end, limit)
             rung -= rung % interval
-        out = []
+        out = {}
         for pos in sorted(
             {p for p in (rung, seq.checkpoint_demand_pos, seq.checkpoint_end_pos) if p}
         ):
             if not start < pos <= end:
                 continue
             assert not pos % hbs, f"checkpoint position {pos} is off the {hbs} grid"
-            nblocks = pos // hbs
+            # The state the kernel materialized at or before `pos`. It must
+            # still be a block boundary to have a hash, which holds exactly
+            # when this forward starts on one -- the scheduler keeps non-final
+            # chunk ends on the block grid (`align_midstep_chunk`) for that.
+            snapped = snap_midstep_position(pos, start, end, grid)
+            if snapped % hbs or not midstep_target_ok(
+                snapped, start, end, grid, min_offset
+            ):
+                self.midstep_positions_unreadable += 1
+                continue
+            nblocks = snapped // hbs
             # A position past the chain is one `_extend_hash_chain` could not
             # name — nothing to file it under, so it cannot be found again.
             if nblocks > len(hashes):
                 continue
-            out.append((pos, hashes[nblocks - 1]))
-        return out
+            out[snapped] = hashes[nblocks - 1]
+        return sorted(out.items())
+
+    def midstep_anchor(self, seq: Sequence, start: int, end: int) -> int:
+        """Where this forward files the prompt-end anchor, or 0.
+
+        `checkpoint_end_pos` moved onto the forward's grid, as
+        `midstep_positions` moves it. The class that ranks checkpoints by
+        whether they are the anchor compares against this, not the unsnapped
+        position, or the anchor it actually filed is ranked as a guess.
+        """
+        anchor = seq.checkpoint_end_pos
+        if not (anchor and start < anchor <= end):
+            return 0
+        return snap_midstep_position(anchor, start, end, self.midstep_grid)
+
+    def _midstep_applies(self, seq: Sequence) -> bool:
+        cache = self._state_checkpoint_cache
+        return cache.readable_midstep and cache.applies(seq)
+
+    def align_midstep_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+        """`chunk` shortened so a non-final prefill chunk ends on a block boundary.
+
+        A readable class needs no cut onto its rungs, so the budget alone ends
+        a chunk -- anywhere. The next chunk would then start off the block
+        grid, every position on *its* grid would be off it too, and
+        `midstep_positions` would have to drop them all: for a prompt longer
+        than one batch, the anchor along with them. Giving back under one
+        block of this forward's budget keeps the next start on the grid.
+
+        Unchanged when the chunk finishes the prompt, or when it is shorter
+        than reaching the next boundary.
+        """
+        if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
+            return chunk
+        hbs = self.hash_block_size
+        aligned = (start + chunk) // hbs * hbs - start
+        return aligned if aligned > 0 else chunk
 
     def plan_midstep(self, seq: Sequence, start: int, end: int) -> None:
         """Reserve a destination slot for every checkpoint this forward covers.
@@ -2481,13 +2546,14 @@ class BlockManager:
         one forward, so a second plan for the same seq means the first forward
         never ran — hand its slots back rather than leak them.
         """
-        if not self.state.readable_midstep:
+        if not self._state_checkpoint_cache.readable_midstep:
             return
         if seq.midstep_reservations:
             self.cancel_midstep(seq)
-        seq.midstep_reservations = self.state.reserve_midstep(
+        seq.midstep_reservations = self._state_checkpoint_cache.reserve_midstep(
             seq, self.midstep_positions(seq, start, end)
         )
+        seq.midstep_anchor_pos = self.midstep_anchor(seq, start, end)
 
     def commit_midstep(self, seq: Sequence) -> None:
         """File this forward's reservations, now that its bytes exist.
@@ -2498,7 +2564,7 @@ class BlockManager:
         """
         if not seq.midstep_reservations:
             return
-        self.state.publish_midstep(seq.midstep_reservations, seq)
+        self._state_checkpoint_cache.publish_midstep(seq.midstep_reservations, seq)
         # The rightmost published position, for the decode-side spacing rule in
         # `checkpointers_at`. Generation is never midstep-readable — its
         # forwards end where acceptance puts them — so it still measures from
@@ -2508,13 +2574,15 @@ class BlockManager:
             seq.last_checkpoint_pos, max(p for _g, p, _h in seq.midstep_reservations)
         )
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def cancel_midstep(self, seq: Sequence) -> None:
         """Hand back reservations whose forward is not going to run."""
         if not seq.midstep_reservations:
             return
-        self.state.cancel_midstep(seq.midstep_reservations)
+        self._state_checkpoint_cache.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def checkpoint_cut(
         self, seq: Sequence, start: int, end: int, *, record: bool = True
@@ -2613,6 +2681,7 @@ class BlockManager:
             "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
+            "midstep_positions_unreadable": self.midstep_positions_unreadable,
             "joint_boundaries": self.joint_boundaries,
             "state_hbm": self.state_hbm_boundaries,
             "state_tier": self.state_tier_boundaries,

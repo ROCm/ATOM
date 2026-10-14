@@ -3113,8 +3113,13 @@ class TestTheCacheCannotStarveLiveKv:
 
 
 #: A backend that reads its recurrent state at interior chunk boundaries.
+#:
+#: Its grid is one hash block, so every block boundary inside a forward is
+#: readable and the tests below are about the mechanism alone. Where the
+#: kernel's grid is coarser than the block -- GDN's 64 against a 16-token
+#: block -- positions move; `TestMidstepGrid` covers that.
 MIDSTEP_STATE_RUNTIME = StateRuntime(
-    transfer=StateTransfer.fork(MIN_FORK, readable_midstep=True)
+    transfer=StateTransfer.fork(MIN_FORK, readable_midstep=True, midstep_grid=BLOCK)
 )
 
 

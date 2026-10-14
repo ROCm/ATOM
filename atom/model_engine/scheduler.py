@@ -239,11 +239,17 @@ class ScheduledBatch:
         # whose committed slot was never claimed carries the -1 sentinel in a
         # one-element list, which is truthy, and letting it through would shift
         # every list positionally aligned with this one.
-        state_seqs = [
-            seq
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.state_slot >= 0
-        ]
+        state_rows: list[int] = []
+        state_seqs: list[Sequence] = []
+        for row, seq in enumerate(seqs.values()):
+            if seq.has_per_req_cache and seq.state_slot >= 0:
+                state_rows.append(row)
+                state_seqs.append(seq)
+        # Batch row of each state-holding seq. Every list below is indexed by
+        # state-holding seq; the token counts, `cu_seqlens` and the kernels'
+        # rows are indexed by batch row. The two coincide only when every row
+        # holds state, so a backend translating between them goes through this.
+        self.state_rows = state_rows
         self.state_slots = [seq.state_slots for seq in state_seqs]
         # Column 0 broken out, because it is what every non-speculative backend
         # wants and rebuilding it per step in each of them would cost the same
@@ -1208,7 +1214,9 @@ class Scheduler:
         target = self.block_manager.checkpoint_cut(
             seq, _cut_floor(seq, start, resume), start + chunk, record=False
         )
-        return target - start if target else chunk
+        if target:
+            return target - start
+        return self.block_manager.align_midstep_chunk(seq, start, chunk)
 
     def _can_admit_head_prefill(self) -> bool:
         """Match SGL's `local_prefillable=True` semantics: report True iff
@@ -3348,6 +3356,11 @@ class Scheduler:
         target = bm.checkpoint_cut(seq, _cut_floor(seq, start, start), start + chunk)
         if target:
             chunk = target - start
+        else:
+            # A readable class is never cut onto a rung; keep the next
+            # chunk's start on the block grid instead, or every snapshot
+            # position in it is off the grid too.
+            chunk = bm.align_midstep_chunk(seq, start, chunk)
         # `cancel_state_fork` runs only when the first two hold, and returning
         # False is what leaves the fork in place — hence holding the chunk open.
         if (

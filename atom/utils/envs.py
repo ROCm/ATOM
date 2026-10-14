@@ -414,6 +414,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
+    # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
+    # interior states instead of cutting prefill chunks onto them. PAGE path
+    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    "ATOM_GDN_STATE_MIDSTEP": lambda: (os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1"),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
