@@ -190,6 +190,8 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             -1, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        # See ATOM_STATE_CHECKPOINT_END_MARGIN and `_record_checkpoint_end`.
+        self.state_checkpoint_end_margin = envs.ATOM_STATE_CHECKPOINT_END_MARGIN
         # Independent of the interval, because the demand rung is not part of
         # the grid: it is the one placement a *refused* hit makes for itself.
         # See `_record_checkpoint_demand` for what turning it off is testing.
@@ -2029,6 +2031,12 @@ class BlockManager:
         # than the model's final forward runs would back off below it
         # (`replay_start`), recomputing what the checkpoint saves.
         room = max(room, self.min_final_prefill_rows)
+        # The next turn re-renders this prompt's last few tokens (the chat
+        # template's generation prompt), so an anchor must sit before them too.
+        # Measured on Qwen3.5 AgentX: with no margin, prompts of length
+        # 16k + 1 put the divergence inside the anchor's block, and their
+        # follow-ups resumed from the anchor 1 time in 282 (95.6% otherwise).
+        room = max(int(room), self.state_checkpoint_end_margin)
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the
