@@ -178,6 +178,31 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             or getattr(config, "enable_rapidserve", False)
         )
 
+    def checkpoint_page_unit_bytes(self) -> int | None:
+        """Bytes of one PAGE unit that a transfer here actually publishes.
+
+        `ModelRunner` sizes the checkpoint unit from the PAGE class's
+        `entry_bytes` unless a backend narrows it. That class total is the sum
+        over everything merged into it, and a draft that owns a KV pool joins
+        it (`DraftKvBuilder.sub_pool_specs` -> `page_pool`) rather than
+        declaring a class of its own.
+
+        The state image, though, is tucked into the TARGET's MLA rows, which is
+        all `_page_unit_regions` enumerates. Leaving the unit at the class
+        total makes the two disagree by exactly the draft's entry bytes and the
+        granularity check raises. The draft's rows are derived state, rewritten
+        from the target's hidden states every step, so they are neither part of
+        the image nor part of its unit.
+
+        `paged_pool_bytes(1)` is this builder's OWN declaration -- the same one
+        `sub_pool_specs` prices -- so with no draft pool merged it is equal to
+        the class total and this returns the number the runner would have used
+        anyway.
+        """
+        if not self._uses_paged_checkpoints():
+            return None
+        return self.paged_pool_bytes(1)
+
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
 

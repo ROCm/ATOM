@@ -61,7 +61,12 @@ def mha_kv_fields(
 
 
 def mha_kv_scale_fields(
-    *, layers: int, entry_tokens: int, num_kv_heads: int, kv_dtype: torch.dtype
+    *,
+    layers: int,
+    entry_tokens: int,
+    num_kv_heads: int,
+    kv_dtype: torch.dtype,
+    per_tensor_scales: bool = False,
 ) -> list[EntryField]:
     """The fp32 dequant scales a quantized cache reads, one per token.
 
@@ -71,9 +76,24 @@ def mha_kv_scale_fields(
     pool at head_dim 128, moved by a P/D transfer as well. The dtype decides
     it because the dtype is why they exist.
 
+    `per_tensor_scales` says the OWNER quantizes at one scale for the whole
+    cache, so there is no per-token plane to store at all -- SGLang's fp8 KV,
+    which carries `layer.k_scale_float` / `layer.v_scale_float`, a single
+    python float defaulting to 1.0 and explicitly refusing anything else
+    ("Only support per-tensor scaling factor for fp8 KV cache",
+    `srt/layers/quantization/kv_cache.py:76`). Empty is not a new state for
+    this pool -- it is what every bf16 pool already reads -- so nothing
+    downstream needs a second code path; `scale_views` keeps raising the
+    `KeyError` it promises, which is the guard that a per-tensor pool is never
+    asked for planes it does not have.
+
+    OPT-IN, and it has to be: the TARGET's MHA pool writes through
+    `aiter.reshape_and_cache_with_pertoken_quant`, which EMITS a scale per
+    (kv head, token) and would have nowhere to put them.
+
     A separate list because they are a separate region, after the cache.
     """
-    if kv_dtype.itemsize > 1:
+    if kv_dtype.itemsize > 1 or per_tensor_scales:
         return []
     per_entry = num_kv_heads * entry_tokens * torch.float32.itemsize
     return [
@@ -105,6 +125,7 @@ class MhaKvPool:
         head_dim: int,
         kv_dtype: torch.dtype,
         blocks_per_entry: int = 1,
+        per_tensor_scales: bool = False,
         extra_fields: Sequence[EntryField] = (),
     ):
         # `block_size` is the caller's block, the only token count the pool
@@ -128,11 +149,17 @@ class MhaKvPool:
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.kv_dtype = kv_dtype
+        self.per_tensor_scales = bool(per_tensor_scales)
         # Every field is priced per entry, and an entry is `blocks_per_entry`
         # blocks. Charging per block instead would multiply `entry_bytes_for`'s
         # 256 B field alignment by the same factor -- 9% of the pool at 8
         # blocks an entry, almost all of it padding on the 64 B scale planes.
-        entry_tokens = block_size * blocks_per_entry
+        #
+        # Kept as an attribute, not a local: it is the token span ONE entry id
+        # addresses, which is what `fa_views` shapes by and what a draft riding
+        # another model's block ids has to agree with (see `fa_views`).
+        self.entry_tokens = entry_tokens = block_size * blocks_per_entry
+        self.blocks_per_entry = blocks_per_entry
         self.cache_fields = mha_kv_fields(
             layers=layers,
             entry_tokens=entry_tokens,
@@ -145,6 +172,7 @@ class MhaKvPool:
             entry_tokens=entry_tokens,
             num_kv_heads=num_kv_heads,
             kv_dtype=kv_dtype,
+            per_tensor_scales=per_tensor_scales,
         )
         self.extra_fields = [f for f in extra_fields if f.layers]
         # The regions an entry is charged for, in layout order. One list, walked
@@ -167,6 +195,7 @@ class MhaKvPool:
         block_size: int,
         layers: int,
         blocks_per_entry: int = 1,
+        per_tensor_scales: bool = False,
         kv_dtype: torch.dtype,
     ) -> MhaKvPool:
         """A pool at the geometry a model config declares, for `layers` of them.
@@ -198,6 +227,7 @@ class MhaKvPool:
             layers=layers,
             block_size=block_size,
             blocks_per_entry=blocks_per_entry,
+            per_tensor_scales=per_tensor_scales,
             num_kv_heads=per_rank,
             head_dim=hf_config.head_dim,
             kv_dtype=kv_dtype,
@@ -262,6 +292,41 @@ class MhaKvPool:
         return (
             self.field_view("k", layer, self.kv_dtype, (-1, nh, hd // x, bs, x)),
             self.field_view("v", layer, self.kv_dtype, (-1, nh, bs // x, hd, x)),
+        )
+
+    def fa_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's `(k, v)`, aliasing the pool, in FLASH layout.
+
+        `[entries, entry_tokens, kv_heads, head_dim]` -- the axis order aiter's
+        `mha_v3.flash_attn_with_kvcache` requires. It reads every axis through
+        its own stride, so a non-contiguous view would be fine, but it hard
+        unpacks FOUR axes: SHUFFLE cannot be offered to it at all, because the
+        x-pack splits `head_dim` across two non-adjacent axes and no permute of
+        a 5-D tensor can put it back.
+
+        The leading axis is the ENTRY and not the block, which is the one place
+        this view differs from `kv_views`. A page table holds ENTRY ids -- that
+        is the unit `page_pool` charges per and the unit a draft riding another
+        model's block ids is handed -- so a reader taking `block_tables`
+        straight has to see `entry_tokens` per id or it addresses one eighth of
+        the span it was given. At `blocks_per_entry == 1` the two coincide,
+        which is exactly how that would go unnoticed.
+
+        Same bytes as `kv_views`, re-shaped rather than converted -- the pool
+        charges per byte (`mha_kv_fields`), so the element order costs nothing
+        and only the reader's requirements decide it.
+
+        This is the layout a NON-CAUSAL reader needs, which is why it exists:
+        every aiter kernel that reads SHUFFLE is causal at `qlen > 1`
+        (`unified_attention` structurally, `pa_decode_gluon` by deriving
+        `is_causal = query_length > 1`, and the persistent ASM path has no
+        `Msk=0` kernel built on gfx950). A block-diffusion draft attends its
+        block bidirectionally, so it reads here instead.
+        """
+        nh, hd, et = self.num_kv_heads, self.head_dim, self.entry_tokens
+        return (
+            self.field_view("k", layer, self.kv_dtype, (-1, et, nh, hd)),
+            self.field_view("v", layer, self.kv_dtype, (-1, et, nh, hd)),
         )
 
     def scale_views(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
