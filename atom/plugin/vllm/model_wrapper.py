@@ -489,8 +489,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # break; picked before the Engram runtime is built below.
             install_vllm_engram_staging()
             # The attention break this frontend needs, applied to the class
-            # before the model below is built out of it.
-            apply_v41_eager_break()
+            # before the model below is built out of it. Asked of the
+            # effective graph setting rather than the breakable flag, which
+            # vLLM sets for V4.1 on ROCm whether or not anything is captured.
+            from atom.plugin.vllm.vllm_runtime import graphs_enabled
+
+            apply_v41_eager_break(graphs_enabled(vllm_config))
         if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
             self.atom_config, "enable_decoder_swa_bounded_replay", False
         ):

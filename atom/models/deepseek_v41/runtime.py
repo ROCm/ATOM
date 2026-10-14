@@ -46,13 +46,18 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
     metadata.step.begin_forward()
     if not metadata.step.requests:
         return
+    # Checked before the staged path returns, so it covers both. What the
+    # width governs is how every later index into this batch is computed, so a
+    # mismatch is not confined to staging: skipping the check for the plugin
+    # left its main path to discover the same disagreement as a reshape error
+    # inside a layer, or not at all, with padding rows read as real ones.
+    if hidden.shape[-2] != metadata.step.width:
+        raise ValueError("Token rows disagree with the width this step declared")
     if getattr(metadata, "staged_outside_forward", False):
         # The plugin staged this step in the metadata builder, where no graph
         # can capture it. Re-staging here would advance the cursor and reset
         # the slots a second time.
         return
-    if hidden.shape[-2] != metadata.step.width:
-        raise ValueError("Token rows disagree with the width this step declared")
     if isinstance(metadata.engram_embeddings, EngramStagedRows):
         metadata.engram_embeddings.stage()
 

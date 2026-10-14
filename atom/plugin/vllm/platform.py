@@ -346,9 +346,11 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
             "Its per-step Engram and state work cannot be replayed from a graph, "
             "and the fx splitting vLLM's PIECEWISE mode needs is not done for "
             "ATOM's plugin models, so PIECEWISE would swallow the backbone whole. "
-            "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 to capture it instead: that mode "
+            "Set both VLLM_USE_BREAKABLE_CUDAGRAPH=1 and "
+            "ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 to capture it instead: that mode "
             "breaks the capture at runtime around the step work, which is what "
-            "`v41_stage_step` is marked for."
+            "`v41_stage_step` is marked for. Naming only the first sends a reader "
+            "back here with the same message, since this gate needs both."
         )
         compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     elif (

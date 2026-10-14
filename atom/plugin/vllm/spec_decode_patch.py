@@ -516,12 +516,18 @@ def _patch_heterogeneous_eagle3_kv_cache() -> None:
     orig_pool_bytes = vllm_kv_cache_utils._pool_bytes_per_block
 
     @functools.wraps(orig_pool_bytes)
-    def patched_pool_bytes_per_block(kv_cache_groups):
+    def patched_pool_bytes_per_block(*args, **kwargs):
+        # The groups are this function's last argument in every vLLM that has
+        # it, but how many come before them is not fixed: upstream has since
+        # added a `vllm_config` ahead of them. Naming them positionally would
+        # make the wrapper's arity, not vLLM's, decide whether a call works, so
+        # the call is forwarded exactly as it arrived.
+        kv_cache_groups = kwargs.get("kv_cache_groups", args[-1] if args else None)
         if _groups_are_heterogeneous_mla_mha(kv_cache_groups) or _groups_have_v41_proxy(
             kv_cache_groups
         ):
             return _heterogeneous_pool_bytes_per_block(kv_cache_groups)
-        return orig_pool_bytes(kv_cache_groups)
+        return orig_pool_bytes(*args, **kwargs)
 
     vllm_kv_cache_utils._pool_bytes_per_block = patched_pool_bytes_per_block
     vllm_kv_cache_utils.get_kv_cache_groups = patched_get_kv_cache_groups

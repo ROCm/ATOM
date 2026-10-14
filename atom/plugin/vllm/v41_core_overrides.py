@@ -99,10 +99,6 @@ def _publish_v41_metadata(prepare):
 class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
     """V2's publication boundary and capture-owned scratch cache."""
 
-    # Keep the measured workaround; explicit H2D ownership alone has not proved
-    # that the deferred stale-state probe is safe on this frontend.
-    _state_probe_blocking_default = True
-
     def prepare_model_inputs(self, input_ids, metadata):
         cache = metadata.cache
         if not hasattr(cache, "_vllm_h2d_owner"):
@@ -516,8 +512,17 @@ def _forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
     )
 
 
-def apply_v41_eager_break() -> bool:
-    """Install the broken-out forward on `Attention`. Idempotent."""
+def apply_v41_eager_break(graphs_enabled: bool) -> bool:
+    """Install the broken-out forward on `Attention`. Idempotent.
+
+    `graphs_enabled` is the deployment's effective setting, not the breakable
+    flag: vLLM turns that flag on for V4.1 on ROCm by itself, so keying on it
+    installed this forward -- and the extra attention-output buffer it writes
+    through -- on eager runs too, where there is no capture to work around and
+    the copy is pure cost an eager baseline then measures.
+    """
+    if not graphs_enabled:
+        return False
     try:
         from vllm.compilation.breakable_cudagraph import eager_break_during_capture
     except ImportError:

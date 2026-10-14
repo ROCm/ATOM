@@ -92,6 +92,27 @@ def capture_breaks_mid_forward() -> bool:
     return BreakableCUDAGraphCapture.is_active()
 
 
+def graphs_enabled(vllm_config) -> bool:
+    """Whether this deployment will capture anything at all.
+
+    Distinct from `breakable_capture_enabled`, which answers whether breaks
+    are available if a capture happens. vLLM turns breakable capture on by
+    itself for some architectures, so the two disagree exactly where it
+    matters: an eager deployment, where reading the breakable flag says
+    "graphs" and every workaround a capture needs gets installed anyway.
+    An eager run then pays for them -- and an eager/graph comparison measures
+    them on both arms.
+    """
+    if getattr(getattr(vllm_config, "model_config", None), "enforce_eager", False):
+        return False
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return False
+    from vllm.config import CUDAGraphMode
+
+    return getattr(compilation_config, "cudagraph_mode", None) != CUDAGraphMode.NONE
+
+
 def breakable_capture_enabled() -> bool:
     """Whether this run may capture graphs around a model's step work at all.
 
@@ -143,11 +164,20 @@ def apply_vllm_dummy_run_patch() -> int:
     The count is returned, and logged by the caller, because a patch that
     installs on a class nobody instantiates reads exactly like one that works:
     three ATOM patches were silently covering nothing for that reason.
+
+    It counts classes that are covered, not classes this call installed on.
+    The two differ because this is deliberately installed from two places
+    (`register_platform` can be swallowed whole), so counting installs made
+    the second call -- the normal one -- report `covers 0`, which is the exact
+    reading the count exists to distinguish.
     """
     covered = 0
     for runner_cls in gpu_model_runner_classes():
         original = getattr(runner_cls, "_dummy_run", None)
-        if original is None or getattr(original, "_atom_dummy_run_patched", False):
+        if original is None:
+            continue
+        if getattr(original, "_atom_dummy_run_patched", False):
+            covered += 1
             continue
 
         def make_wrapper(original):

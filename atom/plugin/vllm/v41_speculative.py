@@ -164,9 +164,19 @@ def _would_mix_prefill_with_drafts(scheduler) -> bool:
     if scheduler.waiting and _admission_is_possible(scheduler):
         return True
     # A running request can still be mid-prompt: chunked prefill keeps it in
-    # `running` while it works through the rest of its tokens.
+    # `running` while it works through the rest of its tokens. The length to
+    # compare against is everything it must recompute, not the prompt: a
+    # preempted request resumes by recomputing its generated tokens too, and
+    # against `num_prompt_tokens` it reads as a decode for all of them -- which
+    # is how a prefill reaches a step that still carries drafts, where
+    # `_v41_prepare_kwargs` refuses the batch outright.
+    #
+    # This is vLLM's own `is_prefill_chunk` test (`scheduler.py`), recomputed
+    # rather than read off the request because the attribute there is the
+    # answer for the step that just ended.
     return any(
-        request.num_computed_tokens < request.num_prompt_tokens
+        request.num_computed_tokens
+        < request.num_tokens + getattr(request, "num_output_placeholders", 0)
         for request in scheduler.running
     )
 

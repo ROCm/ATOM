@@ -31,13 +31,22 @@ the snapshot via ``get_current_req_ids()`` and keys slot allocation on it, with
 no D2H. All of this lives in ATOM; no vLLM source is modified.
 
 The same wrappers expose the ``InputBatch`` itself through
-``get_current_input_batch()``, for two readers with the same problem.
-DeepSeek-V4's state-checkpoint ops read the host mirror of the state checkpoint
-groups' block tables from it. DeepSeek-V4.1 hands vLLM's block table straight
-to its own PAGE table (its PAGE size and vLLM's block size are both 256, so the
-ids are the same ids) and needs the host mirror of it, plus
-``num_computed_tokens_cpu``. None of those is carried by
-``CommonAttentionMetadata`` without a device sync.
+``get_current_input_batch()``, for two readers that want different things from
+it. DeepSeek-V4's state-checkpoint ops read the host mirror of the state
+checkpoint groups' block tables, which ``CommonAttentionMetadata`` does not
+carry without a device sync.
+
+What DeepSeek-V4.1 takes from it is the
+persistent, host-resident request mapping that ``CommonAttentionMetadata`` does
+not carry -- how many requests this step actually scheduled, their batch order,
+and the input ids -- which is what its STATE slots are keyed on.
+
+Not a host mirror of the block table, and not a way to avoid a sync: the V2
+runner's ``InputBatch`` has no full host block table, and its host sequence
+lengths can be optimistic under async speculation, so V4.1 still reads the
+exact lengths and PAGE rows with blocking copies (``snapshot_v41_batch``).
+Removing the D2H is what this patch does for V4's slot assignment, above; it is
+not what V4.1 uses it for.
 """
 
 from __future__ import annotations
@@ -174,7 +183,12 @@ def apply_vllm_req_id_passthrough_patch() -> bool:
     # same as applied in the logs.
     patched_states = _patch_model_state_factory()
 
-    if patched_target or patched_draft or patched_states:
+    # `_patch_model_state_factory` reports its outcome by name, and the names
+    # for its failures -- "unavailable", "absent" -- are as truthy as the ones
+    # for success. Taking `bool` of it therefore read every failure as an
+    # install, and said so in the log: the one place someone checks.
+    states_installed = patched_states in _STATE_FACTORY_INSTALLED
+    if patched_target or patched_draft or states_installed:
         logger.info(
             "ATOM plugin: patched vLLM GPUModelRunner "
             "(_build_attention_metadata=%s, propose_draft_token_ids=%s) and model "
@@ -183,9 +197,14 @@ def apply_vllm_req_id_passthrough_patch() -> bool:
             "the MTP draft path and the V2 runner)",
             patched_target,
             patched_draft,
-            patched_states or "none",
+            patched_states,
         )
-    return bool(patched_target or patched_draft or patched_states)
+    return bool(patched_target or patched_draft or states_installed)
+
+
+# The outcomes of `_patch_model_state_factory` that leave the hook in place.
+# "already" counts: an earlier call installed it.
+_STATE_FACTORY_INSTALLED = ("factory", "already")
 
 
 def _patch_model_state_factory() -> str:

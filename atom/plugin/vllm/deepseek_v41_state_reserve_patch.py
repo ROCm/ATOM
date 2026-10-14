@@ -97,6 +97,7 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
     )
 
     max_model_len = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
+
     # One request must still fit after the tail comes out, or the scheduler
     # can never admit anything -- a clearer failure here than a request that
     # is preempted forever.
@@ -107,7 +108,23 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
     # in the direction that passes: with max_model_len=8192 and 32 PAGEs left,
     # this said yes while an 8191-token prompt -- which needs all 32 -- could
     # only ever be given 31.
-    min_usable = max(1, -(-max_model_len // ATOM_DEEPSEEK_V41_BLOCK_SIZE)) + NULL_BLOCKS
+    #
+    # Counted over every group in the pool, not just the proxy's. With DSpark
+    # the draft layers are a second KV-cache group drawing on the same
+    # BlockPool, so one max-length request needs that group's blocks as well.
+    # Against the proxy group alone, `usable` could land between the two
+    # figures: startup passes, and the request it was sized for can never be
+    # admitted.
+    def _blocks_one_request_needs(cfg) -> int:
+        total = 0
+        for group in cfg.kv_cache_groups:
+            block_size = int(
+                getattr(group.kv_cache_spec, "block_size", 0)
+                or ATOM_DEEPSEEK_V41_BLOCK_SIZE
+            )
+            total += max(1, -(-max_model_len // block_size))
+        return total
+
     applied = False
     seen_groups = []
     for cfg in configs:
@@ -120,6 +137,8 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
         if not owns_proxy:
             continue
         applied = True
+        per_request = _blocks_one_request_needs(cfg)
+        min_usable = per_request + NULL_BLOCKS
         usable = cfg.num_blocks - reserve
         if usable < min_usable:
             raise ValueError(
@@ -129,7 +148,8 @@ def _reserve_state_tail(configs, reserve: int, vllm_config) -> None:
                 f"{vllm_config.scheduler_config.max_num_seqs} concurrent requests, "
                 f"leaving {usable} for history -- below the "
                 f"{min_usable} a single max_model_len={max_model_len} request "
-                f"needs ({min_usable - NULL_BLOCKS} for its own PAGEs plus "
+                f"needs ({per_request} across this pool's "
+                f"{len(cfg.kv_cache_groups)} KV-cache group(s) plus "
                 f"{NULL_BLOCKS} vLLM holds back as its null block). Raise "
                 "--gpu-memory-utilization, or lower --max-num-seqs "
                 "or --max-model-len."

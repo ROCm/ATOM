@@ -1055,11 +1055,10 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     ``prepare_batch_step`` takes the dtype of its request-start array from it;
     int64 matches what native ATOM allocates.
     """
-    from vllm.config import CUDAGraphMode
-
     from atom.plugin.vllm.v41_core_overrides import (
         VllmDeepseekV41MetadataBuilder,
     )
+    from atom.plugin.vllm.vllm_runtime import graphs_enabled
     from atom.utils import CpuGpuBuffer
 
     max_num_batched_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
@@ -1067,10 +1066,7 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
         block_size=ATOM_DEEPSEEK_V41_BLOCK_SIZE,
         device=device,
         config=atom_config,
-        v41_graphs_enabled=(
-            not vllm_config.model_config.enforce_eager
-            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ),
+        v41_graphs_enabled=graphs_enabled(vllm_config),
         max_bs=max(1, int(vllm_config.scheduler_config.max_num_seqs)),
         max_num_batched_tokens=max_num_batched_tokens,
         forward_vars={
@@ -1159,11 +1155,16 @@ def bind_deepseek_v41_proxy_cache(
     # while the bytes are sitting right there. Read the storage instead, which
     # is the same number on both versions.
     storage = proxy.kv_cache.untyped_storage()
+    # From where this layer's slice begins, not from where the allocation does.
+    # Reading from 0 made `raw.storage_offset()` 0 by construction, so the
+    # alignment check below could not fail however the slice was placed, and
+    # the size check measured bytes that belong to other layers.
+    offset = proxy.kv_cache.storage_offset() * proxy.kv_cache.element_size()
     raw = torch.empty(0, dtype=torch.uint8, device=proxy.kv_cache.device)
-    raw.set_(storage, 0, (storage.nbytes(),))
-    if raw.storage_offset() % ATOM_DEEPSEEK_V41_PROXY_ALIGNMENT:
+    raw.set_(storage, offset, (storage.nbytes() - offset,))
+    if offset % ATOM_DEEPSEEK_V41_PROXY_ALIGNMENT:
         raise RuntimeError(
-            f"DeepSeek-V4.1 proxy KV storage offset {raw.storage_offset()} is not "
+            f"DeepSeek-V4.1 proxy KV storage offset {offset} is not "
             f"{ATOM_DEEPSEEK_V41_PROXY_ALIGNMENT}B-aligned; EntryMajorArena cannot "
             "retype carved planes safely"
         )
@@ -1187,6 +1188,13 @@ def bind_deepseek_v41_proxy_cache(
     # `pages` is what the KV-cache manager will hand out; the tensor also holds
     # the withheld tail the STATE region lives in. If the reserve patch never
     # ran, the two overlap -- catch that here rather than at the first request.
+    #
+    # `raw` runs to the end of the allocation, so with a draft model its layers
+    # are still counted here: this is a necessary condition, not an exact one.
+    # Where the proxy slice ends is not knowable from this layer alone -- the
+    # view stops short of the withheld tail, which is precisely the part that
+    # has to be included -- so a tighter bound would need the next layer's
+    # offset, which this bind does not see.
     required = int(geometry.paged_extents(pages)[1]) + num_slots * int(
         geometry.state_bytes
     )

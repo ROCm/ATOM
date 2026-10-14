@@ -270,6 +270,42 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     torch.testing.assert_close(cache.backing, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("staged_outside_forward", [False, True])
+def test_width_invariant_is_checked_on_both_staging_paths(
+    monkeypatch, staged_outside_forward
+):
+    """The plugin stages outside the forward; it is not exempt from the check.
+
+    The early return for a staged step used to come first, so the width
+    invariant covered only the native path. What the width governs is how
+    every later index into the batch is computed, which is not something
+    staging owns: skipping it left a mismatch to surface as a reshape error
+    inside a layer, or as padding rows read as real ones.
+    """
+    PagedAttentionCache, _ = _runtime_pieces()
+    from atom.models.deepseek_v41 import runtime
+
+    geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
+    cache = PagedAttentionCache(geo, 4, 2, "cpu")
+    step = begin_step(cache, [PagedRequest(0, 0, 0, 1, 0, (0,))], plans={})
+    metadata = SimpleNamespace(
+        step=step,
+        cache=cache,
+        engram_embeddings=None,
+        image_mask=None,
+        staged_outside_forward=staged_outside_forward,
+    )
+    monkeypatch.setattr(
+        runtime, "get_forward_context", lambda: SimpleNamespace(attn_metadata=metadata)
+    )
+
+    # The width this step declared is accepted on both paths ...
+    runtime.v41_begin_forward(torch.zeros(1, step.width, 64))
+    # ... and one row short is refused on both, staged or not.
+    with pytest.raises(ValueError, match="width this step declared"):
+        runtime.v41_begin_forward(torch.zeros(1, step.width + 1, 64))
+
+
 def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     """Graph capture runs the model twice over one step.
 
