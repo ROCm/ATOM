@@ -13,6 +13,11 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.protocol.requests import (
+    CompletionResult,
+    EngineRequest,
+    prompt_token_array,
+)
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
@@ -277,7 +282,7 @@ class LLMEngine:
             reqs.extend(fanout)
         self.core_mgr.add_request(reqs)
 
-    def step(self) -> list[Sequence]:
+    def step(self) -> list[CompletionResult]:
         seqs = self.core_mgr.get_output()
         return seqs
 
@@ -691,14 +696,10 @@ class InputOutputProcessor:
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.requests = {}
-        # `has_per_req_cache` flags model architectures that need a
-        # per-request stateful buffer outside the paged KV pool. Sequences
-        # constructed for these models trigger BlockManager to reserve a
-        # per-req cache slot. Currently: GDN-based models (Qwen3-Next /
-        # Qwen3.5). Future stateful models (DeepseekV4, etc.) extend the set.
         self._external_to_internal: dict[str, int] = {}
         self._internal_to_external: dict[int, str] = {}
-        self.has_per_req_cache = False
+        # Only to refuse logprobs under speculative decoding up front; the
+        # engine derives the sequence's draft width from its own config.
         self.num_speculative_tokens = 0
         if (
             hasattr(self.config, "speculative_config")
@@ -707,18 +708,19 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        if self.config.hf_config.model_type in self._per_req_cache_model_types():
-            self.has_per_req_cache = True
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
         """Single source of truth for which model_types use per-req cache.
 
-        Read by Sequence-construction (here) AND by ModelRunner's startup
-        sanity check, which asserts that any model whose attention builder
-        declares a per-request state sub-pool has its model_type
-        registered here. Adding a new stateful-attention model means
-        adding its model_type to this set.
+        `has_per_req_cache` flags model architectures that need a per-request
+        stateful buffer outside the paged KV pool; BlockManager reserves a
+        per-req cache slot for their sequences. Read by the engine's sequence
+        construction (`protocol.codec.AdmissionDefaults`) AND by ModelRunner's
+        startup sanity check, which asserts that any model whose attention
+        builder declares a per-request state sub-pool has its model_type
+        registered here. Adding a new stateful-attention model means adding
+        its model_type to this set.
         """
         return frozenset(
             {
@@ -747,11 +749,11 @@ class InputOutputProcessor:
     ):
         """responsible for:
         1) Tokenize
-        2) Create Sequence object
+        2) Create the EngineRequest
 
         Single-sequence entry point. Rejects ``sampling_params.n > 1`` so that
-        callers which expect exactly one ``Sequence`` back cannot silently
-        drop the other siblings. Use :meth:`preprocess_fanout` for n > 1.
+        callers which expect exactly one request back cannot silently drop the
+        other siblings. Use :meth:`preprocess_fanout` for n > 1.
         """
         if getattr(sampling_params, "n", 1) > 1:
             raise ValueError(
@@ -783,15 +785,16 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
-    ) -> list[Sequence]:
-        """Tokenize once and materialize ``sampling_params.n`` Sequences.
+    ) -> list[EngineRequest]:
+        """Tokenize once and materialize ``sampling_params.n`` EngineRequests.
 
         Returns a list of length ``n``. For ``n == 1`` this is functionally
         equivalent to the legacy single-sequence path. For ``n > 1``:
 
-        * The prompt is tokenized a single time and the token list is copied
-          into each sibling (``Sequence`` copies internally, so mutations stay
-          isolated).
+        * The prompt is tokenized a single time and every sibling shares that
+          one token array -- and so does the message that carries them, which
+          sends it once. Each sibling's ``Sequence`` is built in the engine,
+          with a copy of its own.
         * Every sibling is marked ``needs_independent_noise=True`` so the
           sampler generates fresh per-row noise instead of reusing the cached
           shared exponential tensor. Without this, siblings with identical
@@ -807,6 +810,12 @@ class InputOutputProcessor:
                 multimodal_data=multimodal_data,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
+        # Refused here, where `Sequence` used to refuse it: the engine builds
+        # the sequence now, and the caller should still hear it synchronously.
+        if self.num_speculative_tokens and sampling_params.logprobs:
+            raise ValueError(
+                "Token logprobs are not supported with speculative decoding"
+            )
 
         tokens = (
             self.tokenizer.encode(prompt_or_tokens)
@@ -839,32 +848,47 @@ class InputOutputProcessor:
                 f"stream_callbacks length {len(stream_callbacks)} does not match n={n}"
             )
 
-        seqs: list[Sequence] = []
+        prompt = prompt_token_array(tokens)
+        if not prompt:
+            # What `Sequence` raised on an empty prompt, still raised here.
+            raise IndexError("array index out of range")
+        # The media's content hash, which `Sequence` would otherwise compute in
+        # the engine's input thread: once here, for every sibling.
+        cache_seed = None
+        if multimodal_data is not None:
+            cache_seed = multimodal_data.get("cache_seed")
+            if cache_seed is None:
+                from atom.model_engine.multimodal_runtime import (
+                    multimodal_cache_seed,
+                )
+
+                cache_seed = multimodal_cache_seed(multimodal_data)
+
+        seqs: list[EngineRequest] = []
         for i in range(n):
             cb = (
                 stream_callbacks[i] if stream_callbacks is not None else stream_callback
             )
-            seq = Sequence(
-                tokens,
-                self.block_size,
-                sampling_params,
-                stop_token_sequences,
+            seq = EngineRequest(
+                id=next(Sequence.counter),
+                prompt_token_ids=prompt,
+                sampling_params=sampling_params,
+                stop_token_sequences=stop_token_sequences,
                 stream_callback=cb,
-                num_draft_tokens=self.num_speculative_tokens,
-                has_per_req_cache=self.has_per_req_cache,
                 kv_transfer_params=kv_transfer_params,
                 multimodal_data=multimodal_data,
+                cache_seed=cache_seed,
                 mrope_positions=mrope_positions,
                 mrope_position_delta=mrope_position_delta,
                 needs_independent_noise=(n > 1),
                 parent_request_id=parent_request_id,
                 sibling_index=i,
-                request_id=parent_request_id if n == 1 else None,
+                external_request_id=parent_request_id if n == 1 else None,
                 data_parallel_rank=data_parallel_rank,
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
+                arrive_time=time.time(),
             )
-            seq.arrive_time = time.time()
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -885,7 +909,7 @@ class InputOutputProcessor:
             )
         return seqs
 
-    def postprocess(self, reqs: list[Sequence]):
+    def postprocess(self, reqs: list[CompletionResult]):
         """responsible for:
         1) Compute stats for logging
         2) Detokenize"""

@@ -115,24 +115,28 @@ def test_queue_includes_kv_wait_and_counts_first_forward_once(clock):
 def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     clock, monkeypatch
 ):
-    import pickle
     from contextlib import nullcontext
 
     from aiter_stub import stubbed_aiter
 
+    from atom.model_engine.protocol.codec import (
+        AdmissionDefaults,
+        encode_shutdown,
+        encode_submit,
+    )
+    from atom.model_engine.protocol.requests import EngineRequest
+    from atom.sampling_params import SamplingParams
+
     with stubbed_aiter():
         from atom.model_engine import engine_core as core
 
-    seq = Sequence([1, 3, 4], block_size=4)
-    # A serialized timestamp from another engine must not replace local receipt.
-    SchedulerMetrics.enqueue(seq, received_at=50.0)
-    frames = iter(
-        [
-            pickle.dumps((core.EngineCoreRequestType.ADD, [seq])),
-            pickle.dumps((core.EngineCoreRequestType.SHUTDOWN, None)),
-        ]
+    request = EngineRequest(
+        id=1, prompt_token_ids=[1, 3, 4], sampling_params=SamplingParams()
     )
-    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(frames))
+    messages = iter([encode_submit([request]), encode_shutdown()])
+    sock = SimpleNamespace(
+        send=lambda _: None, recv_multipart=lambda **_: next(messages)
+    )
     monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
     monkeypatch.setattr(
         core.zmq,
@@ -145,6 +149,10 @@ def test_engine_receipt_includes_time_buffered_before_scheduler_admission(
     engine = core.EngineCore.__new__(core.EngineCore)
     engine.label = "metrics-test"
     engine.input_queue = Queue()
+    engine.output_queue = Queue()
+    engine._admission_defaults = AdmissionDefaults(
+        block_size=4, num_draft_tokens=0, has_per_req_cache=False
+    )
     engine.process_input_sockets("input", "control")
     received = engine.input_queue.get_nowait()[0]
     assert received.queue_timing.received_at == 100.0

@@ -10,7 +10,7 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10"
 dynamic = ["version"]
-dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
+dependencies = ["pybind11", "transformers==5.16.1", "zmq", "msgspec", "xxhash", "fastapi>=0.115,<0.137", "psutil", "prometheus_client>=0.25,<0.26", "protobuf>=3.20", "uvicorn", "uvloop", "aiohttp", "datasets", "openpyxl", "tqdm", "setproctitle"]
 
 [project.optional-dependencies]
 # atom/diffusion only. Kept out of the base install because none of it is
@@ -40,7 +40,16 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "model_engine/protocol/*.proto",
 ]
+
+# Generated protobuf bindings (scripts/gen_engine_protocol.py) are kept
+# byte-for-byte as protoc wrote them, so its --check can compare them.
+[tool.black]
+extend-exclude = '_pb2\.py$'
+
+[tool.ruff]
+extend-exclude = ["*_pb2.py"]
 
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway
