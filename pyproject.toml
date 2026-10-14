@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=61", "wheel", "setuptools_scm[toml]>=6.2"]
+# grpcio-tools compiles the engine protocol (setup.py). Kept below 1.65: later
+# versions emit code that refuses protobuf runtimes older than their own.
+requires = ["setuptools>=61", "wheel", "setuptools_scm[toml]>=6.2", "grpcio-tools>=1.62,<1.65"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -43,8 +45,7 @@ atom = [
     "model_engine/protocol/*.proto",
 ]
 
-# Generated protobuf bindings (scripts/gen_engine_protocol.py) are kept
-# byte-for-byte as protoc wrote them, so its --check can compare them.
+# Protobuf bindings generated at install time (atom/model_engine/protocol/generate.py).
 [tool.black]
 extend-exclude = '_pb2\.py$'
 
