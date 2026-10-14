@@ -108,6 +108,12 @@ def _recv_header(group, *, device: torch.device) -> tuple[int, int, int, int]:
     return command, metadata_bytes, payload_bytes, version
 
 
+def _is_count(value) -> bool:
+    """Whether *value* is a size the sender could have written: a JSON integer,
+    not negative, and not a bool, which Python counts as an int."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _decode_bucket(
     metadata_tensor: torch.Tensor, payload: torch.Tensor
 ) -> list[tuple[str, torch.Tensor]]:
@@ -126,29 +132,41 @@ def _decode_bucket(
     weights: list[tuple[str, torch.Tensor]] = []
     spans: list[tuple[int, int, str]] = []
     for entry in metadata:
-        try:
-            name = str(entry["name"])
-            shape = [int(dim) for dim in entry["shape"]]
-            dtype = getattr(torch, entry["dtype"])
-            start = int(entry["offset"])
-            nbytes = int(entry["nbytes"])
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
-            raise RuntimeError(f"invalid RDMA weight metadata entry: {entry}") from exc
+        # Checked as sent, not coerced: int() made a shape of [2.5] into [2],
+        # another tensor that still fits its bytes, and let -1 through, which
+        # view() takes as "infer this dimension".
+        fields = entry if isinstance(entry, dict) else {}
+        name, shape = fields.get("name"), fields.get("shape")
+        start, nbytes = fields.get("offset"), fields.get("nbytes")
+        dtype_name = fields.get("dtype")
+        dtype = (
+            getattr(torch, dtype_name, None) if isinstance(dtype_name, str) else None
+        )
+        if not (
+            isinstance(name, str)
+            and name
+            and isinstance(shape, list)
+            and all(_is_count(dim) for dim in shape)
+            and isinstance(dtype, torch.dtype)
+            and _is_count(start)
+            and _is_count(nbytes)
+        ):
+            raise RuntimeError(f"invalid RDMA weight metadata entry: {entry}")
 
         end = start + nbytes
         # Bounds-check before slicing: a corrupt offset would otherwise either
         # silently truncate or read a neighbouring tensor's bytes.
-        if start < 0 or nbytes <= 0 or end > payload.numel():
+        if nbytes == 0 or end > payload.numel():
             raise RuntimeError(
                 f"RDMA payload range out of bounds for {name}: "
                 f"offset={start} nbytes={nbytes} payload={payload.numel()}"
             )
-        value = payload[start:end].view(dtype).view(shape)
-        if value.numel() * value.element_size() != nbytes:
+        if torch.Size(shape).numel() * dtype.itemsize != nbytes:
             raise RuntimeError(
                 f"RDMA metadata size mismatch for {name}: "
                 f"shape={shape} dtype={dtype} nbytes={nbytes}"
             )
+        value = payload[start:end].view(dtype).view(shape)
         weights.append((name, value))
         spans.append((start, end, name))
 

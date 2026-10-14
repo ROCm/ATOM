@@ -170,17 +170,24 @@ def test_an_out_of_bounds_offset_is_rejected_not_truncated():
 @pytest.mark.parametrize(
     ("mutate", "expect"),
     [
-        # torch's own view() rejects this before the explicit size check does,
-        # which is fine -- what matters is that it is refused, not silently
-        # reshaped into whatever fits.
-        (lambda e: e.update({"shape": [99]}), "invalid for input of size"),
+        (lambda e: e.update({"shape": [99]}), "size mismatch"),
         (lambda e: e.pop("name"), "invalid RDMA weight metadata entry"),
         (
             lambda e: e.update({"dtype": "not_a_dtype"}),
             "invalid RDMA weight metadata entry",
         ),
         (lambda e: e.update({"nbytes": 0}), "out of bounds"),
-        (lambda e: e.update({"offset": -1}), "out of bounds"),
+        (lambda e: e.update({"offset": -1}), "invalid RDMA weight metadata entry"),
+        # Each of these int() coerced into a different layout that still fit
+        # the bytes, or into one view() reshapes to fit.
+        (lambda e: e.update({"shape": [2.5]}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"shape": [-1]}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"shape": [True]}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"shape": "2"}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"offset": 0.5}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"nbytes": 8.0}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"name": 7}), "invalid RDMA weight metadata entry"),
+        (lambda e: e.update({"dtype": "tensor"}), "invalid RDMA weight metadata entry"),
     ],
 )
 def test_corrupt_metadata_is_rejected(mutate, expect):
