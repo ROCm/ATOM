@@ -306,6 +306,18 @@ class PageUnitCheckpointStore:
     def contains_or_pending(self, prefix_hash: int) -> bool:
         return self.contains(prefix_hash) or prefix_hash in self._pending_by_hash
 
+    def has_slot_image(self, prefix_hash: int) -> bool:
+        """A valid SLOT image, including a copy not yet published as READY."""
+        cid = self.hash_to_checkpoint.get(prefix_hash, -1)
+        if cid < 0:
+            cid = self._pending_by_hash.get(prefix_hash, -1)
+        record = self.records.get(cid)
+        return (
+            record is not None
+            and record.slot_id >= 0
+            and record.state in (COPYING, READY)
+        )
+
     def _new_identity(self) -> int:
         checkpoint_id = self._next_checkpoint_id
         self._next_checkpoint_id += 1
@@ -1317,6 +1329,19 @@ class PagedStateCheckpointCoordinator:
     def was_reclaimed(self, op) -> bool:
         """Whether this store's source was taken back before it reported."""
         return self.store.was_reclaimed(op)
+
+    def on_kv_evicted(self, h: int, *, retain_slot: bool) -> None:
+        """Keep an independent SLOT image when CPU KV can make it reachable.
+
+        READY unpinned slots already count as free via `cache_borrowed`; pins
+        and in-flight writers return them there only after completion. Keep
+        that lifecycle and the current LRU position, without re-enqueueing or
+        publishing a copying image early. Actual reuse still checks CPU KV.
+        Explicit unindex/reset must continue to invalidate these images.
+        """
+        if retain_slot and self.store.has_slot_image(h):
+            return
+        self.unindex(h)
 
     def unindex(self, h: int) -> None:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for

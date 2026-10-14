@@ -508,18 +508,25 @@ class BlockManager:
         return totals
 
     def _record_evicted(self, h: int) -> None:
-        """A hash the block pool just dropped: report it, and settle the state.
+        """Report GPU KV eviction without discarding a usable spare STATE image.
 
-        The crossing belongs here rather than in either pool — the two are
-        addressed by one chained content hash and a prefix hit claims both, so
-        neither can be left holding a boundary the other can no longer honour.
-        Without this the state pool keeps handing slots to checkpoints nothing
-        can reach and spends live ones to make room for them.
+        A SLOT checkpoint can still serve a joint CPU KV load. Its own pool
+        reclaims it before reuse; GPU KV eviction need not make it vacant.
+        PAGE and fork checkpoints keep their existing invalidation policy.
         """
         self.total_evicted_blocks += 1
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
-        self._state_checkpoint_cache.unindex(h)
+        if self.paged_state_checkpoints is not None:
+            self.paged_state_checkpoints.on_kv_evicted(
+                h,
+                retain_slot=(
+                    self.state_tier_capability.can_load_state
+                    and self._joint_chunk_tokens > 0
+                ),
+            )
+        else:
+            self._state_checkpoint_cache.unindex(h)
 
     def _fresh_block(self) -> int:
         """Take a block for content this step is about to compute.
@@ -792,14 +799,10 @@ class BlockManager:
         """
         if self.state_offload is None:
             return self._no_joint("off")
-        # PAGE is now the served class, not the excluded one. This used to
-        # read `is not None` and refuse -- correct while a K3 checkpoint was an
-        # Active Slot the tier spilled out of `StateSlotPool`. #2045 moved the
-        # image into the KV pool, and with it the whole reason the joint path
-        # exists: HBM's `state ⊆ KV` (`_record_evicted` unindexes a checkpoint
-        # the instant its boundary block is spent) means a checkpoint can no
-        # longer outlive its KV in HBM -- so when LMCache hands the KV back,
-        # nothing hands the state back unless the two are fetched together.
+        # PAGE checkpoints lose their index with their boundary's GPU KV,
+        # so the CPU tier must supply their state too. Spare SLOT images can
+        # outlive GPU KV and supply the STATE leg locally; both cases still
+        # require the CPU KV lookup to cover the selected boundary.
         if not seq.has_per_req_cache or self.paged_state_checkpoints is None:
             return self._no_joint("no_paged_checkpoints")
         hbs = self._hash_block_size()

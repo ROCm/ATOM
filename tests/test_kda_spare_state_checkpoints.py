@@ -297,7 +297,7 @@ def make_manager(monkeypatch, **overrides):
     )
 
 
-def publish_anchor(bm):
+def publish_anchor(bm, *, complete=True, in_slot=True):
     from atom.model_engine.sequence import Sequence
 
     seq = Sequence(list(range(40)), 4, has_per_req_cache=True)
@@ -308,8 +308,9 @@ def publish_anchor(bm):
     h = bm.kv.block(seq.block_table[boundary // bm.hash_block_size - 1]).hash
     ops = bm.take_state_maintenance_ops()
     assert len(ops.checkpoint_stores) == 1
-    assert ops.checkpoint_stores[0].dst_slot >= 0
-    bm.complete_previous_state_batch()
+    assert (ops.checkpoint_stores[0].dst_slot >= 0) == in_slot
+    if complete:
+        bm.complete_previous_state_batch()
     return seq, h, boundary
 
 
@@ -715,3 +716,181 @@ def test_dspark_cpu_pinned_source_serves_two_full_requests_at_capacity(monkeypat
     for seq in [producer, *readers]:
         bm.deallocate(seq)
     assert bm.state.num_free() == 13
+
+
+def make_offload_manager(
+    monkeypatch, *, dspark=False, role="offload", chunk=4, **overrides
+):
+    # Only the external config parser is stubbed. The real constructor must
+    # enable the K3 tier and joint KV path; no manually attached index.
+    monkeypatch.setattr(
+        "atom.kv_transfer.offload.config.build_lmcache_config",
+        lambda _cfg: SimpleNamespace(chunk_size=chunk),
+    )
+    factory = make_dspark_manager if dspark else make_manager
+    return factory(
+        monkeypatch,
+        kv_transfer_config={
+            "kv_connector": "lmcache_offload",
+            "kv_role": role,
+            "offload_layout": "kimi_k3",
+        },
+        **overrides,
+    )
+
+
+def evict_anchor_kv(bm, producer, boundary):
+    block = producer.block_table[boundary // bm.hash_block_size - 1]
+    h = bm.kv.block(block).hash
+    bm.deallocate(producer)
+    evictions = bm.total_evicted_blocks
+    # Real block reuse, not a direct call to the checkpoint invalidation hook.
+    bm.kv.allocate(block)
+    assert bm.kv.lookup(h) == -1
+    assert bm.total_evicted_blocks == evictions + 1
+
+
+@pytest.mark.parametrize("cpu_state", [False, True])
+@pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("role", ["offload", "kv_both"])
+def test_kv_eviction_retains_slot_for_cpu_kv_restore(
+    monkeypatch, cpu_state, dspark, role
+):
+    from atom.model_engine.sequence import Sequence
+
+    bm = make_offload_manager(monkeypatch, dspark=dspark, role=role)
+    producer, h, boundary = publish_anchor(bm)
+    store = bm.paged_state_checkpoints.store
+    slot = store.records[store.lookup(h)].slot_id
+    if cpu_state:
+        bm.state_offload.note_stored(h)
+    evict_anchor_kv(bm, producer, boundary)
+    assert store.contains(h) and bm.state.is_free(slot)
+    assert bm.paged_state_checkpoints.checkpoints_orphaned == 0
+
+    reader = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    reader.offload_joint.kv_prefix_tokens = boundary
+    hit = bm.can_allocate(reader)
+    assert hit == 0
+    assert reader.offload_joint.boundary_tokens == boundary
+    assert reader.offload_joint.boundary_hash == h
+    assert bm.state_hbm_boundaries == 1 and bm.state_tier_boundaries == 0
+    assert bm.allocate(reader, hit)
+    # KV has not been loaded yet: a STATE image alone must not claim tokens.
+    assert reader.num_cached_tokens == 0
+    assert reader.offload_joint.load_hash == -1
+    assert not bm.take_state_loads()
+    assert len(set(reader.state_slots)) == (4 if dspark else 1)
+    (restore,) = bm.take_state_maintenance_ops().checkpoint_restores
+    assert restore.slot_pair == (slot, reader.state_slot)
+    assert slot not in reader.state_slots
+    assert not bm.state.is_free(slot)
+    bm.complete_previous_state_batch()
+    assert store.contains(h) and bm.state.is_free(slot)
+    bm.deallocate(reader)
+    assert bm.state.num_free() == bm.num_state_slots
+
+
+def test_retained_slot_requires_cpu_kv_lookup(monkeypatch):
+    from atom.model_engine.sequence import Sequence
+
+    bm = make_offload_manager(monkeypatch)
+    producer, h, boundary = publish_anchor(bm)
+    evict_anchor_kv(bm, producer, boundary)
+    reader = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    assert bm.paged_state_checkpoints.contains(h)
+    assert reader.offload_joint.kv_prefix_tokens == 0
+    hit = bm.can_allocate(reader)
+    assert hit == 0 and reader.offload_joint.boundary_tokens == 0
+    assert bm.allocate(reader, hit)
+    assert reader.num_cached_tokens == 0
+    assert not bm.take_state_maintenance_ops().checkpoint_restores
+    assert not bm.take_state_loads()
+
+
+def test_retained_slot_is_reclaimed_only_when_all_vacant_slots_are_spent(monkeypatch):
+    bm = make_offload_manager(monkeypatch)
+    producer, h, boundary = publish_anchor(bm)
+    store = bm.paged_state_checkpoints.store
+    slot = store.records[store.lookup(h)].slot_id
+    # A newer checkpoint lets the test check that KV eviction does not promote
+    # the old one in the existing borrowed LRU.
+    newer = save(store, 123, producer.state_slot)
+    evict_anchor_kv(bm, producer, boundary)
+    vacant = bm.state.pop_many(bm.state.num_free() - 2)
+    assert slot not in vacant and newer.dst_slot not in vacant
+    assert store.contains(h) and store.contains(123)
+    generation = store.generation
+    assert bm.state.pop() == slot
+    assert not store.contains(h) and store.contains(123)
+    assert h in store.changed_since(generation)
+    assert store.slot_evictions == 1
+    assert bm.paged_state_checkpoints.checkpoints_orphaned == 0
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_kv_eviction_during_slot_copy_keeps_writer_protection(monkeypatch, reset):
+    bm = make_offload_manager(monkeypatch)
+    producer, h, boundary = publish_anchor(bm, complete=False)
+    store = bm.paged_state_checkpoints.store
+    record = next(iter(store.records.values()))
+    slot = record.slot_id
+    evict_anchor_kv(bm, producer, boundary)
+    assert not store.contains(h) and record.state == COPYING
+    assert not bm.state.is_free(slot)
+    if reset:
+        bm.clear_cache()
+    held = bm.state.pop_many(bm.state.num_free())
+    assert slot not in held
+    bm.complete_previous_state_batch()
+    assert bm.state.is_free(slot)
+    assert store.contains(h) == (not reset)
+    if reset:
+        assert not store.records
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_kv_eviction_preserves_restore_and_offload_pins(monkeypatch, reset):
+    from atom.model_engine.sequence import Sequence
+
+    bm = make_offload_manager(monkeypatch)
+    producer, h, boundary = publish_anchor(bm)
+    store = bm.paged_state_checkpoints.store
+    ((operation, source),) = bm.take_state_stores(8)
+    reader = Sequence(list(range(40)), 4, has_per_req_cache=True)
+    assert bm.allocate(reader, bm.can_allocate(reader))
+    record = store.records[store.lookup(h)]
+    # Release the reader's KV refs while keeping its issued STATE restore and
+    # CPU source pin alive, so actual KV reallocation can race these readers.
+    bm.take_state_maintenance_ops()
+    bm.deallocate(reader)
+    assert record.pin_count == 2
+    evict_anchor_kv(bm, producer, boundary)
+    assert store.contains(h) and not bm.state.is_free(source.slot_id)
+    if reset:
+        bm.clear_cache()
+        assert not store.contains(h)
+    bm.complete_previous_state_batch()
+    assert record.pin_count == 1 and not bm.state.is_free(source.slot_id)
+    store.release_offload_store_source(operation)
+    assert bm.state.is_free(source.slot_id)
+    assert store.contains(h) == (not reset)
+    bm.settle_state_store(operation, ok=True)
+    assert not store.has_offload_pins()
+    if reset:
+        assert not store.records
+
+
+@pytest.mark.parametrize("mode", ["no_offload", "no_chunk", "page"])
+def test_kv_eviction_keeps_invalidation_for_other_checkpoint_modes(monkeypatch, mode):
+    if mode == "no_offload":
+        bm = make_manager(monkeypatch)
+    else:
+        bm = make_offload_manager(monkeypatch, chunk=0 if mode == "no_chunk" else 4)
+    store = bm.paged_state_checkpoints.store
+    if mode == "page":
+        store.slot_reserve = bm.num_state_slots
+    producer, h, boundary = publish_anchor(bm, in_slot=mode != "page")
+    evict_anchor_kv(bm, producer, boundary)
+    assert not store.contains(h) and not store.records
+    assert bm.paged_state_checkpoints.checkpoints_orphaned == 1
