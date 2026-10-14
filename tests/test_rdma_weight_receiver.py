@@ -1001,6 +1001,43 @@ def test_the_rlhf_runner_keeps_the_deployments_dp_size_before_hiding_it():
     ]
 
 
+def test_every_serving_forward_goes_through_the_fence():
+    """The fence was checked in RLHFModelRunner.forward alone, and a
+    disaggregated EngineCore serves through prefill_forward instead. It is
+    checked in run_model now, which every serving forward runs the model
+    through and graph capture does not. Read, not run, as above."""
+    import ast
+
+    root = Path(__file__).resolve().parent.parent / "atom"
+
+    def method(path, cls_name, name):
+        tree = ast.parse((root / path).read_text())
+        cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name
+        )
+        return next(
+            n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name
+        )
+
+    def calls(function):
+        return {
+            ast.unparse(n.func) for n in ast.walk(function) if isinstance(n, ast.Call)
+        }
+
+    gate = method("rollout/model_runner_ext.py", "RLHFModelRunner", "run_model")
+    assert ast.unparse(gate.body[0]) == "self.assert_weight_update_ready()"
+    runner = "model_engine/model_runner.py"
+    for cls_name, name in [
+        ("ModelRunner", "forward"),
+        ("RapidServeModelRunner", "forward"),
+        ("RapidServeModelRunner", "prefill_forward"),
+    ]:
+        assert "self.run_model" in calls(method(runner, cls_name, name)), name
+    assert "self.run_model" not in calls(
+        method(runner, "ModelRunner", "capture_cudagraph")
+    )
+
+
 def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
     """MLA decodes through W_K and W_V, derived from kv_b_proj once at load.
     A reload rewrote kv_b_proj and left them, and the engine served old and

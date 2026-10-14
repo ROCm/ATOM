@@ -348,6 +348,11 @@ class RLHFModelRunner(
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Every serving forward runs the model through here -- this runner's
+        # forward, and RapidServe's prefill_forward and decode forward, which a
+        # disaggregated EngineCore calls instead -- so none of them serves a
+        # fenced runner's weights. Graph capture bypasses run_model.
+        self.assert_weight_update_ready()
         if not self._extract_mode:
             return super().run_model(input_ids, batch)
 
