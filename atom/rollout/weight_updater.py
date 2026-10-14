@@ -165,6 +165,7 @@ class WeightUpdaterMixin:
         # commit or abort clears them.
         if getattr(self, "_weight_update_version", None) is not None:
             return
+        self._legacy_reload_open = False
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
         getattr(self, "_fused_shards_written", {}).clear()
@@ -1059,6 +1060,7 @@ class WeightUpdaterMixin:
                 to it, or a fused parameter got only some of its shards. Raised
                 once the rest of the batch is applied.
         """
+        self._begin_legacy_reload()
         counts = self._apply_named_tensors(named_tensors)
         updated = counts["updated"]
 
@@ -1350,6 +1352,20 @@ class WeightUpdaterMixin:
                 f"weight update v{active} is already in progress; "
                 "a concurrent reload would interleave two versions"
             )
+        if getattr(self, "_legacy_reload_open", False):
+            # The engine runs the transaction between that reload's buckets,
+            # which carry on afterwards over what it committed.
+            raise RuntimeError(
+                "an SHM or IPC reload is open, its last bucket not yet "
+                "applied; a transaction begun now would interleave two "
+                "versions. Finish that reload, or discard it with "
+                "discard_failed_weight_sync"
+            )
+        if getattr(self, "_weights_discarded", False):
+            raise RuntimeError(
+                "the weights are released; resume them before a reload writes "
+                "into them"
+            )
         last = getattr(self, "_last_started_weight_version", None)
         if last is not None and version <= last:
             # Monotonic versions are what let a receiver reject a replayed or
@@ -1609,18 +1625,35 @@ class WeightUpdaterMixin:
             f"{getattr(self, '_weight_update_failure', 'unknown')}"
         )
 
+    def _begin_legacy_reload(self) -> None:
+        """Open a direct, SHM or IPC reload, unless this bucket continues one.
+
+        While one is open no transaction may begin; see begin_weight_update.
+        And on a fenced runner its coverage starts here: a reload lifts the
+        fence only by rewriting every parameter itself, as what earlier ones
+        wrote may be other versions.
+        """
+        if getattr(self, "_legacy_reload_open", False):
+            return
+        self._legacy_reload_open = True
+        if not getattr(self, "_weight_update_healthy", True):
+            self._reset_reload_coverage()
+
     def _lift_partial_reload_fence(self, path: str) -> None:
-        """Serve again once non-transactional reloads have rewritten everything.
+        """Close a direct, SHM or IPC reload, serving again if it rewrote
+        everything; one on a fenced runner that did not fails.
 
         The fence goes up when a transactional stream aborts, and only a commit
         took it down, so recovering through the direct, SHM or IPC path left
         every later forward refused. But those paths end on the caller's word,
         with no manifest, so finishing one says nothing about what it covered:
         an empty or partial reload would lift the fence over parameters the
-        failed stream left as they were. The test is therefore commit's -- every
-        parameter rewritten since the fence went up, by this reload or the ones
-        before it.
+        failed stream left as they were. The test is therefore commit's: every
+        parameter rewritten by this reload. Short of that it raises, as
+        returning reported the reload a success, and the engine, taking it for
+        one, served again over a runner still fenced.
         """
+        self._legacy_reload_open = False
         if getattr(self, "_weight_update_healthy", True):
             return
         if getattr(self, "_weight_update_version", None) is not None:
@@ -1629,12 +1662,13 @@ class WeightUpdaterMixin:
         covered = self._reload_coverage()
         missing = sorted(name for name, p in params.items() if id(p) not in covered)
         if missing:
-            logger.warning(
-                f"{self.label}: {path} reload finished, but {len(missing)}/"
-                f"{len(params)} parameters are not yet rewritten since the "
-                f"failed update ({missing[:5]}); serving stays fenced"
+            raise RuntimeError(
+                f"{self.label}: {path} reload did not rewrite every parameter, "
+                f"so serving stays fenced after "
+                f"{getattr(self, '_weight_update_failure', None)!r}: "
+                f"{len(missing)}/{len(params)} not rewritten ({missing[:5]}); "
+                f"a reload of the whole model has to succeed first"
             )
-            return
         logger.warning(
             f"{self.label}: {path} reload has rewritten every parameter, lifting "
             f"the fence left by {getattr(self, '_weight_update_failure', None)!r}"
@@ -1708,6 +1742,7 @@ class WeightUpdaterMixin:
                         .view(meta["shape"])
                     )
 
+            self._begin_legacy_reload()
             counts = self._apply_named_tensors(views())
             updated, skipped = counts["updated"], counts["skipped"]
 
@@ -1825,6 +1860,7 @@ class WeightUpdaterMixin:
 
         # A generator, not a list: a list would hold a copy of the whole
         # bucket at once.
+        self._begin_legacy_reload()
         counts = self._apply_named_tensors(copies())
         updated, skipped = counts["updated"], counts["skipped"]
 

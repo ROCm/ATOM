@@ -454,19 +454,27 @@ def test_an_empty_reload_does_not_lift_it():
     """Those paths end on the caller's word, so finishing one was enough: a
     reload that sent nothing lifted the fence over all the failed stream left."""
     runner = _fenced(_Runner(_dense_model()))
-    runner.update_weights([])
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        runner.update_weights([])
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
 
-def test_a_partial_reload_lifts_it_only_once_the_rest_arrives():
+def test_reloads_of_parts_do_not_add_up_to_one_of_the_whole():
+    """Their union lifted the fence, though each may be another version: a
+    reload of v2 rewrote one parameter, one of v3 the rest. And returning, a
+    partial one was taken for a success, the engine serving again over a
+    runner still fenced."""
     runner = _fenced(_Runner(_dense_model()))
     ckpt = _dense_checkpoint()
-    runner.update_weights([("attn.o_proj.weight", ckpt.pop("attn.o_proj.weight"))])
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        runner.update_weights([("attn.o_proj.weight", ckpt.pop("attn.o_proj.weight"))])
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        runner.update_weights(list(ckpt.items()))
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
-    runner.update_weights(list(ckpt.items()))
+    runner.update_weights(list(_dense_checkpoint().items()))
     runner.assert_weight_update_ready()
 
 
@@ -479,21 +487,32 @@ def test_what_the_failed_stream_wrote_is_no_part_of_the_recovery():
     runner.apply_weight_bucket([("attn.o_proj.weight", ckpt.pop("attn.o_proj.weight"))])
     runner.abort_weight_update(1, RuntimeError("stream failed"))
 
-    runner.update_weights(list(ckpt.items()))
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        runner.update_weights(list(ckpt.items()))
 
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
 
-def test_experts_rewritten_over_several_reloads_add_up():
-    """Each reload relays out what it sent, so a buffer is credited expert by
-    expert; counted whole, one whose experts came in two reloads never was."""
+def test_experts_rewritten_over_one_reloads_buckets_add_up():
+    """A buffer is credited expert by expert; counted whole, one whose experts
+    came in two buckets of a reload never was. Two reloads are two versions,
+    though, so experts rewritten across them do not add up."""
     runner = _fenced(_Runner(_moe_model()))
-    runner.update_weights(list(_expert_checkpoint(experts=[0]).items()))
+    for experts in ([0], [1]):
+        with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+            runner.update_weights(list(_expert_checkpoint(experts=experts).items()))
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
-    runner.update_weights(list(_expert_checkpoint(experts=[1]).items()))
+    flat, meta = _staged(_expert_checkpoint())
+    names = list(meta)
+    half = len(names) // 2
+    with _shm_segment(flat) as shm_name:
+        first = {n: meta[n] for n in names[:half]}
+        runner.update_weights_from_shm(shm_name, first, is_last=False)
+        rest = {n: meta[n] for n in names[half:]}
+        runner.update_weights_from_shm(shm_name, rest, is_last=True)
     runner.assert_weight_update_ready()
 
 
@@ -566,7 +585,8 @@ def test_a_partial_shm_or_ipc_reload_keeps_it(path):
     """Its last bucket was all it took, however little the reload held."""
     runner = _fenced(_Runner(_dense_model()))
     ckpt = _dense_checkpoint()
-    _legacy_reload(runner, path, {"attn.o_proj.weight": ckpt["attn.o_proj.weight"]})
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        _legacy_reload(runner, path, {"attn.o_proj.weight": ckpt["attn.o_proj.weight"]})
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
 
@@ -683,7 +703,10 @@ def test_a_failed_update_while_fenced_does_not_count_toward_lifting_it(path):
 
     with pytest.raises(RuntimeError, match="could not be written"):
         _direct_reload(runner, path, unfit)
-    _direct_reload(runner, path, {"attn.o_proj.weight": later["attn.o_proj.weight"]})
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        _direct_reload(
+            runner, path, {"attn.o_proj.weight": later["attn.o_proj.weight"]}
+        )
 
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
@@ -705,7 +728,8 @@ def test_a_failed_update_leaves_no_expert_shard_for_a_later_one_to_complete():
     with pytest.raises(RuntimeError, match="stream broke"):
         runner.update_weights(broken())
     rest = [(n, t) for n, t in _expert_checkpoint().items() if n != first]
-    runner.update_weights(rest)
+    with pytest.raises(RuntimeError, match="did not rewrite every parameter"):
+        runner.update_weights(rest)
 
     with pytest.raises(RuntimeError, match="fenced"):
         runner.assert_weight_update_ready()
@@ -772,6 +796,34 @@ def test_a_legacy_reload_is_refused_while_a_transaction_is_open(monkeypatch, pat
     assert runner.model.attn.o_proj.weight.eq(0.0).all()
     runner.apply_weight_bucket(rest)
     assert runner.commit_weight_update(1)["loaded_internal"] == 3
+
+
+def test_a_transaction_is_refused_while_an_shm_or_ipc_reload_is_open():
+    """The engine can run an RDMA stream between that reload's buckets. Taken,
+    it committed, and the reload's later buckets went on over it, the two
+    versions mixed where coverage could not see it."""
+    runner = _Runner(_dense_model())
+    flat, meta = _staged(_dense_checkpoint())
+    names = list(meta)
+    with _shm_segment(flat) as shm_name:
+        first = {n: meta[n] for n in names[:2]}
+        runner.update_weights_from_shm(shm_name, first, is_last=False)
+        with pytest.raises(RuntimeError, match="SHM or IPC reload is open"):
+            runner.begin_weight_update(1)
+        rest = {n: meta[n] for n in names[2:]}
+        runner.update_weights_from_shm(shm_name, rest, is_last=True)
+
+    runner.begin_weight_update(1)
+
+
+def test_a_transaction_is_refused_while_the_weights_are_released():
+    """Released, each parameter is an empty placeholder, and a stream written
+    into it failed only once every rank had joined and taken it."""
+    runner = _Runner(_dense_model())
+    runner._weights_discarded = True
+
+    with pytest.raises(RuntimeError, match="weights are released"):
+        runner.begin_weight_update(1)
 
 
 def test_a_failed_update_elsewhere_leaves_an_open_transaction_its_shards(
