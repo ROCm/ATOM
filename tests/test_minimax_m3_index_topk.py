@@ -27,6 +27,11 @@ import torch
 
 pytest.importorskip("triton", reason="index_topk defines @triton.jit kernels")
 
+# `aiter.dtypes.fp8` rather than a hardcoded `float8_e4m3fn`: the two ROCm archs
+# disagree on which flavour is native, and these tests must build the container
+# the runtime actually allocates.
+import aiter
+
 from atom.model_ops.minimax_m3 import index_topk as m
 from atom.model_ops.minimax_m3.index_topk import (
     PREFILL_TOPK_MAX_BLOCK_SIZE_K,
@@ -217,7 +222,12 @@ def _inputs(qlens, prefixes, heads, device):
 
     return {
         "idx_q": randn(total_q, heads, HEAD_DIM),
-        "index_kv_cache": randn(batch * nblk, SPARSE_BLOCK_SIZE, HEAD_DIM),
+        # fp8 because that is the only index cache the scorers serve; bf16 is
+        # refused at pool allocation, so no configuration reaches them with it.
+        # `idx_q` stays bf16 -- that is the Q dtype, not the cache's.
+        "index_kv_cache": randn(batch * nblk, SPARSE_BLOCK_SIZE, HEAD_DIM).to(
+            aiter.dtypes.fp8
+        ),
         "block_table": torch.arange(batch * nblk, **i32).view(batch, nblk),
         "cu_seqlens_q": torch.tensor(
             [0, *torch.tensor(qlens).cumsum(0).tolist()], **i32
@@ -591,8 +601,9 @@ def test_the_two_selectors_agree_where_the_dispatch_switches():
     from atom.model_ops.minimax_m3 import index_topk as m2
     from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
 
-    if m2.topk_per_row_small_k is None:
-        pytest.skip("aiter's small-k selector is not installed")
+    # Resolved on use, and not optional: an aiter without it is an ImportError
+    # here rather than a skip, which is the whole point of dropping the guard.
+    m2._topk_small_k()
     batch, heads, ctx = 2, 1, m2._AITER_MIN_WIDTH_WITH_EMIT * SPARSE_BLOCK_SIZE
     kw = _inputs([1] * batch, [ctx - 1] * batch, heads, "cuda")
     md = make_sparse_decode_metadata(
@@ -683,17 +694,14 @@ class TestDecodeScoreAgainstTheDefinition:
             index_score_work_map=work_map, index_score_max_block=max_block,
         )  # fmt: skip
 
-    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("max_query_len", [1, 8])
     @pytest.mark.parametrize("ragged", [False, True], ids=["uniform", "ragged"])
     def test_the_scores_are_the_ones_the_definition_asks_for(
-        self, ragged, max_query_len, fp8
+        self, ragged, max_query_len
     ):
         batch, heads = 6, 2
         prefixes = [8192, 1024, 65536, 256, 16384, 512] if ragged else [8192] * batch
         kw = _inputs([max_query_len] * batch, prefixes, heads, "cuda")
-        if fp8:
-            kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
         max_block = -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE)
         work_map = m.build_index_score_work_map(
             kw["seq_lens"],
@@ -861,11 +869,9 @@ def _prefill_score_oracle(kw, heads, cache=None):
     return out
 
 
-def _prefill_score(kw, heads, backend, fp8=False):
+def _prefill_score(kw, heads, backend):
     """`prefill_index_score` on `_inputs` kwargs, plus the oracle's live mask."""
     cache = kw["index_kv_cache"]
-    if fp8:
-        cache = cache.to(torch.float8_e4m3fn)
     score = m.prefill_index_score(
         kw["idx_q"], cache, kw["block_table"], kw["cu_seqlens_q"], kw["seq_lens"],
         kw["prefix_lens"], kw["max_query_len"], kw["max_seq_len"], kw["sm_scale"],
@@ -932,14 +938,13 @@ class TestPrefillScoreAgainstTheDefinition:
     """
 
     @pytest.mark.parametrize("backend", ["flydsl", "triton"])
-    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("heads", [1, 2], ids=["cp-slice", "tp"])
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
     def test_the_scores_are_the_ones_the_definition_asks_for(
-        self, qlens, prefixes, heads, fp8, backend
+        self, qlens, prefixes, heads, backend
     ):
         kw = _inputs(qlens, prefixes, heads, "cuda")
-        score, want = _prefill_score(kw, heads, backend, fp8)
+        score, want = _prefill_score(kw, heads, backend)
         assert score.shape == want.shape
         # Only where the scorer is required to write: the oracle marks the rest
         # NaN, and past its own tile's window a scorer leaves the slot
@@ -947,7 +952,7 @@ class TestPrefillScoreAgainstTheDefinition:
         live = ~torch.isnan(want)
         assert live.any()
         # atol 1e-3, not 2e-2. Measured worst case over every shape, head count
-        # and backend here is 1.7e-5 on an fp8 cache and ~0 on bf16, so 2e-2
+        # and backend here is 1.7e-5 on an fp8 cache, so 2e-2
         # was three orders of magnitude of slack -- enough that the oracle
         # could model the WRONG rounding (lifting K to Q, which is decode's
         # rule) and still pass at 1.69e-2, within 18% of the bound. 1e-3 keeps
@@ -960,9 +965,32 @@ class TestPrefillScoreAgainstTheDefinition:
         kw = _inputs(*PREFILL_SHAPES[1], 2, "cuda")
         _, want = _prefill_score(kw, 2, backend)
         live = ~torch.isnan(want)
-        kw["index_kv_cache"][kw["block_table"][1, 0]] += 1.0
+        # fp8 has no add kernel, so the perturbation happens in float.
+        page = kw["block_table"][1, 0]
+        kw["index_kv_cache"][page] = (
+            kw["index_kv_cache"][page].to(torch.float32) + 1.0
+        ).to(kw["index_kv_cache"].dtype)
         moved, _ = _prefill_score(kw, 2, backend)
         assert not torch.allclose(moved[live], want[live], rtol=2e-2, atol=2e-2)
+
+
+@gpu
+def test_a_bf16_index_cache_is_refused_by_name():
+    """bf16 was served by the Triton decode scorer, which this change deletes.
+
+    The FlyDSL scorers take fp8 only, so ATOM refuses bf16 itself rather than
+    letting it reach aiter -- aiter's dtype error names neither the flag to pass
+    nor that ATOM is what refuses. `_resolve_index_cache_dtype` refuses the same
+    configuration earlier, when the pool is allocated; this pins the scorer's
+    backstop for any path that did not come through it.
+    """
+    kw = _inputs([1, 1], [511, 511], 1, "cuda")
+    kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.bfloat16)
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        m.decode_index_score(
+            kw["idx_q"], kw["index_kv_cache"], kw["block_table"], kw["seq_lens"],
+            -(-kw["max_seq_len"] // SPARSE_BLOCK_SIZE), 1, 1, kw["sm_scale"],
+        )  # fmt: skip
 
 
 @gpu
@@ -974,32 +1002,25 @@ class TestPrefillScorersAgree:
     rest of the model actually consumes.
     """
 
-    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
-    def test_the_two_scorers_agree_where_either_owes_an_answer(
-        self, qlens, prefixes, fp8
-    ):
+    def test_the_two_scorers_agree_where_either_owes_an_answer(self, qlens, prefixes):
         kw = _inputs(qlens, prefixes, 2, "cuda")
-        fly, want = _prefill_score(kw, 2, "flydsl", fp8)
-        tri, _ = _prefill_score(kw, 2, "triton", fp8)
+        fly, want = _prefill_score(kw, 2, "flydsl")
+        tri, _ = _prefill_score(kw, 2, "triton")
         live = ~torch.isnan(want)
         # Same bound as the oracle comparison above, for the same reason: each
         # scorer sits within 1.7e-5 of the definition, so they sit within twice
         # that of each other and 2e-2 would hide a real divergence.
         assert torch.allclose(fly[live], tri[live], rtol=2e-2, atol=1e-3)
 
-    @pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
     @pytest.mark.parametrize("qlens,prefixes", PREFILL_SHAPES, ids=PREFILL_IDS)
-    def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes, fp8):
+    def test_the_selection_is_the_same(self, monkeypatch, qlens, prefixes):
+        # The case `auto` actually dispatches, and now the only one: `k_lds` --
+        # with it any reason to run the flydsl prefill scorer at all -- is legal
+        # only on an fp8 cache, and bf16 is refused before it can reach either
+        # scorer. This is the test that can see a tie resolve to a different
+        # block.
         kw = _inputs(qlens, prefixes, 2, "cuda")
-        if fp8:
-            # The case `auto` actually dispatches. `k_lds` -- and with it any
-            # reason to run the flydsl prefill scorer at all -- is legal only
-            # on an fp8 cache, so a bf16-only selection check covers everything
-            # except the configuration this dispatch exists to reach. The score
-            # comparison above runs both dtypes; this is the exact one, which
-            # is the only test that can see a tie resolve to a different block.
-            kw["index_kv_cache"] = kw["index_kv_cache"].to(torch.float8_e4m3fn)
         picked = []
         for backend in ("flydsl", "triton"):
             monkeypatch.setenv("ATOM_M3_PREFILL_INDEX_SCORE", backend)

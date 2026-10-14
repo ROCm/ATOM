@@ -107,6 +107,19 @@ except ImportError:  # pragma: no cover - depends on the installed aiter
 
 from atom.utils import envs
 
+# Said by the KV pool allocator that sizes the index cache and by
+# `decode_index_score`'s own guard, so the two cannot drift into naming
+# different flags for the same refusal.
+# Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn, and the allocator
+# hands back whichever `aiter.dtypes.fp8` is on this part.
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+INDEX_CACHE_MUST_BE_FP8 = (
+    "MiniMax-M3's index cache must be fp8: the FlyDSL scorers are the only "
+    "index scorers and they serve fp8 only (ROCm/aiter#5626). Pass "
+    "--index-cache-dtype fp8."
+)
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 # Query rows one prefill score program owns.
@@ -1412,6 +1425,8 @@ def decode_index_score(
     downstream -- except to `_select_with_aiter`, which needs a view and checks
     contiguity for exactly this reason.
     """
+    if index_kv_cache.dtype not in _FP8_DTYPES:
+        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_kv_cache.dtype}.")
     batch = seq_lens.shape[0]
     if work_map is None:
         work_map = build_index_score_work_map(

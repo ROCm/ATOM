@@ -200,11 +200,13 @@ def _assert_chain_matches_tp(
     local,
     transport,
     seed,
-    cache_dtype=torch.bfloat16,
+    cache_dtype=None,  # fp8; resolved at call time, the arch picks the flavour
     pad=0,
 ):
+    # fp8 is the only index cache the scorers serve, so it is what the whole
+    # parity chain is exercised on rather than one test out of the file.
     idx_q, cache, block_table, lens, _ = _inputs(
-        batch, max_seq_len, q, cache_dtype, seed
+        batch, max_seq_len, q, cache_dtype or aiter.dtypes.fp8, seed
     )
     reference = _tp_reference(
         idx_q, cache, block_table, lens, max_seq_len, topk, init, local, q
@@ -347,6 +349,19 @@ def test_parity_holds_on_an_fp8_index_cache(max_query_len, pad):
 
 
 @needs_gpu
+def test_a_bf16_index_cache_is_refused_by_name():
+    """bf16 used to be served by the Triton decode scorer, which this change
+    deletes. The FlyDSL one takes fp8 only, so bf16 is refused rather than
+    passed down -- a dtype error raised inside aiter names neither the flag to
+    pass nor that ATOM is the thing refusing. The pool allocator refuses the
+    same configuration earlier, at startup; this pins the scorer's own backstop
+    for any path that did not come through it."""
+    idx_q, cache, block_table, lens, _ = _inputs(2, 512, 1, torch.bfloat16, 11)
+    with pytest.raises(ValueError, match="index-cache-dtype fp8"):
+        _shard_score(idx_q, cache, block_table, lens, 512, 0, 1, 0)
+
+
+@needs_gpu
 def test_both_transports_deliver_the_same_tensor():
     """The two transports must be interchangeable, not merely both correct.
 
@@ -354,7 +369,7 @@ def test_both_transports_deliver_the_same_tensor():
     all-gather's int64/int32 view round trip would surface only above or only
     below the threshold -- and only in the arm nobody benchmarked.
     """
-    idx_q, cache, block_table, lens, _ = _inputs(4, 4096, 1, torch.bfloat16, 31)
+    idx_q, cache, block_table, lens, _ = _inputs(4, 4096, 1, aiter.dtypes.fp8, 31)
     keys = _cp_candidates(idx_q, cache, block_table, lens, 4096, 16, 1, 2, 1, pad=0)
     for head in range(WORLD):
         a2a = _exchange(keys, head, "all_to_all")
@@ -363,9 +378,8 @@ def test_both_transports_deliver_the_same_tensor():
 
 
 @needs_gpu
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, "fp8"])
 @pytest.mark.parametrize("max_query_len", [1, 4])
-def test_the_shard_scores_match_the_definition(max_query_len, cache_dtype):
+def test_the_shard_scores_match_the_definition(max_query_len):
     """The anchor the rest of this file no longer has.
 
     Every other test here compares the CP chain against `_tp_reference`, and
@@ -378,7 +392,7 @@ def test_the_shard_scores_match_the_definition(max_query_len, cache_dtype):
     Compared in the kernel's base-2 units, and only where it is required to
     write: the scorer leaves every block past a request's length untouched.
     """
-    dtype = aiter.dtypes.fp8 if cache_dtype == "fp8" else cache_dtype
+    dtype = aiter.dtypes.fp8
     max_seq_len, batch = 4096, 4
     idx_q, cache, block_table, lens, blocks = _inputs(
         batch, max_seq_len, max_query_len, dtype, 41
@@ -444,7 +458,7 @@ def test_a_shard_that_runs_past_the_global_end_is_not_selectable(blocks):
     assert any(
         len(range(r, blocks, WORLD)) < local for r in range(WORLD)
     ), "the shape under test divides evenly and cannot show the bug"
-    idx_q, cache, block_table, lens, _ = _inputs(2, max_seq_len, 1, torch.bfloat16, 5)
+    idx_q, cache, block_table, lens, _ = _inputs(2, max_seq_len, 1, aiter.dtypes.fp8, 5)
 
     def selection(poison):
         keys = []

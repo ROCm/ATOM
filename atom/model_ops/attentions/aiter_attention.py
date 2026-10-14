@@ -70,15 +70,38 @@ def _is_indexed_sparse_attention(module) -> bool:
 
 
 def _resolve_index_cache_dtype(config) -> torch.dtype:
+    """MiniMax-M3's index cache dtype, refused here if the scorers cannot serve it.
+
+    fp8 only. The FlyDSL scorers are the only index scorers and they take an
+    fp8 cache (ROCm/aiter#5626); the Triton decode kernels that used to serve
+    bf16 are gone. Refusing at pool allocation rather than at the first decode
+    is the point: the same configuration otherwise starts, serves a prefill,
+    and dies 57 layers into a step with a dtype error raised inside aiter, which
+    names neither the flag to pass nor where the value came from.
+    """
     from aiter import dtypes
 
+    from atom.model_ops.minimax_m3.index_topk import INDEX_CACHE_MUST_BE_FP8
+
     index_cache_dtype = getattr(config, "index_cache_dtype", None)
-    if index_cache_dtype is None:
+    inherited = index_cache_dtype is None
+    if inherited:
         index_cache_dtype = getattr(config, "kv_cache_dtype", "bf16")
-    if index_cache_dtype in ("bf16", "fp8"):
-        return dtypes.d_dtypes[index_cache_dtype]
+    if index_cache_dtype == "fp8":
+        return dtypes.d_dtypes["fp8"]
+    if index_cache_dtype == "bf16":
+        raise ValueError(
+            f"{INDEX_CACHE_MUST_BE_FP8} Got 'bf16'"
+            + (
+                ", inherited from --kv_cache_dtype because --index-cache-dtype "
+                "was not passed."
+                if inherited
+                else "."
+            )
+        )
     raise ValueError(
-        "index_cache_dtype must be 'bf16' or 'fp8', " f"got {index_cache_dtype!r}"
+        f"index_cache_dtype must be 'fp8', got {index_cache_dtype!r}. "
+        f"{INDEX_CACHE_MUST_BE_FP8}"
     )
 
 

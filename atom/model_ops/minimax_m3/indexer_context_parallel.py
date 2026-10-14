@@ -4,8 +4,10 @@ import torch
 import triton
 
 from atom.model_ops.minimax_m3.index_topk import (
+    _FP8_DTYPES,
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
+    INDEX_CACHE_MUST_BE_FP8,
     PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _launch_select,
@@ -77,12 +79,8 @@ def indexer_context_scores(
         or not index_cache.is_contiguous()
     ):
         raise ValueError("index cache must be contiguous [pages,128,128]")
-    if index_cache.dtype not in (
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        raise ValueError("unsupported index cache dtype")
+    if index_cache.dtype not in _FP8_DTYPES:
+        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_cache.dtype}.")
     blocks = triton.cdiv(max_seq_len, 128)
     if (
         block_table.ndim != 2
