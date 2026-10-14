@@ -443,10 +443,8 @@ def _stage_forward(sizes, rank, rows, monkeypatch=None):
         (False, [40], [True], (40, 40, 0, 1)),
         # two finishing prompts: tails capped at the window, one row each
         (True, [500, 64], [True, True], (128 + 64, 2, 1, 1)),
-        # a non-final chunk: placeholder rows, no decoder work of its own
-        (True, [16384], [False], (2, 2, 1, 0)),
-        # a 1-row non-final chunk: one placeholder row
-        (True, [1], [False], (1, 1, 1, 0)),
+        # a non-final chunk: one placeholder row, no decoder work of its own
+        (True, [16384], [False], (1, 1, 1, 0)),
     ],
 )
 def test_a_rank_reports_its_stage_tokens_from_the_batch(
@@ -474,8 +472,8 @@ def test_the_plan_runs_what_the_rank_reported():
     reported = local_stage_tokens(lengths, finals, 128, 505, replaying=True)
     assert plan_stage_tokens(plan, 505) == reported[:2] == (133, 2)
     idle = _forward_step(cache, [300], [0], [False])
-    assert plan_stage_tokens(build_replay_plan(idle, 128), 300) == (2, 2)
-    assert local_stage_tokens([300], [False], 128, 300, replaying=True)[:2] == (2, 2)
+    assert plan_stage_tokens(build_replay_plan(idle, 128), 300) == (1, 1)
+    assert local_stage_tokens([300], [False], 128, 300, replaying=True)[:2] == (1, 1)
     assert plan_stage_tokens(None, 40) == (40, 40)
 
 
@@ -501,21 +499,21 @@ def test_a_group_with_no_decoder_work_skips_the_decoder():
     placeholder rows through layers 20..39."""
     from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
 
-    rows = ((2, 2), (2, 2), (1, 1), (0, 0))
+    rows = ((1, 1), (1, 1), (1, 1), (0, 0))
     got = dp_stage_tokens(_stage_forward([16384, 16384], 0, rows))
     assert got is not None and not got.decoder_active
 
 
 def test_a_placeholder_count_equal_to_the_ranks_own_still_replays():
-    """A 2-row non-final prefill beside a decoding peer: the placeholder count
+    """A 1-row non-final prefill beside a decoding peer: the placeholder count
     equals the rank's own, yet the table still drives the group, since the
     replay decision is an explicit flag, not a changed count."""
     from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
 
-    rows = ((2, 40), (2, 40), (1, 0), (0, 1))
-    got = dp_stage_tokens(_stage_forward([2, 40], 0, rows))
+    rows = ((1, 40), (1, 40), (1, 0), (0, 1))
+    got = dp_stage_tokens(_stage_forward([1, 40], 0, rows))
     assert got is not None and got.decoder_active
-    assert got.decoder == (2, 40) and got.last_layer == (2, 40)
+    assert got.decoder == (1, 40) and got.last_layer == (1, 40)
 
 
 def test_a_placeholder_step_cuts_the_image_mask_to_its_rows():
@@ -606,7 +604,7 @@ def test_placeholder_rows_run_every_decoder_layer_under_its_stage(monkeypatch):
     from atom.models.deepseek_v41 import runtime
     from atom.utils import forward_context as fc
 
-    rows = ((2, 128), (2, 1), (1, 1), (0, 1))
+    rows = ((1, 128), (1, 1), (1, 1), (0, 1))
     forward = _stage_forward([16384, 500], 0, rows)
     forward.attn_metadata = SimpleNamespace(
         step=SimpleNamespace(requests=()), queries=None, image_mask=None
@@ -626,6 +624,6 @@ def test_placeholder_rows_run_every_decoder_layer_under_its_stage(monkeypatch):
     normed = torch.zeros(1, 16384, 4)
     model._join_decoder_collectives(forward, layer20, None, normed, [])
     assert [i for i, _ in log] == list(range(20, 40))
-    assert all(sizes == (2, 128) for i, sizes in log if i < 39)
-    assert log[-1] == (39, (2, 1))
+    assert all(sizes == (1, 128) for i, sizes in log if i < 39)
+    assert log[-1] == (39, (1, 1))
     assert forward.dp_metadata.get_sizes_across_dp() == [16384, 500]

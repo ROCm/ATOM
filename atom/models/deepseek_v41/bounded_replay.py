@@ -126,21 +126,11 @@ class DPStageTokens:
     ``decoder_active``: whether any rank has decoder work -- a tail of its
     own, or all its rows because it does not replay. When none does, every
     rank skips the decoder; otherwise a replaying rank without a tail joins
-    each collective on placeholder tokens."""
+    each collective on one placeholder row."""
 
     decoder: tuple[int, ...]
     last_layer: tuple[int, ...]
     decoder_active: bool = True
-
-
-# Rows a DP rank without decoder work of its own runs through the decoder to
-# join a peer's MoE collectives (`placeholder_rows_of`). Two, not one: the
-# decoder graph is compiled dynamic in its rows, and one row would specialize it.
-DP_PLACEHOLDER_TOKENS = 2
-
-
-def placeholder_tokens(num_tokens: int) -> int:
-    return min(DP_PLACEHOLDER_TOKENS, num_tokens)
 
 
 def tail_lengths(lengths, window: int) -> np.ndarray:
@@ -158,14 +148,15 @@ def local_stage_tokens(
     counts `plan_stage_tokens` reads off the replay plan afterwards. A rank
     that does not replay runs all its rows through both stages; one that
     replays runs each finishing request's tail through the decoder and its
-    last row through layer 39, or placeholder rows when nothing finishes.
+    last row through layer 39, or one placeholder row when nothing finishes.
     """
     if not replaying:
         return num_tokens, num_tokens, 0, 1
     tails = tail_lengths(lengths, window)[np.asarray(finals, dtype=bool)]
     if not len(tails):
-        placeholder = placeholder_tokens(num_tokens)
-        return placeholder, placeholder, 1, 0
+        # Nothing finishes: one placeholder row joins the peers' collectives
+        # (`DeepseekV41RuntimeModel._join_decoder_collectives`).
+        return 1, 1, 1, 0
     return int(tails.sum()), len(tails), 1, 1
 
 
@@ -174,8 +165,7 @@ def plan_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
     if plan is None:
         return num_tokens, num_tokens
     if plan.tail is None:
-        placeholder = placeholder_tokens(num_tokens)
-        return placeholder, placeholder
+        return 1, 1
     return plan.tail.scheduled, len(plan.tail.requests)
 
 
