@@ -66,7 +66,7 @@ permissions:
   contents: read
   pull-requests: write
 
-# Five entries across two concurrency levels, 10 jobs. It was a single-entry
+# Four entries across two concurrency levels, 8 jobs. It was a single-entry
 # smoke until d76360456; the matrix step now fails on a short matrix rather
 # than letting a typo surface at the judge as `partial`.
 # Narrowing for an experiment is a change to this block and nothing else.
@@ -77,43 +77,55 @@ permissions:
 env:
   # Catalog prefixes, not display names -- MiniMax-M3-MXFP8 is `m3-mxfp8` here.
   # DeepSeek-V4-Pro MTP3 is added automatically alongside its base by the matrix
-  # step, so four names produce five entries.
-  PERF_MODELS: deepseek-v4-pro,kimi-k3,m3-mxfp8,glm-5-2-fp8
+  # step, so three names produce four entries.
+  # Kimi-K3 is deliberately absent. It is the most expensive entry by a wide
+  # margin -- 97 of the matrix's 327 measured machine-minutes, and its c=256
+  # job alone ran 64 minutes against the next longest at 55 -- so it set both
+  # the bill and the wall clock on its own. Dropping it costs this line its
+  # view of the largest model, where memory, EP dispatch and long-sequence
+  # behaviour would show first; the nightly still measures it every night on
+  # real weights across the full concurrency band.
+  PERF_MODELS: deepseek-v4-pro,m3-mxfp8,glm-5-2-fp8
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
-  PERF_JUDGING_CONCS: 32,256
+  # c=128 rather than c=256. Both are large-batch, and the nightly keeps
+  # c=256, but the step down is worth 44% of this line's machine time: a wave
+  # at c=128 costs 0.44-0.63 of one at c=256 across these entries, measured
+  # from nightly job times with model load subtracted out.
+  PERF_JUDGING_CONCS: 32,128
   # Empty: every level this line runs is judged. c=4 was the reference level
   # and went with the rest -- at two jobs per entry there is no room for a
   # level that contributes no detection.
   PERF_REFERENCE_CONCS: ""
-  PERF_EXPECTED_ENTRIES: 5
+  PERF_EXPECTED_ENTRIES: 4
   # Measured-window length per level, as a multiple of the level. Unlisted
-  # levels run the nightly's CONC * 10; c=32 is one of them, where the window
-  # is only 298s and shortening it would buy ~2.5 min on a job that is not the
-  # one setting the wall clock.
+  # levels run the nightly's CONC * 10.
   #
-  # c=256 is. Three phases of 1307s make it 50.6 min against c=32's 18.5, 73%
-  # of the matrix's machine time, and the longest single job is the floor the
-  # whole run waits on. The window is linear in this number (at c=64, 64
-  # prompts took 98.03s and 640 took 982.64s -- 10.02x), so x4 takes that
-  # window from 982s to 393s and the job to ~31 min.
+  # The window is linear in this number -- at c=64, 64 prompts took 98.03s and
+  # 640 took 982.64s, 10.02x; at c=256, one wave took 78.01s against four at
+  # 311.60s, 0.13% off -- so this is the one knob that trades measurement
+  # length for time directly.
   #
   # What x4 does not cost: --seed is pinned, so base and head draw identical
   # prompts and identical output lengths. Workload sampling contributes nothing
-  # to the delta at either length -- the shorter window averages run-level
-  # noise (thermal, clock, scheduling) over less time, and nothing else.
+  # to the delta at either length; what a shorter window loses is averaging
+  # time over run-level noise. Measured at x4 on an exclusive node, four phases
+  # on one commit: signal -0.22%, drift -0.23%, three readings spanning 0.34
+  # points. In CI at x4 the shipped matrix gave -1.1 to +2.4 across ten A/A
+  # readings, which is what RESIDUAL_SPREAD_PCT follows at 2.5.
   #
-  # Measured since: on mi355-gpu-41 three readings of one commit spanned 0.34
-  # points, and in CI the shipped matrix gave -1.1 to +2.4 across ten A/A
-  # readings. RESIDUAL_SPREAD_PCT follows that at 2.5. The linearity holds at
-  # this level too -- one wave took 78.01s and four took 311.60s, 0.13% off
-  # four times the first.
+  # Those figures were taken at c=256. This line now judges c=128, where the
+  # window is the same four waves but each wave is shorter, so the residual
+  # has to be re-read from the first complete runs at this level rather than
+  # assumed to carry over.
   #
   # What it does not touch: the CONC * 2 `--num-warmups` atom_test.sh runs
-  # before the measured window, and server launch and teardown -- 325s per
-  # phase at c=256, which is why 4/10 of the window is ~2/3 of the job.
-  PERF_PROMPT_MULTS: "256:4"
+  # before the measured window, nor launch and teardown. At c=256 that
+  # overhead was 8.5-9.5 min per phase, three phases a job -- the floor no
+  # window length can go under, and the reason 30 minutes of wall clock is not
+  # reachable by shortening windows alone.
+  PERF_PROMPT_MULTS: "128:4"
   # Pinned so the pairing's determinism is this workflow's property rather than
   # an upstream default's. perf_check_half.sh carries the argument.
   PERF_SEED: 0
@@ -157,11 +169,12 @@ env:
   # the direction an advisory check should fail in, and the nightly measures
   # this model on real weights every night. The alternative buys those points
   # back by turning the warmup into a third full-length phase, taking the
-  # c=256 job from 29 minutes to about 50 and the matrix past 90 minutes of
-  # wall clock. One entry's bias is not worth the whole run's schedule.
+  # longest job from about 30 minutes to 50. One entry's bias is not worth the
+  # whole run's schedule.
   # Revisit if a second entry does the same, or if this one grows.
   #
-  # Kimi-K3 at c=32 read -12.1% and -11.6% on TTFT in two runs and looked like
+  # Kimi-K3, back when it was still in the matrix, read -12.1% and -11.6% on
+  # TTFT at c=32 in two runs and looked like
   # a second one, but the run before them read -0.5%, and M3 at the same level
   # gave +0.4% and +5.0%. That is this level behaving as the header already
   # says it does, not a bias -- two readings out of three is not a direction.
@@ -347,7 +360,8 @@ jobs:
           # The `|| true` then swallowed it, so this step reported success while
           # doing nothing at all and the debris it exists to clear went on to
           # kill the next job's checkout. Five of the ten cells of run
-          # 37909731003 died that way, before a line of this workflow ran.
+          # 37909731003 died that way -- when the matrix still ran ten --
+          # before a line of this workflow had run.
           if [ -d "${GITHUB_WORKSPACE}" ]; then
             if ! docker run --rm -v "${GITHUB_WORKSPACE}":/workspace -w /workspace \
                    rocm/atom-dev:latest bash -lc \
