@@ -10,10 +10,9 @@ sparse block maps to exactly one page.
 The two phases score differently and then share a Triton selector. Decode
 scores on the matrix cores through aiter's flydsl kernel (`decode_index_score`),
 which is the only decode scorer -- there is no Triton fallback behind it.
-Prefill has two, chosen by `ATOM_M3_PREFILL_INDEX_SCORE` in
-`prefill_index_score`: aiter's flydsl prefill kernel, and the Triton query-tile
-kernel (`_index_block_score_kernel`) it is being measured against. Both are
-live only until that measurement decides; the loser goes the way decode's did.
+Prefill runs the same flydsl family (`prefill_index_score`). The Triton
+query-tile kernel (`_index_block_score_kernel`) stays as the reference the
+tests hold it against, reachable by naming it, not by configuration.
 
 Index-K cache layout: ``(num_blocks, 128, idx_head_dim)``. The indexer is MQA:
 index_q carries num_idx_heads heads, index_k one, shared by all of them.
@@ -91,13 +90,11 @@ def _topk_small_k():
     return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
-# aiter's MFMA prefill block-score kernel. Optional, unlike the decode one: it
-# is newer than the aiter ATOM pins, and an aiter without it is still a working
-# M3 that scores prefill in Triton. `_prefill_score_backend` decides, and only
-# it is allowed to treat a missing kernel as a fallback.
-#
-# Imported by module path because `aiter.ops.flydsl` does not re-export it yet;
-# when it does, this collapses into the import above.
+# aiter's MFMA prefill block-score kernel, by module path because
+# `aiter.ops.flydsl` does not re-export it yet. Guarded for the reason
+# `_flydsl` is deferred, which `test_the_symbols_are_not_imported_at_module_scope`
+# pins: `sparse_attn` imports this module and the vLLM backend imports that, so
+# a hard import here takes the MLA prefill backends down with it.
 try:
     from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
         score_prefill_flydsl,
@@ -105,11 +102,8 @@ try:
 except ImportError:  # pragma: no cover - depends on the installed aiter
     score_prefill_flydsl = None
 
-from atom.utils import envs
-
-# Said by the KV pool allocator that sizes the index cache and by
-# `decode_index_score`'s own guard, so the two cannot drift into naming
-# different flags for the same refusal.
+# Shared by all four allocators and by `decode_index_score`, so they cannot
+# drift into naming different flags for the same refusal.
 # Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn, and the allocator
 # hands back whichever `aiter.dtypes.fp8` is on this part.
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -1132,47 +1126,6 @@ def _topk_index_packed_kernel(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
-PREFILL_INDEX_SCORE_BACKENDS = ("auto", "flydsl", "triton")
-
-
-def _prefill_score_backend(
-    backend: str | None = None, *, fp8_cache: bool = False
-) -> str:
-    """Which prefill scorer runs: ``"flydsl"`` or ``"triton"``.
-
-    ``"auto"`` -- the default -- follows ``fp8_cache``, because that is what
-    decides whether the flydsl kernel is the faster one at all; the comment on
-    the branch below has the numbers. It also falls back to Triton on an aiter
-    that predates the kernel. The two explicit values NEVER fall back: an arm
-    that asked for flydsl and silently got Triton is a wrong measurement rather
-    than a degraded one, and a silent fallback has already cost one wrong
-    conclusion on this model. Ask for one of them by name when measuring.
-    """
-    if backend is None:
-        backend = envs.ATOM_M3_PREFILL_INDEX_SCORE
-    if backend not in PREFILL_INDEX_SCORE_BACKENDS:
-        raise ValueError(
-            f"ATOM_M3_PREFILL_INDEX_SCORE must be one of "
-            f"{PREFILL_INDEX_SCORE_BACKENDS}, got {backend!r}"
-        )
-    if backend == "auto":
-        # Follows the CACHE DTYPE. `k_lds` -- the path that stages K through
-        # LDS and so reads a quarter of the K bytes -- is legal only on an fp8
-        # k128 cache; without it the kernel takes a register path that measured
-        # 3.6-4.8x SLOWER than Triton at 32k-116k context. On an fp8 cache it
-        # is 36.1/41.8/45.9% FASTER at those same contexts (one index head,
-        # 32768-token chunk), so the dtype is what decides.
-        if score_prefill_flydsl is None:
-            return "triton"
-        return "flydsl" if fp8_cache else "triton"
-    if backend == "flydsl" and score_prefill_flydsl is None:
-        raise RuntimeError(
-            "ATOM_M3_PREFILL_INDEX_SCORE=flydsl, but the installed aiter has no "
-            "aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill"
-        )
-    return backend
-
-
 def prefill_index_score(
     idx_q,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache,  # [num_blocks, 128, head_dim]
@@ -1188,7 +1141,7 @@ def prefill_index_score(
     """The prefill block scores, ``[num_idx_heads, total_q, max_block]`` fp32.
 
     The ragged counterpart of :func:`decode_index_score`, and the one place the
-    two prefill scorers are chosen between (`_prefill_score_backend`). Both
+    two prefill scorers are chosen between. Both
     produce the same layout -- aiter's `alloc_score` is deliberately the one the
     Triton kernel wrote -- so everything downstream is blind to the choice.
 
@@ -1202,12 +1155,12 @@ def prefill_index_score(
     Unlike decode there is no indexer-CP variant: prefill stays TP and is handed
     a single index head (see `_sparse_prefill`), so there is no shard to remap.
     """
-    # Resolved before anything reads a shape: a bad backend name is a
-    # configuration error and should not depend on the tensors being valid.
-    # `.dtype` is metadata rather than a shape, so reading it here keeps that.
-    resolved = _prefill_score_backend(
-        backend, fp8_cache=index_kv_cache.dtype != torch.bfloat16
-    )
+    # flydsl, unless a caller names the Triton scorer. There is no env knob and
+    # no dtype routing: bf16 is refused before it reaches either scorer, so the
+    # choice only exists for the tests that hold the two side by side.
+    if backend not in (None, "flydsl", "triton"):
+        raise ValueError(f"backend must be 'flydsl' or 'triton', got {backend!r}")
+    resolved = backend or "flydsl"
 
     total_q, num_idx_heads, head_dim = idx_q.shape
     batch = cu_seqlens_q.shape[0] - 1

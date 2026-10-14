@@ -22,6 +22,7 @@ abort the run for every other test as well.
 
 from __future__ import annotations
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -893,43 +894,6 @@ PREFILL_SHAPES = [
 PREFILL_IDS = ["fresh", "ragged-chunked", "q1-tail"]
 
 
-class TestPrefillScoreBackendChoice:
-    """`ATOM_M3_PREFILL_INDEX_SCORE`, which is pure Python and needs no device."""
-
-    @pytest.mark.parametrize("name", ["flydsl", "triton"])
-    def test_an_explicit_backend_is_taken_literally(self, monkeypatch, name):
-        monkeypatch.setattr(m, "score_prefill_flydsl", object())
-        assert m._prefill_score_backend(name) == name
-
-    def test_auto_follows_the_cache_dtype_not_mere_availability(self, monkeypatch):
-        """flydsl is only a win on an fp8 cache.
-
-        Its `k_lds` path -- a quarter of the K traffic -- is legal only on an
-        fp8 k128 cache; on a bf16 one the kernel takes a register fallback that
-        measures 3.6-4.8x SLOWER than Triton at 32k-116k context. So "aiter has
-        it" is the wrong thing for auto to key on.
-        """
-        monkeypatch.setattr(m, "score_prefill_flydsl", object())
-        assert m._prefill_score_backend("auto", fp8_cache=False) == "triton"
-        assert m._prefill_score_backend("auto", fp8_cache=True) == "flydsl"
-
-    def test_auto_falls_back_but_an_explicit_flydsl_never_does(self, monkeypatch):
-        """The asymmetry is the point: a measured arm must not quietly swap."""
-        monkeypatch.setattr(m, "score_prefill_flydsl", None)
-        assert m._prefill_score_backend("auto", fp8_cache=True) == "triton"
-        with pytest.raises(RuntimeError, match="no"):
-            m._prefill_score_backend("flydsl")
-
-    def test_an_unknown_name_is_rejected(self):
-        with pytest.raises(ValueError, match="must be one of"):
-            m._prefill_score_backend("fly")
-
-    def test_none_reads_the_env(self, monkeypatch):
-        monkeypatch.setattr(m, "score_prefill_flydsl", None)
-        monkeypatch.setenv("ATOM_M3_PREFILL_INDEX_SCORE", "triton")
-        assert m._prefill_score_backend() == "triton"
-
-
 @gpu
 class TestPrefillScoreAgainstTheDefinition:
     """Both prefill scorers against `_prefill_score_oracle`, not each other.
@@ -1079,8 +1043,14 @@ class TestPrefillScorersAgree:
         # block.
         kw = _inputs(qlens, prefixes, 2, "cuda")
         picked = []
+        real = m.prefill_index_score
         for backend in ("flydsl", "triton"):
-            monkeypatch.setenv("ATOM_M3_PREFILL_INDEX_SCORE", backend)
+            # Bound here rather than through a production knob: the entry point
+            # takes no backend, and adding one so a test can reach the second
+            # scorer would be a parameter nothing else wants.
+            monkeypatch.setattr(
+                m, "prefill_index_score", functools.partial(real, backend=backend)
+            )
             idx, _sbt, sctx = m.minimax_m3_index_topk(
                 **kw, emit_sparse_block_table=True
             )

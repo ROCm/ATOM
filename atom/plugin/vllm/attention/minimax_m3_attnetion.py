@@ -89,20 +89,14 @@ def minimax_m3_sparse_attention(
 def _index_cache_torch_dtype(kv_cache_dtype: str, model_config) -> torch.dtype:
     """Torch dtype for the MiniMax-M3 index cache: fp8, or a refusal.
 
-    fp8 does not go through vLLM's ``kv_cache_dtype_str_to_dtype``. That table
-    is shared by every layer of every model and its ``fp8 -> torch.uint8``
-    entry is deliberate: vLLM's kernels take an fp8 KV cache as a byte buffer
-    and reinterpret it, and so do the aiter paged kernels behind ATOM's main
-    caches. The index cache is read by a kernel that dispatches on the tensor
-    instead, so a uint8 label sends it down the bf16 branch and dots bf16
-    against uint8. ``dtypes.d_dtypes`` is the same handle the native server
-    resolves this cache through (`aiter_attention._resolve_index_cache_dtype`),
-    which keeps both paths on one arch-correct fp8 dtype. The element is one
-    byte either way, so vLLM's page-size accounting is unchanged.
+    NOT vLLM's ``kv_cache_dtype_str_to_dtype``: its ``fp8 -> torch.uint8`` is
+    right for caches read as byte buffers, but this one is read by a kernel
+    that branches on ``dtype.is_fp8()``, so a uint8 label dots bf16 against
+    uint8. Same ``dtypes.d_dtypes`` handle as the native server, and one byte
+    either way, so page accounting is unchanged.
 
-    Anything that is not fp8 would be bf16, which no scorer serves, so it is
-    refused here where the layer is constructed rather than by aiter at the
-    first decode.
+    Anything else is bf16, which no scorer serves: refused here, at layer
+    construction, rather than by aiter at the first decode.
     """
     if str(kv_cache_dtype).startswith("fp8"):
         return dtypes.d_dtypes["fp8"]
@@ -658,11 +652,6 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 num_idx_heads=self.num_idx_heads,
                 decode_max_q=max_query_len,
             ),
-            # Same owner and the same hoist, for a steeper cost: the FlyDSL
-            # scorer builds its own dispatch map when none arrives, ~120us of
-            # launch floor against a score kernel of 17-250us, and it would be
-            # paid once per sparse layer instead of once per step.
-            #
             # The bound is the block table's own width, not
             # `ceil(max_seq_len/128)`: the map's row count IS the kernel's grid
             # and must not move between capture and replay, and this step's
