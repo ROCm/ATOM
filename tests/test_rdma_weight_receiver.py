@@ -1017,6 +1017,20 @@ def test_a_dp_engine_refuses_the_weight_group_before_joining(monkeypatch):
     assert joined == []
 
 
+def test_a_prefill_context_parallel_engine_refuses_the_weight_group(monkeypatch):
+    """A worker's rank counts every prefill-context rank of its stage, and the
+    updater took it for the TP rank when slicing a full tensor: with TP=2 and
+    PCP=2, worker 2 asked for a third TP shard of a tensor that has two."""
+    joined = _joins(monkeypatch)
+    worker = _Worker(2, 0, tp=2, tp_world=2, pcp=2)
+
+    with pytest.raises(RuntimeError, match="prefill_context_parallel_size=2"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=5, group_name="g"
+        )
+    assert joined == []
+
+
 def test_a_pipeline_stage_refuses_the_weight_group_before_joining(monkeypatch):
     """A stage holds its own layers, and its workers alone were counted: with
     TP=1 it took the stream without a vote, so a stage that failed left the
@@ -1290,7 +1304,7 @@ def test_the_lifecycle_the_real_mixins_define_is_advertised():
     assert "rdma_weight_receive" in report["features"]
 
 
-@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "pp", "mla"])
+@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "pp", "pcp", "mla"])
 def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
     """The methods are still there; the feature is what says they work here,
     so an orchestrator can choose another path before a rendezvous that
@@ -1307,6 +1321,8 @@ def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
         worker._deployment_data_parallel_size = 2
     if unsafe == "pp":
         worker.config.pipeline_parallel_size = 2
+    if unsafe == "pcp":
+        worker.config.prefill_context_parallel_size = 2
     if unsafe == "mla":
         worker.model = nn.Sequential(_mla_attention(monkeypatch)())
     report = worker.get_worker_capabilities()

@@ -645,6 +645,15 @@ class RDMAWeightReceiverMixin:
                 f"model, so a stage that failed would leave the others serving "
                 f"a newer version than its own."
             )
+        pcp = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
+        if pcp > 1:
+            return (
+                f"prefill_context_parallel_size={pcp}. A worker's rank counts "
+                f"every prefill-context rank of its stage, but the weight "
+                f"updater takes it for the worker's TP rank when it slices a "
+                f"full tensor, so some workers would load another rank's shard, "
+                f"or one that does not exist."
+            )
         if _has_mla_attention(getattr(self, "model", None)):
             return (
                 "the model attends through MLA, whose decode reads W_K and W_V "
