@@ -1332,6 +1332,22 @@ class WeightUpdaterMixin:
         if getattr(self, "_weight_update_version", None) is None:
             raise RuntimeError("no weight update in progress; call begin first")
         try:
+            # Checked before anything is written. A prequantised stream sends
+            # FP8 bytes, of a format the resident one may not be, and block
+            # scales named weight_scale_inv that nothing here maps onto the
+            # resident weight_scale: written, the weights would be read with
+            # the old scales.
+            prequantised = sorted(
+                name
+                for name, tensor in named_tensors
+                if (tensor.dtype.is_floating_point and tensor.dtype.itemsize == 1)
+                or name.endswith(".weight_scale_inv")
+            )
+            if prequantised:
+                raise ValueError(
+                    f"prequantized FP8 weights are not supported; send them "
+                    f"unquantised: {prequantised[:20]}"
+                )
             names = [name for name, _ in named_tensors]
             resent = sorted(self._weight_update_sources.intersection(names))
             if resent:

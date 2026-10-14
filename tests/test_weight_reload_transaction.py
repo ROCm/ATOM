@@ -245,6 +245,30 @@ def test_a_full_reload_commits_past_a_name_the_model_has_no_parameter_for():
     runner.assert_weight_update_ready()
 
 
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        ("attn.o_proj.weight", torch.ones(HIDDEN, 4).to(torch.float8_e4m3fn)),
+        ("attn.o_proj.weight_scale_inv", torch.ones(1)),
+    ],
+    ids=["fp8-bytes", "weight_scale_inv"],
+)
+def test_a_bucket_of_prequantized_fp8_is_refused_before_it_writes(incoming):
+    """Its block scales, weight_scale_inv, map onto nothing here and were
+    dropped as derived: the FP8 weights went in to be read with the old
+    scales, and only coverage stopped the stream."""
+    runner = _Runner(_dense_model())
+    runner.begin_weight_update(1)
+    bucket = [("attn.q_proj.weight", _dense_checkpoint(fill=2.0)["attn.q_proj.weight"])]
+
+    with pytest.raises(ValueError, match="prequantized FP8"):
+        runner.apply_weight_bucket(bucket + [incoming])
+
+    assert runner.model.attn.qkv_proj.weight.eq(0.0).all(), "the bucket was written"
+    with pytest.raises(RuntimeError, match="fenced"):
+        runner.assert_weight_update_ready()
+
+
 def test_a_requantised_fp8_weight_credits_its_scale_too(monkeypatch):
     """Scales are derived, never sent, so without this they read as missing."""
     monkeypatch.setattr(
