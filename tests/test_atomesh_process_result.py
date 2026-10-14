@@ -138,5 +138,69 @@ class AggregatedResourcesTest(unittest.TestCase):
                 self.assertEqual(process_result.topology_key(topology), topology)
 
 
+
+class NonFiniteBenchmarkMetricsTest(unittest.TestCase):
+    """Missing/unmeasured benchmark metrics must not become chart numbers."""
+
+    def test_nonfinite_number_is_missing_and_valid_fallback_survives(self):
+        for invalid in (float("nan"), float("inf"), -float("inf"), "NaN", "Infinity"):
+            with self.subTest(invalid=str(invalid)):
+                self.assertIsNone(process_result.number(invalid))
+                self.assertEqual(process_result.number(invalid, "17.25"), 17.25)
+                self.assertIsNone(process_result.round_or_none(invalid))
+                self.assertIsNone(process_result.int_value(invalid))
+                self.assertEqual(process_result.fmt(invalid), "--")
+                self.assertIsNone(
+                    process_result.metric_entry("TTFT", "ms", invalid, None)
+                )
+        # A real measured zero must not be treated as missing.
+        self.assertEqual(process_result.number(0, 17.25), 0.0)
+        self.assertEqual(
+            process_result.metric_entry("TTFT", "ms", 0, None)["value"], 0.0
+        )
+
+    def test_all_nonfinite_throughput_has_no_dashboard_point(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = write_cell(root, "agg", False)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload.update(
+                total_token_throughput="NaN",
+                input_throughput="Infinity",
+                output_throughput="-Infinity",
+                mean_ttft_ms="NaN",
+                median_tpot_ms="Infinity",
+            )
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            entries, rows = process_result.collect_dashboard_entries(
+                [path], None, {}, None
+            )
+            self.assertEqual(entries, [])
+            self.assertIsNone(rows[0]["tput_per_gpu"])
+            summary = root / "summary.md"
+            process_result.write_summary(rows, summary)
+            self.assertNotIn("nan", summary.read_text(encoding="utf-8").lower())
+            self.assertNotIn("inf", summary.read_text(encoding="utf-8").lower())
+
+    def test_nonfinite_ttft_omitted_when_throughput_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = write_cell(root, "agg", False)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["mean_ttft_ms"] = float("nan")
+            payload["total_token_throughput"] = "NaN"
+            payload["input_throughput"] = float("inf")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            entries, _ = process_result.collect_dashboard_entries(
+                [path], None, {}, None
+            )
+            point = perf_points(entries)["agg"]
+            self.assertNotIn("ttft_ms", point)
+            self.assertNotIn("total_tput", point)
+            self.assertEqual(point["output_tput_per_gpu"], 250.0)
+            # Strict JSON prohibits non-finite chart values.
+            json.dumps(entries, allow_nan=False)
+
+
 if __name__ == "__main__":
     unittest.main()
