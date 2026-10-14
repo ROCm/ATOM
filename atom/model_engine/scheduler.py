@@ -576,7 +576,7 @@ class Scheduler:
         self.config = config
         # tokens a replaying forward carries from before it (`Replay.history_ids`)
         self.replay_history_tokens = getattr(config, "replay_history_tokens", 0)
-        
+
         if getattr(config, "enable_return_routed_experts", False):
             from atom.model_ops.fused_moe.routed_experts_capturer import (
                 check_return_routed_experts,
