@@ -99,7 +99,10 @@ docker exec \
   if ! python3 -c "import pybind11" 2>/dev/null; then
     python3 -m pip install "pybind11>=3.0.1"
   fi
-  python3 -m pip show pybind11 | grep -E '^(Name|Version):' || true
+  # Double-quote the grep pattern: this body is inside bash -lc '...', so a
+  # nested single-quoted ^(Name|Version) terminated the outer string early
+  # (run 38532471586: syntax error near unexpected token '(').
+  python3 -m pip show pybind11 | grep -E "^(Name|Version):" || true
 
   if [[ "${SCATTER_INSTALL_MODE}" == "aiter_ref" && -n "${AITER_GIT_REF}" ]]; then
     echo "=== install aiter from ref ${AITER_GIT_REF} ==="
