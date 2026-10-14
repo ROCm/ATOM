@@ -182,18 +182,20 @@ def plan_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
 def dp_stage_tokens(forward) -> DPStageTokens | None:
     """The group's per-stage token counts, from the step's DP sync.
 
-    None outside DP, and on any step where no rank replays, TBO split the
-    step, or no rank prefills: `sync_dp_metadata` carries the table only
-    when every rank must follow it, so the decision is the group's.
+    `set_forward_context` builds the stages (`ForwardContext.dp_stages`) only
+    when the sync carried them -- some rank replays on a prefill step TBO did
+    not split -- so the decision is the group's. None otherwise.
     """
-    if getattr(forward, "dp_metadata", None) is None:
+    stages = getattr(forward, "dp_stages", None)
+    if not stages:
         return None
-    mode = getattr(forward.context, "forward_mode", None)
-    rows = getattr(getattr(mode, "sync", None), "stage_tokens_across_dp", None)
-    if rows is None:
-        return None
-    decoder, last_layer, _, active = rows
-    return DPStageTokens(decoder, last_layer, decoder_active=any(active))
+    sync = forward.context.forward_mode.sync
+    decoder_active = any(sync.stage_tokens_across_dp[3])
+    return DPStageTokens(
+        stages["decoder"].tokens_across_dp,
+        stages["last_layer"].tokens_across_dp,
+        decoder_active=decoder_active,
+    )
 
 
 @contextlib.contextmanager
@@ -212,47 +214,6 @@ def placeholder_rows_of(metadata, rows):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
-
-
-def _data_parallel_rank() -> int:
-    from atom.config import get_current_atom_config
-
-    return get_current_atom_config().parallel_config.data_parallel_rank
-
-
-@contextlib.contextmanager
-def dp_token_counts(forward, counts: tuple[int, ...] | None):
-    """Size the forward's DP MoE collectives for ``counts`` while this block
-    runs: the variable-length gather reads every rank's count from
-    ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``."""
-    if counts is None:
-        yield
-        return
-    from atom.config import get_current_atom_config
-    from atom.utils.forward_context import DPMetadata
-
-    context = forward.context
-    own = counts[_data_parallel_rank()]
-    outer = (
-        forward.dp_metadata,
-        context.scheduled_tokens,
-        context.running_tokens_across_dp,
-    )
-    forward.dp_metadata = DPMetadata.make(
-        get_current_atom_config().parallel_config,
-        own,
-        torch.tensor(counts, dtype=torch.int32),
-    )
-    context.scheduled_tokens = own
-    context.running_tokens_across_dp = counts
-    try:
-        yield
-    finally:
-        (
-            forward.dp_metadata,
-            context.scheduled_tokens,
-            context.running_tokens_across_dp,
-        ) = outer
 
 
 @dataclass(frozen=True)
