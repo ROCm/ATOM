@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 import torch
 from safetensors import safe_open
 
+from atom.model_loader.weight_utils import local_model_dir
 from atom.models.deepseek_v4.mono.config import (
     COMPRESS_CSA,
     COMPRESS_ROPE_THETA,
@@ -227,8 +228,9 @@ class Checkpoint:
     """Lazy, sliced reads of a sharded safetensors checkpoint."""
 
     def __init__(self, path: str):
-        self.path = path
-        with open(os.path.join(path, "model.safetensors.index.json")) as f:
+        # ``path`` is ``Config.model``: a hub id resolves to its cached snapshot
+        self.path = local_model_dir(path)
+        with open(os.path.join(self.path, "model.safetensors.index.json")) as f:
             self.index = json.load(f)["weight_map"]
         self._files = {}
 
