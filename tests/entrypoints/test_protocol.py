@@ -6,6 +6,7 @@
 import time
 
 import pytest
+from pydantic import ValidationError
 
 from atom.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -430,3 +431,26 @@ class TestPromptTokenIds:
     def test_completion_requires_one_of_the_two(self):
         with pytest.raises(ValueError, match="'prompt' or 'prompt_token_ids'"):
             CompletionRequest().get_prompt_or_tokens()
+
+    def test_completion_prompt_may_be_token_ids(self):
+        # The OpenAI spec's token-array form, in which MLPerf Endpoints sends its
+        # pre-tokenized prompts.
+        request = CompletionRequest.model_validate({"prompt": [5, 6, 7]})
+        assert request.get_prompt_or_tokens() == [5, 6, 7]
+
+    def test_completion_prompt_ids_and_prompt_token_ids_must_agree(self):
+        same = CompletionRequest(prompt=[1, 2], prompt_token_ids=[1, 2])
+        assert same.get_prompt_or_tokens() == [1, 2]
+        with pytest.raises(ValueError, match="disagree"):
+            CompletionRequest(
+                prompt=[1, 2], prompt_token_ids=[1, 3]
+            ).get_prompt_or_tokens()
+
+    def test_completion_empty_prompt_ids_are_rejected(self):
+        with pytest.raises(ValueError, match="empty"):
+            CompletionRequest(prompt=[]).get_prompt_or_tokens()
+
+    @pytest.mark.parametrize("prompt", [[-1], ["a", "b"], [[1, 2], [3]]])
+    def test_completion_prompt_lists_must_be_one_token_list(self, prompt):
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate({"prompt": prompt})

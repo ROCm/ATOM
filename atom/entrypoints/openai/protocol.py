@@ -301,8 +301,9 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    # Required when no prompt_token_ids are supplied.
-    prompt: str | None = None
+    # Text, or token IDs as the OpenAI spec allows. Required when no
+    # prompt_token_ids are supplied.
+    prompt: str | PromptTokenIds | None = None
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -322,7 +323,15 @@ class CompletionRequest(BaseModel):
 
     def get_prompt_token_ids(self) -> PromptTokenIds | None:
         """This request's pre-tokenized prompt, or None to tokenize `prompt`."""
-        return resolve_prompt_token_ids(self.prompt_token_ids, self.kv_transfer_params)
+        ids = self.prompt_token_ids
+        if isinstance(self.prompt, list):
+            if ids is not None and ids != self.prompt:
+                raise ValueError(
+                    "prompt and prompt_token_ids disagree; a request cannot "
+                    "carry two different prompts"
+                )
+            ids = self.prompt
+        return resolve_prompt_token_ids(ids, self.kv_transfer_params)
 
     def get_prompt_or_tokens(self) -> "str | PromptTokenIds":
         """Return pre-tokenized IDs when supplied, otherwise require text."""

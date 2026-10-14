@@ -97,6 +97,26 @@ class TestPromptTokenIdRequests:
         assert server.generate[0][0] == (PROMPT_IDS if use_ids else text)
         assert server.templates == int(endpoint == "chat" and not use_ids)
 
+    def test_completion_prompt_given_as_ids_reaches_generation(self, server):
+        request, handler = _request("completion", prompt=PROMPT_IDS)
+
+        asyncio.run(handler(request, None))
+
+        assert server.generate[0][0] == PROMPT_IDS
+
+    def test_completion_prompt_ids_conflicting_with_prompt_token_ids_are_rejected(
+        self, server
+    ):
+        request, handler = _request(
+            "completion", prompt=PROMPT_IDS, prompt_token_ids=[999]
+        )
+
+        with pytest.raises(api_server.HTTPException) as excinfo:
+            asyncio.run(handler(request, None))
+
+        assert excinfo.value.status_code == 400
+        assert server.generate == []
+
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
     @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize("n", [1, 2])
