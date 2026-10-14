@@ -46,36 +46,23 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 
-_ON = ("1", "true", "yes", "on")
-_OFF = ("0", "false", "no", "off")
-
 
 def stores_state_images(replay_tokens: int) -> bool:
-    """Whether native-state saves carry a state image (ATOM_LMCACHE_MP_STATE_IMAGES).
+    """Whether native-state saves carry a state image: only without a bounded
+    replay (`replay_tokens`, 0 when off).
 
-    "auto", the default, stores one only without a bounded replay
-    (`replay_tokens`, 0 when off). With one the replay rebuilds the state from
-    the PAGE KV, so saves store that alone, the layout registers no image
-    group, and LMCache's own hit is the PAGE KV's extent. Without one a save
-    must carry its image: nothing could resume from PAGE alone. The scheduler
-    and every worker ask with the one replay length the engine runs,
-    `Config.state_replay_tokens` (set once on the engine's config, which a
-    `multi` connector copies to its offload leg as is), and register under the
-    namespace their answer names (`_model_namespace`).
+    With one (DeepSeek-V4, ATOM_DSV4_STATE_REPLAY) the replay rebuilds the
+    state from the PAGE KV, so saves store that alone, the layout registers no
+    image group, and LMCache's own hit is the PAGE KV's extent. Without one a
+    save must carry its image: nothing could resume from PAGE alone, and for a
+    state with no bounded receptive field (Kimi-K3's KDA, GDN) no replay could
+    stand in for it. The scheduler and every worker ask with the one replay
+    length the engine runs, `Config.state_replay_tokens` (set once on the
+    engine's config, which a `multi` connector copies to its offload leg as
+    is), and register under the namespace their answer names
+    (`_model_namespace`).
     """
-    setting = envs.ATOM_LMCACHE_MP_STATE_IMAGES
-    if setting == "auto":
-        return not replay_tokens
-    if setting in _ON:
-        return True
-    if setting in _OFF:
-        if not replay_tokens:
-            raise ValueError(
-                "ATOM_LMCACHE_MP_STATE_IMAGES=0 needs a bounded replay "
-                "(ATOM_DSV4_STATE_REPLAY=1)"
-            )
-        return False
-    raise ValueError(f"ATOM_LMCACHE_MP_STATE_IMAGES={setting!r}: expected auto, 1 or 0")
+    return not replay_tokens
 
 
 def require_native_state_server(adapter: Any, config: Any) -> None:

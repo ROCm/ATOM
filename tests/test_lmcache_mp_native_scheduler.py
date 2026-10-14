@@ -883,7 +883,6 @@ def replaying_engine(monkeypatch, *, reach=32, hbm=16, **overrides):
     """A replaying engine whose HBM holds `hbm` prompt tokens with no checkpoint
     and whose LMCache holds the PAGE KV to `reach`, and a waiting 40-token
     prompt over both."""
-    monkeypatch.delenv("ATOM_LMCACHE_MP_STATE_IMAGES", raising=False)
     adapter = _ReachAdapter(reach)
     engine, connector, _ = engine_scheduler(
         monkeypatch, adapter=adapter, state_replay_tokens=_REPLAY, **overrides
@@ -940,7 +939,6 @@ def test_engine_failed_kv_only_load_replays_below_the_hbm_hit(monkeypatch):
 def test_engine_replay_wider_than_the_budget_resumes_after_its_load(monkeypatch):
     """After the load the replay (7 rows) is wider than a 4-token budget: it
     resumes anyway and continues in the next forwards."""
-    monkeypatch.delenv("ATOM_LMCACHE_MP_STATE_IMAGES", raising=False)
     adapter = _ReachAdapter(32)
     engine, _, _ = engine_scheduler(
         monkeypatch,

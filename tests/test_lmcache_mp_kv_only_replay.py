@@ -4,7 +4,7 @@
 """LMCache MP native-state loads that bring the PAGE KV alone, for a replay.
 
 With a bounded replay the native-state layout stores no state image
-(ATOM_LMCACHE_MP_STATE_IMAGES, "auto"): it registers PAGE alone, so a stock
+(`stores_state_images`): it registers PAGE alone, so a stock
 LMCache server's hit is how far the PAGE KV reaches. No image ends it, so the
 state-carrying hit is 0 and the reach is the replay's (`Sequence.replay_kv_load`).
 These tests drive that lookup through its whole life: answered, weighed, turned
@@ -15,8 +15,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-
-import pytest
 
 from atom.kv_transfer.disaggregation.types import (
     ConnectorCompletion,
@@ -127,14 +125,10 @@ def _freed(adapter):
     return [(f["start"], f["end"]) for f in adapter.freed]
 
 
-def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0, images="unset"):
-    """`images`: ATOM_LMCACHE_MP_STATE_IMAGES as given, "unset" for the default
-    (no images, the replay being on)."""
+def _scheduler(monkeypatch, *, chunks, replay=REPLAY, min_load=0):
+    """`replay`: the engine's `Config.state_replay_tokens`; with one the layout
+    stores no images, without one (0) it does."""
     monkeypatch.setenv("OFFLOAD_MIN_SAVE_TOKENS", "0")
-    if images == "unset":
-        monkeypatch.delenv("ATOM_LMCACHE_MP_STATE_IMAGES", raising=False)
-    else:
-        monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", images)
     monkeypatch.setattr(
         deployment.offcfg,
         "build_lmcache_config",
@@ -221,9 +215,9 @@ def test_without_images_the_server_hit_is_the_kv_only_reach(monkeypatch):
 
 
 def test_with_images_the_server_hit_carries_one(monkeypatch):
-    # Forced images under a replay: the hit is the image's, there is no
-    # KV-only reach, and the hit loads as before.
-    scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=2, images="1")
+    # No replay, so images: the hit is the image's, there is no KV-only
+    # reach, and the hit loads as before.
+    scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=2, replay=0)
     assert adapter.images is True
     seq = _seq()
     assert _look_up(scheduler, seq) == (2 * CHUNK, True)
@@ -371,29 +365,19 @@ def test_an_abort_while_waiting_returns_the_reach(monkeypatch):
     assert (0, 32) in _freed(adapter)
 
 
-# -- ATOM_LMCACHE_MP_STATE_IMAGES: images or PAGE alone ----------------------
+# -- Images or PAGE alone, by the replay ------------------------------------
 
 
-def test_images_off_needs_a_replay(monkeypatch):
-    with pytest.raises(ValueError, match="ATOM_DSV4_STATE_REPLAY"):
-        _scheduler(monkeypatch, chunks=0, replay=0, images="0")
-
-
-def test_by_default_a_replay_stores_no_images(monkeypatch):
+def test_a_replay_stores_no_images(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=0)
     assert scheduler._page_only
     assert adapter.images is False
 
 
-def test_by_default_no_replay_keeps_the_images(monkeypatch):
+def test_no_replay_keeps_the_images(monkeypatch):
     scheduler, _, adapter, _ = _scheduler(monkeypatch, chunks=0, replay=0)
     assert not scheduler._page_only
     assert adapter.images is True
-
-
-def test_an_unknown_images_setting_is_refused(monkeypatch):
-    with pytest.raises(ValueError, match="expected auto, 1 or 0"):
-        _scheduler(monkeypatch, chunks=0, images="sometimes")
 
 
 def test_a_page_only_save_stores_page_alone_with_no_checkpoint(monkeypatch):

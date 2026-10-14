@@ -338,27 +338,14 @@ def test_an_image_on_a_page_only_layout_fails_before_transport(page_worker):
     assert page_worker.submitted == []
 
 
-@pytest.mark.parametrize(
-    "setting, replay, images",
-    [("auto", 7875, False), ("auto", 0, True), ("1", 7875, True), ("0", 7875, False)],
-)
-def test_images_follow_the_replay_unless_forced(monkeypatch, setting, replay, images):
-    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", setting)
+@pytest.mark.parametrize("replay, images", [(7875, False), (0, True)])
+def test_images_follow_the_replay(replay, images):
     assert stores_state_images(replay) is images
 
 
-@pytest.mark.parametrize("setting", ["0", "sometimes"])
-def test_images_off_without_a_replay_or_an_unknown_setting_is_refused(
-    monkeypatch, setting
-):
-    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", setting)
-    with pytest.raises(ValueError, match="ATOM_LMCACHE_MP_STATE_IMAGES"):
-        stores_state_images(0)
-
-
-def _v4_engine_config(kv_transfer_config):
+def _engine_config(kv_transfer_config, architectures=("DeepseekV4ForCausalLM",)):
     hf = SimpleNamespace(
-        architectures=["DeepseekV4ForCausalLM"],
+        architectures=list(architectures),
         sliding_window=128,
         num_hidden_layers=61,
         compress_ratios=[4, 128, 0],
@@ -382,22 +369,34 @@ def test_the_scheduler_and_its_workers_read_one_replay_length(monkeypatch):
     plus LMCache MP offload (whose P/D loads know nothing of a replay) runs no
     replay and keeps images on both sides."""
     monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
-    monkeypatch.setenv("ATOM_LMCACHE_MP_STATE_IMAGES", "auto")
     pd = json.dumps({"kv_role": "kv_producer", "kv_connector": "mooncake"})
     composed = json.loads(
         compose_kv_offload_config(pd, kv_offload_connector_config("lmcache_mp", ""))
     )
     assert composed["kv_connector"] == "multi"
-    engine = _v4_engine_config(composed)
+    engine = _engine_config(composed)
     assert engine.state_replay_tokens == 0
     leg = copy.copy(engine)  # as `MultiConnector` builds its offload leg
     leg.kv_transfer_config = composed["connectors"][1]
     assert stores_state_images(leg.state_replay_tokens)
     assert stores_state_images(engine.state_replay_tokens)
     # LMCache MP offload alone replays, and neither side stores images.
-    alone = _v4_engine_config({"kv_connector": "lmcache_mp", "kv_role": "offload"})
+    alone = _engine_config({"kv_connector": "lmcache_mp", "kv_role": "offload"})
     assert alone.state_replay_tokens == 128 + 60 * 127
     assert not stores_state_images(alone.state_replay_tokens)
+
+
+def test_a_model_the_replay_does_not_cover_keeps_its_images(monkeypatch):
+    """Kimi-K3's KDA state has no bounded receptive field: only an image
+    restores it. The replay switch is DeepSeek-V4's, so it changes nothing
+    there, even turned on."""
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    k3 = _engine_config(
+        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+        architectures=("KimiK3ForConditionalGeneration",),
+    )
+    assert k3.state_replay_tokens == 0
+    assert stores_state_images(k3.state_replay_tokens)
 
 
 def test_load_completion_waits_for_native_restore(worker, monkeypatch):
