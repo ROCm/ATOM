@@ -240,3 +240,32 @@ def test_the_per_128_column_stages_must_stride(rows):
     items = rows * (kda.COLS // 2)
     assert items == rows * 64
     assert (items > THREADS) == (rows > THREADS // 64)
+
+
+def test_bind_moe_does_not_refuse_a_dual_stream_moe():
+    """A dual-stream MoE must still bind: mono never calls the module.
+
+    `_use_dual_stream` only selects a branch inside `KimiSparseMoeBlock.forward`,
+    and a mono layer computes the latent MoE in K2 instead of calling it. The
+    alt stream cannot contend either -- `dual_stream_moe_forward` joins before
+    returning. Refusing on it disarmed mono in the default environment (shared
+    experts present, alt stream set, threshold 1024), which silently scored the
+    production path in three separate GSM8K runs, so this is pinned here.
+    """
+    from atom.models.kimi_k3.mono.weights import bind_moe
+
+    moe = SimpleNamespace(
+        use_latent_moe=True,
+        shared_experts=object(),
+        routed_expert_norm=object(),
+        _use_dual_stream=True,
+    )
+    layer = SimpleNamespace(block_sparse_moe=moe)
+
+    # This fake carries no gate or expert tensors, so binding still fails --
+    # the point is only that it gets PAST the dual-stream check to fail on
+    # something else. Catching Exception keeps the assertion about the one
+    # thing under test rather than about which later check happens to fire.
+    with pytest.raises(Exception) as refusal:
+        bind_moe(layer, 0, Dims(tp=8), rank=0)
+    assert "dual-stream" not in str(refusal.value)

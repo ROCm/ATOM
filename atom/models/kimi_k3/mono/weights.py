@@ -307,11 +307,17 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     _need(moe.use_latent_moe, f"{name}: not a latent MoE")
     _need(moe.shared_experts is not None, f"{name}: no shared experts")
     _need(moe.routed_expert_norm is not None, f"{name}: no routed norm")
-    _need(
-        not getattr(moe, "_use_dual_stream", False),
-        f"{name}: dual-stream MoE; its alt stream would contend for the CUs the "
-        "kernel needs resident",
-    )
+    # No dual-stream refusal. `_use_dual_stream` is a static config flag that
+    # only selects a branch inside `KimiSparseMoeBlock.forward`, and a mono
+    # layer never calls that module at all -- K2 computes the latent MoE from
+    # the tensors bound here. The alt stream cannot contend with the kernel
+    # either: `dual_stream_moe_forward` joins before it returns
+    # (`current_stream.wait_stream(alt_stream)`, deepseek_v2.py), so a
+    # production layer's shared-expert work is complete before the next layer
+    # launches anything. Refusing on it disarmed mono in the DEFAULT
+    # environment -- K3 has shared experts and an alt stream, and
+    # ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD defaults to 1024 -- which cost three
+    # GSM8K runs that scored the production path while reporting "mono".
     gate = _param(moe.gate, f"{name} gate")
     _need(
         gate.dtype == BF16 and tuple(gate.shape) == (EXPERTS, HIDDEN),
