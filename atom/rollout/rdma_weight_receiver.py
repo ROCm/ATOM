@@ -77,6 +77,24 @@ class RDMAStreamOutOfStep(RuntimeError):
     """
 
 
+def _frames_no_bucket(
+    command: int, metadata_bytes: int, payload_bytes: int
+) -> str | None:
+    """Why a header that is not the end marker frames no bucket, if it does not.
+
+    The sender sends buckets, each followed by its metadata and payload
+    broadcasts, and the end marker, which nothing follows. Any other header
+    says nothing of what the sender does next: received as if it framed a
+    bucket, its broadcasts are ones the sender may never post, and every later
+    frame would be read out of step.
+    """
+    if command != _CMD_BUCKET:
+        return f"command {command} is neither a bucket nor the end marker"
+    if metadata_bytes == 0 or payload_bytes == 0:
+        return "a bucket without metadata or without a payload"
+    return None
+
+
 def _unreceivable(
     device: torch.device, metadata_bytes: int, payload_bytes: int
 ) -> str | None:
@@ -282,8 +300,9 @@ def receive_weight_stream(
     naming nobody instead of this rank's error. So the rest of the stream is
     received and discarded, the header's sizes being all that is needed to stay
     in step, and the failure is raised once the end marker arrives. What breaks
-    the stream off before then -- a frame some rank cannot receive, a broadcast
-    that fails -- raises ``RDMAStreamOutOfStep``.
+    the stream off before then -- a header that frames no bucket, a frame some
+    rank cannot receive, a broadcast that fails -- raises
+    ``RDMAStreamOutOfStep``.
 
     *leave* tears down this rank's end of *group*. A rank whose broadcast
     failed calls it before its last vote: a peer still in that broadcast is
@@ -367,8 +386,12 @@ def receive_weight_stream(
             # Decided by every rank before any enters the frame's broadcasts.
             # Free memory differs between them, and one that could not
             # allocate, leaving alone, left its peers in a broadcast it never
-            # joined while it waited for them in the vote.
-            reason = _unreceivable(device, metadata_bytes, payload_bytes)
+            # joined while it waited for them in the vote. A header that frames
+            # no bucket is the same header on every rank, so all of them leave
+            # at it together.
+            reason = _frames_no_bucket(
+                command, metadata_bytes, payload_bytes
+            ) or _unreceivable(device, metadata_bytes, payload_bytes)
             if reason is None:
                 try:
                     metadata_tensor = torch.empty(
@@ -388,15 +411,11 @@ def receive_weight_stream(
                     f"({reason or 'not by every rank taking the stream'})"
                 )
 
-            # Every frame but the end marker is followed by these two
-            # broadcasts, so they are received before the frame is judged: one
-            # this rank cannot use still has to keep it in step.
+            # A bucket is followed by these two broadcasts, so they are received
+            # before the bucket is judged: one this rank cannot use still has
+            # to keep it in step.
             dist.broadcast(metadata_tensor, src=0, group=group)
             dist.broadcast(payload, src=0, group=group)
-            if failure is None and (
-                command != _CMD_BUCKET or metadata_bytes == 0 or payload_bytes == 0
-            ):
-                failure = RuntimeError(f"invalid RDMA weight header: {frame}")
             if failure is not None:
                 drained += 1
                 continue

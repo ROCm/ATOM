@@ -517,24 +517,28 @@ def test_an_allocation_that_fails_anyway_is_out_of_step_too(monkeypatch):
     assert runner.events[-1].startswith("abort")
 
 
-def test_an_unknown_command_is_received_before_it_is_refused(monkeypatch):
-    """Like any frame but the end marker, it carries the sizes of the two
-    broadcasts that follow it. Refused at the header, this rank left the
-    trainer and every other rank waiting in those."""
+@pytest.mark.parametrize(
+    "header",
+    [[9, 3, 5, 1], [9, 0, 0, 1], [_CMD_BUCKET, 0, 5, 1], [_CMD_BUCKET, 3, 0, 1]],
+    ids=["unknown", "unknown-without-sizes", "no-metadata", "no-payload"],
+)
+def test_a_header_that_frames_no_bucket_breaks_the_stream_off(monkeypatch, header):
+    """The sender follows a bucket with its two broadcasts and the end marker
+    with none, so any other header says nothing of what comes next. Received
+    as if it framed a bucket, its broadcasts were ones the sender may never
+    post, and every later frame was read out of step."""
     import torch
 
-    unknown = [
-        torch.tensor([9, 3, 5, 1], dtype=torch.int64),
-        torch.zeros(3, dtype=torch.uint8),
-        torch.zeros(5, dtype=torch.uint8),
-    ]
-    trainer = _Trainer([*unknown, *_frames(_three_buckets())])
+    trainer = _Trainer(
+        [torch.tensor(header, dtype=torch.int64), *_frames(_three_buckets())]
+    )
     runner = _Runner()
+    after_the_header = len(trainer.frames) - 1
 
-    with pytest.raises(RuntimeError, match="command=9"):
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match=f"command={header[0]}"):
         _receive(monkeypatch, trainer, runner)
 
-    assert trainer.frames == [], "every remaining broadcast must still be joined"
+    assert len(trainer.frames) == after_the_header, "a broadcast was posted for it"
     assert not [e for e in runner.events if e.startswith("apply")]
     assert runner.events[-1].startswith("abort")
 
