@@ -646,9 +646,8 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
 
 @pytest.mark.parametrize("q", [1, 3])
 def test_mla_persistent_plan_spans_only_rows_q_has(monkeypatch, q):
-    # running_bs is the group's batch either way; running_tokens is the
-    # group's height only on a DP-unified step, and this rank's own count
-    # while a peer is prefilling -- the height q and o are allocated at.
+    # running_tokens: this rank's own height while a DP peer prefills (the
+    # first two steps), the group's 4 * q on a unified step (the last two).
     runner, builder = make_runner(monkeypatch, "mla", q=q, tbo=False)
     planned = []
     builder.set_mla_persistent_worker_buffers = (

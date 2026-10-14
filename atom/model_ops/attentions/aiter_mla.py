@@ -2809,15 +2809,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
-        # The dense plan spans the sequences q/o have rows for: running_tokens
-        # is running_bs * max_seqlen_q on a DP-unified step, which pads the
-        # activations as well, but only this rank's own count while a peer is
-        # prefilling. The persistent kernel loads q[qo_start] and stores
-        # o[qo_start] for every work item, and the planner hands a zero-KV
-        # sequence one whenever its CU has payload left.
+        # Plan only the sequences q/o have rows for. While a DP peer prefills,
+        # running_tokens is this rank's own count, yet the persistent kernel
+        # reads q and writes o for every work item, zero-KV padding included.
         q_rows_bs = min(running_bs, running_tokens // max_seqlen_q)
-        # Like the positions above, the plan lays every sequence out at
-        # max_seqlen_q rows; one forwarding fewer would get no work item.
         assert q_rows_bs >= scheduled_bs, (
             f"{running_tokens} decode rows cannot hold {scheduled_bs} sequences "
             f"of max_seqlen_q={max_seqlen_q}"
