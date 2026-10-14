@@ -1914,7 +1914,10 @@ class MooncakeConnector(KVConnectorBase):
                     self._pending_recv_nonce[req_id] = write_nonce
                     self._pending_recv_stall_watch[req_id] = time.monotonic()
                     if meta.chunked_transfer:
-                        self._pending_handoffs[req_id] = {"failed": False, "metadata": None}
+                        self._pending_handoffs[req_id] = {
+                            "failed": False,
+                            "metadata": None,
+                        }
             self._pending_recv.add(req_id)
             # Only delta blocks need fencing; reused prefix blocks are coherent.
             self._pending_recv_blocks[req_id] = list(dst_block_ids)
@@ -3576,8 +3579,9 @@ class MooncakeConnector(KVConnectorBase):
                 block_dst.append(dst_base + db * consumer_block_bpb[cidx])
                 block_sizes.append(bpb)
 
+        deadline = request_data.get("_deadline")
         if blocks_only:
-            return self._rdma_write_with_retry(
+            return self._rdma_write(
                 target,
                 block_src,
                 block_dst,
@@ -3585,6 +3589,7 @@ class MooncakeConnector(KVConnectorBase):
                 req_id,
                 "block",
                 engine=engine,
+                deadline=deadline,
             )
 
         # SWA ring transfer: every row of a live slot crosses the wire.
@@ -3616,7 +3621,6 @@ class MooncakeConnector(KVConnectorBase):
             sum(block_sizes),
         )
 
-        deadline = request_data.get("_deadline")
         if not self._rdma_write(
             target,
             block_src,
