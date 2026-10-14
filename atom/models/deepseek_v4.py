@@ -1495,9 +1495,11 @@ class Indexer(nn.Module):
         # head dim (128), so there is exactly one scale per (token, head).
         self._q_quant_group = self.head_dim
         self._weights_scale = self.softmax_scale * self.n_heads**-0.5
-        # `deepgemm_fp8_paged_mqa_logits` decode-path output column count:
-        # one indexer slot per `compress_ratio` source tokens.
-        self._max_model_len_idx = args.max_seq_len // compress_ratio
+        # Decode logits and block tables must cover the same serving context.
+        # The checkpoint may support a longer context than --max-model-len;
+        # using that limit here makes OPUS request columns absent from the table.
+        max_seq_len = min(args.max_seq_len, get_current_atom_config().max_model_len)
+        self._max_model_len_idx = max_seq_len // compress_ratio
 
         # Indexer quantization mode, self-computed at construction so it is
         # correct BEFORE
