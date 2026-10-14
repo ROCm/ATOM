@@ -778,6 +778,10 @@ def _make_connector(**overrides):
     conn._fence_lock = threading.Lock()
     conn._pending_recv_expected = {}
     conn._pending_handoffs = {}
+    conn._pending_chunked_requests = []
+    conn._chunked_prefills = {}
+    conn._reclaim_results = set()
+    conn._received_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()
     conn._pending_recv_nonce = {}

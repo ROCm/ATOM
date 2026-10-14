@@ -2690,13 +2690,13 @@ class Scheduler:
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
 
-        A decode does not prefill a P/D request itself: it is sized and
+        Legacy decode does not prefill a P/D request itself: it is sized and
         compiled for decode, and the request's block table is still the one
         the transfer was writing, which re-admission cannot allocate over. The
         connector reports a failure only once no producer write can still land
         in those blocks (``ATOM_PD_FAILED_WRITE_HOLD_S``), so they are freed at
-        once. Offload load failures (``failed_loading``) still resume their
-        prefill on this node.
+        once. Opt-in chunked receives retain their admission-reclaim fallback;
+        offload load failures (``failed_loading``) also resume local prefill.
         """
         seq = next(
             (
@@ -2713,6 +2713,11 @@ class Scheduler:
                 "nothing to abort",
                 req_id,
             )
+            return
+        if (seq.kv_transfer_params or {}).get("chunked_transfer"):
+            # Chunked admission can deliberately retire an unclaimed source.
+            # Keep its local-prefill fallback, after the connector's write hold.
+            self.failed_recving_kv_req_ids.append(seq.id)
             return
         logger.error("KV receive failed for request %s; aborting it", req_id)
         self.waiting.remove(seq)

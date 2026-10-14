@@ -4,7 +4,7 @@
 import ctypes
 import queue
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -29,6 +29,12 @@ from atom.kv_transfer.disaggregation.types import (
     KVTransferTensors,
     PageRegion,
 )
+
+
+@pytest.fixture(autouse=True)
+def _report_failed_receives_at_once(monkeypatch):
+    """Keep protocol tests immediate; failure holds have separate coverage."""
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "0")
 
 
 class Event:
@@ -76,8 +82,15 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._chunked_local_ids = {}
     c._retired_chunked_transfers = OrderedDict()
     c._kv_cache_ready_events = {}
+    c._kv_cache_ready_batches = deque()
+    c._kv_ready_expired = {}
+    c._kv_ready_done_event = None
     c._pending_chunked_requests = []
     c._completion_lock = threading.Lock()
+    c._pending_recv_acks = {}
+    c._pending_recv_stall_watch = {}
+    c._held_failures = {}
+    c._pending_recv_failed = set()
     c.done_sending = set()
     c.done_recving = set()
     c.failed_recving = set()
@@ -249,6 +262,10 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
 def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
     c._completion_lock = threading.Lock()
+    c._pending_recv_acks = {}
+    c._pending_recv_stall_watch = {}
+    c._held_failures = {}
+    c._pending_recv_failed = set()
     c._fence_lock = threading.Lock()
     c._pending_recv_expected = {21: expected}
     c._pending_recv_stages = {}
@@ -258,8 +275,6 @@ def consumer(expected=2):
     c._pending_recv_slots = {}
     c._swa_block_regions = []
     c._pending_handoffs = {21: {"failed": False, "metadata": None}}
-    c._dispatch_in_flight = set()
-    c._deferred_failures = {}
     c._release_targets = {}
     c._blocks_pending_fence = []
     c.done_recving = set()
@@ -292,11 +307,24 @@ def test_pp_receive_waits_for_every_stage_including_failure(failure):
     assert not c._record_write_done(21, 1, 0, 3, handoff=handoff)
 
 
-def test_pp_failure_can_finish_while_dispatch_flag_is_still_set():
-    c = consumer(1)
-    c._dispatch_in_flight.add(21)
-    assert c._record_write_done(21, 0, 0, 3, success=False)
+def test_chunked_failure_preserves_main_receive_hold(monkeypatch):
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
+    now = [100.0]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    c = consumer(2)
+    handoff = {"first_token_id": 42}
+    assert not c._record_write_done(21, 0, 0, 3, success=False)
+    assert c._record_write_done(21, 1, 0, 3, handoff=handoff)
+    assert c._pending_recv_blocks == {21: [2, 9, 4]}
+    assert not c.failed_recving and not c.done_recving
+    assert not c._pending_handoffs and not c._received_handoffs
+    now[0] += 59
+    c._report_held_failures()
+    assert not c.failed_recving and c._pending_recv_blocks
+    now[0] += 2
+    c._report_held_failures()
     assert c.failed_recving == {21}
+    assert not c._pending_recv_blocks and not c._received_handoffs
 
 
 def test_source_release_requires_every_tp_rank_of_every_pp_stage():
@@ -577,7 +605,11 @@ def test_swa_only_pool_transfers_final_relocated_slot(reverse_indexed):
         },
         local_swa_block_ids=[2],
     )
+    d._mla_landing = MagicMock()
     d.start_load_kv(meta)
+    d._mla_landing.advertise.assert_not_called()
+    d._mla_landing.begin.assert_not_called()
+    assert meta.reqs_to_recv.keys() <= d._pending_handoffs.keys()
     _, (_, payload) = d._send_on_socket.call_args.args
     request = msgpack.loads(payload)
     assert request["has_slot_regions"]
@@ -907,7 +939,9 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
-    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    p._notify_transfer_result.assert_called_once_with(
+        dict(request, _deadline=mc.PD_TRANSFER_DEADLINE_S), success=False
+    )
     assert not p._pending_chunked_requests
 
 
