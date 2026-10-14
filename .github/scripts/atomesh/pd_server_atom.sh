@@ -251,10 +251,10 @@ WAIT_SERVER_TIMEOUT="${WAIT_SERVER_TIMEOUT:-5000}"
 WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
-AIPERF_DIR="${AIPERF_DIR:-/tmp/atomesh-aiperf}"
-AIPERF_VENV="${AIPERF_VENV:-/tmp/atomesh-aiperf-venv}"
-AIPERF_COMMIT="${AIPERF_COMMIT:-b7b16cf851885567988a643282266bce74e34437}"
-AIPERF_SCENARIO="${AIPERF_SCENARIO:-inferencex-agentx-mvp}"
+# The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
+AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.7}"
+AGENTX_VENV="${AGENTX_VENV:-/tmp/atomesh-agentx-venv}"
+AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
 AIPERF_APPLY_CHAT_TEMPLATE="${AIPERF_APPLY_CHAT_TEMPLATE:-false}"
 AIPERF_MAX_CONTEXT_LENGTH="${AIPERF_MAX_CONTEXT_LENGTH:-262144}"
@@ -269,7 +269,6 @@ AIPERF_FAILED_REQUEST_THRESHOLD="${AIPERF_FAILED_REQUEST_THRESHOLD:-0.50}"
 AIPERF_SLICE_DURATION="${AIPERF_SLICE_DURATION:-1.0}"
 AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT:-300}"
 AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT:-900000}"
-AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES:-0}"
 AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT:-1800}"
 AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT:-1800}"
 AIPERF_UNSAFE_OVERRIDE="${AIPERF_UNSAFE_OVERRIDE:-}"
@@ -2118,28 +2117,19 @@ run_benchmark() {
   done
 }
 
-ensure_aiperf() {
-  local current_commit=""
-  if [[ -d "${AIPERF_DIR}/.git" ]]; then
-    current_commit="$(git -C "${AIPERF_DIR}" rev-parse HEAD 2>/dev/null || true)"
-  fi
-  if [[ -x "${AIPERF_VENV}/bin/aiperf" && "${current_commit}" == "${AIPERF_COMMIT}" ]]; then
+ensure_agentx_harness() {
+  if [[ -x "${AGENTX_VENV}/bin/agentx" \
+    && "$("${AGENTX_VENV}/bin/agentx" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
     return
   fi
 
-  echo "[aiperf] preparing ${AIPERF_DIR} @ ${AIPERF_COMMIT}"
-  mkdir -p "$(dirname "${AIPERF_DIR}")" "$(dirname "${AIPERF_VENV}")"
-  if [[ ! -d "${AIPERF_DIR}/.git" ]]; then
-    rm -rf "${AIPERF_DIR}"
-    git clone https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_DIR}"
-  fi
-  git -C "${AIPERF_DIR}" fetch https://github.com/SemiAnalysisAI/aiperf.git "${AIPERF_COMMIT}"
-  git -C "${AIPERF_DIR}" checkout --detach "${AIPERF_COMMIT}"
-  rm -rf "${AIPERF_VENV}"
-  python3 -m venv "${AIPERF_VENV}"
-  "${AIPERF_VENV}/bin/python" -m pip install --upgrade pip
-  "${AIPERF_VENV}/bin/python" -m pip install -e "${AIPERF_DIR}"
-  "${AIPERF_VENV}/bin/aiperf" --version
+  echo "[agentx] installing agentx-harness==${AGENTX_HARNESS_VERSION} into ${AGENTX_VENV}"
+  mkdir -p "$(dirname "${AGENTX_VENV}")"
+  rm -rf "${AGENTX_VENV}"
+  python3 -m venv "${AGENTX_VENV}"
+  "${AGENTX_VENV}/bin/python" -m pip install --upgrade pip
+  "${AGENTX_VENV}/bin/python" -m pip install "agentx-harness==${AGENTX_HARNESS_VERSION}"
+  "${AGENTX_VENV}/bin/agentx" --version
 }
 
 write_aiperf_dashboard_json() {
@@ -2331,7 +2321,7 @@ wait_for_torch_traces() {
 }
 
 run_aiperf_agentic_benchmark() {
-  ensure_aiperf
+  ensure_agentx_harness
 
   if is_agentic_session_affinity; then
     # dp_sticky keys off X-Session-ID. Without it every turn is placed by load
@@ -2401,13 +2391,12 @@ run_aiperf_agentic_benchmark() {
     fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
-    AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
       python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
-      "${AIPERF_VENV}/bin/aiperf" profile \
+      "${AGENTX_VENV}/bin/agentx" profile \
       "${unsafe_args[@]}" \
       --scenario "${AIPERF_SCENARIO}" \
       --url "http://127.0.0.1:${ROUTER_PORT}" \
