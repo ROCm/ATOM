@@ -10,13 +10,18 @@ import torch
 import triton
 import triton.language as tl
 
+from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.model_ops.attentions.qwen4_exp_attn import (
     Qwen4ExpPLEMetadata,
     Qwen4ExpQSAMetadata,
 )
 from atom.model_ops.qwen4_exp.ops.qsa import qsa_compressed_slots
 from atom.model_ops.qwen4_exp.qsa_attention import Qwen4ExpAttention
-from atom.plugin.rtpllm.utils.forward_context import RTPForwardQwen35HybridContext
+from atom.plugin.rtpllm.utils.forward_context import (
+    RTPForwardContext,
+    RTPForwardQwen35HybridContext,
+    _target_verify_state_slots_graph_kernel,
+)
 from atom.utils.forward_context import get_forward_context
 
 
@@ -55,6 +60,135 @@ def _qsa_graph_slots_kernel(
 
 class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
     """Bind the QSA side caches and PLE windows to RTP's request/page IDs."""
+
+    @classmethod
+    def _build_gdn_metadata(
+        cls,
+        attn_inputs: Any,
+        *,
+        seq_size_per_block: int,
+        num_tokens: int,
+        state_indices_cache: dict | None = None,
+        layer_group_map: dict | None = None,
+        cg_bufs: dict | None = None,
+    ) -> GDNAttentionMetadata:
+        if not getattr(attn_inputs, "is_target_verify", False):
+            return super()._build_gdn_metadata(
+                attn_inputs,
+                seq_size_per_block=seq_size_per_block,
+                num_tokens=num_tokens,
+                state_indices_cache=state_indices_cache,
+                layer_group_map=layer_group_map,
+                cg_bufs=cg_bufs,
+            )
+        # RTP labels verification as prefill, but the Q candidate states are
+        # speculative decode states stored in separate reserved blocks.
+        block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
+        if block_table is None or block_table.ndim != 2 or block_table.numel() == 0:
+            raise ValueError("invalid Qwen4Exp MTP target-verify state table")
+        batch_size = int(attn_inputs.input_lengths.numel())
+        if batch_size <= 0 or num_tokens % batch_size:
+            raise ValueError("invalid Qwen4Exp MTP target-verify token count")
+        query_len = num_tokens // batch_size
+        if query_len not in (2, 3, 4) or any(
+            int(length) != query_len for length in attn_inputs.input_lengths.tolist()
+        ):
+            raise ValueError(
+                "Qwen4Exp MTP requires 2, 3, or 4 verify tokens per request "
+                f"(tokens={num_tokens}, batch={batch_size}, query_len={query_len})"
+            )
+        seq_lens = attn_inputs.sequence_lengths_plus_1_device
+        if seq_lens is None or seq_lens.numel() != batch_size:
+            raise ValueError("invalid Qwen4Exp MTP target-verify sequence lengths")
+        in_capture = torch.cuda.is_current_stream_capturing()
+        if in_capture:
+            if (
+                triton is None
+                or cg_bufs is None
+                or "target_read_slots_i32" not in cg_bufs
+            ):
+                raise RuntimeError(
+                    "Qwen4Exp MTP target Graph requires prewarmed buffers"
+                )
+            query_start_loc = cg_bufs["query_start_loc"][: batch_size + 1]
+            read_slots = cg_bufs["target_read_slots_i32"][:batch_size]
+            write_slots = cg_bufs["target_write_slots_i32"][:batch_size]
+            _target_verify_state_slots_graph_kernel[(triton.cdiv(batch_size, 128),)](
+                block_table,
+                seq_lens,
+                read_slots,
+                write_slots,
+                batch_size,
+                block_table.stride(0),
+                block_table.stride(1),
+                block_table.shape[1],
+                seq_size_per_block,
+                query_len,
+                128,
+            )
+            sequence_masks = cg_bufs["target_sequence_masks"][:batch_size]
+            accepted_tokens = cg_bufs["target_accepted_tokens"][:batch_size]
+        else:
+            query_start_loc = RTPForwardContext._query_start_loc(
+                attn_inputs, device=block_table.device
+            )
+            rows = torch.arange(batch_size, device=block_table.device)[:, None]
+            read_col = torch.div(
+                seq_lens.to(torch.int64) - 2,
+                seq_size_per_block,
+                rounding_mode="floor",
+            )
+            write_cols = torch.div(
+                seq_lens.to(torch.int64) - 1,
+                seq_size_per_block,
+                rounding_mode="floor",
+            )[:, None] + torch.arange(query_len, device=block_table.device)
+            if bool(
+                torch.any((read_col < 0) | (read_col >= block_table.shape[1])).item()
+            ) or bool(torch.any(write_cols >= block_table.shape[1]).item()):
+                raise ValueError("Qwen4Exp MTP target-verify block table is too narrow")
+            read_slots = block_table[rows[:, 0], read_col]
+            write_slots = block_table[rows, write_cols]
+            if bool(torch.any(read_slots < 0).item()) or bool(
+                torch.any(write_slots < 0).item()
+            ):
+                raise ValueError("Qwen4Exp MTP target-verify state block is invalid")
+            sequence_masks = torch.ones(
+                batch_size, device=block_table.device, dtype=torch.bool
+            )
+            accepted_tokens = torch.ones(
+                batch_size, device=block_table.device, dtype=torch.int32
+            )
+        metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=batch_size,
+            num_spec_decode_tokens=num_tokens,
+            num_actual_tokens=num_tokens,
+            has_initial_state=None,
+            spec_query_start_loc=query_start_loc,
+            non_spec_query_start_loc=None,
+            spec_state_indices_tensor=write_slots.to(torch.int32),
+            spec_state_indices_in_tensor=(
+                read_slots
+                if in_capture
+                else read_slots[:, None]
+                .expand_as(write_slots)
+                .to(torch.int32)
+                .contiguous()
+            ),
+            non_spec_state_indices_tensor=None,
+            spec_sequence_masks=sequence_masks,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=accepted_tokens,
+        )
+        metadata.rtp_target_verify_block_map = block_table
+        metadata.rtp_target_verify_sequence_lengths = seq_lens.to(torch.int32)
+        metadata.rtp_seq_size_per_block = seq_size_per_block
+        return metadata
 
     @staticmethod
     def collect_layer_maps(model: Any):
@@ -202,7 +336,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         has_initial = gdn.has_initial_state
         if has_initial is None:
             if torch.cuda.is_current_stream_capturing():
-                graph_buffers = runtime._cg_meta_bufs
+                graph_buffers = attn_metadata.plugin_metadata.cg_bufs
                 has_initial = graph_buffers["qwen4_has_initial"][: indices.numel()]
                 logical_positions = attn_metadata.qsa_metadata.logical_positions
                 if spec_indices is not None:

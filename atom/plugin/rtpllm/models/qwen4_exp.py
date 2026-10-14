@@ -72,40 +72,15 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         is_mtp_draft = bool(
             getattr(getattr(self, "_rtp_model_config", None), "is_mtp", False)
         )
-        tokens_per_request = (
+        mtp_tokens_per_request = (
             int(self._rtp_model_config.gen_num_per_cycle) + 1
             if is_target or is_mtp_draft
             else 1
         )
-        if (is_target or is_mtp_draft) and tokens_per_request not in (2, 3, 4):
+        if (is_target or is_mtp_draft) and mtp_tokens_per_request not in (2, 3, 4):
             raise ValueError("Qwen4Exp MTP supports 1, 2, or 3 draft steps")
         max_batch = int(self._cg_max_num_tokens)
-        max_tokens = max_batch * tokens_per_request
         device = self._get_model_device()
-        if tokens_per_request > 1:
-            # Target verification and MTP draft prefill capture gamma + 1
-            # tokens/request; the parent only prewarms ordinary decode.
-            parent_table = buffers["block_table_i32"]
-            buffers["block_table_i32"] = torch.empty(
-                max_batch,
-                parent_table.shape[1] + tokens_per_request - 1,
-                device=device,
-                dtype=torch.int32,
-            )
-            buffers["query_start_loc"] = torch.arange(
-                0, max_tokens + 1, tokens_per_request, device=device, dtype=torch.int32
-            )
-            buffers["seq_id"] = torch.arange(
-                max_batch, device=device, dtype=torch.int64
-            ).repeat_interleave(tokens_per_request)
-            for name, dtype in (
-                ("block_col", torch.int32),
-                ("block_col_i64", torch.int64),
-                ("slot_base", torch.int32),
-                ("token_offset", torch.int32),
-                ("slot_mapping", torch.int64),
-            ):
-                buffers[name] = torch.empty(max_tokens, device=device, dtype=dtype)
         qsa_layers = [
             module
             for module in self._rtp_layer_maps[1].values()
@@ -117,43 +92,100 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 qsa_layers,
                 int(self.kv_cache.get_seq_size_per_block("full")),
             )
-        buffers["seq_id_i32"] = buffers["seq_id"].to(torch.int32)
-        buffers["qsa_positions_i64"] = torch.empty(
-            max_tokens, device=device, dtype=torch.int64
+
+        def add_qsa_buffers(graph_buffers, num_tokens):
+            graph_buffers["seq_id_i32"] = graph_buffers["seq_id"].to(torch.int32)
+            for name, dtype in (
+                ("qsa_positions_i64", torch.int64),
+                ("qwen4_positions_i32", torch.int32),
+                ("qsa_slots_i64", torch.int64),
+                ("qwen4_has_initial", torch.bool),
+                ("qsa_compressed_slots", torch.int64),
+            ):
+                graph_buffers[name] = torch.empty(
+                    num_tokens, device=device, dtype=dtype
+                )
+            physical_block_size = int(self.kv_cache.get_seq_size_per_block("full"))
+            max_physical_blocks = (
+                int(self._cg_max_seq_len) + physical_block_size - 1
+            ) // physical_block_size + num_tokens // max_batch
+            graph_buffers["physical_block_table_i32"] = torch.empty(
+                num_tokens,
+                max_physical_blocks,
+                device=device,
+                dtype=torch.int32,
+            )
+
+        # The same draft runtime is wrapped by both the Q-token draft-prefill
+        # graph and the one-token draft-decode graph. Never replace the decode
+        # geometry in the parent's buffers with Q-strided request indices.
+        add_qsa_buffers(buffers, max_batch)
+        if mtp_tokens_per_request == 1:
+            return
+        max_tokens = max_batch * mtp_tokens_per_request
+        parent_table = buffers["block_table_i32"]
+        table_width = parent_table.shape[1] + mtp_tokens_per_request - 1
+        # RTP's MTP decode graph can carry Q reserved state columns even
+        # though it has only one token per request. Keep its indices 1-token
+        # wide, but give the table enough columns for the upstream copy.
+        buffers["block_table_i32"] = torch.empty(
+            max_batch, table_width, device=device, dtype=torch.int32
         )
-        buffers["qwen4_positions_i32"] = torch.empty(
-            max_tokens, device=device, dtype=torch.int32
+        mtp_buffers = buffers.copy()
+        mtp_buffers["mtp_window_width"] = mtp_tokens_per_request
+        mtp_buffers["block_table_i32"] = torch.empty(
+            max_batch,
+            table_width,
+            device=device,
+            dtype=torch.int32,
         )
-        buffers["qsa_slots_i64"] = torch.empty(
-            max_tokens, device=device, dtype=torch.int64
+        mtp_buffers["query_start_loc"] = torch.arange(
+            0,
+            max_tokens + 1,
+            mtp_tokens_per_request,
+            device=device,
+            dtype=torch.int32,
         )
-        buffers["qwen4_has_initial"] = torch.empty(
-            max_tokens, device=device, dtype=torch.bool
-        )
-        buffers["qsa_compressed_slots"] = torch.empty(
-            max_tokens, device=device, dtype=torch.int64
-        )
+        mtp_buffers["seq_id"] = torch.arange(
+            max_batch, device=device, dtype=torch.int64
+        ).repeat_interleave(mtp_tokens_per_request)
+        for name, dtype in (
+            ("block_col", torch.int32),
+            ("block_col_i64", torch.int64),
+            ("slot_base", torch.int32),
+            ("token_offset", torch.int32),
+            ("slot_mapping", torch.int64),
+        ):
+            mtp_buffers[name] = torch.empty(max_tokens, device=device, dtype=dtype)
+        add_qsa_buffers(mtp_buffers, max_tokens)
         if is_target:
-            buffers["target_read_slots_i32"] = torch.empty(
-                (max_batch, tokens_per_request), device=device, dtype=torch.int32
+            mtp_buffers["target_read_slots_i32"] = torch.empty(
+                (max_batch, mtp_tokens_per_request), device=device, dtype=torch.int32
             )
-            buffers["target_write_slots_i32"] = torch.empty(
-                (max_batch, tokens_per_request), device=device, dtype=torch.int32
+            mtp_buffers["target_write_slots_i32"] = torch.empty(
+                (max_batch, mtp_tokens_per_request), device=device, dtype=torch.int32
             )
-            buffers["target_sequence_masks"] = torch.ones(
+            mtp_buffers["target_sequence_masks"] = torch.ones(
                 max_batch, device=device, dtype=torch.bool
             )
-            buffers["target_accepted_tokens"] = torch.ones(
+            mtp_buffers["target_accepted_tokens"] = torch.ones(
                 max_batch, device=device, dtype=torch.int32
             )
-        kv_cache = self.kv_cache
-        physical_block_size = int(kv_cache.get_seq_size_per_block("full"))
-        max_physical_blocks = (
-            int(self._cg_max_seq_len) + physical_block_size - 1
-        ) // physical_block_size + tokens_per_request
-        buffers["physical_block_table_i32"] = torch.empty(
-            max_tokens, max_physical_blocks, device=device, dtype=torch.int32
-        )
+        self._cg_mtp_meta_bufs = mtp_buffers
+
+    def _graph_buffers_for_inputs(self, attn_inputs):
+        if getattr(attn_inputs, "is_target_verify", False) or (
+            getattr(getattr(self, "_rtp_model_config", None), "is_mtp", False)
+            and getattr(attn_inputs, "is_prefill", False)
+        ):
+            buffers = getattr(self, "_cg_mtp_meta_bufs", None)
+            if buffers is None and (
+                getattr(attn_inputs, "is_cuda_graph", False)
+                or torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError("Qwen4Exp MTP Graph buffers were not prewarmed")
+            return buffers
+        return getattr(self, "_cg_meta_bufs", None)
 
     def forward(self, inputs, fmha_impl=None):
         tagged = inputs.attention_inputs
@@ -224,7 +256,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 raise ValueError(
                     "Qwen4Exp Graph requires per-row device sequence lengths"
                 )
-            graph_buffers = getattr(self, "_cg_meta_bufs", None)
+            graph_buffers = self._graph_buffers_for_inputs(attn_inputs)
             if graph_buffers is not None:
                 positions = graph_buffers["qwen4_positions_i32"][:token_num]
                 if is_mtp_draft_prefill or is_target_verify:
@@ -503,7 +535,7 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
             positions=positions,
             layer_maps=self._rtp_layer_maps,
             cg_max_seq_len=int(self._cg_max_seq_len),
-            cg_bufs=getattr(self, "_cg_meta_bufs", None),
+            cg_bufs=self._graph_buffers_for_inputs(inputs.attention_inputs),
         ):
             # QSA cache slots use the RTP logical position; the draft's RoPE
             # rotates one token ahead, as in ATOM's standalone/SGLang MTP.
