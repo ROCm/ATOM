@@ -2079,6 +2079,7 @@ class Scheduler:
             # its prefetched lookup for the next pass. The HBM probe it needs
             # is kept and reused by the admission probe below.
             hbm_probe = None
+            probed_tier_kv = (0, 0)
             lookup_detachable = False
             if (
                 not remote_ready_for_decode
@@ -2086,6 +2087,7 @@ class Scheduler:
                 and self._lookup_detach_enabled(seq)
             ):
                 hbm_probe = self._probe_hbm_prefix(seq)
+                probed_tier_kv = self._tier_hit(seq)
                 lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
             if (
                 not remote_ready_for_decode
@@ -2205,7 +2207,16 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            if hbm_probe is None:
+            # The detach probe predates `_query_connector_prefill_match`, and
+            # `can_allocate` reads the tier's answer (a replaying hit resumes at
+            # the tier hit or extends to its KV-only reach) and records the
+            # replay on `seq` -- for a replaying model only. Probe again if
+            # that answer moved.
+            if hbm_probe is None or (
+                getattr(self.block_manager, "state_replay_tokens", 0)
+                and seq.has_per_req_cache
+                and self._tier_hit(seq) != probed_tier_kv
+            ):
                 hbm_probe = self._probe_hbm_prefix(seq)
             num_cached_blocks, block_hashes = hbm_probe
             if num_cached_blocks < 0:
@@ -2981,6 +2992,16 @@ class Scheduler:
             reuse_hashes=self._local_prefill_coalescing,
         )
         return num_cached_blocks, block_hashes
+
+    @staticmethod
+    def _tier_hit(seq: Sequence) -> tuple[int, int]:
+        """The tier's answer as `can_allocate` reads it: the LMCache MP hit and
+        its KV-only reach (`kv_prefix_tokens`, `kv_only_tokens`)."""
+        joint = getattr(seq, "offload_joint", None)
+        return (
+            int(getattr(joint, "kv_prefix_tokens", 0) or 0),
+            int(getattr(joint, "kv_only_tokens", 0) or 0),
+        )
 
     def _can_detach_tier_lookup(
         self, seq: Sequence, hbm_probe: tuple[int, list[int]]
