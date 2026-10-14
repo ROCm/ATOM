@@ -881,7 +881,8 @@ models:
           pd_worker_layout: single_node
           concurrency: [72]
           prefill: {}
-          # PP requires eager execution, so no graph capture and no compile level.
+          # Eager baseline for the -cg cell below, which captures each stage's
+          # decode graphs.
           decode:
             workers: 1
             tp: 1
@@ -930,6 +931,31 @@ models:
             tp: 2
             cudagraph: none
             extra_args: "--pipeline-parallel-size 4 --enforce-eager"
+
+        # The PP8 and PP4xTP2 cells with FULL cudagraphs: each stage replays its
+        # own layers' decode graph per microbatch, with the TP8 cells' compile
+        # settings.
+        - <<: *kimi_k3_agentic_agg_pp8
+          name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72
+          display_topology: AGG-PP8-TP1-CG
+          decode:
+            workers: 1
+            tp: 1
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--pipeline-parallel-size 8"
+
+        - <<: *kimi_k3_agentic_agg_pp8
+          name: kimi-k3-mxfp4-agg-pp4-tp2-cg-agentic-lmcache-1m-c72
+          display_topology: AGG-PP4-TP2-CG
+          decode:
+            workers: 1
+            tp: 2
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+            extra_args: "--pipeline-parallel-size 4"
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
