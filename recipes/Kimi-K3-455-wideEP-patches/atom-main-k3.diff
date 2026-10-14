@@ -1,8 +1,8 @@
 diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
-index f7cc712..4515a1c 100644
+index 1eeb571e..663108d2 100644
 --- a/atom/model_ops/attention_mla.py
 +++ b/atom/model_ops/attention_mla.py
-@@ -475,6 +475,11 @@ if is_rocm_aiter_fp4bmm_enabled():
+@@ -473,6 +473,11 @@ if is_rocm_aiter_fp4bmm_enabled():
      from atom.model_ops.utils import quark_post_load_weights
  
  
@@ -14,9 +14,9 @@ index f7cc712..4515a1c 100644
  # Optional flydsl backend for `_kv_b_proj_gather`, gated by
  # ATOM_USE_FLYDSL_GATHER_KV_B_PROJ.
  try:
-@@ -697,6 +702,21 @@ class MLAAttention(nn.Module):
-                 torch.cuda.current_device(), non_blocking=True
-             )
+@@ -683,6 +688,21 @@ class MLAAttention(nn.Module):
+         # Shuffled KV cache; the decode kernel follows use_triton_mla.
+         self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
          self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
 +        # Unfused torch gather: an escape hatch for targets where Triton cannot
 +        # compile the fused kernel for chunked-prefill shapes. Refuse the one
@@ -36,7 +36,7 @@ index f7cc712..4515a1c 100644
          # Resolved on the first gather, when the weights and cache exist; see
          # `_kv_b_proj_gather`. None = not asked yet.
          self._flydsl_gather_ok: bool | None = None
-@@ -1809,7 +1829,14 @@ class MLAAttention(nn.Module):
+@@ -1759,7 +1779,14 @@ class MLAAttention(nn.Module):
                      return k_gather, v_gather, *kv_out_scales
                  return None
  
@@ -53,10 +53,10 @@ index f7cc712..4515a1c 100644
              self._k_scale,
              kv_indptr,
 diff --git a/atom/model_ops/attentions/gdn_attn.py b/atom/model_ops/attentions/gdn_attn.py
-index ae1886a..81478f9 100644
+index fb404ec0..61a97ab0 100644
 --- a/atom/model_ops/attentions/gdn_attn.py
 +++ b/atom/model_ops/attentions/gdn_attn.py
-@@ -1145,6 +1145,21 @@ class GDNStateMixin(PoolRowsMixin):
+@@ -1153,6 +1153,21 @@ class GDNStateMixin(PoolRowsMixin):
          index out of this tensor, and the conv path is handed column 0 alone),
          so this is where a contiguity assumption would have been *invented*
          rather than a place one has to be honoured.
@@ -78,7 +78,7 @@ index ae1886a..81478f9 100644
          """
          self._check_state_indices_writable()
          non_spec_state_indices = self.non_spec_state_indices_tensor.np
-@@ -1155,6 +1170,10 @@ class GDNStateMixin(PoolRowsMixin):
+@@ -1163,6 +1178,10 @@ class GDNStateMixin(PoolRowsMixin):
              "state fork on the spec-decode path: spec_state_indices_tensor has "
              "no read-side counterpart (BlockManager only forks onto prefill)"
          )
@@ -90,36 +90,28 @@ index ae1886a..81478f9 100644
              non_spec_state_indices[idx] = 0
              non_spec_state_indices_in[idx] = 0
 diff --git a/atom/model_ops/attentions/triton_mla.py b/atom/model_ops/attentions/triton_mla.py
-index 78d0d4f..64bd03c 100644
+index 645debb3..19c71f0a 100644
 --- a/atom/model_ops/attentions/triton_mla.py
 +++ b/atom/model_ops/attentions/triton_mla.py
-@@ -16,6 +16,14 @@ from .backends import AttentionBackend
- 
- logger = logging.getLogger("atom")
- 
-+# The dense decode table holds token-level KV row ids (page_size 1). aiter's
-+# Triton decode multiplies each id it loads by the row stride (576 for MLA) in
-+# the id's own type. With int32 ids the offset wraps once a pool passes
-+# 2**31 / 576 = 3,728,270 rows, which is 233,016 blocks of 16. The kernel then
-+# reads outside the layer's KV and gets garbage, NaN, or a memory fault. int64
-+# ids keep the whole offset in 64 bits, although every id fits in int32.
-+TRITON_BLOCK_TABLE_DTYPE = torch.int64
-+
- 
- class TritonMLABackend(AttentionBackend):
-     @staticmethod
-@@ -43,7 +51,7 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
+@@ -39,10 +39,14 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
+         kv_lora_rank = hf.kv_lora_rank
+         num_kv_splits = 4
+         triton_mla_buffers = {
++            # int64, not int32: aiter's Triton decode multiplies each KV row id by
++            # the row stride (576) in the id's own dtype. An int32 offset wraps past
++            # row 2**31 / 576 = 3,728,270 (block 233,016 of 16 tokens), and the
++            # decode then reads outside the KV cache.
              "triton_block_table": torch.zeros(
                  self.max_bs,
                  self.max_num_blocks_per_seq,
 -                dtype=torch.int32,
-+                dtype=TRITON_BLOCK_TABLE_DTYPE,
++                dtype=torch.int64,
                  device=self.device,
              ),
              "triton_attn_logits": torch.empty(
 diff --git a/atom/model_ops/mla_unfused_gather.py b/atom/model_ops/mla_unfused_gather.py
 new file mode 100644
-index 0000000..a4da5d2
+index 00000000..a4da5d2d
 --- /dev/null
 +++ b/atom/model_ops/mla_unfused_gather.py
 @@ -0,0 +1,206 @@
@@ -330,10 +322,10 @@ index 0000000..a4da5d2
 +        k_prefix[start:stop, :, nope:] = k_pe.unsqueeze(1).expand(-1, num_heads, -1)
 +        v_prefix[start:stop] = projected[:, :, nope:]
 diff --git a/atom/utils/envs.py b/atom/utils/envs.py
-index 60014c8..9017b4d 100644
+index 33c3ec88..dbba221d 100644
 --- a/atom/utils/envs.py
 +++ b/atom/utils/envs.py
-@@ -335,6 +335,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -354,6 +354,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (
          os.getenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "1") == "1"
      ),
