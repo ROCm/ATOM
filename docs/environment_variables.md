@@ -78,6 +78,18 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
+## Dynamic chunking
+
+Interpolates pipeline-parallel chunk sizes between the configured batch budget
+and the equal-latency size solved from the calibrated chunk model. Used when
+neither `--dynamic-chunking-smooth-factor` nor `Config.dynamic_chunking_smooth_factor`
+is given, and read only when dynamic chunking is enabled, so a malformed value
+cannot affect a server that does not use the feature.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
+
 ## Model loading
 
 | Variable | Type | Default | Description |
@@ -320,6 +332,7 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_DSV4_STATE_REPLAY** | bool | 0 (false) | DeepSeek-V4: keep a prefix hit that reaches past the nearest state checkpoint by more than the window's receptive field (7,748 tokens on V4-Pro, 7,875 with MTP or DSpark) and recompute only that field below it, which rebuilds the state exactly, instead of resuming at the checkpoint (`Config.state_replay_tokens`). Off on anything but the DeepSeek-V4 trunk with compress ratios 4 / 128, and with context parallelism, a speculative method other than MTP or the model's own DSpark layers (not a separate `--draft-model`), prefix caching off, or a KV connector other than LMCache MP offload alone. With that one LMCache saves carry the PAGE KV alone, no state image (the native layout registers the PAGE group alone, under a namespace of its own, so a stock LMCache server's hit is how far that KV reaches), and a hit whose PAGE KV LMCache holds past the HBM prefix loads that KV alone and replays below it. Every other model, and DeepSeek-V4 without the replay, keeps storing images. |
 
 ### LMCache offload tier
 
@@ -342,6 +355,7 @@ derive a bound.
 | **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
 | **OFFLOAD_ASYNC_LOOKUP_DEPTH** | int | 16 | `lmcache_mp` sends tier lookups for the head of the waiting queue before admission, as non-blocking requests, and admission consumes the answer; a request whose answer has not arrived is passed over (in arrival order) instead of blocking the scheduler. This is how many waiting requests per scheduling pass get a prefetched lookup. |
 | **OFFLOAD_LOOKUP_DEFER_S** | float | 2.0 | How long `lmcache_mp` admission may pass over a request whose prefetched lookup is still in flight before it waits for the answer (finite, ≥ 0). |
+| **OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT** | bool | 1 (true) | On by default; set to `0` to always wait for the lookup. Admit a prefill without waiting for its external-tier lookup when the lookup cannot change what is loaded: the HBM prefix leaves fewer than `OFFLOAD_MIN_LOAD_TOKENS` tokens uncached, so every load path would refuse the tier hit. Requires an asynchronous lookup (LMCache MP) and is not applied with joint KV/state offload. The lookup is still sent, because it refreshes the prefix's L1 LRU recency and opens the MP session whose end touches the request's chunks; its answer is not used as a load hit. The save floor starts at the HBM prefix and is lowered to the tier's contiguous hit when the answer arrives (or to 0 if it never does), so chunks the tier evicted are stored again. Read locks are released when the answer arrives; the MP session ends after that, and an unanswered lookup is given up after 120 s, leaving its locks to the read TTL. |
 | **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
 | **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
 | **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |

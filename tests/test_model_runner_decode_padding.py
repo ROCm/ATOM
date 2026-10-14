@@ -34,6 +34,7 @@ def test_runner_model_height_and_sampling_rows(
     runner.config = SimpleNamespace(prefill_context_parallel_size=1)
     runner._detailed_label_suffix = lambda batch: ""
     runner._piecewise_cg_active = lambda: piecewise
+    runner._dynamic_chunking = runner_module.DynamicChunkingWorker(runner)
     ids = torch.full((32,), -99, dtype=torch.int32)
     ids[:scheduled] = torch.arange(1, scheduled + 1)
     pos = torch.full((32,), -99, dtype=torch.int64)

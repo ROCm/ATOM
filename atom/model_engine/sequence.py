@@ -139,13 +139,18 @@ class Replay(NamedTuple):
     """A prefill forward starting below the point its seq resumed at: that
     point -- the cache holds every row below it --, whether the rows below are
     the seq's state (a `replay` state transfer brought none; otherwise the
-    state is the one at `until`), and the tokens just before the forward, for
+    state is the one at `until`), the tokens just before the forward, for
     state a backend derives from the preceding tokens (V4.1's Engram n-gram
-    history, `Config.replay_history_tokens` of them)."""
+    history, `Config.replay_history_tokens` of them), and where the replay's
+    first forward started: a DeepSeek-V4 bounded replay may span forwards, and
+    no row below that start is in the state it rebuilds. `Scheduler.
+    _resume_prefill` always records it; 0 (no floor) is for a record built
+    elsewhere, which no V4 forward reads."""
 
     until: int
     rebuilds: bool
     history_ids: tuple[int, ...]
+    start: int = 0
 
 
 class SequenceStatus(Enum):
@@ -207,6 +212,11 @@ class OffloadJointRecord:
     # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
     # is where the two legs agree on one boundary. 0 = no lookup.
     kv_prefix_tokens: int = 0
+    # The LMCache-resident KV prefix with no regard for window state, in
+    # tokens: how far the full-attention KV alone reaches, at or past
+    # `kv_prefix_tokens`. Asked only where a bounded replay could use it
+    # (`Sequence.replay_kv_load`). 0 = not asked or not answered.
+    kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
     # covers. `num_cached_tokens` stays at the HBM prefix until both legs
@@ -331,6 +341,15 @@ class Sequence:
         # the reuse a checkpoint would have delivered — what the EngineStats
         # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
+        # DeepSeek-V4 bounded replay: whether the hit `BlockManager.can_allocate`
+        # admitted last has no checkpoint behind its state, so its prefill
+        # starts `Config.state_replay_tokens` below it and rebuilds the state
+        # there (`BlockManager.replay_start`; the forward is a `Replay`).
+        self.replays_hit = False
+        # That replay ends past the HBM hit, at LMCache MP's KV-only reach
+        # (`OffloadJointRecord.kv_only_tokens`): the connector loads that KV
+        # alone first, and once it lands the forward replays below the reach.
+        self.replay_kv_load = False
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
         # checkpoint can be kept. 0 = nowhere. Both written by

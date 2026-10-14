@@ -1,45 +1,72 @@
+import logging
+from typing import ClassVar
+
 import numpy as np
 import torch
+from aiter.dist.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from torch import nn
 
-
-from atom.config import QuantizationConfig, Config
-
-from atom.model_ops.utils import atom_parameter
-from atom.utils.decorators import support_torch_compile
-
-from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
+from atom.config import Config, QuantizationConfig
 from atom.model_config.qwen3_5 import (
     Qwen3_5Config,  # noqa: F401
     Qwen3_5TextConfig,
 )
-
 from atom.model_config.qwen3_5_moe import (
     Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.model_ops.layernorm import fused_ar_gemma_per_group_supported
 from atom.model_ops.linear import (
     MergedColumnParallelLinear,
 )
-from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
+from atom.model_ops.moe import FusedMoE
+from atom.model_ops.utils import atom_parameter
 from atom.models.qwen3_next import (
+    ENABLE_ALLREDUCE_RMSNORM_FUSION,
     Qwen3NextAttention,
+    Qwen3NextDecoderLayer,
     Qwen3NextGatedDeltaNet,
+    Qwen3NextMLP,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
-    Qwen3NextMLP,
-    Qwen3NextDecoderLayer,
 )
-
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    extract_layer_index,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
-    extract_layer_index,
 )
+from atom.plugin.prepare import is_plugin_mode
+from atom.utils.decorators import support_torch_compile
+
+logger = logging.getLogger("atom")
+
+
+def allreduce_norm_fusion_enabled() -> bool:
+    """Whether row-parallel outputs skip their all-reduce and the following
+    Gemma RMSNorm folds it in. Off under PP (stage-boundary activations must
+    be reduced), in plugin mode (not validated there), and on an aiter whose
+    per-group fused kernel cannot do the Gemma norm."""
+    enabled = (
+        ENABLE_ALLREDUCE_RMSNORM_FUSION
+        and get_tensor_model_parallel_world_size() > 1
+        and get_pp_group().world_size == 1
+        and not is_plugin_mode()
+    )
+    if enabled and not fused_ar_gemma_per_group_supported():
+        logger.warning(
+            "Qwen3.5 all-reduce + RMSNorm fusion is off: this aiter's fused "
+            "AR + RMSNorm + per-group quant does not take gemma_norm"
+        )
+        return False
+    return enabled
 
 
 def get_qwen3_5_text_config(atom_config: Config):
@@ -348,6 +375,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         layer_type: str,
         prefix: str = "",
         layer_num: int = 0,
+        fuse_allreduce_norm: bool = False,
     ) -> None:
         super(Qwen3NextDecoderLayer, self).__init__()
 
@@ -357,6 +385,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = layer_num
+        # When set, o_proj / out_proj / MoE return TP-partial sums and the next
+        # norm (this layer's post_attention_layernorm, the next layer's
+        # input_layernorm, or the model's final norm) does AR + RMSNorm.
+        self.fuse_allreduce_norm = fuse_allreduce_norm
+        reduce_results = not fuse_allreduce_norm
 
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(
@@ -364,12 +397,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 quant_config=quant_config,
                 speculative_config=speculative_config,
                 prefix=f"{prefix}.linear_attn",
+                reduce_results=reduce_results,
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
                 atom_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.self_attn",
+                reduce_results=reduce_results,
             )
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
@@ -381,6 +416,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 config,
                 atom_config.quant_config,
                 prefix=f"{prefix}.mlp",
+                reduce_results=reduce_results,
             )
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3NextMLP(
@@ -388,34 +424,36 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=reduce_results,
                 prefix=f"{prefix}.mlp",
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
 
-        # Emit FP8 + per-1x128 scales straight from the norm for the projection
-        # that consumes it, as Qwen3NextDecoderLayer does; the inherited forward
-        # routes them. GemmaRMSNorm only fuses for per_1x128, so BF16 and MXFP4
-        # checkpoints keep the plain norm.
-        if quant_config is None:
-            input_norm_quant = None
-        elif self.layer_type == "full_attention":
-            input_norm_quant = quant_config.get_layer_quant_config(
-                f"{prefix}.self_attn.qkv_proj"
-            )
+        # Fold the FP8 per-group activation quant of the first projection into
+        # the input norm (as Qwen3NextDecoderLayer does); GDN layers also need
+        # the BF16 normed activation for in_proj_ba.
+        if self.layer_type == "full_attention":
+            input_norm_proj = f"{prefix}.self_attn.qkv_proj"
         else:
-            input_norm_quant = quant_config.get_layer_quant_config(
-                f"{prefix}.linear_attn.in_proj_qkvz"
-            )
+            input_norm_proj = f"{prefix}.linear_attn.in_proj_qkvz"
+        input_norm_quant = (
+            quant_config.get_layer_quant_config(input_norm_proj)
+            if quant_config is not None
+            else None
+        )
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
             quant_config=input_norm_quant,
-            # in_proj_ba stays BF16, so the GDN layer needs the BF16 copy too.
             write_bf16=self.layer_type == "linear_attention",
+            # Layer 0's input is the embedding, already complete on every rank.
+            fused_allreduce=fuse_allreduce_norm and layer_num > 0,
         )
         self.post_attention_layernorm = Qwen3_5RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=fuse_allreduce_norm,
         )
 
         self.layer_scale = getattr(config, "layer_scale", False)
@@ -462,12 +500,15 @@ class Qwen3_5Model(Qwen3NextModel):
             config.hidden_size,
         )
 
+        fuse_allreduce_norm = allreduce_norm_fusion_enabled()
+
         def get_layer(prefix: str, layer_num: int):
             return Qwen3_5DecoderLayer(
                 atom_config=atom_config,
                 layer_type=config.layer_types[extract_layer_index(prefix)],
                 prefix=prefix,
                 layer_num=layer_num,
+                fuse_allreduce_norm=fuse_allreduce_norm,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -477,7 +518,12 @@ class Qwen3_5Model(Qwen3NextModel):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # The last layer's MoE output is still TP-partial when fused.
+        self.norm = Qwen3_5RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            fused_allreduce=fuse_allreduce_norm,
+        )
 
 
 _QWEN3_5_PACKED_MODULES_MAPPING = {
@@ -745,14 +791,14 @@ class _Qwen3_5MultimodalBase(nn.Module):
     )
 
     # Weight name mapping: checkpoint -> native ATOM module names.
-    hf_to_atom_mapper = {
+    hf_to_atom_mapper: ClassVar[dict[str, str]] = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",
     }
 
     # Remap quant exclude layer names from checkpoint format to native names.
-    quant_exclude_name_mapping = {
+    quant_exclude_name_mapping: ClassVar[dict[str, str]] = {
         "model.visual.": "visual.",
         "lm_head.": "language_model.lm_head.",
         "model.language_model.": "language_model.model.",

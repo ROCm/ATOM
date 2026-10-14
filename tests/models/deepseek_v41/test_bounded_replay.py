@@ -375,7 +375,7 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     builder.geometry = SimpleNamespace(history_size=mapping.config.max_ngram_size - 1)
     builder.config = SimpleNamespace(image_token_id=image)
     resumes, floors, cached, histories = builder._replay_layout(
-        {1: Replay(384, True, (5, 7))},
+        {1: Replay(384, True, (5, 7), 256)},
         np.array([0, 1]),
         [RequestSpan(1, 0, 0, 10, 0), RequestSpan(2, 256, 10, 200, 1)],
     )

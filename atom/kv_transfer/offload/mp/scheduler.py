@@ -41,7 +41,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     _supports_early_block_release = True
 
-    def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
+    def __init__(
+        self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
+    ) -> None:
         _validate_mp_config(config)
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
@@ -50,7 +52,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             config.kv_cache_block_size,
             minimum=1,
         )
-        adapter = _make_scheduler_adapter(config, checkpoint_spec=checkpoint_spec)
+        adapter = _make_scheduler_adapter(
+            config, checkpoint_spec=checkpoint_spec, images=images
+        )
         try:
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))
@@ -228,6 +232,22 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         super()._finish_retired_request(sid)
         self._end_finished_sessions()
 
+    def has_pending_work(self) -> bool:
+        """Also report pending session ends and unreleased discarded lookups.
+
+        A detached lookup can outlive its request. If no other request is
+        running, nothing else steps the connector, so without this the lookup
+        is never pumped and its session never ends. Both are bounded: a
+        discarded lookup is given up after `_ORPHAN_TIMEOUT_S`, and a session
+        waits only for its saves and its lookup.
+        """
+        orphans = getattr(self._lookup_client, "has_orphans", None)
+        return (
+            super().has_pending_work()
+            or bool(self._pending_session_ends())
+            or bool(callable(orphans) and orphans())
+        )
+
     def _pending_session_ends(self) -> dict[str, Any]:
         """Finished requests whose MP session must outlive their last save.
 
@@ -237,11 +257,30 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         return self.__dict__.setdefault("_sessions_to_end", {})
 
     def _end_finished_sessions(self) -> None:
-        """End each finished request's session once no save of it can follow."""
+        """End each finished request's session once no save or lookup remains.
+
+        A detached lookup (`detach_lookup`) can outlive its request. If
+        `end_session` ran first, the later `free_lookup_locks` would find no
+        prefetch record in a recreated session and release only the
+        full-attention groups; the state groups' read locks would pin their
+        L1 objects until the read TTL. So the session ends only after its
+        lookup has answered and released its locks.
+        """
+        # Pumped on every pass: a detached lookup must be released even while
+        # its request is still transferring and the waiting queue, which
+        # drives `prefetch_lookups`, is empty.
+        client = self._lookup_client
+        pump = getattr(client, "pump", None)
+        if callable(pump):
+            pump()
+        self.reconcile_detached_lookups()
         pending = self._pending_session_ends()
+        in_flight = getattr(client, "is_pending", None)
         for sid, seq in list(pending.items()):
             entry = self._save_tracker.get(sid)
             if (entry is not None and entry[0] is seq) or sid in self._save_inflight:
+                continue
+            if callable(in_flight) and in_flight(sid):
                 continue
             del pending[sid]
             try:

@@ -19,13 +19,14 @@ Every scheduler here owns an :class:`~atom.model_engine.engine_stats.EngineStats
 
 from __future__ import annotations
 
+import enum
 import itertools
 import logging
 import math
 import struct
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,13 @@ from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.dynamic_chunking import (
+    CALIBRATION_SWEEP_RATIO,
+    USEFUL_SHRINK_REFERENCE_CHUNKS,
+    ChunkSizePredictor,
+    chunk_alignment,
+    has_sole_prefill,
+)
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
 from atom.model_engine.request import RequestOutput
@@ -57,6 +65,23 @@ if TYPE_CHECKING:
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
 logger = logging.getLogger("atom")
+
+_DYNAMIC_CHUNKING_SUPPLY_WINDOW = 16
+
+
+class ChunkKind(enum.Enum):
+    """Which prefill chunk a sizing call is for, as dynamic chunking sees it.
+
+    Required at every sizing call rather than defaulted, so a new call site has
+    to say which one it is.
+    """
+
+    # A new request's first chunk: takes the next calibration sweep arm.
+    FIRST = enum.auto()
+    # A later chunk of a request already admitted: keeps the current arm.
+    NEXT = enum.auto()
+    # A prefill that must go whole (`_requires_atomic_prefill`): never limited.
+    WHOLE = enum.auto()
 
 
 # How often the stalled-save reconciler actually scans deferred_free_blocks. The
@@ -374,6 +399,10 @@ class ScheduledBatch:
 
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
+        # Set by the PP head on a batch whose completion it waits for although
+        # the batch produces no output. It travels with the metadata, so the
+        # last stage acks exactly the batches the head waits on.
+        self.pp_completion_ack = False
 
         # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
@@ -454,6 +483,29 @@ class ScheduledBatch:
         if self.is_final_chunk is None:
             return True
         return any(self.is_final_chunk)
+
+
+def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
+    """Where a checkpoint cut of a forward from `start` must land above: where
+    the seq resumed (`resume`, or the `until` of the replay the forward
+    continues), since below it a forward recomputing cached rows
+    (`BlockManager.replay_start`) holds no state worth keeping. A DeepSeek-V4
+    bounded replay has rebuilt the state whole by that point, so a cut may land
+    right on it, and a later branch at the same hit restores from there instead
+    of replaying again."""
+    floor = max(start, resume, seq.replay_until)
+    if seq.replays_hit and floor > start:
+        floor -= 1
+    return floor
+
+
+def _scheduled_replay_until(batch, i: int) -> int:
+    """Where batch entry `i`'s forward resumed if it started below that point
+    (`ScheduledBatch.replaying`), as scheduled, 0 otherwise. Under pipeline
+    parallelism a later chunk's scheduling may already have moved the live
+    `Sequence.replay` by the time this batch is post-processed."""
+    replay = (getattr(batch, "replaying", None) or {}).get(i)
+    return 0 if replay is None else replay.until
 
 
 class ScheduledBatchOutput:
@@ -653,8 +705,40 @@ class Scheduler:
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # Running seqs currently mid-prefill; counter lets schedule() skip the
-        # running-queue scan on pure-decode steps.
+        self.dynamic_chunking_smooth_factor = config.dynamic_chunking_smooth_factor
+        self.dynamic_chunking_min_chunk_size = config.dynamic_chunking_min_chunk_size
+        self.enable_dynamic_chunking = config.enable_dynamic_chunking
+        # Installed after runtime calibration; None keeps fixed/sweep chunking.
+        self.dynamic_chunk_predictor: ChunkSizePredictor | None = None
+        self._calibrating = self.enable_dynamic_chunking
+        # Sweep arm of the request admitted last; a new request takes the other.
+        self._calibration_small_arm = False
+        # Whether the latest first-chunk sizing drew a sweep arm, so that
+        # admitting that request moves the sweep on (see _commit_calibration_arm).
+        self._calibration_arm_drawn = False
+        # Per-step prefill census (`_record_prefill_supply`); dynamic sizing
+        # needs at most one prefill source over the whole window.
+        self._recent_prefill_supply: deque[int] = deque(
+            maxlen=_DYNAMIC_CHUNKING_SUPPLY_WINDOW
+        )
+        # Sizing decisions by outcome, reported beside the engine-status line.
+        self._dynamic_chunking_counts: Counter[str] = Counter()
+        if self._calibrating and self._calibration_arms_collapsed():
+            # The two sweep arms are the same aligned size, so the fit can
+            # never see MIN_CALIBRATION_CHUNK_SIZES distinct chunks. Give up
+            # now instead of polling for a model that cannot be identified.
+            logger.warning(
+                "Dynamic chunking calibration sweep has only one chunk size "
+                "at max_num_batched_tokens=%d, min_chunk_size=%d; chunking "
+                "stays fixed. Set --dynamic-chunking-min-chunk-size below "
+                "--max-num-batched-tokens to enable it",
+                self.max_num_batched_tokens,
+                self.dynamic_chunking_min_chunk_size,
+            )
+            self._calibrating = False
+        # Running seqs currently mid-prefill. Excludes `waiting`. The counter
+        # lets schedule() skip the running-queue scan on pure-decode steps, and
+        # `_record_prefill_supply` adds the admittable waiting seqs to it.
         self._partial_prefill_count: int = 0
         self._schedule_tick: int = 0
 
@@ -830,6 +914,15 @@ class Scheduler:
 
     def _local_prefill_pending_work(self) -> tuple[bool, int]:
         """Count probed work; a bounded scan never invents fill for unseen work."""
+        # The probe sizes the chunks admission is about to size; only
+        # admission's outcomes belong in the sizing report.
+        counts = self._dynamic_chunking_counts.copy()
+        try:
+            return self._probe_local_prefill_work()
+        finally:
+            self._dynamic_chunking_counts = counts
+
+    def _probe_local_prefill_work(self) -> tuple[bool, int]:
         budget = self.max_num_batched_tokens
         pending = 0
         if self._partial_prefill_count:
@@ -838,7 +931,13 @@ class Scheduler:
                     continue
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
-                chunk = self._partial_prefill_chunk(seq, start, resume, pending)
+                chunk = self._partial_prefill_chunk(
+                    seq,
+                    start,
+                    resume,
+                    pending,
+                    cap_from=max(resume, seq.replay_until),
+                )
                 if not chunk:
                     break
                 chunk = self._preview_prefill_chunk(seq, start, resume, chunk)
@@ -854,7 +953,10 @@ class Scheduler:
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
                 resume = self._offload_prefill_start(seq)
-                cached = self.block_manager.replay_start(seq, resume, hit=False)
+                # A replayed hit resumes as one, as admission starts it.
+                cached = self.block_manager.replay_start(
+                    seq, resume, hit=seq.replays_hit
+                )
             else:
                 if probed_tokens >= budget:
                     break
@@ -877,11 +979,18 @@ class Scheduler:
                 if offload_resume
                 else self._new_prefill_tokens(seq, cached, resume)
             )
-            chunk = self._prefill_chunk_for_budget(remaining, budget - pending, pending)
+            atomic = self._requires_atomic_prefill(seq)
+            if atomic:
+                kind = ChunkKind.WHOLE
+            else:
+                kind = ChunkKind.NEXT if offload_resume else ChunkKind.FIRST
+            chunk = self._prefill_chunk_for_budget(
+                remaining, budget - pending, pending, history_len=cached, kind=kind
+            )
             if (
                 chunk is None
-                or (self._requires_atomic_prefill(seq) and chunk < remaining)
-                or cached + chunk <= resume
+                or (atomic and chunk < remaining)
+                or self._waits_below_resume(seq, cached, chunk, resume)
             ):
                 break
             chunk = self._preview_prefill_chunk(seq, cached, resume, chunk)
@@ -893,6 +1002,16 @@ class Scheduler:
             if slots == 0:
                 break
         return prefillable, pending
+
+    @staticmethod
+    def _waits_below_resume(seq: Sequence, start: int, chunk: int, resume: int) -> bool:
+        """Whether a forward of `chunk` rows from `start` waits for a step
+        that lets it pass `resume`, the point its seq resumed at: one ending
+        there or below only recomputes rows the cache holds. A DeepSeek-V4
+        bounded replay does not wait: it continues in the next forwards
+        (`_resume_prefill`), and a budget narrower than the replay would
+        otherwise hold it, and everything queued behind it, forever."""
+        return start + chunk <= resume and not seq.replays_hit
 
     def _offload_prefill_start(self, seq: Sequence) -> int:
         if seq.num_cached_tokens < seq.num_tokens:
@@ -919,17 +1038,31 @@ class Scheduler:
     def _resume_prefill(self, seq: Sequence, start: int, *, hit: bool) -> None:
         """Start `seq`'s prefill forward at `start`, where `BlockManager.
         replay_start` puts it for the point it resumes at, which `seq.replay`
-        keeps when the two differ. `hit`: it resumes at a prefix hit."""
+        keeps when the two differ. `hit`: it resumes at a prefix hit, whose
+        state a `replay` transfer never brings and a DeepSeek-V4 bounded replay
+        (`Sequence.replays_hit`) did not. A DeepSeek-V4 bounded replay may span
+        chunks: a forward picking up where one inside it ended continues it,
+        writing nothing below the point it resumed at and reading no window row
+        below where the replay started."""
         resume = seq.num_cached_tokens
+        replay = seq.replay
+        if replay is not None and not hit and start == resume < replay.until:
+            until, rebuilds, first = replay.until, replay.rebuilds, replay.start
+        else:
+            until, first = resume, start
+            rebuilds = hit and (
+                self.block_manager.state.transfer.replays or seq.replays_hit
+            )
         seq.replay = (
             Replay(
-                resume,
-                hit and self.block_manager.state.transfer.replays,
+                until,
+                rebuilds,
                 tuple(
                     seq.token_ids[max(0, start - self.replay_history_tokens) : start]
                 ),
+                first,
             )
-            if start < resume
+            if start < until
             else None
         )
         seq.num_cached_tokens = start
@@ -967,8 +1100,14 @@ class Scheduler:
                 if not seq.is_partial_prefill:
                     continue
                 remaining = seq.num_tokens - seq.num_cached_tokens
-                if 0 < self.long_prefill_token_threshold < remaining:
-                    remaining = self.long_prefill_token_threshold
+                # A continued replay's rows below its `until` ride on top.
+                cap_from = max(seq.num_cached_tokens, seq.replay_until)
+                if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+                    remaining = (
+                        self.long_prefill_token_threshold
+                        + cap_from
+                        - seq.num_cached_tokens
+                    )
                 k = min(remaining, token_cap - tokens)
                 if k <= 0:
                     return cost
@@ -978,7 +1117,10 @@ class Scheduler:
             if tokens >= token_cap:
                 break
             if self._is_offload_prefill_resume(seq):
-                start = seq.num_cached_tokens
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(
+                    seq, resume, hit=seq.replays_hit
+                )
             else:
                 # Runs on every tick with prefill work, holds included: keep
                 # the head's prompt-block hashes instead of rehashing its
@@ -988,8 +1130,11 @@ class Scheduler:
                 )
                 if cached_blocks < 0:
                     break
-                start = cached_blocks * self.block_manager.hash_block_size
-            k = min(self._new_prefill_tokens(seq, start), token_cap - tokens)
+                # From where the forward will really start, as admission
+                # budgets it: a replayed hit starts below itself.
+                resume = cached_blocks * self.block_manager.hash_block_size
+                start = self.block_manager.replay_start(seq, resume, hit=True)
+            k = min(self._new_prefill_tokens(seq, start, resume), token_cap - tokens)
             if k > 0:
                 cost += self._chunk_cost(start, k)
                 tokens += k
@@ -1029,17 +1174,31 @@ class Scheduler:
             )
 
     def _partial_prefill_chunk(
-        self, seq: Sequence, start: int, resume: int, batched_tokens: int
+        self,
+        seq: Sequence,
+        start: int,
+        resume: int,
+        batched_tokens: int,
+        *,
+        cap_from: int | None = None,
     ) -> int:
         """The next chunk of a running prefill that resumes at `resume` and
         starts at `start`, or 0. A chunk ending at or below `resume` only
         recomputes rows the cache holds, and the next pass would back off the
-        same way again, forever: it waits for a step with room instead."""
+        same way again, forever: it waits for a step with room instead.
+        `cap_from`: where the long-prefill cap counts from, `resume` unless the
+        forward continues a bounded replay, whose rows below its `until` ride
+        on top as its first forward's did."""
+        cap_from = resume if cap_from is None else cap_from
         remaining = seq.num_tokens - start
-        if 0 < self.long_prefill_token_threshold < seq.num_tokens - resume:
-            remaining = self.long_prefill_token_threshold + resume - start
+        if 0 < self.long_prefill_token_threshold < seq.num_tokens - cap_from:
+            remaining = self.long_prefill_token_threshold + cap_from - start
         chunk = self._chunked_prefill_size(
-            remaining, self._prefill_room(batched_tokens, start), batched_tokens
+            remaining,
+            self._prefill_room(batched_tokens, start),
+            batched_tokens,
+            history_len=start,
+            kind=ChunkKind.NEXT,
         )
         return chunk if start + chunk > resume else 0
 
@@ -1050,10 +1209,8 @@ class Scheduler:
         # finalizes that decision after the delayer releases the batch.
         if self._requires_atomic_prefill(seq):
             return chunk
-        # The state starts at `resume`, a forward recomputing rows below it
-        # (`BlockManager.replay_start`) notwithstanding.
         target = self.block_manager.checkpoint_cut(
-            seq, max(start, resume), start + chunk, record=False
+            seq, _cut_floor(seq, start, resume), start + chunk, record=False
         )
         return target - start if target else chunk
 
@@ -1093,6 +1250,11 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
+            if self._is_offload_prefill_resume(seq):
+                # Holds its blocks since before its load: nothing to allocate,
+                # and a probe would recompute the hit flags it was admitted
+                # with (`replays_hit`), which decide how it resumes.
+                return True
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission -- `record=False` so it does not move the joint-
             # boundary funnel counters for a seq it may never schedule.
@@ -1141,6 +1303,8 @@ class Scheduler:
             num_waiting_reqs=num_waiting_reqs,
             kv_usage=self._kv_usage(),
         )
+        if self._dynamic_chunking_counts:
+            self._log_dynamic_chunking_counts()
 
     def heartbeat_throughput(self, now: float) -> None:
         """Close the throughput window on time while the engine sits idle."""
@@ -1736,9 +1900,13 @@ class Scheduler:
         # Reclaim aborted heads even when decode protection vetoes Phase 2.
         while self.waiting and self.waiting[0].status == SequenceStatus.ABORTED:
             self._reject_aborted_waiting(self.waiting.popleft())
+        if self.enable_dynamic_chunking:
+            self._record_prefill_supply()
         if self.kv_connector is not None and self.waiting:
             prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
             if prefetch is not None:
+                # Includes requests whose lookup will be detached: the lookup
+                # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
                 prefetch(
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
@@ -1825,7 +1993,11 @@ class Scheduler:
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(seq, resume, hit=False)
                 chunk = self._partial_prefill_chunk(
-                    seq, start, resume, num_batched_tokens
+                    seq,
+                    start,
+                    resume,
+                    num_batched_tokens,
+                    cap_from=max(resume, seq.replay_until),
                 )
                 if chunk:
                     self._resume_prefill(seq, start, hit=False)
@@ -1902,9 +2074,23 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            # Side-effect free: the lookup is detached only after `allocate`
+            # below, so a request held back by the budget or the pool keeps
+            # its prefetched lookup for the next pass. The HBM probe it needs
+            # is kept and reused by the admission probe below.
+            hbm_probe = None
+            lookup_detachable = False
             if (
                 not remote_ready_for_decode
                 and not offload_resume
+                and self._lookup_detach_enabled(seq)
+            ):
+                hbm_probe = self._probe_hbm_prefix(seq)
+                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
+            if (
+                not remote_ready_for_decode
+                and not offload_resume
+                and not lookup_detachable
                 and self.kv_connector is not None
                 and self._offload_lookup_pending(seq)
             ):
@@ -1912,7 +2098,7 @@ class Scheduler:
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
-                skip=remote_ready_for_decode or offload_resume,
+                skip=remote_ready_for_decode or offload_resume or lookup_detachable,
             )
 
             if remote_ready_for_decode:
@@ -1950,18 +2136,34 @@ class Scheduler:
                     # regardless: the first decode samples from the logits this
                     # prefill produces, and there is nowhere else to get them.
                     seq.num_cached_tokens = self._offload_prefill_start(seq)
+                # A replayed hit resumes as one: its state slot is fresh, so
+                # the forward replays below where the load left
+                # `num_cached_tokens` -- the KV-only reach, or the HBM hit if
+                # the load did not run (`Sequence.replay_kv_load`).
+                replayed = seq.replays_hit
                 start = self.block_manager.replay_start(
-                    seq, seq.num_cached_tokens, hit=False
+                    seq, seq.num_cached_tokens, hit=replayed
                 )
                 num_new_tokens = seq.num_tokens - start
                 budget_remaining = self._prefill_room(num_batched_tokens, start)
                 chunk = self._prefill_chunk_for_budget(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=start,
+                    # Admitted (and sized as FIRST) before it parked for the load.
+                    kind=(
+                        ChunkKind.WHOLE
+                        if self._requires_atomic_prefill(seq)
+                        else ChunkKind.NEXT
+                    ),
                 )
-                if chunk is None or start + chunk <= seq.num_cached_tokens:
+                if chunk is None or self._waits_below_resume(
+                    seq, start, chunk, seq.num_cached_tokens
+                ):
                     self.waiting.appendleft(seq)
                     break
-                self._resume_prefill(seq, start, hit=False)
+                self._resume_prefill(seq, start, hit=replayed)
                 chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
@@ -1976,8 +2178,11 @@ class Scheduler:
                 # The tier's own figure, not the possibly-rolled-back one: what
                 # it returned is what the API should report, and giving the
                 # trailing block back to the forward is this scheduler's
-                # decision rather than a smaller hit.
-                seq.prefix_cache_hit_tokens = tier_hit
+                # decision rather than a smaller hit. A replay recomputes the
+                # rows below the tier's figure: they are not a hit.
+                seq.prefix_cache_hit_tokens = (
+                    seq.num_cached_tokens if replayed else tier_hit
+                )
                 num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                     seq,
                     chunk,
@@ -2000,14 +2205,20 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            block_hashes = []
-            num_cached_blocks = self.block_manager.can_allocate(
-                seq,
-                record=False,
-                block_hashes=block_hashes,
-                reuse_hashes=self._local_prefill_coalescing,
-            )
+            if hbm_probe is None:
+                hbm_probe = self._probe_hbm_prefix(seq)
+            num_cached_blocks, block_hashes = hbm_probe
             if num_cached_blocks < 0:
+                self.waiting.appendleft(seq)
+                break
+            if (
+                seq.replay_kv_load
+                and not needs_remote_load
+                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+            ):
+                # A replay that loads its KV first parks for that load like any
+                # remote load (`needs_remote_load` knew only the state-carrying
+                # hit), so it needs a parked slot too.
                 self.waiting.appendleft(seq)
                 break
 
@@ -2036,13 +2247,23 @@ class Scheduler:
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
             budget_remaining = self._prefill_room(num_batched_tokens, start)
+            # `start` comes from the hit `can_allocate` offered, before
+            # `allocate` may disown the boundary. The worker fits
+            # `batch.num_cached_tokens`, which `_resume_prefill` sets from the
+            # hit kept after that. Sizing has to happen before allocate, so a
+            # cache-hit's first chunk is solved against an upper bound on the
+            # prefix it will actually run.
             chunk = self._prefill_chunk_for_budget(
-                num_new_tokens, budget_remaining, num_batched_tokens
+                num_new_tokens,
+                budget_remaining,
+                num_batched_tokens,
+                history_len=start,
+                kind=ChunkKind.WHOLE if atomic_prefill else ChunkKind.FIRST,
             )
             if (
                 chunk is None
                 or (atomic_prefill and chunk < num_new_tokens)
-                or start + chunk <= resume
+                or self._waits_below_resume(seq, start, chunk, resume)
             ):
                 self.waiting.appendleft(seq)
                 break
@@ -2052,6 +2273,21 @@ class Scheduler:
                 # risking a shared decoding sequence's blocks (finding #2).
                 # Return the seq to waiting for a clean recompute once the pool
                 # has room, and stop admitting this pass.
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
+
+            # Detached before the alloc notification, which reads the save
+            # floor `detach_lookup` sets.
+            if lookup_detachable and not self.kv_connector.detach_lookup(
+                seq, int(seq.num_cached_tokens)
+            ):
+                # `allocate` kept less HBM prefix than the probe offered (e.g.
+                # it disowned a boundary whose state checkpoint was lost), so
+                # a tier load may now be worth it. Undo the admission and let
+                # the next pass take the ordinary path, whose lookup and
+                # remote-load capacity check run before `allocate`.
+                self._decline_lookup_detach(seq)
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break
@@ -2067,10 +2303,15 @@ class Scheduler:
             if not seq.prefix_cache_hit_tokens:
                 seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
+            self._lookup_detach_declined.discard(seq.id)
             self._notify_connector_after_prefill_alloc(seq)
 
+            # A replay that loads its KV first parks for that load whatever the
+            # lookup answered: the answer was the state-carrying hit, which a
+            # KV-only reach can exceed. Running the forward instead would start
+            # under the replay's floors before the KV below them arrived.
             needs_remote_load = self._confirm_remote_load_after_alloc(
-                seq, needs_remote_load
+                seq, needs_remote_load or seq.replay_kv_load
             )
 
             if needs_remote_load:
@@ -2146,6 +2387,10 @@ class Scheduler:
                 self.block_manager.replay_start(seq, seq.num_cached_tokens, hit=True),
                 hit=True,
             )
+            if seq.replays_hit:
+                # A DeepSeek-V4 bounded replay recomputes the rows below its
+                # hit: they are not served from the cache.
+                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
             chunk = self._adjust_prefill_chunk_after_alloc(seq, chunk)
             chunk = self._finalize_prefill_chunk(seq, seq.num_cached_tokens, chunk)
@@ -2165,7 +2410,9 @@ class Scheduler:
             # this stays correct even if the prefix was disowned.
             if (
                 atomic_prefill and chunk < seq.num_tokens - seq.num_cached_tokens
-            ) or seq.num_cached_tokens + chunk <= seq.replay_until:
+            ) or self._waits_below_resume(
+                seq, seq.num_cached_tokens, chunk, seq.replay_until
+            ):
                 # A replayed hit that cannot pass its hit this step waits too.
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
@@ -2180,6 +2427,9 @@ class Scheduler:
                 num_seqs_prefill,
                 num_batched_tokens,
             )
+            # Commit only once the request is on the batch, so a requeue above
+            # leaves the next sizing drawing the same arm.
+            self._commit_calibration_arm()
             self._inflight_prefix_wait.pop(seq.id, None)
 
         if skipped_waiting_requests:
@@ -2545,6 +2795,7 @@ class Scheduler:
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
+        self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
@@ -2694,6 +2945,69 @@ class Scheduler:
         """
         return self._connector_flag("is_offload") and resumes_offload_prefill(seq)
 
+    def _lookup_detach_enabled(self, seq: Sequence) -> bool:
+        """Whether `seq`'s tier lookup is a candidate for detaching at all.
+
+        False when the feature is off, an earlier detach of this request was
+        invalidated by `allocate`, the connector has no offload tier or no
+        detach support, joint KV/state offload is active (a tier hit can
+        change where it resumes), or the request loads remotely.
+        """
+        conn = self.kv_connector
+        return not (
+            not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
+            or seq.id in self._lookup_detach_declined
+            or conn is None
+            or not self._connector_flag("is_offload")
+            or getattr(conn, "can_detach_lookup", None) is None
+            or getattr(conn, "detach_lookup", None) is None
+            or getattr(self.block_manager, "state_offload", None) is not None
+            or (seq.kv_transfer_params or {}).get("do_remote_prefill")
+        )
+
+    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+        """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
+        request does not fit) and the hash chain it walked.
+
+        Done once per admission attempt; the result is shared by the detach
+        decision and the admission itself, which run in the same pass with no
+        pool change in between.
+        """
+        block_hashes: list[int] = []
+        num_cached_blocks = self.block_manager.can_allocate(
+            seq,
+            record=False,
+            block_hashes=block_hashes,
+            reuse_hashes=self._local_prefill_coalescing,
+        )
+        return num_cached_blocks, block_hashes
+
+    def _can_detach_tier_lookup(
+        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
+    ) -> bool:
+        """Whether admission may proceed without waiting for `seq`'s lookup.
+
+        Side-effect free. Requires an HBM hit and the connector's consent
+        (`can_detach_lookup`, which applies `OFFLOAD_MIN_LOAD_TOKENS`). The
+        probe is the one admission uses, so it sees the HBM prefix
+        `_decide_load_after_alloc` will see.
+        """
+        hit_blocks = hbm_probe[0]
+        if hit_blocks <= 0:
+            return False
+        num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
+        return bool(self.kv_connector.can_detach_lookup(seq, num_hbm_tokens))
+
+    @property
+    def _lookup_detach_declined(self) -> set:
+        """Requests whose detach `allocate` invalidated; they take the
+        ordinary lookup path until admitted or aborted. Created on first use,
+        so schedulers built without `__init__` (test doubles) work."""
+        return self.__dict__.setdefault("_lookup_detach_declined_ids", set())
+
+    def _decline_lookup_detach(self, seq: Sequence) -> None:
+        self._lookup_detach_declined.add(seq.id)
+
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
         pending = getattr(self.kv_connector, "lookup_pending", None)
@@ -2766,8 +3080,177 @@ class Scheduler:
         )
         self.running.append(seq)
 
+    def install_chunk_latency_model(self, predictor: ChunkSizePredictor) -> bool:
+        """Install a useful calibrated model and end the calibration sweep.
+
+        One-shot. A model that cannot shrink over a prefix several base chunks
+        deep is rejected, leaving fixed chunking enabled. There is no refresh:
+        the workers stop timing once they have answered with a fit.
+        """
+        self._calibrating = False
+        reference_len = self.max_num_batched_tokens * USEFUL_SHRINK_REFERENCE_CHUNKS
+        if self.max_model_len:
+            reference_len = min(self.max_model_len, reference_len)
+        if not predictor.predicts_useful_shrink(
+            base_chunk_size=self.max_num_batched_tokens,
+            history_len=reference_len,
+        ):
+            logger.warning(
+                "Ignoring dynamic chunking calibration a=%.3e b=%.3e gamma=%.3e: "
+                "it predicts no useful shrink after a %d-token prefix, so "
+                "chunking stays fixed",
+                predictor.quadratic_coeff,
+                predictor.linear_coeff,
+                predictor.prefix_coeff,
+                reference_len,
+            )
+            return False
+        self.dynamic_chunk_predictor = predictor
+        logger.info(
+            "Dynamic chunking latency model installed: a=%.3e b=%.3e c=%.3e gamma=%.3e",
+            predictor.quadratic_coeff,
+            predictor.linear_coeff,
+            predictor.constant_coeff,
+            predictor.prefix_coeff,
+        )
+        return True
+
+    def abandon_chunk_latency_calibration(self) -> None:
+        """End the calibration sweep without a model, leaving chunking fixed."""
+        self._calibrating = False
+        logger.warning(
+            "Dynamic chunking calibration gave up; chunking stays fixed at %d tokens",
+            self.max_num_batched_tokens,
+        )
+
+    @property
+    def dynamic_chunking_active(self) -> bool:
+        """Whether chunk sizes can still differ from the fixed budget."""
+        return self.enable_dynamic_chunking and (
+            self._calibrating or self.dynamic_chunk_predictor is not None
+        )
+
+    def _record_prefill_supply(self) -> None:
+        """Sample this step's prefill sources into the sole-prefill window.
+
+        Counts the requests mid-prefill plus the waiting ones admission could
+        take, before this step admits any. Capped at 2: only "at most one"
+        matters, and the cap keeps a long queue from costing a full scan.
+        """
+        sources = self._partial_prefill_count
+        if sources < 2:
+            waiting = itertools.islice(self._waiting_prefills(), 2 - sources)
+            sources += sum(1 for _ in waiting)
+        self._recent_prefill_supply.append(min(sources, 2))
+
+    def _dynamic_chunk_limit(self, history_len: int, kind: ChunkKind) -> int | None:
+        """Return the dynamic chunk ceiling, or None for fixed chunking.
+
+        Dynamic sizing requires a single prefill source over the whole census
+        window. Before calibration completes, it returns the sweep size.
+        """
+        if kind is not ChunkKind.NEXT:
+            # A new request is being sized: forget any arm an earlier query drew.
+            self._calibration_arm_drawn = False
+        if kind is ChunkKind.WHOLE or not self.dynamic_chunking_active:
+            return None
+        if not has_sole_prefill(self._recent_prefill_supply):
+            self._dynamic_chunking_counts["multi_prefill"] += 1
+            return None
+        if self.dynamic_chunk_predictor is None:
+            self._dynamic_chunking_counts["sweep"] += 1
+            return self._calibration_sweep_chunk(kind)
+        try:
+            limit = self.dynamic_chunk_predictor.predict(
+                history_len=history_len,
+                base_chunk_size=self.max_num_batched_tokens,
+                smooth_factor=self.dynamic_chunking_smooth_factor,
+                alignment=self._chunk_alignment(),
+                max_chunk_size=self.max_num_batched_tokens,
+                min_chunk_size=self.dynamic_chunking_min_chunk_size,
+            )
+        except ValueError:
+            logger.exception(
+                "Dynamic chunking prediction failed; chunking stays fixed at %d tokens",
+                self.max_num_batched_tokens,
+            )
+            self.dynamic_chunk_predictor = None
+            return None
+        outcome = "unreachable" if limit is None else "solved"
+        self._dynamic_chunking_counts[outcome] += 1
+        return limit
+
+    def _log_dynamic_chunking_counts(self) -> None:
+        counts = self._dynamic_chunking_counts
+        logger.info(
+            "Dynamic chunking since last report: %d chunk(s) from the latency "
+            "model, %d calibration-sweep chunk(s); fixed budget kept for %d "
+            "unreachable, %d alongside other prefills",
+            counts["solved"],
+            counts["sweep"],
+            counts["unreachable"],
+            counts["multi_prefill"],
+        )
+        counts.clear()
+
+    def _chunk_alignment(self) -> int:
+        return chunk_alignment(self.block_manager.block_size)
+
+    def _align_chunk_down(self, chunk: int) -> int:
+        alignment = self._chunk_alignment()
+        return max((chunk // alignment) * alignment, alignment)
+
+    def _calibration_arms_collapsed(self) -> bool:
+        """True when the two sweep arms are not two distinct aligned sizes."""
+        budget = self.max_num_batched_tokens
+        full = self._align_chunk_down(budget)
+        small = self._align_chunk_down(
+            max(
+                budget // CALIBRATION_SWEEP_RATIO,
+                self.dynamic_chunking_min_chunk_size,
+            )
+        )
+        return small >= full
+
+    def _commit_calibration_arm(self) -> None:
+        """The request just admitted is the one last sized; its arm is now current."""
+        if self._calibration_arm_drawn:
+            self._calibration_small_arm = not self._calibration_small_arm
+            self._calibration_arm_drawn = False
+
+    def _calibration_sweep_chunk(self, kind: ChunkKind) -> int | None:
+        """Select one of two per-request chunk sizes for an identifiable fit.
+
+        Requests alternate between the full budget (None) and its
+        ``CALIBRATION_SWEEP_RATIO`` fraction, aligned down the same way the
+        full arm is. A first chunk takes the arm the last admitted request did
+        not; sizing only reads that state, and `_commit_calibration_arm` moves
+        it when the request is admitted. So a requeued request, or a fit
+        probe, draws the same arm again rather than burning the other one.
+        Later chunks keep the current arm, which is their own: the sole-prefill
+        gate keeps a second request from being swept while one is mid-prefill.
+        """
+        small = self._calibration_small_arm
+        if kind is ChunkKind.FIRST:
+            small = not small
+            self._calibration_arm_drawn = True
+        if not small:
+            return None
+        return self._align_chunk_down(
+            max(
+                self.max_num_batched_tokens // CALIBRATION_SWEEP_RATIO,
+                self.dynamic_chunking_min_chunk_size,
+            )
+        )
+
     def _chunked_prefill_size(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int,
+        kind: ChunkKind,
     ) -> int:
         """Tokens to forward this step, or 0 to leave the request for the next.
 
@@ -2782,19 +3265,37 @@ class Scheduler:
         Never 0 for an empty batch: something has to go out each step, or a
         `max_num_batched_tokens` below the alignment would stall forever.
         """
-        chunk = min(num_new_tokens, budget_remaining)
+        dynamic_limit = self._dynamic_chunk_limit(history_len, kind)
+        # None means the equal-latency chunk is unreachable for this prefix, so
+        # the fixed budget stands. A reachable limit is the equal-latency or
+        # sweep chunk size; the feature-off path is also None.
+        chunk = min(
+            num_new_tokens,
+            budget_remaining,
+            dynamic_limit if dynamic_limit is not None else num_new_tokens,
+        )
         if chunk >= num_new_tokens:
             return chunk
-        aligned = chunk - chunk % max(self.block_manager.block_size, 64)
+        aligned = chunk - chunk % self._chunk_alignment()
         return aligned or (0 if num_batched_tokens else chunk)
 
     def _prefill_chunk_for_budget(
-        self, num_new_tokens: int, budget_remaining: int, num_batched_tokens: int
+        self,
+        num_new_tokens: int,
+        budget_remaining: int,
+        num_batched_tokens: int,
+        *,
+        history_len: int,
+        kind: ChunkKind,
     ) -> int | None:
         if self.enable_chunked_prefill:
             return (
                 self._chunked_prefill_size(
-                    num_new_tokens, budget_remaining, num_batched_tokens
+                    num_new_tokens,
+                    budget_remaining,
+                    num_batched_tokens,
+                    history_len=history_len,
+                    kind=kind,
                 )
                 or None
             )
@@ -2828,9 +3329,7 @@ class Scheduler:
         bm = self.block_manager
         if self._requires_atomic_prefill(seq):
             return chunk
-        # The state starts where the seq resumed, a forward recomputing rows
-        # below it (`Sequence.replay_until`) notwithstanding.
-        target = bm.checkpoint_cut(seq, max(start, seq.replay_until), start + chunk)
+        target = bm.checkpoint_cut(seq, _cut_floor(seq, start, start), start + chunk)
         if target:
             chunk = target - start
         # `cancel_state_fork` runs only when the first two hold, and returning
@@ -2906,8 +3405,15 @@ class Scheduler:
             # making `wanted - cached` negative. `seq.num_cached_tokens` is
             # deliberately NOT clamped: the forward must skip what was loaded.
             wanted_tokens = seq.num_wanted_hit_blocks * hbs
-            # where it resumed, not where a replaying forward starts below it
-            cached_tokens = max(seq.num_cached_tokens, seq.replay_until)
+            # Where it resumed, not where a replaying forward starts below it
+            # -- unless it is a DeepSeek-V4 bounded replay, standing in for a
+            # checkpoint the gates found missing: the rows it recomputes are
+            # reuse lost for want of one (`wanted - cached`), not a hit.
+            cached_tokens = (
+                seq.num_cached_tokens
+                if seq.replays_hit
+                else max(seq.num_cached_tokens, seq.replay_until)
+            )
             hbm_cached_tokens = min(cached_tokens, wanted_tokens)
             offload_tokens = cached_tokens - hbm_cached_tokens
             self.engine_stats.update_cache(
@@ -3290,7 +3796,12 @@ class Scheduler:
                 continue
             chunk = int(batch.num_scheduled_tokens[i])
             start_tokens = int(batch.num_cached_tokens[i])
-            self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
+            self.block_manager.hash_blocks(
+                seq,
+                chunk,
+                start_tokens=start_tokens,
+                replay_until=_scheduled_replay_until(batch, i),
+            )
 
     def postprocess(
         self,
@@ -3347,7 +3858,12 @@ class Scheduler:
                 is_final = final[i]
                 chunk = int(batch.num_scheduled_tokens[i])
                 start_tokens = int(batch.num_cached_tokens[i])
-                self.block_manager.hash_blocks(seq, chunk, start_tokens=start_tokens)
+                self.block_manager.hash_blocks(
+                    seq,
+                    chunk,
+                    start_tokens=start_tokens,
+                    replay_until=_scheduled_replay_until(batch, i),
+                )
                 if not is_final:
                     pp_middle_chunk_ids.add(req_id)
         elif batch is not None:
@@ -3364,7 +3880,9 @@ class Scheduler:
                 # once the block's KV has been computed by the forward —
                 # correct under chunked-prefill where one block may span
                 # multiple steps (hash_blocks clips to fully-filled blocks).
-                self.block_manager.hash_blocks(seq, chunk)
+                self.block_manager.hash_blocks(
+                    seq, chunk, replay_until=_scheduled_replay_until(batch, i)
+                )
                 seq.num_cached_tokens += chunk
                 # Ask the scheduler what it decided rather than re-deriving it
                 # from lengths here. It froze `is_final_chunk` at pre-advance

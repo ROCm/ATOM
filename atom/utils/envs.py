@@ -155,6 +155,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # DeepSeek-V4 bounded replay: when the compressed history hits further than
+    # the nearest state checkpoint by more than the window's receptive field,
+    # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
+    # to rebuild every layer's window and compressor state exactly.
+    "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
+    in {"1", "true", "yes", "on"},
     # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
     # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
     # Store, no LMCache). Unset = off.
@@ -227,6 +233,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disabled by default because native SGLang normally keeps ranks in sync.
     "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
         os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
+    ),
+    # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
+    # interpolates between the configured initial chunk size (0) and the fitted
+    # equal-latency size (1). Values around 0.6-0.85 are typically most stable.
+    # Read by Config only when dynamic chunking is on and no explicit factor
+    # was given.
+    "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR": lambda: float(
+        os.getenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.75")
     ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
@@ -1070,6 +1084,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # answered before it waits for the answer instead.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
+    ),
+    # Admit a prefill without waiting for its external-tier lookup when the HBM
+    # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
+    # could be loaded. The lookup is still sent to refresh the tier's LRU.
+    # On by default; set to 0 to always wait for the lookup.
+    "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
+        "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "1"
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),

@@ -47,6 +47,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -735,6 +736,7 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -1312,23 +1314,23 @@ class ModelRunner:
         )
         return True
 
+    def warmup_max_tokens(self) -> int:
+        """Tokens one warmup forward carries: the activation peak KV sizing allows."""
+        max_tokens = self.config.max_num_batched_tokens
+        if not self.config.enable_dp_attention:
+            max_tokens //= get_dp_group().world_size
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            max_tokens = max(1, max_tokens // pcp_size)
+        return max_tokens
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
+        max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
-        if self.config.enable_dp_attention:
-            warmup_max_tokens = max_num_batched_tokens
-        else:
-            warmup_max_tokens = max_num_batched_tokens // dp_size
-
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
-            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+        warmup_max_tokens = self.warmup_max_tokens()
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1378,6 +1380,14 @@ class ModelRunner:
         logger.info(
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
+
+    def profile_dynamic_chunking(self):
+        """Fit chunk overhead from startup dummy forwards (engine RPC)."""
+        return self._dynamic_chunking.profile()
+
+    def take_dynamic_chunking_fit(self):
+        """Return newly calibrated chunk latency coefficients (engine RPC)."""
+        return self._dynamic_chunking.take_fit()
 
     def allocate_forward_vars(self):
         config = self.config
@@ -3146,6 +3156,8 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                # Time only the chunk computation between PP receive and send.
+                chunk_sample = self._dynamic_chunking.start_sample(batch)
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -3159,6 +3171,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                self._dynamic_chunking.finish_sample(chunk_sample)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:

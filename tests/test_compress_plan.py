@@ -343,3 +343,60 @@ def test_write_from_drops_groups_the_cache_already_holds():
     assert len(second) == 150
     # the per-seq counts slice the plan the same way
     assert plans[2].cu_compress_cpu.tolist() == [0, len(first), len(first) + 150]
+
+
+def test_write_from_at_a_replay_end_drops_the_cached_prefix_boundaries():
+    """A replaying seq must not write the boundaries of its cached prefix.
+
+    seq0 replays `[24, 304)` with its hit ending at 256: its CSA boundaries at
+    27..255 and HCA boundary 255 sit in shared cached blocks and must go; 259..
+    and 383 are new. seq1 has no floor and keeps everything. The write plan is
+    the same with and without a floor -- the replay needs every ring row.
+    """
+    extend = np.array([280, 64], dtype=np.int32)
+    context = np.array([304, 512], dtype=np.int32)
+    floor = np.array([256, 0], dtype=np.int32)
+    plain = make_compress_plans(
+        extend, context, RATIOS_OVERLAP, plan_buffers=_buffers(512, 512), extra_write=0
+    )
+    floored_bufs = _buffers(512, 512)
+    floored = make_compress_plans(
+        extend,
+        context,
+        RATIOS_OVERLAP,
+        plan_buffers=floored_bufs,
+        extra_write=0,
+        write_from=floor,
+    )
+    for ratio, _ in RATIOS_OVERLAP:
+        kept = floored[ratio].compress_plan_cpu
+        full = plain[ratio].compress_plan_cpu
+        expected = full[(full[:, 2] >= floor[full[:, 1]])]
+        assert np.array_equal(kept, expected)
+        assert (kept[kept[:, 1] == 0][:, 2] >= 256).all()
+        assert floored[ratio].num_write == plain[ratio].num_write
+    # CSA: seq0 keeps 259..303 (12 rows) and seq1 all 16 of 451..511.
+    csa = floored[4].compress_plan_cpu
+    assert int((csa[:, 1] == 0).sum()) == 12
+    assert int((csa[:, 1] == 1).sum()) == 16
+    assert list(floored[4].cu_compress_cpu) == [0, 12, 28]
+    # HCA: seq0's only boundary in range is 255, below the floor.
+    assert int((floored[128].compress_plan_cpu[:, 1] == 0).sum()) == 0
+
+
+def test_an_all_zero_write_from_drops_nothing():
+    extend = np.array([6, 3], dtype=np.int32)
+    context = np.array([600, 40], dtype=np.int32)
+    a = make_compress_plans(
+        extend, context, RATIOS_OVERLAP, plan_buffers=_buffers(), extra_write=0
+    )
+    b = make_compress_plans(
+        extend,
+        context,
+        RATIOS_OVERLAP,
+        plan_buffers=_buffers(),
+        extra_write=0,
+        write_from=np.zeros(2, dtype=np.int32),
+    )
+    for ratio, _ in RATIOS_OVERLAP:
+        assert a[ratio].num_compress == b[ratio].num_compress
