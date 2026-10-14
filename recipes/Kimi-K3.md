@@ -60,9 +60,24 @@ without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
 - `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
   resumes a request from a per-token snapshot slot that ReplaySSM does not
   keep live.
+- **Five projections must stay out of the online quant.** The kernels read
+  them as plain BF16 (`kimi_k3/mono/weights.py`, five `_plain_bf16` call
+  sites): `self_attn.in_proj`, `self_attn.f_b_proj`, `self_attn.o_proj`, and
+  the shared experts' `gate_up_proj` and `down_proj`. The baseline
+  `exclude_layer` list above covers none of them, and
+  `*block_sparse_moe.experts*` does **not** match `shared_experts`. Miss any
+  one and mono refuses the whole model -- the server answers correctly on the
+  production path and says so once, e.g. `mono decode off: layer 1 shared
+  gate_up_proj is torch.float8_e4m3fn`.
 
 ```bash
 export ATOM_ENABLE_REPLAYSSM=0
+```
+
+Add these to the launch's `exclude_layer` list:
+
+```
+"*self_attn.in_proj*", "*self_attn.f_b_proj*", "*self_attn.o_proj*", "*shared_experts*"
 ```
 
 The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or

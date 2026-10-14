@@ -293,6 +293,10 @@ def config_refusal(atom_config) -> str | None:
         ),
         # a step is a uniform spec verify: without a drafter there is none
         (spec is not None, "no speculative decoding"),
+        # ...and the contract is DSpark specifically, as DeepSeek-V4.1's mono
+        # already states it (`deepseek_v41/mono/config.py`); another method
+        # would be admitted here on a path never built or measured for it
+        (spec is None or spec.method == "dspark", "not DSpark"),
         (
             spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_ROWS,
             f"speculative width past the {MAX_ROWS}-row buffers",

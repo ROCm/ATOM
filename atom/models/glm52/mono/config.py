@@ -189,6 +189,17 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
     return None
 
 
+def _is_gfx950() -> bool:
+    """True on gfx950, and on no device at all -- a contract check builds
+    compile-only and never binds one, as ``_cu_count`` does for K3."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return True
+    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    return arch.startswith("gfx950")
+
+
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use GLM-5.2 mono, or None."""
     hf = atom_config.hf_config
@@ -213,6 +224,10 @@ def config_refusal(atom_config) -> str | None:
         (not is_plugin_mode(), "plugin mode"),
         (not envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV, "shuffled MLA cache"),
         (envs.ATOM_MLA_PAGE_SIZE == 1, "segmented MLA cache"),
+        # the kernel is built for gfx950's 163,840 B LDS budget and the runner
+        # always asks for native FP4 MFMA; another arch would be admitted here
+        # and fail at compile/launch instead of falling back
+        (_is_gfx950(), "not gfx950"),
     ]
     if geometry is not None:
         why = model_geometry_refusal(hf, geometry, tp_size)
@@ -245,30 +260,11 @@ def fused_indexer_refusal(atom_config) -> str | None:
     did not, capture would bake whichever branch the dummy capture inputs
     chose into every later replay.
 
-    The kernel does not cover the overflow itself. ``indexer_uses_tiles`` is
-    ``indexer_cp and index_max_seq > INDEX_LOCAL_LDS_CAPACITY``
-    (``mono/kernels/layout.py``), and ATOM builds at ``index_max_seq ==
-    FUSED_INDEX_MAX_SEQ == INDEX_LOCAL_LDS_CAPACITY == 16384``, so
-    ``TILED_INDEXER`` is False in every build ATOM makes and the per-query
-    ``use_long_index`` dispatch (``mono/kernels/kernel.py``) is compiled
-    out. What a request past the capacity does instead depends on the CP
-    switch, and **both outcomes are bad, the second worse**:
-
-    - **CP off** -- a silent wrong answer. Nothing faults: the scoring tile
-      loop stops after ``index_max_seq // 64`` tiles and every cache read is
-      clamped. The kernel scores only keys ``[0, FUSED_INDEX_MAX_SEQ)`` and
-      picks its top-2048 out of a truncated context that excludes the
-      request's own newest token.
-    - **CP on** -- a hang, with no error on any rank. Scoring takes the
-      ``else`` at ``kernel.py:2012`` once ``bound > LOCAL_INDEX_CAPACITY``
-      and so never writes ``index_cp_scores``; the short selector is reached
-      unconditionally (``TILED_INDEXER`` is False) and ``poll``s
-      ``index_cp_scores`` for every slot (``kernel.py:2310-2325``). All four
-      ranks spin on a mailbox nobody will ever publish to.
-
-    ``indexer_cp_refusal`` requires this refusal to have passed, so the
-    second case is gated here and only here. Refusing the deployment is the
-    only option left.
+    A request past the capacity is refused as a deployment, not handled in
+    the kernel: scoring would silently truncate the context (CP off) or spin
+    on a mailbox nobody publishes to (CP on). ``indexer_cp_refusal`` requires
+    this refusal to have passed, so that second case is gated here and only
+    here.
 
     The cost is real and is the deliberate trade: a deployment that does not
     cap ``--max-model-len`` at or under ``FUSED_INDEX_MAX_SEQ`` gets the
