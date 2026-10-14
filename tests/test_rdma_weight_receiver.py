@@ -724,6 +724,38 @@ def test_a_prequantized_stream_is_received_then_refused(monkeypatch):
     assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
 
 
+def test_a_worker_without_the_group_votes_before_it_refuses():
+    """Raising alone, it left the workers that had the group waiting for it in
+    the stream's first vote."""
+    runner = _transacting_runner()
+    cast = []
+
+    def vote(ballot, began):
+        cast.append(ballot)
+        return ballot, began
+
+    runner._vote_with_engine_peers = vote
+
+    with pytest.raises(RuntimeError, match="not initialized"):
+        runner.receive_weights_rdma("g", 1)
+    assert cast == [receiver._BROKEN_OFF]
+
+
+def test_a_stream_is_refused_on_every_worker_if_one_lacks_the_group(monkeypatch):
+    import torch
+
+    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
+    runner = _rdma_runner(monkeypatch, trainer)
+    runner._vote_with_engine_peers = lambda ballot, began: (receiver._BROKEN_OFF, began)
+    frames = len(trainer.frames)
+
+    with pytest.raises(RuntimeError, match="not initialized on every worker"):
+        runner.receive_weights_rdma("g", 1)
+
+    assert len(trainer.frames) == frames, "a header was read"
+    runner.assert_weight_update_ready()
+
+
 def test_a_peer_whose_broadcast_failed_leaves_the_group_too(monkeypatch):
     """Only the rank whose own frame could not be received tore its end down.
     Its peers failed in the broadcast it never joined, kept the group, and the
@@ -959,8 +991,10 @@ def test_a_vote_that_failed_leaves_the_group_to_be_joined_again(monkeypatch):
         runner.receive_weights_rdma("g", 1)
 
     # Not voted on again over a group that had just failed to vote.
-    assert ballots == [receiver._RECEIVING, receiver._PREPARED]
+    # The group's own check, the frame, the end marker: none cast twice.
+    assert ballots == [receiver._RECEIVING, receiver._RECEIVING, receiver._PREPARED]
     assert destroyed == [group]
+    runner._vote_with_engine_peers = lambda ballot, began: (ballot, began)
     with pytest.raises(RuntimeError, match="not initialized"):
         runner.receive_weights_rdma("g", 2)
     with pytest.raises(RuntimeError, match="fenced"):

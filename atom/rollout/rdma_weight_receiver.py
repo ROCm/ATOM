@@ -781,10 +781,21 @@ class RDMAWeightReceiverMixin:
         """
         label = getattr(self, "label", "runner")
         groups = getattr(self, "_rdma_weight_groups", {})
+        # Agreed before the first header: a worker without the group, raising
+        # alone, left the others waiting for it in the stream's first vote.
+        outcome, _ = self._vote_with_engine_peers(
+            _RECEIVING if group_name in groups else _BROKEN_OFF, False
+        )
         if group_name not in groups:
             raise RuntimeError(
                 f"RDMA weight group is not initialized: {group_name!r}; "
                 "call init_rdma_weight_group first"
+            )
+        if outcome != _RECEIVING:
+            raise RuntimeError(
+                f"RDMA weight group {group_name!r} is not initialized on every "
+                f"worker of this engine; call destroy_rdma_weight_group("
+                f"{group_name!r}) on every rank and init it again"
             )
         if not verify_full_load:
             logger.warning(
