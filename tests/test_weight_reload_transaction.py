@@ -808,12 +808,66 @@ def test_a_transaction_is_refused_while_an_shm_or_ipc_reload_is_open():
     with _shm_segment(flat) as shm_name:
         first = {n: meta[n] for n in names[:2]}
         runner.update_weights_from_shm(shm_name, first, is_last=False)
-        with pytest.raises(RuntimeError, match="SHM or IPC reload is open"):
+        with pytest.raises(RuntimeError, match="reload over the SHM path is open"):
             runner.begin_weight_update(1)
         rest = {n: meta[n] for n in names[2:]}
         runner.update_weights_from_shm(shm_name, rest, is_last=True)
 
     runner.begin_weight_update(1)
+
+
+@pytest.mark.parametrize("other", ["direct", "ipc"])
+def test_another_paths_update_is_refused_while_an_shm_reload_is_open(other):
+    """Taken for a bucket of that reload, it applied another version and
+    closed the reload, and the reload's later buckets wrote over it. Refused,
+    it discards nothing of the open reload: q's shard still counts."""
+    runner = _Runner(_dense_model())
+    flat, meta = _staged(_dense_checkpoint(fill=1.0))
+    with _shm_segment(flat) as shm_name:
+        q = {"attn.q_proj.weight": meta["attn.q_proj.weight"]}
+        runner.update_weights_from_shm(shm_name, q, is_last=False)
+
+        with pytest.raises(RuntimeError, match="reload over the SHM path is open"):
+            _direct_reload(runner, other, _dense_checkpoint(fill=3.0))
+
+        rest = {n: m for n, m in meta.items() if n != "attn.q_proj.weight"}
+        runner.update_weights_from_shm(shm_name, rest, is_last=True)
+
+    assert runner.model.attn.qkv_proj.weight.eq(1.0).all()
+    assert runner.model.attn.o_proj.weight.eq(1.0).all()
+    runner.begin_weight_update(1)
+
+
+def test_a_reload_lands_on_the_device_before_it_lifts_the_fence(monkeypatch):
+    """clear_kv_cache, which waited for the writes, is skipped for
+    clear_kv_cache=False: the fence came down, and a forward on a stream of
+    its own could read weights still being written."""
+    runner = _fenced(_Runner(_dense_model()))
+    healthy_when_landed = []
+    runner._await_reload_writes = lambda: healthy_when_landed.append(
+        runner.get_weight_update_status()["healthy"]
+    )
+
+    runner.update_weights(list(_dense_checkpoint().items()), clear_kv_cache=False)
+
+    assert healthy_when_landed == [False]
+    runner.assert_weight_update_ready()
+
+    # A runner that was serving all along needs its writes landed as much.
+    runner.update_weights(list(_dense_checkpoint().items()), clear_kv_cache=False)
+    assert healthy_when_landed == [False, True]
+
+
+def test_landing_a_reload_waits_for_its_device(monkeypatch):
+    runner = _Runner(_dense_model())
+    runner.device = torch.device("cuda", 0)
+    synced = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", synced.append)
+
+    runner._await_reload_writes()
+
+    assert synced == [torch.device("cuda", 0)]
 
 
 def test_a_transaction_is_refused_while_the_weights_are_released():

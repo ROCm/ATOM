@@ -46,26 +46,41 @@ def _discard_sync_state_on_error(method):
     return guarded
 
 
-def _refused_during_a_transaction(method):
-    """A direct, SHM or IPC update may not write into an open transaction.
+def _refused_during_another_reload(path: str):
+    """A direct, SHM or IPC update may not write into an open transaction,
+    nor into a reload another path has open.
 
     Its writes would be credited to the transaction, which could then commit
-    what neither sender sent whole. Applied outside
+    what neither sender sent whole; or they would land between the other
+    reload's buckets, whose later ones write over them. Applied outside
     ``_discard_sync_state_on_error``, so the refusal discards nothing: that
-    scratch is the transaction's, and its commit or abort ends it.
+    scratch is the transaction's or the other reload's, and its own end
+    clears it.
     """
 
-    @wraps(method)
-    def guarded(self, *args, **kwargs):
-        active = getattr(self, "_weight_update_version", None)
-        if active is not None:
-            raise RuntimeError(
-                f"{getattr(self, 'label', 'runner')}: {method.__name__} refused "
-                f"while weight update v{active} is in progress"
-            )
-        return method(self, *args, **kwargs)
+    def decorate(method):
+        @wraps(method)
+        def guarded(self, *args, **kwargs):
+            label = getattr(self, "label", "runner")
+            active = getattr(self, "_weight_update_version", None)
+            if active is not None:
+                raise RuntimeError(
+                    f"{label}: {method.__name__} refused while weight update "
+                    f"v{active} is in progress"
+                )
+            open_path = getattr(self, "_legacy_reload_open", None)
+            if open_path is not None and open_path != path:
+                raise RuntimeError(
+                    f"{label}: {method.__name__} refused while a reload over "
+                    f"the {open_path} path is open, its last bucket not yet "
+                    f"applied; finish that reload, or discard it with "
+                    f"discard_failed_weight_sync"
+                )
+            return method(self, *args, **kwargs)
 
-    return guarded
+        return guarded
+
+    return decorate
 
 
 def _unwrap_once(module) -> torch.nn.Module | None:
@@ -165,7 +180,7 @@ class WeightUpdaterMixin:
         # commit or abort clears them.
         if getattr(self, "_weight_update_version", None) is not None:
             return
-        self._legacy_reload_open = False
+        self._legacy_reload_open = None
         if hasattr(self, "_packed_weight_accum"):
             self._packed_weight_accum.clear()
         getattr(self, "_fused_shards_written", {}).clear()
@@ -1032,7 +1047,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
-    @_refused_during_a_transaction
+    @_refused_during_another_reload("direct")
     @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
@@ -1060,7 +1075,7 @@ class WeightUpdaterMixin:
                 to it, or a fused parameter got only some of its shards. Raised
                 once the rest of the batch is applied.
         """
-        self._begin_legacy_reload()
+        self._begin_legacy_reload("direct")
         counts = self._apply_named_tensors(named_tensors)
         updated = counts["updated"]
 
@@ -1352,14 +1367,15 @@ class WeightUpdaterMixin:
                 f"weight update v{active} is already in progress; "
                 "a concurrent reload would interleave two versions"
             )
-        if getattr(self, "_legacy_reload_open", False):
+        open_path = getattr(self, "_legacy_reload_open", None)
+        if open_path is not None:
             # The engine runs the transaction between that reload's buckets,
             # which carry on afterwards over what it committed.
             raise RuntimeError(
-                "an SHM or IPC reload is open, its last bucket not yet "
-                "applied; a transaction begun now would interleave two "
-                "versions. Finish that reload, or discard it with "
-                "discard_failed_weight_sync"
+                f"a reload over the {open_path} path is open, its last bucket "
+                f"not yet applied; a transaction begun now would interleave "
+                f"two versions. Finish that reload, or discard it with "
+                f"discard_failed_weight_sync"
             )
         if getattr(self, "_weights_discarded", False):
             raise RuntimeError(
@@ -1625,19 +1641,27 @@ class WeightUpdaterMixin:
             f"{getattr(self, '_weight_update_failure', 'unknown')}"
         )
 
-    def _begin_legacy_reload(self) -> None:
-        """Open a direct, SHM or IPC reload, unless this bucket continues one.
+    def _begin_legacy_reload(self, path: str) -> None:
+        """Open a reload over *path* -- direct, SHM or IPC -- unless this
+        bucket continues one.
 
-        While one is open no transaction may begin; see begin_weight_update.
+        While one is open no transaction may begin, and no other path's
+        update; see begin_weight_update and _refused_during_another_reload.
         And on a fenced runner its coverage starts here: a reload lifts the
         fence only by rewriting every parameter itself, as what earlier ones
         wrote may be other versions.
         """
-        if getattr(self, "_legacy_reload_open", False):
+        if getattr(self, "_legacy_reload_open", None) == path:
             return
-        self._legacy_reload_open = True
+        self._legacy_reload_open = path
         if not getattr(self, "_weight_update_healthy", True):
             self._reset_reload_coverage()
+
+    def _await_reload_writes(self) -> None:
+        """Wait until this reload's writes have landed on the device."""
+        device = getattr(self, "device", None)
+        if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
 
     def _lift_partial_reload_fence(self, path: str) -> None:
         """Close a direct, SHM or IPC reload, serving again if it rewrote
@@ -1652,8 +1676,14 @@ class WeightUpdaterMixin:
         parameter rewritten by this reload. Short of that it raises, as
         returning reported the reload a success, and the engine, taking it for
         one, served again over a runner still fenced.
+
+        Either way the reload's writes have landed first. They are
+        asynchronous, and the forward that follows may run on a stream of its
+        own; the clear_kv_cache that waited for them is skipped for
+        clear_kv_cache=False, and waits for nothing with no KV cache.
         """
-        self._legacy_reload_open = False
+        self._await_reload_writes()
+        self._legacy_reload_open = None
         if getattr(self, "_weight_update_healthy", True):
             return
         if getattr(self, "_weight_update_version", None) is not None:
@@ -1686,7 +1716,7 @@ class WeightUpdaterMixin:
             "failure": getattr(self, "_weight_update_failure", None),
         }
 
-    @_refused_during_a_transaction
+    @_refused_during_another_reload("SHM")
     @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
@@ -1742,7 +1772,7 @@ class WeightUpdaterMixin:
                         .view(meta["shape"])
                     )
 
-            self._begin_legacy_reload()
+            self._begin_legacy_reload("SHM")
             counts = self._apply_named_tensors(views())
             updated, skipped = counts["updated"], counts["skipped"]
 
@@ -1766,7 +1796,7 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
-    @_refused_during_a_transaction
+    @_refused_during_another_reload("IPC")
     @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,
@@ -1860,7 +1890,7 @@ class WeightUpdaterMixin:
 
         # A generator, not a list: a list would hold a copy of the whole
         # bucket at once.
-        self._begin_legacy_reload()
+        self._begin_legacy_reload("IPC")
         counts = self._apply_named_tensors(copies())
         updated, skipped = counts["updated"], counts["skipped"]
 
