@@ -9,8 +9,8 @@ BRIDGE_SOURCE = (
 OPS_SOURCE = (
     Path(__file__).parents[2] / "atom/plugin/vllm/deepseek_v4_ops.py"
 ).read_text()
-IMAGE_SOURCE = (
-    Path(__file__).parents[2] / "atom/plugin/vllm/deepseek_v4_image.py"
+STATE_CHECKPOINT_SOURCE = (
+    Path(__file__).parents[2] / "atom/plugin/vllm/deepseek_v4_state_checkpoint.py"
 ).read_text()
 
 
@@ -41,7 +41,7 @@ def test_vllm_proxy_embeds_compressor_state_in_unified_slot_planes():
 
 def test_vllm_proxy_aligns_embedded_state_after_packed_kv_offset():
     # The carve's sizing (slot tail withheld from the pool) budgets the slack.
-    assert "return total + _V4_PROXY_ALIGNMENT - 1" in IMAGE_SOURCE
+    assert "return total + _V4_PROXY_ALIGNMENT - 1" in STATE_CHECKPOINT_SOURCE
     assert "alignment_pad = (" in BRIDGE_SOURCE
     assert ") % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT" in BRIDGE_SOURCE
     assert "raw = raw[alignment_pad:]" in BRIDGE_SOURCE

@@ -31,8 +31,8 @@ the snapshot via ``get_current_req_ids()`` and keys slot allocation on it, with
 no D2H. All of this lives in ATOM; no vLLM source is modified.
 
 The same wrappers expose the ``InputBatch`` itself through
-``get_current_input_batch()``. DeepSeek-V4's checkpoint-image ops read the
-host mirror of the image groups' block tables from it, which
+``get_current_input_batch()``. DeepSeek-V4's state-checkpoint ops read the
+host mirror of the state checkpoint groups' block tables from it, which
 ``CommonAttentionMetadata`` does not carry without a device sync.
 """
 

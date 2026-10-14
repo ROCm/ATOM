@@ -398,16 +398,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
-    # vLLM plugin, checkpoint images: overrides the native checkpoint interval
-    # (tokens; 0 = publish no image, -1 = no rungs, anchor and demand only).
+    # vLLM plugin, state checkpoints: overrides the native checkpoint interval
+    # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.
     "ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS": lambda: (
         int(v) if (v := os.getenv("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS")) else None
     ),
-    # vLLM plugin, checkpoint images: after every schedule, check that no
-    # request holds more than two blocks per image group (diagnostic).
-    "ATOM_STATE_IMAGE_CHECK_BLOCKS": lambda: (
-        os.getenv("ATOM_STATE_IMAGE_CHECK_BLOCKS", "0") == "1"
+    # vLLM plugin, state checkpoints: after every schedule, check that no
+    # request holds more than two blocks per state checkpoint group (diagnostic).
+    "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];

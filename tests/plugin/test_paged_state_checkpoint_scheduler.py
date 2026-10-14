@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The image layer on vLLM's real scheduler, block pool and KV-config code.
+"""The state checkpoint layer on vLLM's real scheduler, block pool and KV-config code.
 
 A fake adapter (block 256, k=3) over a tiny local Llama config, so nothing here
 needs a checkpoint or a GPU.
@@ -14,7 +14,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-pytest.importorskip("vllm", reason="the image layer patches vLLM")
+pytest.importorskip("vllm", reason="the state checkpoint layer patches vLLM")
 
 from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.sampling_params import SamplingParams
@@ -32,17 +32,17 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.plugin.vllm import paged_state_image as G
-from atom.plugin.vllm.paged_state_image_scheduler import apply_scheduler_patches
+from atom.plugin.vllm import paged_state_checkpoint as G
+from atom.plugin.vllm.paged_state_checkpoint_scheduler import apply_scheduler_patches
 
 BLOCK = 256
 K = 3
 PAGE = 1024
 
 
-class _Adapter(G.PagedStateImageAdapter):
+class _Adapter(G.PagedStateCheckpointAdapter):
     name = "FakeSched"
-    layer_suffix = "fake_sched_image"
+    layer_suffix = "fake_sched_state_checkpoint"
     block_size = BLOCK
     proxy_layer_name = "model.layers.0.fake_sched_proxy"
 
@@ -137,7 +137,7 @@ def _specs(adapter):
     )
     assert proxy.page_size_bytes == PAGE
     specs = {adapter.proxy_layer_name: proxy}
-    for name in adapter.image_layer_names(K):
+    for name in adapter.state_checkpoint_layer_names(K):
         specs[name] = MambaSpec(
             block_size=BLOCK,
             shapes=((PAGE,),),
@@ -165,7 +165,7 @@ def _scheduler(
         log_stats=False,
         structured_output_manager=StructuredOutputManager(vc),
     )
-    assert s._atom_state_images is not None
+    assert s._atom_state_checkpoints is not None
     s._test_hasher = get_request_block_hasher(hash_block, sha256)
     return s
 
@@ -242,7 +242,7 @@ class _Engine:
 def _until_pending(eng, rid, max_steps=2000):
     """Step until the decode keep is deferred, stopping right after that step is
     scheduled (its output not landed yet)."""
-    st = eng.s._atom_state_images
+    st = eng.s._atom_state_checkpoints
     for _ in range(max_steps):
         if len(eng.q) >= 2:
             eng.land()
@@ -253,13 +253,14 @@ def _until_pending(eng, rid, max_steps=2000):
 
 
 def _boundary_cached(s, req, idx):
-    st = s._atom_state_images
-    return st._image_cached(req, idx)
+    st = s._atom_state_checkpoints
+    return st._state_checkpoint_cached(req, idx)
 
 
 def _upstream_configs(adapter, tmp_path, physical_blocks, *, max_model_len=4096):
     """vLLM's real get_kv_cache_configs (auto-fit, null-block reserve, memory
-    check, tensor placement) under the image hook, for ``physical_blocks``."""
+    check, tensor placement) under the state checkpoint hook, for ``physical_blocks``.
+    """
     from vllm.v1.core import kv_cache_utils as U
 
     vc = _vllm_config(tmp_path, max_model_len=max_model_len)
@@ -271,7 +272,7 @@ def _upstream_configs(adapter, tmp_path, physical_blocks, *, max_model_len=4096)
 
 
 # max_model_len 4096 = 16 blocks; a running request also holds 2 blocks in each
-# of the K image groups, and vLLM's block pool keeps one null block for good.
+# of the K state checkpoint groups, and vLLM's block pool keeps one null block for good.
 MIN_SCHEDULABLE = 16 + 2 * K + 1
 
 
@@ -314,19 +315,20 @@ def test_interval_zero_still_counts_working_blocks_and_never_hits(
     adapter, tmp_path, monkeypatch
 ):
     monkeypatch.setenv("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS", "0")
-    monkeypatch.setenv("ATOM_STATE_IMAGE_CHECK_BLOCKS", "1")
-    # Interval 0 publishes no image, but the image groups still allocate.
+    monkeypatch.setenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "1")
+    # Interval 0 publishes no state checkpoint, but the state checkpoint groups still
+    # allocate.
     with pytest.raises(ValueError, match="pool too small"):
         _upstream_configs(adapter, tmp_path, 16 + 1 + 11)
     s = _scheduler(adapter, tmp_path)
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     eng = _Engine(s)
     prompt = list(range(1, 1001))
     _request(s, "z1", prompt, max_tokens=8)
     eng.drain()
-    assert 0 < st.counters["max_image_blocks_per_request"] <= 2 * K
-    assert st.counters["images_hashed"] == 0
-    # No image, so no prefix hit: never a proxy-only (zero-state) resume.
+    assert 0 < st.counters["max_state_checkpoint_blocks_per_request"] <= 2 * K
+    assert st.counters["state_checkpoints_hashed"] == 0
+    # No state checkpoint, so no prefix hit: never a proxy-only (zero-state) resume.
     again = _request(s, "z2", prompt, max_tokens=1)
     eng.schedule()
     assert again.num_computed_tokens == len(prompt)  # scheduled from 0 in one go
@@ -336,8 +338,8 @@ def test_interval_zero_still_counts_working_blocks_and_never_hits(
 
 def test_auto_fit_max_model_len_leaves_room_for_the_slot_tail(adapter, tmp_path):
     """--max-model-len -1 under memory pressure: vLLM fits the length to all
-    100 physical blocks (23,808 tokens = 99 blocks with the images and the null
-    block); the slots then take 11, so the length has to fit 89."""
+    100 physical blocks (23,808 tokens = 99 blocks with the state checkpoints and the
+    null block); the slots then take 11, so the length has to fit 89."""
     vc, cfg = _upstream_configs(adapter, tmp_path, 100, max_model_len=-1)
     assert vc.model_config.original_max_model_len == -1
     fitted = vc.model_config.max_model_len
@@ -416,7 +418,9 @@ def _native_keeps(n_answer, *, abort_after=None):
 
 def _plugin_keeps_512(s, n_answer, *, abort_after=None, max_steps=3000):
     """Drive vLLM's async loop; an abort is handled before the oldest in-flight
-    step's output lands, as EngineCore does. Whether 512's image ends up cached."""
+    step's output lands, as EngineCore does. Whether 512's state checkpoint ends up
+    cached.
+    """
     from vllm.v1.request import RequestStatus
 
     req = _request(s, "e", [7], max_tokens=n_answer)
@@ -475,13 +479,13 @@ def test_a_deferred_decode_keep_is_published_while_the_request_runs(
     """Async decode defers the keep at 512 (its closing token is in flight). It
     is published as soon as that hash exists, while the request keeps running,
     and a later keep (1024) does not replace it; a second request over the same
-    prefix hits the image while the first one is still generating.
+    prefix hits the state checkpoint while the first one is still generating.
 
     vLLM caps both ``cache_blocks`` call sites at the finalized tokens, so the
-    image groups' cached-block count passes the keep's block only once its hash
-    exists: the deferred branch fires on the very next schedule."""
+    state checkpoint groups' cached-block count passes the keep's block only once its
+    hash exists: the deferred branch fires on the very next schedule."""
     s = _scheduler(adapter, tmp_path, hash_block=hash_block)
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     eng = _Engine(s)
     req = _request(s, "long", [7], max_tokens=3000)
     assert _until_pending(eng, "long") == 1
@@ -528,18 +532,18 @@ def test_a_co_scheduled_reader_restores_only_after_the_writers_store(
     adapter, tmp_path, guard
 ):
     """Two requests with the same 600-token prompt arrive together. The writer
-    cuts its prefill at the 512 anchor, and its image there is hashed when that
-    chunk is scheduled, before the forward that produces it. A reader admitted
+    cuts its prefill at the 512 anchor, and its state checkpoint there is hashed when
+    that chunk is scheduled, before the forward that produces it. A reader admitted
     in the same schedule() would restore in that step's metadata build, before
     the writer's forward and store. vLLM's Mamba manager refuses a hit whose
     last block was cached in the current step (``cached_blocks_this_step``,
-    which the image groups fill), so the reader is admitted on a later step,
+    which the state checkpoint groups fill), so the reader is admitted on a later step,
     still with the 512 hit. Without that set (``guard=False``) the reader is
     co-scheduled with the writer, which is the hazard."""
     s = _scheduler(adapter, tmp_path)
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     if not guard:
-        for gid in st.image_gids:
+        for gid in st.state_checkpoint_gids:
             st.coordinator.single_type_managers[gid].cached_blocks_this_step = _NoAdd()
     eng = _Engine(s)
     prompt = list(range(1, 601))
@@ -550,7 +554,7 @@ def test_a_co_scheduled_reader_restores_only_after_the_writers_store(
         if len(eng.q) >= 2:
             eng.land()
         out = eng.schedule()
-        if store_step is None and out.atom_image_stores.get("w") == 512:
+        if store_step is None and out.atom_state_checkpoint_stores.get("w") == 512:
             store_step = step
         for new in out.scheduled_new_reqs:
             if new.req_id == "r":
@@ -585,7 +589,7 @@ def test_abort_with_a_deferred_decode_keep_frees_the_request(
     s.finish_requests("a", RequestStatus.FINISHED_ABORTED)
     assert "a" not in s.requests
     assert s.kv_cache_manager.block_pool.get_num_free_blocks() > free_before
-    assert "a" not in s._atom_state_images.pending_hash
+    assert "a" not in s._atom_state_checkpoints.pending_hash
     assert not _boundary_cached(s, req, idx)
     # The engine keeps serving.
     _request(s, "b", list(range(1, 300)), max_tokens=4)
@@ -611,7 +615,7 @@ def test_preemption_drops_the_deferred_decode_keep_and_resumes(adapter, tmp_path
     idx = _until_pending(eng, "p")
     s.running.remove(req)
     s._preempt_request(req, time.time())
-    assert "p" not in s._atom_state_images.pending_hash
+    assert "p" not in s._atom_state_checkpoints.pending_hash
     assert not _boundary_cached(s, req, idx)
     eng.drain()
     assert "p" not in s.requests
@@ -636,15 +640,15 @@ def _hit(s, rid, prompt):
 def test_with_mtp_the_hit_lands_on_the_anchor_as_native(
     adapter, tmp_path, native_hits, extra
 ):
-    """A 1,000-token prompt keeps images at the 512 rung and the 768 anchor. An
-    EAGLE-class drafter makes vLLM drop one more matched block, so a re-send (or
+    """A 1,000-token prompt keeps state checkpoints at the 512 rung and the 768 anchor.
+    An EAGLE-class drafter makes vLLM drop one more matched block, so a re-send (or
     an extension) of the prompt hits 512 and recomputes 488+ tokens. Native's
     can_allocate only withholds the last block (always recomputed for logits),
-    so it resumes at 768; with the draft's state in the image the plugin follows
-    it. The proxy group and every image group report the same hit."""
+    so it resumes at 768; with the draft's state in the state checkpoint the plugin
+    follows it. The proxy group and every state checkpoint group report the same hit."""
     s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=native_hits)
     assert s.use_eagle and s.use_eagle_block_drop is not native_hits
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     eng = _Engine(s)
     prompt = list(range(1, 1001))
     _request(s, "w", prompt, max_tokens=1)
@@ -661,7 +665,7 @@ def test_with_mtp_the_hit_lands_on_the_anchor_as_native(
     hit, groups = _hit(s, "r", prompt + list(range(2001, 2001 + extra)))
     assert hit == (768 if native_hits else 512)
     assert len(groups[st.proxy_gid]) * BLOCK == hit
-    for gid in st.image_gids:
+    for gid in st.state_checkpoint_gids:
         assert len(groups[gid]) * BLOCK == hit
         assert not groups[gid][-1].is_null and groups[gid][-1].block_hash is not None
 
@@ -671,15 +675,15 @@ class _SpecWorld:
     step right after it is scheduled (as the worker does, in step order).
 
     The worker uses the plugin's own decode-keep functions. A slot's content is
-    the committed position its last step left it at; an image block's content
+    the committed position its last step left it at; a state checkpoint block's content
     is the position of the slot it was copied from. A step commits
-    ``1 + accept(rid, j)`` tokens on its ``j``-th decode step. Every image block
-    vLLM publishes must hold exactly its boundary's state by the next build,
+    ``1 + accept(rid, j)`` tokens on its ``j``-th decode step. Every state checkpoint
+    block vLLM publishes must hold exactly its boundary's state by the next build,
     before any reader can restore it."""
 
     def __init__(self, s, accept, monkeypatch):
         self.s, self.accept = s, accept
-        self.st = s._atom_state_images
+        self.st = s._atom_state_checkpoints
         self.q = deque()
         self.tok = 0
         self.pos, self.slot_of, self.slot_pos = {}, {}, {}
@@ -688,14 +692,16 @@ class _SpecWorld:
         self.published = []
         self.pending_prefill = []
         self.copier = NS(execute_paged_state_copies=self._copies, checkpoint_spec=NS())
-        self.worker = G.ImageWorker(None, self.copier, self.st.image_gids)
+        self.worker = G.StateCheckpointWorker(
+            None, self.copier, self.st.state_checkpoint_gids
+        )
         self.req_ids = []
         self.builds = 0
         self.scheduling = False
         self.checked = 0
         self.restores = []
         self.prefill_end = {}
-        monkeypatch.setattr(G, "image_unit_ids", self._unit_ids)
+        monkeypatch.setattr(G, "state_checkpoint_unit_ids", self._unit_ids)
         monkeypatch.setattr(
             G, "_ops", lambda c, slots, units, store: list(zip(slots, units))
         )
@@ -711,7 +717,7 @@ class _SpecWorld:
             kv_cache_group_id,
             block_mask=None,
         ):
-            if kv_cache_group_id in self.st.image_gids:
+            if kv_cache_group_id in self.st.state_checkpoint_gids:
                 # The first build that can restore it: the next step's (one
                 # published by schedule() is read no earlier than the build
                 # after the one that step runs).
@@ -753,8 +759,8 @@ class _SpecWorld:
                 self.content[u] = self.slot_pos[slot]
 
     def _verify(self, build):
-        """Every image a reader could restore in ``build`` holds its boundary's
-        state once the build's own stores are issued."""
+        """Every state checkpoint a reader could restore in ``build`` holds its
+        boundary's state once the build's own stores are issued."""
         left = []
         for first_reader, block_id, boundary in self.published:
             if first_reader <= build:
@@ -778,7 +784,7 @@ class _SpecWorld:
         fresh = [i for i, rid in enumerate(ids) if rid in new or rid in resumed]
         starts = [new.get(r, resumed.get(r, self.pos.get(r))) for r in ids]
         for i in fresh:
-            # A fresh slot; a hit restores the image at its start. Up to
+            # A fresh slot; a hit restores the state checkpoint at its start. Up to
             # vLLM's prefill end the request replays as prefill.
             self.slot_of[ids[i]] = len(self.slot_of) + 100 * self.builds
             req = self.s.requests[ids[i]]
@@ -791,7 +797,7 @@ class _SpecWorld:
             self._copies([(slot, units)], [])
         self.pending_prefill = []
         G._decode_plan.clear()
-        G._decode_plan.update(out.atom_image_decode_candidates)
+        G._decode_plan.update(out.atom_state_checkpoint_decode_candidates)
         G.store_decode_keeps(self.worker, ids, starts, fresh)
         lens = [sched[r] for r in ids]
         self.last_rows = {r: (starts[i], lens[i]) for i, r in enumerate(ids)}
@@ -799,7 +805,7 @@ class _SpecWorld:
         for i in fresh:
             if starts[i] > 0:
                 (units,) = self._unit_ids(
-                    self.st.image_gids, [i], [starts[i] // BLOCK - 1]
+                    self.st.state_checkpoint_gids, [i], [starts[i] // BLOCK - 1]
                 )
                 assert [self.content.get(u) for u in units] == [starts[i]] * K, (
                     ids[i],
@@ -808,10 +814,12 @@ class _SpecWorld:
                 )
                 self.restores.append((ids[i], starts[i]))
             self.slot_pos[slots[i]] = starts[i]
-        for rid, end in out.atom_image_stores.items():
+        for rid, end in out.atom_state_checkpoint_stores.items():
             i = ids.index(rid)
             assert starts[i] + lens[i] == end, (rid, starts[i], lens[i], end)
-            (units,) = self._unit_ids(self.st.image_gids, [i], [end // BLOCK - 1])
+            (units,) = self._unit_ids(
+                self.st.state_checkpoint_gids, [i], [end // BLOCK - 1]
+            )
             self.pending_prefill.append((slots[i], units))
         self._verify(self.builds)
         # The forwards.
@@ -966,12 +974,12 @@ def test_mtp_decode_keeps_land_on_the_committed_end_as_native(
     """Under MTP k=1 on vLLM's AsyncScheduler a step commits 1 + accepted, known
     one step late. The plugin keeps exactly where native's hash_decode_blocks
     does (committed end on a block boundary, one interval past the last keep;
-    a step that steps over a boundary keeps nothing), every published image
+    a step that steps over a boundary keeps nothing), every published state checkpoint
     holds its boundary's state when the next build is done, and no step trips
     the worker's ``hashed at … but this step ends at …`` check."""
     accept = _ACCEPT[pattern]
     s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     st.events = []
     world = _SpecWorld(s, lambda rid, j: accept(j), monkeypatch)
     n_answer = 2600
@@ -1011,12 +1019,12 @@ def test_mtp_follow_up_hits_a_decode_keep_and_a_preempted_request_resumes(
 ):
     """The EngineCore crash the earlier experiment hit (``hashed at 8448 but
     this step ends at 8447`` after a resume) at this test's scale: a request
-    resumed from a cached image under MTP keeps decoding, with acceptance
+    resumed from a cached state checkpoint under MTP keeps decoding, with acceptance
     varying, past its next decode keep. A follow-up over the first request's
     output resumes at its decode keep (restored state = that boundary), and a
-    preempted request resumes from its own images."""
+    preempted request resumes from its own state checkpoints."""
     s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
-    st = s._atom_state_images
+    st = s._atom_state_checkpoints
     st.events = []
     world = _SpecWorld(s, lambda rid, j: (j * 7 + len(rid)) % 3 != 0, monkeypatch)
     prompt = list(range(1, 601))
@@ -1035,7 +1043,7 @@ def test_mtp_follow_up_hits_a_decode_keep_and_a_preempted_request_resumes(
         if world.restores:
             break
     assert world.restores[0] == ("b", decode_a[0])
-    # Preempt b mid-decode; it resumes from an image and keeps going.
+    # Preempt b mid-decode; it resumes from a state checkpoint and keeps going.
     for _ in range(400):
         breq = s.requests.get("b")
         if breq is not None and breq.num_computed_tokens > decode_a[0] + 700:
@@ -1058,17 +1066,19 @@ def test_mtp_follow_up_hits_a_decode_keep_and_a_preempted_request_resumes(
 def test_align_under_spec_decode_keeps_the_running_block_at_end_over_block_minus_one(
     adapter, tmp_path, monkeypatch
 ):
-    """vLLM's Mamba align bookkeeping for the image groups under MTP k=1: no
-    speculative blocks (an image is not a running state), no lookahead
+    """vLLM's Mamba align bookkeeping for the state checkpoint groups under MTP k=1: no
+    speculative blocks (a state checkpoint is not a running state), no lookahead
     allocation, the running block at column ``end // block - 1`` of the
     scheduled (optimistic) end, which also holds every boundary a step can
     commit to; vLLM's accepted-column copy moves nothing."""
-    layer_spec = G.PagedStateImageLayer("x", 0, PAGE, adapter).get_kv_cache_spec(None)
+    layer_spec = G.PagedStateCheckpointLayer("x", 0, PAGE, adapter).get_kv_cache_spec(
+        None
+    )
     assert layer_spec.num_speculative_blocks == 0
     assert layer_spec.mamba_cache_mode == "align"
     s = _scheduler(adapter, tmp_path, spec_k=1, native_hits=True, num_blocks=96)
-    st = s._atom_state_images
-    mgrs = [st.coordinator.single_type_managers[g] for g in st.image_gids]
+    st = s._atom_state_checkpoints
+    mgrs = [st.coordinator.single_type_managers[g] for g in st.state_checkpoint_gids]
     assert all(m.num_speculative_blocks == 0 for m in mgrs)
     assert all(m.mamba_cache_mode == "align" for m in mgrs)
     world = _SpecWorld(s, lambda rid, j: j % 3 != 1, monkeypatch)
@@ -1080,7 +1090,7 @@ def test_align_under_spec_decode_keeps_the_running_block_at_end_over_block_minus
             break
         world.schedule()
         out = world.q[-1][0]
-        threshold = out.atom_image_decode_candidates.get("c")
+        threshold = out.atom_state_checkpoint_decode_candidates.get("c")
         if threshold is not None:
             end = int(req.num_computed_tokens)  # scheduled end, all drafts accepted
             start, n = world.last_rows["c"]  # the worker's exact start
@@ -1101,11 +1111,11 @@ def test_align_under_spec_decode_keeps_the_running_block_at_end_over_block_minus
     world.drain()
     assert checked > 500 and len(boundaries) >= 2, (checked, boundaries)
     # vLLM's pre/post copy of the accepted column (preprocess_mamba /
-    # postprocess_mamba) goes through the image layers' copy function.
+    # postprocess_mamba) goes through the state checkpoint layers' copy function.
     from vllm.model_executor.layers.mamba.mamba_utils import MambaCopySpec
 
     state = torch.zeros(8, PAGE, dtype=torch.uint8)
-    (copy,) = G.image_state_copy_funcs()
+    (copy,) = G.state_checkpoint_copy_funcs()
     for accepted in (1, 2):
         spec = copy(state, [3, 5], 1, accepted)
         assert isinstance(spec, MambaCopySpec) and spec.num_elements == 0

@@ -213,12 +213,13 @@ def _proxy_page_bytes(vllm_config) -> int:
     """What one 128-token block really costs: both plane envelopes + indexer.
 
     The per-request slots are not in this price. They are withheld from the
-    block pool as a tail (`deepseek_v4_image.V4ImageSizing.usable_blocks`), so
-    vLLM's block count is a block count and every image page is a real page.
+    block pool as a tail
+    (`deepseek_v4_state_checkpoint.V4StateCheckpointSizing.usable_blocks`), so vLLM's
+    block count is a block count and every state checkpoint page is a real page.
     """
-    from atom.plugin.vllm.deepseek_v4_image import v4_image_sizing
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_state_checkpoint_sizing
 
-    return v4_image_sizing(vllm_config).page_bytes
+    return v4_state_checkpoint_sizing(vllm_config).page_bytes
 
 
 def _proxy_block_major_view(proxy_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -237,9 +238,9 @@ def _proxy_block_major_view(proxy_kv_cache: torch.Tensor) -> torch.Tensor:
 def _proxy_through_slot_tail(proxy_kv_cache: torch.Tensor, nbytes: int) -> torch.Tensor:
     """The proxy's first ``nbytes`` as ``[blocks, page]``, past the end of its view.
 
-    vLLM sizes each layer view by ``kv_cache_config.num_blocks``, which the image
-    hook lowered to the schedulable blocks; the slot tail it withheld is still
-    allocated right after them (``KVCacheTensor.size`` is unchanged).
+    vLLM sizes each layer view by ``kv_cache_config.num_blocks``, which the state
+    checkpoint hook lowered to the schedulable blocks; the slot tail it withheld is
+    still allocated right after them (``KVCacheTensor.size`` is unchanged).
     """
     view = _proxy_block_major_view(proxy_kv_cache)
     page = int(view[0].numel())
@@ -593,17 +594,19 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
         # on the capture path, so carry the signal into ATOM's forward context.
         md.in_hipgraph = bool(capturing)
-        # Image ops and the selective per-slot reset, OUTSIDE the captured
+        # State checkpoint ops and the selective per-slot reset, OUTSIDE the captured
         # region. For decode the reset is empty (no fresh slots are bound
         # mid-generation); it fires for the prefill chunk that first allocates a
         # request's slot, which is eager.
-        from atom.plugin.vllm.paged_state_image import run_image_step
+        from atom.plugin.vllm.paged_state_checkpoint import run_state_checkpoint_step
 
-        run_image_step(
-            getattr(model, "_atom_image_worker", None),
+        run_state_checkpoint_step(
+            getattr(model, "_atom_state_checkpoint_worker", None),
             md,
             capturing=capturing,
-            plan=lambda: _plan_deepseek_v4_image_ops(model, md, common_attn_metadata),
+            plan=lambda: _plan_deepseek_v4_state_checkpoint_ops(
+                model, md, common_attn_metadata
+            ),
             reset_fn=lambda slots: reset_deepseek_v4_state_slots(model, slots),
             name="DeepSeek-V4",
         )
@@ -994,16 +997,16 @@ def bind_deepseek_v4_proxy_cache_views(
     # the bridge cannot read from common_attn_metadata. Slots come back on
     # vLLM's finished / preempted / resumed events, never by guessing.
     if not hasattr(model, "_atom_v4_slot_allocator"):
-        from atom.plugin.vllm.paged_state_image import register_slot_allocator
+        from atom.plugin.vllm.paged_state_checkpoint import register_slot_allocator
 
         model._atom_v4_slot_allocator = _V4StateSlotAllocator(
             num_slots, evict_lru=False
         )
         register_slot_allocator(model._atom_v4_slot_allocator)
     is_target = layer_name == ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
-    from atom.plugin.vllm.deepseek_v4_image import v4_image_sizing
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_state_checkpoint_sizing
 
-    sizing = v4_image_sizing(vllm_config)
+    sizing = v4_state_checkpoint_sizing(vllm_config)
     if is_target and list(sizing.ratios) != ratios:
         raise RuntimeError(
             f"DeepSeek-V4 sizing priced {len(sizing.ratios)} layers but the "
@@ -1047,9 +1050,9 @@ def bind_deepseek_v4_proxy_cache_views(
     geometry = views["geometry"]
     model._atom_v4_geometry = geometry
     model._atom_v4_is_target = is_target
-    model._atom_image_worker = None
+    model._atom_state_checkpoint_worker = None
     if is_target:
-        _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy)
+        _bind_deepseek_v4_state_checkpoint(model, vllm_config, sizing, views, proxy)
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
         window_size=window_size,
@@ -1119,7 +1122,7 @@ def _bind_deepseek_v4_draft_to_target_slot(model, vllm_config, proxy, ptr) -> bo
     model._atom_v4_geometry = target._atom_v4_geometry
     model._atom_v4_meta_params = params
     model._atom_v4_is_target = False
-    model._atom_image_worker = None
+    model._atom_state_checkpoint_worker = None
     # The target's per-slot reset covers the draft's rows of the slot too.
     target._atom_v4_slot_sharers = attns
     proxy._atom_v4_model = model
@@ -1240,42 +1243,47 @@ def _ensure_v4_decode_bufs(model, vllm_config, ratios, device) -> None:
         )
 
 
-def _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy) -> None:
-    """Attach the image worker when vLLM gave this worker the k image groups."""
-    from atom.plugin.vllm.deepseek_v4_image import (
-        deepseek_v4_image_layer_names,
-        deepseek_v4_images_on,
-        make_v4_image_copier,
-        register_v4_image_adapter,
+def _bind_deepseek_v4_state_checkpoint(
+    model, vllm_config, sizing, views, proxy
+) -> None:
+    """Attach the state checkpoint worker when vLLM gave this worker the k state
+    checkpoint groups."""
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        deepseek_v4_state_checkpoint_layer_names,
+        deepseek_v4_state_checkpoints_on,
+        make_v4_state_checkpoint_copier,
+        register_v4_state_checkpoint_adapter,
     )
-    from atom.plugin.vllm.paged_state_image import (
-        ImageWorker,
-        PagedStateImageLayer,
-        register_image_worker,
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        PagedStateCheckpointLayer,
+        StateCheckpointWorker,
+        register_state_checkpoint_worker,
     )
 
-    if not deepseek_v4_images_on(vllm_config):
+    if not deepseek_v4_state_checkpoints_on(vllm_config):
         return
     sfc = vllm_config.compilation_config.static_forward_context
-    names = deepseek_v4_image_layer_names(sizing.k)
+    names = deepseek_v4_state_checkpoint_layer_names(sizing.k)
     layers = [sfc.get(n) for n in names]
-    gids = [getattr(layer, "_atom_image_group_id", None) for layer in layers]
-    unbound = any(not isinstance(x, PagedStateImageLayer) for x in layers)
+    gids = [getattr(layer, "_atom_state_checkpoint_group_id", None) for layer in layers]
+    unbound = any(not isinstance(x, PagedStateCheckpointLayer) for x in layers)
     if unbound or any(g is None for g in gids):
         raise RuntimeError(
-            "DeepSeek-V4 prefix caching is on but this worker has no bound image "
-            f"groups for {names[:2]}...; refusing to serve bare prefix hits"
+            "DeepSeek-V4 prefix caching is on but this worker has no bound state "
+            f"checkpoint groups for {names[:2]}...; refusing to serve bare prefix hits"
         )
-    copier = make_v4_image_copier(
+    copier = make_v4_state_checkpoint_copier(
         sizing, views, num_blocks=views["num_blocks"], device=proxy.kv_cache.device
     )
     copier.warmup_per_req_cache()
-    model._atom_image_worker = ImageWorker(register_v4_image_adapter(), copier, gids)
-    register_image_worker(model._atom_image_worker)
+    model._atom_state_checkpoint_worker = StateCheckpointWorker(
+        register_v4_state_checkpoint_adapter(), copier, gids
+    )
+    register_state_checkpoint_worker(model._atom_state_checkpoint_worker)
     logger.info(
-        "ATOM DeepSeek-V4 image prefix bound: page_bytes=%d page_unit_bytes=%d "
-        "image_k=%d image_bytes=%d block_size=%d slots=%d carve_blocks=%d "
-        "image_group_ids=%s",
+        "ATOM DeepSeek-V4 state checkpoint prefix bound: page_bytes=%d "
+        "page_unit_bytes=%d units_per_checkpoint=%d image_bytes=%d block_size=%d "
+        "slots=%d carve_blocks=%d state_checkpoint_group_ids=%s",
         sizing.page_bytes,
         sizing.page_unit_bytes,
         sizing.k,
@@ -1287,18 +1295,19 @@ def _bind_deepseek_v4_image(model, vllm_config, sizing, views, proxy) -> None:
     )
 
 
-def _plan_deepseek_v4_image_ops(model, md, common_attn_metadata) -> None:
-    """This step's restores and stores (``paged_state_image.plan_image_ops``)
-    over the V4 rows: the bound slot, ``chunk_start`` and query length of every
-    real row, and the rows bound to a fresh slot by this build."""
-    from atom.plugin.vllm.paged_state_image import plan_image_ops
+def _plan_deepseek_v4_state_checkpoint_ops(model, md, common_attn_metadata) -> None:
+    """This step's restores and stores
+    (``paged_state_checkpoint.plan_state_checkpoint_ops``) over the V4 rows: the bound
+    slot, ``chunk_start`` and query length of every real row, and the rows bound to a
+    fresh slot by this build."""
+    from atom.plugin.vllm.paged_state_checkpoint import plan_state_checkpoint_ops
 
     rows = getattr(md, "_atom_v4_real_rows", 0)
     if not rows:
         return
     q_np = common_attn_metadata.query_start_loc_cpu[: rows + 1].numpy()
-    plan_image_ops(
-        getattr(model, "_atom_image_worker", None),
+    plan_state_checkpoint_ops(
+        getattr(model, "_atom_state_checkpoint_worker", None),
         md,
         rows=rows,
         slots=md._atom_v4_slot_groups,

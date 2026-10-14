@@ -327,12 +327,14 @@ def register_model() -> None:
     apply_vllm_v4_prefill_not_uniform_patch()
 
     # DeepSeek-V4: real per-block pricing with a withheld slot tail, and prefix
-    # hits restored from vLLM-managed checkpoint images. Lives here rather than in
+    # hits restored from vLLM-managed state checkpoints. Lives here rather than in
     # ATOMPlatform because this hook is always reached, in EngineCore and in
     # every worker: vLLM resolves the platform class from inside its own
     # ``import vllm``, so ``register_platform`` can fail on a partially
     # initialized ``vllm`` package and be swallowed. A no-op for every other model.
-    from atom.plugin.vllm.deepseek_v4_image import apply_vllm_v4_prefix_install
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        apply_vllm_v4_prefix_install,
+    )
 
     apply_vllm_v4_prefix_install()
 

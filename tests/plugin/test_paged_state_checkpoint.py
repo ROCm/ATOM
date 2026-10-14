@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The model-agnostic image layer, driven by a fake (non-V4) adapter."""
+"""The model-agnostic state checkpoint layer, driven by a fake (non-V4) adapter."""
 
 import ast
 from pathlib import Path
@@ -10,16 +10,16 @@ import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("vllm", reason="the image layer patches vLLM")
+pytest.importorskip("vllm", reason="the state checkpoint layer patches vLLM")
 
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
-from atom.plugin.vllm import paged_state_image as G
-from atom.plugin.vllm.paged_state_image_scheduler import ImagePlacement
+from atom.plugin.vllm import paged_state_checkpoint as G
+from atom.plugin.vllm.paged_state_checkpoint_scheduler import StateCheckpointPlacement
 
 PLUGIN = Path(__file__).parents[2] / "atom/plugin/vllm"
 BLOCK = 256
 UNIT = 1000
-SLOT = 2600  # image = whole slot, 3 units (the last one partial)
+SLOT = 2600  # state checkpoint = whole slot, 3 units (the last one partial)
 
 
 class _Copier:
@@ -66,21 +66,21 @@ class _Copier:
         return [UNIT, UNIT, SLOT - 2 * UNIT]
 
 
-class _Backend(G.PagedStateImageBackend):
+class _Backend(G.PagedStateCheckpointBackend):
     block_size = BLOCK
 
     @staticmethod
     def get_name():
-        return "FAKE_IMAGE"
+        return "FAKE_STATE_CHECKPOINT"
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None):
         return [BLOCK]
 
 
-class _FakeAdapter(G.PagedStateImageAdapter):
+class _FakeAdapter(G.PagedStateCheckpointAdapter):
     name = "Fake"
-    layer_suffix = "fake_image"
+    layer_suffix = "fake_state_checkpoint"
     block_size = BLOCK
     backend_cls = _Backend
     proxy_layer_name = "model.layers.0.fake_proxy"
@@ -119,7 +119,7 @@ def _vcfg(arch="FakeForCausalLM", prefix=True):
 
 
 def test_generic_layer_imports_no_model_code():
-    for name in ("paged_state_image.py", "paged_state_image_scheduler.py"):
+    for name in ("paged_state_checkpoint.py", "paged_state_checkpoint_scheduler.py"):
         tree = ast.parse((PLUGIN / name).read_text())
         mods = set()
         for node in ast.walk(tree):
@@ -138,7 +138,7 @@ def test_generic_layer_imports_no_model_code():
             "torch",
             "numpy",
             "atom.model_engine.page_unit_checkpoint",
-            "atom.plugin.vllm.paged_state_image",
+            "atom.plugin.vllm.paged_state_checkpoint",
             "atom.plugin.vllm.req_id_passthrough_patch",
             "atom.utils",
         )
@@ -146,20 +146,21 @@ def test_generic_layer_imports_no_model_code():
         assert all(m.startswith(allowed) for m in atom_mods), (name, atom_mods)
 
 
-def test_image_env_vars_are_registered_and_documented():
+def test_state_checkpoint_env_vars_are_registered_and_documented():
     from atom.utils import envs
 
     doc = (Path(__file__).parents[2] / "docs/environment_variables.md").read_text()
     names = (
         "ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS",
         "ATOM_STATE_CHECKPOINT_DEMAND",
-        "ATOM_STATE_IMAGE_CHECK_BLOCKS",
+        "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS",
         "ATOM_V4_CG_INSTR_DIR",
     )
     assert [n for n in names if n not in envs.environment_variables] == []
     assert [n for n in names if f"**{n}**" not in doc] == []
-    # Every ATOM_* the image layer and the V4 cudagraph patch read is registered.
-    for name in ("paged_state_image.py", "paged_state_image_scheduler.py"):
+    # Every ATOM_* the state checkpoint layer and the V4 cudagraph patch read is
+    # registered.
+    for name in ("paged_state_checkpoint.py", "paged_state_checkpoint_scheduler.py"):
         src = (PLUGIN / name).read_text()
         assert "os.environ" not in src and "os.getenv" not in src, name
 
@@ -173,8 +174,10 @@ def test_registry_routes_by_config_and_by_kv_config(fake):
         G.adapter_for_kv_cache_config(NS(kv_cache_groups=[NS(layer_names=["x"])]))
         is None
     )
-    assert G.images_on(fake, _vcfg()) and not G.images_on(fake, _vcfg(prefix=False))
-    assert G.register_image_adapter(_FakeAdapter()) is fake
+    assert G.state_checkpoints_on(fake, _vcfg()) and not G.state_checkpoints_on(
+        fake, _vcfg(prefix=False)
+    )
+    assert G.register_state_checkpoint_adapter(_FakeAdapter()) is fake
 
 
 def test_other_models_pass_through_the_kv_config_hook(fake):
@@ -193,7 +196,7 @@ def test_other_models_pass_through_the_kv_config_hook(fake):
 def _groups(fake, k, block=BLOCK, page=1024):
     from vllm.v1.kv_cache_interface import MambaSpec
 
-    names = fake.image_layer_names(k)
+    names = fake.state_checkpoint_layer_names(k)
     proxy = NS(
         layer_names=[fake.proxy_layer_name],
         kv_cache_spec=NS(block_size=block, page_size_bytes=page),
@@ -224,18 +227,18 @@ def _groups(fake, k, block=BLOCK, page=1024):
 def test_group_check_takes_k_and_block_from_the_adapter(fake):
     sizing = fake.sizing(None)
     assert sizing.spec.units_per_checkpoint == 3
-    assert fake.image_layer_names(3) == [
-        f"model.layers.{i}.fake_image" for i in (1, 2, 3)
+    assert fake.state_checkpoint_layer_names(3) == [
+        f"model.layers.{i}.fake_state_checkpoint" for i in (1, 2, 3)
     ]
-    G.check_image_groups(_groups(fake, 3), fake, sizing)
+    G.check_state_checkpoint_groups(_groups(fake, 3), fake, sizing)
     with pytest.raises(RuntimeError, match="need k=3"):
-        G.check_image_groups(_groups(fake, 2), fake, sizing)
+        G.check_state_checkpoint_groups(_groups(fake, 2), fake, sizing)
     with pytest.raises(RuntimeError, match="block size 256"):
-        G.check_image_groups(_groups(fake, 3, block=128), fake, sizing)
+        G.check_state_checkpoint_groups(_groups(fake, 3, block=128), fake, sizing)
     apart = _groups(fake, 3)
     apart.kv_cache_tensors[2].offset = 100 * 1024
     with pytest.raises(RuntimeError, match="not at byte 0"):
-        G.check_image_groups(apart, fake, sizing)
+        G.check_state_checkpoint_groups(apart, fake, sizing)
 
 
 def test_kv_config_hook_aligns_and_withholds_slots(fake):
@@ -254,10 +257,10 @@ def test_kv_config_hook_aligns_and_withholds_slots(fake):
 
 
 @pytest.mark.parametrize("eagle", [True, False])
-def test_a_family_whose_draft_is_in_the_slot_runs_images_with_a_drafter(
+def test_a_family_whose_draft_is_in_the_slot_runs_state_checkpoints_with_a_drafter(
     fake, monkeypatch, eagle
 ):
-    monkeypatch.setattr(fake, "drafter_state_in_image", lambda vc: True)
+    monkeypatch.setattr(fake, "drafter_state_in_checkpoint", lambda vc: True)
     vc = _vcfg()
     vc.speculative_config = NS(use_eagle=lambda: eagle, disable_eagle_block_drop=False)
     specs = [{fake.proxy_layer_name: object()}]
@@ -268,15 +271,17 @@ def test_a_family_whose_draft_is_in_the_slot_runs_images_with_a_drafter(
     assert vc.speculative_config.disable_eagle_block_drop is eagle
 
 
-def test_images_refuse_a_drafter_the_family_does_not_keep_in_the_slot(
+def test_state_checkpoints_refuse_a_drafter_the_family_does_not_keep_in_the_slot(
     fake, monkeypatch
 ):
     # The capability is per drafter, not per family: only the drafter the
-    # family binds into the target's slot gets images (and the hit rule).
+    # family binds into the target's slot gets state checkpoints (and the hit rule).
     monkeypatch.setattr(
-        fake, "drafter_state_in_image", lambda vc: vc.speculative_config.method == "mtp"
+        fake,
+        "drafter_state_in_checkpoint",
+        lambda vc: vc.speculative_config.method == "mtp",
     )
-    monkeypatch.setattr(fake, "image_drafters", "method 'mtp'")
+    monkeypatch.setattr(fake, "state_checkpoint_drafters", "method 'mtp'")
     specs = [{fake.proxy_layer_name: object()}]
     for method in ("eagle3", "dspark", "ngram"):
         vc = _vcfg()
@@ -290,7 +295,7 @@ def test_images_refuse_a_drafter_the_family_does_not_keep_in_the_slot(
         assert "--no-enable-prefix-caching" in msg
         assert vc.speculative_config.disable_eagle_block_drop is False
         assert vc.cache_config.mamba_cache_mode == "none"
-        # Without prefix caching there are no images, and nothing to refuse.
+        # Without prefix caching there are no state checkpoints, and nothing to refuse.
         vc.cache_config.enable_prefix_caching = False
         G._kv_cache_configs_hook(lambda *a: [_groups(fake, 3)], vc, specs, 0)
         assert vc.speculative_config.disable_eagle_block_drop is False
@@ -311,25 +316,25 @@ def test_a_matching_model_without_the_proxy_layer_passes_through(fake):
 
 
 def test_placement_at_another_block_size():
-    p = ImagePlacement(interval=4096, demand=True, block=BLOCK)
+    p = StateCheckpointPlacement(interval=4096, demand=True, block=BLOCK)
     assert p.anchor(5000, 5000) == 4864
     assert p.cut(0, 5000, 5000, 0, 4864) == 4096
     assert p.cut(4096, 5000, 5000, 0, 4864) == 4864
     assert p.decode_keeps(4096 + 4096, 4096) and not p.decode_keeps(8192 + 128, 4096)
     with pytest.raises(TypeError):
-        ImagePlacement(interval=4096, demand=True)  # no block-size default
+        StateCheckpointPlacement(interval=4096, demand=True)  # no block-size default
 
 
 def test_step_order_and_one_store_per_plan(fake, monkeypatch):
     copier = _Copier()
-    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    worker = G.StateCheckpointWorker(fake, copier, [1, 2, 3])
     events = []
     md = NS(
         reset_slots={2},
-        image_restore_slots=[2],
-        image_restore_units=[(4, 5, 6)],
-        image_store_slots=[2],
-        image_store_units=[(7, 8, 9)],
+        state_checkpoint_restore_slots=[2],
+        state_checkpoint_restore_units=[(4, 5, 6)],
+        state_checkpoint_store_slots=[2],
+        state_checkpoint_store_units=[(7, 8, 9)],
     )
 
     def plan():
@@ -338,7 +343,7 @@ def test_step_order_and_one_store_per_plan(fake, monkeypatch):
     def reset(slots):
         events.append(("reset", sorted(slots), len(copier.calls)))
 
-    G.run_image_step(
+    G.run_state_checkpoint_step(
         worker, md, capturing=False, plan=plan, reset_fn=reset, name="Fake"
     )
     # Plan, reset, restore; this step's store waits for the forward.
@@ -346,13 +351,13 @@ def test_step_order_and_one_store_per_plan(fake, monkeypatch):
     assert events[1] == ("reset", [2], 0)
     assert copier.calls[0] == ("copies", [], [(2, (4, 5, 6))], 0)
     assert worker.pending_stores == ([2], [(7, 8, 9)])
-    host = NS(_atom_image_worker=worker)
-    G.flush_image_stores(host)
-    G.flush_image_stores(host)
+    host = NS(_atom_state_checkpoint_worker=worker)
+    G.flush_state_checkpoint_stores(host)
+    G.flush_state_checkpoint_stores(host)
     assert copier.calls[1:] == [("copies", [(2, (7, 8, 9))], [], 1)]
     # Capture path: nothing planned, nothing restored or stored.
     md2 = NS(reset_slots=set())
-    G.run_image_step(
+    G.run_state_checkpoint_step(
         worker, md2, capturing=True, plan=lambda: 1 / 0, reset_fn=reset, name="Fake"
     )
     assert len(copier.calls) == 2
@@ -362,9 +367,11 @@ def test_stores_run_once_right_after_the_runner_forward(fake):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     G._apply_runner_patches()
-    assert getattr(GPUModelRunner._model_forward, "_atom_state_image_patched", False)
+    assert getattr(
+        GPUModelRunner._model_forward, "_atom_state_checkpoint_patched", False
+    )
     copier = _Copier()
-    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    worker = G.StateCheckpointWorker(fake, copier, [1, 2, 3])
     calls = []
 
     class _Runner:
@@ -374,12 +381,14 @@ def test_stores_run_once_right_after_the_runner_forward(fake):
 
     runner = _Runner()
     before = G.store_counts()
-    G.register_image_worker(worker)
+    G.register_state_checkpoint_worker(worker)
     try:
         md = NS(
-            reset_slots=set(), image_store_slots=[3], image_store_units=[(10, 11, 12)]
+            reset_slots=set(),
+            state_checkpoint_store_slots=[3],
+            state_checkpoint_store_units=[(10, 11, 12)],
         )
-        G.run_image_step(
+        G.run_state_checkpoint_step(
             worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
         )
         assert copier.calls == [] and worker.pending_stores is not None
@@ -425,15 +434,17 @@ def test_with_a_drafter_stores_run_at_the_next_build_after_both_forwards(fake):
 
     G._apply_runner_patches()
     copier = _Copier()
-    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    worker = G.StateCheckpointWorker(fake, copier, [1, 2, 3])
     runner = _DraftRunner(copier, 3)
     before = G.store_counts()
-    G.register_image_worker(worker)
+    G.register_state_checkpoint_worker(worker)
     try:
         md = NS(
-            reset_slots=set(), image_store_slots=[3], image_store_units=[(10, 11, 12)]
+            reset_slots=set(),
+            state_checkpoint_store_slots=[3],
+            state_checkpoint_store_units=[(10, 11, 12)],
         )
-        G.run_image_step(
+        G.run_state_checkpoint_step(
             worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
         )
         GPUModelRunner._model_forward(runner, input_ids=None, positions=None)
@@ -441,7 +452,7 @@ def test_with_a_drafter_stores_run_at_the_next_build_after_both_forwards(fake):
         runner.draft()
         expected = copier.slots[3].clone()
         events = []
-        G.run_image_step(
+        G.run_state_checkpoint_step(
             worker,
             NS(reset_slots={3}),
             capturing=False,
@@ -471,19 +482,23 @@ def test_with_a_drafter_a_store_whose_forward_never_ran_is_still_refused(fake):
 
     G._apply_runner_patches()
     copier = _Copier()
-    worker = G.ImageWorker(fake, copier, [1, 2, 3])
+    worker = G.StateCheckpointWorker(fake, copier, [1, 2, 3])
     runner = _DraftRunner(copier, 2)
-    G.register_image_worker(worker)
+    G.register_state_checkpoint_worker(worker)
     try:
-        md = NS(reset_slots=set(), image_store_slots=[2], image_store_units=[(7, 8, 9)])
-        G.run_image_step(
+        md = NS(
+            reset_slots=set(),
+            state_checkpoint_store_slots=[2],
+            state_checkpoint_store_units=[(7, 8, 9)],
+        )
+        G.run_state_checkpoint_step(
             worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
         )
         # A forward from before this build (or a dummy run) marks nothing.
         assert not worker.forward_ran
         before = G.store_counts()
         with pytest.raises(RuntimeError, match="never ran"):
-            G.run_image_step(
+            G.run_state_checkpoint_step(
                 worker,
                 NS(reset_slots=set()),
                 capturing=False,
@@ -496,7 +511,7 @@ def test_with_a_drafter_a_store_whose_forward_never_ran_is_still_refused(fake):
         # A capture build never issues one, even after the forward ran.
         worker.pending_stores = ([2], [(7, 8, 9)])
         GPUModelRunner._model_forward(runner, input_ids=None, positions=None)
-        G.run_image_step(
+        G.run_state_checkpoint_step(
             worker,
             NS(reset_slots=set()),
             capturing=True,
@@ -529,7 +544,7 @@ def test_vllm_runs_the_drafter_between_the_target_forward_and_the_next_build():
 
 
 def test_a_store_never_runs_inside_a_capture(fake, monkeypatch):
-    worker = G.ImageWorker(fake, _Copier(), [1, 2, 3])
+    worker = G.StateCheckpointWorker(fake, _Copier(), [1, 2, 3])
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     G.flush_worker(worker)  # nothing pending: nothing to refuse
@@ -541,21 +556,25 @@ def test_a_store_never_runs_inside_a_capture(fake, monkeypatch):
 
 def test_a_store_whose_forward_never_ran_is_refused_not_copied(fake):
     """A build registers a store for its boundary (the scheduler has already
-    hashed the image blocks for it); the forward that would have advanced the
+    hashed the state checkpoint blocks for it); the forward that would have advanced the
     slot there never runs. The next build must not copy the slot, which still
     holds an earlier position's state, into those blocks."""
     copier = _Copier()
     copier.slots[2] = torch.randint(0, 256, (SLOT,), dtype=torch.uint8)
-    worker = G.ImageWorker(fake, copier, [1, 2, 3])
-    md = NS(reset_slots=set(), image_store_slots=[2], image_store_units=[(7, 8, 9)])
-    G.run_image_step(
+    worker = G.StateCheckpointWorker(fake, copier, [1, 2, 3])
+    md = NS(
+        reset_slots=set(),
+        state_checkpoint_store_slots=[2],
+        state_checkpoint_store_units=[(7, 8, 9)],
+    )
+    G.run_state_checkpoint_step(
         worker, md, capturing=False, plan=lambda: None, reset_fn=None, name="Fake"
     )
     units_before = copier.units.clone()
     before = G.store_counts()
     # No GPUModelRunner._model_forward here.
     with pytest.raises(RuntimeError, match="never ran"):
-        G.run_image_step(
+        G.run_state_checkpoint_step(
             worker,
             NS(reset_slots=set()),
             capturing=False,
@@ -571,15 +590,15 @@ def test_store_restore_round_trip(fake, monkeypatch):
     copier = _Copier()
     copier.slots[1] = torch.randint(0, 256, (SLOT,), dtype=torch.uint8)
     src = copier.slots[1].clone()
-    G.execute_image_stores(copier, [1], [(9, 3, 12)])
-    G.execute_image_restores(copier, [2], [(9, 3, 12)])
+    G.execute_state_checkpoint_stores(copier, [1], [(9, 3, 12)])
+    G.execute_state_checkpoint_restores(copier, [2], [(9, 3, 12)])
     assert torch.equal(copier.slots[2], src)
 
 
-def test_plan_refuses_an_unrestored_resume_without_images(monkeypatch):
+def test_plan_refuses_an_unrestored_resume_without_state_checkpoints(monkeypatch):
     md = NS()
     with pytest.raises(RuntimeError, match="Fake request"):
-        G.plan_image_ops(
+        G.plan_state_checkpoint_ops(
             None,
             md,
             rows=2,
@@ -591,7 +610,7 @@ def test_plan_refuses_an_unrestored_resume_without_images(monkeypatch):
             is_target=True,
             name="Fake",
         )
-    G.plan_image_ops(
+    G.plan_state_checkpoint_ops(
         None,
         md,
         rows=2,
@@ -603,7 +622,9 @@ def test_plan_refuses_an_unrestored_resume_without_images(monkeypatch):
         is_target=False,
         name="Fake",
     )
-    assert md.image_restore_rows == [] and md.image_store_rows == []
+    assert (
+        md.state_checkpoint_restore_rows == [] and md.state_checkpoint_store_rows == []
+    )
 
 
 def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
@@ -615,9 +636,9 @@ def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
         "DeepseekV4ForCausalLM",
         NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X"),
     )
-    from atom.plugin.vllm.deepseek_v4_image import (
-        register_v4_image_adapter,
-        v4_image_sizing,
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        register_v4_state_checkpoint_adapter,
+        v4_state_checkpoint_sizing,
     )
 
     ratios = [0, 0, 4, 128, 4, 128, 4, 0]
@@ -638,7 +659,7 @@ def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
         cache_config=NS(cache_dtype="fp8", enable_prefix_caching=True),
         speculative_config=None,
     )
-    a = register_v4_image_adapter()
+    a = register_v4_state_checkpoint_adapter()
     s = a.sizing(vc)
     assert isinstance(s.spec, PagedStateCheckpointSpec)
     assert (
@@ -648,4 +669,4 @@ def test_v4_adapter_spec_is_native_and_k_follows_it(monkeypatch):
         s.spec.layout_id,
     ) == (s.page_unit_bytes, s.slot_bytes, s.image_bytes, s.layout_id)
     assert s.k == s.spec.units_per_checkpoint == -(-s.image_bytes // s.page_unit_bytes)
-    assert a.block_size == 128 and a.matches(vc) and s == v4_image_sizing(vc)
+    assert a.block_size == 128 and a.matches(vc) and s == v4_state_checkpoint_sizing(vc)

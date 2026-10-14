@@ -1,14 +1,14 @@
-"""Where checkpoint images go, on vLLM's scheduler (EngineCore side).
+"""Where state checkpoints go, on vLLM's scheduler (EngineCore side).
 
-A slot only holds the state of the position its last forward ended at, so an image
-can only be taken at a forward's end. Images go where native ATOM puts them
-(``ImagePlacement``): every ``state_checkpoint_interval_tokens`` rung, the
-prompt-end anchor and a demand rung, with prefill cut so a forward ends there and
-nowhere else, and in generation native's spacing rule; nothing else. A request
-holds at most two images' blocks. The worker stores exactly where the scheduler
-says (``scheduler_output.atom_image_stores``).
+A slot only holds the state of the position its last forward ended at, so a state
+checkpoint can only be taken at a forward's end. State checkpoints go where native ATOM
+puts them (``StateCheckpointPlacement``): every ``state_checkpoint_interval_tokens``
+rung, the prompt-end anchor and a demand rung, with prefill cut so a forward ends there
+and nowhere else, and in generation native's spacing rule; nothing else. A request
+holds at most two state checkpoints' blocks. The worker stores exactly where the
+scheduler says (``scheduler_output.atom_state_checkpoint_stores``).
 
-Model-agnostic: the family's adapter (``paged_state_image``) supplies the block
+Model-agnostic: the family's adapter (``paged_state_checkpoint``) supplies the block
 size, the placement defaults and the layer names that identify the groups.
 """
 
@@ -20,20 +20,21 @@ from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import resolve_block_hashes
 
-from atom.plugin.vllm.paged_state_image import adapter_for_kv_cache_config
+from atom.plugin.vllm.paged_state_checkpoint import adapter_for_kv_cache_config
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
-# Blocks a running request holds in each image group at its peak: the running
+# Blocks a running request holds in each state checkpoint group at its peak: the running
 # block and the previous step's (whose store may still be in flight). vLLM's
-# align mode allocates them whether or not an image is ever published there.
-IMAGE_BLOCKS_PER_GROUP = 2
+# align mode allocates them whether or not a state checkpoint is ever published there.
+STATE_CHECKPOINT_BLOCKS_PER_GROUP = 2
 
 
 @dataclass(frozen=True)
-class ImagePlacement:
-    """Where an image is kept, and where prefill is cut so a forward ends there.
+class StateCheckpointPlacement:
+    """Where a state checkpoint is kept, and where prefill is cut so a forward ends
+    there.
 
     Line for line native ``BlockManager.checkpoint_limit``, ``_record_checkpoint_end``,
     ``_record_checkpoint_demand``, ``checkpoint_cut`` and
@@ -41,10 +42,10 @@ class ImagePlacement:
     readable mid-step), at the family's block size; generation uses the
     unaimed spacing rule (``decode_keeps``).
 
-    ``interval``: >0 a rung every N tokens, 0 no image is published (so no prefix
-    hit: vLLM reports one only with every image group cached; the groups still
-    allocate working blocks), -1 no rungs but the anchor and the demand rung still
-    place images (native semantics).
+    ``interval``: >0 a rung every N tokens, 0 no state checkpoint is published (so no
+    prefix hit: vLLM reports one only with every state checkpoint group cached; the
+    groups still allocate working blocks), -1 no rungs but the anchor and the demand
+    rung still place state checkpoints (native semantics).
     """
 
     interval: int
@@ -54,7 +55,7 @@ class ImagePlacement:
     @classmethod
     def from_env(
         cls, defaults: tuple[int, bool], block: int, **kwargs
-    ) -> ImagePlacement:
+    ) -> StateCheckpointPlacement:
         interval, demand = defaults
         if envs.ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS is not None:
             interval = envs.ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS
@@ -104,7 +105,8 @@ class ImagePlacement:
         return min(candidates) if candidates else 0
 
     def keeps(self, pos: int, num_prompt_tokens: int, demand: int, anchor: int) -> bool:
-        """Whether a prefill forward ending at ``pos`` leaves an image there."""
+        """Whether a prefill forward ending at ``pos`` leaves a state checkpoint
+        there."""
         if self.interval == 0 or pos <= 0 or pos > num_prompt_tokens:
             return False
         on_grid = self.interval > 0 and pos % self.interval == 0
@@ -120,8 +122,8 @@ class ImagePlacement:
             and pos - last_checkpoint_pos >= self.interval
         )
 
-    def images_per_request(self) -> int:
-        """Images one request holds at once: the current one and the one it
+    def state_checkpoints_per_request(self) -> int:
+        """State checkpoints one request holds at once: the current one and the one it
         replaces; none when checkpointing is off."""
         return 0 if self.interval == 0 else 2
 
@@ -133,35 +135,40 @@ def request_marks(request) -> tuple[int, int]:
     )
 
 
-class SchedulerImages:
+class SchedulerStateCheckpoints:
     """Native placement bound to one vLLM ``Scheduler`` (EngineCore side).
 
-    Three things have to agree for an image to be usable: where prefill is cut
-    (``chunk_len``), which image block vLLM files under a prefix hash
-    (``cache_image_blocks``), and where the worker copies the slot out
-    (``scheduler_output.atom_image_stores``). All three read ``placement``.
+    Three things have to agree for a state checkpoint to be usable: where prefill is cut
+    (``chunk_len``), which state checkpoint block vLLM files under a prefix hash
+    (``cache_state_checkpoint_blocks``), and where the worker copies the slot out
+    (``scheduler_output.atom_state_checkpoint_stores``). All three read ``placement``.
     """
 
     #: Family name in errors (set from the adapter).
     name = "paged-state"
 
     def __init__(
-        self, scheduler, placement: ImagePlacement, proxy_gid, image_gids, name=None
+        self,
+        scheduler,
+        placement: StateCheckpointPlacement,
+        proxy_gid,
+        state_checkpoint_gids,
+        name=None,
     ):
         if name is not None:
             self.name = name
         self.scheduler = scheduler
         self.placement = placement
         self.proxy_gid = proxy_gid
-        self.image_gids = list(image_gids)
-        self.k = len(self.image_gids)
+        self.state_checkpoint_gids = list(state_checkpoint_gids)
+        self.k = len(self.state_checkpoint_gids)
         kvm = scheduler.kv_cache_manager
         self.coordinator = kvm.coordinator
         self.block_pool = kvm.block_pool
         self.cache_end = -1
         # req_id -> (boundary, [(group id, block)]) hashed during this schedule().
         self.step_keeps: dict[str, tuple[int, list]] = {}
-        # req_id -> last position a native-placed image was kept at (native
+        # req_id -> last position a native-placed state checkpoint was kept at (native
         # ``Sequence.last_checkpoint_pos``: set on a keep, cleared on preemption).
         self.last_ckpt: dict[str, int] = {}
         # req_id -> decode step end on a block boundary, from this schedule().
@@ -174,7 +181,8 @@ class SchedulerImages:
         # req_id -> first block index worth scanning (everything below is null).
         self._scan_from: dict[str, int] = {}
         # req_id -> block indices the release pass keeps this step (computed on
-        # the first image group, applied to all k; they allocate in lockstep).
+        # the first state checkpoint group, applied to all k; they allocate in
+        # lockstep).
         self._release_keep: dict[str, tuple[int, set]] = {}
         self._release_step = 0
         # Speculative decode (MTP): a step commits 1 + accepted tokens, known
@@ -194,18 +202,18 @@ class SchedulerImages:
         self.landing: dict[str, tuple] = {}
         self.awaiting: dict[str, tuple] = {}
 
-        self.check_blocks = envs.ATOM_STATE_IMAGE_CHECK_BLOCKS
+        self.check_blocks = envs.ATOM_STATE_CHECKPOINT_CHECK_BLOCKS
         self.counters = {
             "chunks_cut_for_rung": 0,
             "chunks_cut_for_anchor": 0,
             "chunks_cut_for_demand": 0,
-            "images_hashed": 0,
+            "state_checkpoints_hashed": 0,
             "demands_recorded": 0,
             "demands_declined_no_room": 0,
             "stores_unhashed": 0,
             "decode_keeps": 0,
-            "duplicate_images_skipped": 0,
-            "max_image_blocks_per_request": 0,
+            "duplicate_state_checkpoints_skipped": 0,
+            "max_state_checkpoint_blocks_per_request": 0,
             "pending_hashes_dropped": 0,
             "decode_keeps_truncated": 0,
             "decode_keeps_not_continued": 0,
@@ -218,7 +226,7 @@ class SchedulerImages:
             int(request.num_prompt_tokens), int(request.num_tokens)
         )
         # The proxy-only hit: vLLM reports it as the shared-prefix junction
-        # exactly when the image groups cut the hit short.
+        # exactly when the state checkpoint groups cut the hit short.
         compressed_hit = shared_prefix_boundary or hit
         has_room = True
         if p.demand and p.interval != 0 and compressed_hit > hit:
@@ -282,8 +290,8 @@ class SchedulerImages:
                 self.counters["chunks_cut_for_anchor"] += 1
         return target - start
 
-    # -- which image block gets a prefix hash ---------------------------------
-    def cache_image_blocks(self, mgr, request, num_tokens: int) -> None:
+    # -- which state checkpoint block gets a prefix hash ----------------------
+    def cache_state_checkpoint_blocks(self, mgr, request, num_tokens: int) -> None:
         rid = request.request_id
         bs = mgr.block_size
         num_cached = mgr.num_cached_block.get(rid, 0)
@@ -301,8 +309,9 @@ class SchedulerImages:
             mask[pend - num_cached] = True
         if decision is not None and blocks[num_full - 1].is_null:
             raise RuntimeError(
-                f"{self.name} image for {rid} at {end}: the running image block "
-                "is null; vLLM align did not allocate where the forward ends"
+                f"{self.name} state checkpoint for {rid} at {end}: the running state "
+                "checkpoint block is null; vLLM align did not allocate where the "
+                "forward ends"
             )
         if keep:
             mask[-1] = True
@@ -320,7 +329,7 @@ class SchedulerImages:
             blk = blocks[pend]
             if blk.block_hash is not None:
                 mgr.cached_blocks_this_step.add(blk.block_hash)
-            if mgr.kv_cache_group_id == self.image_gids[-1]:
+            if mgr.kv_cache_group_id == self.state_checkpoint_gids[-1]:
                 self.pending_hash.pop(rid, None)
         if decision is not None:
             blk = blocks[num_full - 1]
@@ -331,7 +340,7 @@ class SchedulerImages:
 
     def _decide(self, request, end: int):
         """Whether a prefill forward ending at ``end`` keeps a native-placed
-        image ("hash") or nothing (None). Decided once per request and step
+        state checkpoint ("hash") or nothing (None). Decided once per request and step
         (all k groups ask). Decode steps are decided in ``take_store_plan``.
         """
         memo = getattr(request, "_atom_img_decided", None)
@@ -345,8 +354,8 @@ class SchedulerImages:
             demand, anchor = request_marks(request)
             if p.keeps(end, int(request.num_prompt_tokens), demand, anchor):
                 self.last_ckpt[rid] = end
-                if self._image_cached(request, end // p.block - 1):
-                    self.counters["duplicate_images_skipped"] += 1
+                if self._state_checkpoint_cached(request, end // p.block - 1):
+                    self.counters["duplicate_state_checkpoints_skipped"] += 1
                 else:
                     decision = "hash"
         if decision is not None and self.events is not None:
@@ -354,21 +363,22 @@ class SchedulerImages:
         request._atom_img_decided = (self._release_step, end, decision)
         return decision
 
-    # -- per-request image blocks: at most two images -------------------------
-    def release_image_blocks(self, mgr, request_id: str) -> None:
-        """Replaces vLLM align's ``remove_skipped_blocks`` for the image groups.
+    # -- per-request state checkpoint blocks: at most two state checkpoints ---
+    def release_state_checkpoint_blocks(self, mgr, request_id: str) -> None:
+        """Replaces vLLM align's ``remove_skipped_blocks`` for the state checkpoint
+        groups.
 
         Keeps the last non-null block (the previous step's running block, whose
-        store may still be in flight) and frees the rest. A hashed image stays in
-        the prefix cache once freed. Called before every allocation, so after it
-        a request holds at most two images, with or without async scheduling
-        (vLLM's own pass lags by the in-flight step and can leave a third behind
-        until the request ends).
+        store may still be in flight) and frees the rest. A hashed state checkpoint
+        stays in the prefix cache once freed. Called before every allocation, so after
+        it a request holds at most two state checkpoints, with or without async
+        scheduling (vLLM's own pass lags by the in-flight step and can leave a third
+        behind until the request ends).
         """
         blocks = mgr.req_to_blocks.get(request_id)
         if not blocks:
             return
-        if mgr.kv_cache_group_id == self.image_gids[0]:
+        if mgr.kv_cache_group_id == self.state_checkpoint_gids[0]:
             start = self._scan_from.get(request_id, 0)
             held = [i for i in range(start, len(blocks)) if not blocks[i].is_null]
             keep = {held[-1]} if held else set()
@@ -420,29 +430,30 @@ class SchedulerImages:
         self._release_keep.pop(rid, None)
         request._atom_img_decided = None
 
-    def image_blocks_held(self, request_id: str) -> int:
+    def state_checkpoint_blocks_held(self, request_id: str) -> int:
         n = 0
         start = self._scan_from.get(request_id, 0)
-        for gid in self.image_gids:
+        for gid in self.state_checkpoint_gids:
             blocks = self.coordinator.single_type_managers[gid].req_to_blocks.get(
                 request_id, ()
             )
             n += sum(1 for b in blocks[start:] if not b.is_null)
         return n
 
-    def check_image_blocks(self) -> None:
-        """Instrumented runs: no request may hold more than two blocks per image
-        group (also with checkpointing off, where none is published)."""
-        limit = IMAGE_BLOCKS_PER_GROUP * self.k
+    def check_state_checkpoint_blocks(self) -> None:
+        """Instrumented runs: no request may hold more than two blocks per state
+        checkpoint group (also with checkpointing off, where none is published)."""
+        limit = STATE_CHECKPOINT_BLOCKS_PER_GROUP * self.k
         for req in self.scheduler.running:
-            n = self.image_blocks_held(req.request_id)
-            self.counters["max_image_blocks_per_request"] = max(
-                self.counters["max_image_blocks_per_request"], n
+            n = self.state_checkpoint_blocks_held(req.request_id)
+            self.counters["max_state_checkpoint_blocks_per_request"] = max(
+                self.counters["max_state_checkpoint_blocks_per_request"], n
             )
             if n > limit:
                 raise RuntimeError(
-                    f"{self.name} request {req.request_id} holds {n} image blocks, "
-                    f"more than {limit} ({IMAGE_BLOCKS_PER_GROUP} x k={self.k})"
+                    f"{self.name} request {req.request_id} holds {n} state checkpoint "
+                    f"blocks, more than {limit} "
+                    f"({STATE_CHECKPOINT_BLOCKS_PER_GROUP} x k={self.k})"
                 )
 
     # -- the worker's store plan ----------------------------------------------
@@ -459,13 +470,13 @@ class SchedulerImages:
                 and len(blocks) == self.k
             ):
                 plan[rid] = end
-                self.counters["images_hashed"] += 1
+                self.counters["state_checkpoints_hashed"] += 1
                 continue
             # Hashed for a forward that is not going to run: take the hash back.
             self.block_pool.evict_blocks({b.block_id for _g, b in blocks})
             self.counters["stores_unhashed"] += 1
             logger.warning(
-                "ATOM %s: image for %s at %d hashed but not scheduled; "
+                "ATOM %s: state checkpoint for %s at %d hashed but not scheduled; "
                 "unhashed its %d blocks",
                 self.name,
                 rid,
@@ -491,16 +502,16 @@ class SchedulerImages:
     # -- decode keeps under speculative decode ---------------------------------
     def _take_decode_candidates(self, scheduler_output) -> None:
         """This step's decode rows and their spacing thresholds go to the worker,
-        which records the image blocks of every boundary the step could commit
-        to. Decisions waiting for this step (it was not scheduled yet when the
+        which records the state checkpoint blocks of every boundary the step could
+        commit to. Decisions waiting for this step (it was not scheduled yet when the
         previous step's output landed) are taken now."""
         scheduled = scheduler_output.num_scheduled_tokens
         rows, self.decode_rows = self.decode_rows, {}
-        scheduler_output.atom_image_decode_candidates = {
+        scheduler_output.atom_state_checkpoint_decode_candidates = {
             rid: thr for rid, thr in rows.items() if rid in scheduled
         }
         self.step_id += 1
-        scheduler_output.atom_image_step = self.step_id
+        scheduler_output.atom_state_checkpoint_step = self.step_id
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         resumed = set(getattr(cached, "resumed_req_ids", None) or ())
         new = {r.req_id for r in scheduler_output.scheduled_new_reqs}
@@ -519,8 +530,10 @@ class SchedulerImages:
         sampled, before any stop truncation). Native ``hash_decode_blocks``
         keeps only there, and only on an eligible boundary."""
         self.landing = {}
-        cands = getattr(scheduler_output, "atom_image_decode_candidates", None)
-        step = getattr(scheduler_output, "atom_image_step", None)
+        cands = getattr(
+            scheduler_output, "atom_state_checkpoint_decode_candidates", None
+        )
+        step = getattr(scheduler_output, "atom_state_checkpoint_step", None)
         if not cands or step is None:
             return
         index = model_runner_output.req_id_to_index
@@ -563,8 +576,8 @@ class SchedulerImages:
         self._keep_decode(request, end)
 
     def _undecided_blocks(self, request_id: str, held) -> set:
-        """Image blocks a decode keep may still be decided on or published in:
-        a pending hash, and boundaries at or past the committed position and
+        """State checkpoint blocks a decode keep may still be decided on or published
+        in: a pending hash, and boundaries at or past the committed position and
         the spacing threshold (the next step's output decides them)."""
         out = set()
         pend = self.pending_hash.get(request_id)
@@ -582,31 +595,31 @@ class SchedulerImages:
         return out
 
     def _keep_decode(self, request, end: int) -> None:
-        """A scheduled decode step on which native's unaimed rule keeps an image
-        (native keeps it on the request's last step too: ``_checkpoint_room``
+        """A scheduled decode step on which native's unaimed rule keeps a state
+        checkpoint (native keeps it on the request's last step too: ``_checkpoint_room``
         is 0 there and a PAGE checkpoint's ``successor_room`` is 0). Hashed as
         soon as the block's prefix hash exists."""
         rid = request.request_id
         idx = end // self.placement.block - 1
-        for gid in self.image_gids:
+        for gid in self.state_checkpoint_gids:
             blocks = self.coordinator.single_type_managers[gid].req_to_blocks.get(
                 rid, []
             )
             if idx >= len(blocks) or blocks[idx].is_null:
                 raise RuntimeError(
-                    f"{self.name} decode image for {rid} at {end}: no running image "
-                    "block there"
+                    f"{self.name} decode state checkpoint for {rid} at {end}: no "
+                    "running state checkpoint block there"
                 )
         self.last_ckpt[rid] = end
         self._hash_or_defer(request, idx)
         self.counters["decode_keeps"] += 1
-        self.counters["images_hashed"] += 1
+        self.counters["state_checkpoints_hashed"] += 1
         if self.events is not None:
             self.events.append(("hash", rid, end))
 
-    def _image_cached(self, request, idx: int) -> bool:
-        """Whether this boundary already has a whole image (native skips a store
-        whose prefix hash is already present or pending: `take_checkpoint_ops`).
+    def _state_checkpoint_cached(self, request, idx: int) -> bool:
+        """Whether this boundary already has a whole state checkpoint (native skips a
+        store whose prefix hash is already present or pending: `take_checkpoint_ops`).
 
         vLLM evicts block by block, so a boundary can have lost some groups'
         blocks; it is stored again then, and a later hit may take some groups
@@ -616,11 +629,12 @@ class SchedulerImages:
         if len(hashes) <= idx:
             return False
         return (
-            self.block_pool.get_cached_block(hashes[idx], self.image_gids) is not None
+            self.block_pool.get_cached_block(hashes[idx], self.state_checkpoint_gids)
+            is not None
         )
 
     def _boundary_hashes(self, request):
-        """The request's prefix hashes at the image block size (vLLM computes
+        """The request's prefix hashes at the state checkpoint block size (vLLM computes
         them at ``hash_block_size``, which may be finer)."""
         return resolve_block_hashes(
             request.block_hashes, self.block_pool.hash_block_size, self.placement.block
@@ -631,7 +645,7 @@ class SchedulerImages:
 
     def _hash_or_defer(self, request, idx: int) -> None:
         rid = request.request_id
-        mgr0 = self.coordinator.single_type_managers[self.image_gids[0]]
+        mgr0 = self.coordinator.single_type_managers[self.state_checkpoint_gids[0]]
         if mgr0.num_cached_block.get(rid, 0) > idx and self._has_boundary_hash(
             request, idx
         ):
@@ -642,16 +656,17 @@ class SchedulerImages:
     def _hash_block(self, request, idx: int) -> bool:
         rid = request.request_id
         hashed = False
-        if self._image_cached(request, idx):
-            self.counters["duplicate_images_skipped"] += 1
+        if self._state_checkpoint_cached(request, idx):
+            self.counters["duplicate_state_checkpoints_skipped"] += 1
             return False
-        for gid in self.image_gids:
+        for gid in self.state_checkpoint_gids:
             mgr = self.coordinator.single_type_managers[gid]
             blocks = mgr.req_to_blocks.get(rid, [])
             if idx >= len(blocks) or blocks[idx].is_null:
                 raise RuntimeError(
-                    f"{self.name} image of {rid} at {(idx + 1) * self.placement.block} "
-                    "is no longer held; the release pass dropped it"
+                    f"{self.name} state checkpoint of {rid} at "
+                    f"{(idx + 1) * self.placement.block} is no longer held; the "
+                    "release pass dropped it"
                 )
             if blocks[idx].block_hash is not None:
                 continue
@@ -668,17 +683,17 @@ class SchedulerImages:
         return hashed
 
 
-def find_image_groups(kv_cache_config, adapter):
-    proxy, images = None, []
+def find_state_checkpoint_groups(kv_cache_config, adapter):
+    proxy, state_checkpoints = None, []
     for gid, g in enumerate(kv_cache_config.kv_cache_groups):
         if adapter.proxy_layer_name in g.layer_names:
             proxy = gid
-        elif any(adapter.is_image_layer(n) for n in g.layer_names):
-            images.append(gid)
-    return proxy, images
+        elif any(adapter.is_state_checkpoint_layer(n) for n in g.layer_names):
+            state_checkpoints.append(gid)
+    return proxy, state_checkpoints
 
 
-def bind_scheduler_images(scheduler) -> SchedulerImages | None:
+def bind_scheduler_state_checkpoints(scheduler) -> SchedulerStateCheckpoints | None:
     """Attach native placement to a prefix-caching scheduler of a registered
     model family; else None."""
     kvm = getattr(scheduler, "kv_cache_manager", None)
@@ -688,13 +703,15 @@ def bind_scheduler_images(scheduler) -> SchedulerImages | None:
     adapter = adapter_for_kv_cache_config(cfg)
     if adapter is None:
         return None
-    proxy, images = find_image_groups(cfg, adapter)
-    if proxy is None or not images:
+    proxy, state_checkpoints = find_state_checkpoint_groups(cfg, adapter)
+    if proxy is None or not state_checkpoints:
         return None
-    placement = ImagePlacement.from_env(
+    placement = StateCheckpointPlacement.from_env(
         adapter.checkpoint_defaults(), adapter.block_size
     )
-    st = SchedulerImages(scheduler, placement, proxy, images, name=adapter.name)
+    st = SchedulerStateCheckpoints(
+        scheduler, placement, proxy, state_checkpoints, name=adapter.name
+    )
 
     orig_gcb = kvm.get_computed_blocks
 
@@ -716,10 +733,10 @@ def bind_scheduler_images(scheduler) -> SchedulerImages | None:
             st.cache_end = -1
 
     coordinator.cache_blocks = coordinator_cache_blocks
-    for gid in images:
+    for gid in state_checkpoints:
         mgr = coordinator.single_type_managers[gid]
 
-        def image_cache_blocks(
+        def state_checkpoint_cache_blocks(
             request,
             num_tokens,
             retention_interval=None,
@@ -727,16 +744,16 @@ def bind_scheduler_images(scheduler) -> SchedulerImages | None:
             replay_boundaries=(),
             _m=mgr,
         ):
-            st.cache_image_blocks(_m, request, num_tokens)
+            st.cache_state_checkpoint_blocks(_m, request, num_tokens)
 
-        mgr.cache_blocks = image_cache_blocks
+        mgr.cache_blocks = state_checkpoint_cache_blocks
 
-        def image_remove_skipped_blocks(
+        def state_checkpoint_remove_skipped_blocks(
             request_id, processed_computed_tokens, num_prompt_tokens=None, _m=mgr
         ):
-            st.release_image_blocks(_m, request_id)
+            st.release_state_checkpoint_blocks(_m, request_id)
 
-        mgr.remove_skipped_blocks = image_remove_skipped_blocks
+        mgr.remove_skipped_blocks = state_checkpoint_remove_skipped_blocks
 
     orig_rsb = coordinator.remove_skipped_blocks
 
@@ -755,15 +772,15 @@ def bind_scheduler_images(scheduler) -> SchedulerImages | None:
 
         setattr(kvm, name, wrapped_free)
     logger.info(
-        "ATOM %s image placement bound to the scheduler (%s): "
+        "ATOM %s state checkpoint placement bound to the scheduler (%s): "
         "state_checkpoint_interval_tokens=%d state_checkpoint_demand=%s "
-        "proxy_group=%d image_groups=%s image_block_check=%s",
+        "proxy_group=%d state_checkpoint_groups=%s state_checkpoint_block_check=%s",
         adapter.name,
         type(scheduler).__name__,
         st.placement.interval,
         st.placement.demand,
         proxy,
-        images,
+        state_checkpoints,
         st.check_blocks,
     )
     return st
@@ -772,7 +789,7 @@ def bind_scheduler_images(scheduler) -> SchedulerImages | None:
 def apply_scheduler_patches() -> bool:
     from vllm.v1.core.sched.scheduler import Scheduler
 
-    if getattr(Scheduler.__init__, "_atom_state_image_patched", False):
+    if getattr(Scheduler.__init__, "_atom_state_checkpoint_patched", False):
         return False
     orig_init = Scheduler.__init__
     orig_split = Scheduler._mamba_block_aligned_split
@@ -781,7 +798,7 @@ def apply_scheduler_patches() -> bool:
     @functools.wraps(orig_init)
     def __init__(self, *args, **kwargs):
         orig_init(self, *args, **kwargs)
-        self._atom_state_images = bind_scheduler_images(self)
+        self._atom_state_checkpoints = bind_scheduler_state_checkpoints(self)
 
     @functools.wraps(orig_split)
     def _mamba_block_aligned_split(
@@ -791,7 +808,7 @@ def apply_scheduler_patches() -> bool:
         num_new_local_computed_tokens=0,
         num_external_computed_tokens=0,
     ):
-        st = getattr(self, "_atom_state_images", None)
+        st = getattr(self, "_atom_state_checkpoints", None)
         if st is None:
             return orig_split(
                 self,
@@ -810,18 +827,18 @@ def apply_scheduler_patches() -> bool:
     @functools.wraps(orig_schedule)
     def schedule(self, *args, **kwargs):
         out = orig_schedule(self, *args, **kwargs)
-        st = getattr(self, "_atom_state_images", None)
+        st = getattr(self, "_atom_state_checkpoints", None)
         if st is not None:
-            out.atom_image_stores = st.take_store_plan(out)
+            out.atom_state_checkpoint_stores = st.take_store_plan(out)
             if st.check_blocks:
-                st.check_image_blocks()
+                st.check_state_checkpoint_blocks()
         return out
 
     orig_update = Scheduler.update_from_output
 
     @functools.wraps(orig_update)
     def update_from_output(self, scheduler_output, model_runner_output):
-        st = getattr(self, "_atom_state_images", None)
+        st = getattr(self, "_atom_state_checkpoints", None)
         if st is None or not st.spec:
             return orig_update(self, scheduler_output, model_runner_output)
         st.on_outputs(scheduler_output, model_runner_output)
@@ -833,7 +850,7 @@ def apply_scheduler_patches() -> bool:
         st.after_outputs()
         return out
 
-    __init__._atom_state_image_patched = True
+    __init__._atom_state_checkpoint_patched = True
     Scheduler.__init__ = __init__
     Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
     Scheduler.schedule = schedule

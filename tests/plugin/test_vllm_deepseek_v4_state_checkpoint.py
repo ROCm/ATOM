@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""DeepSeek-V4 prefix images on the vLLM plugin: slots, sizing, round trip."""
+"""DeepSeek-V4 prefix state checkpoints on the vLLM plugin: slots, sizing, round
+trip."""
 
 from types import SimpleNamespace as NS
 
@@ -21,17 +22,17 @@ from atom.plugin.vllm.deepseek_v4_bridge import (
 from atom.plugin.vllm.deepseek_v4_bridge import (
     _V4StateSlotAllocator as StateSlotAllocator,
 )
-from atom.plugin.vllm.deepseek_v4_image import (
-    AtomDeepseekV4ImageLayer,
-    V4ImagePlacement,
-    deepseek_v4_image_layer_names,
-    deepseek_v4_image_state_copy_funcs,
-    make_v4_image_copier,
-    v4_image_sizing,
+from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+    AtomDeepseekV4StateCheckpointLayer,
+    V4StateCheckpointPlacement,
+    deepseek_v4_state_checkpoint_copy_funcs,
+    deepseek_v4_state_checkpoint_layer_names,
+    make_v4_state_checkpoint_copier,
+    v4_state_checkpoint_sizing,
 )
-from atom.plugin.vllm.paged_state_image import (
-    execute_image_restores,
-    execute_image_stores,
+from atom.plugin.vllm.paged_state_checkpoint import (
+    execute_state_checkpoint_restores,
+    execute_state_checkpoint_stores,
 )
 
 RATIOS = [0, 0, 4, 128, 4, 128, 4, 0]
@@ -70,10 +71,12 @@ def _hook_vcfg(arch, ratios, *, prefix=True, spec=None):
 
 
 def _through_hook(vc, specs):
-    from atom.plugin.vllm import paged_state_image as G
-    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
+    from atom.plugin.vllm import paged_state_checkpoint as G
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        register_v4_state_checkpoint_adapter,
+    )
 
-    register_v4_image_adapter()
+    register_v4_state_checkpoint_adapter()
     sentinel, called = [object()], []
 
     def original(vc_, specs_, mem):
@@ -94,7 +97,7 @@ def test_vllms_own_v41_is_left_to_vllm(prefix):
 
 def test_v4_served_by_vllm_itself_is_left_to_vllm():
     # Without the plugin's registration the registry resolves V4 to vLLM.
-    from atom.plugin.vllm.deepseek_v4_image import is_atom_deepseek_v4_config
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import is_atom_deepseek_v4_config
 
     vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=NS(num_speculative_tokens=1))
     assert not is_atom_deepseek_v4_config(vc)
@@ -106,7 +109,7 @@ def test_v4_served_by_vllm_itself_is_left_to_vllm():
 def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
     from vllm.model_executor.models.registry import ModelRegistry
 
-    from atom.plugin.vllm.deepseek_v4_image import is_atom_deepseek_v4_config
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import is_atom_deepseek_v4_config
 
     atom = NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X")
     monkeypatch.setitem(ModelRegistry.models, "DeepseekV4ForCausalLM", atom)
@@ -118,13 +121,15 @@ def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
     vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=NS(num_speculative_tokens=1))
     out, sentinel, _ = _through_hook(vc, [{"model.layers.0.attn": object()}])
     assert out is sentinel and vc.cache_config.mamba_cache_mode == "none"
-    # With the proxy: images on, and with MTP too, since the draft's ring is in
-    # the target's slot: native's hit rule (vLLM's own drop switch) and align.
-    from atom.plugin.vllm import paged_state_image as G
+    # With the proxy: state checkpoints on, and with MTP too, since the draft's ring is
+    # in the target's slot: native's hit rule (vLLM's own drop switch) and align.
+    from atom.plugin.vllm import paged_state_checkpoint as G
     from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
-    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        register_v4_state_checkpoint_adapter,
+    )
 
-    register_v4_image_adapter()
+    register_v4_state_checkpoint_adapter()
     vc.speculative_config = NS(
         method="mtp",
         draft_model_config=NS(architectures=["DeepSeekV4MTPModel"]),
@@ -143,11 +148,13 @@ def test_atoms_v4_is_matched_only_by_exact_arch_and_registry(monkeypatch):
 def atom_v4(monkeypatch):
     from vllm.model_executor.models.registry import ModelRegistry
 
-    from atom.plugin.vllm.deepseek_v4_image import register_v4_image_adapter
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        register_v4_state_checkpoint_adapter,
+    )
 
     atom = NS(module_name="atom.plugin.vllm.model_wrapper", class_name="X")
     monkeypatch.setitem(ModelRegistry.models, "DeepseekV4ForCausalLM", atom)
-    register_v4_image_adapter()
+    register_v4_state_checkpoint_adapter()
 
 
 @pytest.fixture(scope="module")
@@ -204,7 +211,7 @@ def _real_spec(target, method):
 
 
 def _v4_hook(vc):
-    from atom.plugin.vllm import paged_state_image as G
+    from atom.plugin.vllm import paged_state_checkpoint as G
     from atom.plugin.vllm.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
 
     return G._kv_cache_configs_hook(
@@ -214,7 +221,7 @@ def _v4_hook(vc):
 
 @pytest.mark.parametrize("method", ["mtp", "deepseek_mtp"])
 def test_v4_mtp_is_the_drafter_bound_into_the_targets_slot(atom_v4, v4_target, method):
-    from atom.plugin.vllm.deepseek_v4_image import v4_drafter_in_target_slot
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_drafter_in_target_slot
 
     spec = _real_spec(v4_target, method)
     # vLLM normalizes every MTP spelling; the V4 target gets the V4 MTP draft,
@@ -251,23 +258,23 @@ def _drafters(v4_target):
     ]
 
 
-def test_v4_images_refuse_every_other_drafter_at_startup(atom_v4, v4_target):
+def test_v4_state_checkpoints_refuse_every_other_drafter_at_startup(atom_v4, v4_target):
     for spec in _drafters(v4_target):
         spec.disable_eagle_block_drop = False
         vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=spec)
         with pytest.raises(ValueError) as e:
             _v4_hook(vc)
         msg = str(e.value)
-        assert msg.startswith("DeepSeek-V4 prefix caching through checkpoint images")
+        assert msg.startswith("DeepSeek-V4 prefix caching through state checkpoints")
         assert f"speculative method {spec.method!r}" in msg
         assert "the DeepSeek-V4 MTP draft" in msg
         assert "--no-enable-prefix-caching" in msg
-        # Refused before vLLM's EAGLE drop or the image groups are touched.
+        # Refused before vLLM's EAGLE drop or the state checkpoint groups are touched.
         assert spec.disable_eagle_block_drop is False
         assert vc.cache_config.mamba_cache_mode == "none"
 
 
-def test_v4_without_images_takes_any_drafter_and_no_drafter_takes_images(
+def test_v4_without_state_checkpoints_takes_any_drafter_and_no_drafter_takes_state_checkpoints(
     atom_v4, v4_target
 ):
     for spec in [_real_spec(v4_target, "mtp"), *_drafters(v4_target)]:
@@ -290,7 +297,7 @@ def gfx(monkeypatch):
     return set_gfx
 
 
-def test_v4_images_run_with_an_fp8_kv_cache(atom_v4, gfx):
+def test_v4_state_checkpoints_run_with_an_fp8_kv_cache(atom_v4, gfx):
     gfx("gfx950")
     for dtype in ("fp8", "fp8_e4m3"):
         vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS)
@@ -308,13 +315,13 @@ def test_v4_images_run_with_an_fp8_kv_cache(atom_v4, gfx):
         ("fp8", "gfx942", "which this GPU runs as a bf16 KV cache"),
     ],
 )
-def test_v4_images_refuse_a_bf16_kv_cache_at_startup(
+def test_v4_state_checkpoints_refuse_a_bf16_kv_cache_at_startup(
     atom_v4, gfx, monkeypatch, v4_target, dtype, arch, why
 ):
     from atom.plugin.vllm.deepseek_v4_bridge import _v4_kv_fp8
-    from atom.plugin.vllm.deepseek_v4_image import (
-        DeepseekV4ImageAdapter,
-        register_deepseek_v4_image_layers,
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        DeepseekV4StateCheckpointAdapter,
+        register_deepseek_v4_state_checkpoint_layers,
     )
 
     gfx(arch)
@@ -327,16 +334,16 @@ def test_v4_images_refuse_a_bf16_kv_cache_at_startup(
         vc.cache_config.cache_dtype = dtype
         vc.compilation_config = NS(static_forward_context={})
         assert not _v4_kv_fp8(vc)
-        # Both where a worker turns images on (model construction, before the
+        # Both where a worker turns state checkpoints on (model construction, before the
         # model profiles) and in EngineCore's KV-config hook.
-        for site in (register_deepseek_v4_image_layers, _v4_hook):
+        for site in (register_deepseek_v4_state_checkpoint_layers, _v4_hook):
             with monkeypatch.context() as m:
-                m.setattr(DeepseekV4ImageAdapter, "sizing", no_sizing)
+                m.setattr(DeepseekV4StateCheckpointAdapter, "sizing", no_sizing)
                 with pytest.raises(ValueError) as e:
                     site(vc)
             msg = str(e.value)
             assert msg.startswith(
-                "DeepSeek-V4 prefix caching through checkpoint images is only "
+                "DeepSeek-V4 prefix caching through state checkpoints is only "
                 "validated with an fp8 KV cache"
             )
             assert f"--kv-cache-dtype {dtype!r}, {why}." in msg
@@ -344,7 +351,7 @@ def test_v4_images_refuse_a_bf16_kv_cache_at_startup(
             assert "--no-enable-prefix-caching" in msg
         assert vc.compilation_config.static_forward_context == {}
         assert vc.cache_config.mamba_cache_mode == "none"
-        # Without prefix caching there are no images to refuse.
+        # Without prefix caching there are no state checkpoints to refuse.
         vc.cache_config.enable_prefix_caching = False
         assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "none"
 
@@ -375,13 +382,14 @@ def test_lru_default_is_unchanged_for_other_bridges():
 
 def test_sizing_prices_real_blocks_and_native_checkpoint_ranges():
     vc = _vcfg()
-    s = v4_image_sizing(vc)
+    s = v4_state_checkpoint_sizing(vc)
     assert s.page_bytes % 256 == 0 and s.page_bytes - s.page_unit_bytes < 256
     assert s.k == -(-s.image_bytes // s.page_unit_bytes)
-    # HCA compressor state is not in a 128-aligned image; the window rows are.
+    # HCA compressor state is not in a 128-aligned state checkpoint; the window rows
+    # are.
     assert s.image_bytes < s.slot_bytes
     assert "nocopy=hca_main_kv,hca_main_score" in s.layout_id
-    assert len(deepseek_v4_image_layer_names(s.k)) == s.k
+    assert len(deepseek_v4_state_checkpoint_layer_names(s.k)) == s.k
     # The slot tail comes out of the tensor, not out of every page.
     tail = -(-s.num_slots * s.slot_bytes // s.page_bytes)
     for blocks in (tail + 64, tail + 1000):
@@ -394,7 +402,7 @@ def test_sizing_prices_real_blocks_and_native_checkpoint_ranges():
 def test_draft_proxy_carves_its_slots_from_its_own_withheld_tail():
     vc = _vcfg()
     vc.speculative_config = NS(num_speculative_tokens=1)
-    s = v4_image_sizing(vc)
+    s = v4_state_checkpoint_sizing(vc)
     tensor_blocks = -(-s.num_slots * s.slot_bytes // s.page_bytes) + 64
     usable = s.usable_blocks(tensor_blocks)
     head = s.page_bytes // (2 * ATOM_DEEPSEEK_V4_BLOCK_SIZE)
@@ -434,9 +442,9 @@ def test_draft_proxy_carves_its_slots_from_its_own_withheld_tail():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
-def test_image_round_trip_through_the_plugin_carve():
+def test_state_checkpoint_round_trip_through_the_plugin_carve():
     vc = _vcfg()
-    s = v4_image_sizing(vc)
+    s = v4_state_checkpoint_sizing(vc)
     tensor_blocks = -(-s.num_slots * s.slot_bytes // s.page_bytes) + 6 * s.k + 8
     usable = s.usable_blocks(tensor_blocks)
     head = s.page_bytes // (2 * ATOM_DEEPSEEK_V4_BLOCK_SIZE)
@@ -458,7 +466,9 @@ def test_image_round_trip_through_the_plugin_carve():
         row_widths=widths,
         num_blocks=usable,
     )
-    copier = make_v4_image_copier(s, views, num_blocks=usable, device=raw.device)
+    copier = make_v4_state_checkpoint_copier(
+        s, views, num_blocks=usable, device=raw.device
+    )
     geo = views["geometry"]
 
     def slot_bytes(group):
@@ -483,9 +493,9 @@ def test_image_round_trip_through_the_plugin_carve():
     # Non-contiguous, out-of-order ids, as a block pool hands them out.
     units = tuple(range(usable - 1, usable - 1 - 2 * s.k, -2))
     untouched = raw.clone()
-    execute_image_stores(copier, [2], [units])
+    execute_state_checkpoint_stores(copier, [2], [units])
     fill_slot(1, 0)
-    execute_image_restores(copier, [1], [units])
+    execute_state_checkpoint_restores(copier, [1], [units])
     torch.cuda.synchronize()
     restored = slot_bytes(1)
     ranges = copier._checkpoint_slot_ranges()
@@ -497,10 +507,10 @@ def test_image_round_trip_through_the_plugin_carve():
             assert torch.equal(flat_dst[off : off + n], flat_src[off : off + n])
             mask[off : off + n] = True
             carried += n
-        # Bytes the image does not carry stay as the reset left them.
+        # Bytes the state checkpoint does not carry stay as the reset left them.
         assert int(flat_dst[~mask].count_nonzero()) == 0
     assert carried == s.image_bytes
-    # Only the slots and the image's own units changed in the pool.
+    # Only the slots and the state checkpoint's own units changed in the pool.
     changed = (raw != untouched).nonzero().flatten()
     assert changed.numel() > 0
     region_bases, region_sizes = copier._page_unit_regions()
@@ -524,14 +534,16 @@ def test_image_round_trip_through_the_plugin_carve():
 def test_copy_funcs_meet_vllms_by_type_contract():
     from vllm.v1.worker.mamba_utils import validate_mamba_state_copy_funcs
 
-    s = v4_image_sizing(_vcfg())
-    spec = AtomDeepseekV4ImageLayer("x", 0, s.page_bytes).get_kv_cache_spec(None)
-    funcs = deepseek_v4_image_state_copy_funcs({spec.mamba_type})
+    s = v4_state_checkpoint_sizing(_vcfg())
+    spec = AtomDeepseekV4StateCheckpointLayer("x", 0, s.page_bytes).get_kv_cache_spec(
+        None
+    )
+    funcs = deepseek_v4_state_checkpoint_copy_funcs({spec.mamba_type})
     validate_mamba_state_copy_funcs({spec: [0]}, funcs)
 
 
 def test_placement_follows_native_ladder():
-    p = V4ImagePlacement(interval=8192, demand=True)
+    p = V4StateCheckpointPlacement(interval=8192, demand=True)
     # 12,288-token prompt: rung 8192, anchor one block short of the end.
     assert p.limit(12288) == 8192
     anchor = p.anchor(12288, 12288)
@@ -546,25 +558,32 @@ def test_placement_follows_native_ladder():
     assert p.keeps(2944, 12288, 2944, anchor)
     assert not p.keeps(4096, 12288, 0, anchor)
     assert not p.keeps(16384, 12288, 0, anchor)
-    # Demand only when the proxy hit is longer than the image hit, and room.
+    # Demand only when the proxy hit is longer than the state checkpoint hit, and room.
     assert p.demand_pos(0, 2944, True) == 2944
     assert p.demand_pos(2944, 2944, True) == 0
     assert p.demand_pos(0, 2944, False) == 0
-    assert V4ImagePlacement(interval=8192, demand=False).demand_pos(0, 2944, True) == 0
-    assert p.images_per_request() == 2
+    assert (
+        V4StateCheckpointPlacement(interval=8192, demand=False).demand_pos(
+            0, 2944, True
+        )
+        == 0
+    )
+    assert p.state_checkpoints_per_request() == 2
     # Generation: native's spacing rule, one interval past the last checkpoint.
     assert p.decode_keeps(9344, 0) and not p.decode_keeps(9344, 2944)
     assert not p.decode_keeps(9345, 0)
-    assert not V4ImagePlacement(interval=-1, demand=True).decode_keeps(9344, 0)
+    assert not V4StateCheckpointPlacement(interval=-1, demand=True).decode_keeps(
+        9344, 0
+    )
 
 
 def test_placement_interval_off_and_ladder_off():
-    off = V4ImagePlacement(interval=0, demand=True)
+    off = V4StateCheckpointPlacement(interval=0, demand=True)
     assert off.anchor(3000, 3000) == 0
     assert off.demand_pos(0, 2944, True) == 0
     assert not off.keeps(2944, 3000, 2944, 2944)
-    assert off.images_per_request() == 0
-    ladder_off = V4ImagePlacement(interval=-1, demand=True)
+    assert off.state_checkpoints_per_request() == 0
+    ladder_off = V4StateCheckpointPlacement(interval=-1, demand=True)
     assert ladder_off.limit(20000) == 0
     assert ladder_off.anchor(3000, 3000) == 2944
     assert not ladder_off.keeps(8192, 20000, 0, 19968)
@@ -578,19 +597,21 @@ def test_partial_eviction_restores_by_group():
     group, the old one for the rest."""
     from vllm.v1.core.block_pool import BlockPool
 
-    from atom.plugin.vllm.deepseek_v4_image import V4SchedulerImages
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        V4SchedulerStateCheckpoints,
+    )
 
     gids = [1, 2, 3]
     pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=128)
-    st = object.__new__(V4SchedulerImages)
+    st = object.__new__(V4SchedulerStateCheckpoints)
     st.block_pool = pool
-    st.placement = V4ImagePlacement(interval=8192, demand=True)
-    st.image_gids = gids
+    st.placement = V4StateCheckpointPlacement(interval=8192, demand=True)
+    st.state_checkpoint_gids = gids
     st.k = len(gids)
     req = NS(block_hashes=[b"h0", b"h1"], request_id="r")
 
     def store():
-        image = []
+        state_checkpoint = []
         for gid in gids:
             (blk,) = pool.get_new_blocks(1)
             pool.cache_full_blocks(
@@ -601,18 +622,18 @@ def test_partial_eviction_restores_by_group():
                 block_size=128,
                 kv_cache_group_id=gid,
             )
-            image.append(blk)
-        pool.free_blocks(image)
-        return image
+            state_checkpoint.append(blk)
+        pool.free_blocks(state_checkpoint)
+        return state_checkpoint
 
     a = store()
-    assert st._image_cached(req, 0)
+    assert st._state_checkpoint_cached(req, 0)
     assert pool._maybe_evict_cached_block(a[1])
     assert a[0].block_hash is not None and a[2].block_hash is not None
     assert a[1].block_hash is None
-    assert not st._image_cached(req, 0)
+    assert not st._state_checkpoint_cached(req, 0)
     b = store()
-    assert st._image_cached(req, 0)
+    assert st._state_checkpoint_cached(req, 0)
     hit = pool.get_cached_block(b"h0", gids)
     assert [blk.block_id for blk in hit] == [
         a[0].block_id,

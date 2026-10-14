@@ -1,15 +1,15 @@
-"""DeepSeek-V4 adapter for prefix caching through checkpoint images.
+"""DeepSeek-V4 adapter for prefix caching through state checkpoints.
 
 V4 keeps every request's sliding-window ring and compressor tails in a per-request
-slot carved from the proxy pool, outside any block vLLM hashes. The image
-mechanism itself is model-agnostic (``paged_state_image``,
-``paged_state_image_scheduler``); this module supplies V4's side of it
-(``DeepseekV4ImageAdapter``):
+slot carved from the proxy pool, outside any block vLLM hashes. The state checkpoint
+mechanism itself is model-agnostic (``paged_state_checkpoint``,
+``paged_state_checkpoint_scheduler``); this module supplies V4's side of it
+(``DeepseekV4StateCheckpointAdapter``):
 
 * The paged cache stays one opaque proxy layer, priced at its real per-block
   bytes. The slot area is withheld from the block pool as a tail, not amortized
-  into every page (``V4ImageSizing.usable_blocks``).
-* An image is the part of a slot a native checkpoint carries (CSA main/indexer
+  into every page (``V4StateCheckpointSizing.usable_blocks``).
+* A state checkpoint is the part of a slot a native checkpoint carries (CSA main/indexer
   compressor kv/score and every window row; HCA owes a 128-aligned boundary
   nothing): native ``PagedStateCheckpointSpec`` with ``k = units_per_checkpoint``
   PAGE units at block size 128.
@@ -28,34 +28,35 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from atom.plugin.vllm.paged_state_image import (
-    PagedStateImageAdapter,
-    PagedStateImageBackend,
-    PagedStateImageLayer,
-    image_state_copy_funcs,
-    images_on,
+from atom.plugin.vllm.paged_state_checkpoint import (
+    PagedStateCheckpointAdapter,
+    PagedStateCheckpointBackend,
+    PagedStateCheckpointLayer,
     install,
-    register_image_adapter,
-    register_image_layers,
+    register_state_checkpoint_adapter,
+    register_state_checkpoint_layers,
+    state_checkpoint_copy_funcs,
+    state_checkpoints_on,
 )
-from atom.plugin.vllm.paged_state_image_scheduler import (
-    ImagePlacement,
-    SchedulerImages,
+from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+    SchedulerStateCheckpoints,
+    StateCheckpointPlacement,
 )
 
 logger = logging.getLogger("atom")
 
-ATOM_DEEPSEEK_V4_IMAGE_LAYER_SUFFIX = "atom_deepseek_v4_image"
-_V4_IMAGE_BLOCK_SIZE = 128
+ATOM_DEEPSEEK_V4_STATE_CHECKPOINT_LAYER_SUFFIX = "atom_deepseek_v4_state_checkpoint"
+_V4_STATE_CHECKPOINT_BLOCK_SIZE = 128
 _V4_PROXY_ALIGNMENT = 256
-_V4_IMAGE_LAYOUT_PREFIX = "dsv4-paged-state-v3-plugin"
+_V4_STATE_CHECKPOINT_LAYOUT_PREFIX = "dsv4-paged-state-v3-plugin"
 
 
-def deepseek_v4_image_layer_names(k: int) -> list[str]:
+def deepseek_v4_state_checkpoint_layer_names(k: int) -> list[str]:
     # Layer index 1+i: index 0 is the proxy, and the draft proxy sits at
     # num_hidden_layers, which is far above any k this layout produces.
     return [
-        f"model.layers.{1 + i}.{ATOM_DEEPSEEK_V4_IMAGE_LAYER_SUFFIX}" for i in range(k)
+        f"model.layers.{1 + i}.{ATOM_DEEPSEEK_V4_STATE_CHECKPOINT_LAYER_SUFFIX}"
+        for i in range(k)
     ]
 
 
@@ -71,9 +72,9 @@ def is_atom_deepseek_v4_config(vllm_config) -> bool:
     )
 
 
-def deepseek_v4_images_on(vllm_config) -> bool:
-    """Whether V4 prefix hits are restored from checkpoint images."""
-    return images_on(register_v4_image_adapter(), vllm_config)
+def deepseek_v4_state_checkpoints_on(vllm_config) -> bool:
+    """Whether V4 prefix hits are restored from state checkpoints."""
+    return state_checkpoints_on(register_v4_state_checkpoint_adapter(), vllm_config)
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +100,10 @@ class _PluginV4StateCopier:
     """Native V4 slot <-> PAGE-unit checkpoint copy, bound to the plugin's pool.
 
     Every method that decides bytes or addresses is native ATOM's own function
-    (attached in ``_attach_native``), so a store/restore here cuts the image at the
-    same ranges, in the same order, through the same descriptor kernel as a native
-    checkpoint. This class only supplies what those methods read off ``self``: the
-    planes, the indexer pool, the geometry, the arena field split and a
+    (attached in ``_attach_native``), so a store/restore here cuts the state checkpoint
+    at the same ranges, in the same order, through the same descriptor kernel as a
+    native checkpoint. This class only supplies what those methods read off ``self``:
+    the planes, the indexer pool, the geometry, the arena field split and a
     ``model_runner`` carrying the checkpoint spec.
     """
 
@@ -134,7 +135,7 @@ class _PluginV4StateCopier:
         self._device = device
         self.model_runner = SimpleNamespace(
             config=SimpleNamespace(
-                kv_cache_block_size=_V4_IMAGE_BLOCK_SIZE,
+                kv_cache_block_size=_V4_STATE_CHECKPOINT_BLOCK_SIZE,
                 decode_context_parallel_size=1,
                 max_num_seqs=int(max_num_seqs),
             ),
@@ -202,7 +203,7 @@ def _attach_native() -> None:
 
 
 @dataclass(frozen=True)
-class V4ImageSizing:
+class V4StateCheckpointSizing:
     ratios: tuple[int, ...]
     n_csa: int
     win_with_spec: int
@@ -246,7 +247,7 @@ class V4ImageSizing:
             num_blocks=int(num_blocks),
             num_slots=int(self.num_slots if num_slots is None else num_slots),
             ring_slots=self.win_with_spec,
-            block_size=_V4_IMAGE_BLOCK_SIZE,
+            block_size=_V4_STATE_CHECKPOINT_BLOCK_SIZE,
             arena_rows=self.arena_rows,
         )
 
@@ -257,7 +258,10 @@ class V4ImageSizing:
         geo = self.geometry(num_blocks)
         regions = [geo.plane_bytes(w) for w in self.row_widths]
         regions.append(
-            self.n_csa * num_blocks * (_V4_IMAGE_BLOCK_SIZE // 4) * self.index_row_bytes
+            self.n_csa
+            * num_blocks
+            * (_V4_STATE_CHECKPOINT_BLOCK_SIZE // 4)
+            * self.index_row_bytes
         )
         _, total = plan_regions(regions)
         # A packed allocation may start this cache off the 256 B boundary.
@@ -278,7 +282,7 @@ class V4ImageSizing:
         return max(usable, 0)
 
 
-def v4_image_sizing(vllm_config) -> V4ImageSizing:
+def v4_state_checkpoint_sizing(vllm_config) -> V4StateCheckpointSizing:
     from atom.plugin.vllm.deepseek_v4_bridge import (
         _index_row_bytes,
         _layer_counts,
@@ -291,7 +295,7 @@ def v4_image_sizing(vllm_config) -> V4ImageSizing:
     hf = vllm_config.model_config.hf_config
     # Every ratio the checkpoint lists, MTP layer included: the target carves
     # its slot over all of them, as native does (a draft ring lives in the
-    # target's slot), and the image is a function of that slot.
+    # target's slot), and the state checkpoint is a function of that slot.
     ratios, _dense, n_csa, _hca = _layer_counts(hf)
     kv_fp8 = _v4_kv_fp8(vllm_config)
     arena_planes, arena_rows, row_widths = _v4_state_layout(vllm_config, kv_fp8)
@@ -311,12 +315,12 @@ def v4_image_sizing(vllm_config) -> V4ImageSizing:
         num_blocks=1,
         num_slots=max_num_seqs,
         ring_slots=win,
-        block_size=_V4_IMAGE_BLOCK_SIZE,
+        block_size=_V4_STATE_CHECKPOINT_BLOCK_SIZE,
         arena_rows=arena_rows,
     )
     page_unit = (
         sum(geo.block_bytes(w) for w in row_widths)
-        + n_csa * (_V4_IMAGE_BLOCK_SIZE // 4) * index_row
+        + n_csa * (_V4_STATE_CHECKPOINT_BLOCK_SIZE // 4) * index_row
     )
     page = -(-page_unit // _V4_PROXY_ALIGNMENT) * _V4_PROXY_ALIGNMENT
     slot = sum(geo.slot_bytes(w) for w in row_widths)
@@ -328,17 +332,17 @@ def v4_image_sizing(vllm_config) -> V4ImageSizing:
         num_slots=max_num_seqs,
         max_num_seqs=max_num_seqs,
     )
-    image = int(sizer.checkpoint_image_bytes())
+    image_bytes = int(sizer.checkpoint_image_bytes())
     nocopy = ",".join(
         f.name for plane in arena_planes for f in plane if not f.in_checkpoint
     )
     layout_id = (
-        f"{_V4_IMAGE_LAYOUT_PREFIX}:block={_V4_IMAGE_BLOCK_SIZE}:ring={win}"
-        f":dims={head_dim},{rope},{index_head_dim}"
+        f"{_V4_STATE_CHECKPOINT_LAYOUT_PREFIX}:block={_V4_STATE_CHECKPOINT_BLOCK_SIZE}"
+        f":ring={win}:dims={head_dim},{rope},{index_head_dim}"
         f":main={'fp8-2buff' if kv_fp8 else 'bf16'}"
         f":ratios={','.join(str(r) for r in ratios)}:nocopy={nocopy}:entry=packed"
     )
-    return V4ImageSizing(
+    return V4StateCheckpointSizing(
         ratios=tuple(int(r) for r in ratios),
         n_csa=n_csa,
         win_with_spec=win,
@@ -350,12 +354,14 @@ def v4_image_sizing(vllm_config) -> V4ImageSizing:
         page_unit_bytes=int(page_unit),
         page_bytes=int(page),
         slot_bytes=int(slot),
-        image_bytes=image,
+        image_bytes=image_bytes,
         layout_id=layout_id,
     )
 
 
-def make_v4_image_copier(sizing: V4ImageSizing, views, *, num_blocks: int, device):
+def make_v4_state_checkpoint_copier(
+    sizing: V4StateCheckpointSizing, views, *, num_blocks: int, device
+):
     """The copier over a bound pool, cross-checked against the sizing."""
     _attach_native()
     geo = views["geometry"]
@@ -379,56 +385,58 @@ def make_v4_image_copier(sizing: V4ImageSizing, views, *, num_blocks: int, devic
     _, strides = copier._page_unit_regions()
     actual_page = int(np.asarray(strides).sum())
     actual_slot = sum(geo.slot_bytes(w) for w in sizing.row_widths)
-    actual_image = int(copier.checkpoint_image_bytes())
+    actual_image_bytes = int(copier.checkpoint_image_bytes())
     if (
         actual_page != sizing.page_unit_bytes
         or actual_slot != sizing.slot_bytes
-        or actual_image != sizing.image_bytes
+        or actual_image_bytes != sizing.image_bytes
     ):
         raise RuntimeError(
-            "DeepSeek-V4 image geometry differs from sizing: "
+            "DeepSeek-V4 state checkpoint geometry differs from sizing: "
             f"page={actual_page}/{sizing.page_unit_bytes}, "
             f"slot={actual_slot}/{sizing.slot_bytes}, "
-            f"image={actual_image}/{sizing.image_bytes}"
+            f"image={actual_image_bytes}/{sizing.image_bytes}"
         )
     return copier
 
 
 # ---------------------------------------------------------------------------
-# Image layers, placement defaults
+# State checkpoint layers, placement defaults
 # ---------------------------------------------------------------------------
 
 
-class AtomDeepseekV4ImageBackend(PagedStateImageBackend):
-    block_size = _V4_IMAGE_BLOCK_SIZE
+class AtomDeepseekV4StateCheckpointBackend(PagedStateCheckpointBackend):
+    block_size = _V4_STATE_CHECKPOINT_BLOCK_SIZE
 
     @staticmethod
     def get_name() -> str:
-        return "ATOM_DEEPSEEK_V4_IMAGE"
+        return "ATOM_DEEPSEEK_V4_STATE_CHECKPOINT"
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None):
-        return [_V4_IMAGE_BLOCK_SIZE]
+        return [_V4_STATE_CHECKPOINT_BLOCK_SIZE]
 
 
-class AtomDeepseekV4ImageLayer(PagedStateImageLayer):
-    """One PAGE unit of a V4 checkpoint image, as vLLM sees it."""
+class AtomDeepseekV4StateCheckpointLayer(PagedStateCheckpointLayer):
+    """One PAGE unit of a V4 state checkpoint, as vLLM sees it."""
 
     def __init__(self, prefix: str, part: int, page_bytes: int, adapter=None):
         super().__init__(
-            prefix, part, page_bytes, adapter or register_v4_image_adapter()
+            prefix, part, page_bytes, adapter or register_v4_state_checkpoint_adapter()
         )
 
 
-def register_deepseek_v4_image_layers(vllm_config) -> list[str]:
-    """Register the k image layers next to the proxy (worker side)."""
-    return register_image_layers(
-        register_v4_image_adapter(), vllm_config, AtomDeepseekV4ImageLayer
+def register_deepseek_v4_state_checkpoint_layers(vllm_config) -> list[str]:
+    """Register the k state checkpoint layers next to the proxy (worker side)."""
+    return register_state_checkpoint_layers(
+        register_v4_state_checkpoint_adapter(),
+        vllm_config,
+        AtomDeepseekV4StateCheckpointLayer,
     )
 
 
-def deepseek_v4_image_state_copy_funcs(mamba_types):
-    return {t: image_state_copy_funcs() for t in mamba_types}
+def deepseek_v4_state_checkpoint_copy_funcs(mamba_types):
+    return {t: state_checkpoint_copy_funcs() for t in mamba_types}
 
 
 def _native_checkpoint_defaults() -> tuple[int, bool]:
@@ -442,17 +450,19 @@ def _native_checkpoint_defaults() -> tuple[int, bool]:
 
 
 @dataclass(frozen=True)
-class V4ImagePlacement(ImagePlacement):
+class V4StateCheckpointPlacement(StateCheckpointPlacement):
     """Native placement at V4's 128-token block."""
 
-    block: int = _V4_IMAGE_BLOCK_SIZE
+    block: int = _V4_STATE_CHECKPOINT_BLOCK_SIZE
 
     @classmethod
-    def from_env(cls, defaults=None, block=_V4_IMAGE_BLOCK_SIZE) -> V4ImagePlacement:
+    def from_env(
+        cls, defaults=None, block=_V4_STATE_CHECKPOINT_BLOCK_SIZE
+    ) -> V4StateCheckpointPlacement:
         return super().from_env(defaults or _native_checkpoint_defaults(), block)
 
 
-V4SchedulerImages = SchedulerImages
+V4SchedulerStateCheckpoints = SchedulerStateCheckpoints
 
 
 # ---------------------------------------------------------------------------
@@ -460,12 +470,14 @@ V4SchedulerImages = SchedulerImages
 # ---------------------------------------------------------------------------
 
 
-class DeepseekV4ImageAdapter(PagedStateImageAdapter):
+class DeepseekV4StateCheckpointAdapter(PagedStateCheckpointAdapter):
     name = "DeepSeek-V4"
-    layer_suffix = ATOM_DEEPSEEK_V4_IMAGE_LAYER_SUFFIX
-    block_size = _V4_IMAGE_BLOCK_SIZE
-    backend_cls = AtomDeepseekV4ImageBackend
-    image_drafters = "speculative method 'mtp' with the DeepSeek-V4 MTP draft"
+    layer_suffix = ATOM_DEEPSEEK_V4_STATE_CHECKPOINT_LAYER_SUFFIX
+    block_size = _V4_STATE_CHECKPOINT_BLOCK_SIZE
+    backend_cls = AtomDeepseekV4StateCheckpointBackend
+    state_checkpoint_drafters = (
+        "speculative method 'mtp' with the DeepSeek-V4 MTP draft"
+    )
 
     @property
     def proxy_layer_name(self) -> str:
@@ -478,21 +490,21 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
     def matches(self, vllm_config) -> bool:
         return is_atom_deepseek_v4_config(vllm_config)
 
-    def sizing(self, vllm_config) -> V4ImageSizing:
-        return v4_image_sizing(vllm_config)
+    def sizing(self, vllm_config) -> V4StateCheckpointSizing:
+        return v4_state_checkpoint_sizing(vllm_config)
 
-    def image_layer_names(self, k: int) -> list[str]:
-        return deepseek_v4_image_layer_names(k)
+    def state_checkpoint_layer_names(self, k: int) -> list[str]:
+        return deepseek_v4_state_checkpoint_layer_names(k)
 
     def checkpoint_defaults(self) -> tuple[int, bool]:
         return _native_checkpoint_defaults()
 
-    def drafter_state_in_image(self, vllm_config) -> bool:
+    def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         return v4_drafter_in_target_slot(vllm_config)
 
-    def check_images_supported(self, vllm_config) -> None:
-        # Images are validated only over the fp8 2buff layout; the bf16 one is
-        # another plane geometry, and the plugin's bf16 V4 path does not run.
+    def check_state_checkpoints_supported(self, vllm_config) -> None:
+        # State checkpoints are validated only over the fp8 2buff layout; the bf16 one
+        # is another plane geometry, and the plugin's bf16 V4 path does not run.
         from atom.plugin.vllm.deepseek_v4_bridge import _v4_kv_fp8
 
         if _v4_kv_fp8(vllm_config):
@@ -504,7 +516,7 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
             else "a bf16 KV cache"
         )
         raise ValueError(
-            "DeepSeek-V4 prefix caching through checkpoint images is only "
+            "DeepSeek-V4 prefix caching through state checkpoints is only "
             f"validated with an fp8 KV cache; got --kv-cache-dtype {dtype!r}, "
             f"{why}. Pass --kv-cache-dtype fp8 (gfx950 / gfx1250), or "
             "--no-enable-prefix-caching."
@@ -531,27 +543,27 @@ def v4_drafter_in_target_slot(vllm_config) -> bool:
     return bool(archs) and archs[0] in _DEEPSEEK_V4_MTP_ARCHES
 
 
-_V4_ADAPTER = DeepseekV4ImageAdapter()
+_V4_ADAPTER = DeepseekV4StateCheckpointAdapter()
 
 
-def register_v4_image_adapter() -> DeepseekV4ImageAdapter:
-    return register_image_adapter(_V4_ADAPTER)
+def register_v4_state_checkpoint_adapter() -> DeepseekV4StateCheckpointAdapter:
+    return register_state_checkpoint_adapter(_V4_ADAPTER)
 
 
 def apply_vllm_v4_prefix_install() -> None:
-    """Register the V4 adapter and install every image hook. Idempotent; called
-    from register_model.
+    """Register the V4 adapter and install every state checkpoint hook. Idempotent;
+    called from register_model.
 
     ``ATOMPlatform.check_and_update_config`` is not a reliable site: vLLM may
     never activate the platform (``register_platform`` runs inside ``import vllm``
     and its failure is swallowed). ``register_model`` runs in EngineCore and
     in every worker.
     """
-    register_v4_image_adapter()
+    register_v4_state_checkpoint_adapter()
     a, b, c, d = install()
     if a or b or c or d:
         logger.info(
-            "ATOM DeepSeek-V4: installed image prefix hooks "
+            "ATOM DeepSeek-V4: installed state checkpoint prefix hooks "
             "(get_kv_cache_configs=%s, kv zeroing=%s, runner events=%s, "
             "placement scheduler=%s)",
             a,

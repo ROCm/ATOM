@@ -11,7 +11,7 @@ import torch
 pytest.importorskip("aiter", reason="the V4 bridge reaches AITER dtypes")
 
 from atom.plugin.vllm import deepseek_v4_bridge as B
-from atom.plugin.vllm.deepseek_v4_image import v4_image_sizing
+from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_state_checkpoint_sizing
 
 RATIOS = [0, 0, 4, 128, 4, 128, 4, 0]
 MTP_LAYER = len(RATIOS) - 1
@@ -79,7 +79,7 @@ def _register_both(vc):
 def _shared_pool(vc, sfc):
     """The target proxy's 0.31 view over the schedulable blocks, tail after it;
     the draft proxy gets that same tensor, as vLLM's KV sharing hands it."""
-    s = v4_image_sizing(vc)
+    s = v4_state_checkpoint_sizing(vc)
     tensor_blocks = -(-s.num_slots * s.slot_bytes // s.page_bytes) + 64
     usable = s.usable_blocks(tensor_blocks)
     assert usable > 0
@@ -179,12 +179,12 @@ def test_draft_waits_for_the_target_then_binds_into_its_slot(bound):
         d_attn.unified_kv_rope.data_ptr() == views["unified_rope"][MTP_LAYER].data_ptr()
     )
     assert d_attn.swa_window == target.model.layers[0].attn.swa_window
-    assert d_attn.swa_cache_size == v4_image_sizing(vc).win_with_spec == 129
-    # One allocator, one geometry, one set of meta params; no image path.
+    assert d_attn.swa_cache_size == v4_state_checkpoint_sizing(vc).win_with_spec == 129
+    # One allocator, one geometry, one set of meta params; no state checkpoint path.
     assert draft._atom_v4_slot_allocator.owner is target._atom_v4_slot_allocator
     assert draft._atom_v4_geometry is target._atom_v4_geometry
     assert draft._atom_v4_meta_params is target._atom_v4_meta_params
-    assert draft._atom_image_worker is None and not draft._atom_v4_is_target
+    assert draft._atom_state_checkpoint_worker is None and not draft._atom_v4_is_target
     assert sfc[DRAFT]._atom_v4_model is draft and sfc[TARGET]._atom_v4_model is target
     assert target._atom_v4_slot_sharers == [d_attn]
     # Rebinding on the same tensor is a no-op.
@@ -214,7 +214,7 @@ def test_draft_ring_rows_are_the_targets_slot_rows_for_layer_n_layers(bound):
         d_plane[row].fill_(0xA5)
         absolute = geo.layer_base_row(MTP_LAYER) + row
         # Written through the draft, landed in the target's plane, inside the
-        # target's slot, in the window rows a checkpoint image carries.
+        # target's slot, in the window rows a state checkpoint carries.
         assert torch.all(plane[absolute] == 0xA5)
         assert start <= absolute < stop
         entry_row = absolute - start - geo.arena_rows

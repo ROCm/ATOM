@@ -36,9 +36,9 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     """Apply V4-specific plugin constraints.
 
     1. Prefix caching: V4's per-request SWA ring and compressor tails are not
-       in any block vLLM hashes. A hit restores them from a checkpoint image
-       vLLM keeps where native ATOM checkpoints (``deepseek_v4_image``). The hooks are
-       installed from ``register_model``, which is always reached; calling the
+       in any block vLLM hashes. A hit restores them from a state checkpoint
+       vLLM keeps where native ATOM checkpoints (``deepseek_v4_state_checkpoint``). The
+       hooks are installed from ``register_model``, which is always reached; calling the
        same idempotent entry here covers a run where this platform is active.
 
     2. Guard the non-chunked oversized forward: with chunked prefill off, vLLM
@@ -56,7 +56,9 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
     if cache_config is not None and getattr(
         cache_config, "enable_prefix_caching", False
     ):
-        from atom.plugin.vllm.deepseek_v4_image import apply_vllm_v4_prefix_install
+        from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+            apply_vllm_v4_prefix_install,
+        )
 
         apply_vllm_v4_prefix_install()
 

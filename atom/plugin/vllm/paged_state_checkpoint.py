@@ -1,25 +1,26 @@
-"""Prefix caching through vLLM-managed checkpoint images, for any ATOM model
+"""Prefix caching through vLLM-managed state checkpoints, for any ATOM model
 whose per-request state lives in slots outside the blocks vLLM hashes.
 
 Such a model (DeepSeek-V4's sliding-window ring and compressor tails, for one)
 exposes its paged cache to vLLM as one opaque proxy layer. A block-table hit
 brings back the paged history and nothing a resumer needs at the boundary. This
-module lets vLLM keep, at the boundaries native ATOM checkpoints at, a byte image
+module lets vLLM keep, at the boundaries native ATOM checkpoints at, a state checkpoint
 of that slot and hand it back on a hit:
 
-* An image is native ATOM's checkpoint image (``PagedStateCheckpointSpec``), cut
+* A state checkpoint is native ATOM's own (``PagedStateCheckpointSpec``), cut
   over ``k = spec.units_per_checkpoint`` PAGE units. vLLM sees it as ``k``
   single-layer ``MambaSpec`` groups in ``align`` mode at the proxy's block size,
-  which share the proxy's tensor and block pool. A hit returns the ``k`` image
-  block ids with the proxy blocks; vLLM only reports the hit when both are cached.
+  which share the proxy's tensor and block pool. A hit returns the ``k`` state
+  checkpoint block ids with the proxy blocks; vLLM only reports the hit when both
+  are cached.
 * The copy between a slot and ``k`` PAGE units is the model's native
   ``execute_paged_state_copies``, supplied by the model family's adapter.
 * A block id means the same unit to vLLM and ATOM but not the same bytes, so every
   vLLM-side byte operation on these blocks is switched off: the align pre-copy,
   new-block zeroing and partial-hit CoW block copies.
 
-Everything model-specific comes through a ``PagedStateImageAdapter`` the model's
-bridge registers. This module and ``paged_state_image_scheduler`` import no model
+Everything model-specific comes through a ``PagedStateCheckpointAdapter`` the model's
+bridge registers. This module and ``paged_state_checkpoint_scheduler`` import no model
 code.
 """
 
@@ -46,8 +47,8 @@ logger = logging.getLogger("atom")
 # ---------------------------------------------------------------------------
 
 
-class PagedStateImageAdapter:
-    """One model family's side of the image path.
+class PagedStateCheckpointAdapter:
+    """One model family's side of the state checkpoint path.
 
     ``sizing(vllm_config)`` returns an object with ``spec`` (native
     ``PagedStateCheckpointSpec``), ``page_bytes`` (what vLLM prices a block at),
@@ -59,14 +60,15 @@ class PagedStateImageAdapter:
 
     #: Family name in logs and errors.
     name: str = "paged-state"
-    #: Suffix of the image layer names.
+    #: Suffix of the state checkpoint layer names.
     layer_suffix: str = ""
-    #: The proxy's and every image group's block size.
+    #: The proxy's and every state checkpoint group's block size.
     block_size: int = 0
-    #: vLLM attention backend of the image layers (a ``PagedStateImageBackend``).
+    #: vLLM attention backend of the state checkpoint layers (a
+    #: ``PagedStateCheckpointBackend``).
     backend_cls: type | None = None
-    #: The drafters ``drafter_state_in_image`` accepts, for the refusal message.
-    image_drafters: str = ""
+    #: The drafters ``drafter_state_in_checkpoint`` accepts, for the refusal message.
+    state_checkpoint_drafters: str = ""
 
     @property
     def proxy_layer_name(self) -> str:
@@ -78,32 +80,34 @@ class PagedStateImageAdapter:
     def sizing(self, vllm_config):
         raise NotImplementedError
 
-    def image_layer_names(self, k: int) -> list[str]:
+    def state_checkpoint_layer_names(self, k: int) -> list[str]:
         return [f"model.layers.{1 + i}.{self.layer_suffix}" for i in range(k)]
 
-    def is_image_layer(self, name: str) -> bool:
+    def is_state_checkpoint_layer(self, name: str) -> bool:
         return name.endswith("." + self.layer_suffix)
 
     def checkpoint_defaults(self) -> tuple[int, bool]:
         """Native (state_checkpoint_interval_tokens, state_checkpoint_demand)."""
         raise NotImplementedError
 
-    def drafter_state_in_image(self, vllm_config) -> bool:
+    def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         """Whether the configured speculative drafter keeps all of its state in
-        the target's slot, so an image carries it. Images refuse to run with
-        any other drafter: a prefix hit would resume it without its state."""
+        the target's slot, so a state checkpoint carries it. State checkpoints refuse to
+        run with any other drafter: a prefix hit would resume it without its state."""
         return False
 
-    def check_images_supported(self, vllm_config) -> None:
-        """Raise ``ValueError`` when images cannot run with this config. Runs
-        where a worker registers the image layers and in EngineCore's KV-config
-        hook, each time before the family's sizing."""
+    def check_state_checkpoints_supported(self, vllm_config) -> None:
+        """Raise ``ValueError`` when state checkpoints cannot run with this config. Runs
+        where a worker registers the state checkpoint layers and in EngineCore's
+        KV-config hook, each time before the family's sizing."""
 
 
-_adapters: list[PagedStateImageAdapter] = []
+_adapters: list[PagedStateCheckpointAdapter] = []
 
 
-def register_image_adapter(adapter: PagedStateImageAdapter) -> PagedStateImageAdapter:
+def register_state_checkpoint_adapter(
+    adapter: PagedStateCheckpointAdapter,
+) -> PagedStateCheckpointAdapter:
     for a in _adapters:
         if type(a) is type(adapter):
             return a
@@ -111,14 +115,14 @@ def register_image_adapter(adapter: PagedStateImageAdapter) -> PagedStateImageAd
     return adapter
 
 
-def adapter_for_config(vllm_config) -> PagedStateImageAdapter | None:
+def adapter_for_config(vllm_config) -> PagedStateCheckpointAdapter | None:
     for a in _adapters:
         if a.matches(vllm_config):
             return a
     return None
 
 
-def adapter_for_kv_cache_config(cfg) -> PagedStateImageAdapter | None:
+def adapter_for_kv_cache_config(cfg) -> PagedStateCheckpointAdapter | None:
     groups = getattr(cfg, "kv_cache_groups", ())
     for a in _adapters:
         if any(a.proxy_layer_name in g.layer_names for g in groups):
@@ -131,8 +135,10 @@ def adapter_for_kv_cache_config(cfg) -> PagedStateImageAdapter | None:
 # ---------------------------------------------------------------------------
 
 
-def images_on(adapter: PagedStateImageAdapter | None, vllm_config) -> bool:
-    """Whether this config's prefix hits are restored from checkpoint images."""
+def state_checkpoints_on(
+    adapter: PagedStateCheckpointAdapter | None, vllm_config
+) -> bool:
+    """Whether this config's prefix hits are restored from state checkpoints."""
     cc = getattr(vllm_config, "cache_config", None)
     return (
         adapter is not None
@@ -142,15 +148,15 @@ def images_on(adapter: PagedStateImageAdapter | None, vllm_config) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Image layers: k single-layer MambaSpec(align) groups
+# State checkpoint layers: k single-layer MambaSpec(align) groups
 # ---------------------------------------------------------------------------
 
 
-def _noop_image_copy(state, block_ids, cur_block_idx, num_accepted_tokens):
+def _noop_state_checkpoint_copy(state, block_ids, cur_block_idx, num_accepted_tokens):
     """vLLM's align pre-copy, made to copy nothing.
 
-    ATOM writes an image itself, through its own carve; vLLM's view of the same
-    block id is other blocks' bytes (see module docstring).
+    ATOM writes a state checkpoint itself, through its own carve; vLLM's view of the
+    same block id is other blocks' bytes (see module docstring).
     """
     from vllm.model_executor.layers.mamba.mamba_utils import MambaCopySpec
 
@@ -158,11 +164,11 @@ def _noop_image_copy(state, block_ids, cur_block_idx, num_accepted_tokens):
     return MambaCopySpec(start_addr=src.data_ptr(), num_elements=0)
 
 
-def image_state_copy_funcs():
-    return (_noop_image_copy,)
+def state_checkpoint_copy_funcs():
+    return (_noop_state_checkpoint_copy,)
 
 
-class _PagedStateImageMetadataBuilder(AttentionMetadataBuilder):
+class _PagedStateCheckpointMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
@@ -175,8 +181,9 @@ class _PagedStateImageMetadataBuilder(AttentionMetadataBuilder):
         return None
 
 
-class PagedStateImageBackend(AttentionBackend):
-    """Image layers' backend; a family subclasses it with its name and block."""
+class PagedStateCheckpointBackend(AttentionBackend):
+    """State checkpoint layers' backend; a family subclasses it with its name and
+    block."""
 
     block_size: int = 0
 
@@ -188,7 +195,9 @@ class PagedStateImageBackend(AttentionBackend):
     def get_kv_cache_shape(
         num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"
     ):
-        raise NotImplementedError("image layers are MambaSpec; vLLM sizes them")
+        raise NotImplementedError(
+            "state checkpoint layers are MambaSpec; vLLM sizes them"
+        )
 
     @staticmethod
     def get_impl_cls():
@@ -196,15 +205,15 @@ class PagedStateImageBackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
-        return _PagedStateImageMetadataBuilder
+        return _PagedStateCheckpointMetadataBuilder
 
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
         return (cls.__module__, cls.__qualname__)
 
 
-class PagedStateImageLayer(nn.Module, AttentionLayerBase):
-    """One PAGE unit of a checkpoint image, as vLLM sees it."""
+class PagedStateCheckpointLayer(nn.Module, AttentionLayerBase):
+    """One PAGE unit of a state checkpoint, as vLLM sees it."""
 
     def __init__(self, prefix: str, part: int, page_bytes: int, adapter):
         super().__init__()
@@ -212,8 +221,8 @@ class PagedStateImageLayer(nn.Module, AttentionLayerBase):
         self.part = int(part)
         self.page_bytes = int(page_bytes)
         self.adapter = adapter
-        self._atom_state_image_layer = True
-        self._atom_image_group_id = None
+        self._atom_state_checkpoint_layer = True
+        self._atom_state_checkpoint_group_id = None
         self.kv_cache = (torch.tensor([]),)
         self.impl = nn.Identity()
 
@@ -237,19 +246,19 @@ class PagedStateImageLayer(nn.Module, AttentionLayerBase):
         self.kv_cache = (pages,)
 
 
-def register_image_layers(
-    adapter, vllm_config, layer_cls=PagedStateImageLayer
+def register_state_checkpoint_layers(
+    adapter, vllm_config, layer_cls=PagedStateCheckpointLayer
 ) -> list[str]:
-    """Register the k image layers next to the proxy (worker side)."""
+    """Register the k state checkpoint layers next to the proxy (worker side)."""
     # The worker builds the model and profiles it before EngineCore's KV-config
     # hook runs; refuse here first.
-    adapter.check_images_supported(vllm_config)
+    adapter.check_state_checkpoints_supported(vllm_config)
     sizing = adapter.sizing(vllm_config)
     sfc = vllm_config.compilation_config.static_forward_context
-    names = adapter.image_layer_names(sizing.spec.units_per_checkpoint)
+    names = adapter.state_checkpoint_layer_names(sizing.spec.units_per_checkpoint)
     for i, name in enumerate(names):
         existing = sfc.get(name)
-        if isinstance(existing, PagedStateImageLayer):
+        if isinstance(existing, PagedStateCheckpointLayer):
             continue
         if existing is not None:
             raise ValueError(f"Duplicate layer name: {name}")
@@ -265,45 +274,54 @@ _KV_CFG_TARGETS = ("vllm.v1.core.kv_cache_utils", "vllm.v1.engine.core")
 _KV_CFG_ATTR = "get_kv_cache_configs"
 
 
-def check_image_groups(cfg, adapter, sizing) -> None:
+def check_state_checkpoint_groups(cfg, adapter, sizing) -> None:
     from vllm.v1.kv_cache_interface import MambaSpec
 
     k = sizing.spec.units_per_checkpoint
     proxy_name = adapter.proxy_layer_name
-    image_names = set(adapter.image_layer_names(k))
+    state_checkpoint_names = set(adapter.state_checkpoint_layer_names(k))
     groups = list(cfg.kv_cache_groups)
     proxy_groups = [g for g in groups if proxy_name in g.layer_names]
-    image_groups = [
-        g for g in groups if any(adapter.is_image_layer(n) for n in g.layer_names)
+    state_checkpoint_groups = [
+        g
+        for g in groups
+        if any(adapter.is_state_checkpoint_layer(n) for n in g.layer_names)
     ]
     problems = []
     if len(proxy_groups) != 1:
         problems.append(f"{len(proxy_groups)} proxy groups")
-    if len(image_groups) != k:
-        problems.append(f"{len(image_groups)} image groups, need k={k}")
+    if len(state_checkpoint_groups) != k:
+        problems.append(
+            f"{len(state_checkpoint_groups)} state checkpoint groups, need k={k}"
+        )
     found = set()
-    for g in image_groups:
+    for g in state_checkpoint_groups:
         spec = g.kv_cache_spec
         if len(g.layer_names) != 1:
-            problems.append(f"image group with layers {g.layer_names}")
+            problems.append(f"state checkpoint group with layers {g.layer_names}")
         if not isinstance(spec, MambaSpec) or spec.mamba_cache_mode != "align":
-            problems.append(f"image group spec {type(spec).__name__}")
+            problems.append(f"state checkpoint group spec {type(spec).__name__}")
         found.update(g.layer_names)
-    if found != image_names:
-        problems.append(f"image layers {sorted(found)} != {sorted(image_names)}")
+    if found != state_checkpoint_names:
+        problems.append(
+            f"state checkpoint layers {sorted(found)} != "
+            f"{sorted(state_checkpoint_names)}"
+        )
     for g in groups:
         if g.kv_cache_spec.block_size != adapter.block_size:
             problems.append(f"group block_size {g.kv_cache_spec.block_size}")
         if g.kv_cache_spec.page_size_bytes != sizing.page_bytes:
             problems.append(f"group page {g.kv_cache_spec.page_size_bytes}")
     # Every KVCacheTensor is a placement in one backing allocation; the proxy
-    # and each image must put block b's page at the same bytes.
+    # and each state checkpoint must put block b's page at the same bytes.
     placed = {}
     for t in cfg.kv_cache_tensors:
         for i, name in enumerate(t.layers):
             placed[name] = (t.offset + i * t.layer_stride, t.block_stride)
     misplaced = sorted(
-        n for n in (proxy_name, *image_names) if placed.get(n) != (0, sizing.page_bytes)
+        n
+        for n in (proxy_name, *state_checkpoint_names)
+        if placed.get(n) != (0, sizing.page_bytes)
     )
     if misplaced:
         problems.append(
@@ -312,7 +330,7 @@ def check_image_groups(cfg, adapter, sizing) -> None:
     if problems:
         raise RuntimeError(
             f"{adapter.name} prefix caching needs 1 proxy group + k single-layer "
-            "MambaSpec(align) image groups sharing one tensor at block size "
+            "MambaSpec(align) state checkpoint groups sharing one tensor at block size "
             f"{adapter.block_size}; got: " + "; ".join(problems)
         )
 
@@ -324,8 +342,8 @@ def follow_native_hit_rule(vllm_config) -> bool:
     vLLM drops one more block for EAGLE drafters because a draft's paged KV row
     at a cached block's last position was computed with the token after the
     block, which a reader may not share. A family whose draft has no pages and
-    keeps its state in the slot gets that state back from the image, as native
-    restores it; the one row computed with the writer's next token only steers
+    keeps its state in the slot gets that state back from the state checkpoint, as
+    native restores it; the one row computed with the writer's next token only steers
     proposals, which the target verifies. Sets vLLM's own
     ``disable_eagle_block_drop`` (EngineCore, before the scheduler is built).
     Returns whether it changed the config.
@@ -338,8 +356,8 @@ def follow_native_hit_rule(vllm_config) -> bool:
         return False
     spec.disable_eagle_block_drop = True
     logger.info(
-        "ATOM image prefix caching: the draft's state is in the checkpoint "
-        "image, so prefix hits follow native ATOM's rule "
+        "ATOM state checkpoint prefix caching: the draft's state is in the state "
+        "checkpoint, so prefix hits follow native ATOM's rule "
         "(disable_eagle_block_drop=True)"
     )
     return True
@@ -381,21 +399,25 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     # anything else (e.g. vLLM's own implementation) keeps vLLM's allocator.
     if proxy_name is None or not any(proxy_name in s for s in kv_cache_specs):
         return original(vllm_config, kv_cache_specs, available_memory)
-    from atom.plugin.vllm.paged_state_image_scheduler import (
-        IMAGE_BLOCKS_PER_GROUP,
-        ImagePlacement,
+    from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+        STATE_CHECKPOINT_BLOCKS_PER_GROUP,
+        StateCheckpointPlacement,
     )
 
     bs = adapter.block_size
-    pc = images_on(adapter, vllm_config)
+    pc = state_checkpoints_on(adapter, vllm_config)
     if pc:
-        adapter.check_images_supported(vllm_config)
+        adapter.check_state_checkpoints_supported(vllm_config)
         spec = getattr(vllm_config, "speculative_config", None)
         if spec is not None:
-            if not adapter.drafter_state_in_image(vllm_config):
-                only = f" ({adapter.image_drafters})" if adapter.image_drafters else ""
+            if not adapter.drafter_state_in_checkpoint(vllm_config):
+                only = (
+                    f" ({adapter.state_checkpoint_drafters})"
+                    if adapter.state_checkpoint_drafters
+                    else ""
+                )
                 raise ValueError(
-                    f"{adapter.name} prefix caching through checkpoint images "
+                    f"{adapter.name} prefix caching through state checkpoints "
                     "carries a drafter's state only for a drafter that lives in "
                     f"the target's slot{only}; speculative method "
                     f"{getattr(spec, 'method', None)!r} keeps its own state, which "
@@ -415,54 +437,61 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
     max_model_len = int(vllm_config.model_config.max_model_len)
     per_req = -(-max_model_len // bs)
     placement = (
-        ImagePlacement.from_env(adapter.checkpoint_defaults(), bs) if pc else None
+        StateCheckpointPlacement.from_env(adapter.checkpoint_defaults(), bs)
+        if pc
+        else None
     )
-    # A running request's peak: its KV blocks, and in each image group the
+    # A running request's peak: its KV blocks, and in each state checkpoint group the
     # running block plus the previous one, published or not.
-    image_blocks = IMAGE_BLOCKS_PER_GROUP * k if pc else 0
+    state_checkpoint_blocks = STATE_CHECKPOINT_BLOCKS_PER_GROUP * k if pc else 0
     for cfg in configs:
         if not any(proxy_name in g.layer_names for g in cfg.kv_cache_groups):
             continue
         if pc:
-            check_image_groups(cfg, adapter, sizing)
+            check_state_checkpoint_groups(cfg, adapter, sizing)
             logger.info(
-                "ATOM %s image placement: state_checkpoint_interval_tokens=%d "
-                "state_checkpoint_demand=%s block_size=%d images_per_request=%d; "
-                "pool check: %d proxy blocks (max_model_len=%d) + %d x k=%d image "
+                "ATOM %s state checkpoint placement: "
+                "state_checkpoint_interval_tokens=%d state_checkpoint_demand=%s "
+                "block_size=%d state_checkpoints_per_request=%d; pool check: %d "
+                "proxy blocks (max_model_len=%d) + %d x k=%d state checkpoint "
                 "blocks + 1 null block = %d",
                 adapter.name,
                 placement.interval,
                 placement.demand,
                 bs,
-                placement.images_per_request(),
+                placement.state_checkpoints_per_request(),
                 per_req,
                 max_model_len,
-                IMAGE_BLOCKS_PER_GROUP,
+                STATE_CHECKPOINT_BLOCKS_PER_GROUP,
                 k,
-                per_req + image_blocks + 1,
+                per_req + state_checkpoint_blocks + 1,
             )
         tensor_blocks = int(cfg.num_blocks)
         usable = sizing.usable_blocks(tensor_blocks)
         # vLLM's block pool keeps one block (the null block) for good.
-        need = per_req + image_blocks + 1
+        need = per_req + state_checkpoint_blocks + 1
         if usable < need:
-            images = f" + {IMAGE_BLOCKS_PER_GROUP}x{k} image blocks" if pc else ""
+            state_checkpoints = (
+                f" + {STATE_CHECKPOINT_BLOCKS_PER_GROUP}x{k} state checkpoint blocks"
+                if pc
+                else ""
+            )
             raise ValueError(
                 f"{adapter.name} plugin pool too small: "
                 f"{tensor_blocks} blocks of {sizing.page_bytes} B, "
                 f"{tensor_blocks - usable} withheld for {sizing.num_slots} slots of "
                 f"{sizing.slot_bytes} B, {usable} left; one max_model_len="
                 f"{max_model_len} request needs {need} "
-                f"({per_req} KV blocks{images} + 1 null block)"
+                f"({per_req} KV blocks{state_checkpoints} + 1 null block)"
             )
         cfg.num_blocks = usable
         logger.info(
-            "ATOM %s %s: page_bytes=%d page_unit_bytes=%d image_k=%d "
+            "ATOM %s %s: page_bytes=%d page_unit_bytes=%d units_per_checkpoint=%d "
             "image_bytes=%d block_size=%d slots=%d slot_bytes=%d tensor_blocks=%d "
             "reserve_blocks=%d schedulable_blocks=%d kv_groups=%d "
             "mamba_cache_mode=%s long_prefill_token_threshold=%s",
             adapter.name,
-            "image prefix" if pc else "proxy (no prefix caching)",
+            "state checkpoint prefix" if pc else "proxy (no prefix caching)",
             sizing.page_bytes,
             sizing.spec.page_unit_bytes,
             k if pc else 0,
@@ -488,12 +517,12 @@ def _apply_kv_cache_configs_patch() -> bool:
         try:
             modules.append(importlib.import_module(name))
         except Exception as e:  # noqa: BLE001 - optional/version-dependent module
-            logger.debug("ATOM image install: %s unavailable (%s)", name, e)
+            logger.debug("ATOM state checkpoint install: %s unavailable (%s)", name, e)
     modules = [m for m in modules if hasattr(m, _KV_CFG_ATTR)]
     if not modules:
         return False
     current = getattr(modules[0], _KV_CFG_ATTR)
-    if getattr(current, "_atom_state_image_patched", False):
+    if getattr(current, "_atom_state_checkpoint_patched", False):
         return False
 
     @functools.wraps(current)
@@ -502,7 +531,7 @@ def _apply_kv_cache_configs_patch() -> bool:
             current, vllm_config, kv_cache_specs, available_memory
         )
 
-    patched._atom_state_image_patched = True
+    patched._atom_state_checkpoint_patched = True
     for module in modules:
         setattr(module, _KV_CFG_ATTR, patched)
     return True
@@ -516,7 +545,7 @@ def _apply_zeroing_patch() -> bool:
     from vllm.v1.kv_cache_interface import KVCacheConfig
 
     prop = KVCacheConfig.__dict__.get("needs_kv_cache_zeroing")
-    if prop is None or getattr(prop.fget, "_atom_state_image_patched", False):
+    if prop is None or getattr(prop.fget, "_atom_state_checkpoint_patched", False):
         return False
     original = prop.fget
 
@@ -527,13 +556,13 @@ def _apply_zeroing_patch() -> bool:
             return False
         return original(self)
 
-    needs_kv_cache_zeroing._atom_state_image_patched = True
+    needs_kv_cache_zeroing._atom_state_checkpoint_patched = True
     KVCacheConfig.needs_kv_cache_zeroing = property(needs_kv_cache_zeroing)
     return True
 
 
 # ---------------------------------------------------------------------------
-# Runner side: lifecycle events, the step's store plan, image group ids
+# Runner side: lifecycle events, the step's store plan, state checkpoint group ids
 # ---------------------------------------------------------------------------
 
 # Worker-side lifecycle events go straight to every slot allocator in the
@@ -541,15 +570,15 @@ def _apply_zeroing_patch() -> bool:
 # this step's metadata is built.
 _slot_allocators: list = []
 _event_counts = {"finished": 0, "preempted": 0, "resumed": 0}
-# This step's image stores as the scheduler hashed them: req_id -> boundary.
+# This step's state checkpoint stores as the scheduler hashed them: req_id -> boundary.
 _store_plan: dict[str, int] = {}
 # Speculative decode: this step's decode rows -> the spacing threshold a
-# committed end must reach to keep an image (decided after the step).
+# committed end must reach to keep a state checkpoint (decided after the step).
 _decode_plan: dict[str, int] = {}
 
 
-# The image worker of each registered family's target model in this process.
-_workers: dict[str, ImageWorker] = {}
+# The state checkpoint worker of each registered family's target model in this process.
+_workers: dict[str, StateCheckpointWorker] = {}
 # Stores registered by builds: planned; issued right after the step's model
 # forward (no drafter) or, with a drafter, at the next build once the forward
 # ran; found still pending at the next build with no forward run (refused).
@@ -562,11 +591,11 @@ _store_counts = {
 }
 
 
-def current_image_store_plan() -> dict[str, int]:
+def current_state_checkpoint_store_plan() -> dict[str, int]:
     return _store_plan
 
 
-def register_image_worker(worker) -> None:
+def register_state_checkpoint_worker(worker) -> None:
     """The worker whose stores run after every model forward of this process."""
     _workers[worker.adapter.name] = worker
 
@@ -585,7 +614,7 @@ def _apply_runner_patches() -> bool:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     original_update = GPUModelRunner._update_states
-    if getattr(original_update, "_atom_state_image_patched", False):
+    if getattr(original_update, "_atom_state_checkpoint_patched", False):
         return False
 
     @functools.wraps(original_update)
@@ -602,10 +631,13 @@ def _apply_runner_patches() -> bool:
         _event_counts["preempted"] += len(preempted)
         _event_counts["resumed"] += len(resumed)
         _store_plan.clear()
-        _store_plan.update(getattr(scheduler_output, "atom_image_stores", None) or {})
+        _store_plan.update(
+            getattr(scheduler_output, "atom_state_checkpoint_stores", None) or {}
+        )
         _decode_plan.clear()
         _decode_plan.update(
-            getattr(scheduler_output, "atom_image_decode_candidates", None) or {}
+            getattr(scheduler_output, "atom_state_checkpoint_decode_candidates", None)
+            or {}
         )
         copies = getattr(scheduler_output, "kv_cache_block_copies", None)
         if copies and _config_has_proxy(getattr(self, "kv_cache_config", None)):
@@ -615,7 +647,7 @@ def _apply_runner_patches() -> bool:
             )
         return original_update(self, scheduler_output, *args, **kwargs)
 
-    wrapped_update_states._atom_state_image_patched = True
+    wrapped_update_states._atom_state_checkpoint_patched = True
     GPUModelRunner._update_states = wrapped_update_states
 
     original_init_kv = GPUModelRunner.initialize_kv_cache
@@ -627,11 +659,11 @@ def _apply_runner_patches() -> bool:
         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
             for name in group.layer_names:
                 layer = sfc.get(name)
-                if getattr(layer, "_atom_state_image_layer", False):
-                    layer._atom_image_group_id = gid
+                if getattr(layer, "_atom_state_checkpoint_layer", False):
+                    layer._atom_state_checkpoint_group_id = gid
         return result
 
-    wrapped_initialize_kv_cache._atom_state_image_patched = True
+    wrapped_initialize_kv_cache._atom_state_checkpoint_patched = True
     GPUModelRunner.initialize_kv_cache = wrapped_initialize_kv_cache
     install_store_sites(GPUModelRunner)
     return True
@@ -646,8 +678,8 @@ def install_store_sites(runner_cls) -> None:
     drafter that is right after ``_model_forward``. With one, the draft's layers
     live in the same slot and write it later in the step (``sample_tokens``
     runs the drafter), so the stores go where native ATOM drains them: into the
-    next batch's build (``run_image_step``), once both forwards ran. The target
-    forward only marks them as run, so a build whose forward never ran is still
+    next batch's build (``run_state_checkpoint_step``), once both forwards ran. The
+    target forward only marks them as run, so a build whose forward never ran is still
     refused rather than copied.
     """
     original = runner_cls._model_forward
@@ -662,17 +694,19 @@ def install_store_sites(runner_cls) -> None:
                 worker.forward_ran = True
         return output
 
-    wrapped_model_forward._atom_state_image_patched = True
+    wrapped_model_forward._atom_state_checkpoint_patched = True
     runner_cls._model_forward = wrapped_model_forward
 
 
 def install() -> tuple[bool, bool, bool, bool]:
-    """Install every image hook. Idempotent; a no-op for unregistered models.
+    """Install every state checkpoint hook. Idempotent; a no-op for unregistered models.
 
     Returns which hooks this call installed: (get_kv_cache_configs, kv zeroing,
     runner events, placement scheduler).
     """
-    from atom.plugin.vllm.paged_state_image_scheduler import apply_scheduler_patches
+    from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+        apply_scheduler_patches,
+    )
 
     return (
         _apply_kv_cache_configs_patch(),
@@ -683,13 +717,13 @@ def install() -> tuple[bool, bool, bool, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Per-step image ops (worker)
+# Per-step state checkpoint ops (worker)
 # ---------------------------------------------------------------------------
 
 
-class ImageWorker:
-    """A target model's image path on one worker: its copier, the image groups'
-    ids and the stores a step leaves for after its forward."""
+class StateCheckpointWorker:
+    """A target model's state checkpoint path on one worker: its copier, the state
+    checkpoint groups' ids and the stores a step leaves for after its forward."""
 
     def __init__(self, adapter, copier, group_ids):
         self.adapter = adapter
@@ -699,23 +733,24 @@ class ImageWorker:
         # With a drafter: the target forward after the build that planned
         # ``pending_stores`` ran (they are issued at the next build).
         self.forward_ran = False
-        # Speculative decode: req_id -> (slot, {boundary: image unit ids}) for
-        # every boundary the last step could commit to; the next build stores
+        # Speculative decode: req_id -> (slot, {boundary: state checkpoint unit ids})
+        # for every boundary the last step could commit to; the next build stores
         # the one it did commit to, if any.
         self.decode_candidates: dict[str, tuple[int, dict]] = {}
 
 
-def image_unit_ids(
+def state_checkpoint_unit_ids(
     group_ids, rows, cols, name: str = "paged-state"
 ) -> list[tuple[int, ...]]:
-    """`k` image block ids per (batch row, block column), from the host block table."""
+    """`k` state checkpoint block ids per (batch row, block column), from the host block
+    table."""
     from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
 
     batch = get_current_input_batch()
     if batch is None or group_ids is None:
         raise RuntimeError(
-            f"{name} image ops need the vLLM input batch and the image group "
-            "ids; the runner patches did not run"
+            f"{name} state checkpoint ops need the vLLM input batch and the state "
+            "checkpoint group ids; the runner patches did not run"
         )
     tables = [batch.block_table[g].block_table.np for g in group_ids]
     out = []
@@ -723,8 +758,8 @@ def image_unit_ids(
         units = tuple(int(t[row, col]) for t in tables)
         if any(u <= 0 for u in units):
             raise RuntimeError(
-                f"{name} image for batch row {row} at block {col} is missing "
-                f"(unit ids {units}); refusing to run from an unrestored slot"
+                f"{name} state checkpoint for batch row {row} at block {col} is "
+                f"missing (unit ids {units}); refusing to run from an unrestored slot"
             )
         out.append(units)
     return out
@@ -744,21 +779,21 @@ def _ops(copier, slots, units, store: bool):
     ]
 
 
-def execute_image_restores(copier, slots, units) -> None:
+def execute_state_checkpoint_restores(copier, slots, units) -> None:
     if not slots:
         return
     copier.execute_paged_state_copies([], _ops(copier, slots, units, False), 0)
 
 
-def execute_image_stores(copier, slots, units) -> None:
+def execute_state_checkpoint_stores(copier, slots, units) -> None:
     if not slots:
         return
     copier.execute_paged_state_copies(_ops(copier, slots, units, True), [], 1)
 
 
-def flush_image_stores(model) -> None:
-    """Store this step's boundary images (the model's own worker)."""
-    flush_worker(getattr(model, "_atom_image_worker", None))
+def flush_state_checkpoint_stores(model) -> None:
+    """Store this step's boundary state checkpoints (the model's own worker)."""
+    flush_worker(getattr(model, "_atom_state_checkpoint_worker", None))
 
 
 def flush_worker(worker, site: str = "after_forward") -> None:
@@ -766,18 +801,18 @@ def flush_worker(worker, site: str = "after_forward") -> None:
         return
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "image stores reached a CUDA graph capture; a replay would store the "
-            "capture batch's slots every step"
+            "state checkpoint stores reached a CUDA graph capture; a replay would "
+            "store the capture batch's slots every step"
         )
     pending = worker.pending_stores
     worker.pending_stores = None
     worker.forward_ran = False
     slots, units = pending
-    execute_image_stores(worker.copier, slots, units)
+    execute_state_checkpoint_stores(worker.copier, slots, units)
     _store_counts[site] += len(slots)
 
 
-def plan_image_ops(
+def plan_state_checkpoint_ops(
     worker,
     md,
     *,
@@ -794,30 +829,31 @@ def plan_image_ops(
 
     A row bound to a fresh slot with ``chunk_start > 0`` resumes from a cached
     prefix (a cross-request hit, or a preempted request's own blocks): its slot
-    is reset and then restored from the image at ``chunk_start`` before the
+    is reset and then restored from the state checkpoint at ``chunk_start`` before the
     forward. A row the scheduler's store plan names (native placement: an
     interval rung, the prompt-end anchor or a demand rung, which prefill was cut
-    to end on, or a decode keep) leaves its slot as that boundary's image, stored
-    after the step's forwards (``run_image_step``) into the block vLLM allocated
-    for it (align mode
+    to end on, or a decode keep) leaves its slot as that boundary's state checkpoint,
+    stored after the step's forwards (``run_state_checkpoint_step``) into the block vLLM
+    allocated for it (align mode
     keeps the running state block at column ``end // block - 1``) and hashed.
-    Results go on ``md`` as ``image_restore_*`` / ``image_store_*``.
+    Results go on ``md`` as ``state_checkpoint_restore_*`` /
+    ``state_checkpoint_store_*``.
     """
     if not rows:
         return
-    md.image_restore_rows = []
-    md.image_restore_slots = []
-    md.image_restore_units = []
-    md.image_store_rows = []
-    md.image_store_slots = []
-    md.image_store_units = []
+    md.state_checkpoint_restore_rows = []
+    md.state_checkpoint_restore_slots = []
+    md.state_checkpoint_restore_units = []
+    md.state_checkpoint_store_rows = []
+    md.state_checkpoint_store_slots = []
+    md.state_checkpoint_store_units = []
     resumed = [i for i in fresh_rows if int(chunk_start[i]) > 0]
     if worker is None:
         if resumed and is_target:
             raise RuntimeError(
                 f"{name} request(s) resumed at chunk_start "
                 f"{[int(chunk_start[i]) for i in resumed]} into a fresh slot, "
-                "but no checkpoint image path is bound; the slot would be read "
+                "but no state checkpoint path is bound; the slot would be read "
                 "unrestored"
             )
         return
@@ -832,20 +868,20 @@ def plan_image_ops(
         if int(chunk_start[i]) % block:
             raise RuntimeError(
                 f"{name} prefix hit at {int(chunk_start[i])} is not on a "
-                f"{block}-token image boundary"
+                f"{block}-token state checkpoint boundary"
             )
     if resumed:
-        md.image_restore_rows = resumed
-        md.image_restore_slots = [int(slots[i]) for i in resumed]
-        md.image_restore_units = image_unit_ids(
+        md.state_checkpoint_restore_rows = resumed
+        md.state_checkpoint_restore_slots = [int(slots[i]) for i in resumed]
+        md.state_checkpoint_restore_units = state_checkpoint_unit_ids(
             worker.group_ids,
             resumed,
             [int(chunk_start[i]) // block - 1 for i in resumed],
             name,
         )
-    plan = dict(current_image_store_plan())
+    plan = dict(current_state_checkpoint_store_plan())
     # One step's plan is good for that step's build only.
-    current_image_store_plan().clear()
+    current_state_checkpoint_store_plan().clear()
     if not plan:
         return
     ends = chunk_start[:rows].astype(np.int64) + lens[:rows].astype(np.int64)
@@ -855,16 +891,16 @@ def plan_image_ops(
         i = row_of.get(rid)
         if i is None or int(ends[i]) != int(end) or int(end) % block:
             raise RuntimeError(
-                f"{name} image for {rid} was hashed at {end} but this step "
+                f"{name} state checkpoint for {rid} was hashed at {end} but this step "
                 f"{'does not carry it' if i is None else f'ends at {int(ends[i])}'}; "
-                "the cached image would never be written"
+                "the cached state checkpoint would never be written"
             )
         stores.append(i)
     stores.sort()
     if stores:
-        md.image_store_rows = stores
-        md.image_store_slots = [int(slots[i]) for i in stores]
-        md.image_store_units = image_unit_ids(
+        md.state_checkpoint_store_rows = stores
+        md.state_checkpoint_store_slots = [int(slots[i]) for i in stores]
+        md.state_checkpoint_store_units = state_checkpoint_unit_ids(
             worker.group_ids, stores, [int(ends[i]) // block - 1 for i in stores], name
         )
 
@@ -872,7 +908,7 @@ def plan_image_ops(
 def _exact_starts(rows: int, name: str):
     """Each row's first position this step. Under async speculative decode the
     builder's ``seq_lens_cpu_upper_bound`` assumes every in-flight draft was
-    accepted; in align mode (images on) vLLM applies the correction to the
+    accepted; in align mode (state checkpoints on) vLLM applies the correction to the
     input batch before the metadata build, so this is exact."""
     from atom.plugin.vllm.req_id_passthrough_patch import get_current_input_batch
 
@@ -906,15 +942,17 @@ def store_decode_keeps(worker, req_ids, starts, fresh_rows) -> None:
             units.append(unit_ids)
     if slots:
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("decode keep image stores reached a CUDA graph capture")
-        execute_image_stores(worker.copier, slots, units)
+            raise RuntimeError(
+                "decode keep state checkpoint stores reached a CUDA graph capture"
+            )
+        execute_state_checkpoint_stores(worker.copier, slots, units)
         _store_counts["decode_keep"] += len(slots)
 
 
 def record_decode_candidates(worker, req_ids, slots, starts, lens, block, name):
-    """The image blocks of every boundary this step's decode rows could commit
-    to, at or past their spacing threshold (vLLM allocates image blocks up to
-    the scheduled end, so each is there)."""
+    """The state checkpoint blocks of every boundary this step's decode rows could
+    commit to, at or past their spacing threshold (vLLM allocates state checkpoint
+    blocks up to the scheduled end, so each is there)."""
     plan = dict(_decode_plan)
     _decode_plan.clear()
     out = {}
@@ -930,20 +968,22 @@ def record_decode_candidates(worker, req_ids, slots, starts, lens, block, name):
             if b >= threshold
         ]
         if ends:
-            unit_ids = image_unit_ids(
+            unit_ids = state_checkpoint_unit_ids(
                 worker.group_ids, [i] * len(ends), [b // block - 1 for b in ends], name
             )
             out[rid] = (int(slots[i]), dict(zip(ends, unit_ids)))
     worker.decode_candidates = out
 
 
-def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) -> None:
+def run_state_checkpoint_step(
+    worker, md, *, capturing: bool, plan, reset_fn, name: str
+) -> None:
     """One step's slot work, outside any captured graph, in this order:
 
     1. the stores the last build left behind: with a drafter, issued here once
        its forward ran (native drains them into the next batch's build, after
        the target and the draft forward); refused if it never ran;
-    2. ``plan()`` (``plan_image_ops`` with the bridge's row data);
+    2. ``plan()`` (``plan_state_checkpoint_ops`` with the bridge's row data);
     3. ``reset_fn(md.reset_slots)``: fresh slots back to the reset state;
     4. restores of this step's prefix hits;
     5. stores registered for after the step's forwards
@@ -955,19 +995,20 @@ def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) ->
         # The last build planned stores that its forward never issued, so the
         # slots still hold an earlier position's state while the scheduler has
         # already hashed (and may already have handed to a later step's prefix
-        # hit) the image blocks for the planned boundary. Neither copying nor
+        # hit) the state checkpoint blocks for the planned boundary. Neither copying nor
         # unhashing from here can make that right.
         _store_counts["at_next_build"] += len(worker.pending_stores[0])
         logger.error(
-            "ATOM %s: image stores planned by the previous build were never issued",
+            "ATOM %s: state checkpoint stores planned by the previous build were "
+            "never issued",
             name,
         )
         raise RuntimeError(
-            f"{name} image stores planned by the previous step's metadata build were "
-            "never issued: that step's model forward never ran after the build (or "
-            "ran outside GPUModelRunner._model_forward). Their image blocks are "
-            "already hashed for the planned boundary and copying the slot now would "
-            "cache an earlier position's state."
+            f"{name} state checkpoint stores planned by the previous step's metadata "
+            "build were never issued: that step's model forward never ran after the "
+            "build (or ran outside GPUModelRunner._model_forward). Their state "
+            "checkpoint blocks are already hashed for the planned boundary and copying "
+            "the slot now would cache an earlier position's state."
         )
     if not capturing:
         plan()
@@ -976,12 +1017,17 @@ def run_image_step(worker, md, *, capturing: bool, plan, reset_fn, name: str) ->
         reset_fn(reset_slots)
     if worker is None:
         return
-    # A prefix hit's fresh slot: reset above, then its boundary image back.
-    if getattr(md, "image_restore_slots", None):
-        execute_image_restores(
-            worker.copier, md.image_restore_slots, md.image_restore_units
+    # A prefix hit's fresh slot: reset above, then its boundary state checkpoint back.
+    if getattr(md, "state_checkpoint_restore_slots", None):
+        execute_state_checkpoint_restores(
+            worker.copier,
+            md.state_checkpoint_restore_slots,
+            md.state_checkpoint_restore_units,
         )
-    if getattr(md, "image_store_slots", None):
-        worker.pending_stores = (md.image_store_slots, md.image_store_units)
+    if getattr(md, "state_checkpoint_store_slots", None):
+        worker.pending_stores = (
+            md.state_checkpoint_store_slots,
+            md.state_checkpoint_store_units,
+        )
         worker.forward_ran = False
-        _store_counts["planned"] += len(md.image_store_slots)
+        _store_counts["planned"] += len(md.state_checkpoint_store_slots)
