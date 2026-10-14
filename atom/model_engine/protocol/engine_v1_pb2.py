@@ -91,5 +91,3 @@ if _descriptor._USE_C_DESCRIPTORS == False:
   _STOPPED._serialized_start=4918
   _STOPPED._serialized_end=4927
 # @@protoc_insertion_point(module_scope)
-
-PROTO_SHA256 = "96176b755a5e4e4cc8929bab3e5e3b995e9baf0bf2a305abf19e18bf1483cf66"

@@ -18,7 +18,7 @@ from dataclasses import fields
 from itertools import chain
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
-from atom.model_engine.protocol.binding import pb
+from atom.model_engine.protocol import engine_v1_pb2 as pb
 from atom.model_engine.protocol.requests import CompletionResult, IngressRequest
 from atom.model_engine.protocol.wire import (
     FrameReader,

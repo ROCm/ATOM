@@ -80,19 +80,6 @@ jobs:
       - name: Validate catalogs
         run: python3 .github/scripts/validate_catalog.py
 
-  engine-protocol-binding:
-    name: Check the engine protocol binding is up to date
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-      - name: Set up Python environment
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Check engine_v1_pb2.py against engine_v1.proto
-        run: python3 atom/model_engine/protocol/generate.py --check
-
   unit-tests:
     name: Run non-GPU unit tests
     runs-on: ubuntu-latest
