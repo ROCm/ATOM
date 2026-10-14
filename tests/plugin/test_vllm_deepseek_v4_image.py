@@ -280,6 +280,75 @@ def test_v4_without_images_takes_any_drafter_and_no_drafter_takes_images(
     assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "align"
 
 
+@pytest.fixture
+def gfx(monkeypatch):
+    from aiter.jit.utils import chip_info
+
+    def set_gfx(name):
+        monkeypatch.setattr(chip_info, "get_gfx", lambda: name)
+
+    return set_gfx
+
+
+def test_v4_images_run_with_an_fp8_kv_cache(atom_v4, gfx):
+    gfx("gfx950")
+    for dtype in ("fp8", "fp8_e4m3"):
+        vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS)
+        vc.cache_config.cache_dtype = dtype
+        assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "align"
+
+
+@pytest.mark.parametrize(
+    "dtype,arch,why",
+    [
+        ("auto", "gfx950", "a bf16 KV cache"),
+        ("bfloat16", "gfx950", "a bf16 KV cache"),
+        # The same decision as the sizing: fp8 asked, degraded to bf16 off
+        # gfx950 / gfx1250.
+        ("fp8", "gfx942", "which this GPU runs as a bf16 KV cache"),
+    ],
+)
+def test_v4_images_refuse_a_bf16_kv_cache_at_startup(
+    atom_v4, gfx, monkeypatch, v4_target, dtype, arch, why
+):
+    from atom.plugin.vllm.deepseek_v4_bridge import _v4_kv_fp8
+    from atom.plugin.vllm.deepseek_v4_image import (
+        DeepseekV4ImageAdapter,
+        register_deepseek_v4_image_layers,
+    )
+
+    gfx(arch)
+
+    def no_sizing(self, vc):
+        raise AssertionError("sized before the dtype check")
+
+    for spec in (None, _real_spec(v4_target, "mtp")):
+        vc = _hook_vcfg("DeepseekV4ForCausalLM", RATIOS, spec=spec)
+        vc.cache_config.cache_dtype = dtype
+        vc.compilation_config = NS(static_forward_context={})
+        assert not _v4_kv_fp8(vc)
+        # Both where a worker turns images on (model construction, before the
+        # model profiles) and in EngineCore's KV-config hook.
+        for site in (register_deepseek_v4_image_layers, _v4_hook):
+            with monkeypatch.context() as m:
+                m.setattr(DeepseekV4ImageAdapter, "sizing", no_sizing)
+                with pytest.raises(ValueError) as e:
+                    site(vc)
+            msg = str(e.value)
+            assert msg.startswith(
+                "DeepSeek-V4 prefix caching through checkpoint images is only "
+                "validated with an fp8 KV cache"
+            )
+            assert f"--kv-cache-dtype {dtype!r}, {why}." in msg
+            assert "--kv-cache-dtype fp8" in msg
+            assert "--no-enable-prefix-caching" in msg
+        assert vc.compilation_config.static_forward_context == {}
+        assert vc.cache_config.mamba_cache_mode == "none"
+        # Without prefix caching there are no images to refuse.
+        vc.cache_config.enable_prefix_caching = False
+        assert _v4_hook(vc) == [] and vc.cache_config.mamba_cache_mode == "none"
+
+
 def test_event_driven_slots_never_take_a_live_requests_slot():
     alloc = StateSlotAllocator(2, evict_lru=False)
     slots, reset = alloc.assign(["a", "b"], np.array([0, 256]))

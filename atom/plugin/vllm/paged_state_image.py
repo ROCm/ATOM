@@ -94,6 +94,11 @@ class PagedStateImageAdapter:
         any other drafter: a prefix hit would resume it without its state."""
         return False
 
+    def check_images_supported(self, vllm_config) -> None:
+        """Raise ``ValueError`` when images cannot run with this config. Runs
+        where a worker registers the image layers and in EngineCore's KV-config
+        hook, each time before the family's sizing."""
+
 
 _adapters: list[PagedStateImageAdapter] = []
 
@@ -236,6 +241,9 @@ def register_image_layers(
     adapter, vllm_config, layer_cls=PagedStateImageLayer
 ) -> list[str]:
     """Register the k image layers next to the proxy (worker side)."""
+    # The worker builds the model and profiles it before EngineCore's KV-config
+    # hook runs; refuse here first.
+    adapter.check_images_supported(vllm_config)
     sizing = adapter.sizing(vllm_config)
     sfc = vllm_config.compilation_config.static_forward_context
     names = adapter.image_layer_names(sizing.spec.units_per_checkpoint)
@@ -380,9 +388,8 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
 
     bs = adapter.block_size
     pc = images_on(adapter, vllm_config)
-    sizing = adapter.sizing(vllm_config)
-    k = sizing.spec.units_per_checkpoint
     if pc:
+        adapter.check_images_supported(vllm_config)
         spec = getattr(vllm_config, "speculative_config", None)
         if spec is not None:
             if not adapter.drafter_state_in_image(vllm_config):
@@ -400,6 +407,8 @@ def _kv_cache_configs_hook(original, vllm_config, kv_cache_specs, available_memo
         # Align mode also makes vLLM correct an async spec-decode step's
         # positions before the metadata build, which decode keeps rely on.
         vllm_config.cache_config.mamba_cache_mode = "align"
+    sizing = adapter.sizing(vllm_config)
+    k = sizing.spec.units_per_checkpoint
     configs = original(vllm_config, kv_cache_specs, available_memory)
     if getattr(vllm_config.model_config, "original_max_model_len", None) == -1:
         _refit_max_model_len(vllm_config, configs, proxy_name, sizing)

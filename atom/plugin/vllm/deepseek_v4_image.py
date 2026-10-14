@@ -490,6 +490,26 @@ class DeepseekV4ImageAdapter(PagedStateImageAdapter):
     def drafter_state_in_image(self, vllm_config) -> bool:
         return v4_drafter_in_target_slot(vllm_config)
 
+    def check_images_supported(self, vllm_config) -> None:
+        # Images are validated only over the fp8 2buff layout; the bf16 one is
+        # another plane geometry, and the plugin's bf16 V4 path does not run.
+        from atom.plugin.vllm.deepseek_v4_bridge import _v4_kv_fp8
+
+        if _v4_kv_fp8(vllm_config):
+            return
+        dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+        why = (
+            "which this GPU runs as a bf16 KV cache"
+            if isinstance(dtype, str) and dtype.startswith("fp8")
+            else "a bf16 KV cache"
+        )
+        raise ValueError(
+            "DeepSeek-V4 prefix caching through checkpoint images is only "
+            f"validated with an fp8 KV cache; got --kv-cache-dtype {dtype!r}, "
+            f"{why}. Pass --kv-cache-dtype fp8 (gfx950 / gfx1250), or "
+            "--no-enable-prefix-caching."
+        )
+
 
 def v4_drafter_in_target_slot(vllm_config) -> bool:
     """Whether the drafter is the V4 MTP draft, the one the plugin binds into the
