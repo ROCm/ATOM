@@ -367,8 +367,10 @@ class Drafter(abc.ABC):
         """``[len(req_ids)]`` int32 mapping each request to its first q row."""
         return None
 
-    def stage_draft_sampling(self, scheduled_bs: int) -> None:
-        """Refresh the draft sampler's per-step inputs before the block runs."""
+    def stage_draft_sampling_host(self, batch, bs: int, group) -> None:
+        """Stage the draft sampler's per-step inputs into pinned host buffers
+        and claim their counts in `prepare_sample`'s own `sampling` H2D
+        publication, which is what carries them to the device."""
         return
 
     def record_draft_probs_slots(self, req_ids) -> None:

@@ -1,5 +1,6 @@
 import logging
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -74,6 +75,14 @@ class DSparkProposer(Drafter):
     _q_slot_of = None
     _q_free = None
     _draft_sample_step = 0
+    _draft_temps_buf = None
+    _draft_greedy_buf = None
+    _draft_seed_buf = None
+    #: How many sequences the last `stage_draft_sampling_host` covered, so
+    #: `propose` can check it is drafting that same batch. -1 is "nothing
+    #: staged yet", which only a propose with no `prepare_sample` before it
+    #: could see -- there is no such path, and the assertion says so.
+    _staged_draft_bs = -1
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -134,6 +143,29 @@ class DSparkProposer(Drafter):
             # arm DeepSeek-V4 the day its head grew that method. Silent, because
             # "this flavor has not been ported" is not an operator error.
             return
+        if self.config.pipeline_parallel_size > 1:
+            # The draft's temperatures / greedy mask / seed ride the runner's
+            # `sampling` publication group (see `stage_draft_sampling_host`),
+            # and PP gives that group a RING -- one cloned buffer set per
+            # in-flight microbatch, rotated by `_advance_forward_vars`. The
+            # block head binds one address, so it would read slot 0 while
+            # `prepare_sample` wrote slot k.
+            #
+            # Falls back rather than keeping a private copy, because PP has no
+            # use for the feature anyway: `Scheduler` reports `spec_decode_local
+            # = pp_size == 1`, so such an engine DRAFTS FOR HANDOFF and
+            # verifies nothing. The ratio accept rule is unreachable there, and
+            # arming the draft half alone is the sampled-draft/exact-match pair
+            # that is strictly worse than flag-off.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is not implemented under pipeline "
+                "parallelism (pp=%d): such an engine drafts for handoff and "
+                "verifies nothing, so the ratio accept rule it pairs with is "
+                "never reached. Falling back to greedy proposal with "
+                "exact-match acceptance.",
+                self.config.pipeline_parallel_size,
+            )
+            return
         if get_pcp_world_size() > 1:
             # PCP decodes redundantly and aligns by BROADCASTING the draft ids
             # (`ModelRunner.propose_draft_token_ids`), because the ranks' kernels
@@ -162,14 +194,60 @@ class DSparkProposer(Drafter):
         # reads it a step after the pass that wrote it, so it cannot come from
         # the graph's private pool either.
         probs = torch.empty((max_bs, t, vocab), dtype=torch.float32, device=self.device)
+        # The block head's three scalar inputs. Staged on the HOST by
+        # `stage_draft_sampling_host` and uploaded by the runner's existing
+        # batched `sampling` publication, alongside `temperatures` / `top_ks` /
+        # `top_ps` -- which is why they are CpuGpuBuffers in a publication
+        # group rather than plain device tensors. See that method for why none
+        # of this can be derived on the device.
+        #
+        # The runner picks them up through `metadata_buffers`, so they are
+        # declared before `ModelRunner.allocate_forward_vars` runs. Allocated
+        # ONCE and never reallocated, like `probs`: the block head is captured
+        # and bakes each address. (PP, the one thing that would rotate them, is
+        # refused above.)
+        pin = torch.device(self.device).type != "cpu"
+        buffers = {
+            "draft_temperatures": CpuGpuBuffer(
+                max_bs,
+                dtype=torch.float32,
+                device=self.device,
+                pin_memory=pin,
+                publication_group="sampling",
+            ),
+            "draft_greedy_mask": CpuGpuBuffer(
+                max_bs,
+                dtype=torch.int32,
+                device=self.device,
+                pin_memory=pin,
+                publication_group="sampling",
+            ),
+            "draft_sample_seed": CpuGpuBuffer(
+                1,
+                dtype=torch.int32,
+                device=self.device,
+                pin_memory=pin,
+                publication_group="sampling",
+            ),
+        }
+        # Default 1.0 rather than 0: the tail rows between `scheduled_bs` and
+        # `running_bs` are fabricated and nothing reads their q, but a 0 here
+        # would divide by zero inside the kernel on every step. Only `[:bs]` is
+        # ever staged or uploaded, so the tail keeps whatever it is seeded with
+        # -- on BOTH halves, since the host half is what later uploads copy.
+        buffers["draft_temperatures"].np[:] = 1.0
+        buffers["draft_temperatures"].gpu.fill_(1.0)
+        buffers["draft_greedy_mask"].np[:] = 1
+        buffers["draft_greedy_mask"].gpu.fill_(1)
+        self.metadata_buffers.update(buffers)
+        self._draft_temps_buf = buffers["draft_temperatures"]
+        self._draft_greedy_buf = buffers["draft_greedy_mask"]
+        self._draft_seed_buf = buffers["draft_sample_seed"]
         self.draft_sampling = DraftSampling(
             probs=probs,
-            # Default 1.0 rather than 0: the tail rows between `scheduled_bs`
-            # and `running_bs` are fabricated and nothing reads their q, but a
-            # 0 here would divide by zero inside the kernel on every step.
-            temperatures=torch.ones(max_bs, dtype=torch.float32, device=self.device),
-            greedy_mask=torch.ones(max_bs, dtype=torch.int32, device=self.device),
-            seed=torch.zeros(1, dtype=torch.int32, device=self.device),
+            temperatures=self._draft_temps_buf.gpu,
+            greedy_mask=self._draft_greedy_buf.gpu,
+            seed=self._draft_seed_buf.gpu,
         )
         # Flat `[max_bs * T, V]` view, which is how the block head addresses the
         # SCRATCH it writes: one row per (batch slot, block position).
@@ -236,22 +314,61 @@ class DSparkProposer(Drafter):
         """
         return None if self.draft_sampling is None else self._q_store
 
-    def stage_draft_sampling(self, scheduled_bs: int) -> None:
-        """Refresh this step's temperatures, greedy mask and Philox key.
+    def stage_draft_sampling_host(self, batch, bs: int, group) -> None:
+        """Stage this step's temperatures, greedy mask and Philox key on the HOST.
 
-        OUTSIDE the recording, every step: the block head is captured, so the
-        only thing that can vary between replays is the CONTENT of the buffers
-        whose addresses it baked.
+        Called from `ModelRunner.prepare_sample`, which already holds
+        `batch.temperatures` as a numpy array and is already publishing a
+        batched `sampling` H2D. Three more members in that group ride along for
+        free, which is the point: done on the device this was
+        `copy_ / compare / cast / copy_ / fill_` -- four launches on `[bs]`
+        tensors, a measured 23.6us FLAT from bs=1 to bs=64, i.e. pure launch
+        overhead on the critical path between the target forward and the draft.
+
+        Nothing here needs the device. The greedy mask is a pure function of
+        `batch.temperatures`, which only ever existed on the host; it used to
+        be recovered by uploading those temperatures and comparing them back.
+
+        The buffers' ADDRESSES are still fixed for the process (the block head
+        is captured and bakes them); only the contents vary, and they are
+        refreshed outside any recording -- the publication is part of host
+        preparation, strictly before the forward.
 
         Reads the runner's own per-request sampling parameters rather than
         taking them as arguments, so the temperature the draft divides by is
         the number the target's verify softmax will divide by --
         `rejection_sampler._ratio_target_probs` reads the runner's buffer and
-        this copies out of it. The ONE case where the two deliberately differ
-        is a top-k/top-p batch, which drafts greedily; see below.
+        this stages from the same `batch.temperatures`. The ONE case where the
+        two deliberately differ is a top-k/top-p batch, which drafts greedily;
+        see below.
         """
-        if self.draft_sampling is None or scheduled_bs == 0:
+        if self.draft_sampling is None:
             return
+        temps = self._draft_temps_buf
+        mask = self._draft_greedy_buf
+        seed = self._draft_seed_buf
+        # The Philox key. A plain SPMD counter, so every TP rank reaches the
+        # same number without exchanging it -- which is the whole requirement:
+        # ranks drawing different uniforms draft different blocks, and
+        # `num_bonus_tokens` (rank-local) then disagrees with `sampled_tokens`
+        # (broadcast from rank 0), the anchor gather reads a -1 column, and the
+        # draft embeds an invalid id. `prepare_sample` runs once per step on
+        # every rank of a TP group, so it advances in lockstep exactly as the
+        # per-propose version did.
+        seed.np[0] = self._draft_sample_step
+        self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
+        counts = group.counts
+        counts[group.indices["draft_sample_seed"]] = 1
+        # A 0-row batch has nothing to stage and `[:0]` writes would publish a
+        # zero-length member; leave the buffers alone, as the device version did.
+        counts[group.indices["draft_temperatures"]] = bs or None
+        counts[group.indices["draft_greedy_mask"]] = bs or None
+        if not bs:
+            return
+        # Which batch this is sized by: the SCHEDULED one. The pad rows up to
+        # `running_bs` that the block pass fabricates are not here, and nothing
+        # reads their q -- they keep the 1.0 / 1 seeded at allocation.
+        self._staged_draft_bs = bs
         if self.runner.sampling_has_row_filter:
             # A batch with top-k or top-p on ANY row drafts GREEDILY, the whole
             # batch of it, and the reason is that the verify side cannot take
@@ -290,28 +407,18 @@ class DSparkProposer(Drafter):
             # This is the draft's own copy of the temperature, not the target's:
             # `rejection_sampler` reads `forward_vars["temperatures"]`, which is
             # untouched here, so the target's p keeps the request's real T.
-            dst = self.draft_sampling.temperatures[:scheduled_bs]
-            dst.fill_(SAMPLER_EPS)
-            self.draft_sampling.greedy_mask[:scheduled_bs].fill_(1)
+            temps.np[:bs] = SAMPLER_EPS
+            mask.np[:bs] = 1
         else:
-            temperatures = self.runner.forward_vars["temperatures"].gpu[:scheduled_bs]
-            dst = self.draft_sampling.temperatures[:scheduled_bs]
-            dst.copy_(temperatures)
+            # The same clamp `prepare_sample` applies to the TARGET's copy, so
+            # the two divide by the same number row for row.
+            np.maximum(batch.temperatures, SAMPLER_EPS, out=temps.np[:bs])
             # A greedy row is "temperature was 0 before `prepare_sample` clamped
             # it to SAMPLER_EPS", and `Sampler` itself tests `temperatures <=
             # SAMPLER_EPS` -- the same predicate, so a row cannot be greedy to
-            # the target and stochastic to the draft.
-            self.draft_sampling.greedy_mask[:scheduled_bs].copy_(
-                (dst <= SAMPLER_EPS).to(torch.int32)
-            )
-        # The Philox key. A plain SPMD counter, so every TP rank reaches the
-        # same number without exchanging it -- which is the whole requirement:
-        # ranks drawing different uniforms draft different blocks, and
-        # `num_bonus_tokens` (rank-local) then disagrees with `sampled_tokens`
-        # (broadcast from rank 0), the anchor gather reads a -1 column, and the
-        # draft embeds an invalid id.
-        self.draft_sampling.seed.fill_(self._draft_sample_step)
-        self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
+            # the target and stochastic to the draft. Tested PRE-clamp here,
+            # which is the same set of rows: `max(t, EPS) <= EPS` iff `t <= EPS`.
+            mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
 
     def _claim_q_slot(self) -> int:
         """A free persistent q slot, recycling the stalest live one if need be.
@@ -1019,13 +1126,29 @@ class DSparkProposer(Drafter):
             running_bs, next_token_ids, target_positions, last_token_indices
         )
 
-        # This step's temperatures / greedy mask / Philox key into the buffers
-        # the captured block head baked the addresses of. Here, above the flavor
-        # split, so neither path can forget it -- a stale seed would make two
-        # consecutive steps draft from the SAME uniform stream. Sized by the
-        # SCHEDULED batch: the pad rows up to `running_bs` are fabricated and
-        # nothing reads their q.
-        self.stage_draft_sampling(scheduled_bs)
+        # This step's temperatures / greedy mask / Philox key are already in the
+        # buffers the captured block head baked the addresses of:
+        # `stage_draft_sampling_host` wrote them during `prepare_sample` and the
+        # step's own `sampling` H2D carried them, so there is nothing to launch
+        # here. `prepare_sample` runs once per step, above the prefill/decode
+        # split and before every propose this engine makes -- align-only ones
+        # included -- which is the same coverage the call that used to sit here
+        # had, and a stale seed would make two consecutive steps draft from the
+        # SAME uniform stream.
+        #
+        # The one thing that would break silently is the two sizing themselves
+        # by different batches, so say it out loud. Both count SCHEDULED
+        # sequences: `next_token_ids` has one row per sampled sequence and
+        # `prepare_sample` reads `batch.total_seqs_num`. The pad rows up to
+        # `running_bs` are in neither, and nothing reads their q.
+        assert (
+            self.draft_sampling is None
+            or scheduled_bs == 0
+            or self._staged_draft_bs == scheduled_bs
+        ), (
+            f"draft sampling staged for {self._staged_draft_bs} sequences but "
+            f"the block is drafting {scheduled_bs}"
+        )
 
         if self._with_draft:
             return self._propose_with_draft(

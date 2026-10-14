@@ -745,7 +745,7 @@ def _lossless_verify_inputs(drafter, req_ids, *, all_greedy, top_ks, top_ps):
     still been SAMPLED, and a sampled proposal under exact-match acceptance
     matches strictly less often than the greedy proposal the flag-off path
     makes, so one `top_p < 1` request made every row in the batch worse than if
-    the flag were off. It no longer is. `DSparkProposer.stage_draft_sampling`
+    the flag were off. It no longer is. `DSparkProposer.stage_draft_sampling_host`
     reads `ModelRunner.sampling_has_row_filter` and drafts such a batch
     greedily, so a filtered batch is now exactly the flag-off pair -- greedy
     proposal, exact-match acceptance -- rather than worse than it.
@@ -1472,11 +1472,11 @@ class ModelRunner:
         f32_kwargs = {"dtype": torch.float, "device": self.device}
 
         # Does the batch currently being sampled carry an active top-k/top-p on
-        # ANY row? Written by `prepare_sample` and read, a few hundred
-        # microseconds later in the same step, by
-        # `DSparkProposer.stage_draft_sampling` -- which has to know it BEFORE
-        # it drafts, because the only thing that can un-regress a filtered
-        # batch is drafting it greedily. See the comment there.
+        # ANY row? Written by `prepare_sample` and read a few lines later in the
+        # same call by `DSparkProposer.stage_draft_sampling_host`, which has to
+        # know it BEFORE the batch is drafted, because the only thing that can
+        # un-regress a filtered batch is drafting it greedily. See the comment
+        # there.
         #
         # A host bool rather than a device tensor: `prepare_sample` already
         # decides it on the CPU to keep the sampler free of syncs, so reading
@@ -2757,6 +2757,16 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
+        # The DRAFT's copy of the same three facts, staged into the same
+        # publication. A no-op on every drafter but a DSpark one with lossless
+        # sampling armed, and that one contributes its own members to this
+        # group, so the upload stays a single batched H2D. Here and not in
+        # `propose` because everything it needs is on the HOST at this point --
+        # `batch.temperatures`, `sampling_has_row_filter` decided just above --
+        # whereas by propose it would have to be read back off the device.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            drafter.stage_draft_sampling_host(batch, bs, group)
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]

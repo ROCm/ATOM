@@ -19,7 +19,7 @@ Two halves, one test file:
 
 * `_lossless_verify_inputs` -- the verify side never hands the ratio kernel a
   filtered batch.
-* `stage_draft_sampling` -- the draft side answers that by clamping the DRAFT's
+* `stage_draft_sampling_host` -- the draft side answers that by clamping the DRAFT's
   temperature to `SAMPLER_EPS` and setting every `greedy_mask` row, so the token
   is an argmax AND the published `q` is the delta that argmax drew from. The
   mask alone would not do: it only replaces the exponential race, leaving `q` at
@@ -38,6 +38,7 @@ ZERO coverage in CI (`.github/scripts/run_unit_tests.sh`).
 import ast
 import pathlib
 
+import numpy as np
 import pytest
 import torch
 
@@ -71,10 +72,10 @@ def _lift(path, name, namespace, cls=None):
 
 lossless_verify_inputs = _lift(RUNNER_SOURCE, "_lossless_verify_inputs", {})
 needs_verification_sample = _lift(RUNNER_SOURCE, "_needs_verification_sample", {})
-stage_draft_sampling = _lift(
+stage_draft_sampling_host = _lift(
     PROPOSER_SOURCE,
-    "stage_draft_sampling",
-    {"torch": torch, "SAMPLER_EPS": SAMPLER_EPS},
+    "stage_draft_sampling_host",
+    {"np": np, "torch": torch, "SAMPLER_EPS": SAMPLER_EPS},
     cls="DSparkProposer",
 )
 
@@ -190,92 +191,171 @@ def test_an_all_greedy_batch_never_draws_one():
     assert not needs_verification_sample(True, torch.zeros(4, 8))
 
 
-class FakeProposer:
-    """`stage_draft_sampling`'s world: the runner's temperatures, the draft's
-    own copy of them, and the greedy mask the block head reads."""
+class FakeBuffer:
+    """A `CpuGpuBuffer` as `stage_draft_sampling_host` uses it: a pinned host
+    array it writes, which the runner's batched `sampling` H2D later uploads."""
 
-    stage_draft_sampling = stage_draft_sampling
+    def __init__(self, n, dtype, fill):
+        self.np = np.full(n, fill, dtype=dtype)
+
+
+class FakeGroup:
+    """A `PublicationGroup`: named slots whose counts say how many rows of each
+    member this step's single upload carries."""
+
+    def __init__(self, names):
+        self.indices = {name: i for i, name in enumerate(names)}
+        self.counts = [None] * len(names)
+
+
+MEMBERS = (
+    "temperatures",
+    "top_ks",
+    "top_ps",
+    "draft_temperatures",
+    "draft_greedy_mask",
+    "draft_sample_seed",
+)
+
+
+class FakeProposer:
+    """`stage_draft_sampling_host`'s world: the scheduler's raw per-request
+    temperatures on the host, the draft's own pinned copy of them, the greedy
+    mask the block head reads, and the publication they all ride."""
+
+    stage_draft_sampling_host = stage_draft_sampling_host
 
     def __init__(self, temperatures, has_filter, max_bs=8):
         bs = len(temperatures)
-        self.draft_sampling = type(
-            "DraftSampling",
-            (),
-            {
-                "temperatures": torch.ones(max_bs),
-                "greedy_mask": torch.zeros(max_bs, dtype=torch.int32),
-                "seed": torch.zeros(1, dtype=torch.int32),
-            },
-        )()
-        gpu = torch.ones(max_bs)
-        gpu[:bs] = torch.tensor(temperatures, dtype=torch.float32)
-        self.runner = type(
-            "Runner",
-            (),
-            {
-                "forward_vars": {"temperatures": type("B", (), {"gpu": gpu})()},
-                "sampling_has_row_filter": has_filter,
-            },
-        )()
+        self.draft_sampling = object()  # merely "armed"; the buffers are below
+        # Seeded exactly as `_init_lossless_sampling` seeds them: 1.0 and 1, so
+        # the fabricated tail rows never divide by zero in the block head.
+        self._draft_temps_buf = FakeBuffer(max_bs, np.float32, 1.0)
+        self._draft_greedy_buf = FakeBuffer(max_bs, np.int32, 1)
+        self._draft_seed_buf = FakeBuffer(1, np.int32, 0)
+        self.runner = type("Runner", (), {"sampling_has_row_filter": has_filter})()
         self._draft_sample_step = 0
+        self._staged_draft_bs = -1
         self.bs = bs
+        self.group = FakeGroup(MEMBERS)
+        # The RAW temperatures, pre-clamp -- which is what `prepare_sample`
+        # holds and what a greedy request actually carries.
+        self.batch = type(
+            "Batch", (), {"temperatures": np.asarray(temperatures, dtype=np.float32)}
+        )()
+
+    def stage(self):
+        self.stage_draft_sampling_host(self.batch, self.bs, self.group)
+
+    @property
+    def temps(self):
+        return torch.from_numpy(self._draft_temps_buf.np)
+
+    @property
+    def mask(self):
+        return torch.from_numpy(self._draft_greedy_buf.np)
 
 
 # Mixed temperatures, so "the whole batch went greedy" is distinguishable from
-# "the rows that were already greedy stayed greedy".
-TEMPS = [1.0, SAMPLER_EPS, 0.7]
+# "the rows that were already greedy stayed greedy". 0.0 is what a greedy
+# request really carries before `prepare_sample` clamps it.
+TEMPS = [1.0, 0.0, 0.7]
 
 
 def test_a_filtered_batch_drafts_greedily_and_publishes_a_delta_q():
     p = FakeProposer(TEMPS, has_filter=True)
-    p.stage_draft_sampling(p.bs)
+    p.stage()
     # Every row, not only the filtered ones: the verify-side drop is batch-wide,
     # so a row left sampling would be the sampled-draft/exact-match pair that is
     # worse than flag-off.
     torch.testing.assert_close(
-        p.draft_sampling.greedy_mask[: p.bs],
-        torch.ones(p.bs, dtype=torch.int32),
-        rtol=0,
-        atol=0,
+        p.mask[: p.bs], torch.ones(p.bs, dtype=torch.int32), rtol=0, atol=0
     )
     # The temperature too, which is what makes the published q a delta rather
     # than merely making the id an argmax.
     torch.testing.assert_close(
-        p.draft_sampling.temperatures[: p.bs],
-        torch.full((p.bs,), SAMPLER_EPS),
-        rtol=0,
-        atol=0,
+        p.temps[: p.bs], torch.full((p.bs,), SAMPLER_EPS), rtol=0, atol=0
     )
 
 
 def test_an_unfiltered_batch_keeps_each_requests_own_temperature():
     """The control, and the contract the ratio rule rests on: the draft divides
-    by the number the target's verify softmax divides by, row for row."""
+    by the number the target's verify softmax divides by, row for row -- which
+    means the SAME `max(t, SAMPLER_EPS)` clamp the target's copy gets."""
     p = FakeProposer(TEMPS, has_filter=False)
-    p.stage_draft_sampling(p.bs)
+    p.stage()
     torch.testing.assert_close(
-        p.draft_sampling.temperatures[: p.bs],
-        torch.tensor(TEMPS, dtype=torch.float32),
+        p.temps[: p.bs],
+        torch.tensor([1.0, SAMPLER_EPS, 0.7], dtype=torch.float32),
         rtol=0,
         atol=0,
     )
     torch.testing.assert_close(
-        p.draft_sampling.greedy_mask[: p.bs],
-        torch.tensor([0, 1, 0], dtype=torch.int32),
-        rtol=0,
-        atol=0,
+        p.mask[: p.bs], torch.tensor([0, 1, 0], dtype=torch.int32), rtol=0, atol=0
     )
+
+
+def test_the_greedy_predicate_is_the_samplers_own():
+    """`<= SAMPLER_EPS`, not `== 0`: `Sampler` tests the clamped value against
+    the same bound, so a row cannot be greedy to the target and stochastic to
+    the draft. Pre- or post-clamp is the same set -- `max(t, EPS) <= EPS` iff
+    `t <= EPS` -- and a temperature just above it must stay stochastic."""
+    p = FakeProposer([SAMPLER_EPS, SAMPLER_EPS * 2, 0.0], has_filter=False)
+    p.stage()
+    torch.testing.assert_close(
+        p.mask[: p.bs], torch.tensor([1, 0, 1], dtype=torch.int32), rtol=0, atol=0
+    )
+
+
+def test_the_whole_step_rides_one_publication():
+    """The saving: three more members in the batched `sampling` H2D instead of
+    four device launches (`copy_`, compare, cast, `copy_`, `fill_`) on `[bs]`
+    tensors. Counts are what put a member in that upload, so an unclaimed one
+    would silently ship nothing."""
+    p = FakeProposer(TEMPS, has_filter=False)
+    p.stage()
+    assert p.group.counts[p.group.indices["draft_temperatures"]] == p.bs
+    assert p.group.counts[p.group.indices["draft_greedy_mask"]] == p.bs
+    assert p.group.counts[p.group.indices["draft_sample_seed"]] == 1
+    # And the step's own sampling members are not disturbed by it.
+    assert p.group.counts[p.group.indices["temperatures"]] is None
+
+
+def test_the_philox_key_advances_once_per_step():
+    """A stale seed would make two consecutive steps draft from the SAME
+    uniform stream. It is a plain SPMD counter so every TP rank reaches the
+    same number without exchanging it."""
+    p = FakeProposer(TEMPS, has_filter=False)
+    seen = []
+    for _ in range(3):
+        p.stage()
+        seen.append(int(p._draft_seed_buf.np[0]))
+    assert seen == [0, 1, 2]
+
+
+def test_an_empty_batch_stages_nothing():
+    """A 0-row batch has nothing to draft; claiming a zero-length member would
+    put an empty source in the upload."""
+    p = FakeProposer([], has_filter=False)
+    p.stage()
+    assert p.group.counts[p.group.indices["draft_temperatures"]] is None
+    assert p.group.counts[p.group.indices["draft_greedy_mask"]] is None
+    # The key still advances: the counter is per STEP, not per drafted row.
+    assert p.group.counts[p.group.indices["draft_sample_seed"]] == 1
 
 
 def test_the_tail_rows_past_the_scheduled_batch_are_left_alone():
-    """`stage_draft_sampling` is sized by the SCHEDULED batch; the slots above
-    it are fabricated padding and a 0 temperature there divides by zero inside
-    the block head."""
+    """`stage_draft_sampling_host` is sized by the SCHEDULED batch; the slots
+    above it are fabricated padding and a 0 temperature there divides by zero
+    inside the block head."""
     p = FakeProposer(TEMPS, has_filter=True)
-    p.stage_draft_sampling(p.bs)
+    p.stage()
     torch.testing.assert_close(
-        p.draft_sampling.temperatures[p.bs :],
-        torch.ones(p.draft_sampling.temperatures.numel() - p.bs),
+        p.temps[p.bs :], torch.ones(p.temps.numel() - p.bs), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        p.mask[p.bs :],
+        torch.ones(p.mask.numel() - p.bs, dtype=torch.int32),
         rtol=0,
         atol=0,
     )
