@@ -63,6 +63,11 @@ class MoRIIOAgentMetadata(
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
+    # Per-request state by tensor name: the packed descriptor of the whole
+    # tensor and the bytes of one slot. Omitted for models without any.
+    state_descs: dict[str, bytes] | None = None
+    state_slot_bytes: dict[str, int] | None = None
+    num_state_slots: int = 0
 
 
 # ---------------------------------------------------------------------------

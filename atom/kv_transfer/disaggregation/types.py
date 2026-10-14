@@ -428,6 +428,9 @@ class ReqMeta:
     remote_tp_size: int = 0
     transfer_id: int = 0
     local_slot_index: int = -1
+    # The producer's state slot, for a connector that moves per-request state
+    # by slot. -1 when the model keeps none.
+    remote_slot_index: int = -1
 
     # PD incremental: blocks already in decode's prefix cache; both sides
     # skip block_ids[:num_computed_blocks]. 0 = full transfer.
@@ -526,6 +529,7 @@ class ConnectorMetadata:
             ),
             transfer_id=kv_transfer_params.get("transfer_id", 0),
             local_slot_index=kv_transfer_params.get("local_slot_index", -1),
+            remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
         )
