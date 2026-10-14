@@ -155,6 +155,22 @@ def test_the_decoded_tensors_are_views_not_copies():
     assert view.data_ptr() == payload.data_ptr()
 
 
+def test_a_tensor_packed_off_its_alignment_is_decoded_too():
+    """The sender packs tensors back to back, so an FP32 tensor after three
+    BF16 values starts six bytes in, which view() cannot reinterpret: a valid
+    bucket failed. That tensor is copied; the rest are still views."""
+    import torch
+
+    a = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    b = torch.tensor([4.5, 5.5], dtype=torch.float32)
+    meta, payload = _encode([("a", a), ("b", b)])
+
+    (_, got_a), (_, got_b) = _decode_bucket(meta, payload)
+
+    assert torch.equal(got_a, a) and torch.equal(got_b, b)
+    assert got_a.data_ptr() == payload.data_ptr()
+
+
 def test_an_out_of_bounds_offset_is_rejected_not_truncated():
     """Silently clamping would hand a neighbouring tensor's bytes to the model."""
     import torch

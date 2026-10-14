@@ -121,7 +121,9 @@ def _decode_bucket(
 
     Views, not copies: the payload stays alive for the duration of the bucket's
     application, and copying here would double the peak footprint of a transfer
-    already sized in tens of GB.
+    already sized in tens of GB. The one exception is a tensor whose offset is
+    not a multiple of its own element size, which view() cannot reinterpret in
+    place; that tensor alone is copied.
     """
     # Through a byte buffer: tolist() builds a list slot per byte, which at the
     # metadata ceiling is half a gigabyte of host memory before JSON sees it.
@@ -166,7 +168,12 @@ def _decode_bucket(
                 f"RDMA metadata size mismatch for {name}: "
                 f"shape={shape} dtype={dtype} nbytes={nbytes}"
             )
-        value = payload[start:end].view(dtype).view(shape)
+        raw = payload[start:end]
+        if start % dtype.itemsize:
+            # The sender packs tensors back to back, so one that follows an
+            # odd-sized tensor of a narrower dtype starts off its alignment.
+            raw = raw.clone()
+        value = raw.view(dtype).view(shape)
         weights.append((name, value))
         spans.append((start, end, name))
 
