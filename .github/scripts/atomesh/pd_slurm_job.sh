@@ -550,12 +550,54 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
   # Use an explicit worker argument because the batch shell also has rank 0
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
-  echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
-  exec srun \
-    --nodes="${NUM_NODES}" \
-    --ntasks="${NUM_NODES}" \
-    --ntasks-per-node=1 \
-    bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker
+  #
+  # Spur sometimes runs the batch script on every allocated node anyway. Each
+  # copy then dispatches its own srun, two workers per rank race on the same
+  # container name, and the loser's cleanup kills the winner. Let one batch
+  # copy dispatch via an atomic mkdir on the shared RUN_DIR. The others must
+  # stay alive (workers on their node run inside their namespaces) and exit
+  # with the dispatcher's rc.
+  DISPATCH_DIR="${RUN_DIR}/.spur-dispatch-${ATOMESH_RUN_TOKEN:-0}"
+  if mkdir "${DISPATCH_DIR}" 2>/dev/null; then
+    hostname > "${DISPATCH_DIR}/owner" 2>/dev/null || true
+    echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers from $(hostname) ==="
+    dispatch_rc=0
+    srun \
+      --nodes="${NUM_NODES}" \
+      --ntasks="${NUM_NODES}" \
+      --ntasks-per-node=1 \
+      bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-worker \
+      || dispatch_rc=$?
+    printf '%s\n' "${dispatch_rc}" > "${DISPATCH_DIR}/rc.tmp"
+    mv "${DISPATCH_DIR}/rc.tmp" "${DISPATCH_DIR}/rc"
+    exit "${dispatch_rc}"
+  fi
+
+  echo "=== Spur job ${JOB_ID}: $(hostname) skips duplicate dispatch; workers come from $(cat "${DISPATCH_DIR}/owner" 2>/dev/null || echo unknown) ==="
+  all_ranks_done_since=""
+  while [[ ! -f "${DISPATCH_DIR}/rc" ]]; do
+    # Fallback if the dispatcher dies without writing rc: every worker
+    # publishes rank-rc-* on exit, so stop once all of them did.
+    rank_rcs=()
+    for f in "${RUN_DIR}"/rank-rc-*; do
+      [[ -f "${f}" && "${f}" != *.tmp ]] && rank_rcs+=("${f}")
+    done
+    if [[ "${#rank_rcs[@]}" -ge "${NUM_NODES}" ]]; then
+      all_ranks_done_since="${all_ranks_done_since:-${SECONDS}}"
+      if (( SECONDS - all_ranks_done_since >= 60 )); then
+        max_rc=0
+        for f in "${rank_rcs[@]}"; do
+          rc="$(cat "${f}" 2>/dev/null || echo 1)"
+          [[ "${rc}" =~ ^[0-9]+$ ]] || rc=1
+          (( rc > max_rc )) && max_rc="${rc}"
+        done
+        echo "WARNING: dispatcher wrote no rc; all ranks exited, using max rank rc=${max_rc}" >&2
+        exit "${max_rc}"
+      fi
+    fi
+    sleep 5
+  done
+  exit "$(cat "${DISPATCH_DIR}/rc")"
 fi
 
 mapfile -t ALLOC_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
