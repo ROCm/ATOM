@@ -162,12 +162,12 @@ class CompilationConfig:
     """
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
-    """Cuda graph capture sizes
-    1. if none provided, then default set to [min(max_num_seqs * 2, 512)]
-    2. if one value is provided, then the capture list would follow the
-    pattern: [1, 2, 4] + [i for i in range(8, cuda_graph_sizes + 1, 8)]
-    3. more than one value (e.g. 1 2 128) is provided, then the capture list
-    will follow the provided list."""
+    """Fallback ladder when cudagraph_capture_sizes is not provided.
+
+    Defaults to [1024] in FULL_AND_PIECEWISE and [512] otherwise. A single
+    value is a ceiling expanded by Config.capture_sizes; multiple values
+    are used as explicit candidates.
+    """
     debug_dump_path: str = ""
     """The path to dump the debug information."""
 
@@ -275,7 +275,9 @@ class CompilationConfig:
         if self.level not in {0, 1, 2, 3}:
             raise ValueError("level must in 0-3")
         if not self.cuda_graph_sizes:
-            self.cuda_graph_sizes = [512]
+            self.cuda_graph_sizes = [
+                1024 if self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE else 512
+            ]
 
     def compute_hash(self) -> str:
         """

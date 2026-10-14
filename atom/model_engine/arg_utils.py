@@ -149,7 +149,7 @@ class EngineArgs:
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     gpu_memory_utilization: float = 0.9
-    cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
+    cudagraph_capture_sizes: str | None = None
     level: int = 3
     cudagraph_mode: str = "FULL"
     load_dummy: str | None = None
@@ -326,7 +326,11 @@ class EngineArgs:
             "--cudagraph-capture-sizes",
             type=str,
             default=EngineArgs.cudagraph_capture_sizes,
-            help="Sizes to capture cudagraph. Example: [1,2,4,8,16]",
+            help=(
+                "Explicit cudagraph capture sizes. FULL_AND_PIECEWISE defaults "
+                "to 83 token buckets through 1024; other modes keep the "
+                "batch-size ladder through 512. Example: [1,2,4,8,16]"
+            ),
         )
         parser.add_argument(
             "--level", type=int, default=3, help="The level of compilation (0-3)."
@@ -789,13 +793,17 @@ class EngineArgs:
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
+        graph_mode = CUDAGraphMode[kwargs.pop("cudagraph_mode")]
+        capture_sizes = kwargs.pop("cudagraph_capture_sizes")
+        # Preserve omission until the mode is known. An explicitly supplied
+        # list, even the old default list, must always take precedence.
+        if capture_sizes is None and graph_mode != CUDAGraphMode.FULL_AND_PIECEWISE:
+            capture_sizes = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
-            cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
+            cudagraph_mode=graph_mode,
             cudagraph_capture_sizes=(
-                parse_size_list(kwargs.pop("cudagraph_capture_sizes"))
-                if self.cudagraph_capture_sizes
-                else None
+                parse_size_list(capture_sizes) if capture_sizes else None
             ),
         )
         if self.method and self.num_speculative_tokens > 0:

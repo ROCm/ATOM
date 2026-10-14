@@ -8,7 +8,7 @@ import torch
 
 pytest.importorskip("aiter")
 
-from atom.config import Config, CUDAGraphMode
+from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.model_engine import model_runner
 from atom.utils.forward_context import ForwardMode
 
@@ -116,10 +116,8 @@ def test_hybrid_uses_one_token_ladder_with_query_aligned_full_decode():
 
 def test_hybrid_default_ladder_and_internal_tail_shapes():
     config = SimpleNamespace(
-        compilation_config=SimpleNamespace(
+        compilation_config=CompilationConfig(
             cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
-            cudagraph_capture_sizes=None,
-            cuda_graph_sizes=[1024],
         )
     )
     assert len(Config.capture_sizes.fget(config)) == 83
@@ -129,6 +127,70 @@ def test_hybrid_default_ladder_and_internal_tail_shapes():
     pw, full = runner._cudagraph_capture_plan([6])
     assert pw[2] == [768, 256, 192, 128, 6]
     assert full[2] == [128, 32, 1]
+
+
+@pytest.mark.parametrize("from_cli", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["FULL", "PIECEWISE", "AF_PIECEWISE", "FULL_AND_PIECEWISE"]
+)
+def test_capture_defaults_reach_engine_config_without_explicit_sizes(mode, from_cli):
+    import argparse
+
+    from atom.model_engine.arg_utils import EngineArgs
+
+    if from_cli:
+        parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+        args = EngineArgs.from_cli_args(parser.parse_args(["--cudagraph-mode", mode]))
+    else:
+        args = EngineArgs(cudagraph_mode=mode)
+    kwargs = args._get_engine_kwargs()
+    assert "cudagraph_capture_sizes" not in kwargs
+    config = SimpleNamespace(compilation_config=kwargs["compilation_config"])
+    expected = (
+        [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))
+        if mode == "FULL_AND_PIECEWISE"
+        else [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128, 256, 512]
+    )
+    assert Config.capture_sizes.fget(config) == expected
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [1024],
+        [8, 128, 704],
+        [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128, 256, 512],
+    ],
+)
+def test_hybrid_cli_explicit_capture_sizes_override_default(sizes):
+    import argparse
+
+    from atom.model_engine.arg_utils import EngineArgs
+
+    parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--cudagraph-mode",
+                "FULL_AND_PIECEWISE",
+                "--cudagraph-capture-sizes",
+                str(sizes),
+            ]
+        )
+    )
+    config = SimpleNamespace(
+        compilation_config=args._get_engine_kwargs()["compilation_config"]
+    )
+    assert Config.capture_sizes.fget(config) == sizes
+
+
+def test_python_hybrid_capture_ceiling_override_is_preserved():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE, cuda_graph_sizes=[256]
+        )
+    )
+    assert Config.capture_sizes.fget(config) == [1, 2, 4] + list(range(8, 257, 8))
 
 
 @pytest.mark.parametrize("query,expected_bs", [(2, 100), (6, 102), (4, 100)])

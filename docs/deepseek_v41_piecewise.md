@@ -17,18 +17,20 @@ whole attention call. Both modes use the existing attention kernels.
 Use hybrid mode for AF piecewise prefill and whole-forward FULL decode:
 
 ```bash
-CAPTURE_SIZES=$(python3 -c 'import json; print(json.dumps([1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))))')
-# Add these arguments to the existing server launch command:
---level 3 --cudagraph-mode FULL_AND_PIECEWISE --cudagraph-capture-sizes "$CAPTURE_SIZES"
+--level 3 --cudagraph-mode FULL_AND_PIECEWISE
 ```
 
-In this mode, the capture ladder is measured in **tokens**. The command above
-captures 83 token sizes through 1024. For Python configuration, a single
+In this mode, the capture ladder is measured in **tokens**. Omitting
+`--cudagraph-capture-sizes` defaults to 83 token sizes through 1024:
+`[1, 2, 4] + range(8, 256, 8) + range(256, 1025, 16)`.
+The Python configuration uses the same default. A single
 `CompilationConfig.cuda_graph_sizes` value expands to `[1, 2, 4]`, multiples
 of 8 below 256, then multiples of 16 through that maximum. An explicit
 `--cudagraph-capture-sizes '[1, 2, 4, 8, 16, 32, 64, 128, 256, 448, 512, 704, 768, 1024]'`
-uses exactly those token candidates. Existing FULL, PIECEWISE and AF_PIECEWISE
-options retain their batch-size units.
+uses exactly those token candidates, overriding the default. In particular,
+`'[1024]'` selects just that candidate rather than expanding the ladder.
+Existing FULL, PIECEWISE and AF_PIECEWISE options retain their default
+batch-size lists and units.
 
 Prefill captures the token ladder independently of request count. FULL decode
 rounds each candidate up to a multiple of Q, derives BS=T/Q, deduplicates and
