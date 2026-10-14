@@ -2,29 +2,38 @@
 
 ## Startup
 
-Run inside the prepared vLLM 0.31 / ATOM environment. This tested configuration
-uses TP4, FULL decode graphs (FULL_AND_PIECEWISE with breakable capture),
-DSpark 5, and in-process PAGE + STATE offload.
+Run from the repository root in a prepared vLLM 0.31 / ATOM environment.
+Use only your allocated GPUs and unused ports. Keep the source unchanged until
+both the model and MP server have stopped.
+
+Start the MP PAGE server in a separate terminal:
 
 ```bash
-export PYTHONPATH=/workspace/ATOM-dsv41-lmc031
+HIP_VISIBLE_DEVICES=0,1,2,3 LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5561 --chunk-size 256 \
+  --l1-size-gb 64 --eviction-policy LRU \
+  --supported-transfer-mode auto --shm-name dsv41mp_5561 \
+  --no-l1-use-lazy --max-gpu-workers 4 \
+  --http-host 127.0.0.1 --http-port 8086 --prometheus-port 9006
+```
+
+Start the model (ON):
+
+```bash
+export MODEL=/data/amd_int/models/DeepSeek-V4.1-Flash
+export PYTHONPATH="$PWD"
 export HIP_VISIBLE_DEVICES=0,1,2,3
-export AITER_LOG_LEVEL=WARNING
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export AITER_LOG_LEVEL=WARNING VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONHASHSEED=0
-export ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1
-export VLLM_USE_BREAKABLE_CUDAGRAPH=1
+export ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1
-export ATOM_V41_STATE_IMAGES=0
-export ATOM_V41_LOCAL_PREFIX_HITS=0
+export ATOM_V41_STATE_IMAGES=0 ATOM_V41_LOCAL_PREFIX_HITS=0
 export ATOM_V41_IMAGE_LOCAL_HITS=0
-export LMCACHE_LOCAL_CPU=True
-export LMCACHE_MAX_LOCAL_CPU_SIZE=16
-export LMCACHE_CHUNK_SIZE=256
-export LMCACHE_CACHE_POLICY=ATOM_SLRU
+export LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=16
+export LMCACHE_CHUNK_SIZE=256 LMCACHE_CACHE_POLICY=ATOM_SLRU
 export OFFLOAD_MIN_LOAD_TOKENS=256
 
-vllm serve /data/amd_int/models/DeepSeek-V4.1-Flash \
+vllm serve "$MODEL" \
   --served-model-name DeepSeek-V4.1-Flash \
   --host 127.0.0.1 --port 8021 \
   --dtype auto --kv-cache-dtype auto \
@@ -37,113 +46,146 @@ vllm serve /data/amd_int/models/DeepSeek-V4.1-Flash \
   --kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector",
     "kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector",
     "kv_role":"kv_both","kv_load_failure_policy":"recompute",
-    "kv_connector_extra_config":{"atom.offload.backend":"inproc",
-      "atom.offload.v41.state_interval":4096}}'
+    "kv_connector_extra_config":{"atom.offload.backend":"mp",
+      "lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5561,
+      "lmcache.mp.state_transport":"own-pool","lmcache.mp.state_cpu_size_gb":16,
+      "lmcache.mp.tp_rank_collapse":true,"atom.offload.v41.state_interval":4096}}'
 ```
 
-For MP PAGE offload, start the shared server in a separate terminal with the
-same GPU visibility. Use a unique shared-memory name and unused ports:
+This allocates **64 GiB shared PAGE + 16 GiB STATE per rank** (128 GiB nominal
+CPU pools at TP4, plus process/staging overhead). The target uses the ATOM BF16
+pool; DSpark requires its separate explicit `fp8_ds_mla` pool.
 
-```bash
-HIP_VISIBLE_DEVICES=0,1,2,3 LMCACHE_DISABLE_BANNER=1 lmcache server \
-  --host localhost --port 5561 --chunk-size 256 \
-  --l1-size-gb 32 --eviction-policy LRU \
-  --supported-transfer-mode auto --shm-name dsv41mp_5561 \
-  --no-l1-use-lazy --max-gpu-workers 4 \
-  --http-host 127.0.0.1 --http-port 8086 --prometheus-port 9006
-```
-
-In the model command above, replace only `--kv-transfer-config` with:
-
-```bash
---kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector",
-  "kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector",
-  "kv_role":"kv_both","kv_load_failure_policy":"recompute",
-  "kv_connector_extra_config":{"atom.offload.backend":"mp",
-    "lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5561,
-    "lmcache.mp.state_transport":"own-pool","lmcache.mp.state_cpu_size_gb":4,
-    "lmcache.mp.tp_rank_collapse":true,"atom.offload.v41.state_interval":4096}}'
-```
-
-This MP configuration has one shared 32 GiB PAGE pool and a separate 4 GiB
-STATE pool per rank, not a 16 GiB PAGE pool per rank.
-
-Keep the explicit draft `kv_cache_dtype`: the target uses the ATOM BF16 pool,
-while DSpark uses its own `fp8_ds_mla` pool. Local HBM prefix reuse is **not yet
-supported by this tested configuration**; keep all three image/local-hit flags
-above at zero. Stop the service before changing its editable source tree.
+For OFF, stop ON and its MP server, then start the same model command without
+`--kv-transfer-config`, replacing `--enable-prefix-caching` with
+`--no-enable-prefix-caching`. Keep graphs, DSpark and all other model parameters
+unchanged. This compares CPU PAGE+STATE reuse against **no prefix reuse**, not
+CPU offload against existing local-HBM prefix reuse. The three image/local-hit
+flags above must remain zero for this tested configuration.
 
 ## Test method
 
-Against an otherwise idle server, run long concurrency-4 probes:
+Check model identity, graph capture, GPU/process ownership and readiness before
+sending requests. Use an otherwise idle endpoint; check client exit status,
+complete results, server faults and actual token-source counters, not HTTP 200
+or launcher exit alone. Stop only the verified processes belonging to your run.
+
+### Fixed-manifest GSM8K
+
+Client dependencies: `lm_eval==0.4.13`, `aiohttp`, `prometheus_client`, and an
+existing official GSM8K Arrow cache. Preparation is offline/CPU-only. Render
+once, then reuse the **same manifest for all four passes**, without resampling
+few-shot examples:
 
 ```bash
-python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
-  --concurrency 4 --seed 2026101301 --out accuracy-seed1.json
-python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
-  --concurrency 4 --seed 2026101302 --out accuracy-seed2.json
-python3 tools/kv_offload_accuracy_arms.py 8021 16 900 640 DeepSeek-V4.1-Flash \
-  --concurrency 4 --seed 2026101303 --out accuracy-seed3.json
+python tools/gsm8k_fixed_manifest.py prepare \
+  --dataset-cache /path/to/existing/gsm8k/arrow-cache \
+  --model DeepSeek-V4.1-Flash --output results/gsm8k-prepared
+
+# Run twice on ON, then twice on OFF; use a fresh output for every pass.
+ARM=on PASS=1 PHASE=cold  # pass 2: PHASE=warm; then ARM=off, passes 1 and 2
+python tools/gsm8k_fixed_manifest.py run \
+  --manifest results/gsm8k-prepared/manifest.jsonl \
+  --endpoint http://127.0.0.1:8021/v1/completions \
+  --arm "$ARM" --phase "$PHASE" --pass-id "$ARM-p$PASS" \
+  --output "results/gsm8k-$ARM-p$PASS"
 ```
 
-The different seeds produce different warm documents. For a short smoke test,
-replace `900 640` with `64 96` and use another output filename.
+The tool uses official test1319/5-shot prompts and official strict/flexible
+filters, raw completions, concurrency 16, temperature/seed 0 and a 4096-token
+budget. All 1319 responses must complete and be scored; any length truncation
+fails the complete-accuracy gate. ON pass 2 requires actual CPU supply >=10% of
+all response prompt tokens. Three source counters must sum to that same token
+count. A measurement PASS alone does not establish accuracy equivalence.
 
-Use fresh output filenames. Each invocation primes one synthetic document, then
-runs blind (no document), cold (unique nonce at the document head), and warm
-(shared document) arms. The tool checks both correctness and actual cache
-supply; the default warm-tier minimum is 50% of **all prompt tokens in the arm**.
-HTTP 200 or a completed drain alone is not a passing result: check the client
-exit code and JSON status. For concurrency testing, add `--concurrency N`.
+### Fixed-request performance
 
-Full accuracy requires a separate two-pass evaluation that replays the same
-prompts and verifies nonzero tier supply. A single GSM8K pass with independently
-resampled few-shot examples does not establish that offload recovery occurred.
-Performance must compare the same source, prompts, concurrency, and measurement
-window with graphs on in both arms. Without the connector, V4.1 requires
-`--no-enable-prefix-caching`, so that OFF comparison is reuse versus no reuse,
-not CPU tier versus local HBM reuse.
+Generate each manifest once (`C=16,24`, `R=1,2,3`), then reuse it on both arms:
+
+```bash
+C=16 R=1
+python tools/kv_offload_perf_acceptance.py manifest \
+  --case graph-dspark-mp --round "$R" --concurrency "$C" \
+  --model DeepSeek-V4.1-Flash --output "results/perf-r$R-c$C.json"
+
+ARM=on  # Repeat unchanged on OFF, using the same manifest.
+python tools/kv_offload_perf_acceptance.py run \
+  --manifest "results/perf-r$R-c$C.json" --arm "$ARM" \
+  --base-url http://127.0.0.1:8021 --output-root results/performance
+```
+
+Each round primes 12 distinct documents serially (one output token), then
+measures 240 streaming requests with unique tails and exactly 64 output tokens
+(`ignore_eos=true`). The window is first measured dispatch through last complete
+response, including ramp/drain but excluding prime and metric scrapes. Require
+all 240 requests, `[DONE]`, usage, and valid source accounting; ON actual CPU
+supply must exceed 50%. Never report partial-success throughput. Use the tool's
+`compare` command only for two passing summaries with identical manifests and
+the current validator version. Prime completion is not a PAGE/STATE save barrier;
+this is not a proven steady-state warm-cache window. Use fast local output storage:
+synchronous evidence writes can delay the client event loop and observed latency.
 
 ## Test results
 
-2026-10-13: vLLM `0.31.1.dev0+gdb9527a46.d20261008`, LMCache
-`0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`; TP4, FULL decode
-and PIECEWISE graphs + DSpark 5, MP PAGE 32 GiB shared + STATE 4 GiB/rank.
-Supply below is warm-tier tokens / all actual warm-arm prompt tokens.
+2026-10-14, server source **`fdb24d5d2`**, MI355 TP4; vLLM
+`0.31.1.dev0+gdb9527a46.d20261008.rocm724`, LMCache
+`0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1`. Both boots captured target
+PIECEWISE 53 / FULL 41 and DSpark FULL 38 graphs. CPU pools were 64 GiB shared
+PAGE + 16 GiB STATE/rank. The four GSM8K passes and six successful ON performance
+windows had zero local-HBM supply; the failed OFF performance window has no
+complete source measurement.
 
-| Source / long probe, concurrency 4 | Blind | Cold | Warm | Tier supply | Verdict |
-|---|---:|---:|---:|---:|---|
-| `f29878cab`, seed 2026101301 | 0/16 | 16/16 | 16/16 | 278,528 / 278,880 (99.874%) | Passed |
-| `f29878cab`, seed 2026101302 | 0/16 | 16/16 | 16/16 | 278,528 / 279,488 (99.657%) | Passed |
-| `10228cb99`, seed 2026101303 | 0/16 | 16/16 | 16/16 | 278,528 / 279,264 (99.736%) | Passed |
+| GSM8K pass | Flexible exact match | Strict exact match | Actual CPU / prompt tokens | Length truncations |
+|---|---:|---:|---:|---:|
+| ON 1 | 1221/1319 (92.57%) | 1222/1319 (92.65%) | 0 / 1,154,587 | 0 |
+| ON 2 | 1216/1319 (92.19%) | 1217/1319 (92.27%) | 975,104 / 1,154,587 (84.45%) | 1 |
+| OFF 1 | 1225/1319 (92.87%) | 1226/1319 (92.95%) | 0 / 1,154,587 | 1 |
+| OFF 2 | 1218/1319 (92.34%) | 1219/1319 (92.42%) | 0 / 1,154,587 | 2 |
 
-The first two distinct warm documents shared one boot. The third ran in a new
-boot with the TP lifecycle fix (`3a97b1657`); its tested production/test bytes
-match `10228cb99`, committed after teardown. All client/drain exits were zero;
-cold-tier and local-HBM supply were zero. The latest run completed target and
-DSpark FULL graph capture on four ranks, served 49 requests, and verified every
-question's correctness and prompt-token sums. All 1,051 tracked ATOM files and
-five validation files stayed unchanged through its model/MP teardown. These
-are service smoke tests, not proof of every CPU corner case or full accuracy.
+All four passes completed/scored 1319 responses without HTTP errors; their
+three source counters matched response usage. **Accuracy acceptance is not
+passed:** ON 2 and both OFF passes failed the predeclared no-truncation gate.
+Repeated enumeration occurred with and without offload. These two repeats per
+arm do not establish a noise floor, equivalence or a causal attribution.
 
-Latest shutdown **failed graceful-exit acceptance**: four explicit reused-AITER
-TP close markers, four `LocalCPUBackend closed successfully` lines and zero
-`Error closing` lines, followed by 12 AITER `free_meta_buffer` destructor
-`UnicodeDecodeError`s and vLLM SIGKILL escalation for all four workers. The
-worker timeout remained the default 5 seconds plus 4 seconds after SIGTERM.
-Explicit close markers do not establish that every native resource was freed.
-Model launcher exit was 0; MP exit was 143 from intentional SIGTERM. All seven
-recorded processes and host KFD entries disappeared and four ports closed.
+ON performance: each row is a complete 240-request window. Total tokens/s
+includes reused input tokens, not just tokens computed on the GPU. TPOT is the
+client-observed `(last_content-first_content)/(output_tokens-1)`, not per-token
+ITL. Latency columns are request percentiles in milliseconds.
 
-CPU-focused receive/STATE/namespace/scheduling/codec/probe/wait regression:
-**825 passed + 69 subtests**, with 90 deprecation warnings. Includes ten TP
-ownership/cleanup cases, 29 real sync/async admission cases (DSpark input-budget
-edges use the real drafting-slot property), and real LMCache token-accounting,
-flat-byte, `clear`/`close`, and full-pool cases. Black and Ruff passed.
+| Concurrency / round | Total tokens/s | TTFT p50 / p99 | TPOT p50 / p99 | Actual CPU supply |
+|---|---:|---:|---:|---:|
+| 16 / 1 | 103,430 | 504 / 859 | 10.75 / 18.66 | 97.275% |
+| 16 / 2 | 100,184 | 475 / 768 | 11.38 / 20.49 | 97.287% |
+| 16 / 3 | 102,137 | 448 / 770 | 11.91 / 20.04 | 97.287% |
+| 24 / 1 | 116,619 | 608 / 1077 | 15.37 / 26.77 | 97.262% |
+| 24 / 2 | 125,360 | 718 / 1048 | 11.80 / 22.23 | 97.236% |
+| 24 / 3 | 119,290 | 620 / 1024 | 14.95 / 25.14 | 97.287% |
 
-Earlier in-process short/long and MP short/long probes passed. The earlier MP
-namespace run with zero tier supply was invalid; the pre-holding-queue-fix
-concurrency-4 run failed with HTTP 500. Historical results remain in PR #2357.
-Full two-pass GSM8K, STATE byte equality, cancellation/failure-recompute,
-high-concurrency capacity safety, and local-HBM restoration remain pending.
-**No current performance result is claimed.**
+Actual mean input length was 7,631–7,635 tokens/request. These are three rounds
+per concurrency in one ON boot, not independent boot replications.
+**No ON/OFF speedup is available:** OFF 16/1 crashed after 160/240 measured
+requests with HIP illegal memory access; its throughput is invalid and the
+remaining five OFF rounds were not run. The error surfaced asynchronously at
+`deepseek_v41_bridge.py:1029` during `seq_lens.cpu()`; the offending kernel is
+not identified. ON ran before OFF on a shared host, not randomized/interleaved.
+
+**Shutdown is still failing.** ON logged four CA and eight IPC destructor
+exceptions and four-worker SIGKILL escalation after explicit TP close hooks.
+OFF exited after its inference fault. Launcher exit 0 did not override either
+failure. The model/MP KFD resources were released; OFF left four non-holding
+zombies (no KFD entry), not a clean process teardown.
+
+The server and experimental clients were frozen throughout testing. The shipped
+tools preserve request/score construction but add post-measurement deadline,
+UTF-8, source/lookup, response-limit and SSE-termination fixes; they are not the
+client hashes used above. Legacy performance summaries are not version-2 passes:
+the old client stopped at `[DONE]`, so any later HTTP bytes were not observed.
+Scoped CPU tests: **78 passed, 1 skipped, 189 subtests passed**; the official
+offline integration separately passed and reproduced the frozen 1319-question
+manifest exactly. All four tool/test files pass Black and Ruff. The experimental
+client's missing-source gate was supplemented by independent checks on every
+pass. Historical smoke/CPU results and detailed evidence remain in PR #2357.
+Local-HBM + CPU-tail joint restoration, STATE byte equality, cancellation/load
+failure recomputation and recoverable STATE capacity remain unvalidated or
+unfinished. These results are **not complete feature acceptance**.
