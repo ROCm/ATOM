@@ -21,7 +21,6 @@ from .bounded_replay import (
     dp_stage_tokens,
     late_layer_start,
     placeholder_rows_of,
-    placeholder_tokens,
     plan_stage_tokens,
     replayable,
     rows_of,
@@ -380,16 +379,12 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
         A rank whose prefill finishes no prompt runs none of the decoder, but
         while a peer has decoder work its MoE gathers count on this rank once
-        per layer. It runs the decoder on `placeholder_tokens` of its rows
-        under a request-less step (`placeholder_rows_of`): attention returns
+        per layer. It runs the decoder on its first row under a request-less
+        step (`placeholder_rows_of`): attention returns
         zeros and writes no cache, so the rows only feed the collectives, and
         their output is dropped."""
         metadata = forward.attn_metadata
-        rows = torch.arange(
-            placeholder_tokens(normed.shape[1]),
-            dtype=torch.int32,
-            device=normed.device,
-        )
+        rows = torch.zeros(1, dtype=torch.int32, device=normed.device)
         normed, *seam = gather_rows(rows, normed, *seam, dim=1)
         with (
             placeholder_rows_of(metadata, rows),
