@@ -10,6 +10,7 @@ from setuptools.command.build_py import build_py as _build_py
 
 _editable_wheel = import_module("setuptools.command.editable_wheel").editable_wheel
 _ATOMESH_BUILT = False
+_ROOT = Path(__file__).resolve().parent
 
 
 def get_build_env(name: str):
@@ -42,15 +43,26 @@ def build_atomesh() -> None:
     _ATOMESH_BUILT = True
 
 
+def generate_engine_protocol() -> None:
+    """Compile engine_v1.proto into the binding the package imports."""
+    # Run by path: the package itself is not importable yet at build time.
+    script = _ROOT / "atom" / "model_engine" / "protocol" / "generate.py"
+    binding = runpy.run_path(str(script))["generate"](_ROOT)
+    print(f"Generated {binding.relative_to(_ROOT)}", flush=True)
+
+
 class install_atomesh(_build_py):
     def run(self) -> None:
         build_atomesh()
+        # Before the copy: build_py collects the package's .py files as it runs.
+        generate_engine_protocol()
         super().run()
 
 
 class editable_install_atomesh(_editable_wheel):
     def run(self) -> None:
         build_atomesh()
+        generate_engine_protocol()
         super().run()
 
 

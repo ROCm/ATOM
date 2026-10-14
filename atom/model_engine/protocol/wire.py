@@ -22,7 +22,7 @@ import sys
 
 import numpy as np
 
-from atom.model_engine.protocol import engine_v1_pb2 as pb
+from atom.model_engine.protocol.binding import pb
 
 if sys.byteorder != "little":  # pragma: no cover - every supported host is LE
     raise ImportError("the engine wire protocol assumes a little-endian host")

@@ -63,3 +63,6 @@ online_quant_info_*.json
 # so it lands in `git status` on every local run and gets committed by accident.
 # That has happened before (#1662 removed one), hence the rule rather than care.
 unit-report.xml
+
+# generated at install time (atom/model_engine/protocol/generate.py)
+atom/model_engine/protocol/*_pb2.py
