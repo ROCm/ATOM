@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791922879185,
+  "lastUpdate": 1791937987517,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "jasen",
-            "username": "Jasen2201",
-            "email": "yajizhan@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "5b78f17b3f567e3b5fff0da711ec5ffcef0549e6",
-          "message": "Expose streaming ITL and API TTFT histograms with latency reports (#2165)\n\n* feat(metrics): expose streaming ITL histogram\n\nObserve frontend output intervals after detokenization and before stream\ncoalescing. Exclude the first token batch and normalize later intervals by\nnew token count, weighting the histogram by that count.\n\nKeep the cumulative histogram independent of runtime snapshot refreshes.\nAdd streaming regression coverage and Prometheus scrape configurations\nfor standalone and prefill/decode deployments. No TPOT metric is added.\n\nValidation: 25 streaming tests passed; 375 histogram parity cases\npassed. Standard GLM-5.2 CPP4+DCP4 P/D verification completed 120 streaming\nrequests with 30,242 ITL samples and both Prometheus targets UP.\n\n* feat(metrics): expose API and Mesh TTFT histograms\n\nRecord one local API TTFT sample per request for streaming output or the first internal token delivery. Measure HTTP Mesh TTFT from ingress through queueing and routing to the first generated SSE payload.\n\nAdd Prometheus scrape labels and a Mesh target, with regression coverage for event parsing, request isolation, and managed router selection.\n\nValidated with 49 Python timing/streaming tests, 5 Rust TTFT tests, and a 10-minute GLM-5.2 CPP4+DCP4 run: 1150 successful requests and exactly 1150 TTFT observations at each of Prefill, Decode, and Mesh.\n\n* ci: generate latency reports for agentic PD benchmarks\n\nBuild Mesh from the current checkout and collect Prefill, Decode, and Mesh metrics with an isolated Prometheus instance for each agentic benchmark invocation. Export interactive offline HTML and JSON while preserving benchmark exit codes and partial results.\n\nUpload a separate report artifact for each matrix job and link it from the Actions summary, selecting only the current Slurm job. Include the reusable report interface, examples, documentation, and regression tests.\n\nValidation: 16 tests passed, including real Prometheus integration; 10 agentic matrix cells passed submit dry-run; workflow, shell, lint, and whitespace checks passed. The Mesh build helper was verified inside the requested development image.\n\n* chore: remove unused Prometheus example configurations\n\n* fix(observability): address latency instrumentation review\n\nAggregate ITL samples with weighted histogram updates and separate delivery timing from detokenization. Parse fragmented SSE incrementally in Python and Rust.\n\nSeparate report collection, finalization and publication while preserving benchmark exit codes. Build Mesh in an explicit CI setup container with release profile, persistent cache and recorded provenance.\n\nValidated in the ATOM image: 90 focused Python tests, 7 Rust tests, real Prometheus collection, non-root Mesh release build, report CLI checks and formatting checks. The full unit suite encountered AITER/rocminfo collection errors without GPU devices.\n\n* fix(observability): preserve cold-start and final latency samples",
-          "timestamp": "2026-09-09T15:31:30Z",
-          "url": "https://github.com/ROCm/ATOM/commit/5b78f17b3f567e3b5fff0da711ec5ffcef0549e6"
-        },
-        "date": 1788986177093,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34249092710 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260908 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.834,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34249092710 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260908 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8241 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8605,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34249092710 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260908 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8491 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.8711,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34249092710 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260908 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.859 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8726,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34249092710 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260908 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8537 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -256917,6 +256865,34 @@ window.BENCHMARK_DATA = {
             "value": 62.8619,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38401261971 | docker_image=rocm/atom-dev:nightly_202610131249 | precision=MXFP4 | display_topology=1P3D-CPP4-MTP5-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9755%2C%22cache_hit_tokens%22%3A570294192%2C%22cache_total_tokens%22%3A584636725%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A3643%2C%22concurrency%22%3A24%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p3d_cpp4_mtp5_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A3%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3613.4464%2C%22e2el_ms%22%3A6492.4077%2C%22e2el_p90%22%3A15229.5446%2C%22e2el_p99%22%3A50551.8411%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610131249%22%2C%22input_tput%22%3A161794.7048%2C%22input_tput_per_gpu%22%3A10112.169%2C%22interactivity%22%3A70.2081%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A3641%2C%22interactivity_p90_itl%22%3A148.8148%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A5.3348%2C%22itl_p90%22%3A6.7198%2C%22median_e2el_ms%22%3A3045.4194%2C%22median_itl_ms%22%3A5.2455%2C%22median_tpot_ms%22%3A5.2455%2C%22median_ttft_ms%22%3A806.7713%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A12%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A1005.7909%2C%22output_tput_per_gpu%22%3A62.8619%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.927%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p3d_cpp4_tp4_mtp5-isl1048576-osl1024-conc24-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38401261971%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A162800.4957%2C%22tpot_ms%22%3A5.3348%2C%22tpot_p90%22%3A6.7198%2C%22tpot_p99%22%3A8.5724%2C%22tput_per_gpu%22%3A10175.031%2C%22ttft_ms%22%3A1070.216%2C%22ttft_p90%22%3A1790.858%2C%22ttft_p99%22%3A4558.6913%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "committer": {
+            "name": "Jasen2201",
+            "username": "Jasen2201",
+            "email": "yajizhan@amd.com"
+          },
+          "id": "c94b43de46b21767c03498ca43c4466a793cc8bf",
+          "message": "[CI] atomesh: Store cells compact each NUMA node for up to 30 min\n\npit2-p03-g35's free memory was fragmented on 2026-10-13: compacting for 768\nGiB ran at about 0.8 GB/s, so the default 600 s stopped NUMA node 0 at about\n500 GiB of huge pages and owner0's 768 GiB registration failed with ENOMEM\n(-202), twice (runs 38401186685, 38401196804). 768 GiB at that rate takes\nabout 16 min; MOONCAKE_STORE_COMPACT_TIMEOUT=1800 gives each node 30 min.\nIt only delays startup: each NUMA node compacts before the servers start.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-13T14:46:59Z",
+          "url": "https://github.com/ROCm/ATOM/commit/c94b43de46b21767c03498ca43c4466a793cc8bf"
+        },
+        "date": 1791937986961,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p3d_cpp4_mtp5_tp1_tp4 1048576/1024 c=16 perf point",
+            "value": 42.3268,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38401273260 | docker_image=rocm/atom-dev:nightly_202610131249 | precision=MXFP4 | display_topology=1P3D-CPP4-MTP5-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9737%2C%22cache_hit_tokens%22%3A368480496%2C%22cache_total_tokens%22%3A378420858%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A2508%2C%22concurrency%22%3A16%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p3d_cpp4_mtp5_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A3%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3613.5927%2C%22e2el_ms%22%3A5480.0304%2C%22e2el_p90%22%3A12425.9105%2C%22e2el_p99%22%3A45616.0062%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610131249%22%2C%22input_tput%22%3A104721.4379%2C%22input_tput_per_gpu%22%3A6545.0899%2C%22interactivity%22%3A80.0002%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A2505%2C%22interactivity_p90_itl%22%3A174.5307%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A4.6865%2C%22itl_p90%22%3A5.7297%2C%22median_e2el_ms%22%3A2590.6003%2C%22median_itl_ms%22%3A4.5171%2C%22median_tpot_ms%22%3A4.5171%2C%22median_ttft_ms%22%3A736.4454%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A12%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A677.2292%2C%22output_tput_per_gpu%22%3A42.3268%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.6909%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p3d_cpp4_tp4_mtp5-isl1048576-osl1024-conc16-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38401273260%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A105398.6671%2C%22tpot_ms%22%3A4.6865%2C%22tpot_p90%22%3A5.7297%2C%22tpot_p99%22%3A6.8168%2C%22tput_per_gpu%22%3A6587.4167%2C%22ttft_ms%22%3A904.6722%2C%22ttft_p90%22%3A1654.7462%2C%22ttft_p99%22%3A3629.905%7D"
           }
         ]
       }
