@@ -23,12 +23,16 @@ from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 from atom.model_engine.protocol import engine_v1_pb2 as pb
 from atom.model_engine.protocol.codec import (
+    ADMIN_COMMANDS,
+    REJECT_INTERNAL,
+    REJECT_INVALID,
     SAMPLING_FIELDS,
-    AdmissionDefaults,
+    AdmissionContext,
     build_sequence,
     decode_client_message,
     decode_core_message,
     encode_abort,
+    encode_command,
     encode_completions,
     encode_metrics,
     encode_ready,
@@ -37,7 +41,6 @@ from atom.model_engine.protocol.codec import (
     encode_stopped,
     encode_stream,
     encode_submit,
-    encode_utility,
     encode_utility_reply,
 )
 from atom.model_engine.protocol.requests import (
@@ -385,8 +388,8 @@ def _new_core_sequences(reqs, config, **encode_kwargs):
     frames = _wire(encode_submit(reqs, **encode_kwargs))
     kind, specs, failures = decode_client_message(frames)
     assert kind == EngineCoreRequestType.ADD and failures == []
-    defaults = AdmissionDefaults.from_config(config)
-    return [build_sequence(spec, defaults) for spec in specs]
+    context = AdmissionContext(config)
+    return [build_sequence(spec, context) for spec in specs]
 
 
 def _multimodal_data():
@@ -462,14 +465,17 @@ def _fanout():
 
 def _multimodal():
     data = _multimodal_data()
+    # Shared by the siblings, as preprocess_fanout shares them.
+    prompt = prompt_token_array([101, 7, 7, 102])
+    positions = np.arange(12, dtype=np.int64).reshape(3, 4)
     return [
         _request(
             60 + i,
-            [101, 7, 7, 102],
+            prompt,
             SamplingParams(n=2),
             multimodal_data=data,
             cache_seed=multimodal_cache_seed(data),
-            mrope_positions=np.arange(12, dtype=np.int64).reshape(3, 4),
+            mrope_positions=positions,
             mrope_position_delta=-2,
             needs_independent_noise=True,
             sibling_index=i,
@@ -509,10 +515,12 @@ def test_prefill_half_of_a_disagg_pair_gets_one_token():
 
 def test_siblings_send_their_shared_prompt_and_media_once():
     reqs = _multimodal()
-    frames = encode_submit(reqs)
-    sent = sum(memoryview(f).nbytes for f in frames[1:])
-    pixel_bytes = reqs[0].multimodal_data["pixel_values"].numel() * 4
-    assert sent < 2 * pixel_bytes  # not once per sibling
+    once = encode_submit(reqs[:1])
+    twice = encode_submit(reqs)
+    sent_once = sum(memoryview(f).nbytes for f in once[1:])
+    sent_twice = sum(memoryview(f).nbytes for f in twice[1:])
+    # The second sibling adds envelope fields, not another copy of any buffer.
+    assert sent_twice == sent_once
 
 
 def test_cache_seed_is_lent_to_the_constructor_and_taken_back():
@@ -532,7 +540,7 @@ def test_a_request_that_does_not_decode_is_reported_not_dropped():
     frames[0] = envelope.SerializeToString()
     _, specs, failures = decode_client_message(_wire(frames))
     assert [s.seq_id for s in specs] == [1]
-    assert [seq_id for seq_id, _ in failures] == [2]
+    assert [(seq_id, code) for seq_id, _, code in failures] == [(2, REJECT_INVALID)]
 
 
 # ----------------------------------------------------------------- outputs --
@@ -612,13 +620,70 @@ def test_stream_outputs_roundtrip():
     assert decoded == outputs
 
 
-def test_admin_and_lifecycle_messages_roundtrip():
-    payload = {"cmd": "update_weights", "named_tensors": [("w", torch.ones(3))]}
-    kind, (cmd, decoded), _ = decode_client_message(_wire(encode_utility(payload)))
+def _envelope(frames):
+    return decode_envelope(_wire(frames))
+
+
+def test_utility_commands_stay_pickled_and_name_their_request():
+    payload = {
+        "cmd": "update_weights",
+        "named_tensors": [("w", torch.ones(3))],
+        "request_id": "abc",
+    }
+    frames = encode_command(payload)
+    assert _envelope(frames).WhichOneof("body") == "utility"
+    assert _envelope(frames).utility.request_id == "abc"
+    kind, (cmd, decoded), _ = decode_client_message(_wire(frames))
     assert kind == EngineCoreRequestType.UTILITY and cmd == "update_weights"
     assert decoded["named_tensors"][0][0] == "w"
     assert torch.equal(decoded["named_tensors"][0][1], torch.ones(3))
 
+    reply = {"cmd": "update_weights", "result": 3, "request_id": "abc"}
+    frames = encode_utility_reply(reply)
+    assert _envelope(frames).utility_reply.request_id == "abc"
+    assert decode_core_message(_wire(frames)) == (
+        EngineCoreRequestType.UTILITY_RESPONSE,
+        reply,
+    )
+
+
+@pytest.mark.parametrize("cmd", sorted(ADMIN_COMMANDS))
+def test_admin_commands_are_typed_and_decode_to_the_same_payload(cmd):
+    for payload in (
+        {"cmd": cmd},
+        {"cmd": cmd, "request_id": "r1", "timeout": 30.0, "deadline": 1.7e9},
+    ):
+        frames = encode_command(payload)
+        envelope = _envelope(frames)
+        assert envelope.WhichOneof("body") == "admin"
+        assert envelope.admin.kind == ADMIN_COMMANDS[cmd]
+        assert len(frames) == 1  # nothing pickled
+        decoded = decode_client_message(_wire(frames))
+        assert decoded == (EngineCoreRequestType.UTILITY, (cmd, payload), [])
+        assert list(decoded[1][1]) == list(payload)  # the broadcast's key order
+
+
+def test_an_admin_command_with_other_arguments_falls_back_to_utility():
+    payload = {"cmd": "start_profile", "trace_dir": "/tmp"}
+    assert _envelope(encode_command(payload)).WhichOneof("body") == "utility"
+
+
+def test_admin_replies_are_typed_values():
+    for reply in (
+        {"cmd": "get_mtp_statistics", "result": {"enabled": False}, "request_id": "r"},
+        {"cmd": "start_profile", "result": None, "request_id": "r"},
+        {"cmd": "stop_profile", "result": [{"trace": "/tmp/x"}, None]},
+        {"cmd": "clear_kv_cache", "error": "RuntimeError: boom", "request_id": "r"},
+    ):
+        frames = encode_utility_reply(reply)
+        envelope = _envelope(frames)
+        assert envelope.WhichOneof("body") == "admin_reply"
+        decoded = decode_core_message(_wire(frames))
+        assert decoded == (EngineCoreRequestType.UTILITY_RESPONSE, reply)
+        assert list(decoded[1]) == list(reply)
+
+
+def test_lifecycle_messages_roundtrip():
     assert decode_client_message(_wire(encode_abort([7, 0]))) == (
         EngineCoreRequestType.ABORT,
         [7, 0],
@@ -626,12 +691,6 @@ def test_admin_and_lifecycle_messages_roundtrip():
     )
     assert decode_client_message(_wire(encode_shutdown()))[0] == (
         EngineCoreRequestType.SHUTDOWN
-    )
-
-    reply = {"cmd": "stop_profile", "result": {"trace": "/tmp/x"}, "request_id": "r"}
-    assert decode_core_message(_wire(encode_utility_reply(reply))) == (
-        EngineCoreRequestType.UTILITY_RESPONSE,
-        reply,
     )
     assert decode_core_message(_wire(encode_ready({"max_pool_tokens": 4096}))) == (
         EngineCoreRequestType.READY,
@@ -651,9 +710,79 @@ def test_admin_and_lifecycle_messages_roundtrip():
     )
 
 
-def test_rejections_end_their_requests():
-    kind, results = decode_core_message(_wire(encode_rejected([(8, "bad top_p")])))
+def test_ready_refuses_a_fact_it_has_no_field_for():
+    with pytest.raises(ProtocolError, match="no field"):
+        encode_ready({"max_pool_tokens": 1, "new_fact": 2})
+
+
+def test_rejections_end_their_requests_and_say_why():
+    frames = encode_rejected(
+        [(8, "bad top_p", REJECT_INVALID), (9, "oom", REJECT_INTERNAL)]
+    )
+    items = _envelope(frames).rejected.items
+    assert [(i.seq_id, i.reason, i.code) for i in items] == [
+        (8, "bad top_p", REJECT_INVALID),
+        (9, "oom", REJECT_INTERNAL),
+    ]
+    kind, results = decode_core_message(_wire(frames))
     assert kind == EngineCoreRequestType.ADD
-    (result,) = results
-    assert result.id == 8 and result.num_completion_tokens == 0
-    assert result.leave_reason == "rejected: bad top_p"
+    assert [r.id for r in results] == [8, 9]
+    assert results[0].num_completion_tokens == 0
+    assert results[0].leave_reason == "rejected: bad top_p"
+
+
+# ------------------------------------------- what the Core fills in itself --
+
+
+def test_model_validation_runs_in_the_core():
+    def refuse(*, num_draft_tokens, multimodal_data, enable_dp_attention):
+        if multimodal_data:
+            raise ValueError("text requests only")
+
+    config = _config()
+    config.hf_config.validate_request = refuse
+    context = AdmissionContext(config)
+    (text,) = decode_client_message(_wire(encode_submit([_request(1, [1])])))[1]
+    build_sequence(text, context)
+    image = _request(2, [1], multimodal_data={"x": np.zeros(2, np.int8)})
+    (spec,) = decode_client_message(_wire(encode_submit([image])))[1]
+    with pytest.raises(ValueError, match="text requests only"):
+        build_sequence(spec, context)
+
+
+def test_the_core_computes_mrope_positions_a_client_left_out(monkeypatch):
+    from atom.multimodal import registry
+
+    calls = []
+
+    def positions(config, tokens, multimodal_data):
+        calls.append(list(tokens))
+        return np.arange(len(tokens) * 3).reshape(3, -1), -1
+
+    monkeypatch.setattr(registry, "get_mrope_input_positions", positions)
+    context = AdmissionContext(_config())
+    media = {"pixel_values": torch.ones(2, 2)}
+    left_out = _request(1, [5, 6], multimodal_data=media)
+    sent = _request(
+        2,
+        [5, 6],
+        multimodal_data=media,
+        mrope_positions=np.zeros((3, 2), np.int64),
+        mrope_position_delta=4,
+    )
+    specs = decode_client_message(_wire(encode_submit([left_out, sent])))[1]
+    computed, given = (build_sequence(spec, context) for spec in specs)
+    assert calls == [[5, 6]]  # only for the one that left them out
+    assert np.array_equal(computed.mrope_positions, np.arange(6).reshape(3, 2))
+    assert computed.mrope_position_delta == -1
+    assert np.array_equal(given.mrope_positions, np.zeros((3, 2)))
+    assert given.mrope_position_delta == 4
+
+
+def test_the_core_hashes_media_a_client_did_not():
+    media = _multimodal_data()
+    (spec,) = decode_client_message(
+        _wire(encode_submit([_request(1, [1, 2], multimodal_data=media)]))
+    )[1]
+    seq = build_sequence(spec, AdmissionContext(_config()))
+    assert seq.cache_seed == multimodal_cache_seed(media)

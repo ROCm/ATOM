@@ -15,7 +15,6 @@ ends reads as it did when the payloads were pickled.
 
 import pickle
 from itertools import chain
-from typing import NamedTuple
 
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.protocol import engine_v1_pb2 as pb
@@ -49,6 +48,22 @@ SAMPLING_FIELDS = (
 
 # A rejected admission's leave_reason starts with this.
 REJECTED_REASON = "rejected"
+
+# Why a request was rejected (RejectedRequest.Code).
+REJECT_INVALID = pb.RejectedRequest.INVALID
+REJECT_INTERNAL = pb.RejectedRequest.INTERNAL
+
+# Admin commands with a typed form (AdminCommand), and the arguments one may
+# carry. Anything else on the control socket travels as a pickled Utility.
+ADMIN_COMMANDS = {
+    "start_profile": pb.AdminCommand.START_PROFILE,
+    "stop_profile": pb.AdminCommand.STOP_PROFILE,
+    "get_mtp_statistics": pb.AdminCommand.GET_MTP_STATISTICS,
+    "get_cache_statistics": pb.AdminCommand.GET_CACHE_STATISTICS,
+    "clear_kv_cache": pb.AdminCommand.CLEAR_KV_CACHE,
+}
+_ADMIN_NAMES = {kind: name for name, kind in ADMIN_COMMANDS.items()}
+_ADMIN_ARGS = ("request_id", "timeout", "deadline")
 
 
 def _optional(msg, name):
@@ -155,11 +170,64 @@ def encode_abort(seq_ids) -> list:
     return FrameWriter().frames(envelope)
 
 
+def encode_command(payload: dict) -> list:
+    """A control-socket command; `payload` is the dict the Core's handler
+    receives. Typed (AdminCommand) when it is one of `ADMIN_COMMANDS` with
+    only the arguments that form carries, a pickled Utility otherwise."""
+    kind = ADMIN_COMMANDS.get(payload.get("cmd"))
+    if kind is not None and _fits_admin_command(payload):
+        return _encode_admin(kind, payload)
+    return encode_utility(payload)
+
+
+def _is_number(value) -> bool:
+    return type(value) in (int, float)
+
+
+def _fits_admin_command(payload: dict) -> bool:
+    request_id = payload.get("request_id")
+    return (
+        set(payload) - {"cmd"} <= set(_ADMIN_ARGS)
+        and (request_id is None or isinstance(request_id, str))
+        and all(
+            _is_number(payload[name])
+            for name in ("timeout", "deadline")
+            if payload.get(name) is not None
+        )
+    )
+
+
+def _encode_admin(kind, payload: dict) -> list:
+    envelope = pb.Envelope()
+    msg = envelope.admin
+    msg.kind = kind
+    for name in _ADMIN_ARGS:
+        if payload.get(name) is not None:
+            setattr(msg, name, payload[name])
+    return FrameWriter().frames(envelope)
+
+
+def _decode_admin(msg) -> tuple[str, dict]:
+    name = _ADMIN_NAMES.get(msg.kind)
+    if name is None:
+        raise ProtocolError(f"unknown admin command {msg.kind}")
+    # The dict CoreManager's broadcast builds, keys in its order.
+    payload = {"cmd": name}
+    for field in _ADMIN_ARGS:
+        if msg.HasField(field):
+            payload[field] = getattr(msg, field)
+    return name, payload
+
+
 def encode_utility(payload: dict) -> list:
-    """An admin command; `payload` is the dict the Core's handler receives."""
+    """A Python-only admin command; `payload` is the dict the Core's handler
+    receives, pickled into a frame."""
     writer = FrameWriter()
     envelope = pb.Envelope()
     envelope.utility.cmd = str(payload.get("cmd", ""))
+    request_id = payload.get("request_id")
+    if isinstance(request_id, str):
+        envelope.utility.request_id = request_id
     writer.add(
         pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL),
         envelope.utility.payload,
@@ -253,7 +321,9 @@ def decode_core_message(frames: list):
         return EngineCoreRequestType.STREAM, _decode_stream(envelope.stream, reader)
     if body == "rejected":
         return EngineCoreRequestType.ADD, [
-            CompletionResult(id=item.seq_id, leave_reason=item.reason)
+            CompletionResult(
+                id=item.seq_id, leave_reason=f"{REJECTED_REASON}: {item.reason}"
+            )
             for item in envelope.rejected.items
         ]
     if body == "metrics":
@@ -264,9 +334,16 @@ def decode_core_message(frames: list):
         return EngineCoreRequestType.UTILITY_RESPONSE, pickle.loads(
             reader.view(envelope.utility_reply.payload)
         )
+    if body == "admin_reply":
+        return EngineCoreRequestType.UTILITY_RESPONSE, _decode_admin_reply(
+            envelope.admin_reply, reader
+        )
     if body == "ready":
-        return EngineCoreRequestType.READY, decode_optional_value(
-            envelope.ready, "payload", reader
+        ready = envelope.ready
+        return EngineCoreRequestType.READY, (
+            {"max_pool_tokens": ready.max_pool_tokens}
+            if ready.HasField("max_pool_tokens")
+            else None
         )
     if body == "stopped":
         return EngineCoreRequestType.SHUTDOWN, None
@@ -318,9 +395,10 @@ def decode_client_message(frames: list):
     """`(kind, data, failures)` for one message from a client.
 
     ADD's data is the `AdmissionSpec`s that decoded; `failures` lists
-    `(seq_id, reason)` for those that did not, each of which the Core must
-    reject so its client is not left waiting. UTILITY's data is `(cmd,
-    payload)`; ABORT's is the sequence ids.
+    `(seq_id, reason, code)` for those that did not, each of which the Core
+    must reject so its client is not left waiting. UTILITY's data is `(cmd,
+    payload)`, from a Utility or an AdminCommand alike; ABORT's is the
+    sequence ids.
     """
     envelope = decode_envelope(frames)
     reader = FrameReader(frames)
@@ -331,11 +409,19 @@ def decode_client_message(frames: list):
             try:
                 specs.append(_decode_spec(msg, reader))
             except Exception as exc:  # noqa: BLE001 - reported per request
-                failures.append((msg.seq_id, f"{type(exc).__name__}: {exc}"))
+                failures.append(
+                    (
+                        msg.seq_id,
+                        f"{type(exc).__name__}: {exc}",
+                        REJECT_INVALID,
+                    )
+                )
         return EngineCoreRequestType.ADD, specs, failures
     if body == "utility":
         payload = pickle.loads(reader.view(envelope.utility.payload))
         return EngineCoreRequestType.UTILITY, (envelope.utility.cmd, payload), []
+    if body == "admin":
+        return EngineCoreRequestType.UTILITY, _decode_admin(envelope.admin), []
     if body == "abort":
         return EngineCoreRequestType.ABORT, list(envelope.abort.seq_ids), []
     if body == "shutdown":
@@ -343,40 +429,60 @@ def decode_client_message(frames: list):
     raise ProtocolError(f"unexpected message from a client: {body}")
 
 
-class AdmissionDefaults(NamedTuple):
-    """The `Sequence` arguments a Core derives from its own config.
+class AdmissionContext:
+    """How a Core turns a decoded request into its `Sequence`.
 
-    The client used to derive them from its copy of the same config. Computed
-    once per Core, at startup: the per-request-cache list lives with the
-    frontend's `InputOutputProcessor`, whose import costs a second that no
-    request should wait on.
+    Holds what the Core derives from its own config -- the client used to
+    derive the same from its copy of it -- and fills in what a client may
+    leave out (the REQUESTS section of engine_v1.proto). Built once per Core,
+    at startup: the per-request-cache list lives with the frontend's
+    `InputOutputProcessor`, whose import costs a second that no request
+    should wait on.
     """
 
-    block_size: int
-    num_draft_tokens: int
-    has_per_req_cache: bool
-
-    @classmethod
-    def from_config(cls, config) -> "AdmissionDefaults":
+    def __init__(self, config):
         from atom.model_engine.llm_engine import InputOutputProcessor
 
         speculative = getattr(config, "speculative_config", None)
-        return cls(
-            block_size=config.kv_cache_block_size,
-            num_draft_tokens=(
-                speculative.num_speculative_tokens if speculative is not None else 0
-            ),
-            has_per_req_cache=config.hf_config.model_type
-            in InputOutputProcessor._per_req_cache_model_types(),
+        self.config = config
+        self.block_size = config.kv_cache_block_size
+        self.num_draft_tokens = (
+            speculative.num_speculative_tokens if speculative is not None else 0
         )
+        self.has_per_req_cache = (
+            config.hf_config.model_type
+            in InputOutputProcessor._per_req_cache_model_types()
+        )
+        self.validate_request = getattr(config.hf_config, "validate_request", None)
+        self.enable_dp_attention = bool(getattr(config, "enable_dp_attention", False))
 
 
-def build_sequence(spec: AdmissionSpec, defaults: AdmissionDefaults):
-    """The `Sequence` the client would have built for `spec`."""
+def build_sequence(spec: AdmissionSpec, context: AdmissionContext):
+    """The `Sequence` the client would have built for `spec`.
+
+    Raises what the frontend would have raised building it, plus what the
+    model's own request validation refuses.
+    """
     from atom.model_engine.sequence import Sequence
 
-    kwargs = spec.kwargs
+    kwargs = dict(spec.kwargs)
     multimodal_data = kwargs["multimodal_data"]
+    if context.validate_request is not None:
+        context.validate_request(
+            num_draft_tokens=context.num_draft_tokens,
+            multimodal_data=multimodal_data,
+            enable_dp_attention=context.enable_dp_attention,
+        )
+    if multimodal_data is not None and kwargs["mrope_positions"] is None:
+        # A client that cannot run the model's MRoPE code leaves them out.
+        from atom.multimodal.registry import get_mrope_input_positions
+
+        (
+            kwargs["mrope_positions"],
+            kwargs["mrope_position_delta"],
+        ) = get_mrope_input_positions(
+            context.config, list(kwargs["token_ids"]), multimodal_data
+        )
     # The client hashed the media already; hand the seed to the constructor
     # the way it reads one, then take it back out, so the sequence's
     # multimodal_data is the dict the client sent.
@@ -389,9 +495,9 @@ def build_sequence(spec: AdmissionSpec, defaults: AdmissionDefaults):
         multimodal_data["cache_seed"] = spec.cache_seed
     try:
         seq = Sequence(
-            block_size=defaults.block_size,
-            num_draft_tokens=defaults.num_draft_tokens,
-            has_per_req_cache=defaults.has_per_req_cache,
+            block_size=context.block_size,
+            num_draft_tokens=context.num_draft_tokens,
+            has_per_req_cache=context.has_per_req_cache,
             id=spec.seq_id,
             **kwargs,
         )
@@ -402,6 +508,13 @@ def build_sequence(spec: AdmissionSpec, defaults: AdmissionDefaults):
     seq.id = spec.seq_id
     seq.arrive_time = spec.arrive_time
     return seq
+
+
+def rejection_code(exc: BaseException) -> int:
+    """INVALID for what a bad request raises, INTERNAL for anything else."""
+    if isinstance(exc, (ValueError, TypeError, IndexError, KeyError, OverflowError)):
+        return REJECT_INVALID
+    return REJECT_INTERNAL
 
 
 def _encode_completion(seq, msg, writer: FrameWriter) -> None:
@@ -461,22 +574,29 @@ def encode_stream(outputs) -> list:
 
 
 def encode_rejected(rejections) -> list:
-    """`rejections`: `(seq_id, reason)` pairs."""
+    """`rejections`: `(seq_id, reason, code)`, code a RejectedRequest.Code."""
     envelope = pb.Envelope()
     envelope.rejected.SetInParent()
-    for seq_id, reason in rejections:
+    for seq_id, reason, code in rejections:
         item = envelope.rejected.items.add()
         item.seq_id = seq_id
-        item.reason = f"{REJECTED_REASON}: {reason}"
+        item.reason = reason
+        item.code = code
     return FrameWriter().frames(envelope)
 
 
 def encode_ready(payload) -> list:
-    writer = FrameWriter()
+    """EngineCore's READY payload: None, or a dict of the facts in `Ready`."""
     envelope = pb.Envelope()
     envelope.ready.SetInParent()
-    encode_optional_value(payload, envelope.ready, "payload", writer)
-    return writer.frames(envelope)
+    if payload is not None:
+        unknown = set(payload) - {"max_pool_tokens"}
+        if unknown:
+            # A new startup fact needs a Ready field, not a silent drop.
+            raise ProtocolError(f"Ready has no field for {sorted(unknown)}")
+        if payload.get("max_pool_tokens") is not None:
+            envelope.ready.max_pool_tokens = payload["max_pool_tokens"]
+    return FrameWriter().frames(envelope)
 
 
 def encode_metrics(snapshot) -> list:
@@ -488,13 +608,60 @@ def encode_metrics(snapshot) -> list:
 
 
 def encode_utility_reply(reply) -> list:
+    """A utility handler's reply: an AdminReply when it answers a typed admin
+    command in the shape those take, a pickled UtilityReply otherwise."""
+    kind = ADMIN_COMMANDS.get(reply.get("cmd")) if isinstance(reply, dict) else None
+    if kind is not None and _fits_admin_reply(reply):
+        return _encode_admin_reply(kind, reply)
     writer = FrameWriter()
     envelope = pb.Envelope()
+    request_id = reply.get("request_id") if isinstance(reply, dict) else None
+    if isinstance(request_id, str):
+        envelope.utility_reply.request_id = request_id
     writer.add(
         pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL),
         envelope.utility_reply.payload,
     )
     return writer.frames(envelope)
+
+
+def _fits_admin_reply(reply: dict) -> bool:
+    request_id = reply.get("request_id")
+    return (
+        set(reply) <= {"cmd", "result", "error", "request_id"}
+        and ("result" in reply) != ("error" in reply)
+        and isinstance(reply.get("error", ""), str)
+        and (request_id is None or isinstance(request_id, str))
+    )
+
+
+def _encode_admin_reply(kind, reply: dict) -> list:
+    writer = FrameWriter()
+    envelope = pb.Envelope()
+    msg = envelope.admin_reply
+    msg.kind = kind
+    if reply.get("request_id") is not None:
+        msg.request_id = reply["request_id"]
+    if "error" in reply:
+        msg.error = reply["error"]
+    else:
+        encode_value(reply["result"], msg.result, writer)
+    return writer.frames(envelope)
+
+
+def _decode_admin_reply(msg, reader: FrameReader) -> dict:
+    name = _ADMIN_NAMES.get(msg.kind)
+    if name is None:
+        raise ProtocolError(f"unknown admin command {msg.kind}")
+    # The dict the handler built, keys in its order.
+    reply = {"cmd": name}
+    if msg.HasField("error"):
+        reply["error"] = msg.error
+    else:
+        reply["result"] = decode_value(msg.result, reader)
+    if msg.HasField("request_id"):
+        reply["request_id"] = msg.request_id
+    return reply
 
 
 def encode_stopped() -> list:

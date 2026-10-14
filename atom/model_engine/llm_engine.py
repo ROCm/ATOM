@@ -716,7 +716,7 @@ class InputOutputProcessor:
         `has_per_req_cache` flags model architectures that need a per-request
         stateful buffer outside the paged KV pool; BlockManager reserves a
         per-req cache slot for their sequences. Read by the engine's sequence
-        construction (`protocol.codec.AdmissionDefaults`) AND by ModelRunner's
+        construction (`protocol.codec.AdmissionContext`) AND by ModelRunner's
         startup sanity check, which asserts that any model whose attention
         builder declares a per-request state sub-pool has its model_type
         registered here. Adding a new stateful-attention model means adding

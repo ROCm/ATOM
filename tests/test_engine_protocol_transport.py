@@ -19,7 +19,7 @@ import torch
 import zmq
 from aiter_stub import stubbed_aiter
 
-from atom.model_engine.protocol.codec import AdmissionDefaults, decode_client_message
+from atom.model_engine.protocol.codec import AdmissionContext, decode_client_message
 from atom.model_engine.protocol.requests import CompletionResult, EngineRequest
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
@@ -64,7 +64,7 @@ class Link:
         core.output_queue = queue.Queue()
         core.utility_queue = queue.Queue()
         core._has_pending_utility = False
-        core._admission_defaults = AdmissionDefaults.from_config(core_config)
+        core._admission = AdmissionContext(core_config)
         self.core = core
         self.core_threads = [
             threading.Thread(
@@ -243,29 +243,35 @@ def test_abort_reaches_the_utility_queue_as_before(link):
     assert link.core._has_pending_utility
 
 
-def test_utility_commands_roundtrip(link):
+@pytest.mark.parametrize(
+    "cmd,result",
+    [
+        # Typed: AdminCommand out, AdminReply back.
+        ("get_mtp_statistics", {"enabled": False}),
+        # Python-only: a pickled Utility out, a pickled UtilityReply back.
+        ("get_weight_sync_status", {"fenced": False, "sync_id": None}),
+    ],
+)
+def test_synchronous_commands_roundtrip(link, cmd, result):
     def respond():
-        cmd, payload = link.core.utility_queue.get(timeout=TIMEOUT)
-        assert cmd == "get_mtp_statistics" and payload["cmd"] == cmd
+        got, payload = link.core.utility_queue.get(timeout=TIMEOUT)
+        assert got == cmd and payload["cmd"] == cmd
+        assert set(payload) == {"cmd", "request_id", "timeout", "deadline"}
         link.core.output_queue.put(
             (
                 "UTILITY_RESPONSE",
-                {
-                    "cmd": cmd,
-                    "result": {"enabled": False},
-                    "request_id": payload["request_id"],
-                },
+                {"cmd": cmd, "result": result, "request_id": payload["request_id"]},
             )
         )
 
     responder = threading.Thread(target=respond)
     responder.start()
-    (reply,) = link.mgr.broadcast_utility_command_sync(
-        "get_mtp_statistics", timeout=TIMEOUT
-    )
+    (reply,) = link.mgr.broadcast_utility_command_sync(cmd, timeout=TIMEOUT)
     responder.join()
-    assert reply["result"] == {"enabled": False}
+    assert reply["result"] == result
 
+
+def test_fire_and_forget_commands_reach_the_utility_queue(link):
     link.mgr.send_utility_command("get_mtp_stats")
     assert link.core.utility_queue.get(timeout=TIMEOUT) == (
         "get_mtp_stats",
