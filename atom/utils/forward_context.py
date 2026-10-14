@@ -261,6 +261,7 @@ class ForwardMode:
         max_seqlen_q: int,
         graph_shapes: Collection[tuple[int, int]] | None = None,
         supports_piecewise_prefill: bool = False,
+        capture_sizes_by_q: dict[int, np.ndarray] | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -331,6 +332,9 @@ class ForwardMode:
         # ascending int32 (`ModelRunner.capture_sizes_np`, sorted where it is
         # built and never mutated), so the insertion point IS the smallest size
         # that holds the batch, and running off the end IS "no recording can".
+        # Select after the DP reduction: all ranks must use the agreed Q.
+        if capture_sizes_by_q is not None and not is_prefill:
+            capture_sizes = capture_sizes_by_q.get(max_seqlen_q, ())
         rung = int(np.searchsorted(capture_sizes, unified_bs))
         on_ladder = rung < len(capture_sizes)
         running_bs = int(capture_sizes[rung]) if on_ladder else unified_bs

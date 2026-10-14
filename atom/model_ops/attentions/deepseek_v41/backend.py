@@ -1134,6 +1134,34 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         if metadata.cache.pending is not None:
             metadata.cache.commit_tentative(metadata.step, last_token_indices)
 
+    def build_for_piecewise_capture(self, num_tokens):
+        """Capture dense token buckets without binding request-shaped attention."""
+        if not 0 < num_tokens <= self.max_num_batched_tokens:
+            raise ValueError("CSA2 piecewise capture exceeds the token buffer")
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=(),
+            num_scheduled_tokens=(),
+            context_lens=(),
+            state_slots_committed=(),
+            total_seqs_num=0,
+            total_tokens_num=0,
+            is_final_chunk=None,
+            replaying={},
+        )
+        metadata, positions = self._prepare(batch, 1, num_tokens, engram_live=False)
+        metadata.dummy = True
+        metadata.engram_embeddings = {}
+        return metadata, Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=0,
+            scheduled_tokens=0,
+            running_bs=1,
+            running_tokens=num_tokens,
+        )
+
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Binds the serving allocation, as V4 does: a scratch cache would bake
         # the wrong window address into the shared draft graph. Runtime idle

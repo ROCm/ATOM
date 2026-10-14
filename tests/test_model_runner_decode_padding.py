@@ -8,6 +8,7 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.config import CUDAGraphMode
 from atom.model_engine import model_runner as runner_module
 from atom.utils.forward_context import ForwardMode
 
@@ -31,7 +32,10 @@ def test_runner_model_height_and_sampling_rows(
 ):
     runner = runner_module.ModelRunner.__new__(runner_module.ModelRunner)
     runner.use_mrope = mrope
-    runner.config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.config = SimpleNamespace(
+        prefill_context_parallel_size=1,
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
     runner._detailed_label_suffix = lambda batch: ""
     runner._piecewise_cg_active = lambda: piecewise
     ids = torch.full((32,), -99, dtype=torch.int32)

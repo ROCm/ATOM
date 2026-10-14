@@ -155,6 +155,11 @@ class CompilationConfig:
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     cudagraph_capture_sizes: list[int] | None = None
+    """Capture ladder: token counts for FULL_AND_PIECEWISE, batch sizes otherwise.
+
+    Hybrid mode uses these tokens directly for prefill and rounds them up to
+    each decode query length to derive FULL (batch size, query length) graphs.
+    """
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
     """Cuda graph capture sizes
@@ -2137,7 +2142,7 @@ class Config:
 
     @property
     def capture_sizes(self) -> list[int]:
-        """The declared CUDAGraph capture ladder, in batch sizes.
+        """The declared capture ladder (tokens for FULL_AND_PIECEWISE, else BS).
 
         Declared, not schedulable -- `ModelRunner` drops what its own token
         budget can never produce, a bound needing the drafter's resolved
@@ -2149,6 +2154,17 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
+            if (
+                self.compilation_config.cudagraph_mode
+                == CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                return [
+                    n
+                    for n in [1, 2, 4]
+                    + list(range(8, 256, 8))
+                    + list(range(256, sizes[0] + 1, 16))
+                    if n <= sizes[0]
+                ]
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 

@@ -344,13 +344,17 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use FULL, PIECEWISE, AF_PIECEWISE or enforce_eager=True)",
+            (
+                "CUDAGraph mode (use FULL, PIECEWISE, AF_PIECEWISE, "
+                "FULL_AND_PIECEWISE or enforce_eager=True)"
+            ),
             not config.enforce_eager
             and graph_mode
             not in (
                 CUDAGraphMode.FULL,
                 CUDAGraphMode.PIECEWISE,
                 CUDAGraphMode.AF_PIECEWISE,
+                CUDAGraphMode.FULL_AND_PIECEWISE,
             ),
         ),
         (

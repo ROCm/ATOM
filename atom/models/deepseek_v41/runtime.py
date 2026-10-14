@@ -155,7 +155,11 @@ def v41_piecewise_begin(hidden: torch.Tensor) -> None:
     if not metadata.step.requests:
         return
     rows = metadata.engram_embeddings
-    if getattr(rows, "stage", None) is not None:
+    context = get_forward_context()
+    if getattr(rows, "stage", None) is not None and (
+        not getattr(context, "in_hipgraph", False)
+        or context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+    ):
         rows.join()
 
 
@@ -292,7 +296,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.piecewise = (
             config.compilation_config.level == 3
             and config.compilation_config.cudagraph_mode
-            in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.AF_PIECEWISE)
+            in (
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.AF_PIECEWISE,
+                CUDAGraphMode.FULL_AND_PIECEWISE,
+            )
             and not config.enforce_eager
         )
         self._late_piecewise_inputs = {}
@@ -301,7 +309,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             layer.af_piecewise = (
                 self.piecewise
                 and config.compilation_config.cudagraph_mode
-                == CUDAGraphMode.AF_PIECEWISE
+                in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
             )
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (
                 layer,

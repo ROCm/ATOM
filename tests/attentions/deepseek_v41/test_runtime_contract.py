@@ -308,7 +308,9 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         validate_runtime_config(value)
 
 
-@pytest.mark.parametrize("mode_name", ["FULL", "PIECEWISE", "AF_PIECEWISE"])
+@pytest.mark.parametrize(
+    "mode_name", ["FULL", "PIECEWISE", "AF_PIECEWISE", "FULL_AND_PIECEWISE"]
+)
 def test_level3_accepts_full_and_piecewise_modes(mode_name):
     from atom.config import CUDAGraphMode
 

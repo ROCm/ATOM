@@ -1,4 +1,4 @@
-# DeepSeek-V4.1 PIECEWISE and AF_PIECEWISE
+# DeepSeek-V4.1 piecewise prefill and FULL decode
 
 V4.1 text prefills can replay token-bucket CUDA graphs while preserving
 decoder SWA bounded replay. Opt in with either of these options:
@@ -11,6 +11,40 @@ decoder SWA bounded replay. Opt in with either of these options:
 FULL remains the default. PIECEWISE captures the dense work around attention
 and Engram, including mHC and FFN. AF_PIECEWISE also captures each layer's
 whole attention call. Both modes use the existing attention kernels.
+
+## FULL_AND_PIECEWISE
+
+Use hybrid mode for AF piecewise prefill and whole-forward FULL decode:
+
+```bash
+--level 3 --cudagraph-mode FULL_AND_PIECEWISE --cuda-graph-sizes '[1024]'
+```
+
+In this mode, the capture ladder is measured in **tokens**. A single
+`cuda_graph_sizes` value expands to `[1, 2, 4]`, multiples of 8 below 256,
+then multiples of 16 through that maximum. An explicit
+`--cudagraph-capture-sizes '[1, 2, 4, 8, 16, 32, 64, 128, 256, 448, 512, 704, 768, 1024]'`
+uses exactly those token candidates. Existing FULL, PIECEWISE and AF_PIECEWISE
+options retain their batch-size units.
+
+Prefill captures the token ladder independently of request count. FULL decode
+rounds each candidate up to a multiple of Q, derives BS=T/Q, deduplicates and
+filters by the token ceiling and scheduler capacity. Padding selects the BS
+ladder for the DP-agreed Q. With DSpark 5, Q=6: a 600-token prefill uses the
+608 bucket in the default 1024 ladder; BS=100 decode uses FULL at BS=102,
+612 tokens. Out-of-range decode runs eagerly, not through AF piecewise.
+
+PIECEWISE is captured first, then FULL, then draft passes. FULL capture runs
+the compiled pieces without inner graph replay/capture. Draft warmup covers
+the union of batch sizes reachable at every decode Q. Bounded-replay tail
+buckets are added internally when missing. The existing per-bucket piecewise
+memory pools are retained; a shared token ladder does not merge graph objects.
+
+Every rank logs allocated/reserved/device-used/free GiB before capture,
+after each target mode/Q, and after draft capture. Subtract those readings to
+separate target piecewise, target FULL and draft memory. The final capture
+summary includes total reserved and allocated deltas. Device-used includes
+KV caches and allocations outside the PyTorch allocator, not just graphs.
 
 ## Graph boundaries
 
@@ -105,6 +139,7 @@ Run the regression suite in an ATOM ROCm environment:
 
 ```bash
 python -m pytest -q \
+  tests/test_hybrid_cudagraph.py \
   tests/test_forward_mode.py \
   tests/models/deepseek_v41/test_piecewise.py \
   tests/models/deepseek_v41/test_af_attention.py \
