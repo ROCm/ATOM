@@ -1308,16 +1308,45 @@ check_mooncake_owner_devices() {
   done
 }
 
+# Free memory per NUMA node in blocks of 2 MiB or more (buddy order 9 and up).
+mooncake_huge_block_gib() {
+  awk '{ node = $2; sub(",", "", node)
+         for (k = 9; k <= NF - 5; k++) gib[node] += $(k + 5) * 2 ^ (k - 9) * 2 / 1024 }
+       END { for (node in gib) printf "node%s %.0f GiB  ", node, gib[node]; print "" }' \
+    /proc/buddyinfo
+}
+
+# reclaim_node_memory_as_root: drops the whole node's clean page cache and its
+# dentry/inode slab, then compacts every zone. drop_page_cache.py cannot do
+# this. It evicts only the files it names, and it leaves the pages that other
+# processes still reference: other teams' models in the node-local /models kept
+# 1.1 TiB of one NUMA node in page cache, and the compaction behind it stalled at
+# 256 of 768 GiB. Needs root in a privileged container (/proc/sys is read-only
+# otherwise); returns 1 without it. On pit2-p03-g53 it took about 3 min and left
+# 1404/1410 GiB in 2 MiB blocks on NUMA0/1, up from 453/308.
+reclaim_node_memory_as_root() {
+  [[ -w /proc/sys/vm/drop_caches && -w /proc/sys/vm/compact_memory ]] || return 1
+  echo "[mooncake-store] 2 MiB blocks before reclaim: $(mooncake_huge_block_gib)"
+  local start="${SECONDS}"
+  sync
+  echo 3 > /proc/sys/vm/drop_caches || return 1
+  echo 1 > /proc/sys/vm/compact_memory || return 1
+  echo "[mooncake-store] dropped the node's page cache and slab and compacted it in $(( SECONDS - start )) s; 2 MiB blocks now: $(mooncake_huge_block_gib)"
+}
+
 # prepare_mooncake_store_memory: drops the clean page cache that the owners'
-# huge-page faults would otherwise reclaim through compaction, then refuses pins
-# that do not fit a NUMA node (numa_memory_budget.py warns when they exceed its
-# free memory), and compacts each node for its pins: owners that fault a
-# fragmented node from many threads get 4 KiB pages, which the NICs refuse.
+# huge-page faults would otherwise reclaim through compaction (the whole node's
+# as root, else the model directories' own), then refuses pins that do not fit
+# a NUMA node (numa_memory_budget.py warns when they exceed its free memory),
+# and compacts each node for its pins: owners that fault a fragmented node from
+# many threads get 4 KiB pages, which the NICs refuse.
 prepare_mooncake_store_memory() {
   local -a drop_dirs=()
   IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
-  echo "[mooncake-store] dropping the page cache of ${drop_dirs[*]}"
-  python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${drop_dirs[@]}"
+  if ! reclaim_node_memory_as_root; then
+    echo "[mooncake-store] /proc/sys/vm is read-only here; dropping the page cache of ${drop_dirs[*]} only"
+    python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${drop_dirs[@]}"
+  fi
   local -a pins=()
   local i
   for i in "${!mooncake_owner_plan_numa[@]}"; do
