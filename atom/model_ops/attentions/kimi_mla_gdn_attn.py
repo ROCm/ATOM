@@ -178,31 +178,6 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
             or getattr(config, "enable_rapidserve", False)
         )
 
-    def checkpoint_page_unit_bytes(self) -> int | None:
-        """Bytes of one PAGE unit that a transfer here actually publishes.
-
-        `ModelRunner` sizes the checkpoint unit from the PAGE class's
-        `entry_bytes` unless a backend narrows it. That class total is the sum
-        over everything merged into it, and a draft that owns a KV pool joins
-        it (`DraftKvBuilder.sub_pool_specs` -> `page_pool`) rather than
-        declaring a class of its own.
-
-        The state image, though, is tucked into the TARGET's MLA rows, which is
-        all `_page_unit_regions` enumerates. Leaving the unit at the class
-        total makes the two disagree by exactly the draft's entry bytes and the
-        granularity check raises. The draft's rows are derived state, rewritten
-        from the target's hidden states every step, so they are neither part of
-        the image nor part of its unit.
-
-        `paged_pool_bytes(1)` is this builder's OWN declaration -- the same one
-        `sub_pool_specs` prices -- so with no draft pool merged it is equal to
-        the class total and this returns the number the runner would have used
-        anyway.
-        """
-        if not self._uses_paged_checkpoints():
-            return None
-        return self.paged_pool_bytes(1)
-
     def state_transfer(self) -> StateTransfer:
         """A PAGE-image copy, not `GDNStateMixin`'s fork.
 
@@ -267,6 +242,29 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         """MLA paged KV for the full-attention layers, plus the KDA/GDN
         per-request state pool (`GDNStateMixin.state_spec`)."""
         return [page_pool(self._declare_kv_pool().entry_bytes), self.state_spec()]
+
+    def checkpoint_page_unit_bytes(self) -> int | None:
+        """Bytes of one PAGE unit a transfer here actually publishes.
+
+        `ModelRunner` sizes the checkpoint unit from the PAGE class's charged
+        `entry_bytes`. For MLA alone that is already the rows the page geometry
+        walks, so no override is needed. A draft model that owns a KV pool
+        changes that: it joins this class rather than declaring its own
+        (`DraftKvBuilder.sub_pool_specs` -> `page_pool`), which is what riding
+        the target's block ids costs. The state image still lives in the
+        target's MLA rows -- the draft's are derived state, rewritten from the
+        target's hidden states every step -- so the charged class exceeds the
+        published regions by exactly the draft's entry bytes.
+
+        Answer with the target's own declaration, the same one `sub_pool_specs`
+        prices above, so the two agree by construction. `MlaKvPool` answers
+        `entry_bytes` before any block count exists, which matters here: this is
+        consulted while the plan is still being sized, so the pool is not
+        allocated yet and there is no cache tensor to measure.
+        """
+        if not self._uses_paged_checkpoints():
+            return None
+        return int(self._declare_kv_pool().entry_bytes)
 
     def _aligned_index_dim(self) -> int:
         """Indexer entry width, padded to 16B so inductor sees aligned rows."""
