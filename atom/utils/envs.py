@@ -161,6 +161,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to rebuild every layer's window and compressor state exactly.
     "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
     in {"1", "true", "yes", "on"},
+    # Native-state LMCache MP: whether a PAGE save also stores a state image.
+    # "auto" (default): only when no bounded replay runs. With one
+    # (ATOM_DSV4_STATE_REPLAY), saves store the PAGE KV alone and every LMCache
+    # hit is a KV-only load plus that replay, which rebuilds the state exactly.
+    # "1" / "0" force it either way; "0" needs the replay.
+    "ATOM_LMCACHE_MP_STATE_IMAGES": lambda: os.getenv(
+        "ATOM_LMCACHE_MP_STATE_IMAGES", "auto"
+    ).lower(),
     # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
     # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
     # Store, no LMCache). Unset = off.

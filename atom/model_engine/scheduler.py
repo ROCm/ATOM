@@ -883,7 +883,10 @@ class Scheduler:
             offload_resume = self._is_offload_prefill_resume(seq)
             if offload_resume:
                 resume = self._offload_prefill_start(seq)
-                cached = self.block_manager.replay_start(seq, resume, hit=False)
+                # A replayed hit resumes as one, as admission starts it.
+                cached = self.block_manager.replay_start(
+                    seq, resume, hit=seq.replays_hit
+                )
             else:
                 if probed_tokens >= budget:
                     break
@@ -1037,7 +1040,10 @@ class Scheduler:
             if tokens >= token_cap:
                 break
             if self._is_offload_prefill_resume(seq):
-                start = resume = seq.num_cached_tokens
+                resume = seq.num_cached_tokens
+                start = self.block_manager.replay_start(
+                    seq, resume, hit=seq.replays_hit
+                )
             else:
                 # Runs on every tick with prefill work, holds included: keep
                 # the head's prompt-block hashes instead of rehashing its
@@ -1163,6 +1169,11 @@ class Scheduler:
                 and num_new_tokens > self.max_num_batched_tokens
             ):
                 continue
+            if self._is_offload_prefill_resume(seq):
+                # Holds its blocks since before its load: nothing to allocate,
+                # and a probe would recompute the hit flags it was admitted
+                # with (`replays_hit`), which decide how it resumes.
+                return True
             # KV-pressured requests definitely cannot prefill. A fit probe, not
             # an admission -- `record=False` so it does not move the joint-
             # boundary funnel counters for a seq it may never schedule.
@@ -2024,18 +2035,25 @@ class Scheduler:
                     # regardless: the first decode samples from the logits this
                     # prefill produces, and there is nowhere else to get them.
                     seq.num_cached_tokens = self._offload_prefill_start(seq)
+                # A replayed hit resumes as one: its state slot is fresh, so
+                # the forward replays below where the load left
+                # `num_cached_tokens` -- the KV-only reach, or the HBM hit if
+                # the load did not run (`Sequence.replay_kv_load`).
+                replayed = seq.replays_hit
                 start = self.block_manager.replay_start(
-                    seq, seq.num_cached_tokens, hit=False
+                    seq, seq.num_cached_tokens, hit=replayed
                 )
                 num_new_tokens = seq.num_tokens - start
                 budget_remaining = self._prefill_room(num_batched_tokens, start)
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens, budget_remaining, num_batched_tokens
                 )
-                if chunk is None or start + chunk <= seq.num_cached_tokens:
+                if chunk is None or self._waits_below_resume(
+                    seq, start, chunk, seq.num_cached_tokens
+                ):
                     self.waiting.appendleft(seq)
                     break
-                self._resume_prefill(seq, start, hit=False)
+                self._resume_prefill(seq, start, hit=replayed)
                 chunk = self._finalize_prefill_chunk(seq, start, chunk)
                 self._assert_positive_prefill_chunk(
                     chunk, num_new_tokens, budget_remaining
@@ -2050,8 +2068,11 @@ class Scheduler:
                 # The tier's own figure, not the possibly-rolled-back one: what
                 # it returned is what the API should report, and giving the
                 # trailing block back to the forward is this scheduler's
-                # decision rather than a smaller hit.
-                seq.prefix_cache_hit_tokens = tier_hit
+                # decision rather than a smaller hit. A replay recomputes the
+                # rows below the tier's figure: they are not a hit.
+                seq.prefix_cache_hit_tokens = (
+                    seq.num_cached_tokens if replayed else tier_hit
+                )
                 num_seqs_prefill, num_batched_tokens = self._schedule_prefill_seq(
                     seq,
                     chunk,
@@ -2082,6 +2103,16 @@ class Scheduler:
                 reuse_hashes=self._local_prefill_coalescing,
             )
             if num_cached_blocks < 0:
+                self.waiting.appendleft(seq)
+                break
+            if (
+                seq.replay_kv_load
+                and not needs_remote_load
+                and len(self.running) + self._num_parked_remote_kv >= self.max_num_seqs
+            ):
+                # A replay that loads its KV first parks for that load like any
+                # remote load (`needs_remote_load` knew only the state-carrying
+                # hit), so it needs a parked slot too.
                 self.waiting.appendleft(seq)
                 break
 
@@ -2143,8 +2174,12 @@ class Scheduler:
 
             self._notify_connector_after_prefill_alloc(seq)
 
+            # A replay that loads its KV first parks for that load whatever the
+            # lookup answered: the answer was the state-carrying hit, which a
+            # KV-only reach can exceed. Running the forward instead would start
+            # under the replay's floors before the KV below them arrived.
             needs_remote_load = self._confirm_remote_load_after_alloc(
-                seq, needs_remote_load
+                seq, needs_remote_load or seq.replay_kv_load
             )
 
             if needs_remote_load:

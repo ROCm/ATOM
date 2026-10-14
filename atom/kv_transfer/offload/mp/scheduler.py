@@ -41,7 +41,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
 
     _supports_early_block_release = True
 
-    def __init__(self, config: Any, *, checkpoint_spec: Any = None) -> None:
+    def __init__(
+        self, config: Any, *, checkpoint_spec: Any = None, images: bool = True
+    ) -> None:
         _validate_mp_config(config)
         kvc = getattr(config, "kv_transfer_config", {}) or {}
         validated_kv_role(kvc)
@@ -50,7 +52,9 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
             config.kv_cache_block_size,
             minimum=1,
         )
-        adapter = _make_scheduler_adapter(config, checkpoint_spec=checkpoint_spec)
+        adapter = _make_scheduler_adapter(
+            config, checkpoint_spec=checkpoint_spec, images=images
+        )
         try:
             extra = _extra_config(config)
             timeout = float(extra.get("lmcache.mp.lookup_timeout", 30.0))

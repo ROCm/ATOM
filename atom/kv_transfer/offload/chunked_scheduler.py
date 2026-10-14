@@ -437,6 +437,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         self._handoff_loads.discard(sid)
         self._load_save_floors.pop(sid, None)
         self._hit_save_floors.pop(sid, None)
+        self._release_lookup(sid)
+
+    def _release_lookup(self, sid: str) -> None:
+        """Clear this request's lookup once no load spec needs it."""
         # clear_lookup_status only clears the client's memo; it does not
         # release worker pins. Keep the ID for the next metadata dispatch.
         if self._lookup_client is not None:
