@@ -1759,16 +1759,19 @@ def test_max_pending_saves_rejects_invalid_connector_extra(value):
 def test_max_pending_saves_precedence_and_worker_default(monkeypatch):
     monkeypatch.setenv("OFFLOAD_MAX_PENDING_SAVES", "7")
     assert connector_module.max_pending_saves({}, 3) == 7
+    assert connector_module.max_pending_saves({}, 3, pp_size=8) == 7
     assert (
         connector_module.max_pending_saves(
             {"kv_connector_extra_config": {"max_pending_saves": 5}},
             3,
+            pp_size=8,
         )
         == 5
     )
     monkeypatch.delenv("OFFLOAD_MAX_PENDING_SAVES")
     assert connector_module.max_pending_saves({}, 3) == 6
     assert connector_module.max_pending_saves({}, 1) == 2
+    assert connector_module.max_pending_saves({}, 1, pp_size=8) == 16
 
 
 def test_wait_for_publication_times_out_with_bounded_positive_sleeps():
