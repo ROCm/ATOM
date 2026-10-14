@@ -936,6 +936,64 @@ def test_a_dp_engine_refuses_the_weight_group_before_joining(monkeypatch):
     assert joined == []
 
 
+def test_a_dp_engine_is_refused_though_its_world_was_isolated_to_one(monkeypatch):
+    """Once a DP engine's workers have a world of their own, their config says
+    data_parallel_size=1, and the refusal, reading that, let every DP engine
+    of the deployment join one weight group."""
+    joined = _joins(monkeypatch)
+    worker = _Worker(0, 1, tp=1, tp_world=1, pcp=1, dp=1)
+    worker._deployment_data_parallel_size = 2
+
+    with pytest.raises(RuntimeError, match="data_parallel_size=2"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+
+def test_the_rlhf_runner_keeps_the_deployments_dp_size_before_hiding_it():
+    """The runner that builds those worlds is what rewrites the config, so it
+    has to keep the deployment's size first. Read, not run: importing the
+    runner needs aiter on a ROCm device."""
+    import ast
+
+    src = (
+        Path(__file__).resolve().parent.parent
+        / "atom"
+        / "rollout"
+        / "model_runner_ext.py"
+    ).read_text()
+    runner = next(
+        n
+        for n in ast.parse(src).body
+        if isinstance(n, ast.ClassDef) and n.name == "RLHFModelRunner"
+    )
+    setup = next(
+        n
+        for n in runner.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_setup_device_and_distributed"
+    )
+    writes = sorted(
+        (node.lineno, ast.unparse(target), ast.unparse(node.value))
+        for node in ast.walk(setup)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if ast.unparse(target)
+        in (
+            "self._deployment_data_parallel_size",
+            "config.parallel_config.data_parallel_size",
+        )
+    )
+
+    assert [(target, value) for _, target, value in writes] == [
+        (
+            "self._deployment_data_parallel_size",
+            "config.parallel_config.data_parallel_size",
+        ),
+        ("config.parallel_config.data_parallel_size", "1"),
+    ]
+
+
 def test_an_mla_model_refuses_the_weight_group_before_joining(monkeypatch):
     """MLA decodes through W_K and W_V, derived from kv_b_proj once at load.
     A reload rewrote kv_b_proj and left them, and the engine served old and
@@ -1067,7 +1125,7 @@ def test_the_lifecycle_the_real_mixins_define_is_advertised():
     assert "rdma_weight_receive" in report["features"]
 
 
-@pytest.mark.parametrize("unsafe", ["dp", "mla"])
+@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "mla"])
 def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
     """The methods are still there; the feature is what says they work here,
     so an orchestrator can choose another path before a rendezvous that
@@ -1080,6 +1138,8 @@ def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
         pass
 
     worker = _Composed(0, 0, tp=1, tp_world=1, pcp=1, dp=2 if unsafe == "dp" else 1)
+    if unsafe == "isolated-dp":
+        worker._deployment_data_parallel_size = 2
     if unsafe == "mla":
         worker.model = nn.Sequential(_mla_attention(monkeypatch)())
     report = worker.get_worker_capabilities()

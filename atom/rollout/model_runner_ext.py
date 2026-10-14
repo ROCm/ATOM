@@ -189,7 +189,10 @@ class RLHFModelRunner(
         # DP is handled at the EngineCore level (DPEngineCoreProc), not
         # within ModelRunner. Override so downstream code (get_dp_padding,
         # ForwardMode.decide/sync_dp_metadata) sees dp_size=1 and skips cross-DP
-        # collectives that would fail on the isolated process group.
+        # collectives that would fail on the isolated process group. Kept
+        # first for what has to see the whole deployment: an RDMA weight group
+        # would span every DP engine of it.
+        self._deployment_data_parallel_size = config.parallel_config.data_parallel_size
         config.parallel_config.data_parallel_size = 1
 
         # aiter's init_dist_env creates a signal tensor on device=rankID

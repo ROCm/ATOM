@@ -555,9 +555,14 @@ class RDMAWeightReceiverMixin:
 
     def _rdma_reload_refusal(self) -> str | None:
         """Why a reload over RDMA would be unsafe on this engine, if it would."""
-        config = getattr(self, "config", None)
-        parallel = getattr(config, "parallel_config", None)
-        dp = int(getattr(parallel, "data_parallel_size", 1) or 1)
+        # Not the runner's own config alone: once a DP engine's workers have a
+        # world of their own, it says data_parallel_size=1 on every one of them.
+        dp = getattr(self, "_deployment_data_parallel_size", None)
+        if dp is None:
+            config = getattr(self, "config", None)
+            parallel = getattr(config, "parallel_config", None)
+            dp = getattr(parallel, "data_parallel_size", 1)
+        dp = int(dp or 1)
         if dp > 1:
             return (
                 f"data_parallel_size={dp}. One group would span {dp} "
