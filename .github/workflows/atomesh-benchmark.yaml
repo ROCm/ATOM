@@ -1576,6 +1576,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Preflight scatter_bounds script syntax
+        run: |
+          set -euo pipefail
+          # Catch nested-quote / parse errors before burning a Slurm GPU allocation
+          # (runs 38532471586, 38535702939 failed only after sbatch).
+          bash .github/scripts/atomesh/check_scatter_bounds_syntax.sh
+
       - name: Submit scatter_bounds Slurm verify
         id: scatter-bounds
         run: |
