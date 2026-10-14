@@ -955,7 +955,22 @@ def test_a_rank_whose_broadcast_failed_leaves_the_group_before_it_votes(
         )
 
     assert order == ["vote", "vote", "leave", "vote"]
-    assert peers.ballots[-1] == (receiver._BROKEN_OFF, True)
+    assert peers.ballots[-1] == (receiver._LEFT, True)
+
+
+def test_a_rank_that_left_the_group_takes_its_peers_out_of_it_too(monkeypatch):
+    """A rank whose broadcast failed left the group and voted the stream off,
+    while a peer that had reached the end marker only refused it: that peer
+    kept a group the other was gone from, and the next stream waited for it."""
+    trainer = _Trainer(_frames(_three_buckets()))
+    runner = _Runner()
+
+    def agree(ballot, began):
+        return (ballot if ballot == receiver._RECEIVING else receiver._LEFT), True
+
+    with pytest.raises(receiver.RDMAStreamOutOfStep, match="left its group"):
+        _receive(monkeypatch, trainer, runner, agree=agree)
+    assert runner.events[-1].startswith("abort")
 
 
 def test_a_vote_that_failed_leaves_the_group_to_be_joined_again(monkeypatch):

@@ -62,6 +62,7 @@ _RDMA_CAPABILITY_VERSION = 2
 
 # A rank's ballot at each vote on a stream; a vote's outcome is the least
 # ballot any rank cast. See receive_weight_stream.
+_LEFT = -1  # broke off between votes and left the group: no rank may keep it
 _BROKEN_OFF = 0  # cannot follow the stream any further, or cannot commit it
 _PREPARED = 1  # at the end marker, with this rank's commit prepared
 _RECEIVING = 2  # can receive the frame just announced
@@ -264,9 +265,9 @@ def _alone(ballot: int, began: bool) -> tuple[int, bool]:
 def vote_on_stream(group, ballot: int, began: bool) -> tuple[int, bool]:
     """One vote on a stream, by every rank of *group*.
 
-    Each rank casts ``_RECEIVING``, ``_PREPARED`` or ``_BROKEN_OFF``, and says
-    whether it began the stream at all; the outcome is the least ballot cast,
-    and whether any rank began. *group* is a CPU one: a vote is two integers.
+    Each rank casts one of the ballots above, and says whether it began the
+    stream at all; the outcome is the least ballot cast, and whether any rank
+    began. *group* is a CPU one: a vote is two integers.
     """
     votes = torch.tensor([int(ballot), -int(began)], dtype=torch.int64)
     dist.all_reduce(votes, op=dist.ReduceOp.MIN, group=group)
@@ -465,6 +466,13 @@ def receive_weight_stream(
                 failure = exc
         outcome, any_began = decide(_PREPARED if failure is None else _BROKEN_OFF)
         decided = True
+        if outcome == _LEFT:
+            # Its peers have the group, this rank too, but not the one that
+            # left: the next stream would wait for it.
+            raise RDMAStreamOutOfStep(
+                f"RDMA weight stream v{expected_version}: a rank taking it left "
+                f"its group"
+            ) from failure
         if failure is None and outcome != _PREPARED:
             failure = RuntimeError(
                 f"RDMA weight stream v{expected_version} not committed: another "
@@ -500,7 +508,11 @@ def receive_weight_stream(
                 any_began = True  # unknown, so take it that a peer began
             else:
                 try:
-                    _, any_began = agree(_BROKEN_OFF, began)
+                    # Left, not just broken off: a peer that reached the end
+                    # marker would otherwise keep a group this rank is gone from.
+                    _, any_began = agree(
+                        _LEFT if leave is not None else _BROKEN_OFF, began
+                    )
                 except Exception:  # noqa: BLE001 - the stream's own failure is raised
                     any_began = True  # unknown, so take it that a peer began
         if began:
