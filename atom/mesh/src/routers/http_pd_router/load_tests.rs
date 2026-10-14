@@ -520,3 +520,19 @@ async fn atom_chunked_http_error_cancels_the_pending_peer() {
         assert_eq!(d.worker.load(), 0);
     }
 }
+
+#[tokio::test]
+async fn atom_chunked_decode_admission_rejection_cancels_pending_prefill() {
+    for streaming in [false, true] {
+        let (p, mut d) = servers().await;
+        let task = dispatch(DispatchKind::AtomChunked, &p, &d, streaming);
+        p.wait_entered().await;
+        d.wait_entered().await;
+        // D rejects before enqueue/200 headers. P is still waiting for ready
+        // and never supplies a response; the HTTP error must end both leases.
+        d.respond((StatusCode::BAD_REQUEST, "unsupported chunked topology").into_response());
+        assert_eq!(result(task).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(p.worker.load(), 0);
+        assert_eq!(d.worker.load(), 0);
+    }
+}

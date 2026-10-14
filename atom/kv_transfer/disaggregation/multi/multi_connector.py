@@ -795,9 +795,8 @@ class MultiConnectorScheduler(KVConnectorSchedulerBase):
             if hasattr(c, "has_pending_work")
         )
 
-    def admission_blocked(self, seq: Any) -> None:
-        for connector in self._connectors:
-            connector.admission_blocked(seq)
+    def admission_ready(self, seq: Any) -> bool:
+        return all(connector.admission_ready(seq) for connector in self._connectors)
 
     def abort_send(self, seq: Any) -> None:
         for connector in self._connectors:

@@ -37,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
+from atom.kv_transfer.disaggregation.chunked_prefill import chunked_topology_supported
 from atom.kv_transfer.disaggregation.mooncake.endpoint import (
     DEFAULT_HANDSHAKE_PORT,
     producer_endpoint,
@@ -1161,6 +1162,28 @@ def _validate_return_token_ids(
         )
 
 
+def _validate_chunked_receive(params: dict[str, Any] | None) -> None:
+    """Reject unroutable D requests before enqueue or successful SSE headers.
+
+    The router cancels the waiting P request on this HTTP error. A worker-only
+    receive failure would let D recover locally while P waits for ready forever.
+    """
+    if not params or not (
+        params.get("chunked_transfer") and params.get("do_remote_prefill")
+    ):
+        return
+    cfg = engine.config
+    if not chunked_topology_supported(
+        params.get("remote_tp_size", 1),
+        cfg.tensor_parallel_size,
+        cfg.pipeline_parallel_size,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Chunked P/D requires D PP=1 and D TP a multiple of positive P TP",
+        )
+
+
 def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -1619,6 +1642,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
     """Handle chat completion requests (OpenAI-compatible)."""
 
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         request.tools = normalize_chat_tools(request.tools)
@@ -1894,6 +1918,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
     """Handle text completion requests (OpenAI-compatible)."""
 
     validate_model(request.model)
+    _validate_chunked_receive(request.kv_transfer_params)
 
     try:
         effective_n = _coerce_n(request.n, request.temperature)
@@ -2024,6 +2049,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
     and returns Anthropic-formatted responses. Enables Claude Code and other
     Anthropic-compatible tools to use ATOM as a backend.
     """
+    _validate_chunked_receive(request.kv_transfer_params)
     # One validator over the shape both endpoints share: this path already
     # converts, so validating the conversion leaves a single rule rather than
     # a second one in Anthropic's spelling. It checked nothing before, so a
@@ -2434,6 +2460,7 @@ async def responses_create(raw_request: Request):
                 }
             },
         )
+    _validate_chunked_receive(kv_transfer_params)
     kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
 
     unsupported = unsupported_responses_parameter(body)

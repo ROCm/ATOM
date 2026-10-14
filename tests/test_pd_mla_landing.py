@@ -1315,6 +1315,8 @@ def _listen(monkeypatch, mc, listener, messages):
     conn = listener.__self__
     conn._completed_prefills_lock = threading.Lock()
     conn._pending_chunked_requests = []
+    conn._chunked_admissions = {}
+    conn._chunked_local_ids = {}
     conn._listener_bound = threading.Event()
     conn._listener_error = None
     monkeypatch.setattr(mc, "zmq_socket_ctx", lambda *_a, **_k: nullcontext(_Socket()))

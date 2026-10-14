@@ -514,7 +514,7 @@ class ConnectorMetadata:
         "reqs_to_send",
         "reqs_in_batch",
         "reqs_not_processed",
-        "reclaim_unclaimed_prefills",
+        "chunked_admissions",
     )
 
     def __init__(self) -> None:
@@ -524,9 +524,9 @@ class ConnectorMetadata:
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
-        # One scheduler-selected source per capacity escape. All TP/PP ranks
-        # attempt the same request; workers still reject sources with any claim.
-        self.reclaim_unclaimed_prefills: dict[ReqId, TransferId] = {}
+        # Register P logical requests before allocating source blocks. Workers
+        # report D readiness through the existing TP/PP completion channel.
+        self.chunked_admissions: dict[ReqId, TransferId] = {}
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""
