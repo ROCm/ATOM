@@ -642,6 +642,60 @@ def test_a_rank_out_of_step_leaves_the_group(monkeypatch):
         runner.receive_weights_rdma("g", 2)
 
 
+def _rdma_runner(monkeypatch, trainer):
+    """The real entry points over one weight, its group joined, fed by *trainer*."""
+    import torch
+
+    monkeypatch.setattr(
+        receiver,
+        "dist",
+        SimpleNamespace(
+            broadcast=trainer.broadcast, destroy_process_group=lambda group: None
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    runner = _transacting_runner()
+    runner._rdma_weight_groups = {"g": object()}
+    return runner
+
+
+def test_the_vllm_callers_arguments_are_taken(monkeypatch):
+    """LumenRL drives this RPC with the vLLM worker's arguments, and
+    prequantized_fp8 was not among this one's: the call raised TypeError on
+    every rank before it read a header."""
+    import torch
+
+    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
+    runner = _rdma_runner(monkeypatch, trainer)
+
+    stats = runner.receive_weights_rdma(
+        group_name="g", version=1, verify_full_load=True, prequantized_fp8=False
+    )
+
+    assert stats["buckets"] == 1.0
+    assert runner.model.w.item() == 5.0
+
+
+def test_a_prequantized_stream_is_received_then_refused(monkeypatch):
+    """Nothing here maps its weight_scale_inv onto the resident scales, so it
+    is refused; received first, or the trainer would wait in its broadcast,
+    and with nothing written, so the runner serves on."""
+    import torch
+
+    trainer = _Trainer(_frames([_encode([("w", torch.tensor([5.0]))])]))
+    runner = _rdma_runner(monkeypatch, trainer)
+
+    with pytest.raises(NotImplementedError, match="prequantized FP8"):
+        runner.receive_weights_rdma(
+            group_name="g", version=1, verify_full_load=True, prequantized_fp8=True
+        )
+
+    assert trainer.frames == [], "the stream was not received"
+    assert runner.model.w.item() == 0.0
+    runner.assert_weight_update_ready()
+    assert "g" in runner._rdma_weight_groups, "a group still in step was dropped"
+
+
 def test_a_peer_whose_broadcast_failed_leaves_the_group_too(monkeypatch):
     """Only the rank whose own frame could not be received tore its end down.
     Its peers failed in the broadcast it never joined, kept the group, and the

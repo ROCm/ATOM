@@ -254,6 +254,7 @@ def receive_weight_stream(
     expected_version: int,
     agree=_alone,
     leave: Callable[[], object] | None = None,
+    refusal: Exception | None = None,
 ) -> dict[str, float]:
     """Consume one weight stream and apply it as a single transaction.
 
@@ -288,6 +289,10 @@ def receive_weight_stream(
     failed calls it before its last vote: a peer still in that broadcast is
     released only once this rank's end is gone, and the vote would wait for
     that peer until then.
+
+    *refusal*, if given, refuses the stream as a refused begin does: it is
+    received in full and discarded, nothing is written, and the refusal is
+    raised at the end marker.
     """
     total_bytes = 0
     total_weights = 0
@@ -311,6 +316,8 @@ def receive_weight_stream(
 
     try:
         try:
+            if refusal is not None:
+                raise refusal
             runner.begin_weight_update(expected_version)
             began = True
         except Exception as exc:  # noqa: BLE001 - raised at the end marker
@@ -649,6 +656,7 @@ class RDMAWeightReceiverMixin:
         group_name: str,
         version: int,
         verify_full_load: bool = True,
+        prequantized_fp8: bool = False,
     ) -> dict[str, float]:
         """Receive one version of the weights into resident memory.
 
@@ -656,6 +664,14 @@ class RDMAWeightReceiverMixin:
         is accepted because the caller drives the vLLM worker with the same
         arguments, but it cannot turn that off: a commit of part of the model
         would serve the rest from another version.
+
+        So is ``prequantized_fp8``, which a stream is refused for. This
+        receiver takes full-precision weights and requantises them to its
+        resident FP8 format itself; a stream already quantised carries FP8
+        bytes, of a format the resident one may not be, with scales named
+        ``weight_scale_inv`` that nothing here maps onto the resident
+        ``weight_scale``. It is received and discarded, so the trainer is not
+        left in its broadcast, and nothing is written.
         """
         label = getattr(self, "label", "runner")
         groups = getattr(self, "_rdma_weight_groups", {})
@@ -678,6 +694,15 @@ class RDMAWeightReceiverMixin:
                 expected_version=int(version),
                 agree=self._vote_with_engine_peers,
                 leave=lambda: self.destroy_rdma_weight_group(group_name),
+                refusal=(
+                    NotImplementedError(
+                        "a prequantized FP8 stream is not supported: send the "
+                        "weights unquantised, and this receiver requantises "
+                        "them to its resident format"
+                    )
+                    if prequantized_fp8
+                    else None
+                ),
             )
         except RDMAStreamOutOfStep as exc:
             logger.error(
