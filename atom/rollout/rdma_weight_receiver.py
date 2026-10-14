@@ -592,19 +592,14 @@ class RDMAWeightReceiverMixin:
         later stream.
 
         Decided by every worker of the engine before any joins. One that could
-        not -- its rank out of range, its earlier join a different one -- or
-        that had joined where the others had not, left them in the rendezvous
-        waiting for a rank that never came.
+        not -- refused, its rank out of range, its earlier join a different
+        one -- or that had joined where the others had not, left them in the
+        rendezvous waiting for a rank that never came.
         """
         # Vendored, so a container with ATOM but no RL framework still works.
         from atom.utils.independent_process_group import (
             init_independent_process_group,
         )
-
-        # Its config's and its model's, so every worker refuses alike.
-        refusal = self._rdma_reload_refusal()
-        if refusal:
-            raise RuntimeError(f"cannot receive weights over RDMA: {refusal}")
 
         groups = getattr(self, "_rdma_weight_groups", None)
         if groups is None:
@@ -623,7 +618,12 @@ class RDMAWeightReceiverMixin:
         }
         joined = group_name in groups
         problem: Exception | None = None
-        if rank <= 0 or rank >= int(world_size):
+        # Cast as a ballot like any other reason not to join: a refusal reads
+        # this worker's own model, which its peers do not see.
+        refusal = self._rdma_reload_refusal()
+        if refusal:
+            problem = RuntimeError(f"cannot receive weights over RDMA: {refusal}")
+        elif rank <= 0 or rank >= int(world_size):
             workers = _workers_per_engine(getattr(self, "config", None))
             problem = ValueError(
                 f"invalid RDMA rank {rank} for world_size={world_size} "
@@ -647,7 +647,14 @@ class RDMAWeightReceiverMixin:
             ballot = _CANNOT_JOIN
         else:
             ballot = _JOINED_ALREADY if joined else _WILL_JOIN
-        outcome, any_will_join = self._vote_with_engine_peers(ballot, not joined)
+        try:
+            outcome, any_will_join = self._vote_with_engine_peers(ballot, not joined)
+        except Exception as exc:
+            if problem is None:
+                raise
+            # Not taken on any worker -- under PP the world spans stages the
+            # engine does not count -- so each raises its own reason.
+            raise problem from exc
         if outcome == _CANNOT_JOIN:
             raise problem or RuntimeError(
                 f"RDMA weight group {group_name!r} not joined: another worker "

@@ -1434,6 +1434,42 @@ def test_a_worker_that_cannot_join_says_so_before_any_joins(monkeypatch):
     assert joined == []
 
 
+def test_a_worker_that_refuses_casts_its_refusal_as_a_ballot(monkeypatch):
+    """Raised before the vote, a refusal one worker found in its own model
+    left the peers that found none in the vote's all-reduce."""
+    joined = _joins(monkeypatch)
+    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+    worker._rdma_reload_refusal = lambda: "1 parameter(s) held as MXFP4"
+
+    with pytest.raises(RuntimeError, match="cannot receive.*MXFP4"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+
+    assert worker.cast == [receiver._CANNOT_JOIN]
+    assert joined == []
+
+
+def test_a_refusal_is_still_raised_where_the_vote_cannot_be_taken(monkeypatch):
+    """Under PP the world spans stages the engine does not count, so the vote
+    fails on every worker alike; each raises the refusal, not the vote's
+    failure."""
+    joined = _joins(monkeypatch)
+    worker = _voting_worker(lambda ballot, will_join: (ballot, will_join))
+    worker._rdma_reload_refusal = lambda: "pipeline_parallel_size=2"
+
+    def untakeable(ballot, will_join):
+        raise RuntimeError("the process world has 4 rank(s), the engine 2")
+
+    worker._vote_with_engine_peers = untakeable
+
+    with pytest.raises(RuntimeError, match="pipeline_parallel_size=2"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+
 def test_a_group_joined_on_only_some_workers_is_not_reused(monkeypatch):
     """Retried after a partial failure, a worker that had joined reused its
     group while one that had not joined it anew, alone in a rendezvous."""
