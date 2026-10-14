@@ -97,6 +97,7 @@ on:
           Kimi-K3 (standalone cases connect directly to ATOM without Mesh):
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48,
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72,
+            kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c88,
             kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-agentic-lmcache-state-1m-c72,
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48,
             kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72,

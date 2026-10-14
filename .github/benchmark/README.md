@@ -46,6 +46,7 @@ set `suite=nightly`, and set `case_names` to one or more of these entries:
 
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48`
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72`
+- `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c88`
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-agentic-lmcache-state-1m-c72` (DSpark3)
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48` (baseline)
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72` (baseline)
@@ -53,19 +54,20 @@ set `suite=nightly`, and set `case_names` to one or more of these entries:
 Select multiple cases with a comma-separated list. Leave `benchmark_concurrency` empty
 to use each case's concurrency. Each case runs for 3600 seconds with a fresh
 single ATOM server and independent caches. The entries in
-[`models_atomesh.yaml`](./models_atomesh.yaml) share the same replay settings.
-C48 uses `max-num-seqs=96`; C72 uses `max-num-seqs=144`. The standalone launch
+[`models_atomesh.yaml`](./models_atomesh.yaml) share the same Agentic dataset.
+C48 uses `max-num-seqs=96`, C72 uses 144, and C88 uses 176. The standalone launch
 path connects AIPerf directly to ATOM without starting Mesh or a separate decode
 worker.
 
 All cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
-and `max-num-batched-tokens=8192`. The four cases without DSpark use FULL graph
-capture sizes 1 through 96 at C48 and 1 through 144 at C72. The C72 cases enable
+and `max-num-batched-tokens=8192`. The cases without DSpark use FULL graph
+capture sizes 1–96 at C48, 1–144 at C72, and 1–176 at C88. C72 and C88 enable
 identical communication-group reuse and GEMM bucket warmup. Each loads the K3
 FP4 weights, uses FP8 KV and LMCache DRAM offload, block size 128, and LMCache
 chunk size 1024. Both C48 cases use a shared 128 GiB CPU pool per rank; the two
 C72 cases without DSpark use 192 GiB (`LMCACHE_MAX_LOCAL_CPU_SIZE`). Those four
-retain a 128 GiB STATE cap per rank (`OFFLOAD_STATE_CPU_SIZE=128`). The STATE
+retain a 128 GiB STATE cap per rank (`OFFLOAD_STATE_CPU_SIZE=128`); C88 uses
+a 224 GiB shared pool and a 96 GiB STATE cap. The STATE
 cap does not reserve a separate allocation; STATE and KV share the CPU pool.
 The Agentic trace context cap is 1,048,576
 tokens; request lengths come from the dataset rather than random ISL/OSL flags.
@@ -118,8 +120,8 @@ server and independent caches. Keeping `atomesh_single_node=auto` allows the
 scheduler to choose different machines for the two cases.
 
 `AIPERF_APPLY_CHAT_TEMPLATE=1` adds `--apply-chat-template` to the AIPerf
-command, matching `k3_log/baseline/benchmark.log`. For the four cases without
-DSpark, `--online_quant_config` matches the `Engine kwargs` in the supplied
+command, matching `k3_log/baseline/benchmark.log`. For the four original C48/C72
+cases without DSpark, `--online_quant_config` matches the `Engine kwargs` in
 `k3_log/baseline/mia1-p01-g37_agg_w0.out`: `global_quant_config=ptpc_fp8`
 with all 14 exclusion patterns. In addition to the existing seven patterns,
 the exclusions include:
@@ -139,6 +141,30 @@ standalone cases therefore use no draft model or forced acceptance length.
 
 AIPerf keeps its 10 warmup requests per lane. The chat-template switch is
 captured in benchmark metadata and the recipe fingerprint.
+
+### Standalone C88 with STATE checkpoints
+
+Select `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c88`
+to run one C88 cell. It follows the no-draft C88 warmup/state-cap experiment
+in [run 36960585301](https://github.com/ROCm/ATOM/actions/runs/36960585301):
+176 maximum sequences, FULL graphs 1–176, an 8192-token batch budget, a 224 GiB
+shared CPU pool and a 96 GiB STATE cap per rank. It uses the same K3 model
+quantization defaults (seven exclusion patterns) and AIPerf commit, dataset,
+trace timing, warmup, and 3600-second measurement settings as that reference.
+
+The combined server uses TP8/DCP8 on one node, direct AIPerf access, and
+`lmcache_offload` in place of the reference's P/D connectors. It retains the
+standalone prefill delayer (interval 4, queue cap 5000 ms), spare checkpoints
+with reserve 8, the SLOT-retention fix, and prompt-end checkpoint placement.
+ReplaySSM and speculation remain off. `ATOM_WARMUP_GEMM_M_BUCKETS=1` replaces
+the reference's retired `ATOM_WARMUP_PREFILL_TOKEN_STRIDE=32` parameter.
+
+For comparison with the recent C72 runs, dispatch with
+`atomesh_image=rocm/atom-dev:nightly_202610131522-rocm10.0`,
+`atomesh_slurm_account=amd-atom`, `atomesh_slurm_partition=amd-spur`, and
+`publish_dashboard=false`. This uses the current runtime image rather than
+the historical run's September image; C72 and C88 also differ in CPU budgets,
+so their results do not isolate concurrency alone.
 
 ### Standalone DSpark3 C72 with STATE checkpoints
 

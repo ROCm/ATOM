@@ -1010,6 +1010,29 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_hc_dspark3_reuse_env
 
+        # Single-server counterpart to the no-draft jitwarm/statecap C88
+        # experiment in run 36960585301. Use the current GEMM bucket warmup
+        # instead of the retired ATOM_WARMUP_PREFILL_TOKEN_STRIDE=32 sweep.
+        - <<: *kimi_k3_standalone_state_c72
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c88
+          concurrency: [88]
+          prefill:
+            <<: *kimi_k3_standalone_state_prefill
+            cudagraph: auto
+            cudagraph_max_num_seqs: 176
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 176
+              kv_transfer_config: '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
+              extra_args: --tool-call-parser kimi_k3 --data-parallel-size 1
+          env:
+            common:
+              <<: *kimi_k3_standalone_state_c72_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: '224'
+              OFFLOAD_STATE_CPU_SIZE: '96'
+          benchmark: *kimi_k3_agentic_benchmark
+
         # Standalone STATE counterpart to the 1P1D DSpark3 C72 recipe.
         # Keep the single-server placement and prefill delayer from STATE C72;
         # its auto graphs now cover 1..576 = 144 * (1 + 3) query tokens.
