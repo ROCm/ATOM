@@ -12,7 +12,23 @@ from pathlib import Path
 import socket
 
 
-def snapshot(label, error=None):
+def read_counter(path):
+    try:
+        return int(path.read_text())
+    except (OSError, ValueError) as error:
+        return repr(error)
+
+
+def registered_storages(kv_caches):
+    storages = {}
+    for cache in kv_caches.values():
+        storage = cache.untyped_storage()
+        storages[storage.data_ptr()] = storage.nbytes()
+    return {"count": len(storages), "bytes": sum(storages.values()),
+            "max_bytes": max(storages.values(), default=0)}
+
+
+def snapshot(label, error=None, extra=None):
     directory = os.environ.get("MOONCAKE_KERNEL_EVIDENCE_DIR")
     if not directory:
         return
@@ -26,6 +42,7 @@ def snapshot(label, error=None):
             "hostname": socket.gethostname(),
             "cuda_initialized": torch.cuda.is_initialized(),
             "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            **(extra or {}),
         }
         if error is not None:
             row["error"] = repr(error)
@@ -46,6 +63,16 @@ def snapshot(label, error=None):
             str(path): int(path.read_text())
             for path in Path("/sys/class/drm").glob("card*/device/mem_info_vram_used")
         }
+        row["gtt_and_visible_vram"] = {
+            str(path): read_counter(path)
+            for name in ("gtt_used", "vis_vram_used")
+            for path in Path("/sys/class/drm").glob(f"card*/device/mem_info_{name}")
+        }
+        # KFD sysfs names processes by host PID; record every entry on this node.
+        row["kfd_proc_vram"] = {
+            f"{path.parent.name}/{path.name}": read_counter(path)
+            for path in Path("/sys/class/kfd/kfd/proc").glob("*/vram_*")
+        }
         root = Path(directory) / f"{socket.gethostname()}-{os.getpid()}"
         root.mkdir(parents=True, exist_ok=True)
         with (root / "startup-state.jsonl").open("a") as stream:
@@ -58,7 +85,13 @@ def trace_stage(label):
     def decorate(function):
         @functools.wraps(function)
         def traced(*args, **kwargs):
-            snapshot(label + ":before")
+            extra = None
+            if label.endswith("register_kv_caches") and len(args) > 1:
+                try:
+                    extra = {"registered_storages": registered_storages(args[1])}
+                except Exception as error:
+                    extra = {"registered_storages_error": repr(error)}
+            snapshot(label + ":before", extra=extra)
             try:
                 result = function(*args, **kwargs)
             except BaseException as error:

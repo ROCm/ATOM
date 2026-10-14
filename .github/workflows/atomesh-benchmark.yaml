@@ -1572,7 +1572,7 @@ jobs:
         || (github.event_name == 'workflow_dispatch' && inputs.run_model_benchmark)
       )
     runs-on: ${{ matrix.runner.slurm_submit_runner }}
-    timeout-minutes: ${{ matrix.run_eval && matrix.accuracy.task == 'swebench_lite' && 780 || 420 }}
+    timeout-minutes: ${{ (matrix.run_eval && matrix.accuracy.task == 'swebench_lite' || matrix.name == 'kimi-k3-mooncake-inferencex-c48') && 780 || 420 }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -1591,7 +1591,7 @@ jobs:
           mkdir -p "${target}"
           curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/kvcache-ai/Mooncake/actions/artifacts/11593557642/zip \
+            https://api.github.com/repos/kvcache-ai/Mooncake/actions/artifacts/11902935372/zip \
             -o "${target}/wheel.zip"
           python3 - "${target}" <<'PYWHEEL'
           import hashlib, sys, zipfile
@@ -1600,11 +1600,11 @@ jobs:
           name = "mooncake_transfer_engine_rocm-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl"
           with zipfile.ZipFile(target / "wheel.zip") as archive:
               wheel = archive.read(name)
-          assert hashlib.sha256(wheel).hexdigest() == "7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6"
+          assert hashlib.sha256(wheel).hexdigest() == "2672955647ebb81cb6871fe1e40abb79e2a19d6201e4019d2a7d8a953b3bef7a"
           (target / name).write_bytes(wheel)
           PYWHEEL
           curl -fsSL --retry 3 \
-            https://raw.githubusercontent.com/kvcache-ai/Mooncake/b140c1a904d53d24ed211d01ce9a87fc161cb432/scripts/e2e/python/verify_rocm_wheel.py \
+            https://raw.githubusercontent.com/kvcache-ai/Mooncake/81ffa4d388c30048ddab0c5846b8605d08e287fe/scripts/e2e/python/verify_rocm_wheel.py \
             -o "${target}/verify_rocm_wheel.py"
 
       - name: Cancel existing jobs on benchmark nodes
@@ -1773,8 +1773,8 @@ jobs:
         if: ${{ always() && matrix.name == 'kimi-k3-mooncake-inferencex-c48' }}
         uses: actions/upload-artifact@v4
         with:
-          name: atomesh-prior-slurm-8019-${{ github.run_id }}
-          path: atomesh-results/prior-slurm-8019.json
+          name: atomesh-prior-slurm-8245-${{ github.run_id }}
+          path: atomesh-results/prior-slurm-8245.json
           if-no-files-found: error
 
       - name: Run Slurm benchmark cell

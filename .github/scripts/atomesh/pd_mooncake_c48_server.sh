@@ -9,7 +9,7 @@ prepare_mooncake_c48_runtime() {
     timeout 20s ibv_devinfo -l || true
   } > "${RUNTIME_LOG_DIR}/hardware-rank-${NODE_RANK}.txt" 2>&1
   local wheel="${ATOMESH_SCRIPT_DIR}/mooncake-dist/mooncake_transfer_engine_rocm-0.3.13-cp312-cp312-manylinux_2_35_x86_64.whl"
-  printf '%s  %s\n' 7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6 "${wheel}" | sha256sum -c -
+  printf '%s  %s\n' 2672955647ebb81cb6871fe1e40abb79e2a19d6201e4019d2a7d8a953b3bef7a "${wheel}" | sha256sum -c -
   uv venv --system-site-packages --python "$(command -v python3)" /tmp/mooncake-c48-venv
   uv pip install --python /tmp/mooncake-c48-venv/bin/python --no-deps "${wheel}"
   export PATH="/tmp/mooncake-c48-venv/bin:${PATH}"

@@ -11,6 +11,6 @@
   "proxy_sha256": "fea24b40fa8ea11d4757c3298271525fdfa16a01b57cc693c00785aa7c28e359",
   "integration_patch_sha256": "514aed8d5a3c8828a6687d5b01766f05c7d93cde4a855accd98e8e9ebc200112",
   "historical_config_sha256": "89d3ea28982df2dce11fa8dded4500d35c3fe09745299efc0bb7850f1aa17ef3",
-  "mooncake_sha": "b140c1a904d53d24ed211d01ce9a87fc161cb432",
-  "mooncake_wheel_sha256": "7dfe1f9acec16843868dde28dcb1d3903aafeaf8b92a657239055581a8c44df6"
+  "mooncake_sha": "81ffa4d388c30048ddab0c5846b8605d08e287fe",
+  "mooncake_wheel_sha256": "2672955647ebb81cb6871fe1e40abb79e2a19d6201e4019d2a7d8a953b3bef7a"
 }
