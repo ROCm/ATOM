@@ -7,7 +7,6 @@ import importlib
 import logging
 import os
 from collections.abc import Callable
-from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
@@ -26,25 +25,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("atom")
-
-_PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
-_VALIDATED_GFX950_PCI_DEVICE_IDS = frozenset({0x75A3})
-
-
-def _get_pci_device_id() -> int | None:
-    """Return the PCI product ID for the active HIP device, when available."""
-    try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        bdf = (
-            f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
-            f"{props.pci_device_id:02x}.0"
-        )
-        return int(
-            (_PCI_DEVICES_ROOT / bdf / "device").read_text(encoding="utf-8"),
-            0,
-        )
-    except (AttributeError, OSError, RuntimeError, ValueError):
-        return None
 
 
 def _load_backend() -> tuple[ModuleType, ModuleType] | None:
@@ -102,12 +82,6 @@ def create_comm_fused_moe_backend(
         return None
 
     gfx = get_gfx_runtime()
-    if gfx == "gfx950" and _get_pci_device_id() not in _VALIDATED_GFX950_PCI_DEVICE_IDS:
-        # The persistent Mega/Direct/Window winners were tuned and validated
-        # on MI355X (0x75a3). MI350 (0x75b0) has the same gfx950/256-CU shape
-        # key but is not performance-compatible with those winners.
-        return None
-
     modules = _load_backend()
     if modules is None:
         return None
