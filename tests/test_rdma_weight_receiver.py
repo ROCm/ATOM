@@ -45,11 +45,35 @@ def test_an_orchestrator_can_reach_every_receiver_rpc():
         if not name.startswith("_")
     }
     assert public == {
+        "get_rdma_capabilities",
         "init_rdma_weight_group",
         "receive_weights_rdma",
         "destroy_rdma_weight_group",
     }
     assert public <= COLLECTIVE_RPC_METHODS
+
+
+def test_the_rdma_capability_probe_says_what_this_receiver_takes():
+    """LumenRL's orchestrator probes each worker with get_rdma_capabilities,
+    and collective_rpc refused the call. Answered now, as this receiver is:
+    full-precision streams, on an engine that takes RDMA reloads at all, and
+    no prequantised ones."""
+    from atom.model_engine.collective_rpc import is_plain_rpc_value
+
+    report = _Worker(0, 0, tp=1, tp_world=1, pcp=1).get_rdma_capabilities()
+
+    assert report == {
+        "protocol_version": 2,
+        "module_path": "atom.rollout.rdma_weight_receiver",
+        "online_quant_reload": True,
+        "prequantized_stream": False,
+        "refusal": None,
+    }
+    assert is_plain_rpc_value(report)
+
+    refused = _Worker(0, 0, tp=2, tp_world=2, pcp=2).get_rdma_capabilities()
+    assert refused["online_quant_reload"] is False
+    assert "prefill_context_parallel_size=2" in refused["refusal"]
 
 
 def test_the_reload_transaction_steps_stay_off_the_public_path():

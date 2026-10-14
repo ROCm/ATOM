@@ -56,6 +56,10 @@ _HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
 _MAX_METADATA_BYTES = 64 << 20
 _MAX_PAYLOAD_BYTES = 1 << 40
 
+# The version of LumenRL's RDMA capability contract, whose wire format is the
+# one decoded here; see get_rdma_capabilities.
+_RDMA_CAPABILITY_VERSION = 2
+
 # A rank's ballot at each vote on a stream; a vote's outcome is the least
 # ballot any rank cast. See receive_weight_stream.
 _BROKEN_OFF = 0  # cannot follow the stream any further, or cannot commit it
@@ -528,6 +532,25 @@ class RDMAWeightReceiverMixin:
     Named to match the vLLM worker extension, so the same caller drives either
     backend.
     """
+
+    def get_rdma_capabilities(self) -> dict[str, object]:
+        """This worker's RDMA reload capabilities, in the contract LumenRL's
+        orchestrator reads from the vLLM worker
+        (``lumenrl.engine.inference.rdma_protocol``).
+
+        Answered as this receiver is, not as that check wants: it takes
+        full-precision streams and requantises them to the resident format,
+        on an engine it does not refuse RDMA reloads on, and no prequantised
+        stream at all. ``refusal`` says why an engine takes none.
+        """
+        refusal = self._rdma_reload_refusal()
+        return {
+            "protocol_version": _RDMA_CAPABILITY_VERSION,
+            "module_path": RDMAWeightReceiverMixin.__module__,
+            "online_quant_reload": refusal is None,
+            "prequantized_stream": False,
+            "refusal": refusal,
+        }
 
     def init_rdma_weight_group(
         self,
