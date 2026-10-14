@@ -27,11 +27,12 @@ from build_benchmark_matrix import RESERVED_INPUTS
 
 # Legacy hard-coded matrix `exclude` block (suffix, concurrency) pairs. The
 # refactor must reproduce exactly this pruning via per-variant conc bands.
+# The legacy ("-mtp3", 1) and ("-mtp3", 2) entries are gone: MTP3 now runs the
+# low-concurrency points, where speculative decoding matters most.
 LEGACY_EXCLUDE = {
-    ("-mtp3", 1),
-    ("-mtp3", 2),
     ("-mtp3", 512),
     ("-mtp3", 1024),
+    ("-dpa", 1),
     ("-dpa", 2),
     ("-dpa", 4),
     ("-dpa", 8),

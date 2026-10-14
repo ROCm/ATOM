@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash agentic on ATOM — TP2 / TP4
 
 - Hardware: MI355X, single-node TP2 or TP4, no expert parallelism
-- Model: `DeepSeek-V4.1-Flash`, BF16 KV, FP8 index cache
+- Model: `DeepSeek-V4.1-Flash`, BF16 KV, FP4 index cache
 - Execution: level 3, FULL graphs, DSpark with 5 draft tokens and fixed acceptance length 3.51
 - Workload: `inferencex-agentx-mvp`, dataset `semianalysis_cc_traces_weka_062126`
 - Profiling: 3,600 seconds per concurrency point, 5 warmup requests per lane
@@ -32,7 +32,7 @@ python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --trust-remote-code \
   --host 0.0.0.0 --server-port 8000 \
   --tensor-parallel-size 2 \
-  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp4 \
   --gpu-memory-utilization 0.9 --max-num-seqs 128 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --enable_prefix_caching --block-size 16 \
@@ -63,7 +63,7 @@ python3 -u -m atom.entrypoints.openai_server \
   --model "$MODEL_PATH" --trust-remote-code \
   --host 0.0.0.0 --server-port 8000 \
   --tensor-parallel-size 4 \
-  --kv_cache_dtype bf16 --index-cache-dtype fp8 \
+  --kv_cache_dtype bf16 --index-cache-dtype fp4 \
   --gpu-memory-utilization 0.9 --max-num-seqs 128 \
   --max-num-batched-tokens 16384 --attn-prefill-chunk-size 16384 \
   --enable_prefix_caching --block-size 16 \

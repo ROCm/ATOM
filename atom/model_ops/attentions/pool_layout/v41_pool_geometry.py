@@ -23,20 +23,27 @@ runs (a plane is `rows * row_bytes` and both factors are already coarse), and
 an index plane is aligned once over the whole pool rather than per page, so
 four owners cost at most four alignments. The two terms that do move are the
 internal fragmentation of each request's last page -- `(block_size - 1)` tokens
-at 3200 B (BF16 KV and index), so 816 KB per in-flight request at 256, ~0.1% of
-a pool -- and the block table, `[max_num_seqs, max_model_len / block_size]`
+at 3200 B (BF16 KV and index), so 406 KB per in-flight request at 128, ~0.05%
+of a pool -- and the block table, `[max_num_seqs, max_model_len / block_size]`
 int32 held twice and copied to the device every forward: 134 MB at block 16
-against 8.4 MB at 256, for a million-token context. The block table is the
+against 16.8 MB at 128, for a million-token context. The block table is the
 larger of the two and it is per-forward traffic, which is why CSA2 takes a
-coarse page, as DeepSeek-V4 does. What a coarse page costs is prefix reuse
-below its own size, which no longer matches at all.
+coarse page. What a coarse page costs is prefix reuse below its own size,
+which no longer matches at all, and the rows encoder bounded replay recomputes
+below a hit, a whole page; 128 keeps both at the window's size.
 """
 
 from dataclasses import dataclass
 
 import torch
 
-from .entry_arena import EntryField, entry_bytes_for, field_extents, plan_regions
+from .entry_arena import (
+    EntryField,
+    checkpoint_ranges_for,
+    entry_bytes_for,
+    field_extents,
+    plan_regions,
+)
 from .v4_pool_fields import (
     MQA_LOGITS_PRESHUFFLE_ROWS,
     fp8_indexer_block_fields,
@@ -56,6 +63,10 @@ MAIN_FP4 = {"group_size": 16, "scale_dtype": torch.float8_e4m3fn}
 # disagree about it differ by up to 2x per row and nothing about the bytes says
 # which one meant what.
 INDEX_FP8_SCALE_FMT = "ue8m0"
+
+# The rows one page of the FP4 index plane holds: the row-group scorer's page-8
+# layout, a page being a candidate block so a kept list is its block table.
+FP4_INDEX_PAGE_ROWS = 8
 
 
 @dataclass(frozen=True)
@@ -82,6 +93,10 @@ class V41PoolGeometry:
     # plane passes. A layout choice and not the kernel's tile -- 8 is what lets
     # a candidate list be a block table, the length candidates are picked in.
     index_block_rows: int = MQA_LOGITS_PRESHUFFLE_ROWS
+    # The index plane's format: FP8 rows with their scales inside each block,
+    # or the FP4 page-8 layout the row-group scorer reads, values and E8M0
+    # scales in two planes (`index_planes`).
+    index_fp4: bool = False
 
     def __post_init__(self):
         if self.speculative_tokens < 0:
@@ -105,6 +120,11 @@ class V41PoolGeometry:
         if len({owner for owner, _ in self.owners}) != len(self.owners):
             raise ValueError("Each global owner must be declared once")
         rows = self.index_block_rows
+        if self.index_fp4 and (rows != FP4_INDEX_PAGE_ROWS or self.index_dim % 128):
+            raise ValueError(
+                f"The FP4 index plane is paged at {FP4_INDEX_PAGE_ROWS} rows of "
+                f"whole 128-dim K tiles; got {rows} rows of {self.index_dim}"
+            )
         if rows % MQA_LOGITS_PRESHUFFLE_ROWS and rows != 8:
             raise ValueError(
                 f"An index block holds whole {MQA_LOGITS_PRESHUFFLE_ROWS}-row MFMA "
@@ -120,7 +140,7 @@ class V41PoolGeometry:
             # that a statement about twice the PAGE.
             if self.rows_per_page(ratio) % rows:
                 raise ValueError(
-                    f"An FP8 index plane needs whole {rows}-row blocks: "
+                    f"An index plane needs whole {rows}-row blocks: "
                     f"ratio {ratio} gives a PAGE {self.rows_per_page(ratio)} rows, "
                     f"so raise the PAGE token count to a multiple of "
                     f"{rows * max(r for _, r in self.owners)}"
@@ -141,20 +161,33 @@ class V41PoolGeometry:
         return self.head_dim // 2 + self.head_dim // MAIN_FP4["group_size"]
 
     @property
-    def index_row_bytes(self):
-        """What one index row costs, which is not what one row *is*.
+    def index_planes(self):
+        """`(name, bytes one row costs in it)` of each plane an owner's index
+        rows take, in layout order.
 
-        Under preshuffle a row's bytes are interleaved across its tile, so this
-        is the block over its rows -- the same convention
+        FP8 is one plane: under preshuffle a row's bytes are interleaved across
+        its tile, so a row's cost is the block over its rows -- the convention
         `fp8_indexer_block_fields` states, and the reason a scale sits past the
-        block's data rather than beside its own row.
+        block's data rather than beside its own row. FP4 is two, the packed
+        E2M1 values and their E8M0 scales, each dense in pages: the row-group
+        scorer addresses page `i` of either at `i *` its page bytes.
         """
+        if self.index_fp4:
+            return (
+                ("index", self.index_dim // 2),
+                ("index_scale", self.index_dim // 32),
+            )
         block = indexer_block_regions(
             fp8_indexer_block_fields(
                 self.index_block_rows, self.index_dim, torch.float8_e4m3fn
             )
         )[1]
-        return block // self.index_block_rows
+        return (("index", block // self.index_block_rows),)
+
+    @property
+    def index_row_bytes(self):
+        """What one index row costs over all of its owner's index planes."""
+        return sum(width for _, width in self.index_planes)
 
     @property
     def window_row_bytes(self):
@@ -222,6 +255,11 @@ class V41PoolGeometry:
         """Rows one PAGE holds for an owner at this ratio, main and index alike."""
         return self.block_size // ratio
 
+    def index_blocks_per_page(self, ratio):
+        """Index blocks one PAGE holds at this ratio: a block id is block
+        `id % this` of the PAGE its request's column `id // this` names."""
+        return self.rows_per_page(ratio) // self.index_block_rows
+
     @property
     def paged_bytes(self):
         """One PAGE's whole cost: its main rows and its index rows.
@@ -234,13 +272,14 @@ class V41PoolGeometry:
         )
 
     def paged_extents(self, pages):
-        """`({owner: index plane offset}, bytes the PAGE currency spans)`.
+        """`({owner: offset of each of its index_planes}, bytes the PAGE
+        currency spans)`.
 
-        The offset is from the pool's first PAGE and the total is where STATE
+        An offset is from the pool's first PAGE and the total is where STATE
         begins, so this is the one walk that places everything scaling with
-        history. Within a plane the pages are dense -- `index_rows *
-        index_row_bytes` apart -- which is the stride a paged reader is handed;
-        only the plane's own start is aligned.
+        history. Within a plane the pages are dense -- `index_rows *` its row
+        bytes apart -- which is the stride a paged reader is handed; only the
+        plane's own start is aligned.
 
         The total is rounded to `alignment` rather than to `plan_regions`' own,
         because the window ring behind it is addressed in whole rows.
@@ -248,12 +287,18 @@ class V41PoolGeometry:
         offsets, total = plan_regions(
             [pages * self.page_bytes]
             + [
-                pages * self.rows_per_page(ratio) * self.index_row_bytes
+                pages * self.rows_per_page(ratio) * width
                 for _, ratio in self.owners
+                for _, width in self.index_planes
             ]
         )
+        per_owner = len(self.index_planes)
+        planes = offsets[1:]
         return (
-            dict(zip(self.compress_owners, offsets[1:])),
+            {
+                owner: tuple(planes[i * per_owner : (i + 1) * per_owner])
+                for i, owner in enumerate(self.compress_owners)
+            },
             -(-total // self.alignment) * self.alignment,
         )
 
@@ -270,6 +315,8 @@ class V41PoolGeometry:
         # `K_pool` raw projections per owner, so a pool window reaching back
         # before this forward reads them from here instead of the caller
         # carrying an incomplete group across the boundary.
+        # Not checkpointed: CSA2 pools without overlap and a checkpoint sits on a
+        # PAGE boundary (a multiple of every ratio), so a resumer reads none.
         rings = [
             EntryField(
                 name,
@@ -277,6 +324,7 @@ class V41PoolGeometry:
                 (self.compress_ring_slots, self.head_dim),
                 torch.float32,
                 align=self.alignment,
+                in_checkpoint=False,
             )
             for name in ("compress_kv", "compress_score")
         ]
@@ -296,6 +344,15 @@ class V41PoolGeometry:
     @property
     def state_bytes(self):
         return self._aligned_bytes(self.state_fields)
+
+    @property
+    def checkpoint_image_ranges(self):
+        """`(offset, num_bytes)` of a STATE entry a checkpoint image holds."""
+        return checkpoint_ranges_for(self.state_fields)
+
+    @property
+    def checkpoint_image_bytes(self):
+        return sum(nbytes for _, nbytes in self.checkpoint_image_ranges)
 
     def main_offset(self, owner):
         return next(
@@ -334,6 +391,9 @@ class V41PoolGeometry:
             # Every other term below was already the same in v1, so without the
             # bump a v1 image would read as compatible and restore into fields
             # that no longer mean what it holds.
+            # v3: the image no longer carries the compressor tails, so it is
+            # no longer the whole entry; a v2 image would restore its tail
+            # bytes over the cursor.
             #
             # The index plane's format is here even though no STATE field holds
             # an index row: this string is what a resumed prefix is matched on,
@@ -342,7 +402,7 @@ class V41PoolGeometry:
             # than read off a field because FP8 is the only plane the scorer
             # takes -- an image from a build that had another must not match.
             f"dsv41-{'packed' if self.packed else 'bf16'}-index-fp8"
-            f"-state-v2:layers={self.layers}:owners={self.owners}"
+            f"-state-v3:layers={self.layers}:owners={self.owners}"
             f":block={self.block_size}:window={self.window_size}"
             f":dims={self.head_dim},{self.index_dim}:history={self.history_size}"
         )

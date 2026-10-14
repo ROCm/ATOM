@@ -188,6 +188,20 @@ def slug(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-").lower()
 
 
+AGGREGATED_TOPOLOGY_RE = re.compile(r"^agg", re.IGNORECASE)
+
+
+def is_disaggregated(topology: str) -> bool:
+    """Whether `topology` names a prefill/decode split.
+
+    The name carries this: `<P>p<D>d[_variant]` is a split, anything starting
+    with `agg` is one aggregated server. Keying off the whole `agg` prefix
+    rather than an exact spelling means no way of writing it reads as P/D by
+    accident, which would otherwise publish numbers measured in the wrong mode.
+    """
+    return not AGGREGATED_TOPOLOGY_RE.match(topology)
+
+
 def format_display_topology(
     topology: str,
     suite_cfg: dict[str, Any],
@@ -292,11 +306,6 @@ def build_cell(
         "atomesh-cicd-mi355-crusoe",
     }
     requires_explicit_candidate_nodes = slurm_submit_runner == "atomesh-cicd-mi350"
-    node_pool = (
-        resolve_nodes(os.environ.get("ATOMESH_NODE_POOL", ""))
-        if slurm_submit_runner == "atomesh-cicd"
-        else []
-    )
 
     single_node_override = os.environ.get("ATOMESH_SINGLE_NODE", "").strip()
     if single_node_pd and single_node_override not in ("", "auto"):
@@ -307,20 +316,7 @@ def build_cell(
         nodes = resolve_nodes(suite_cfg.get("nodes"))
         if slurm_submit_runner == "atomesh-cicd-mi355-crusoe":
             nodes = []
-    if node_pool:
-        outside_pool = set(nodes) - set(node_pool)
-        if outside_pool:
-            raise ValueError(
-                "Nodes outside the atomesh-cicd candidate pool: "
-                + ",".join(sorted(outside_pool))
-            )
-        nodes = list(dict.fromkeys(nodes or node_pool))
-        if len(nodes) < required_nodes:
-            raise ValueError(
-                f"{suite_cfg.get('name', model_name)} needs at least "
-                f"{required_nodes} node(s)"
-            )
-    elif allow_auto_nodes and requires_explicit_candidate_nodes:
+    if allow_auto_nodes and requires_explicit_candidate_nodes:
         if not nodes:
             raise ValueError(
                 f"{suite_cfg.get('name', model_name)} needs a non-empty "
@@ -355,9 +351,7 @@ def build_cell(
             f"{required_nodes} node(s)"
         )
     num_nodes = (
-        required_nodes
-        if not nodes or requires_explicit_candidate_nodes or node_pool
-        else len(nodes)
+        required_nodes if not nodes or requires_explicit_candidate_nodes else len(nodes)
     )
 
     server_args = deep_merge(
@@ -416,6 +410,9 @@ def build_cell(
         "topology": topology,
         "display_topology": display_topology,
         "pd_worker_layout": pd_worker_layout,
+        # Derived, not authored: the layout says where workers run, the topology
+        # says whether there is a prefill/decode split to place at all.
+        "disaggregated": is_disaggregated(topology),
         "nodes": nodes,
         "num_nodes": num_nodes,
         "isl": isl,

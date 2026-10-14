@@ -3,6 +3,7 @@
 
 import logging
 import threading
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -168,12 +169,32 @@ class DPMetadata:
 
 @dataclass
 class SpecDecodeMetadata:
-    draft_token_ids: torch.Tensor
+    # The step's input ids. Draft r is input_ids[target_logits_indices[r] + 1]:
+    # logits row t verifies the token that follows it. Read in place by the
+    # rejection sampler, on the forward stream the next step publishes its
+    # input ids on, so they cannot be overwritten under it.
+    input_ids: torch.Tensor
     num_spec_steps: int
     num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+
+
+_uncaptured_decode_shape_warned = False
+
+
+def _warn_uncaptured_decode_shape(running_bs: int, max_seqlen_q: int) -> None:
+    global _uncaptured_decode_shape_warned
+    if _uncaptured_decode_shape_warned:
+        return
+    _uncaptured_decode_shape_warned = True
+    _logger.warning(
+        "No CUDA graph recorded at (bs=%d, q=%d): decode steps at an uncaptured "
+        "shape run eagerly. Expected only on a P/D producer that keeps a drafter.",
+        running_bs,
+        max_seqlen_q,
+    )
 
 
 @dataclass(frozen=True)
@@ -231,16 +252,21 @@ class ForwardMode:
         dp_size: int,
         dp_group,
         enforce_eager: bool,
+        step_needs_eager: bool,
         capture_sizes: list[int],
         captured_tokens: list[int] | None,
         is_block_drafter: bool,
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
+        graph_shapes: Collection[tuple[int, int]] | None = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
         Any new force-eager condition belongs here, not in a caller-side check.
+        `step_needs_eager` is this rank's attention backend refusing a graph for
+        the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
+        agrees on it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
         from atom.utils.tbo.ubatching import sync_dp_metadata
@@ -262,6 +288,7 @@ class ForwardMode:
                 scheduled_bs=scheduled_bs,
                 is_prefill=is_prefill,
                 tbo_on=tbo_on,
+                needs_eager=step_needs_eager,
                 local_meets_min_tokens=meets_min,
                 local_can_split=can_split,
                 local_ub_tokens=(ub0, ub1),
@@ -283,6 +310,9 @@ class ForwardMode:
             # group, and then each rank runs its own count through the
             # variable-length gather.
             unified = not sync.any_rank_has_prefill
+            # A graph replays its collectives: the group replays or runs
+            # eagerly as one.
+            step_needs_eager = sync.any_rank_needs_eager
         else:
             # One rank pads to nobody, so it has one height by construction, and
             # its TBO answer stands unvetoed.
@@ -308,7 +338,26 @@ class ForwardMode:
         # Whether the TARGET replays. It no longer decides how wide anything
         # is; when the batch answered four ways depending on this, `running_bs`
         # was per-rank on two of them and every consumer had to know which.
-        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
+        #
+        # The ladder answers the batch question alone, but a recording is keyed
+        # by `(running_bs, max_seqlen_q)`. Only a P/D producer passes
+        # `graph_shapes`: it keeps its drafter, so capture holds the q=mtp_k+1
+        # shapes, while the scheduler never speculates for it and every decode
+        # it runs is q=1. That holds on every rank, its DP dummy included, and
+        # `running_bs` is the group's, so the lookup is DP-agreed: the group
+        # replays or runs eagerly as one.
+        replayable = (
+            not is_prefill
+            and unified
+            and not (enforce_eager or step_needs_eager)
+            and on_ladder
+        )
+        shape_captured = (
+            graph_shapes is None or (running_bs, max_seqlen_q) in graph_shapes
+        )
+        if replayable and not shape_captured:
+            _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
+        use_cudagraph = replayable and shape_captured
 
         running_tokens, piecewise_captured = cls._running_tokens(
             is_prefill=is_prefill,
@@ -596,6 +645,10 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # The FP4 sparse indexer's key bound for each query token (its position +
+    # 1), published once per decode step for every full layer; a draft step's
+    # aliases context_lens.
+    index_row_ends: torch.Tensor | None = None
     # Block-table row per query token, for the same indexer -- both aiter ops
     # address the table by row. Aliases block_tables at one query per sequence.
     # Every producer that rewrites block_tables must rewrite this too: a stale
@@ -638,6 +691,7 @@ class AttentionMetaData:
         sparse_kv_indptr: torch.Tensor | None = None,
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
+        index_row_ends: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -678,6 +732,7 @@ class AttentionMetaData:
         self.sparse_kv_indptr = sparse_kv_indptr
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
+        self.index_row_ends = index_row_ends
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set

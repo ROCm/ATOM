@@ -25,8 +25,6 @@ from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
-    fp4_decode_parallel_units,
-    fp4_decode_schedule,
     fp4_index_scale_rows,
     fp4_prefill_schedule,
     fp4_q_scale_shape,
@@ -127,8 +125,8 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
         check(fused_writer=False)
-    # PCP's candidate exchange is the only reader of the indexer op's return, so
-    # the FP4 path may leave that tensor unwritten only while this refusal holds.
+    # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
+    # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
         check(prefill_context_parallel=True)
     # Decode micro-batching is supported; only the prefill split is not, because
@@ -136,37 +134,6 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     # undeclared ones. A blanket TBO refusal would take the decode path with it.
     with pytest.raises(ValueError, match="prefill micro-batching"):
         check(prefill_ubatching=True)
-
-
-def test_every_backend_answers_the_draft_s_fp4_schedule_publish():
-    """`EagleProposer` refreshes this on whatever builder the target uses, and
-    only the MLA one has an FP4 indexer to refresh. Every other backend has to
-    answer it anyway: EAGLE3 on Llama-3, MTP on Qwen3-Next and on DeepSeek-V4
-    (whose builder is a `CommonAttentionBuilder` sibling, not an MLA subclass)
-    all reach that line with FP4 nowhere in the picture."""
-    backends = _import_or_skip("atom.model_ops.attentions.backends")
-    base = backends.CommonAttentionBuilder._publish_indexer_fp4_decode_schedule
-
-    mla = _import_or_skip("atom.model_ops.attentions.aiter_mla")
-    assert mla.AiterMLAMetadataBuilder._publish_indexer_fp4_decode_schedule is not base
-
-    for module, name in (
-        ("atom.model_ops.attentions.aiter_attention", "AiterAttentionMetadataBuilder"),
-        (
-            "atom.model_ops.attentions.deepseek_v4_attn",
-            "DeepseekV4AttentionMetadataBuilder",
-        ),
-        ("atom.model_ops.attentions.gdn_attn", "GDNAttentionMetadataBuilder"),
-        ("atom.model_ops.attentions.triton_mha", "TritonMHAMetadataBuilder"),
-    ):
-        builder = getattr(_import_or_skip(module), name)
-        assert builder._publish_indexer_fp4_decode_schedule is base, name
-
-    # Inert, not merely present: the draft reuses the target's metadata object,
-    # so anything written here would reach the verify step.
-    metadata = SimpleNamespace()
-    base(object(), metadata, 4, 1)
-    assert not vars(metadata)
 
 
 def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
@@ -192,24 +159,6 @@ def test_the_builder_compares_the_indexer_s_fp4_verdict_instead_of_setting_it():
         and target.value.attr == "indexer"
     ]
     assert not overwrites, f"builder overwrites the Indexer's verdict at {overwrites}"
-
-
-def test_decode_parallel_units_cover_the_batch_at_every_speculation_width():
-    """Everything the one captured buffer rests on: a slot per sequence per
-    step, the varctx floor, and `f(n) >= f(1)` -- the buffer is sized at
-    `max_seqlen_qo` and the draft then asks at 1. That last one is the weakest
-    true statement, not the obvious one: `f` is NOT monotonic in `next_n`."""
-    for max_bs in (1, 7, 16, 64, 128, 300, 512, 8192):
-        floor = fp4_decode_parallel_units(max_bs, 1)
-        for next_n in range(1, 17):
-            units = fp4_decode_parallel_units(max_bs, next_n)
-            assert units % next_n == 0
-            assert units // next_n >= max_bs
-            assert units >= sparse_indexer_fp4.FP4_MQA_VARCTX_PARALLEL_UNIT_NUM
-            assert units >= floor
-
-    # The counterexample the docstring names, so it cannot rot back.
-    assert fp4_decode_parallel_units(1, 3) > fp4_decode_parallel_units(1, 4)
 
 
 def test_q_scale_shape_pads_the_m_tile_axis_to_one_dword():
@@ -289,7 +238,7 @@ def _paged_layout(batch: int, ctx_len: int):
     return table, num_blocks, token, seq, slots
 
 
-def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
+def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0, weights_fill=0.0):
     """The production writer, in FP4 mode. Returns everything it emits.
 
     Through ATOM's own shim rather than `aiter.` directly: the shim is what
@@ -306,7 +255,7 @@ def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
     weights = (torch.randn(rows, HEADS, device="cuda") * weight_gain).bfloat16()
     q_fp4 = torch.zeros(rows, HEADS, HEAD_DIM // 2, **u8)
     q_scale = torch.zeros(fp4_q_scale_shape(rows, HEADS, HEAD_DIM), **u8)
-    weights_out = torch.zeros_like(weights)
+    weights_out = torch.full_like(weights, weights_fill)
     kv_cache = torch.zeros(num_blocks, 1, 4, _BLOCK, 16, **u8)
     kv_scale = torch.zeros(num_blocks, 1, 4, _BLOCK, **u8)
     attention_mla.indexer_qk_rope_quant_and_cache(
@@ -331,6 +280,42 @@ def _fused_fp4(slots, positions, num_blocks, weight_gain=1.0):
         kv_cache_scale=kv_scale,
     )
     return q_fp4, q_scale, weights_out, kv_cache, kv_scale
+
+
+@pytest.mark.parametrize("next_n", [5, 6])
+def test_fp4_writer_covers_valid_rows_and_skips_padding(on_gfx950, monkeypatch, next_n):
+    from atom.model_ops import attention_mla
+
+    batch, short = 2, 2
+    rows = batch * next_n
+    ends = torch.tensor(
+        list(range(1, next_n + 1))
+        + [max(0, short - next_n + row + 1) for row in range(next_n)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    valid = ends > 0
+    slots = torch.full((rows,), -1, dtype=torch.int64, device="cuda")
+    slots[:next_n] = torch.arange(next_n, device="cuda")
+    slots[next_n:][valid[next_n:]] = 8 * _BLOCK + torch.arange(short, device="cuda")
+    positions = (ends - 1).clamp_min(0).long()
+
+    def write(fill):
+        torch.manual_seed(7)
+        return _fused_fp4(slots, positions, 16, weight_gain=0.1, weights_fill=fill)
+
+    zero, poison = write(0.0), write(float("nan"))
+    assert torch.equal(zero[2][valid], poison[2][valid])
+    assert torch.isnan(poison[2][~valid]).all()
+    assert torch.equal(zero[0][valid], poison[0][valid])
+    assert torch.equal(zero[1][valid], poison[1][valid])
+    assert torch.equal(zero[3], poison[3]) and torch.equal(zero[4], poison[4])
+
+    # DCP computes every scheduled row instead of skipping slot<0 rows.
+    monkeypatch.setattr(attention_mla, "get_dcp_world_size", lambda: 2)
+    dcp_zero, dcp_poison = write(0.0), write(float("nan"))
+    assert torch.equal(dcp_zero[2], dcp_poison[2])
+    assert not torch.isnan(dcp_poison[2]).any()
 
 
 def _written_cache_and_queries(batch, next_n, ctx_len, seed):
@@ -406,39 +391,38 @@ def test_scale_row_swizzle_matches_its_oracle():
 
 
 def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
-    """The rectangular kernel at a speculation width: one row per (seq, step),
-    each seeing one token less than the step after it. `next_n=1` is the DCP
-    test's shape, so what this one holds down is the `next_n > 1` reshape."""
+    """A speculation width's rows, a request's one sequence
+    (`Fp4MqaRaggedMetadata`, as the decode scorer passes them): one row per
+    (seq, step), each seeing one token less than the step after it. `next_n=1`
+    is the DCP test's shape, so what this one holds down is a sequence's rows
+    sharing its block table."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
-    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4 import (
-        compute_varctx_schedule,
-    )
+
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     batch, next_n, ctx_len = 2, 4, 768
     table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
         _written_cache_and_queries(batch, next_n, ctx_len, seed=0)
     )
     ctx_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device="cuda")
-    _, cta_info, n_ctas = compute_varctx_schedule(
-        ctx_lens, FP4_MQA_BLOCK_K, None, ctx_len, next_n=next_n
-    )
+    # Each of a request's next_n rows sees one token less than the one after it.
+    row = torch.arange(rows, device="cuda")
+    visible = (ctx_lens.repeat_interleave(next_n) - (next_n - 1 - row % next_n)).int()
+    starts = torch.arange(0, (batch + 1) * next_n, next_n, device="cuda").int()
     logits = torch.empty(rows, ctx_len, dtype=torch.float32, device="cuda")
     flydsl_pa_mqa_logits_fp4(
         q_fp4.reshape(batch, next_n, HEADS, HEAD_DIM // 2),
-        q_scale.reshape(batch, next_n, *q_scale.shape[1:]),
+        q_scale,
         kv_cache,
         kv_scale,
-        table,
-        weights_out,
-        ctx_lens,
-        ctx_len,
+        weights=weights_out,
+        max_seq_len=ctx_len,
         weight_scale=WEIGHTS_SCALE,
-        next_n=next_n,
-        block_k=FP4_MQA_BLOCK_K,
         kv_block_size=_BLOCK,
         out=logits,
-        cta_info=cta_info,
-        total_ctas=n_ctas,
+        **Fp4MqaRaggedMetadata(starts, next_n, table).kernel_args(
+            visible, heads=HEADS, page_size=_BLOCK, max_seq_len=ctx_len
+        ),
     )
 
     want = _oracle(
@@ -451,17 +435,68 @@ def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
         weights_out,
         lambda keys: keys.repeat_interleave(next_n, dim=0),
     )
-    # Each of a request's next_n rows sees one token less than the one after it.
-    row = torch.arange(rows, device="cuda")
-    visible = ctx_lens.repeat_interleave(next_n) - (next_n - 1 - row % next_n)
     _assert_agrees(logits, want, visible, topk=512)
+
+
+def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypatch):
+    """`Indexer._score_topk_decode_fp4_flydsl` at a ragged MTP step: requests
+    of 4, 1 and 3 rows (each row of a c-row request one token behind the
+    next), an empty padding request and two padding rows, read off the step's
+    metadata alone. Every real row picks the cache's top-k within its own
+    bound; a padding row picks nothing."""
+    from atom.models import deepseek_v4
+
+    batch, next_n, ctx_len, topk = 3, 4, 768, 512
+    table, kv_cache, kv_scale, q_fp4, q_scale, weights, _ = _written_cache_and_queries(
+        batch, next_n, ctx_len, seed=1
+    )
+    counts = [4, 1, 3]
+    seq = [b for b, c in enumerate(counts) for _ in range(c)]
+    ends = [ctx_len - c + n + 1 for c in counts for n in range(c)]
+    picks = [b * next_n + n for b, c in enumerate(counts) for n in range(c)]
+    pad = 2
+    rows = torch.tensor(picks + picks[:pad], device="cuda")
+    starts = [0, *np.cumsum(counts).tolist(), sum(counts)]
+    metadata = SimpleNamespace(
+        csa_n_committed_per_token=torch.tensor(
+            ends + [0] * pad, dtype=torch.int32, device="cuda"
+        ),
+        cu_seqlens_q=torch.tensor(starts, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=next_n,
+        indexer_meta={},
+    )
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv_cache, kv_scale
+    indexer._max_model_len_idx, indexer._weights_scale = ctx_len, WEIGHTS_SCALE
+    padded_table = torch.cat([table, table[:1]])  # the padding request's row
+    got = indexer._score_topk_decode_fp4_flydsl(
+        q_fp4[rows], q_scale[rows], padded_table, weights[rows], topk
+    )
+
+    want = _oracle(
+        q_fp4[rows[: len(picks)]], q_scale[rows[: len(picks)]], kv_cache, kv_scale,
+        table, ctx_len, weights[rows[: len(picks)]], lambda keys: keys[seq],
+    )  # fmt: skip
+    for r, end in enumerate(ends):
+        chosen = set(got[r][got[r] >= 0].tolist())
+        assert len(chosen) == min(topk, end) and max(chosen) < end, r
+        best = set(want[r, :end].topk(min(topk, end)).indices.tolist())
+        assert len(chosen & best) / len(best) > 0.99, r
+    assert (got[len(picks) :] == -1).all()
 
 
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
     """The geometry `dcp_decode_candidate_exchange_fused` hands the scorer: one
-    row per query token over this rank's shard, so the windows are ragged and
-    the schedule is built at next_n=1 whatever the speculation width."""
+    row per query token over this rank's shard, each its own sequence, so the
+    windows are ragged whatever the speculation width."""
     from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+
+    from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 
     batch, next_n, width = 3, 4, 1024
     table, kv_cache, kv_scale, q_fp4, q_scale, weights_out, rows = (
@@ -473,9 +508,6 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
     local_ctx = torch.tensor(
         [width - (r % 7) * 37 for r in range(rows)], dtype=torch.int32, device="cuda"
     )
-    units = fp4_decode_parallel_units(batch, next_n)
-    cta_info = torch.zeros(units, 4, dtype=torch.int32, device="cuda")
-    fp4_decode_schedule(local_ctx, FP4_MQA_BLOCK_K, units, width, 1, cta_info)
 
     logits = torch.empty(rows, width, dtype=torch.float32, device="cuda")
     flydsl_pa_mqa_logits_fp4(
@@ -483,17 +515,16 @@ def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950)
         q_scale.reshape(rows, 1, *q_scale.shape[1:]),
         kv_cache,
         kv_scale,
-        table.repeat_interleave(next_n, dim=0),
-        weights_out,
-        local_ctx,
-        width,
+        weights=weights_out,
+        max_seq_len=width,
         weight_scale=WEIGHTS_SCALE,
-        next_n=1,
-        block_k=FP4_MQA_BLOCK_K,
         kv_block_size=_BLOCK,
         out=logits,
-        cta_info=cta_info,
-        total_ctas=units,
+        **Fp4MqaRaggedMetadata(
+            torch.arange(rows + 1, dtype=torch.int32, device="cuda"),
+            1,
+            table.repeat_interleave(next_n, dim=0),
+        ).kernel_args(local_ctx, heads=HEADS, page_size=_BLOCK, max_seq_len=width),
     )
 
     want = _oracle(
@@ -761,3 +792,217 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
         lambda keys: keys[row_to_batch.long()],
     )
     _assert_agrees(logits, want, local_ends, topk=256)
+
+
+@pytest.mark.parametrize("rows,capacity", [(8, 8), (64, 64), (64, 16)])
+@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
+def test_v4_fp4_one_graph_replays_sequence_layouts(
+    on_gfx950, monkeypatch, rows, capacity, prefix
+):
+    """One graph, fixed launch, changing GPU metadata (including empty slots)."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.models import deepseek_v4
+    from atom.utils import CpuGpuBuffer
+    from atom.utils.forward_context import AttnState
+
+    width, topk = 768, 512
+    table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
+        rows, 1, width, seed=17
+    )
+    weights = weights.bfloat16()
+    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
+    var = {
+        prefix
+        + "cu_seqlens_q": CpuGpuBuffer(capacity + 1, dtype=torch.int32, device="cuda"),
+        prefix
+        + "v4_fp4_query_start_loc": CpuGpuBuffer(
+            capacity + 1, dtype=torch.int32, device="cuda"
+        ),
+        prefix + "block_tables": SimpleNamespace(gpu=table[:capacity]),
+    }
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 7
+    builder._indexer_fp4 = True
+    builder.indexer_layout = "gfx950"
+    metadata = SimpleNamespace(state=AttnState.DECODE, csa_n_committed_per_token=ends)
+    monkeypatch.setattr(
+        deepseek_v4,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer.kv_cache, indexer.kv_scale = kv, ks
+    indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
+
+    def publish(counts, empty=False):
+        bs = len(counts)
+        cu = np.r_[np.int32(0), np.cumsum(counts, dtype=np.int32)]
+        metadata.cu_seqlens_q = builder._stage(prefix + "cu_seqlens_q", cu)
+        metadata.max_seqlen_q = max(counts)
+        metadata.block_tables = table[:bs]
+        bounds = [width - c + i + 1 for c in counts for i in range(c)]
+        bounds += [0] * (rows - len(bounds))
+        if empty:
+            bounds = [0] * rows
+        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
+        metadata.indexer_meta = builder._build_v4_indexer_meta(
+            attn_metadata=metadata,
+            positions_gpu=None,
+            scheduled_bs=bs,
+            total_tokens=int(cu[-1]),
+            device="cuda",
+            buf_prefix_ubatch=prefix,
+        )
+        return bounds
+
+    def run():
+        return indexer._score_topk_decode_fp4_flydsl(
+            q, qs, metadata.block_tables, weights, topk
+        )
+
+    shapes = (
+        [[1] * 8, [8], [3, 1, 4], [4, 4], [1, 0, 3], [0]]
+        if rows == 8
+        else [[1] * 64, [8] * 8, [3, 1, 4] * 8, [4] * 16, [1, 0, 3], [0]]
+    )
+    if capacity < rows:
+        shapes = [[4] * 16, [8] * 8, [3, 1, 4] * 4 + [8] * 4, [1, 0, 3], [0]]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        publish(shapes[0])
+        for _ in range(3):
+            run()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            got = run()
+        stream.synchronize()
+        output_ptr = got.data_ptr()
+        metadata_ptr = metadata.indexer_meta["fp4_decode"].query_start_loc.data_ptr()
+
+        # Python-side launches must never run again: every shape replays the
+        # SAME captured row-group scorer and top-k.
+        def no_recapture(*args, **kwargs):
+            raise AssertionError("scorer was relaunched instead of replayed")
+
+        monkeypatch.setattr(deepseek_v4, "flydsl_pa_mqa_logits_fp4", no_recapture)
+        for counts in shapes[::-1] + shapes:
+            bounds = publish(counts)
+            ragged = metadata.indexer_meta["fp4_decode"]
+            assert ragged.query_start_loc.data_ptr() == metadata_ptr
+            assert ragged.query_start_loc.numel() == capacity + 1
+            assert ragged.max_qlen == 8
+            graph.replay()
+            stream.synchronize()
+            assert got.data_ptr() == output_ptr
+            n_real = sum(counts)
+            seq = [b for b, count in enumerate(counts) for _ in range(count)]
+            if n_real:
+                want = _oracle(
+                    q[:n_real],
+                    qs[:n_real],
+                    kv,
+                    ks,
+                    table[: len(counts)],
+                    width,
+                    weights[:n_real],
+                    lambda keys, seq=seq: keys[seq],
+                )
+                for row, end in enumerate(bounds[:n_real]):
+                    chosen = set(got[row][got[row] >= 0].tolist())
+                    best = set(want[row, :end].topk(topk).indices.tolist())
+                    assert len(chosen) == topk and max(chosen) < end
+                    assert len(chosen & best) / topk > 0.99
+            assert bool((got[n_real:] == -1).all())
+        publish(shapes[0], empty=True)
+        graph.replay()
+        stream.synchronize()
+        assert bool((got == -1).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(
+    "rows,counts,running_bs",
+    [
+        # An idle DP rank's one-row dummy while a peer prefills 16 requests.
+        (1, [1], 16),
+        # A decoding rank with fewer rows than the group's batch.
+        (4, [1, 1, 1], 8),
+        # Unified: the batch fits the bucket exactly.
+        (8, [1] * 8, 8),
+    ],
+)
+def test_fp4_decode_bounds_drop_the_dp_padded_empty_tail(rows, counts, running_bs):
+    """Under DP a prefilling peer keeps `running_bs` at the group's batch while
+    this rank runs only its own rows, so `cu_seqlens_q` carries more (empty)
+    sequences than the token bucket holds. They are padding: the published
+    boundaries keep the nonempty ones and repeat the end for the rest."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils import CpuGpuBuffer
+
+    max_bs = 32
+    cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)
+    cu[0] = 0
+    cu[1 : len(counts) + 1] = np.cumsum(counts)
+    var = {
+        "cu_seqlens_q": CpuGpuBuffer(max_bs + 1, dtype=torch.int32, device="cuda"),
+        "v4_fp4_query_start_loc": CpuGpuBuffer(
+            max_bs + 1, dtype=torch.int32, device="cuda"
+        ),
+        "block_tables": SimpleNamespace(
+            gpu=torch.zeros(max_bs, 4, dtype=torch.int32, device="cuda")
+        ),
+    }
+    var["cu_seqlens_q"].np[: cu.size] = cu
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 0
+    metadata = SimpleNamespace(
+        cu_seqlens_q=torch.empty(running_bs + 1),
+        csa_n_committed_per_token=torch.empty(rows),
+    )
+    meta = builder._refresh_fp4_rowgroup_decode_meta(metadata)
+    want = np.full(rows + 1, sum(counts))
+    want[: len(counts) + 1] = cu[: len(counts) + 1]
+    assert meta.query_start_loc.tolist() == want.tolist()
+    assert meta.block_tables.shape[0] == rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_fp4_decode_bounds_reject_a_sequence_past_the_bucket():
+    """Only the empty tail may be dropped: a nonempty sequence at or past the
+    bucket's capacity still raises rather than losing its rows."""
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+    from atom.utils import CpuGpuBuffer
+
+    var = {
+        "cu_seqlens_q": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
+        "v4_fp4_query_start_loc": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
+        "block_tables": SimpleNamespace(
+            gpu=torch.zeros(8, 4, dtype=torch.int32, device="cuda")
+        ),
+    }
+    # Two rows, but the second nonempty sequence is the third one.
+    var["cu_seqlens_q"].np[:5] = [0, 1, 1, 2, 2]
+    builder = DeepseekV4AttentionMetadataBuilder.__new__(
+        DeepseekV4AttentionMetadataBuilder
+    )
+    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.max_spec_steps = 0
+    metadata = SimpleNamespace(
+        cu_seqlens_q=torch.empty(5), csa_n_committed_per_token=torch.empty(2)
+    )
+    with pytest.raises(ValueError, match="exceed the decode bucket"):
+        builder._refresh_fp4_rowgroup_decode_meta(metadata)

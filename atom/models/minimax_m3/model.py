@@ -821,7 +821,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
-        self._mono = MonoDecode(self, atom_config, config)
+        self._mono = MonoDecode(self, atom_config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)

@@ -91,7 +91,7 @@ ARG INSTALL_LM_EVAL=1
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
 COPY aiter-whl/ /tmp/aiter-whl/
-RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]"; else echo "Skip lm-eval install"; fi
+RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]" "datasets==5.0.0"; else echo "Skip lm-eval install"; fi
 RUN pip install hf_transfer
 RUN pip install --upgrade "pybind11>=3.0.1"
 RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true && \

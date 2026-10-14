@@ -70,7 +70,7 @@ entry.
 {
   "default_scenarios": [                 // workload grid applied to every variant
     {"isl": 1024, "osl": 1024,
-     "concurrency": [4, 8, 16, 32, 64, 128, 256, 512, 1024],
+     "concurrency": [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
      "random_range_ratio": 0.8},
     {"isl": 8192, "osl": 1024, "concurrency": [...], "random_range_ratio": 0.8}
   ],
@@ -87,7 +87,7 @@ entry.
         {"label": "", "suffix": "", "conc_max": 256},
         {"label": "MTP3", "suffix": "-mtp3",
          "extra_args": "--method mtp --num-speculative-tokens 3",
-         "bench_args": "--use-chat-template", "conc_min": 4, "conc_max": 256},
+         "bench_args": "--use-chat-template", "conc_min": 1, "conc_max": 256},
         {"label": "DPA", "suffix": "-dpa",
          "extra_args": "--enable-dp-attention",
          "conc_min": 64, "conc_max": 1024},

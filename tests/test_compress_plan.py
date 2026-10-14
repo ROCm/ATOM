@@ -314,3 +314,32 @@ def test_graph_bs_and_decode_cap_mutually_exclusive():
             decode_capacity_per_ratio={4: 8, 128: 8},
             extra_write=0,
         )
+
+
+# ── write_from: rows a rebuilding forward recomputes but must not write ──────
+
+
+def test_write_from_drops_groups_the_cache_already_holds():
+    """A request rebuilding its state from 256 below a hit at 512 compresses
+    only the groups ending at or past the hit; the other keeps them all."""
+    ratios = [(2, False)]
+    extend = np.asarray([300, 300], dtype=np.int32)
+    context = np.asarray([256 + 300, 300], dtype=np.int32)
+    bufs = {2: {"compress": _FakeBuf(512), "write": _FakeBuf(512)}}
+    plans = make_compress_plans(
+        extend,
+        context,
+        ratios,
+        plan_buffers=bufs,
+        extra_write=0,
+        write_from=np.asarray([512, 0], dtype=np.int32),
+    )
+    rows = plans[2].compress_plan_cpu
+    first = rows[rows[:, 1] == 0][:, POSITION_COL]
+    second = rows[rows[:, 1] == 1][:, POSITION_COL]
+    # every group of the first ends at or past the hit, and none is lost there
+    assert first.min() == 513 and len(first) == (556 - 512) // 2
+    assert np.all((first + 1) % 2 == 0)
+    assert len(second) == 150
+    # the per-seq counts slice the plan the same way
+    assert plans[2].cu_compress_cpu.tolist() == [0, len(first), len(first) + 150]

@@ -309,15 +309,42 @@ def _get_qsa_tokens_per_req(forward_batch: Any) -> int:
     return 1
 
 
+def _resolved_spec_draft_tokens() -> int:
+    """Draft width after SGLang 0.5.20 resolution, or 0 if unpublished."""
+    try:
+        from sglang.srt.runtime_context import get_spec
+
+        spec = get_spec()
+    except Exception:  # noqa: BLE001 - unpublished context or older SGLang
+        return 0
+    return int(getattr(spec, "speculative_num_draft_tokens", 0) or 0)
+
+
 def _get_qsa_graph_max_tokens_per_req() -> int:
     """Launch-time tokens/req for persistent QSA CUDA-graph buffers.
 
-    After SGLang speculative init, TARGET_VERIFY width is
-    ``speculative_num_draft_tokens`` (Flash chain: ``steps+1``). Fill still
-    uses ``_get_qsa_tokens_per_req``.
+    TARGET_VERIFY width is ``speculative_num_draft_tokens`` (Flash chain:
+    ``steps+1``). 0.5.20 stores that on ``get_spec()``; the raw server-args
+    record stays unset when the CLI only passes ``--speculative-num-steps``.
+    Sizing the captured buffers from the raw record (width 1) then faults
+    verify capture, 8 vs 24. Fill still uses ``_get_qsa_tokens_per_req``.
     """
+    width = _resolved_spec_draft_tokens()
+    if width > 0:
+        return width
     args = _server_args()
-    return max(int(getattr(args, "speculative_num_draft_tokens", 0) or 0), 1)
+    if args is None:
+        return 1
+    width = int(getattr(args, "speculative_num_draft_tokens", 0) or 0)
+    if width > 0:
+        return width
+    # Eagle topk 1: SGLang itself sets draft tokens to steps+1.
+    algo = getattr(args, "speculative_algorithm", None)
+    steps = getattr(args, "speculative_num_steps", None)
+    topk = getattr(args, "speculative_eagle_topk", None)
+    if algo and steps and topk in (None, 1):
+        return int(steps) + 1
+    return 1
 
 
 def bind_qsa_replay_batch(forward_batch: Any, backend: Any) -> Any:
