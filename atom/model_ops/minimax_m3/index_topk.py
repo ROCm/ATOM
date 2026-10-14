@@ -32,20 +32,6 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
-    # direction as the Triton one below, same selection on every shape tried.
-    # It narrows in one pass where Triton folds tl.topk over
-    # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
-    # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
-    from aiter.ops.flydsl.topk_per_row_small_k import (
-        topk_per_row_small_k,
-        topk_per_row_small_k_supported,
-    )
-except ImportError:  # pragma: no cover - aiter is optional at import time
-    topk_per_row_small_k = None
-    topk_per_row_small_k_supported = None
-
 
 # aiter's MFMA block-score kernel: max-over-128-tokens block scoring on the
 # matrix cores, with a packed work map so a ragged batch does not pay for its
@@ -73,6 +59,36 @@ def _flydsl(name):
             f"this is not recoverable at runtime -- install an aiter that "
             f"includes the FlyDSL M3 index-score kernels (ROCm/aiter#5626)."
         ) from exc
+
+
+@functools.cache
+def _topk_small_k():
+    """aiter's chunk-narrowing per-row selector: ``(select, supported)``.
+
+    Same forced-block pins and tie direction as the Triton one below, same
+    selection on every shape tried. It narrows in one pass where Triton folds
+    `tl.topk` over ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as
+    the row widens -- 7us against 36us at a 1M context. `_aiter_selector_wins`
+    says where.
+
+    Resolved on use rather than at module scope, for the reason `_flydsl` is:
+    the only CI job that runs `tests/` installs no aiter, so a module-scope
+    import would turn this file's whole test module into a collection error.
+
+    NOT guarded by `try/except ImportError`. It was, and the module moved
+    underneath it (`flydsl/` -> `flydsl/topk/`), which that guard turns into
+    "every row takes the 36us path, forever, silently" instead of an error.
+    There is no aiter that carries the M3 score kernels this file requires but
+    not this selector -- it is older and sits on aiter main -- so an absent
+    module means a moved path, and the right answer to a moved path is to say
+    so.
+    """
+    from aiter.ops.flydsl.topk.topk_per_row_small_k import (
+        topk_per_row_small_k,
+        topk_per_row_small_k_supported,
+    )
+
+    return topk_per_row_small_k, topk_per_row_small_k_supported
 
 
 # aiter's MFMA prefill block-score kernel. Optional, unlike the decode one: it
@@ -327,21 +343,6 @@ def n_valid_column_per_row_for_forward(owner, phase, row_starts, row_prefix, **k
     return cache[phase]
 
 
-@functools.lru_cache(maxsize=1)
-def index_score_config(cp_world=1, cp_rank=0):
-    """The one config every ATOM caller of the flydsl scorer uses.
-
-    ``cp_world``/``cp_rank`` describe an indexer-CP shard, where this rank owns
-    the round-robin blocks ``b % world == rank`` and the score it produces is
-    the compacted ``[heads, tokens, ceil(blocks/world)]`` that
-    `local_candidate_keys` expects. The 1/0 default is the whole context on one
-    rank, which folds the remap away entirely. It has to reach the map builder
-    and the score call identically -- they re-derive the same per-request local
-    block count from it -- so it is built here rather than at each site.
-    """
-    return _flydsl("MiniMaxM3IndexScoreConfig")(cp_world=cp_world, cp_rank=cp_rank)
-
-
 def build_index_score_work_map(
     seq_lens, *, max_block, max_query_len, num_idx_heads, out=None,
     cp_world=1, cp_rank=0,
@@ -361,9 +362,11 @@ def build_index_score_work_map(
     :func:`build_n_valid_column_per_row` -- a captured decode replays against
     the pointer baked in at capture.
 
-    Under indexer CP, ``max_block`` is this rank's LOCAL bound
-    ``ceil(global_blocks / cp_world)``, not the global one -- see
-    :func:`index_score_config`.
+    ``cp_world``/``cp_rank`` describe an indexer-CP shard: this rank owns the
+    round-robin blocks ``b % world == rank``, and ``max_block`` is then this
+    rank's LOCAL bound ``ceil(global_blocks / cp_world)``, not the global one.
+    The same pair must reach the map builder and the score call, which
+    re-derive the same per-request local block count from it.
     """
     if seq_lens.shape[0] <= 0:
         return None
@@ -372,7 +375,8 @@ def build_index_score_work_map(
         max_block,
         max_query_len,
         num_idx_heads,
-        index_score_config(cp_world, cp_rank),
+        cp_world=cp_world,
+        cp_rank=cp_rank,
         out=out,
     )
 
@@ -391,7 +395,8 @@ def index_score_work_map_size(
         max_block,
         max_query_len,
         num_idx_heads,
-        index_score_config(cp_world, cp_rank),
+        cp_world=cp_world,
+        cp_rank=cp_rank,
     )
 
 
@@ -420,7 +425,8 @@ def index_score_work_map_capacity(
         max_block,
         max_query_len,
         num_idx_heads,
-        index_score_config(cp_world, cp_rank),
+        cp_world=cp_world,
+        cp_rank=cp_rank,
     )
 
 
@@ -861,8 +867,9 @@ def _select_with_aiter(
     its LDS budget, so the guard costs nothing today; it is here so the two
     changes stay independent.
     """
-    if topk_per_row_small_k is None or not score.is_contiguous():
+    if not score.is_contiguous():
         return False
+    select, supported = _topk_small_k()
     heads, total_q, max_block = score.shape
     rows = heads * total_q
     flat_score = score.view(rows, max_block)
@@ -873,12 +880,12 @@ def _select_with_aiter(
     key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
     served = _AITER_SERVES.get(key)
     if served is None:
-        served = _AITER_SERVES[key] = topk_per_row_small_k_supported(
+        served = _AITER_SERVES[key] = supported(
             flat_score, n_valid_column_per_row, flat_idx, topk
         )
     if not served:
         return False
-    topk_per_row_small_k(
+    select(
         flat_score, n_valid_column_per_row, flat_idx, topk, init_blocks, local_blocks
     )
     return True
@@ -1406,7 +1413,6 @@ def decode_index_score(
     contiguity for exactly this reason.
     """
     batch = seq_lens.shape[0]
-    cfg = index_score_config(cp_world, cp_rank)
     if work_map is None:
         work_map = build_index_score_work_map(
             seq_lens, max_block=max_block, max_query_len=max_query_len,
@@ -1459,8 +1465,9 @@ def decode_index_score(
         sm_scale,
         max_block,
         out=score,
-        cfg=cfg,
         work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
     )
     return score
 

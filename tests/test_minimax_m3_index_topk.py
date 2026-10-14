@@ -141,15 +141,13 @@ class TestTheAiterDependencyIsDeferred:
         monkeypatch.setitem(sys.modules, "aiter.ops.flydsl", stub)
         monkeypatch.setattr("aiter.ops.flydsl", stub)
         m._flydsl.cache_clear()
-        m.index_score_config.cache_clear()
         try:
             with pytest.raises(RuntimeError, match="aiter#5626"):
-                m.index_score_config()
+                m.index_score_work_map_size(1, 1, 1, 1)
         finally:
-            # Both caches memoize across tests; a stubbed entry left behind
+            # The resolver memoizes across tests; a stubbed entry left behind
             # would fail every later GPU test in this file.
             m._flydsl.cache_clear()
-            m.index_score_config.cache_clear()
 
 
 # The shape the non-monotonicity shows up at: at max_block 256 a batch of 8
