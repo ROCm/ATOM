@@ -1739,16 +1739,38 @@ jobs:
           SLURM_STATUS_RANKS=1
           monitor_slurm_job "${JOB_ID}"
 
+          # Same fail-closed pattern as rdma-smoke: monitor_slurm_job only waits
+          # for a terminal state; read_slurm_exit_code turns FAILED into a
+          # non-zero Actions step exit (run 38520975962 stayed green otherwise).
+          SLURM_ACCOUNTING_TIMEOUT="${SLURM_ACCOUNTING_TIMEOUT:-180}"
+          read_slurm_exit_code "${JOB_ID}"
+          read_slurm_status_files "${run_dir}" 1
+          SLURM_JOB_ACTIVE=0
+          echo "slurm_state=${SLURM_STATE}"
+          echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+          echo "slurm job exit code: ${SLURM_JOB_RC}"
+
           echo "=== scatter_bounds logs ==="
           tail -n 80 "${SCATTER_OUT_DIR}/rank.log" 2>/dev/null || true
           tail -n 40 "${SCATTER_OUT_DIR}/pytest_atom_scatter.log" 2>/dev/null || true
           # Copy onto the Actions workspace so upload-artifact can see them.
           cp -a "${SCATTER_OUT_DIR}/." "${workspace_out}/" 2>/dev/null || true
           cp -a "${run_dir}/"slurm-*.out "${run_dir}/"slurm-*.err "${workspace_out}/" 2>/dev/null || true
+
           if [[ -f "${SCATTER_OUT_DIR}/rank-rc" ]]; then
-            rc="$(cat "${SCATTER_OUT_DIR}/rank-rc")"
-            [[ "${rc}" == "0" ]] || exit "${rc}"
+            rank_rc="$(cat "${SCATTER_OUT_DIR}/rank-rc")"
+            echo "rank_rc=${rank_rc}"
+            if [[ "${rank_rc}" != "0" ]]; then
+              echo "::error::scatter_bounds rank exited ${rank_rc}"
+              exit "${rank_rc}"
+            fi
+          else
+            echo "::warning::scatter_bounds rank-rc missing; relying on Slurm exit code ${SLURM_JOB_RC}"
           fi
+          if [[ "${SLURM_JOB_RC}" != "0" ]]; then
+            echo "::error::scatter_bounds Slurm job ${JOB_ID} failed with rc=${SLURM_JOB_RC} state=${SLURM_STATE}"
+          fi
+          exit "${SLURM_JOB_RC}"
 
       - name: Upload scatter_bounds logs
         if: always()

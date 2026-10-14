@@ -24,6 +24,7 @@ host="$(hostname)"
 mkdir -p "${SCATTER_OUT_DIR}"
 chmod 0777 "${SCATTER_OUT_DIR}" 2>/dev/null || true
 log="${SCATTER_OUT_DIR}/rank.log"
+rc_file="${SCATTER_OUT_DIR}/rank-rc"
 
 exec > >(tee -a "${log}") 2>&1
 echo "=== scatter_bounds rank start host=${host} job=${job_id} container=${container} ==="
@@ -32,6 +33,11 @@ echo "repo=${SCATTER_REPO_ROOT}"
 echo "aiter_ref=${AITER_GIT_REF} mode=${SCATTER_INSTALL_MODE}"
 
 cleanup() {
+  local rc=$?
+  # Always publish a rank-rc so the GHA wrapper can fail closed if Slurm
+  # accounting is flaky (previous run left no rank-rc and GHA stayed green).
+  printf '%s\n' "${rc}" > "${rc_file}.tmp" 2>/dev/null || true
+  mv "${rc_file}.tmp" "${rc_file}" 2>/dev/null || true
   if command -v timeout >/dev/null 2>&1; then
     timeout 20 docker kill "${container}" >/dev/null 2>&1 || true
     timeout 20 docker rm -f "${container}" >/dev/null 2>&1 || true
@@ -39,6 +45,7 @@ cleanup() {
     docker kill "${container}" >/dev/null 2>&1 || true
     docker rm -f "${container}" >/dev/null 2>&1 || true
   fi
+  exit "${rc}"
 }
 trap cleanup EXIT
 
@@ -47,6 +54,8 @@ docker pull "${SCATTER_IMAGE}"
 cache="/tmp/atomesh-scatter-${job_id}"
 mkdir -p "${cache}/home" "${cache}/aiter/jit"
 
+# Keep the ATOM checkout :ro — tests import via PYTHONPATH (no editable pip
+# write of atom.egg-info into the mount).
 docker run -d --name "${container}" \
   --network host --ipc host \
   --device=/dev/kfd --device=/dev/dri \
@@ -62,6 +71,8 @@ docker run -d --name "${container}" \
   -e ROCR_VISIBLE_DEVICES=0 \
   -e AITER_GIT_REF="${AITER_GIT_REF}" \
   -e SCATTER_INSTALL_MODE="${SCATTER_INSTALL_MODE}" \
+  -e PYTHONPATH="/workspace/ATOM${PYTHONPATH:+:${PYTHONPATH}}" \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -v "${SCATTER_REPO_ROOT}:/workspace/ATOM:ro" \
   -v "${SCATTER_OUT_DIR}:/out" \
   -v "${cache}:${cache}" \
@@ -69,7 +80,14 @@ docker run -d --name "${container}" \
   "${SCATTER_IMAGE}" \
   sleep infinity
 
-docker exec "${container}" bash -lc '
+docker exec \
+  -e AITER_GIT_REF="${AITER_GIT_REF}" \
+  -e SCATTER_INSTALL_MODE="${SCATTER_INSTALL_MODE}" \
+  -e PYTHONPATH="/workspace/ATOM" \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -e AITER_LOG_LEVEL=WARNING \
+  -e AMD_SERIALIZE_KERNEL=3 \
+  "${container}" bash -lc '
   set -euo pipefail
   echo "=== env ==="
   python3 -c "import torch; print(\"torch\", torch.__version__, \"hip\", torch.version.hip); print(\"devices\", torch.cuda.device_count())"
@@ -105,8 +123,10 @@ print(f"OK patched kernel: {src}")
 print(f"aiter={aiter.__file__}")
 PY
 
-  echo "=== install ATOM editable (no deps) ==="
-  python3 -m pip install -e /workspace/ATOM --no-deps
+  # Do not pip install -e: /workspace/ATOM is mounted read-only and writing
+  # atom.egg-info fails (run 38520975962). Prefer source import via PYTHONPATH.
+  export PYTHONPATH="/workspace/ATOM${PYTHONPATH:+:${PYTHONPATH}}"
+  python3 -c "import atom, aiter; print(\"atom\", atom.__file__); print(\"aiter\", aiter.__file__)"
 
   echo "=== ATOM MiniMax-M3 scatter_reduce tests ==="
   python3 -m pytest -p no:cacheprovider -v -s \
@@ -126,4 +146,3 @@ PY
 '
 
 echo "=== scatter_bounds rank done ==="
-printf '0\n' > "${SCATTER_OUT_DIR}/rank-rc"
