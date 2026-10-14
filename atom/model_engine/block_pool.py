@@ -93,6 +93,11 @@ class BlockPool:
         self._on_evict = on_evict
         self.blocks: list[Block] = [Block(i) for i in range(self.max_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
+        # Bumped by every change to which block a hash names: a publish, an
+        # unindex that drops an entry, a relocation, a clear. A reader that
+        # resolved hashes to ids at version v holds the index's current answer
+        # while it is still v (`BlockManager._take_admission_walk`).
+        self.index_version: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
@@ -175,11 +180,39 @@ class BlockPool:
         """Block id indexed under content hash `h`, or -1."""
         return self._hash_to_block_id.get(h, -1)
 
+    @property
+    def index_get(self):
+        """The index's own `dict.get`: block id or None, for C-speed lookups
+        of a whole chain with `map`. Read it per walk, not once per pool."""
+        return self._hash_to_block_id.get
+
+    def count_used(self, block_ids) -> int:
+        """How many of `block_ids` (distinct) some live sequence holds."""
+        return len(self._used.intersection(block_ids))
+
+    def claim_many(self, block_ids) -> None:
+        """`claim` each of `block_ids`, in order; the loop with its lookups
+        hoisted, for an admission claiming a whole hit."""
+        blocks, used, take = self.blocks, self._used, self._take_named
+        slru = self.cache_policy == "slru"
+        for block_id in block_ids:
+            block = blocks[block_id]
+            if slru and block.hash != -1:
+                self._reused.add(block_id)
+            if block_id in used:
+                block.ref_count += 1
+            else:
+                assert block.ref_count == 0
+                block.ref_count = 1
+                take(block_id)
+                used.add(block_id)
+
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         """Index `block_id` under the content hash of the tokens it now holds."""
         block = self.blocks[block_id]
         block.update(h, token_ids)
         self._hash_to_block_id[h] = block_id
+        self.index_version += 1
 
     def clear_index(self) -> None:
         """Drop every content-hash entry, keeping blocks live sequences hold.
@@ -188,6 +221,7 @@ class BlockPool:
         longer reachable by hash, so no future request can claim them.
         """
         self._hash_to_block_id.clear()
+        self.index_version += 1
         for block in self.blocks:
             if block.ref_count == 0:
                 block.hash = -1
@@ -215,6 +249,7 @@ class BlockPool:
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
             del self._hash_to_block_id[block.hash]
+            self.index_version += 1
             dropped = True
             if self._on_evict is not None:
                 self._on_evict(block.hash)
@@ -461,6 +496,7 @@ class BlockPool:
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
+            self.index_version += 1
         self._used.discard(source)
         self._used.add(destination)
         src.ref_count, src.hash, src.token_ids = 0, -1, array.array("i")

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
+from atom.model_engine import block_manager as bm_module
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -120,6 +121,11 @@ def test_estimate_keeps_the_head_prompt_hashes(monkeypatch, seq_factory):
     hashed = []
     real = bm.compute_hash
     monkeypatch.setattr(bm, "compute_hash", lambda *a: hashed.append(a) or real(*a))
+    # The fast prefix walk hashes a missing chain in bulk instead.
+    bulk = bm_module.chained_block_hashes
+    monkeypatch.setattr(
+        bm_module, "chained_block_hashes", lambda *a: hashed.append(a) or bulk(*a)
+    )
     # 8 cached blocks of 4 tokens: the chunk is the 32 new tokens after them.
     cost = sched._estimate_prefill_chunk_cost()
     assert cost == sched._chunk_cost(32, 32)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref
 
 import numpy as np
 import xxhash
@@ -25,6 +25,7 @@ from atom.distributed.kv_events import (
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
+from atom.model_engine.prefix_hash import chained_block_hashes
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
@@ -115,6 +116,32 @@ class JointBoundaryDecision:
 # a delayer hold with room to spare; ~64 KB of ints.
 _RECENT_EVICTIONS = 8192
 
+# Blocks the hit walk hashes per round when the prompt chain runs out (no
+# frontend chain): the first round is small so a short hit hashes little past
+# its miss, and later rounds grow to keep the per-round overhead down. The cap
+# bounds the hashing wasted past the first miss.
+_WALK_HASH_ROUND_MIN = 64
+_WALK_HASH_ROUND_MAX = 1024
+
+
+@dataclass(slots=True)
+class _AdmissionWalk:
+    """`can_allocate`'s hit, kept for the `allocate` that follows it.
+
+    The scheduler probes and then allocates the same seq within one Phase-2
+    iteration, with nothing in between that changes the KV index, so
+    `allocate` claims these ids instead of hashing and looking up the prompt
+    a second time. `index_version` says whether that held
+    (`_take_admission_walk`).
+    """
+
+    seq: ref
+    num_tokens: int
+    cache_seed: int
+    index_version: int
+    hashes: list[int]
+    ids: list[int]
+
 
 @dataclass(slots=True)
 class _FitEstimate:
@@ -194,6 +221,10 @@ class BlockManager:
         self._recent_evictions: deque[int] = deque(maxlen=_RECENT_EVICTIONS)
         self._index_clears = 0
         self.fit_estimate_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
+        # `can_allocate`'s hit walk at C speed, handed to `allocate`
+        # (`_hit_walk`). Off: the per-block walk and `allocate`'s re-walk.
+        self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
+        self._admission_walk: _AdmissionWalk | None = None
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -1110,18 +1141,31 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = seq.cache_seed
-        compressed_hit = 0
         prompt = self._prompt_hashes(seq)
-        for i in range(self._n_hash_blocks(seq) - 1):
-            h = self._block_hash(seq, prompt, i, h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != (
-                self._hash_block_tokens(seq, i)
-            ):
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        if self.fast_prefix_walk:
+            hit_hashes, hit_ids = self._hit_walk(seq, prompt)
+            block_hashes += hit_hashes
+            compressed_hit = len(hit_hashes)
+            self._admission_walk = _AdmissionWalk(
+                ref(seq),
+                seq.num_tokens,
+                seq.cache_seed,
+                self.kv.index_version,
+                hit_hashes,
+                hit_ids,
+            )
+        else:
+            h = seq.cache_seed
+            compressed_hit = 0
+            for i in range(self._n_hash_blocks(seq) - 1):
+                h = self._block_hash(seq, prompt, i, h)
+                block_id = self.kv.lookup(h)
+                if block_id == -1 or self.kv.block(block_id).token_ids != (
+                    self._hash_block_tokens(seq, i)
+                ):
+                    break
+                block_hashes.append(h)
+                compressed_hit += 1
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -1146,9 +1190,12 @@ class BlockManager:
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
         num_new_blocks = self._n_hash_blocks(seq)
-        for i in range(num_cached_blocks):
-            if self.kv.is_used(self.kv.lookup(block_hashes[i])):
-                num_new_blocks -= 1
+        if self.fast_prefix_walk:
+            num_new_blocks -= self.kv.count_used(hit_ids[:num_cached_blocks])
+        else:
+            for i in range(num_cached_blocks):
+                if self.kv.is_used(self.kv.lookup(block_hashes[i])):
+                    num_new_blocks -= 1
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
@@ -1198,6 +1245,89 @@ class BlockManager:
         # place, because that is a policy decision and this is not.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
+        """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
+
+        The per-block walk at C speed: the cached prompt chain is resolved with
+        one `map` over the index's `dict.get`, and the hit ends at the first
+        `None`. Where the chain stops short (no frontend chain, or a preempted
+        seq's generated blocks) it is hashed ahead in rounds and resolved the
+        same way, so hashing stops within one round of the first miss.
+
+        Tokens are compared on the last hit block only, not on every block.
+        A hit block's contents cannot change while it stays indexed (`publish`
+        writes fresh blocks, `allocate` unindexes first), so a mismatch means a
+        64-bit chained-hash collision; vLLM does not compare at all. If that
+        one block does differ, every block is compared and the hit cut at the
+        first mismatch, as the per-block walk did. The miss block's hash is
+        left in the prompt chain, where `_remember_walk` reads it.
+        """
+        n = self._n_hash_blocks(seq) - 1
+        get = self.kv.index_get
+        hashes: list[int] = []
+        ids: list = []
+        hash_round = _WALK_HASH_ROUND_MIN
+        while len(hashes) < n:
+            k = len(hashes)
+            if k < len(prompt):
+                new = prompt[k:n]
+            else:
+                end = min(n, k + hash_round)
+                new = chained_block_hashes(
+                    seq.token_ids,
+                    self.hash_block_size,
+                    k,
+                    end,
+                    hashes[-1] if k else seq.cache_seed,
+                )
+                if k == len(prompt):
+                    # Prompt blocks only: those past it can still change.
+                    full = seq.num_prompt_tokens // self.hash_block_size
+                    prompt += new[: max(0, full - k)]
+                hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
+            new_ids = list(map(get, new))
+            try:
+                miss = new_ids.index(None)
+            except ValueError:
+                hashes += new
+                ids += new_ids
+                continue
+            hashes += new[:miss]
+            ids += new_ids[:miss]
+            break
+        last = len(ids) - 1
+        if last >= 0 and self.kv.block(ids[last]).token_ids != (
+            self._hash_block_tokens(seq, last)
+        ):
+            for i, block_id in enumerate(ids):
+                if self.kv.block(block_id).token_ids != self._hash_block_tokens(seq, i):
+                    del hashes[i:], ids[i:]
+                    break
+        return hashes, ids
+
+    def _take_admission_walk(self, seq: Sequence) -> _AdmissionWalk | None:
+        """The last `can_allocate` walk, if it was of `seq` and still holds.
+
+        Consumed whatever the answer. Holds while the KV index is at the
+        version the walk read; past that, while every hash still resolves to
+        the id the walk found (one `map`), which is all `allocate` takes from
+        it. A hit block cannot change contents while indexed, so its tokens
+        need no second look. `None` sends `allocate` down the per-block walk.
+        """
+        walk, self._admission_walk = self._admission_walk, None
+        if (
+            walk is None
+            or walk.seq() is not seq
+            or walk.num_tokens != seq.num_tokens
+            or walk.cache_seed != seq.cache_seed
+        ):
+            return None
+        if walk.index_version != self.kv.index_version and (
+            list(map(self.kv.index_get, walk.hashes)) != walk.ids
+        ):
+            return None
+        return walk
 
     def can_allocate_estimate(self, seq: Sequence) -> int:
         """`can_allocate(seq, record=False)` for the delayer, memoised per seq.
@@ -1378,8 +1508,20 @@ class BlockManager:
         )
         h = seq.cache_seed
         hit_hash = -1
+        # The ids the probe just found, claimed as one run; the loop below
+        # walks only what it did not cover (a joint tail past the HBM hit, or
+        # everything when the walk is missing or stale).
+        claimed = 0
+        walk = self._take_admission_walk(seq)
+        if walk is not None and (claimed := min(claim_blocks, len(walk.ids))):
+            ids = walk.ids[:claimed]
+            self.kv.claim_many(ids)
+            seq.block_table.extend(ids)
+            h = walk.hashes[claimed - 1]
+            if cached := min(claimed, num_cached_blocks):
+                hit_hash = walk.hashes[cached - 1]
         prompt = self._prompt_hashes(seq)
-        for i in range(claim_blocks):
+        for i in range(claimed, claim_blocks):
             h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:

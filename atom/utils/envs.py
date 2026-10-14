@@ -994,6 +994,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
         os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
     ),
+    # Admission's prefix-hit walk at C speed: look the whole prompt chain up
+    # with one `map`, compare tokens on the last hit block only (all blocks if
+    # that one differs), and let `allocate` claim the ids `can_allocate`
+    # found instead of walking the prompt again. "0" walks block by block with
+    # a token compare per block, the old behaviour.
+    "ATOM_PREFIX_FAST_WALK": lambda: (os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1"),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

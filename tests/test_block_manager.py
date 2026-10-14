@@ -6,6 +6,7 @@ import logging
 import pytest
 from conftest import MockConfig
 
+from atom.model_engine import block_manager as bm_module
 from atom.model_engine.block_manager import BlockManager
 
 # ── compute_hash ───────────────────────────────────────────────────────────
@@ -352,6 +353,7 @@ class TestPrefixCaching:
         bm.hash_blocks(s1, s1.num_tokens - s1.num_cached_tokens)
         bm.deallocate(s1)
 
+        # Blocks hashed, by the per-block hasher or the fast walk's bulk one.
         calls = []
         real = BlockManager.compute_hash
         monkeypatch.setattr(
@@ -359,6 +361,13 @@ class TestPrefixCaching:
             "compute_hash",
             classmethod(lambda cls, t, p=-1: calls.append(1) or real(t, p)),
         )
+        bulk = bm_module.chained_block_hashes
+
+        def bulk_spy(tokens, hbs, start, end, prev):
+            calls.extend([1] * (end - start))
+            return bulk(tokens, hbs, start, end, prev)
+
+        monkeypatch.setattr(bm_module, "chained_block_hashes", bulk_spy)
         s2 = seq_factory(list(range(1, 17)) + [90, 91, 92, 93])
         # The delayer's probe, the lookup-detach probe, its re-probe after the
         # tier answer, and admission's probe, then the claim.
