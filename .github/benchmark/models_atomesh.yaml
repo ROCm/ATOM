@@ -879,7 +879,12 @@ models:
             common_args:
               <<: *kimi_k3_agentic_hc_dspark3_args
               max_num_seqs: 144
-          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+          env:
+            <<: *kimi_k3_agentic_hc_dspark3_reuse_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
 
         - <<: *kimi_k3_agentic_hc_dspark3
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
