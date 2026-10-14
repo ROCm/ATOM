@@ -486,7 +486,15 @@ class Glm52MonoRunner:
                             prepare_glm5_weights(weights, AttentionWeight.FP8_PTPC),
                         )
                     )
-        except (MonoUnsupported, ValueError) as error:
+        # `Exception`, not (MonoUnsupported, ValueError): every one of these four
+        # blocks hands its verdict to `tp_uniform_local_validation`, which is
+        # COLLECTIVE. A failure the narrow tuple missed -- `torch.OutOfMemoryError`
+        # from the dense allocations in `prepare_glm5_weights`, realistically --
+        # left this rank before that collective while its peers blocked inside it,
+        # so the group hung instead of falling back together. Same shape
+        # `bind_agreed` uses. The original type survives: the helper reports each
+        # rank's failure as `f"{type(error).__name__}: {error}"`.
+        except Exception as error:  # noqa: BLE001 - collective below
             validation_error = error
         try:
             tp_uniform_local_validation(
@@ -526,7 +534,7 @@ class Glm52MonoRunner:
                                 layer_weights(layer, rank, npes, with_indexer=True),
                             )
                         )
-            except (MonoUnsupported, ValueError) as error:
+            except Exception as error:  # noqa: BLE001 - collective below
                 fused_validation_error = error
             try:
                 tp_uniform_local_validation(
@@ -602,7 +610,7 @@ class Glm52MonoRunner:
                 # what `forward` has to consume; recomputing it from
                 # `_fused_ops` later would silently paper over a disagreement.
                 fused_launches = fused_layer_count
-            except (MonoUnsupported, ValueError) as error:
+            except Exception as error:  # noqa: BLE001 - collective below
                 fused_build_error = error
             try:
                 tp_uniform_local_validation(
@@ -659,7 +667,7 @@ class Glm52MonoRunner:
                         self._runtimes[chunk_samples] = runtime
                     self._ops[key] = owned
                     made.append(key)
-        except (MonoUnsupported, ValueError) as error:
+        except Exception as error:  # noqa: BLE001 - collective below
             build_error = error
         # Agreed TP-uniformly, like the weight-mapping failures above: every
         # rank must reach this same collective before any rank may return, or
