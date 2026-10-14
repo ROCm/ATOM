@@ -898,7 +898,8 @@ models:
         # Non-disaggregated counterpart to the C72 cell above: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_agentic_agg
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
           topology: agg
           display_topology: AGG-TP8-DCP8
@@ -922,7 +923,7 @@ models:
             # that anchor also carries the mooncake half of the `multi`
             # connector, which has no peer to stream KV to here. What is left is
             # the same 192 GiB CPU tier behind a standalone offload connector.
-            decode:
+            decode: &kimi_k3_agentic_agg_decode_env
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               LMCACHE_CHUNK_SIZE: "1024"
@@ -939,6 +940,27 @@ models:
               ATOM_PREFILL_DELAYER_MAX_QUEUE_MS: "5000"
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"lmcache_offload","kv_role":"offload"}
+
+        # AGG counterpart to the DSpark3 C72 on-demand cell: keep the AGG
+        # scheduling settings and standalone offload connector, with the same
+        # draft, warmup, and 128 GiB KV + 96 GiB state CPU tier as 1P1D.
+        - <<: *kimi_k3_agentic_agg
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-dspark3-agentic-lmcache-1m-c72-on-demand
+          display_topology: AGG-TP8-DCP8-DSPARK3
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            decode:
+              <<: *kimi_k3_agentic_agg_decode_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
