@@ -854,7 +854,7 @@ models:
             # that anchor also carries the mooncake half of the `multi`
             # connector, which has no peer to stream KV to here. What is left is
             # the same 192 GiB CPU tier behind a standalone offload connector.
-            decode:
+            decode: &kimi_k3_agentic_agg_dcp8_decode_env
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
               LMCACHE_CHUNK_SIZE: "1024"
@@ -973,6 +973,23 @@ models:
           benchmark:
             <<: *kimi_k3_agentic_aiperf
             max_output_tokens: 1
+
+        # The TP8xDCP8 pure-prefill cell at the save bound PP8's stages get by
+        # default (2 per stage x 8 stages), so the PP8 comparison is at equal
+        # save concurrency.
+        - <<: *kimi_k3_agentic_agg_dcp8
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72-osl1-saves16
+          display_topology: AGG-TP8-DCP8-OSL1-SAVES16
+          benchmark:
+            <<: *kimi_k3_agentic_aiperf
+            max_output_tokens: 1
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: *kimi_k3_agentic_agg_dcp8_decode_env
+              OFFLOAD_MAX_PENDING_SAVES: "16"
 
         - <<: *kimi_k3_agentic_agg_pp8_cg
           name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1
