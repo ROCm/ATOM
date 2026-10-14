@@ -10,10 +10,10 @@ import numpy as np
 import pytest
 import torch
 
-from atom.plugin.vllm import deepseek_v41_bridge as bridge
-from atom.plugin.vllm.v41_core_overrides import VllmDeepseekV41MetadataBuilder
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+from atom.plugin.vllm import deepseek_v41_bridge as bridge
+from atom.plugin.vllm.v41_core_overrides import VllmDeepseekV41MetadataBuilder
 from atom.utils.h2d import PublicationError
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
@@ -58,12 +58,13 @@ def test_profile_full_builder_prepares_scratch_before_forward(
     monkeypatch, speculative_tokens, width
 ):
     """V2 calls the factory twice in mode NONE before ordinary FULL capture."""
-    from atom.plugin.vllm import req_id_passthrough_patch as passthrough
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import _mark_v4_proxy_cache_mode
-    from atom.model_ops.engram.device.staging import EngramStagedRows
-    from atom.utils.forward_context import get_forward_context
     from vllm.config import CUDAGraphMode
     from vllm.forward_context import override_forward_context
+
+    from atom.model_ops.engram.device.staging import EngramStagedRows
+    from atom.plugin.vllm import req_id_passthrough_patch as passthrough
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import _mark_v4_proxy_cache_mode
+    from atom.utils.forward_context import get_forward_context
 
     builder = _builder(speculative_tokens=speculative_tokens, max_tokens=24)
     builder.cache = None
@@ -161,17 +162,19 @@ def test_profile_full_builder_prepares_scratch_before_forward(
             staging.start.call_count,
         )
         context = SimpleNamespace(attn_metadata={layer: returned})
-        with override_forward_context(context):
-            with bridge.atom_deepseek_v41_forward_context(
+        with (
+            override_forward_context(context),
+            bridge.atom_deepseek_v41_forward_context(
                 atom_config=builder.config,
                 builder=builder,
                 input_ids=batch.input_ids,
                 positions=None,
                 vllm_config=config,
                 force_dummy=True,
-            ) as positions:
-                assert get_forward_context().attn_metadata is metadata
-                assert positions.data_ptr() == prepared.positions.data_ptr()
+            ) as positions,
+        ):
+            assert get_forward_context().attn_metadata is metadata
+            assert positions.data_ptr() == prepared.positions.data_ptr()
         assert before == (
             prepare_spy.call_count,
             inputs_spy.call_count,
@@ -242,7 +245,7 @@ def test_real_preparation_reuses_metadata_and_publishes_cursor_once(builder):
             builder.cache.cursor[step_snapshot.state_slots, 0].tolist()
             == step_snapshot.ends.tolist()
         )
-        for ratio, plan in metadata.step.plans.items():
+        for plan in metadata.step.plans.values():
             assert plan.compress_plan_gpu.shape[0] == 4
             assert (plan.compress_plan_gpu[plan.num_compress :, 2] == -1).all()
         assert builder.model_runner.h2d_owner._state == "sealed"
@@ -468,7 +471,7 @@ def test_outside_staging_is_not_repeated_by_forward_boundaries(builder, monkeypa
         "EngramStagedRows": EngramStagedRows,
         "get_forward_context": lambda: SimpleNamespace(attn_metadata=prepared.metadata),
     }
-    exec(
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"),
         namespace,
     )

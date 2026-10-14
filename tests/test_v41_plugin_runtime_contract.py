@@ -31,7 +31,7 @@ def scratch_allocator():
         return SimpleNamespace(num_pages=pages, num_slots=slots, max_tokens=max_tokens)
 
     scope = {"PagedAttentionCache": Mock(side_effect=allocate)}
-    exec(
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=[method], type_ignores=[]), str(OVERRIDES), "exec"),
         scope,
     )
@@ -119,7 +119,7 @@ def _functions(*names, **namespace):
     ]
     assert {node.name for node in functions} == set(names)
     scope = {"np": np, "SimpleNamespace": SimpleNamespace, **namespace}
-    exec(
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=functions, type_ignores=[]), str(BRIDGE), "exec"), scope
     )
     return SimpleNamespace(**{name: scope[name] for name in names})
@@ -256,7 +256,7 @@ def test_proxy_factory_stages_unbound_profiling_full_only(
         "bind_deepseek_v41_proxy_cache": lambda *_: bound,
         "_v41_stage_outside_forward": stage,
     }
-    exec(
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
         compile(ast.Module(body=[method], type_ignores=[]), str(BRIDGE), "exec"), scope
     )
     common = SimpleNamespace()

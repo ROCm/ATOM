@@ -1055,11 +1055,12 @@ def make_deepseek_v41_metadata_builder(atom_config, vllm_config, device):
     ``prepare_batch_step`` takes the dtype of its request-start array from it;
     int64 matches what native ATOM allocates.
     """
+    from vllm.config import CUDAGraphMode
+
     from atom.plugin.vllm.v41_core_overrides import (
         VllmDeepseekV41MetadataBuilder,
     )
     from atom.utils import CpuGpuBuffer
-    from vllm.config import CUDAGraphMode
 
     max_num_batched_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
     runner = SimpleNamespace(

@@ -39,7 +39,6 @@ from atom.plugin.vllm.v41_core_overrides import (
 from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import metadata_buffers
 
-
 _CAPACITY = 4
 _HEAD_DIM = 512
 # Neither batch indices nor STATE slots equal PAGE ids. PAGE 0 and PAGE 5
@@ -366,6 +365,9 @@ def test_profile_to_serving_full_graph_rebinds_real_engram_and_cache(
 ):
     """True plugin/kernel/graph integration; only V2 orchestration is synthetic."""
     pytest.importorskip("vllm", reason="requires vLLM plugin runtime")
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import override_forward_context
+
     from atom.model_ops.engram.device.hashing import (
         engram_cursor_rows_reference,
         engram_row_indices_reference,
@@ -377,8 +379,6 @@ def test_profile_to_serving_full_graph_rebinds_real_engram_and_cache(
     from atom.utils.forward_context import get_forward_context
     from tests.model_ops.engram.test_hash_bounds import build, tiny_config
     from tests.model_ops.engram.test_overlap import make_staging
-    from vllm.config import CUDAGraphMode
-    from vllm.forward_context import override_forward_context
 
     mapping = build(tiny_config())
     total = _CAPACITY * width
@@ -530,30 +530,32 @@ def test_profile_to_serving_full_graph_rebinds_real_engram_and_cache(
             staging_storage = staging_pointers()
 
             def forward(common):
-                with override_forward_context(
-                    SimpleNamespace(attn_metadata={layer: common})
-                ):
-                    with bridge.atom_deepseek_v41_forward_context(
+                with (
+                    override_forward_context(
+                        SimpleNamespace(attn_metadata={layer: common})
+                    ),
+                    bridge.atom_deepseek_v41_forward_context(
                         atom_config=builder.config,
                         builder=builder,
                         input_ids=batch.input_ids,
                         positions=None,
                         vllm_config=config,
+                    ),
+                ):
+                    metadata = get_forward_context().attn_metadata
+                    assert metadata is common.atom_v41_prepared.metadata
+                    assert metadata.staged_outside_forward
+                    for lid, buffer in output.items():
+                        buffer.copy_(metadata.engram_embeddings.get(lid)[0])
+                    for observed, pointer in zip(
+                        observed_indptrs, metadata.step.indptrs[ratio][:2]
                     ):
-                        metadata = get_forward_context().attn_metadata
-                        assert metadata is common.atom_v41_prepared.metadata
-                        assert metadata.staged_outside_forward
-                        for lid in output:
-                            output[lid].copy_(metadata.engram_embeddings.get(lid)[0])
-                        for observed, pointer in zip(
-                            observed_indptrs, metadata.step.indptrs[ratio][:2]
-                        ):
-                            observed.copy_(pointer)
-                        # Profiling deliberately has builder.cache=None. The prepared
-                        # cache is the production consumer's authority in both phases.
-                        return metadata.cache.compress(
-                            0, compressor, values, scores, metadata.step, rope
-                        )
+                        observed.copy_(pointer)
+                    # Profiling deliberately has builder.cache=None. The prepared
+                    # cache is the production consumer's authority in both phases.
+                    return metadata.cache.compress(
+                        0, compressor, values, scores, metadata.step, rope
+                    )
 
             _mark_v4_proxy_cache_mode(sfc, True)
             scratch = builder._capture_dummy_cache(1, _CAPACITY, total)
