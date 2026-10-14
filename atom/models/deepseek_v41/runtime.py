@@ -19,12 +19,12 @@ from .bounded_replay import (
     build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
-    dp_token_counts,
     dp_stage_sync_enabled,
-    sync_dp_stage_tokens,
+    dp_token_counts,
     late_layer_start,
     replayable,
     rows_of,
+    sync_dp_stage_tokens,
 )
 from .config import validate_tbo_parallelism
 from .model import Block
