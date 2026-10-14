@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -57,13 +58,16 @@ EVAL_TOPOLOGY_RE = re.compile(
 
 
 def number(*values: Any) -> float | None:
+    """Return the first finite measurement, preserving an explicit zero."""
     for value in values:
         if value is None or value == "":
             continue
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             continue
+        if math.isfinite(parsed):
+            return parsed
     return None
 
 
@@ -101,12 +105,13 @@ def slurm_job_env(path: Path) -> dict[str, str]:
 def metric_entry(
     name: str, unit: str, value: float | None, extra: str | None
 ) -> dict[str, Any] | None:
-    if value is None:
+    measured = number(value)
+    if measured is None:
         return None
     return {
         "name": name,
         "unit": unit,
-        "value": round(float(value), 4),
+        "value": round(measured, 4),
         **({"extra": extra} if extra else {}),
     }
 
