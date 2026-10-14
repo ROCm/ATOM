@@ -326,7 +326,11 @@ def receive_weight_stream(
     began = False
     any_began = False
     ended = False
-    voted = False
+    # Set by the vote that is every rank's last -- at a frame some rank cannot
+    # take, or at the end marker -- and by no other. A frame vote all ranks
+    # pass leaves it unset, so a failure in the broadcasts after it still
+    # leaves the group and votes.
+    decided = False
     vote_failed = False
 
     def decide(ballot: int) -> tuple[int, bool]:
@@ -409,7 +413,7 @@ def receive_weight_stream(
                     reason = str(exc)
             outcome, any_began = decide(_RECEIVING if reason is None else _BROKEN_OFF)
             if outcome != _RECEIVING:
-                voted = True
+                decided = True
                 raise RDMAStreamOutOfStep(
                     f"RDMA weight frame cannot be received: {frame} "
                     f"({reason or 'not by every rank taking the stream'})"
@@ -454,7 +458,7 @@ def receive_weight_stream(
             except Exception as exc:  # noqa: BLE001 - voted on, then raised
                 failure = exc
         outcome, any_began = decide(_PREPARED if failure is None else _BROKEN_OFF)
-        voted = True
+        decided = True
         if failure is None and outcome != _PREPARED:
             failure = RuntimeError(
                 f"RDMA weight stream v{expected_version} not committed: another "
@@ -472,7 +476,7 @@ def receive_weight_stream(
 
         manifest = runner.finish_weight_commit(expected_version)
     except Exception as exc:
-        if not voted:
+        if not decided:
             # Broken off between votes, in a broadcast a peer may still be in.
             # That peer is released only once this rank's end is gone, so it
             # goes first: voting first would wait for the peer until the group
