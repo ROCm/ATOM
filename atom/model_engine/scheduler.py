@@ -1347,13 +1347,16 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        # Register every logical P request, including those behind a capacity
+        # blocked head. Workers must not expire their D metadata as orphaned.
+        admission_ready = getattr(self.kv_connector, "admission_ready", None)
+        if callable(admission_ready) and self._unschedulable_reason(seq) is None:
+            admission_ready(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
-            self.metrics.enqueue(seq)
-            self._warn_if_unschedulable(seq)
-        self.waiting.extend(seqs)
+            self.add(seq)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1977,6 +1980,13 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
+            admission_ready = getattr(self.kv_connector, "admission_ready", None)
+            if callable(admission_ready) and not admission_ready(seq):
+                # D may reserve a later request first. Unready P requests own no
+                # source blocks and must not block those that already have D space.
+                skipped_waiting_requests.append(seq)
+                continue
+
             remote_ready_for_decode = self._resolve_waiting_remote_kv(
                 seq, skipped_waiting_requests
             )
@@ -2090,9 +2100,6 @@ class Scheduler:
                 reuse_hashes=self._local_prefill_coalescing,
             )
             if num_cached_blocks < 0:
-                callback = getattr(self.kv_connector, "admission_blocked", None)
-                if callable(callback):
-                    callback(seq)
                 self.waiting.appendleft(seq)
                 break
 
@@ -2695,8 +2702,8 @@ class Scheduler:
         the transfer was writing, which re-admission cannot allocate over. The
         connector reports a failure only once no producer write can still land
         in those blocks (``ATOM_PD_FAILED_WRITE_HOLD_S``), so they are freed at
-        once. Opt-in chunked receives retain their admission-reclaim fallback;
-        offload load failures (``failed_loading``) also resume local prefill.
+        once. Chunked receives fall back to local prefill after the same write
+        hold; offload load failures (``failed_loading``) also resume local prefill.
         """
         seq = next(
             (
@@ -2715,8 +2722,8 @@ class Scheduler:
             )
             return
         if (seq.kv_transfer_params or {}).get("chunked_transfer"):
-            # Chunked admission can deliberately retire an unclaimed source.
-            # Keep its local-prefill fallback, after the connector's write hold.
+            # Admission ordering avoids capacity cycles, but transfers can still
+            # fail. Preserve local recovery after the connector's write hold.
             self.failed_recving_kv_req_ids.append(seq.id)
             return
         logger.error("KV receive failed for request %s; aborting it", req_id)

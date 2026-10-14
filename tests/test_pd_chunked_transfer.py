@@ -76,7 +76,8 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
     c._completed_prefills_lock = threading.Lock()
     c._completed_prefills_cv = threading.Condition(c._completed_prefills_lock)
     c._chunked_prefills = {}
-    c._reclaim_results = set()
+    c._admission_results = set()
+    c._chunked_admissions = {}
     c._swa_block_regions = []
     c._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
     c._chunked_local_ids = {}
@@ -124,6 +125,7 @@ def producer(pp_rank=0, pp_size=1, num_tokens=10):
         "write_nonce": 3,
         "dst_block_ids": [2, 9, 4],
         "consumer_tp_size": 1,
+        "consumer_tp_rank": 0,
         "consumer_base_addrs": [ctypes.addressof(buf) for buf in dst],
         "consumer_num_layers": pp_size,
     }
@@ -261,6 +263,7 @@ def test_bad_prompt_or_block_geometry_fails_before_writing():
 
 def consumer(expected=2):
     c = mc.MooncakeConnector.__new__(mc.MooncakeConnector)
+    c.pp_size = 1
     c._completion_lock = threading.Lock()
     c._pending_recv_acks = {}
     c._pending_recv_stall_watch = {}
@@ -417,7 +420,7 @@ def test_tp_failure_or_metadata_disagreement_discards_partial_handoff(bad_metada
     assert not agg._received_handoffs
 
 
-def scheduler_connector(monkeypatch, is_producer, pp_size=1):
+def scheduler_connector(monkeypatch, is_producer, pp_size=1, dcp_size=1):
     monkeypatch.setattr(mc, "get_ip", lambda: "127.0.0.1")
     monkeypatch.setattr(mc, "get_open_port", lambda: 6400)
     return mc.MooncakeConnectorScheduler(
@@ -430,7 +433,7 @@ def scheduler_connector(monkeypatch, is_producer, pp_size=1):
             pipeline_parallel_size=pp_size,
             parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_rank=0),
             kv_cache_block_size=4,
-            decode_context_parallel_size=1,
+            decode_context_parallel_size=dcp_size,
         )
     )
 
@@ -458,6 +461,14 @@ def test_real_scheduler_pins_from_first_chunk_through_final_handoff(
         },
     )
     sched.add(seq)
+    assert not connector.admission_ready(seq)
+    connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_admission_ready", seq.id, True)
+            }
+        )
+    )
     batches = []
     for _ in range(3):
         batch, seqs = sched.schedule()
@@ -939,9 +950,8 @@ def test_idle_write_listener_expires_unadmitted_chunk_request(monkeypatch):
         p._send_executor = pool
         with pytest.raises(StopListener):
             p._write_listener()
-    p._notify_transfer_result.assert_called_once_with(
-        dict(request, _deadline=mc.PD_TRANSFER_DEADLINE_S), success=False
-    )
+    p._notify_transfer_result.assert_called_once_with(request, success=False)
+    assert request["transfer_id"] in p._retired_chunked_transfers
     assert not p._pending_chunked_requests
 
 
@@ -965,6 +975,14 @@ def test_scheduler_abort_keeps_source_until_readers_and_tp_pp_drain(
         },
     )
     sched.add(seq)
+    assert not connector.admission_ready(seq)
+    connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_admission_ready", seq.id, True)
+            }
+        )
+    )
     batch, seqs = sched.schedule()
     worker, _, request, _, _ = producer()
     worker._chunked_prefills.clear()
@@ -1109,151 +1127,6 @@ def test_handoff_cache_hits_reach_final_chat_response(
     )
 
 
-def test_opposite_admission_order_with_exhausted_kv_pools(monkeypatch, seq_factory):
-    from conftest import MockConfig
-
-    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
-    from atom.sampling_params import SamplingParams
-
-    p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=10))
-    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=10))
-    p.kv_connector = scheduler_connector(monkeypatch, True)
-    d.kv_connector = scheduler_connector(monkeypatch, False)
-
-    def request(name, is_producer):
-        return seq_factory(
-            list(range(10)),
-            sampling_params=SamplingParams(max_tokens=1 if is_producer else 2),
-            kv_transfer_params={
-                "chunked_transfer": True,
-                "do_remote_decode" if is_producer else "do_remote_prefill": True,
-                "transfer_id": name,
-                "block_size": 4,
-                "dcp_size": 1,
-            },
-        )
-
-    pa, pb = request("xfer-a", True), request("xfer-b", True)
-    da, db = request("xfer-a", False), request("xfer-b", False)
-    for seq in (pa, pb):
-        p.add(seq)
-    for seq in (db, da):
-        d.add(seq)
-    pbatch, pseqs = p.schedule()
-    _, dseqs = d.schedule()
-    assert list(pseqs) == [pa.id] and not dseqs
-    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 0
-    assert not pb.block_table and not da.block_table
-
-    worker, _, wire, _, _ = producer()
-    worker._chunked_prefills.clear()
-    worker._chunked_local_ids.clear()
-    worker._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
-    worker.start_load_kv(pbatch.connector_meta_output)
-    wire_b = dict(wire, request_id=db.id, transfer_id="xfer-b")
-    # D's B reservation has already asked P for a transfer, but P only has A.
-    worker._pending_chunked_requests.append((wire_b, mc.time.monotonic()))
-    worker._dispatch_ready_chunked_requests()
-    assert len(worker._pending_chunked_requests) == 1
-    publish(worker._chunked_prefills["xfer-a"], 10)
-    p.postprocess(
-        list(pseqs.values()),
-        ScheduledBatchOutput([pa.id], [(42,)], None, None, None),
-        batch=pbatch,
-    )
-    worker.start_load_kv(p.kv_connector.build_connector_meta())
-    # P cannot allocate B. Even a snapshot containing ONLY the capacity signal
-    # must count as work, or the idle engine will never dispatch it.
-    now = [mc.time.monotonic()]
-    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
-    pressure, seqs = p.schedule()
-    assert not seqs and not pressure.connector_meta_output.has_work()
-    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
-    pressure, seqs = p.schedule()
-    assert not seqs and pressure.connector_meta_output.has_work()
-    assert pressure.connector_meta_output.reclaim_unclaimed_prefills
-    assert not pressure.connector_meta_output.reqs_to_save
-    worker.start_load_kv(pressure.connector_meta_output)
-    p._update_from_kv_xfer_finished(worker.get_finished())
-    assert not pa.block_table and p.block_manager.kv.num_free == 3
-
-    # P can now finish B, well before the 60-second transfer timeout.
-    pbatch, pseqs = p.schedule()
-    assert list(pseqs) == [pb.id]
-    worker.start_load_kv(pbatch.connector_meta_output)
-    state_b = worker._chunked_prefills["xfer-b"]
-    wire_b["prompt_digest"] = state_b.prompt_digest
-    p.postprocess(
-        list(pseqs.values()),
-        ScheduledBatchOutput([pb.id], [(42,)], None, None, None),
-        batch=pbatch,
-    )
-    worker.start_load_kv(p.kv_connector.build_connector_meta())
-    publish(state_b, 10)
-    worker._dispatch_ready_chunked_requests()
-    worker._notify_transfer_result.assert_called_once_with(wire_b, success=True)
-    p._update_from_kv_xfer_finished(worker.get_finished())
-    assert not pb.block_table
-    d._update_from_kv_xfer_finished(
-        KVConnectorOutput(
-            finished_recving={db.id},
-            received_handoffs={
-                db.id: PrefillHandoff.from_wire(db.id, wire_b["prefill_handoff"])
-            },
-        )
-    )
-    dbatch, dseqs = d.schedule()
-    assert list(dseqs) == [db.id]
-    assert d.postprocess(
-        list(dseqs.values()),
-        ScheduledBatchOutput([db.id], [(43,)], None, None, None),
-        batch=dbatch,
-    ) == [db]
-
-    # D's late A admission gets an immediate failure for the retired source,
-    # then completes by the existing local-prefill fallback using the same pool.
-    _, seqs = d.schedule()
-    assert not seqs and da.block_table
-    wire_a = dict(wire, request_id=da.id)
-    worker._pending_chunked_requests.append((wire_a, mc.time.monotonic()))
-    worker._dispatch_ready_chunked_requests()
-    worker._notify_transfer_result.assert_called_with(wire_a, success=False)
-    assert not worker._pending_chunked_requests
-    d._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={da.id}))
-    dbatch, dseqs = d.schedule()
-    assert list(dseqs) == [da.id] and dbatch.total_seqs_num_prefill == 1
-    d.postprocess(
-        list(dseqs.values()),
-        ScheduledBatchOutput([da.id], [(44,)], None, None, None),
-        batch=dbatch,
-    )
-    dbatch, dseqs = d.schedule()
-    assert d.postprocess(
-        list(dseqs.values()),
-        ScheduledBatchOutput([da.id], [(45,)], None, None, None),
-        batch=dbatch,
-    ) == [da]
-    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 3
-    assert not p.deferred_free_blocks and not d.deferred_free_blocks
-
-
-@pytest.mark.parametrize("reader_done", [False, True])
-def test_capacity_reclaim_preserves_active_and_partially_served_sources(reader_done):
-    worker, state, _, _, _ = producer()
-    publish(state, 10)
-    state.finish({"first_token_id": 42})
-    assert state.acquire(("first-consumer",), 2)
-    if reader_done:
-        state.release()
-    pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
-    worker.start_load_kv(pressure)
-    assert not state.cancelled and not state.source_safe()
-    assert worker.get_finished().connector_completions == {
-        ConnectorCompletion("pd_reclaim_done", 7, False)
-    }
-
-
 def test_late_metadata_cannot_resurrect_retired_source():
     worker, state, wire, _, _ = producer()
     state.cancel()
@@ -1276,7 +1149,7 @@ def test_late_metadata_cannot_resurrect_retired_source():
     assert worker.transfer_engine.writes.empty()
 
 
-def test_capacity_signal_survives_composite_metadata(monkeypatch, seq_factory):
+def test_admission_signal_survives_composite_metadata(monkeypatch, seq_factory):
     from atom.kv_transfer.disaggregation.multi.multi_connector import (
         MultiConnectorScheduler,
     )
@@ -1290,31 +1163,20 @@ def test_capacity_signal_survives_composite_metadata(monkeypatch, seq_factory):
             "transfer_id": "xfer-a",
         },
     )
-    seq.block_table = [1, 2, 3]
-    connector.update_state_after_alloc(seq)
-    connector.build_connector_meta()
     multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
     multi._connectors = [connector]
-    seq.output_tokens = [42]
-    connector.request_finished(seq)
-    connector.build_connector_meta()
-    now = [mc.time.monotonic()]
-    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
-    multi.admission_blocked(seq)
-    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
-    multi.admission_blocked(seq)
+    assert not multi.admission_ready(seq)
     meta = multi.build_connector_meta()
-    assert meta.has_work() and meta.metas[0].reclaim_unclaimed_prefills
+    assert meta.has_work() and meta.metas[0].chunked_admissions == {seq.id: "xfer-a"}
     assert not multi.build_connector_meta().has_work()
-
-
-def test_capacity_reclaim_waits_for_final_prefill():
-    worker, state, _, _, _ = producer()
-    publish(state, 4)
-    pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
-    worker.start_load_kv(pressure)
-    assert not state.cancelled and not state.source_safe()
+    multi.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_admission_ready", seq.id, True)
+            }
+        )
+    )
+    assert multi.admission_ready(seq)
 
 
 def test_terminal_transfer_history_is_bounded_without_retaining_sources(monkeypatch):
@@ -1378,127 +1240,546 @@ def test_idle_dispatch_remains_opt_in(
     assert core.pp_transport.send_metadata.call_count == int(dispatches and pp_size > 1)
 
 
-def test_reclaim_is_gated_ordered_and_waits_for_tp_pp_ack(monkeypatch, seq_factory):
-    now = [100.0]
-    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
-    connector = scheduler_connector(monkeypatch, True)
-    sources = []
-    for transfer_id in ("oldest", "next", "newest"):
-        seq = seq_factory(
-            list(range(10)),
-            kv_transfer_params={
-                "chunked_transfer": True,
-                "transfer_id": transfer_id,
-                "do_remote_decode": True,
-            },
-        )
-        seq.block_table = [1, 2, 3]
-        connector.update_state_after_alloc(seq)
-        seq.output_tokens = [42]
-        connector.request_finished(seq)
-        sources.append(seq)
-    connector.build_connector_meta()
-    head = seq_factory(list(range(10)))
-    connector.admission_blocked(head)
-    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS / 2
-    connector.admission_blocked(head)
-    assert not connector.build_connector_meta().has_work()
-    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS / 2
-    connector.admission_blocked(head)
-    meta = connector.build_connector_meta()
-    assert meta.reclaim_unclaimed_prefills == {sources[0].id: "oldest"}
-    assert meta.has_work()
-    now[0] += 5
-    connector.admission_blocked(head)
-    assert not connector.build_connector_meta().has_work()
+def idle_producer(pp_rank=0, pp_size=1):
+    worker, _, request, src, dst = producer(pp_rank, pp_size)
+    worker._chunked_prefills.clear()
+    worker._chunked_local_ids.clear()
+    return worker, request, src, dst
 
-    # A reader raced the oldest candidate. Only the complete TP/PP rejection
-    # permits trying the next source; partial reports cannot authorize it.
-    tp = [KVOutputAggregator(2), KVOutputAggregator(2)]
-    pp = PPKVAggregator(2)
-    done = KVConnectorOutput(
-        connector_completions={
-            ConnectorCompletion("pd_reclaim_done", sources[0].id, False)
-        }
+
+def decode_worker(dst):
+    worker, _, _, _, _ = producer()
+    worker.__dict__.update(consumer(1).__dict__)
+    worker._pending_recv_expected.clear()
+    worker._pending_recv_nonce.clear()
+    worker._pending_recv.clear()
+    worker._pending_recv_blocks.clear()
+    worker._pending_handoffs.clear()
+    worker._chunked_prefills.clear()
+    worker._chunked_local_ids.clear()
+    worker.is_producer = False
+    worker.tp_rank = worker.dp_rank = worker.dcp_rank = 0
+    worker.dcp_interleave_size = 1
+    worker.local_ip = "cpu"
+    worker.rpc_port = 1
+    worker.ib_device = None
+    worker._notification_port = 2
+    worker._has_slot_regions = False
+    worker._block_regions = [(ctypes.addressof(dst), 4)]
+    worker.kv_caches_base_addr = [ctypes.addressof(dst)]
+    worker._send_on_socket = MagicMock()
+    return worker
+
+
+def pd_sequence(seq_factory, transfer_id="xfer-a", producer=True):
+    from atom.sampling_params import SamplingParams
+
+    return seq_factory(
+        list(range(10)),
+        sampling_params=SamplingParams(max_tokens=1 if producer else 2),
+        kv_transfer_params={
+            "chunked_transfer": True,
+            "do_remote_decode" if producer else "do_remote_prefill": True,
+            "transfer_id": transfer_id,
+            "block_size": 4,
+            "dcp_size": 1,
+            "remote_host": "cpu",
+            "remote_handshake_port": 6301,
+            "remote_tp_size": 1,
+        },
     )
-    for rank in range(2):
-        assert tp[rank].aggregate([done, KVConnectorOutput()]).is_empty()
-        out = pp.ingest(rank, tp[rank].aggregate([KVConnectorOutput(), done]))
-        connector.process_pd_completions(out)
-        connector.admission_blocked(head)
-        assert not connector.build_connector_meta().has_work()
-    now[0] += mc.CHUNKED_RECLAIM_STALL_SECONDS
-    connector.admission_blocked(head)
-    assert connector.build_connector_meta().reclaim_unclaimed_prefills == {
-        sources[1].id: "next"
-    }
 
-    # A successful cancellation acknowledgement alone does not release HBM.
+
+def test_opposite_admission_order_progresses_without_recompute(
+    monkeypatch, seq_factory
+):
+    import msgpack
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+
+    p = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
+    d = Scheduler(MockConfig(num_kvcache_blocks=3, max_num_batched_tokens=4))
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    d.kv_connector = scheduler_connector(monkeypatch, False)
+    pa, pb = [pd_sequence(seq_factory, name) for name in ("xfer-a", "xfer-b")]
+    da, db = [pd_sequence(seq_factory, name, False) for name in ("xfer-a", "xfer-b")]
+    p.extend([pa, pb])
+    d.extend([db, da])
+    pw, _, _src, destinations = idle_producer()
+    dw = decode_worker(destinations[0])
+
+    def receive(_addr, message):
+        assert message[0] == mc.MSG_WRITE_REQUEST
+        dispatch(pw, msgpack.loads(message[1]))
+
+    def complete(data, success):
+        assert success, "capacity must not cause transfer failure or D recomputation"
+        dw._record_write_done(
+            data["request_id"],
+            0,
+            0,
+            data["write_nonce"],
+            handoff=data["prefill_handoff"],
+        )
+
+    dw._send_on_socket.side_effect = receive
+    pw._notify_transfer_result.side_effect = complete
+    pw._ack_write_request = MagicMock(
+        side_effect=lambda data: dw._record_write_ack(
+            {
+                "request_id": data["request_id"],
+                "write_nonce": data["write_nonce"],
+                "pp_rank": 0,
+                "tp_rank": 0,
+                "write_window_s": mc._write_window_s(),
+            }
+        )
+    )
+    batch, seqs = p.schedule()
+    assert not seqs and not pa.block_table and not pb.block_table
+    assert p.block_manager.kv.num_free == 3
+    pw.start_load_kv(batch.connector_meta_output)
+    assert pw.get_finished().is_empty()
+
+    for ps, ds in ((pb, db), (pa, da)):
+        batch, seqs = d.schedule()
+        assert not seqs
+        # A 4-token batch budget still reserves all 10 prompt tokens on D.
+        assert len(ds.block_table) == 3 and d.block_manager.kv.num_free == 0
+        dw.start_load_kv(batch.connector_meta_output)
+        p._update_from_kv_xfer_finished(pw.get_finished())
+        batch, seqs = p.schedule()
+        assert list(seqs) == [ps.id]
+        assert batch.context_lens.tolist() == [4]
+        pw.start_load_kv(batch.connector_meta_output)
+        state = pw._chunked_prefills[ps.kv_transfer_params["transfer_id"]]
+        # Only real completed forwards publish pages. Source stays pinned.
+        with ThreadPoolExecutor(1) as pool:
+            pw._send_executor = pool
+            for end in (4, 8, 10):
+                assert ps.block_table and ds.block_table
+                publish(state, end)
+                pw._dispatch_ready_chunked_requests()
+                assert pw.transfer_engine.writes.get(timeout=5)[2] == [4]
+                p.postprocess(
+                    list(seqs.values()),
+                    ScheduledBatchOutput([ps.id], [(42,)], None, None, None),
+                    batch=batch,
+                )
+                pw.start_load_kv(p.kv_connector.build_connector_meta())
+                if end != 10:
+                    batch, seqs = p.schedule()
+                    assert batch.context_lens.tolist() == [min(end + 4, 10)]
+        pw._send_executor = SimpleNamespace(submit=lambda fn, *a, **kw: fn(*a, **kw))
+        p._update_from_kv_xfer_finished(pw.get_finished())
+        assert not ps.block_table and p.block_manager.kv.num_free == 3
+        d._update_from_kv_xfer_finished(dw.get_finished())
+        batch, seqs = d.schedule()
+        assert list(seqs) == [ds.id]
+        assert batch.total_seqs_num_decode == 1 and batch.total_seqs_num_prefill == 0
+        assert d.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput([ds.id], [(43,)], None, None, None),
+            batch=batch,
+        ) == [ds]
+    assert p.block_manager.kv.num_free == d.block_manager.kv.num_free == 3
+    assert not p.deferred_free_blocks and not d.deferred_free_blocks
+    assert not pw._pending_chunked_requests and not pw._chunked_local_ids
+    assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
+    assert pw._notify_transfer_result.call_count == 2
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_admission_requires_all_tp_dcp_and_pp_ranks(monkeypatch, seq_factory, early):
+    connector = scheduler_connector(monkeypatch, True, 2)
+    seq = pd_sequence(seq_factory)
+    assert not connector.admission_ready(seq)
+    registration = connector.build_connector_meta()
+    tp = [KVOutputAggregator(2) for _ in range(2)]
+    pp = PPKVAggregator(2)
+    workers = []
+    for stage in range(2):
+        row = []
+        for rank in range(2):
+            worker, request, _, _ = idle_producer(stage, 2)
+            worker.tp_size, worker.tp_rank = 2, rank
+            request.update(consumer_tp_size=4, consumer_tp_rank=rank)
+            if not early:
+                worker.start_load_kv(registration)
+            dispatch(worker, request)
+            dispatch(worker, request.copy())  # Duplicates cannot fill another rank.
+            if early:
+                worker.start_load_kv(registration)
+            assert worker.get_finished().is_empty()
+            worker.start_load_kv(registration)  # Repeated scheduler snapshot.
+            row.append((worker, request))
+        workers.append(row)
+    for stage in range(2):
+        for rank in range(2):
+            worker, request = workers[stage][rank]
+            dispatch(
+                worker,
+                dict(
+                    request,
+                    consumer_tp_rank=rank + 2,
+                    notify_port=rank + 10,
+                    write_nonce=100 + rank,
+                ),
+            )
+            out = worker.get_finished()
+            assert out.connector_completions == {
+                ConnectorCompletion("pd_admission_ready", seq.id, True)
+            }
+            outputs = [KVConnectorOutput(), KVConnectorOutput()]
+            outputs[rank] = out
+            connector.process_pd_completions(
+                pp.ingest(stage, tp[stage].aggregate(outputs))
+            )
+            assert connector.admission_ready(seq) is (stage == 1 and rank == 1)
+            assert worker.get_finished().is_empty()
+            assert not worker._chunked_prefills  # Readiness itself allocates nothing.
+
+
+def test_capacity_wait_does_not_expire_ready_or_queued_requests(
+    monkeypatch, seq_factory
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    p = Scheduler(MockConfig(num_kvcache_blocks=3))
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    occupied = seq_factory(list(range(10)))
+    assert p.block_manager.allocate(occupied)
+    seqs = [pd_sequence(seq_factory, f"wait-{i}") for i in range(3)]
+    p.extend(seqs)
+    worker, request, _src, _dst = idle_producer()
+    worker._ack_write_request = MagicMock()
+    # Registration includes requests behind a blocked, ready head.
+    batch, scheduled = p.schedule()
+    worker.start_load_kv(batch.connector_meta_output)
+    for seq in seqs:
+        dispatch(
+            worker,
+            dict(
+                request,
+                transfer_id=seq.kv_transfer_params["transfer_id"],
+                write_ack=True,
+            ),
+        )
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    now = mc.time.monotonic()
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now + 1000)
+    for _ in range(2):
+        batch, scheduled = p.schedule()
+        assert not scheduled and not batch.connector_meta_output.has_work()
+        assert worker.get_finished().is_empty()
+    worker._ack_write_request.assert_not_called()
+    worker._notify_transfer_result.assert_not_called()
+    assert len(worker._pending_chunked_requests) == 3
+    assert all(not seq.block_table for seq in seqs)
+    p.block_manager.deallocate(occupied)
+    batch, scheduled = p.schedule()
+    assert list(scheduled) == [seqs[0].id]
+    worker.start_load_kv(batch.connector_meta_output)
+    state = worker._chunked_prefills[seqs[0].kv_transfer_params["transfer_id"]]
+    publish(state, 10)
+    state.finish({"first_token_id": 42})
+    worker._pending_chunked_requests[0][0]["prompt_digest"] = state.prompt_digest
+    worker._dispatch_ready_chunked_requests()
+    worker._ack_write_request.assert_called_once()
+    assert (
+        worker._ack_write_request.call_args.args[0]["_deadline"]
+        == now + 1000 + mc.PD_TRANSFER_DEADLINE_S
+    )
+    assert len(worker._pending_chunked_requests) == 2
+
+
+@pytest.mark.parametrize("ready_before_cancel", [False, True])
+def test_waiting_cancel_and_late_ready_do_not_resurrect_request(
+    monkeypatch, seq_factory, ready_before_cancel
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+
+    p = Scheduler(MockConfig())
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    seq = pd_sequence(seq_factory)
+    p.add(seq)
+    batch, scheduled = p.schedule()
+    worker, request, _src, _dst = idle_producer()
+    worker.start_load_kv(batch.connector_meta_output)
+    if ready_before_cancel:
+        dispatch(worker, request)
+    report = worker.get_finished()
+    assert p.abort_request(seq.id)
+    assert not seq.block_table and not p.deferred_free_blocks
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    p._update_from_kv_xfer_finished(report)
+    dispatch(worker, request.copy())
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert not p.kv_connector._chunked_waiting and not p.kv_connector._chunked_ready
+    assert not worker._chunked_admissions and not worker._chunked_local_ids
+    assert not worker._chunked_prefills and not worker._pending_chunked_requests
+    assert worker.transfer_engine.writes.empty()
+    # A fresh scheduler ID with the same retired transfer ID is rejected.
+    reused = pd_sequence(seq_factory)
+    p.add(reused)
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert reused.status == SequenceStatus.ABORTED
+    _, scheduled = p.schedule()
+    assert not scheduled and not reused.block_table
+
+
+def test_reusing_live_transfer_id_cannot_cancel_original(monkeypatch, seq_factory):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import SequenceStatus
+
+    p = Scheduler(MockConfig())
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    original, reused = pd_sequence(seq_factory), pd_sequence(seq_factory)
+    p.extend([original, reused])
+    worker, request, _src, _dst = idle_producer()
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    assert reused.status == SequenceStatus.ABORTED
+    _, scheduled = p.schedule()
+    worker.start_load_kv(p.kv_connector.build_connector_meta())
+    assert "xfer-a" not in worker._retired_chunked_transfers
+    dispatch(worker, request)
+    p._update_from_kv_xfer_finished(worker.get_finished())
+    _, scheduled = p.schedule()
+    assert list(scheduled) == [original.id]
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_d_transfer_failure_waits_for_write_hold_before_local_recovery(
+    monkeypatch, seq_factory, cancelled
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+
+    monkeypatch.setenv("ATOM_PD_FAILED_WRITE_HOLD_S", "30")
+    now = [mc.time.monotonic()]
+    monkeypatch.setattr(mc.time, "monotonic", lambda: now[0])
+    d = Scheduler(MockConfig(num_kvcache_blocks=3))
+    d.kv_connector = scheduler_connector(monkeypatch, False)
+    seq = pd_sequence(seq_factory, producer=False)
+    d.add(seq)
+    batch, scheduled = d.schedule()
+    assert not scheduled and len(seq.block_table) == 3
+    dst = (ctypes.c_ubyte * 48)()
+    worker = decode_worker(dst)
+    worker.start_load_kv(batch.connector_meta_output)
+    deallocate = MagicMock(wraps=d.block_manager.deallocate)
+    monkeypatch.setattr(d.block_manager, "deallocate", deallocate)
+    if cancelled:
+        assert d.abort_request(seq.id)
+    worker._record_write_done(
+        seq.id, 0, 0, worker._pending_recv_nonce[seq.id], success=False
+    )
+    now[0] += 29
+    d._update_from_kv_xfer_finished(worker.get_finished())
+    _, scheduled = d.schedule()
+    assert not scheduled and seq.block_table
+    assert d.block_manager.kv.num_free == 0
+    deallocate.assert_not_called()
+
+    now[0] += 2
+    d._update_from_kv_xfer_finished(worker.get_finished())
+    if cancelled:
+        # A cancelled request drains safely without starting local prefill.
+        assert seq.leave_reason == "aborted"
+        assert not seq.block_table and d.block_manager.kv.num_free == 3
+    else:
+        assert seq.block_table
+        deallocate.assert_not_called()
+        # Any partial handoff must not influence the local generation.
+        seq.kv_transfer_params.update(first_token_id=42, draft_token_ids=[43])
+        batch, scheduled = d.schedule()
+        assert list(scheduled) == [seq.id]
+        assert batch.total_seqs_num_prefill == 1 and batch.total_seqs_num_decode == 0
+        assert seq.num_cached_tokens == 0
+        for key in ("chunked_transfer", "first_token_id", "draft_token_ids"):
+            assert key not in seq.kv_transfer_params
+        deallocate.assert_called_once_with(seq)
+        d.postprocess(
+            list(scheduled.values()),
+            ScheduledBatchOutput([seq.id], [(44,)], None, None, None),
+            batch=batch,
+        )
+        batch, scheduled = d.schedule()
+        assert batch.total_seqs_num_decode == 1
+        assert d.postprocess(
+            list(scheduled.values()),
+            ScheduledBatchOutput([seq.id], [(45,)], None, None, None),
+            batch=batch,
+        ) == [seq]
+        assert list(seq.output_tokens) == [44, 45]
+        assert not seq.block_table and d.block_manager.kv.num_free == 3
+    assert not d.waiting and not d.running and not d.deferred_free_blocks
+    assert not d.failed_recving_kv_req_ids
+
+
+@pytest.mark.parametrize("producer_side", [False, True])
+def test_legacy_requests_bypass_admission_gate(monkeypatch, seq_factory, producer_side):
+    connector = scheduler_connector(monkeypatch, producer_side)
+    seq = seq_factory([1, 2, 3], kv_transfer_params={"do_remote_decode": producer_side})
+    assert connector.admission_ready(seq)
+    assert not connector.build_connector_meta().has_work()
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2, 4])
+def test_d_reserves_full_prompt_without_max_new_tokens(
+    monkeypatch, seq_factory, dcp_size
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    blocks = (10 + 4 * dcp_size - 1) // (4 * dcp_size)
+    d = Scheduler(
+        MockConfig(
+            num_kvcache_blocks=blocks,
+            max_num_batched_tokens=4,
+            decode_context_parallel_size=dcp_size,
+        )
+    )
+    d.kv_connector = scheduler_connector(monkeypatch, False, dcp_size=dcp_size)
+    seq = pd_sequence(seq_factory, producer=False)
+    seq.max_tokens = 32
+    d.add(seq)
+    batch, scheduled = d.schedule()
+    assert not scheduled and len(seq.block_table) == blocks
+    assert batch.connector_meta_output.reqs_to_recv[seq.id].local_block_ids == list(
+        seq.block_table
+    )
+    assert d.block_manager.kv.num_free == 0
+
+
+@pytest.mark.parametrize("remote_tp,d_tp,d_pp", [(2, 1, 1), (3, 4, 1), (1, 1, 2)])
+def test_unroutable_chunked_topology_fails_before_any_write_request(
+    remote_tp, d_tp, d_pp
+):
+    dst = (ctypes.c_ubyte * 48)()
+    d = decode_worker(dst)
+    d.tp_size, d.pp_size = d_tp, d_pp
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(
+        21,
+        [1, 2, 3],
+        {
+            "chunked_transfer": True,
+            "remote_tp_size": remote_tp,
+        },
+    )
+    d.start_load_kv(meta)
+    d._send_on_socket.assert_not_called()
+    assert d.get_finished().failed_recving == {21}
+
+
+def test_partial_ready_cancel_drains_tp_pp_quorum(monkeypatch, seq_factory):
+    connector = scheduler_connector(monkeypatch, True, 2)
+    seq = pd_sequence(seq_factory)
+    connector.admission_ready(seq)
+    registration = connector.build_connector_meta()
+    workers = [idle_producer(stage, 2)[0] for stage in range(2)]
+    pp = PPKVAggregator(2)
+    for worker in workers:
+        worker.start_load_kv(registration)
+    _, request, _, _ = idle_producer()
+    dispatch(workers[0], request)
+    assert pp.ingest(0, workers[0].get_finished()).is_empty()
+    seq.leave_reason = "aborted"
+    connector.request_finished(seq)
+    cancel = connector.build_connector_meta()
+    for worker in workers:
+        worker.start_load_kv(cancel)
+    out = pp.ingest(1, workers[1].get_finished())
+    assert out.connector_completions == {
+        ConnectorCompletion("pd_admission_ready", seq.id, False)
+    }
+    connector.process_pd_completions(out)
+    assert not pp.has_pending() and not connector._chunked_ready
+    assert all(not w._chunked_local_ids and not w._chunked_admissions for w in workers)
+
+
+def test_source_safe_still_waits_for_other_multi_connector_owner(
+    monkeypatch, seq_factory
+):
+    from conftest import MockConfig
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+    from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+
+    p = Scheduler(MockConfig())
+    connector = p.kv_connector = scheduler_connector(monkeypatch, True)
+    seq = pd_sequence(seq_factory)
+    p.add(seq)
     connector.process_pd_completions(
         KVConnectorOutput(
             connector_completions={
-                ConnectorCompletion("pd_reclaim_done", sources[1].id, True)
+                ConnectorCompletion("pd_admission_ready", seq.id, True),
             }
         )
     )
-    now[0] += 5
-    connector.admission_blocked(head)
-    assert not connector.build_connector_meta().has_work()
-    terminal = connector.process_pd_completions(
+    batch, seqs = p.schedule()
+    p.postprocess(
+        list(seqs.values()),
+        ScheduledBatchOutput([seq.id], [(42,)], None, None, None),
+        batch=batch,
+    )
+    # Model LMCache's independent source ownership after prefill has finished.
+    owner = SimpleNamespace(
+        should_defer_free=lambda _: True, process_pd_completions=lambda output: output
+    )
+    multi = MultiConnectorScheduler.__new__(MultiConnectorScheduler)
+    multi._connectors = [connector, owner]
+    multi.is_producer, multi.is_offload = True, False
+    multi._load_winner = {}
+    p.kv_connector = multi
+    p._update_from_kv_xfer_finished(
         KVConnectorOutput(
             connector_completions={
-                ConnectorCompletion("pd_source_safe", sources[1].id, True)
+                ConnectorCompletion("pd_source_safe", seq.id, True),
             }
         )
     )
-    assert terminal.finished_sending == {sources[1].id}
-    connector.send_finished(sources[1].id)
-    connector.admission_blocked(head)
+    assert not connector.should_defer_free(seq)
+    assert seq.block_table and seq.id in p.deferred_free_blocks
+    owner.should_defer_free = lambda _: False
+    p._maybe_release_deferred(seq)
+    assert not seq.block_table and not p.deferred_free_blocks
+
+
+def test_admitted_source_can_resume_offload_load_without_another_ready(
+    monkeypatch, seq_factory
+):
+    connector = scheduler_connector(monkeypatch, True)
+    seq = pd_sequence(seq_factory)
+    assert not connector.admission_ready(seq)
+    connector.build_connector_meta()
+    connector.process_pd_completions(
+        KVConnectorOutput(
+            connector_completions={
+                ConnectorCompletion("pd_admission_ready", seq.id, True),
+            }
+        )
+    )
+    seq.block_table = [1, 2, 3]
+    connector.update_state_after_alloc(seq)
+    connector.build_connector_meta()
+    assert connector.admission_ready(seq)
     assert not connector.build_connector_meta().has_work()
-    # Allocation succeeds after release: it resets pressure, so ordinary
-    # progress cannot immediately sacrifice the last completed prefill.
-    connector.update_state_after_alloc(head)
-    now[0] += 5
-    connector.admission_blocked(head)
-    assert not connector.build_connector_meta().has_work()
-
-
-def test_reclaim_targets_same_source_on_pp_ranks_with_different_claims():
-    workers = [producer(rank, 2)[0] for rank in range(2)]
-    states = [worker._chunked_prefills["xfer-a"] for worker in workers]
-    for state in states:
-        publish(state, 10)
-        state.finish({"first_token_id": 42})
-    states[0].acquire(("reader",), 1)
-    pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
-    pp = PPKVAggregator(2)
-    for rank, worker in enumerate(workers):
-        worker.start_load_kv(pressure)
-        result = pp.ingest(rank, worker.get_finished())
-    assert states[1].cancelled and not states[0].cancelled
-    assert result.connector_completions == {
-        ConnectorCompletion("pd_reclaim_done", 7, False)
-    }
-    states[0].release()
-    result = pp.ingest(0, workers[0].get_finished())
-    assert result.connector_completions == {
-        ConnectorCompletion("pd_source_safe", 7, True)
-    }
-
-
-def test_reclaim_does_not_cancel_other_finished_sources():
-    worker, state, _, _, _ = producer()
-    other = ChunkedPrefill(8, [1], 4, 4)
-    publish(state, 10)
-    state.finish({"first_token_id": 42})
-    publish(other, 4)
-    other.finish({"first_token_id": 43})
-    worker._chunked_prefills["xfer-b"] = other
-    pressure = ConnectorMetadata()
-    pressure.reclaim_unclaimed_prefills = {7: "xfer-a"}
-    worker.start_load_kv(pressure)
-    assert state.cancelled and not other.cancelled
 
 
 @pytest.mark.parametrize("chunked", [False, True])
@@ -1527,3 +1808,44 @@ def test_failed_receive_cleanup_is_limited_to_chunked_requests(chunked, seq_fact
         assert list(seq.block_table) == blocks
         assert seq.kv_transfer_params["first_token_id"] == 42
         assert seq.kv_transfer_params["draft_token_ids"] == [43]
+
+
+@pytest.mark.parametrize("received_metadata", [False, True])
+def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
+    monkeypatch, seq_factory, received_metadata
+):
+    from conftest import MockConfig
+
+    from atom.model_engine.scheduler import Scheduler
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import EngineCore
+
+    p = Scheduler(MockConfig())
+    p.kv_connector = scheduler_connector(monkeypatch, True)
+    seq = pd_sequence(seq_factory)
+    p.add(seq)
+    worker, request, _src, _dst = idle_producer()
+    batch, _ = p.schedule()
+    worker.start_load_kv(batch.connector_meta_output)
+    if received_metadata:
+        dispatch(worker, request)
+    assert p.abort_request(seq.id)
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = p
+    core.kv_transfer_enabled = True
+    core.label = "pd-cancel"
+    core._next_idle_kv_drain = mc.time.monotonic() + 1000
+    core.output_queue = queue.Queue()
+    core.runner_mgr = MagicMock()
+    core.runner_mgr.call_func.side_effect = lambda method, meta: worker.start_load_kv(
+        meta
+    )
+    core.runner_mgr.call_func_with_aggregation.side_effect = (
+        lambda _: worker.get_finished()
+    )
+    core._process_engine_step_inner()
+    assert p.is_finished() and not seq.block_table
+    assert not p.kv_connector._reqs_need_save
+    assert not worker._chunked_admissions
+    assert not worker._chunked_local_ids and not worker._pending_chunked_requests

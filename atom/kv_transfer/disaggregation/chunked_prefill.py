@@ -16,6 +16,17 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def chunked_topology_supported(producer_tp, consumer_tp, consumer_pp):
+    """Whether D's rank routing can reach every P worker before admission."""
+    return (
+        type(producer_tp) is int
+        and producer_tp > 0
+        and consumer_pp == 1
+        and consumer_tp >= producer_tp
+        and consumer_tp % producer_tp == 0
+    )
+
+
 @dataclass(frozen=True)
 class PrefillHandoff:
     """Generation state passed from P to D after prefill; KV travels via RDMA."""
@@ -127,19 +138,6 @@ class ChunkedPrefill:
         with self.cv:
             self.cancelled = True
             self.cv.notify_all()
-
-    def cancel_if_unclaimed(self):
-        """Relinquish a finished source under capacity pressure, before any read.
-
-        A partially served fan-out must finish normally: ``readers == 0`` alone
-        could mean one consumer has finished while another has yet to arrive.
-        """
-        with self.cv:
-            if self.handoff is None or self.claims:
-                return False
-            self.cancelled = True
-            self.cv.notify_all()
-            return True
 
     def acquire(self, consumer_identity, expected_readers):
         """Claim one consumer's reads of this producer rank's source blocks.

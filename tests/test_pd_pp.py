@@ -270,7 +270,9 @@ def _mooncake_consumer_scheduler(mc, block_size=64, dcp_size=1):
     sched.transfer_id_to_request_id = {}
     sched._reqs_need_recv = {}
     sched._reqs_need_save = {}
-    sched._reclaim_unclaimed_prefills = {}
+    sched._pending_chunked_admissions = {}
+    sched._chunked_waiting = {}
+    sched._chunked_ready = set()
     return sched
 
 
@@ -780,7 +782,9 @@ def _make_connector(**overrides):
     conn._pending_handoffs = {}
     conn._pending_chunked_requests = []
     conn._chunked_prefills = {}
-    conn._reclaim_results = set()
+    conn._admission_results = set()
+    conn._chunked_admissions = {}
+    conn._chunked_local_ids = {}
     conn._received_handoffs = {}
     conn._pending_recv_stages = {}
     conn._pending_recv_failed = set()

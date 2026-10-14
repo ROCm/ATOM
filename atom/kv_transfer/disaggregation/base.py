@@ -120,8 +120,9 @@ class KVConnectorSchedulerBase(ABC):
         """Preserve completions unless the backend consumes chunked P/D metadata."""
         return output
 
-    def admission_blocked(self, seq: Any) -> None:
-        """Notify the connector that KV capacity prevented prefill admission."""
+    def admission_ready(self, seq: Any) -> bool:
+        """Whether the scheduler may allocate this request and start prefill."""
+        return True
 
     def abort_send(self, seq: Any) -> None:
         """Retire an unsent abort; streaming senders must wait for reader drain."""
