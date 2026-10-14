@@ -158,6 +158,22 @@ def test_bind_agreed_reraises_this_ranks_refusal():
     bind_agreed(lambda: None, None)
 
 
+def test_bind_agreed_converts_other_failures_to_refusal():
+    """A non-refusal failure must still leave every rank on the same path.
+
+    Peers only ever see MonoUnsupported, so a rank whose bind raised something
+    else -- an OOM, typically -- has to refuse the same way instead of dying
+    alone with an exception LazyRunner does not catch."""
+
+    import torch
+
+    def oom():
+        raise torch.OutOfMemoryError("out of memory")
+
+    with pytest.raises(MonoUnsupported, match="OutOfMemoryError: out of memory"):
+        bind_agreed(oom, None)
+
+
 def _mlir_escaped(data: bytes) -> str:
     return "".join(
         chr(b) if 0x20 <= b < 0x7F and b not in b'\\"' else f"\\{b:02X}" for b in data

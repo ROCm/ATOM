@@ -32,9 +32,18 @@ def bind_agreed(bind, group) -> None:
     rank's verdict agreed: a rank that raised re-raises, the others raise too."""
     try:
         bind()
-    except Exception:
+    except MonoUnsupported:
         tp_agree(False, group)
         raise
+    except Exception as error:
+        tp_agree(False, group)
+        # Peers see only `another TP rank refused mono`, a MonoUnsupported that
+        # LazyRunner catches and falls back on. A rank that failed for some
+        # other reason -- an OOM dequantizing latent-MoE weights, say -- has to
+        # refuse the same way, or it alone propagates an exception nobody
+        # catches and dies while every peer keeps serving. The original is
+        # chained, and its type and message are in the refusal text.
+        raise MonoUnsupported(f"{type(error).__name__}: {error}") from error
     if not tp_agree(True, group):
         raise MonoUnsupported("another TP rank refused mono")
 
