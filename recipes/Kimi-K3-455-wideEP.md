@@ -29,6 +29,7 @@ Contents:
 - [Tray operations](#tray-operations)
 - [Container and patches](#container-and-patches)
 - [Launch](#launch-dp8ep8)
+- [Online FP8 quantization](#online-fp8-quantization-optional)
 - [Accuracy](#accuracy-gate-and-gsm8k)
 - [Agentic](#agentic-agentx)
 - [Known issues](#known-issues)
@@ -599,6 +600,69 @@ until curl -sf -m 5 http://10.210.11.26:8000/v1/models >/dev/null; do sleep 15; 
 - **Cold start.** About 8 min in a fresh container, most of it aiter JIT builds.
 - **Hangs.** When the server goes quiet, take `py-spy dump` of the `ATOM::DP<r>TP0` processes and rocgdb
   `info dispatches` **before** killing anything; see [Known issues](#known-issues).
+
+---
+
+## Online FP8 quantization (optional)
+
+The launch above runs every non-MoE linear in BF16. With `--online_quant_config`, ATOM quantizes them to FP8 at
+load time; the MXFP4 routed experts are unchanged. **Not validated on this page's image yet**; see
+[Measured](#measured-online-fp8) for the stack it was measured on.
+
+- **Linears:** 128x128 block FP8 (`per_block_fp8`) with **E8M0** (power-of-two) scales. On gfx1250, aiter's
+  `gemm_a8w8_blockscale_bpreshuffle` takes the FlyDSL mxfp8_128 GEMM only when both the activation and the
+  weight scale are E8M0. FP32 weight scales fall back to an untuned Triton GEMM that is slower than BF16.
+- **MLA `kv_b_proj`:** per-token FP8 (`ptpc_fp8`), so aiter's FlyDSL `gather_kv_b_proj` can read it.
+
+### PRs it needs
+
+None of these is in this page's image.
+
+| PR | why | status, 2026-10-14 |
+|---|---|---|
+| [ATOM #2554](https://github.com/ROCm/ATOM/pull/2554) | online `per_1x128` quantization writes E8M0 weight scales. K3's fused norm + quant producers emit FP32 scales, so they stand down when the consumer is E8M0. Pads N to 128: KDA `in_proj` 49376 -> 49408, `fused_qkv_a_proj` 2112 -> 2176 | open, draft |
+| [ATOM #2466](https://github.com/ROCm/ATOM/pull/2466) | gfx1250 MXFP4 linears always take the Triton/Gluon GEMM. With `ATOM_USE_TRITON_GEMM=0` they otherwise take the ASM GEMM, whose scale layout needs ATOM #2505 + aiter #6294, and GSM8K showed runaway answers on that path | open |
+| [aiter #6121](https://github.com/ROCm/aiter/pull/6121) | FlyDSL `gather_kv_b_proj` for the FP8 `kv_b_proj` | open |
+| [aiter #6530](https://github.com/ROCm/aiter/pull/6530) | tuned table for K3's 8 blockscale shapes, M = 1..16384. Without it every call takes the untuned FlyDSL fallback, 2-36x slower at decode M | open |
+
+### Launch changes
+
+On top of [the launch](#launch-dp8ep8):
+
+```bash
+export ATOM_USE_TRITON_GEMM=0               # keeps the ptpc kv_b_proj preshuffled, which #6121 needs
+export ATOM_UNFUSED_GATHER_KV_B_PROJ=0      # #2380's unfused gather cannot read the preshuffled FP8 weight
+export ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1 # already set above
+# ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE and ATOM_USE_FLYDSL_GATHER_KV_B_PROJ: leave at their default, 1
+--online_quant_config '{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}'
+```
+
+Check that it took effect:
+- With `AITER_LOG_LEVEL=WARNING`, a line `[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned M=…, N=…, K=…; falling
+  back to flydsl kernel '…'` names a shape that the table does not cover.
+- In a torch trace, the blockscale GEMMs are `gemm_a8w8_mx128_*` (FlyDSL). `_gemm_a8w8_blockscale_preshuffle_gfx1250*`
+  (Triton) means the weight scales are FP32, i.e. #2554 is missing or `ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE` is off.
+
+### Measured: online FP8
+
+8k in / 1k out, concurrency 32, 128 prompts (`atom.benchmarks.benchmark_serving`, random, `--ignore-eos`), and
+GSM8K 5-shot on all 1319 questions:
+
+| | BF16 | online FP8 |
+|---|---|---|
+| output throughput, tok/s | 511.6 | **591.5** |
+| mean TTFT, ms | 5874 | **2933** |
+| mean TPOT, ms | 56.0 | **50.5** |
+| GSM8K strict-match | 0.9644 ±0.0051 | 0.9598 ±0.0054 |
+
+- Both on `rocm/atom-dev` 1009 (torch 2.14), two B0 trays without perf_setup, with that stack's launch: mori
+  dispatch, bf16 combine, 2048 batched tokens, Triton MLA decode.
+- BF16: ATOM `16cc652b` + #2380, aiter `6bf550b6` + #5431 + #6121 (`4b89b9d2`); CT2 + CT15, 2026-10-12.
+- Online FP8: ATOM `main` `d67a79f4` + #2466 + #2554, aiter `main` `9c971f57` + #6121 (`7ce0a5de`) + a K3 table
+  from the same tuning as #6530's; CT2 + CT3, 2026-10-14.
+- The columns also differ in ATOM and aiter version and in one tray, so not all of the difference is the
+  quantization.
+- GSM8K: one question (doc 593) ran into a repeating answer under load. It answers correctly when sent alone.
 
 ---
 
