@@ -12,8 +12,9 @@ for the daily 08:17 UTC run. Both use `rocm/atom-dev:latest` and checked-out bra
 code. The manual `test` catalog contains DeepSeek V4.1 Flash + DSpark5,
 TP4 with FULL graphs, concurrency 2/4 and 900 seconds per point. Kimi-K3 standalone
 STATE checkpoint cases use the **Atomesh Benchmark** workflow and
-[`models_atomesh.yaml`](./models_atomesh.yaml), with TP8/DCP8, no speculative
-decoding, concurrency 48/72 and 3600 seconds per point.
+[`models_atomesh.yaml`](./models_atomesh.yaml), with TP8/DCP8, concurrency 48/72
+and 3600 seconds per point. The original cases use no speculative decoding;
+a separate C72 variant enables DSpark3.
 Nightly remains DeepSeek only, based on InferenceX PR #3387
 with a custom grid: TP2 c=1/2/4/8/16/32/64/128 and TP4 c=1/4/8,
 3600 seconds per point, 5 warmup requests per lane and fixed AL 3.51.
@@ -45,6 +46,7 @@ set `suite=nightly`, and set `case_names` to one or more of these entries:
 
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c48`
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-state-1m-c72`
+- `kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-agentic-lmcache-state-1m-c72` (DSpark3)
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c48` (baseline)
 - `kimi-k3-mxfp4-standalone-tp8-dcp8-agentic-lmcache-no-spare-state-1m-c72` (baseline)
 
@@ -56,14 +58,15 @@ C48 uses `max-num-seqs=96`; C72 uses `max-num-seqs=144`. The standalone launch
 path connects AIPerf directly to ATOM without starting Mesh or a separate decode
 worker.
 
-All four cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
-`max-num-batched-tokens=8192`, no speculative decoding,
-and FULL graph capture sizes 1 through 96. Each loads the K3 FP4
-weights, uses FP8 KV and LMCache DRAM offload, block size 128, and LMCache chunk
-size 1024. Both C48 cases use a shared 128 GiB CPU pool per rank; both C72 cases
-use 192 GiB (`LMCACHE_MAX_LOCAL_CPU_SIZE`). All four retain a 128 GiB STATE cap
-per rank (`OFFLOAD_STATE_CPU_SIZE=128`). The STATE cap does not reserve a
-separate allocation; STATE and KV share the CPU pool.
+All cases use TP8/DCP8, DP1, expert parallel disabled (EP1), DP attention disabled,
+and `max-num-batched-tokens=8192`. The four cases without DSpark use FULL graph
+capture sizes 1 through 96 at C48 and 1 through 144 at C72. The C72 cases enable
+identical communication-group reuse and GEMM bucket warmup. Each loads the K3
+FP4 weights, uses FP8 KV and LMCache DRAM offload, block size 128, and LMCache
+chunk size 1024. Both C48 cases use a shared 128 GiB CPU pool per rank; the two
+C72 cases without DSpark use 192 GiB (`LMCACHE_MAX_LOCAL_CPU_SIZE`). Those four
+retain a 128 GiB STATE cap per rank (`OFFLOAD_STATE_CPU_SIZE=128`). The STATE
+cap does not reserve a separate allocation; STATE and KV share the CPU pool.
 The Agentic trace context cap is 1,048,576
 tokens; request lengths come from the dataset rather than random ISL/OSL flags.
 
@@ -115,8 +118,8 @@ server and independent caches. Keeping `atomesh_single_node=auto` allows the
 scheduler to choose different machines for the two cases.
 
 `AIPERF_APPLY_CHAT_TEMPLATE=1` adds `--apply-chat-template` to the AIPerf
-command, matching `k3_log/baseline/benchmark.log`. The server's
-`--online_quant_config` matches the `Engine kwargs` in the supplied
+command, matching `k3_log/baseline/benchmark.log`. For the four cases without
+DSpark, `--online_quant_config` matches the `Engine kwargs` in the supplied
 `k3_log/baseline/mia1-p01-g37_agg_w0.out`: `global_quant_config=ptpc_fp8`
 with all 14 exclusion patterns. In addition to the existing seven patterns,
 the exclusions include:
@@ -131,11 +134,47 @@ layers.*.mlp.down_proj
 context_proj
 ```
 
-That server log also records `speculative_config=None`; the Kimi case therefore
-uses no draft model or forced acceptance length.
+That server log also records `speculative_config=None`; the four original
+standalone cases therefore use no draft model or forced acceptance length.
 
 AIPerf keeps its 10 warmup requests per lane. The chat-template switch is
 captured in benchmark metadata and the recipe fingerprint.
+
+### Standalone DSpark3 C72 with STATE checkpoints
+
+Select only
+`kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-agentic-lmcache-state-1m-c72`
+in `case_names` to run the new variant. It inherits standalone STATE C72 and
+aligns these settings with
+`kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72`:
+
+| Setting | Standalone STATE C72 | Standalone DSpark3 STATE C72 |
+| --- | --- | --- |
+| Speculation | Disabled | DSpark, 3 draft tokens |
+| Draft model | None | `${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark` |
+| Fixed acceptance length | None | 3.00 |
+| FULL graph capture sizes | 1–144 | 1–576 (`144 * (1 + 3)`) |
+| Shared CPU pool per rank | 192 GiB | 224 GiB |
+| STATE cap within that pool | 128 GiB | 96 GiB |
+| Quantization exclusion patterns | Original 14-pattern recipe | K3 model defaults, same 7 patterns as 1P1D |
+
+Both standalone C72 variants retain `max-num-seqs=144`, compilation level 3,
+`AITER_REUSE_IDENTICAL_COMM_GROUPS=1` and `ATOM_WARMUP_GEMM_M_BUCKETS=1`.
+The DSpark3 variant shares the 1P1D AIPerf configuration, including its commit,
+dataset, 1M context cap, 3600-second duration, warmup and trace timing settings.
+
+The intentional differences from 1P1D are:
+
+- One TP8/DCP8 server on eight GPUs, with direct AIPerf access and a pure
+  `lmcache_offload` connector. There is no Mooncake producer/consumer pair.
+  The standalone prefill delayer remains at interval 4 and a 5000 ms queue cap.
+- Spare STATE checkpoints remain enabled with reserve 8 and checkpoint interval
+  -1. DSpark3 uses four physical STATE slots per active request; each retained
+  prefill checkpoint still occupies one spare slot.
+- `ATOM_ENABLE_REPLAYSSM=0`, whereas the 1P1D recipe uses 1. The current
+  [block manager](../../atom/model_engine/block_manager.py) rejects ReplaySSM
+  with spare STATE checkpoints. DSpark3 supports these checkpoints only during
+  prefill, so enabling ReplaySSM in this case would fail at startup.
 
 ## Flow
 

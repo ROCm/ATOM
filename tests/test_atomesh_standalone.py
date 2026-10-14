@@ -259,6 +259,79 @@ export PREFILL_TP_SIZE="$PREFILL_TP" DECODE_TP_SIZE="$DECODE_TP"
                 client = captures["benchmark"]["args"]
                 self.assertEqual(client[client.index("--concurrency") + 1], "72")
 
+    def test_dspark3_c72_launch_aligns_with_pd_and_keeps_spare_state(self):
+        case = (
+            "kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-"
+            "agentic-lmcache-state-1m-c72"
+        )
+        (cell,) = self.cells(case)
+        (baseline,) = self.cells(
+            "kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72"
+        )
+        self.assertEqual(cell["num_nodes"], 1)
+        self.assertEqual(cell["service"]["decode"]["workers"], 0)
+        self.assertEqual(cell["pd_worker_layout"], "standalone")
+        self.assertEqual(cell["benchmark"], baseline["benchmark"])
+        for key, value in baseline["server_args"].items():
+            if key != "extra_args":  # Standalone also pins DP1 explicitly.
+                self.assertEqual(cell["server_args"][key], value, key)
+        for key, value in baseline["env"]["prefill"].items():
+            if key not in ("ATOM_ENABLE_REPLAYSSM", "PREFILL_KV_TRANSFER_CONFIG"):
+                self.assertEqual(cell["env"]["prefill"][key], value, key)
+
+        captures = self.launch(case)
+        args = captures["launch"]["args"]
+        for flag, value in {
+            "-tp": "8",
+            "--decode-context-parallel-size": "8",
+            "--data-parallel-size": "1",
+            "--max-num-seqs": "144",
+            "--max-num-batched-tokens": "8192",
+            "--method": "dspark",
+            "--draft-model": "/models/Inferact/Kimi-K3-DSpark",
+            "--num-speculative-tokens": "3",
+            "--spec-decode-acceptance-length": "3.0",
+            "--state-checkpoint-interval-tokens": "-1",
+            "--cudagraph-mode": "FULL",
+            "--level": "3",
+        }.items():
+            self.assertEqual(args.count(flag), 1, flag)
+            self.assertEqual(args[args.index(flag) + 1], value, flag)
+        self.assertEqual(
+            json.loads(args[args.index("--cudagraph-capture-sizes") + 1]),
+            list(range(1, 577)),
+        )
+        self.assertEqual(
+            json.loads(args[args.index("--kv-transfer-config") + 1]),
+            {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+        )
+        self.assertEqual(
+            json.loads(args[args.index("--online_quant_config") + 1]),
+            json.loads(baseline["server_args"]["online_quant_config"]),
+        )
+        self.assertNotIn("--pd-disaggregation", args)
+        self.assertNotIn("--no-enable_prefix_caching", args)
+        env = captures["launch"]["env"]
+        for key, value in {
+            "ATOM_KDA_SPARE_STATE_CHECKPOINTS": "1",
+            "ATOM_KDA_SPARE_STATE_RESERVE": "8",
+            "ATOM_ENABLE_REPLAYSSM": "0",
+            "ATOM_STATE_CHECKPOINT_DEMAND": "0",
+            "ATOM_PREFILL_DECODE_INTERVAL": "4",
+            "ATOM_PREFILL_DELAYER_MAX_QUEUE_MS": "5000",
+            "AITER_REUSE_IDENTICAL_COMM_GROUPS": "1",
+            "ATOM_WARMUP_GEMM_M_BUCKETS": "1",
+            "LMCACHE_MAX_LOCAL_CPU_SIZE": "224",
+            "OFFLOAD_STATE_CPU_SIZE": "96",
+            "OFFLOAD_KV_FOR_HYBRID": "1",
+        }.items():
+            self.assertEqual(env[key], value, key)
+        client = captures["benchmark"]["args"]
+        self.assertEqual(client[client.index("--concurrency") + 1], "72")
+        self.assertEqual(client[client.index("--standalone") + 1], "127.0.0.1:8000")
+        self.assertNotIn("--mesh", client)
+        self.assertNotIn("--decode", client)
+
     def test_real_launch_and_client_connect_directly_with_original_recipe(self):
         captures = self.launch()
         args = captures["launch"]["args"]

@@ -813,7 +813,7 @@ models:
               cudagraph: auto
               cudagraph_mode: FULL
               compilation_level: 3
-            benchmark:
+            benchmark: &kimi_k3_agentic_benchmark
               <<: *agentic_1m_aiperf
               aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
             run_eval: false
@@ -1010,8 +1010,33 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_hc_dspark3_reuse_env
 
-        # Non-disaggregated counterpart to the C72 cell above: one server does
-        # prefill and decode on a single node, same workload and same server
+        # Standalone STATE counterpart to the 1P1D DSpark3 C72 recipe.
+        # Keep the single-server placement and prefill delayer from STATE C72;
+        # its auto graphs now cover 1..576 = 144 * (1 + 3) query tokens.
+        - <<: *kimi_k3_standalone_state_c72
+          name: kimi-k3-mxfp4-standalone-tp8-dcp8-dspark3-agentic-lmcache-state-1m-c72
+          display_topology: STANDALONE-TP8-DCP8-DSPARK3-STATE
+          server:
+            # Inherit the DSpark recipe and the model's quantization defaults,
+            # replacing the P/D connector with colocated LMCache offload.
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+              kv_transfer_config: '{"kv_connector":"lmcache_offload","kv_role":"offload"}'
+              extra_args: --tool-call-parser kimi_k3 --data-parallel-size 1
+          env:
+            common:
+              <<: *kimi_k3_standalone_state_c72_env
+              # Unlike the 1P1D recipe, spare STATE requires ReplaySSM off.
+              # DSpark3 supports prefill checkpoints only, with four physical
+              # STATE slots per request and interval=-1 (inherited above).
+              ATOM_ENABLE_REPLAYSSM: '0'
+              LMCACHE_MAX_LOCAL_CPU_SIZE: '224'
+              OFFLOAD_STATE_CPU_SIZE: '96'
+          benchmark: *kimi_k3_agentic_benchmark
+
+        # Non-disaggregated counterpart to the no-draft 1P1D C72 cell: one
+        # server does prefill and decode, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-agg-tp8-dcp8-agentic-lmcache-1m-c72
