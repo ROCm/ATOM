@@ -600,11 +600,11 @@ class RDMAWeightReceiverMixin:
 
     def _rdma_reload_refusal(self) -> str | None:
         """Why a reload over RDMA would be unsafe on this engine, if it would."""
+        config = getattr(self, "config", None)
         # Not the runner's own config alone: once a DP engine's workers have a
         # world of their own, it says data_parallel_size=1 on every one of them.
         dp = getattr(self, "_deployment_data_parallel_size", None)
         if dp is None:
-            config = getattr(self, "config", None)
             parallel = getattr(config, "parallel_config", None)
             dp = getattr(parallel, "data_parallel_size", 1)
         dp = int(dp or 1)
@@ -616,6 +616,15 @@ class RDMAWeightReceiverMixin:
                 f"all-reduce -- and each decides the stream for its own "
                 f"workers alone, so DP replicas could commit different "
                 f"versions. Run each DP replica as its own server."
+            )
+        pp = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+        if pp > 1:
+            return (
+                f"pipeline_parallel_size={pp}. Each stage holds its own layers "
+                f"and its workers alone are counted for the stream: it would "
+                f"take, vote on and commit the stream as if it held the whole "
+                f"model, so a stage that failed would leave the others serving "
+                f"a newer version than its own."
             )
         if _has_mla_attention(getattr(self, "model", None)):
             return (

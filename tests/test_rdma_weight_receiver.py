@@ -1013,6 +1013,21 @@ def test_a_dp_engine_refuses_the_weight_group_before_joining(monkeypatch):
     assert joined == []
 
 
+def test_a_pipeline_stage_refuses_the_weight_group_before_joining(monkeypatch):
+    """A stage holds its own layers, and its workers alone were counted: with
+    TP=1 it took the stream without a vote, so a stage that failed left the
+    others serving a newer version than its own."""
+    joined = _joins(monkeypatch)
+    worker = _Worker(0, 0, tp=1, tp_world=1, pcp=1)
+    worker.config.pipeline_parallel_size = 2
+
+    with pytest.raises(RuntimeError, match="pipeline_parallel_size=2"):
+        worker.init_rdma_weight_group(
+            "127.0.0.1", 29500, base_rank=1, world_size=2, group_name="g"
+        )
+    assert joined == []
+
+
 def test_a_dp_engine_is_refused_though_its_world_was_isolated_to_one(monkeypatch):
     """Once a DP engine's workers have a world of their own, their config says
     data_parallel_size=1, and the refusal, reading that, let every DP engine
@@ -1271,7 +1286,7 @@ def test_the_lifecycle_the_real_mixins_define_is_advertised():
     assert "rdma_weight_receive" in report["features"]
 
 
-@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "mla"])
+@pytest.mark.parametrize("unsafe", ["dp", "isolated-dp", "pp", "mla"])
 def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
     """The methods are still there; the feature is what says they work here,
     so an orchestrator can choose another path before a rendezvous that
@@ -1286,6 +1301,8 @@ def test_the_feature_is_withheld_where_init_would_refuse(monkeypatch, unsafe):
     worker = _Composed(0, 0, tp=1, tp_world=1, pcp=1, dp=2 if unsafe == "dp" else 1)
     if unsafe == "isolated-dp":
         worker._deployment_data_parallel_size = 2
+    if unsafe == "pp":
+        worker.config.pipeline_parallel_size = 2
     if unsafe == "mla":
         worker.model = nn.Sequential(_mla_attention(monkeypatch)())
     report = worker.get_worker_capabilities()
