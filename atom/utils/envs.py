@@ -155,11 +155,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
-    # LMCache KV offload without --kv-transfer-config: "lmcache" (in-process) or
-    # "lmcache_mp" (standalone `lmcache server`). Unset = off.
+    # DeepSeek-V4 bounded replay: when the compressed history hits further than
+    # the nearest state checkpoint by more than the window's receptive field,
+    # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
+    # to rebuild every layer's window and compressor state exactly.
+    "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
+    in {"1", "true", "yes", "on"},
+    # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
+    # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
+    # Store, no LMCache). Unset = off.
     "ATOM_KV_OFFLOAD": lambda: os.getenv("ATOM_KV_OFFLOAD", ""),
     # JSON object for that connector's kv_connector_extra_config, e.g.
-    # {"lmcache.chunk_size": 256} or {"lmcache.mp.port": 5556}.
+    # {"lmcache.chunk_size": 256}, {"lmcache.mp.port": 5556} or
+    # {"mooncake_store.master": "10.0.0.1:26051", ...}.
     "ATOM_KV_OFFLOAD_EXTRA_CONFIG": lambda: os.getenv(
         "ATOM_KV_OFFLOAD_EXTRA_CONFIG", ""
     ),
@@ -187,6 +195,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # --- DP prefill cost balancing (DP attention with more than one rank) ---
+    # Under DP attention every rank prefills in the same lockstep step and the
+    # step lasts as long as the slowest rank. With the same token budget, a rank
+    # whose chunk attends long contexts is that straggler. The ranks exchange
+    # the estimated cost of their chunk on the PrefillDelayer's per-tick
+    # all_reduce (cost = new tokens x (TOKEN_WEIGHT + prior context + new / 2);
+    # estimated only by ranks with prefill work) and on a prefill step aim at
+    # min(costliest, mean x (1 + SLACK)): a rank above it takes fewer tokens
+    # (never fewer than MIN_TOKENS).
+    "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT": lambda: _int_env(
+        "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 360000
+    ),
+    "ATOM_DP_PREFILL_BALANCE_SLACK": lambda: float(
+        os.getenv("ATOM_DP_PREFILL_BALANCE_SLACK", "0.1")
+    ),
+    "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS": lambda: _int_env(
+        "ATOM_DP_PREFILL_BALANCE_MIN_TOKENS", 4096
+    ),
     # Prefix for process titles set via set_process_title (shown in ps/top/rocm-smi)
     "ATOM_PROCESS_NAME_PREFIX": lambda: os.getenv("ATOM_PROCESS_NAME_PREFIX", "ATOM"),
     # SGLang's GLM-5.2 and DeepSeek V4 prefill CP paths still force
@@ -220,12 +246,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
-    # Use the block_size=64 *shuffled* KV-cache Triton/Gluon MLA kernels
-    # (aiter.ops.triton.attention.mla.mla_decode_fwd + the shuffled cat/cache
-    # write kernels) instead of the SGLang-style page_size=1 decode path.
-    # Requires ATOM_USE_TRITON_MLA=1 (selects TritonMLABackend).
+    # Deprecated: use ATOM_MLA_KV_SHUFFLED. Only effective together with
+    # ATOM_USE_TRITON_MLA=1.
     "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
         os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
+    ),
+    # Shuffled MLA KV cache: block_size=64 pages, NoPE/RoPE split into 16x16
+    # tiles. Independent of the decode kernel.
+    # Also set by the legacy ATOM_USE_TRITON_MLA=1 + ATOM_USE_TRITON_MLA_SHUFFLE_KV=1.
+    "ATOM_MLA_KV_SHUFFLED": lambda: (
+        os.getenv("ATOM_MLA_KV_SHUFFLED", "0") == "1"
+        or (
+            os.getenv("ATOM_USE_TRITON_MLA", "0") == "1"
+            and os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
+        )
     ),
     # Run the routed experts with the aiter Triton/gluon MoE kernels instead of
     # FlyDSL fused_moe, on prefill and decode alike. For SiLU models on gfx1250
@@ -293,7 +327,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
     # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
-    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "0") == "1",
+    # Set to 0 to retain the unmasked path.
+    "ATOM_MEGA_MASK_PAD_ROWS": lambda: os.getenv("ATOM_MEGA_MASK_PAD_ROWS", "1") == "1",
     "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # Match SGLang's gfx950 prefill fast path, with or without a cached prefix:
     # cast Q/K/V to FP8 and use AITER's head-dim-256 per-tensor FMHA kernel.

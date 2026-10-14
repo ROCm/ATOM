@@ -1967,6 +1967,11 @@ class Config:
     # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
     # Set by the model: V4.1's Engram n-gram lookback.
     replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
     # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
     # checkpoint and rebuilds it by recomputing the window rows below the hit
     # (`--encoder-swa-bounded-replay`). On by default;
@@ -2435,9 +2440,16 @@ class Config:
             # the scheduler never does, so hashing the live config gives each a
             # different namespace and every scheduler lookup misses. Snapshot it
             # here, before the config is shipped to either process.
-            from atom.kv_transfer.offload.config import snapshot_page_hf_geometry
+            from atom.kv_transfer.offload.config import (
+                snapshot_kv_encoding,
+                snapshot_page_hf_geometry,
+            )
 
             self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
+            # Likewise how K and V are encoded (the RoPE settings above all):
+            # llama.py adds a key to the live `rope_parameters` while a worker
+            # builds the model.
+            self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2641,6 +2653,13 @@ class Config:
             from atom.models.deepseek_v41.config import validate_runtime_config
 
             validate_runtime_config(self)
+
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
 
     def compute_hash(self) -> str:
         """
