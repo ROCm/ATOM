@@ -179,6 +179,10 @@ class BlockManager:
         self._prefill_probe_hashes: WeakKeyDictionary[
             Sequence, tuple[int, list[int]]
         ] = WeakKeyDictionary()
+        # Frontend-hashed chains taken as-is vs. refused and rehashed here
+        # (`_adopt_shipped_chain`). Rejections should stay at 0.
+        self.shipped_chains_adopted: int = 0
+        self.shipped_chains_rejected: int = 0
         self.total_evicted_blocks: int = 0
         # The delayer's per-seq probe memo (`can_allocate_estimate`) and what
         # validates it: the hashes evicted most recently, positioned by
@@ -743,13 +747,65 @@ class BlockManager:
         the GPU waits out. Prompt blocks never change, so the chain is
         computed once. Keyed on `cache_seed` too, since a different seed is a
         different chain.
+
+        Starts from the chain the frontend shipped with the request when it
+        checks out (`_adopt_shipped_chain`), so this thread hashes nothing.
         """
         seed = seq.cache_seed
         cached = self._prefill_probe_hashes.get(seq)
         if cached is None or cached[0] != seed:
-            cached = (seed, [])
+            cached = (seed, self._adopt_shipped_chain(seq))
             self._prefill_probe_hashes[seq] = cached
         return cached[1]
+
+    def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
+        """The prompt chain `seq` brought from the frontend, or `[]` to hash here.
+
+        Taken only when it was minted for this engine's hash block size and
+        seed and covers exactly the full prompt blocks, and when its first and
+        last links rehash to the same values here -- a check of the encoding
+        (dtype, byte order, seeding) at two blocks' cost. Anything else falls
+        back to hashing on this thread, so a stale or foreign chain costs time,
+        never a wrong hit. Consumed either way: the array is a prompt's worth
+        of ints the request would otherwise carry for its lifetime.
+        """
+        shipped = getattr(seq, "prompt_hash_chain", None)
+        if shipped is None:
+            return []
+        seq.prompt_hash_chain = None
+        hbs = self.hash_block_size
+        n = seq.num_prompt_tokens // hbs
+        block_size, seed, packed = shipped
+        if block_size != hbs or seed != seq.cache_seed or len(packed) != n:
+            return self._reject_shipped_chain(
+                f"minted for hash block {block_size}, seed {seed}, {len(packed)} "
+                f"blocks; this engine wants {hbs}, {seq.cache_seed}, {n}"
+            )
+        chain = packed.tolist()
+        if n and (
+            chain[0] != self.compute_hash(self._hash_block_tokens(seq, 0), seed)
+            or chain[-1]
+            != self.compute_hash(
+                self._hash_block_tokens(seq, n - 1),
+                chain[-2] if n > 1 else seed,
+            )
+        ):
+            return self._reject_shipped_chain("its hashes differ from this engine's")
+        self.shipped_chains_adopted += 1
+        return chain
+
+    def _reject_shipped_chain(self, why: str) -> list[int]:
+        # Latched: a frontend/engine disagreement is a property of the build or
+        # the launch, so it would repeat on every request.
+        if not self.shipped_chains_rejected:
+            logger.warning(
+                "Prefix cache: rehashing a prompt chain the frontend shipped, "
+                "%s. Prefix hits are unaffected; the scheduler thread pays "
+                "the hashing.",
+                why,
+            )
+        self.shipped_chains_rejected += 1
+        return []
 
     def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
         """Chained hash of block `i` given block `i - 1`'s hash `prev`.
@@ -988,9 +1044,12 @@ class BlockManager:
         boundary addressable. Resumes from the last APPENDED hash: on a miss the
         caller's loop variable holds a hash that is not in the chain.
         """
-        chain = list(block_hashes)
-        h = chain[-1] if chain else seq.cache_seed
         prompt = self._prompt_hashes(seq)
+        # `block_hashes` is a prefix of the prompt's own chain, so the rest of
+        # the prompt's cached hashes continue it as one slice.
+        chain = list(block_hashes)
+        chain += prompt[len(chain) : blocks]
+        h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
             h = self._block_hash(seq, prompt, i, h)
             chain.append(h)

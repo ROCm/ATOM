@@ -386,6 +386,12 @@ class Sequence:
         # `BlockManager._extend_hash_chain` for why it cannot simply be the
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
+        # The prompt's chained block hashes, computed where the request was
+        # built (`prefix_hash.ship_prompt_hash_chain`) and carried through IPC
+        # as `(hash_block_size, cache_seed, array("Q"))`, so the scheduler
+        # thread does not hash the prompt. `BlockManager._prompt_hashes` adopts
+        # it once and clears it. None = the engine hashes the prompt itself.
+        self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`

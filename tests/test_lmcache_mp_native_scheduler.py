@@ -128,6 +128,9 @@ def make_scheduler(
     )
     manager._prefill_probe_hashes = WeakKeyDictionary()
     manager._prompt_hashes = lambda seq: BlockManager._prompt_hashes(manager, seq)
+    manager._adopt_shipped_chain = lambda seq: BlockManager._adopt_shipped_chain(
+        manager, seq
+    )
     manager._block_hash = lambda seq, chain, i, prev: BlockManager._block_hash(
         manager, seq, chain, i, prev
     )

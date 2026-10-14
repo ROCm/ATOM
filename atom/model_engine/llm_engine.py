@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.prefix_hash import ship_prompt_hash_chain
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
@@ -685,6 +686,9 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
+    # See `__init__`; a class default so a processor built without it ships
+    # nothing rather than failing.
+    prefix_hash_block_size = 0
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
@@ -709,6 +713,15 @@ class InputOutputProcessor:
             )
         if self.config.hf_config.model_type in self._per_req_cache_model_types():
             self.has_per_req_cache = True
+        # The engine's prefix-cache hash block (`BlockManager.hash_block_size`),
+        # for hashing the prompt chain here rather than on the scheduler thread.
+        # 0 = no prefix cache, nothing to ship. The engine checks it against its
+        # own and rehashes on a mismatch, so a wrong value costs speed only.
+        self.prefix_hash_block_size = 0
+        if getattr(config, "enable_prefix_caching", False):
+            self.prefix_hash_block_size = int(block_size) * int(
+                getattr(config, "decode_context_parallel_size", 1) or 1
+            )
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
@@ -871,6 +884,14 @@ class InputOutputProcessor:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
+
+        # Off the engine thread: every caller runs this in an executor or its
+        # own submit thread, never on the API server's event loop. Siblings
+        # share a prompt and a seed, so one chain serves them all.
+        if self.prefix_hash_block_size:
+            ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
+            for seq in seqs[1:]:
+                seq.prompt_hash_chain = seqs[0].prompt_hash_chain
 
         if n == 1:
             logger.info(

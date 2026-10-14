@@ -987,6 +987,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DELAYER_PROBE_MEMO": lambda: (
         os.getenv("ATOM_PREFILL_DELAYER_PROBE_MEMO", "1") == "1"
     ),
+    # Hash the prompt's block chain where the request is built (API server
+    # preprocessing executor) and ship it to the engine, which adopts it
+    # instead of hashing the prompt on the scheduler thread. "0" leaves all
+    # hashing to the engine, the old behaviour.
+    "ATOM_FRONTEND_PREFIX_HASH": lambda: (
+        os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
+    ),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
