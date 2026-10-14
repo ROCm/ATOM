@@ -1092,15 +1092,21 @@ class OffloadSchedulerMixin(ABC):
         return active is not None and active[0] is seq
 
 
-def max_pending_saves(kvc, save_workers: int) -> int:
-    """Return the maximum running-plus-queued worker save operations."""
+def max_pending_saves(kvc, save_workers: int, pp_size: int = 1) -> int:
+    """Return the maximum running-plus-queued worker save operations.
+
+    Under pipeline parallelism a save reports only once every stage has stored
+    its layers, and a stage reaches the save only after the batches queued ahead
+    of it, so one save stays outstanding for about `pp_size` times as long. The
+    default scales with it; an explicit setting is taken as given.
+    """
 
     extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
     configured = extra.get("max_pending_saves")
     if configured is None:
         capacity = envs.OFFLOAD_MAX_PENDING_SAVES
         if capacity is None:
-            capacity = max(2, 2 * save_workers)
+            capacity = max(2, 2 * save_workers) * max(1, int(pp_size))
     else:
         if isinstance(configured, bool) or not isinstance(configured, int):
             raise ValueError("max pending saves must be a positive integer")
