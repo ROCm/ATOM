@@ -89,10 +89,16 @@ env:
   PERF_ISL: 8192
   PERF_OSL: 1024
   PERF_RATIO: "0.8"
-  # c=128 rather than c=256. Both are large-batch, and the nightly keeps
-  # c=256, but the step down is worth 44% of this line's machine time: a wave
-  # at c=128 costs 0.44-0.63 of one at c=256 across these entries, measured
-  # from nightly job times with model load subtracted out.
+  # c=128 rather than c=256. Both are large-batch and the nightly keeps c=256.
+  # The step down was taken for cost and delivered it: run 38524500630 came in
+  # at 182 machine-minutes against 327 for the ten-cell shape, 3.0 node-hours
+  # against 5.4, with every cell within 2 minutes of its projection.
+  #
+  # It did not deliver wall clock, and the reason is worth keeping here: that
+  # run took 74 minutes against the ten-cell shape's 65, because the pool gave
+  # it five runners rather than six. Wall clock is set by how many runners are
+  # free, which this workflow does not control; machine time is the part a
+  # smaller matrix actually buys.
   PERF_JUDGING_CONCS: 32,128
   # Empty: every level this line runs is judged. c=4 was the reference level
   # and went with the rest -- at two jobs per entry there is no room for a
@@ -115,10 +121,12 @@ env:
   # points. In CI at x4 the shipped matrix gave -1.1 to +2.4 across ten A/A
   # readings, which is what RESIDUAL_SPREAD_PCT follows at 2.5.
   #
-  # Those figures were taken at c=256. This line now judges c=128, where the
-  # window is the same four waves but each wave is shorter, so the residual
-  # has to be re-read from the first complete runs at this level rather than
-  # assumed to carry over.
+  # Those figures were taken at c=256, and the first complete run at c=128
+  # (38524500630) says they do not carry over unchanged. Three entries read
+  # +0.0/+0.3, -0.1/+0.6 and +0.6/+0.1 across the two levels -- tighter than
+  # anything measured at c=256. GLM-5.2-FP8 read +5.3% at c=128, against the
+  # +2.2-2.4% it held across four runs at c=256, so the one entry that already
+  # carried a bias carries a larger one here. See WARMUP_MULT below.
   #
   # What it does not touch: the CONC * 2 `--num-warmups` atom_test.sh runs
   # before the measured window, nor launch and teardown. At c=256 that
@@ -153,7 +161,8 @@ env:
   # at both levels, and GLM-5.2-FP8 did this:
   #
   #   GLM-5.2-FP8  c=256  +2.4 / +2.1 / +2.3 / +2.2%   (four runs)
-  #   GLM-5.2-FP8  c=32   +3.1%                        (first clean reading)
+  #   GLM-5.2-FP8  c=32   +3.1 / +2.9%
+  #   GLM-5.2-FP8  c=128  +5.3%                        (first run at this level)
   #
   # with TTFT and TPOT agreeing every time. c=256 is the quiet level, 0.5-1.2%
   # run to run, so four readings inside 0.3 points of each other are not the
@@ -162,9 +171,11 @@ env:
   # remove, still present at this length for this model.
   #
   # Kept at 1 anyway, which is a decision rather than an oversight, and it
-  # costs something specific: a GLM-5.2-FP8 regression has to be about 2.6
-  # points deeper at BOTH levels before either reads as down, so detection
-  # there starts near -4.6% rather than -2.0%. What it does not do is invent
+  # costs something specific that grew when the matrix moved to c=128: a
+  # GLM-5.2-FP8 regression now has to be about 4.1 points deeper before the
+  # family median reads as down, and 5.3 at c=128 itself, so detection for
+  # that entry starts near -7.3% at that level rather than -2.0%. It is also
+  # past RESIDUAL_SPREAD_PCT, which no longer covers it. What it does not do is invent
   # one -- the bias is positive, so it hides rather than fabricates, which is
   # the direction an advisory check should fail in, and the nightly measures
   # this model on real weights every night. The alternative buys those points
