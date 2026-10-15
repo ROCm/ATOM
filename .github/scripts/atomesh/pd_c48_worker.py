@@ -47,7 +47,9 @@ def inspect_speculative(spec, expected_drafts, expected_al):
 
 class ManifestWorker(Worker):
     def load_model(self, *, load_dummy_weights=False):
-        super().load_model(load_dummy_weights=load_dummy_weights)
+        from pd_c48_memory import LoadingMemoryProbe
+        with LoadingMemoryProbe(self):
+            super().load_model(load_dummy_weights=load_dummy_weights)
         runner = self.model_runner
         target = inspect_model(runner.get_model())
         draft = inspect_model(runner.get_draft_model())

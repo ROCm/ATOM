@@ -8,6 +8,8 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 
 
@@ -75,13 +77,26 @@ def main() -> None:
         from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__
         record["versions"] = {}
-        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori"):
+        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors"):
             try:
                 record["versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError:
                 record["versions"][name] = None
         assert "81198e97b" in record["versions"]["vllm"], record["versions"]
         record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
+        record["loading_memory_evidence"] = {"interval_seconds": 2, "active_only_during_load_model": True}
+        record["gpu_state_before_worker_start"] = {}
+        command = shutil.which("rocm-smi")
+        if command:
+            try:
+                result = subprocess.run([command, "--showmeminfo", "vram", "--showpids", "--json"],
+                                        text=True, capture_output=True, timeout=20)
+                record["gpu_state_before_worker_start"] = {"returncode": result.returncode,
+                    "stdout": result.stdout[:65536], "stderr": result.stderr[:4096]}
+            except subprocess.TimeoutExpired:
+                record["gpu_state_before_worker_start"] = {"timeout": True}
+        else:
+            record["gpu_state_before_worker_start"] = {"unavailable": "rocm-smi"}
         record["model_files"] = {}
         for root in (Path(options.model), draft_path(options.model)):
             assert (root / "config.json").is_file(), root
@@ -89,6 +104,17 @@ def main() -> None:
                 p.name: {"bytes": p.stat().st_size,
                          "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
                 for p in root.iterdir() if p.is_file() and p.suffix == ".json"}
+            metadata = {"config": json.loads((root / "config.json").read_text()), "shards": {}}
+            for checkpoint in sorted(root.glob("*.safetensors")):
+                with checkpoint.open("rb") as handle:
+                    header_size = int.from_bytes(handle.read(8), "little")
+                    if header_size > 128 * 1024 * 1024:
+                        raise ValueError(f"Invalid safetensors header size: {checkpoint.name}")
+                    header = json.loads(handle.read(header_size))
+                metadata["shards"][checkpoint.name] = {"bytes": checkpoint.stat().st_size, "header": header}
+            metadata_path = options.output.parent / (root.name + "-checkpoint-metadata.json")
+            metadata_path.write_text(json.dumps(metadata) + "\n")
+            record["model_files"][str(root)]["checkpoint_metadata_artifact"] = str(metadata_path)
         record["platform_environment"] = {key: value for key, value in os.environ.items()
             if key.startswith(("NCCL_", "MORI_", "HSA_", "HIP_", "GLOO_"))}
     options.output.write_text(json.dumps(record, indent=2) + "\n")
