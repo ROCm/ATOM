@@ -1074,7 +1074,9 @@ models:
         # three drafts at InferenceX's golden AL (3.00, forced), ReplaySSM on,
         # the prefill GEMM bucket warmup, and a 96 GiB KDA state tier in a
         # 224 GiB pool. Only the last prefill stage holds the drafter; the
-        # others relay its aux hidden states forward.
+        # others relay its aux hidden states forward. The prefill runs eager:
+        # PP cudagraphs do not carry speculative decoding, and a P/D producer
+        # never decodes.
         - <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72
           topology: 1p1d_pp8_dcp8
@@ -1085,6 +1087,7 @@ models:
             tp: 1
             extra_args: >-
               --pipeline-parallel-size 8
+              --enforce-eager
               --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}
           server:
             common_args:
