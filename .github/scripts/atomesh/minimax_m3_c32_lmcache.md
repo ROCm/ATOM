@@ -106,3 +106,27 @@ the tail of each allowed log, and records original sizes and truncation in
 `snapshot.json`. Environment files and paths outside the selected run are not
 collected. This snapshot has its own CI run and does not change the original
 benchmark's outcome.
+
+## Runtime stall evidence
+
+Run 38752033481 prepared 1024 GiB of THP successfully in 116 seconds and
+initialized all four LMCache CPU backends in 59–74 seconds. During AgentX warmup,
+request 27's 13.36 GiB save then took about 3400 seconds on every rank; later,
+all TP ranks timed out at broadcast sequence 95. Pre-start memory preparation
+alone therefore does not establish that the runtime pin/copy path is healthy.
+
+The C32 CI service now uses a temporary copy of the same ATOM package with a
+native Python stack watchdog added at import. It dumps every 120 seconds, even
+if a native call holds the GIL. A separate process samples host/NUMA memory,
+compaction/THP counters and registered workers' thread wait channels every
+30 seconds. It checks process start times before reading a PID. NCCL's bounded
+4096-entry trace buffer dumps on timeout. No model, scheduling, concurrency,
+cache capacity, warmup, or performance-duration settings are changed.
+
+During AIPerf, `benchmark_guard.py` fails with exit code 86 on a fatal worker
+error, or after 900 seconds with requests in flight but no inference progress.
+HTTP metrics/health responses and unchanged AIPerf progress lines do not reset
+that timer. Successful request returns, scheduled prefill batches, output sends,
+and completed offload saves do reset it. This avoids occupying an allocation
+for hours after a worker has died. Artifacts include `benchmark-guard.json` and
+`benchmark_results/runtime-diagnostics/`; read-only collection supports both.

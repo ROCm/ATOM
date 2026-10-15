@@ -28,6 +28,9 @@ PATTERNS = (
     "slurm_job-*/benchmark_results/lmcache-host-memory/*.log",
     "slurm_job-*/benchmark_results/lmcache-host-memory/summary.json",
     "slurm_job-*/benchmark_results/lmcache-host-memory/host/hugetlb.json",
+    "slurm_job-*/benchmark_results/runtime-diagnostics/*",
+    "slurm_job-*/benchmark_results/runtime-diagnostics/*/*",
+    "slurm_job-*/benchmark_results/*/benchmark-guard.json",
     "slurm_job-*/job-result.json",
     "slurm_job-*/rank-rc-*",
 )
