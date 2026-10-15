@@ -11,7 +11,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS, FP8_MAX, ROPE_DIM
-from atom.models.deepseek_v4.mono.contract import (
+from atom.models.deepseek_v4.mono.kernels.common import pow2_ceil
+from atom.models.deepseek_v4.mono.kernels.plan import (
     Q_B_TILE,
     QKV_A_TILE,
     THREADS,
@@ -19,7 +20,6 @@ from atom.models.deepseek_v4.mono.contract import (
     q_b_groups,
     qkv_a_groups,
 )
-from atom.models.deepseek_v4.mono.kernels.common import pow2_ceil
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device.flydsl_helpers import traced
 

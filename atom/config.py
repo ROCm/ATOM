@@ -2036,6 +2036,13 @@ class Config:
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
     )
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
+    # Model-level Mono decode policy (currently consumed by DeepSeek-V4).
+    # ``auto`` is the production default:
+    # supported deployments install the backend and each step is admitted by its
+    # runtime contract; unsupported deployments/steps keep the native path.
+    # ``off`` is the rollback switch, while ``force`` turns every refusal into a
+    # visible error for qualification and benchmarking.
+    mono_decode: str = "auto"
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
     mark_trace: bool = False
@@ -2160,6 +2167,13 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
+        self.mono_decode = str(self.mono_decode or "auto").strip().lower()
+        if self.mono_decode not in ("auto", "off", "force"):
+            raise ValueError(
+                "mono_decode must be one of {'auto', 'off', 'force'}, "
+                f"got {self.mono_decode!r}"
+            )
+
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )

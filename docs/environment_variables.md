@@ -311,7 +311,7 @@ from `GPU_MAX_HW_QUEUES`, not from where the forks sit.
 
 ## V4 attention backend (Migration)
 
-Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`
+Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4/model.py`
 and the new batched `V4AttentionBackend` (`atom/model_ops/v4_attention_backend.py`).
 The new backend removes ~256 GPU→CPU `.item()` syncs per forward and is required
 to enable CUDAGraph capture for V4. Legacy stays available during PR-A migration

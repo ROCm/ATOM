@@ -12,7 +12,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.deepseek_v4.mono.config import EPS, FP8_MAX, ROUTE_SCALE
-from atom.models.deepseek_v4.mono.contract import MIN_I32, THREADS, TL_COLS, WAVES
+from atom.models.deepseek_v4.mono.kernels.plan import MIN_I32, THREADS, TL_COLS, WAVES
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device import flydsl_helpers as helpers
 from atom.mono.device.flydsl_helpers import SHARED_SOURCE_KEY, LaunchState, traced

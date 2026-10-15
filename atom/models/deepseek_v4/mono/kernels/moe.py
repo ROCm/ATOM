@@ -9,7 +9,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import SCALE_BM
-from atom.models.deepseek_v4.mono.contract import (
+from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
+from atom.models.deepseek_v4.mono.kernels.plan import (
     ROUTER_TILE,
     UG8,
     UG_TILE,
@@ -17,7 +18,6 @@ from atom.models.deepseek_v4.mono.contract import (
     ffn_hcc,
     router_spt,
 )
-from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device.flydsl_helpers import traced
 from atom.mono.device.flydsl_primitives import (

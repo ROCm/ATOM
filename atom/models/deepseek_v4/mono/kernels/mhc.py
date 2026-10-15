@@ -9,7 +9,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS
-from atom.models.deepseek_v4.mono.contract import ROW_TILE
+from atom.models.deepseek_v4.mono.kernels.plan import ROW_TILE
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device.flydsl_helpers import traced
 from atom.mono.device.flydsl_primitives import (

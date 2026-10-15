@@ -11,7 +11,12 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS, ROPE_DIM
-from atom.models.deepseek_v4.mono.contract import (
+from atom.models.deepseek_v4.mono.kernels.common import (
+    FP4_MAX,
+    fp4_roundtrip,
+    pow2_ceil,
+)
+from atom.models.deepseek_v4.mono.kernels.plan import (
     IH_TASK,
     MIN_I32,
     Q_B_TILE,
@@ -20,11 +25,6 @@ from atom.models.deepseek_v4.mono.contract import (
     THREADS,
     WAVES,
     q_b_groups,
-)
-from atom.models.deepseek_v4.mono.kernels.common import (
-    FP4_MAX,
-    fp4_roundtrip,
-    pow2_ceil,
 )
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device.flydsl_helpers import traced

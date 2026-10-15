@@ -9,7 +9,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS, ROPE_DIM
-from atom.models.deepseek_v4.mono.contract import (
+from atom.models.deepseek_v4.mono.kernels.attn_pre import kv_quant
+from atom.models.deepseek_v4.mono.kernels.common import bf16x2_has_nan, wave_any
+from atom.models.deepseek_v4.mono.kernels.plan import (
     Q_B_TILE,
     ROW_TILE,
     SPLIT_KEYS,
@@ -17,8 +19,6 @@ from atom.models.deepseek_v4.mono.contract import (
     WAVES,
     o_a_spt,
 )
-from atom.models.deepseek_v4.mono.kernels.attn_pre import kv_quant
-from atom.models.deepseek_v4.mono.kernels.common import bf16x2_has_nan, wave_any
 from atom.mono.device import buffer_ops as bo
 from atom.mono.device.flydsl_helpers import traced
 

@@ -73,7 +73,21 @@ from atom.models.deepseek_v4.mono.config import (
     MoeMode,
     moe_format,
 )
-from atom.models.deepseek_v4.mono.contract import (
+from atom.models.deepseek_v4.mono.kernels.attention import attention_stages
+from atom.models.deepseek_v4.mono.kernels.attn_pre import (
+    compressor_helpers,
+    q_b_stage,
+    qkv_handoff_stages,
+    qkv_stages,
+)
+from atom.models.deepseek_v4.mono.kernels.common import common_defs
+from atom.models.deepseek_v4.mono.kernels.indexer import (
+    index_query_stages,
+    index_select_stages,
+)
+from atom.models.deepseek_v4.mono.kernels.mhc import hc_attn_stages
+from atom.models.deepseek_v4.mono.kernels.moe import ffn_stages
+from atom.models.deepseek_v4.mono.kernels.plan import (
     BLOCKS,
     LAYER_SLOTS,
     Q_B_TILE,
@@ -94,22 +108,8 @@ from atom.models.deepseek_v4.mono.contract import (
     stage_tasks,
     uv_tile,
 )
-from atom.models.deepseek_v4.mono.kernels.attention import attention_stages
-from atom.models.deepseek_v4.mono.kernels.attn_pre import (
-    compressor_helpers,
-    q_b_stage,
-    qkv_handoff_stages,
-    qkv_stages,
-)
-from atom.models.deepseek_v4.mono.kernels.common import common_defs
-from atom.models.deepseek_v4.mono.kernels.indexer import (
-    index_query_stages,
-    index_select_stages,
-)
-from atom.models.deepseek_v4.mono.kernels.mhc import hc_attn_stages
-from atom.models.deepseek_v4.mono.kernels.moe import ffn_stages
+from atom.models.deepseek_v4.mono.sources import SOURCES
 from atom.mono.device import buffer_ops as bo
-from atom.mono.device.flydsl_helpers import SHARED_SOURCE_KEY
 from atom.mono.device.flydsl_primitives import rsrc, uniform
 
 
@@ -427,7 +427,7 @@ def build_dsv4_kernel(
     )
     HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
     # `uv` stores one per-split weight in misc, so it must hold N_SPLIT of them
-    misc_words = max(HC_MISC + S * max(HC_COEF, 1), n_keys // SPLIT_KEYS)
+    misc_words = max(HC_MISC + S * max(HC_COEF, 1), N_KEYS // SPLIT_KEYS)
     H = heads
     W = npes
     G = BLOCKS
@@ -615,10 +615,10 @@ def build_dsv4_kernel(
         # radix-select bins, replicated, plus two words to broadcast the winning digit
         hist: fx.Array[fx.Int32, (TK_BC + 4) if IHD else 1, 16]
 
-    # the stages read this build's constants from bc; _cache_tag puts them in the JIT cache key,
-    # with the digest of the shared helper sources (outside this directory, so outside the key)
+    # Keep build-time constants and the complete device dependency digest in
+    # the JIT key, including layout/task plans and helpers in traced branches.
     bc = dict(locals())
-    _cache_tag = (SHARED_SOURCE_KEY,) + tuple(
+    _cache_tag = (SOURCES,) + tuple(
         (n, v)
         for n, v in sorted(bc.items())
         if isinstance(v, (bool, int, float, str, tuple, type(None), enum.Enum))
@@ -972,9 +972,11 @@ def build_advance_step(scr_pairs: int, sym_pairs: int):
     period = scrub_period(n)
     chunk = -(-n // period)
     per_thread = -(-chunk // THREADS)
+    _cache_tag = (SOURCES, scr_pairs, sym_pairs, THREADS, LAYER_SLOTS)
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def advance_kernel(step: Int64, scratch: Int64, sym: Int64):
+        _ = _cache_tag
         tid = fx.thread_idx.x
 
         def scrub(addr, new_base):

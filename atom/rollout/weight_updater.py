@@ -106,6 +106,17 @@ class WeightUpdaterMixin:
                 return model
             model = inner
 
+    def _v4_mono_session(self):
+        """Return the installed V4 Mono session when this host owns a model.
+
+        Small mixin-only tests intentionally exercise transport cleanup without
+        constructing ``self.model``.  Preserve that supported shape: lifecycle
+        notification is optional until a real ModelRunner has installed Mono.
+        """
+        if getattr(self, "model", None) is None:
+            return None
+        return getattr(self._sync_target_model(), "_v4_mono", None)
+
     def _warn_if_nothing_matched(self, updated: int, skipped: int) -> None:
         """A sync that matched nothing is the failure this whole path is about.
 
@@ -949,6 +960,9 @@ class WeightUpdaterMixin:
         Returns:
             Number of parameters successfully updated
         """
+        mono = self._v4_mono_session()
+        if mono is not None:
+            mono.invalidate_weights()
         param_to_module = self._get_param_to_module_mapping()
 
         updated = 0
@@ -1025,6 +1039,8 @@ class WeightUpdaterMixin:
             f"ignored_scales={ignored_scales}"
         )
         self._warn_if_nothing_matched(updated, skipped)
+        if mono is not None:
+            mono.weights_updated(cache_reset=clear_kv_cache)
         return updated
 
     @_discard_sync_state_on_error
@@ -1054,6 +1070,10 @@ class WeightUpdaterMixin:
         """
         from multiprocessing import shared_memory as _shm_mod
         from unittest.mock import patch
+
+        mono = self._v4_mono_session()
+        if mono is not None:
+            mono.invalidate_weights()
 
         # Open the existing shared-memory segment (do NOT unlink – caller owns it)
         with patch(
@@ -1155,6 +1175,8 @@ class WeightUpdaterMixin:
                 f"ignored_scales={ignored_scales}, is_last={is_last}"
             )
             self._warn_if_nothing_matched(updated, skipped)
+            if mono is not None and is_last:
+                mono.weights_updated(cache_reset=True)
             return updated
         finally:
             shm.close()
@@ -1197,6 +1219,10 @@ class WeightUpdaterMixin:
         Returns:
             Number of parameters successfully updated in this bucket.
         """
+        mono = self._v4_mono_session()
+        if mono is not None:
+            mono.invalidate_weights()
+
         # Cache the IPC buffer mapping: only open once per weight-update cycle.
         if not hasattr(self, "_ipc_buffer") or self._ipc_buffer is None:
             from atom.rollout.weight_sync import rebuild_ipc_handle
@@ -1325,4 +1351,6 @@ class WeightUpdaterMixin:
             f"ignored_scales={ignored_scales}, is_last={is_last}"
         )
         self._warn_if_nothing_matched(updated, skipped)
+        if mono is not None and is_last:
+            mono.weights_updated(cache_reset=True)
         return updated

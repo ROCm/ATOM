@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """DeepSeek-V4 Mono installation and deployment admission.
 
-The model executor stays in :mod:`runner`; this module owns the policy boundary
+The executor stays in :mod:`runner` and its serving lifecycle in :mod:`session`;
+this module owns the policy boundary
 that selects ordinary or MTP target decode and keeps unsupported deployments on
 the native path.
 """
@@ -15,7 +16,7 @@ from atom.models.deepseek_v4.mono.profile import (
     MTP3_TARGET_PROFILE,
     ORDINARY_PROFILE,
 )
-from atom.models.deepseek_v4.mono.runner import V4MonoSession
+from atom.models.deepseek_v4.mono.session import V4MonoSession
 from atom.mono.runtime.consensus import MonoUnsupported
 
 logger = logging.getLogger("atom")

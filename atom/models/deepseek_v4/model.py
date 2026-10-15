@@ -165,6 +165,52 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 SPARSE_INDEXER_LOGITS_BUDGET_MB = envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
 
 
+@lru_cache(1)
+def _aiter_mhc_runtime_capabilities() -> tuple[bool, bool]:
+    """Return the packed-weight and fused post/pre capabilities of module_mhc.
+
+    The Python mHC helpers and the prebuilt JIT extension can come from different
+    revisions.  Checking for ``mhc_shuffle_fn`` alone is unsafe: a stale extension
+    exposes the old ``is_fn_pack_bf16`` ABI, whose flag consumes FP32 weights, while
+    the current helper produces a pre-packed int32 BF16 hi/lo layout.  Feeding that
+    layout to the old kernel is accepted positionally and silently corrupts mHC.
+
+    Read the loaded pybind signatures once and keep optimized paths disabled unless
+    the extension advertises the current argument names.  The fallback keeps FP32
+    fn weights and uses the standalone mHC path, which is compatible with both ABIs.
+    """
+    if not hasattr(aiter, "mhc_shuffle_fn"):
+        return False, False
+    try:
+        from aiter.jit.core import get_module
+
+        module = get_module("module_mhc")
+        pre_doc = getattr(module.mhc_pre_gemm_sqrsum, "__doc__", "") or ""
+        fused_doc = getattr(module.mhc_fused_post_pre_gemm_sqrsum, "__doc__", "") or ""
+        big_fuse_doc = getattr(module.mhc_pre_big_fuse, "__doc__", "") or ""
+        packed_weights = "w_preshuffle_bf16" in pre_doc
+        fused_post_pre = (
+            packed_weights
+            and "w_preshuffle_bf16" in fused_doc
+            and "res_preshuffle" in fused_doc
+            and "res_preshuffle" in big_fuse_doc
+        )
+        if not (packed_weights and fused_post_pre):
+            logger.warning(
+                "AITER module_mhc uses a legacy ABI at %s; disabling packed BF16 "
+                "mHC weights and fused post/pre to preserve endpoint correctness",
+                getattr(module, "__file__", "<unknown>"),
+            )
+        return packed_weights, fused_post_pre
+    except Exception:
+        logger.warning(
+            "Unable to verify the loaded AITER module_mhc ABI; disabling packed "
+            "BF16 mHC weights and fused post/pre",
+            exc_info=True,
+        )
+        return False, False
+
+
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     if _V4_USE_TRITON_RMSNORM:
         return rmsnorm_nw(x, eps)
@@ -4146,13 +4192,14 @@ class Block(nn.Module):
         self._mhc_fused_post_pre = (
             getattr(aiter, "mhc_fused_post_pre", None) if _dim_ok else None
         )
+        mhc_packed_weights, mhc_fused_post_pre = _aiter_mhc_runtime_capabilities()
         self.enable_hc_fn_pack_bf16 = (
-            envs.ATOM_MHC_USE_BF16
-            and self._mhc_pre is not None
-            and hasattr(aiter, "mhc_shuffle_fn")
+            envs.ATOM_MHC_USE_BF16 and self._mhc_pre is not None and mhc_packed_weights
         )
         self.enable_fused_hc = (
-            self._mhc_fused_post_pre is not None and self.layer_id != 0
+            self._mhc_fused_post_pre is not None
+            and mhc_fused_post_pre
+            and self.layer_id != 0
         )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
@@ -4655,9 +4702,11 @@ class DeepseekV4Model(nn.Module):
         self.hc_eps = args.hc_eps
         self.hc_mult = args.hc_mult
         self._mhc_arch = get_gfx_runtime()
-        self.enable_res_preshuffle = hasattr(
-            aiter, "mhc_res_shuffle_enabled"
-        ) and aiter.mhc_res_shuffle_enabled(1, self._mhc_arch)
+        self.enable_res_preshuffle = (
+            _aiter_mhc_runtime_capabilities()[1]
+            and hasattr(aiter, "mhc_res_shuffle_enabled")
+            and aiter.mhc_res_shuffle_enabled(1, self._mhc_arch)
+        )
 
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
@@ -4706,7 +4755,7 @@ class DeepseekV4Model(nn.Module):
         """Pack the head's constant fn using AITER's architecture-specific layout."""
         if (
             not envs.ATOM_MHC_USE_BF16
-            or not hasattr(aiter, "mhc_shuffle_fn")
+            or not _aiter_mhc_runtime_capabilities()[0]
             or self.hc_head_fn.dtype == torch.int32
         ):
             return
@@ -4714,6 +4763,15 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_fn.data = aiter.mhc_shuffle_fn(
             self.hc_head_fn.data.contiguous().float()
         )
+
+    def mhc_input(
+        self, input_ids: torch.Tensor, res_preshuffle: bool = False
+    ) -> torch.Tensor:
+        """Shared ordinary/Mono token embedding and mHC entry."""
+        h = self.embed(input_ids)
+        if hasattr(aiter, "mhc_res_repeat"):
+            return aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
+        return h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -4734,20 +4792,14 @@ class DeepseekV4Model(nn.Module):
         # out of the compiled graph). So everything here runs on the 1/W shard;
         # the K/V all-gather inside attention reconstructs full KV per layer,
         # and the final all-gather + un-pad happens back in the caller.
-        h = self.embed(input_ids)  # [num_tokens, dim]
         # Keep this static: concrete-M gating is handled inside AITER custom ops.
         # Checking h.size(0) here would specialize the compiled graph to warmup M.
         res_preshuffle = self.enable_res_preshuffle and (
             self.layers[0]._mhc_fused_post_pre is not None
         )
-        if hasattr(aiter, "mhc_res_repeat"):
-            # Aiter writes either the ordinary repeated residual or the shuffled
-            # gfx1250 layout directly, without materializing repeat + shuffle.
-            h = aiter.mhc_res_repeat(h, self.hc_mult, res_preshuffle)
-        else:
-            # Older AITER versions only support the ordinary residual layout.
-            h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if not hasattr(aiter, "mhc_res_repeat"):
             res_preshuffle = False
+        h = self.mhc_input(input_ids, res_preshuffle)
         hc_state = HCState(
             residual=h,
             post_mix=None,
@@ -4889,6 +4941,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         # `model.forward` — production runner, warmup, benchmarks — gets
         # correct hash routing without a separate setup step.
         ctx = get_forward_context()
+
+        # The runner publishes real metadata before eager/captured dispatch.
+        # Keep host admission outside the internal torch.compile boundary.
+        mono = getattr(self, "_v4_mono", None)
+        if mono is not None and mono.armed:
+            return mono.forward(input_ids, positions)
 
         # ===== PCP: round-robin-split the prefill sequence OUTSIDE torch.compile =====
         # PCP splits the prefill query sequence across the PCP group (full-KV

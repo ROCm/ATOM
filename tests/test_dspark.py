@@ -1869,12 +1869,14 @@ def test_custom_op_bodies_only_call_methods_that_exist():
 
     try:
         import atom.models.deepseek_v4 as v4
+
+        _ = v4.model
     except ImportError as e:
         if "aiter" not in str(e) and "forward_context" not in str(e):
             raise
         pytest.skip(f"deepseek_v4 not importable here: {e}")
 
-    tree = ast.parse(inspect.getsource(v4))
+    tree = ast.parse(inspect.getsource(v4.model))
     # The module-level functions registered as custom ops: named in a
     # `direct_register_custom_op` call, or decorated with `mark_spliting_op`.
     registered = set()
@@ -1939,6 +1941,8 @@ def test_every_op_fake_agrees_with_its_body():
 
     try:
         import atom.models.deepseek_v4 as v4
+
+        _ = v4.model
     except ImportError as e:
         if "aiter" not in str(e) and "forward_context" not in str(e):
             raise
@@ -2085,6 +2089,8 @@ def test_qk_norm_rope_shapes_match_what_the_paged_kernel_asserts():
 
     try:
         import atom.models.deepseek_v4 as v4
+
+        _ = v4.model
         from atom.model_ops.v4_kernels.v4_quant import (
             V4_DIM_NOPE,
             V4_DIM_QK_PACKED,
@@ -2343,6 +2349,8 @@ def test_sparse_attention_sizes_on_the_q_not_positions():
 
     try:
         import atom.models.deepseek_v4 as v4
+
+        _ = v4.model
     except ImportError as e:
         if "aiter" not in str(e) and "forward_context" not in str(e):
             raise

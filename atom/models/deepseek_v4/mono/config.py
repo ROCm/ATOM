@@ -355,7 +355,7 @@ class V4Config:
 def shape_dims(cfg) -> dict:
     """The shape arguments layout(), stage_tasks() and build_dsv4_kernel() must share identically.
 
-    The JIT disk cache does not key on layout()/stage_tasks(): edit them with FLYDSL_RUNTIME_ENABLE_CACHE=0.
+    sources.SOURCES explicitly keys the device plans and all traced helpers.
     """
     return {
         "hidden": cfg.hidden,

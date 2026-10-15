@@ -19,7 +19,7 @@ from atom.models.deepseek_v4.mono.config import (
     shape_dims,
     validate_shard,
 )
-from atom.models.deepseek_v4.mono.contract import TL_COLS, stage_tasks
+from atom.models.deepseek_v4.mono.kernels.plan import TL_COLS, stage_tasks
 from atom.models.deepseek_v4.mono.state import Dsv4Variant, fp4_pool_shapes
 from atom.models.deepseek_v4.mono.weights import LayerWeights, pack_layer_weights
 

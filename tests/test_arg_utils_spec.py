@@ -135,6 +135,26 @@ class TestMoEBackendCli:
         assert args._get_engine_kwargs()["moe_backend"] == "mega"
 
 
+class TestMonoDecodeCli:
+    def _parse(self, argv):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_is_auto(self):
+        args = self._parse([])
+
+        assert args.mono_decode == "auto"
+        assert args._get_engine_kwargs()["mono_decode"] == "auto"
+
+    @pytest.mark.parametrize("policy", ["auto", "off", "force"])
+    def test_explicit_policy(self, policy):
+        args = self._parse(["--mono-decode", policy])
+
+        assert args.mono_decode == policy
+        assert args._get_engine_kwargs()["mono_decode"] == policy
+
+
 class TestMoEAll2AllBackendCli:
     def _parse(self, argv):
         parser = argparse.ArgumentParser()
