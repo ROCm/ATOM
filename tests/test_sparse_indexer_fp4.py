@@ -20,6 +20,7 @@ import torch
 
 from atom.model_ops import sparse_indexer_fp4
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.sparse_indexer_chunk import dcp_qsplit_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
     FP4_MQA_BLOCK_K,
@@ -794,6 +795,81 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
     _assert_agrees(logits, want, local_ends, topk=256)
 
 
+@pytest.mark.parametrize("row_lo", [256, 512, 768])
+def test_prefill_scores_a_restricted_row_range_the_same_as_the_whole_batch(
+    on_gfx950, row_lo
+):
+    """A rank's row slice must score exactly as those rows do in the full batch.
+
+    This is what the DCP query-row split relies on and what the CPU partition
+    tests cannot reach: rank r is handed ``slice(row_lo, row_lo + stride)`` with
+    a NONZERO start, and `_prefill_mqa_logits_fp4` has to rebuild its ragged
+    schedule for that partial batch -- `cta_info` encodes absolute row ids, so a
+    schedule reused or rebuilt wrong shows up as rows scored against the wrong
+    window. Compared bit-for-bit against the same rows of a whole-batch run, on
+    the same cache: both sides are the same kernel on the same bytes, so any
+    difference is an offset bug, not arithmetic.
+    """
+    from atom.models.deepseek_v2 import _prefill_mqa_logits_fp4
+
+    torch.manual_seed(1)
+    batch, ctx_len = 2, 512
+    table, num_blocks, token, seq, slots = _paged_layout(batch, ctx_len)
+    q_fp4, q_scale, weights_out, kv_cache, kv_scale = _fused_fp4(
+        slots, token, num_blocks, weight_gain=0.1
+    )
+    rows = batch * ctx_len
+    local_ends = (token + 1).to(torch.int32)
+    row_to_batch = seq.to(torch.int32)
+    cta_info, n_ctas, local_starts = fp4_prefill_schedule(
+        row_to_batch, local_ends, FP4_MQA_BLOCK_K, rows, ctx_len
+    )
+    meta = SimpleNamespace(
+        batch_id_per_q_token=row_to_batch,
+        block_tables=table,
+        indexer_fp4_local_starts=local_starts,
+        indexer_fp4_local_ends=local_ends,
+        indexer_fp4_max_seq_len=ctx_len,
+        indexer_fp4_cta_info=cta_info,
+        indexer_fp4_n_ctas=n_ctas,
+    )
+
+    def score(chunk, whole_batch):
+        return _prefill_mqa_logits_fp4(
+            meta,
+            chunk,
+            whole_batch,
+            q_fp4[chunk],
+            q_scale[chunk],
+            weights_out[chunk],
+            kv_cache,
+            kv_scale,
+            WEIGHTS_SCALE,
+            _BLOCK,
+            table,
+        )
+
+    full = score(slice(0, rows), True)
+    stride = 256
+    part = score(slice(row_lo, row_lo + stride), False)
+    assert part.shape[0] == stride
+
+    # Compare only inside each row's own window. Outside it the buffer is
+    # scratch that no reader looks at -- `top_k_per_row_prefill` is handed the
+    # same starts/ends and never indexes past them -- so a mismatch there says
+    # nothing about the scoring.
+    want = full[row_lo : row_lo + stride]
+    starts = local_starts[row_lo : row_lo + stride].to(torch.int64)
+    ends = local_ends[row_lo : row_lo + stride].to(torch.int64)
+    cols = torch.arange(part.shape[1], device=part.device).unsqueeze(0)
+    in_window = (cols >= starts.unsqueeze(1)) & (cols < ends.unsqueeze(1))
+    assert int(in_window.sum()) > 0, "window mask selected nothing -- test bug"
+    assert torch.equal(part[in_window], want[in_window]), (
+        f"rows [{row_lo}, {row_lo + stride}) scored differently as a partial "
+        f"batch than as part of the whole batch, inside their own windows"
+    )
+
+
 def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
     """The gfx950 decode scorer over `rows` query rows, each its own KV
     sequence, with fixed-address step metadata the test republishes. Batch
@@ -936,3 +1012,104 @@ def test_v4_fp4_decode_scores_a_dp_padded_batch_wider_than_its_rows(
         bounds = publish(counts, 16, 1)
         torch.cuda.synchronize()
         check(run(16), counts, bounds)
+
+
+def _qsplit_roundtrip(full_topk, world_size, sentinel=-7):
+    """Replay what the DCP prefill path does to a selection, on one process.
+
+    Modelled the way the path actually runs it: ONE buffer of
+    ``world_size`` strides, each rank writing the rows it scored into its own
+    slot, which is what the in-place all-gather makes the ranks agree on. The
+    first ``num_rows`` rows are then the result. Everything else is filled with
+    a sentinel, so a failure tells us whether an unwritten row leaked into the
+    result rather than just that something moved.
+    """
+    num_rows, topk = full_topk.shape
+    stride = dcp_qsplit_rows(num_rows, 0, world_size)[0]
+    gathered = torch.full((stride * world_size, topk), sentinel, dtype=full_topk.dtype)
+    for rank in range(world_size):
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
+        assert rows_per_rank == stride
+        gathered[slot_lo : slot_lo + (row_hi - row_lo)] = full_topk[row_lo:row_hi]
+    return gathered[:num_rows]
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+@pytest.mark.parametrize(
+    "num_rows",
+    [
+        4096,  # divides evenly
+        4097,  # one row over -- the last rank carries a single row
+        4095,  # one row under -- the last rank's tail is padding
+        12,  # small but still even
+        7,  # fewer rows than ranks at W=8, uneven at W=4
+        3,  # fewer rows than ranks at both widths
+        1,  # one row, every other rank is empty
+    ],
+)
+def test_qsplit_reassembles_the_unsplit_selection_exactly(num_rows, world_size):
+    """Reassembly must return the selection the unsplit path would.
+
+    Splitting the QUERY rows leaves each rank scoring its rows against the whole
+    key set, so its top-k is the global one; what remains between "scored" and
+    "used" is the partition and the reassembly, which is what this pins.
+    Compared element-wise against the unsplit tensor, not against a tolerance --
+    there is no arithmetic here to be approximate about.
+
+    The scorer under a restricted row range is the other half, and it needs a
+    GPU: see test_prefill_scores_a_restricted_row_range_the_same_as_the_whole_batch.
+    """
+    torch.manual_seed(num_rows * 100 + world_size)
+    full = torch.randint(0, 1 << 20, (num_rows, 2048), dtype=torch.int32)
+    out = _qsplit_roundtrip(full, world_size)
+    assert out.shape == full.shape
+    assert torch.equal(out, full)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_rows", [1, 3, 7, 12, 4095, 4096, 4097])
+def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
+    """Every row belongs to exactly one rank, and the padding is bounded.
+
+    The reassembly above would also pass if two ranks claimed the same row and
+    a third claimed none, as long as the concatenation happened to line up, so
+    pin the partition itself: the slices tile [0, num_rows) in order, the
+    stride is uniform, and the gathered payload exceeds num_rows by less than
+    world_size rows (this is the padding the all-gather pays for).
+    """
+    seen = []
+    strides = set()
+    slots = []
+    for rank in range(world_size):
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
+        strides.add(rows_per_rank)
+        assert row_lo <= row_hi <= num_rows
+        assert row_hi - row_lo <= rows_per_rank
+        # The slot is where the in-place all-gather reads this rank's input
+        # from, so it must be the rank's OWN stride -- including for a rank
+        # with no rows, whose clamped row range sits in a lower rank's slot.
+        assert slot_lo == rank * rows_per_rank
+        # A rank with rows scores at the head of its own slot; one without
+        # rows has a clamped, empty range that must NOT be read as a slot.
+        assert row_lo == row_hi or (
+            row_lo == slot_lo and row_hi <= slot_lo + rows_per_rank
+        )
+        slots.append((slot_lo, slot_lo + rows_per_rank))
+        seen.extend(range(row_lo, row_hi))
+    assert seen == list(range(num_rows))
+    assert len(strides) == 1
+    stride = strides.pop()
+    gathered_rows = stride * world_size
+    assert num_rows <= gathered_rows < num_rows + world_size
+    # The slots tile the gathered buffer exactly, in rank order: no two ranks
+    # read from the same rows, and the last slot ends at the buffer's end.
+    assert slots == [(r * stride, (r + 1) * stride) for r in range(world_size)]
+
+
+def test_qsplit_degenerates_to_the_whole_range_without_dcp():
+    """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
+    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)

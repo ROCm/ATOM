@@ -171,6 +171,13 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
+def _drop_shipped_chains(seqs: list[Sequence]) -> None:
+    """Free the prompt hash chains once sent: the engine has its copy, and the
+    API server would otherwise hold one per request until it finishes."""
+    for seq in seqs:
+        seq.prompt_hash_chain = None
+
+
 class CoreManager:
     def _init_shared_state(
         self,
@@ -930,17 +937,20 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
-        if self.pp_size > 1:
-            # Pipeline parallel (dp=1): requests enter only at stage 0, which
-            # drives the pipeline downstream.
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
-        else:
-            self._dispatch_to_dp_ranks(seqs)
+        try:
+            if self.pp_size > 1:
+                # Pipeline parallel (dp=1): requests enter only at stage 0, which
+                # drives the pipeline downstream.
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
+                self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            elif self._routable_engine_count == 1:
+                # Single routable engine, send all requests
+                logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
+                self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            else:
+                self._dispatch_to_dp_ranks(seqs)
+        finally:
+            _drop_shipped_chains(seqs)
 
     @property
     def _routable_engine_count(self) -> int:
@@ -2072,23 +2082,26 @@ class DisaggCoreManager(CoreManager):
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
 
-        # Send decode payload as-is.
-        decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
-        self._send_request(1, decode_payload)
+        try:
+            # Send decode payload as-is.
+            decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
+            self._send_request(1, decode_payload)
 
-        # For prefill: limit each sequence to 1 output token.  Prefill discards
-        # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
-        # ensures the forward pass terminates after a single generate step and
-        # that num_scheduled_tokens correctly reflects only the prompt tokens.
-        import copy as _copy
+            # For prefill: limit each sequence to 1 output token.  Prefill discards
+            # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
+            # ensures the forward pass terminates after a single generate step and
+            # that num_scheduled_tokens correctly reflects only the prompt tokens.
+            import copy as _copy
 
-        prefill_seqs = []
-        for seq in seqs:
-            ps = _copy.copy(seq)
-            ps.max_tokens = 1
-            prefill_seqs.append(ps)
-        prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-        self._send_request(0, prefill_payload)
+            prefill_seqs = []
+            for seq in seqs:
+                ps = _copy.copy(seq)
+                ps.max_tokens = 1
+                prefill_seqs.append(ps)
+            prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
+            self._send_request(0, prefill_payload)
+        finally:
+            _drop_shipped_chains(seqs)
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"

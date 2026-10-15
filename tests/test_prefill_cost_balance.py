@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 
+from atom.model_engine import block_manager as bm_module
 from atom.model_engine.scheduler import Scheduler
 
 
@@ -108,10 +109,11 @@ def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
     assert delayer.reported == [0.0]
 
 
-def test_estimate_keeps_the_head_prompt_hashes(monkeypatch, seq_factory):
+def test_estimate_keeps_the_head_walk(monkeypatch, seq_factory):
     """The estimate probes the waiting head on every tick with prefill work.
-    Its prompt-block hashes are kept between ticks (content hashes only: pool
-    hits are rechecked), so a repeat probe hashes nothing and costs the same."""
+    Its prompt-block hashes and its prefix walk are kept between ticks
+    (`can_allocate_memoized`), so a repeat probe walks and hashes nothing and
+    costs the same."""
     sched = _sched(monkeypatch, prefix_caching=True)
     prefix = list(range(100, 132))
     _cached_prefix(sched, seq_factory, prefix)
@@ -120,13 +122,21 @@ def test_estimate_keeps_the_head_prompt_hashes(monkeypatch, seq_factory):
     hashed = []
     real = bm.compute_hash
     monkeypatch.setattr(bm, "compute_hash", lambda *a: hashed.append(a) or real(*a))
+    # The fast prefix walk hashes a missing chain in bulk instead.
+    bulk = bm_module.chained_block_hashes
+    monkeypatch.setattr(
+        bm_module, "chained_block_hashes", lambda *a: hashed.append(a) or bulk(*a)
+    )
+    walks = []
+    walk = bm._walk_prefix
+    monkeypatch.setattr(bm, "_walk_prefix", lambda s: walks.append(s) or walk(s))
     # 8 cached blocks of 4 tokens: the chunk is the 32 new tokens after them.
     cost = sched._estimate_prefill_chunk_cost()
     assert cost == sched._chunk_cost(32, 32)
-    assert hashed
+    assert hashed and len(walks) == 1
     first_probe = len(hashed)
     assert sched._estimate_prefill_chunk_cost() == cost
-    assert len(hashed) == first_probe
+    assert len(hashed) == first_probe and len(walks) == 1
 
 
 def test_balanced_admission_takes_exactly_the_cached_prefix(monkeypatch, seq_factory):

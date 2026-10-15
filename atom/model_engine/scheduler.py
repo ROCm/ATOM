@@ -960,9 +960,8 @@ class Scheduler:
             else:
                 if probed_tokens >= budget:
                     break
-                cached_blocks = self.block_manager.can_allocate(
-                    seq, record=False, reuse_hashes=True
-                )
+                # The exact probe's answer; the walk is memoised across ticks.
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
@@ -1091,7 +1090,7 @@ class Scheduler:
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch
         budget: resumable partials first, then the head of `waiting`, probing
-        the prefix cache without recording (`can_allocate(record=False)`). An
+        the prefix cache without recording (`can_allocate_memoized`). An
         estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
@@ -1122,12 +1121,9 @@ class Scheduler:
                     seq, resume, hit=seq.replays_hit
                 )
             else:
-                # Runs on every tick with prefill work, holds included: keep
-                # the head's prompt-block hashes instead of rehashing its
-                # cached prefix each time.
-                cached_blocks = self.block_manager.can_allocate(
-                    seq, record=False, reuse_hashes=True
-                )
+                # Runs on every tick with prefill work, holds included: reuse
+                # the walk across ticks; the answer is the exact probe's.
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
@@ -2989,7 +2985,6 @@ class Scheduler:
             seq,
             record=False,
             block_hashes=block_hashes,
-            reuse_hashes=self._local_prefill_coalescing,
         )
         return num_cached_blocks, block_hashes
 

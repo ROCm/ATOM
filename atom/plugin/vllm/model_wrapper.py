@@ -615,10 +615,35 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 if self._is_deepseek_v4_mtp
                 else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
             )
+            # The MTP draft's layers live in the target's slot, as natively:
+            # its proxy only carries the drafter's metadata and reuses the
+            # target proxy's KV, so vLLM gives it no pages of its own.
             register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
+                kv_sharing_target_layer_name=(
+                    ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+                    if self._is_deepseek_v4_mtp
+                    else None
+                ),
             )
+            if not self._is_deepseek_v4_mtp:
+                from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+                    deepseek_v4_state_checkpoint_copy_funcs,
+                    deepseek_v4_state_checkpoints_on,
+                    register_deepseek_v4_state_checkpoint_layers,
+                )
+
+                if deepseek_v4_state_checkpoints_on(vllm_config):
+                    # Prefix hits restore the slot from k state-checkpoint
+                    # blocks vLLM manages as MambaSpec(align) groups. This
+                    # worker's config has to say "align" before the input
+                    # batch sizes its block tables at KV-cache init.
+                    vllm_config.cache_config.mamba_cache_mode = "align"
+                    register_deepseek_v4_state_checkpoint_layers(vllm_config)
+                    self.get_mamba_state_copy_funcs = (
+                        deepseek_v4_state_checkpoint_copy_funcs
+                    )
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.

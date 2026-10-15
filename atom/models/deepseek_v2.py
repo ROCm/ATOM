@@ -110,7 +110,10 @@ from atom.model_ops.linear import (
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    dcp_qsplit_rows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -1602,8 +1605,16 @@ def sparse_attn_indexer(
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
 ) -> None:
+    # Room for the DCP prefill all-gather to land in place. It produces
+    # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
+    # than there are prefill rows; giving the allocation that slack is what
+    # lets the gather write straight into this tensor instead of through a
+    # staging buffer. Those trailing rows are never read: the owned-slot filter
+    # sizes its grid from `dsa_kv_indptr` (`num_tokens = shape[0] - 1` in
+    # `triton_filter_and_convert_dcp_index_prefill`), not from this tensor.
+    _dcp_gather_slack = max(get_dcp_world_size() - 1, 0)
     topk_indices = torch.empty(
-        hidden_states.shape[0],
+        hidden_states.shape[0] + _dcp_gather_slack,
         topk_tokens,
         dtype=torch.int32,
         device=hidden_states.device,
@@ -1823,11 +1834,20 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # Under DCP every rank holds the whole gathered index cache, so having
+        # all W of them score every row recomputes the SAME top-k W times.
+        # Score only this rank's slice of the QUERY ROWS instead: against the
+        # full key set, so the top-k is the EXACT global one, and the
+        # [rows, topk] selections are all-gathered back below. At dcp=1 this
+        # degenerates to the whole range, which is the original behaviour.
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, get_dcp_rank(), get_dcp_world_size()
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        chunk_tokens = sparse_indexer_row_chunk(
+            max(row_hi - row_lo, 1), row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
+        for chunk_start in range(row_lo, row_hi, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, row_hi)
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -1836,7 +1856,11 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    # `_prefill_mqa_logits_fp4` rebuilds its ragged schedule
+                    # whenever it is handed less than the whole batch, because
+                    # cta_info encodes absolute row ids. Under DCP the row
+                    # range is a rank's slice, which is such a partial batch.
+                    get_dcp_world_size() == 1 and chunk_tokens == num_rows,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
@@ -1881,6 +1905,33 @@ def sparse_attn_indexer(
             # virtual-block layout, and COMPACT them to the front -- the same
             # treatment the decode path gets, with the row unit being a query token
             # instead of a request.
+            # Gather the selections in place. Rank-major concatenation lands
+            # back in ROW order because the split is contiguous with a uniform
+            # stride: rank r scored [r*rows_per_rank, (r+1)*rows_per_rank), so
+            # gathered row i IS row i, and scoring already wrote those rows
+            # here. The gather region is `world_size` whole strides, which runs
+            # up to `_dcp_gather_slack` rows past the prefill rows; the tail is
+            # uninitialised and never read.
+            gather_rows = rows_per_rank * get_dcp_world_size()
+            gather_region = topk_indices[
+                num_decode_tokens : num_decode_tokens + gather_rows, :topk_tokens
+            ]
+            # In-place all-gather: the input is this rank's own slot inside the
+            # output, which is the form RCCL/NCCL supports. Called on the
+            # process group directly because the group wrapper's `all_gather`
+            # only has an out-of-place form, which would allocate and copy --
+            # the two things this is removing.
+            # `slot_lo`, not `row_lo`: the input must be this rank's OWN slot,
+            # and `row_lo` is clamped to the row count for scoring, so a rank
+            # with no rows would hand in a lower rank's slot instead.
+            torch.distributed.all_gather_into_tensor(
+                gather_region,
+                gather_region[slot_lo : slot_lo + rows_per_rank],
+                group=get_dcp_group().device_group,
+            )
+            # The filter below must be handed the WHOLE `topk_indices`: it calls
+            # `.contiguous()` on what it gets, so passing a row slice would
+            # silently copy the very bytes this gather just avoided moving.
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,

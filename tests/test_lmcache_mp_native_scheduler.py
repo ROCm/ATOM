@@ -4,6 +4,7 @@
 
 from collections import deque
 from types import SimpleNamespace
+from weakref import WeakKeyDictionary
 
 import pytest
 from conftest import MockConfig
@@ -124,6 +125,14 @@ def make_scheduler(
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
+    )
+    manager._prompt_hash_chains = WeakKeyDictionary()
+    manager._prompt_hashes = lambda seq: BlockManager._prompt_hashes(manager, seq)
+    manager._adopt_shipped_chain = lambda seq: BlockManager._adopt_shipped_chain(
+        manager, seq
+    )
+    manager._block_hash = lambda seq, chain, i, prev: BlockManager._block_hash(
+        manager, seq, chain, i, prev
     )
     manager.prefix_hash_chain = lambda seq, hashes, blocks: BlockManager._chain_to(
         manager, seq, hashes, blocks
