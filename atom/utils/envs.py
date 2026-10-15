@@ -199,11 +199,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
     # whose chunk attends long contexts is that straggler. The ranks exchange
-    # the estimated cost of their chunk on the PrefillDelayer's per-tick
-    # all_reduce (cost = new tokens x (TOKEN_WEIGHT + prior context + new / 2);
+    # the estimated cost of their chunk on the scheduler's per-tick DP schedule
+    # sync (cost = new tokens x (TOKEN_WEIGHT + prior context + new / 2);
     # estimated only by ranks with prefill work) and on a prefill step aim at
     # min(costliest, mean x (1 + SLACK)): a rank above it takes fewer tokens
-    # (never fewer than MIN_TOKENS).
+    # (never fewer than MIN_TOKENS). Independent of ATOM_ENABLE_PREFILL_DELAYER:
+    # with both on, the delayer's counts and the costs share one all_reduce.
+    "ATOM_DP_PREFILL_BALANCE": lambda: (
+        os.getenv("ATOM_DP_PREFILL_BALANCE", "1") == "1"
+    ),
     "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT": lambda: _int_env(
         "ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT", 360000
     ),

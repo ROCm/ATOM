@@ -43,6 +43,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
     "ATOM_MEGA_MASK_PAD_ROWS",
+    "ATOM_DP_PREFILL_BALANCE",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -153,6 +154,9 @@ class TestEnvsDefaults:
     def test_mega_mask_pad_rows_default_enabled(self):
         assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is True
 
+    def test_dp_prefill_balance_default_enabled(self):
+        assert _get_envs().ATOM_DP_PREFILL_BALANCE is True
+
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
             _ = _get_envs().ATOM_NONEXISTENT_VAR
@@ -165,6 +169,11 @@ class TestEnvsOverrides:
     def test_mhc_use_bf16_override(self, monkeypatch, value, expected):
         monkeypatch.setenv("ATOM_MHC_USE_BF16", value)
         assert _get_envs().ATOM_MHC_USE_BF16 is expected
+
+    @pytest.mark.parametrize("value, expected", [("0", False), ("1", True)])
+    def test_dp_prefill_balance_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE", value)
+        assert _get_envs().ATOM_DP_PREFILL_BALANCE is expected
 
     def test_dp_rank_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_RANK", "3")

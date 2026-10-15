@@ -62,6 +62,7 @@ from atom.model_engine.state_runtime import (
 from atom.utils import envs
 
 if TYPE_CHECKING:
+    from atom.model_engine.dp_schedule_sync import DPScheduleSync
     from atom.model_engine.prefill_delayer import PrefillDelayer
 
 logger = logging.getLogger("atom")
@@ -583,16 +584,19 @@ class Scheduler:
     ):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        # DP prefill cost balancing, on whenever DP attention runs more than
-        # one rank: every rank estimates the cost of its chunk at the whole
-        # batch budget; the ranks then aim at one cost target, a costlier rank
-        # shrinking its chunk. The costs ride the PrefillDelayer's all_reduce,
-        # so balancing needs the delayer (ATOM_ENABLE_PREFILL_DELAYER).
+        # DP prefill cost balancing (ATOM_DP_PREFILL_BALANCE, on by default)
+        # whenever DP attention runs more than one rank: every rank estimates
+        # the cost of its chunk at the whole batch budget; the ranks then aim at
+        # one cost target, a costlier rank shrinking its chunk. The costs travel
+        # on the per-tick DP schedule sync (`dp_sync`), independent of the
+        # PrefillDelayer: either runs without the other.
         dp_size = getattr(
             getattr(config, "parallel_config", None), "data_parallel_size", 1
         )
         self.cost_balance = (
-            getattr(config, "enable_dp_attention", False) and dp_size > 1
+            envs.ATOM_DP_PREFILL_BALANCE
+            and getattr(config, "enable_dp_attention", False)
+            and dp_size > 1
         )
         self._balance_token_weight = envs.ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT
         self._balance_slack = envs.ATOM_DP_PREFILL_BALANCE_SLACK
@@ -843,11 +847,17 @@ class Scheduler:
         self.prefill_delayer: PrefillDelayer | None = None
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
+        # Set by EngineCore under DP attention when the delayer or prefill cost
+        # balancing is on: the one cross-DP collective `schedule()` makes per tick.
+        self.dp_sync: DPScheduleSync | None = None
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
         self._local_prefill_coalescing = delayer is not None and delayer.is_local
         self._inflight_prefix_wait = {}
+
+    def set_dp_sync(self, sync: DPScheduleSync | None) -> None:
+        self.dp_sync = sync
 
     def _wait_for_inflight_prefix(self, seq: Sequence, cached_tokens: int) -> bool:
         """Bounded wait for a hybrid producer's planned prompt-end checkpoint."""
@@ -1136,15 +1146,16 @@ class Scheduler:
                 tokens += k
         return cost
 
-    def _balance_prefill_step(self, own: float) -> None:
+    def _balance_prefill_step(self, own: float, rank_costs: list[float]) -> None:
         """Set this prefill step's cost target from every DP rank's chunk cost.
 
-        The costs rode the delayer's all_reduce this tick (`own` is this rank's,
-        0 when it estimated none), so every rank sees the same list. The target
-        is the costliest chunk, lowered to `1 + slack` times the mean over the
-        ranks that prefill: a rank above it shrinks its chunk. No rank
-        reporting a cost means no rank has prefill work: nothing to balance."""
-        costs = [c for c in self.prefill_delayer.rank_prefill_costs if c > 0]
+        `rank_costs` came back from this tick's DP schedule sync, so every rank
+        holds the same list (`own` is this rank's estimate, 0 when it has none;
+        the sync rounded each cost up to a whole number). The target is the
+        costliest chunk, lowered to `1 + slack` times the mean over the ranks
+        that prefill: a rank above it shrinks its chunk. No rank reporting a
+        cost means no rank has prefill work: nothing to balance."""
+        costs = [c for c in rank_costs if c > 0]
         if not costs:
             return
         target = min(max(costs), sum(costs) / len(costs) * (1 + self._balance_slack))
@@ -1907,15 +1918,21 @@ class Scheduler:
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
 
-        # should_allow_prefill() runs a cross-DP all_reduce and MUST be called
-        # every tick on every rank for lockstep — hence before the early-return.
-        if self.prefill_delayer is not None:
+        # The PrefillDelayer and DP prefill cost balancing each read every DP
+        # rank before this rank builds its batch, through the one collective
+        # `dp_sync` makes per tick. Every rank MUST run it every tick for
+        # lockstep — hence before the early-return.
+        delayer = self.prefill_delayer
+        balancing = self.cost_balance and self.dp_sync is not None
+        delayer_signals = None
+        prefillable = False
+        if delayer is not None:
             # pending = fresh waiting new-tokens + resumable partials' remaining,
             # capped at the batch budget: the coalescer's accumulation signal.
             running_decode_batch = max(
                 0, len(self.running) - self._partial_prefill_count
             )
-            protects_decode = self.prefill_delayer.protects_decode(running_decode_batch)
+            protects_decode = delayer.protects_decode(running_decode_batch)
             if protects_decode or (
                 self._local_prefill_coalescing and not running_decode_batch
             ):
@@ -1936,39 +1953,46 @@ class Scheduler:
                     + self._partial_prefill_remaining_tokens(),
                     self.max_num_batched_tokens,
                 )
-            # DP prefill cost balancing: this rank's chunk cost rides the same
-            # all_reduce, estimated only when this rank has prefill work. Not
-            # skipped inside the decode-protection window: whether the delayer
-            # holds there depends on every rank's decode load, known only after
-            # the reduce (with no decode anywhere it fires through that window).
-            prefill_cost = (
-                self._estimate_prefill_chunk_cost()
-                if self.cost_balance and prefillable
-                else 0.0
-            )
-            delayer_allows = self.prefill_delayer.should_allow_prefill(
-                prefillable=prefillable,
-                pending_tokens=pending_tokens,
+            delayer_signals = {
+                "prefillable": prefillable,
+                "pending_tokens": pending_tokens,
                 # decode-only: self.running also holds mid-chunked-prefill seqs,
                 # which are NOT decode load — counting them would defeat the
                 # coalescer's "no decode → fire" fast path.
-                running_decode_batch=running_decode_batch,
-                kv_usage=0.0 if protects_decode else self._kv_usage(),
-                has_partial=self._partial_prefill_count > 0,
-                oldest_waiting_age_ms=(
+                "running_decode_batch": running_decode_batch,
+                "kv_usage": 0.0 if protects_decode else self._kv_usage(),
+                "has_partial": self._partial_prefill_count > 0,
+                "oldest_waiting_age_ms": (
                     self._oldest_waiting_prefill_age_ms()
-                    if not protects_decode
-                    and self.prefill_delayer.max_queue_ms is not None
+                    if not protects_decode and delayer.max_queue_ms is not None
                     else 0.0
                 ),
-                prefill_cost=prefill_cost,
+            }
+        # DP prefill cost balancing: this rank's chunk cost, estimated only when
+        # it has prefill work (as the delayer saw it, when that is on). Not
+        # skipped inside the decode-protection window: whether the delayer holds
+        # there depends on every rank's decode load, known only after the sum
+        # (with no decode anywhere it fires through that window).
+        prefill_cost = (
+            self._estimate_prefill_chunk_cost()
+            if balancing and (delayer is None or prefillable)
+            else 0.0
+        )
+        rank_costs: list[float] = []
+        if self.dp_sync is None:
+            # One scheduler drives every worker: its counts are the global ones.
+            delayer_allows = delayer is None or delayer.should_allow_prefill(
+                **delayer_signals
             )
         else:
-            delayer_allows = True
-            prefill_cost = 0.0
+            summed_counts, rank_costs = self.dp_sync.exchange(
+                None if delayer is None else delayer.local_counts(**delayer_signals),
+                prefill_cost,
+            )
+            delayer_allows = delayer is None or delayer.decide(summed_counts)
 
-        if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
-            self._balance_prefill_step(prefill_cost)
+        if balancing and delayer_allows:
+            self._balance_prefill_step(prefill_cost, rank_costs)
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:

@@ -17,9 +17,9 @@ bounded; the decode interval, backlog, and execution add to observed TTFT.
 
 Single-rank / TP-only mode
 --------------------------
-With ``is_local`` (``dp_size=1`` and ``cpu_group=None``) the delayer runs the same coalescer
-locally and skips the cross-rank ``all_reduce`` — a single scheduler drives all
-TP workers, so there is no cross-rank phase to align. Only the batching value
+With ``is_local`` (``dp_size=1``) the delayer runs the same coalescer on this
+scheduler's own counts (``should_allow_prefill``) — a single scheduler drives
+all TP workers, so there is no cross-rank phase to align. Only the batching value
 remains (fill / stall / ttft / kv bounds decide FIRE/HOLD from this rank's own
 counts); the ``n_prefillable < dp_size`` alignment gate is vacuous.
 EngineCore opts TP/DCP into this mode when DP=1, PP=1, the master switch is
@@ -35,8 +35,9 @@ must-fire bound forces release regardless.
 
 Decision (evaluated every tick, on every rank, in lockstep)
 -----------------------------------------------------------
-Each rank reports local state; a single cpu ``all_reduce(SUM)`` reduces it; then
-every rank computes the SAME FIRE/HOLD from the reduced values:
+Each rank reports local state (``local_counts``); the scheduler's DP schedule
+sync sums it over the ranks; then every rank computes the SAME FIRE/HOLD from
+the sums (``decide``):
 
   n_prefillable   = #ranks with admittable prefill (SUM of a 0/1 flag)
   G_pending       = total pending prefill tokens across ranks (fresh + partial
@@ -75,12 +76,14 @@ fires smaller — that is a request-routing problem, out of scope here.
 
 Cross-DP comms
 --------------
-Single ``all_reduce(SUM)`` over an 8-int64 cpu buffer (gloo-safe). Booleans are
-encoded as 0/1 and read back as ``sum > 0`` (logical OR). All timing is
-tick-based (``hold_ticks``), which is deterministic across ranks — no per-rank
-wall-clock, so ranks never diverge on a timeout boundary. Fail-open on a
-collective error (a peer dying should not crash schedule()); the guarded
-DP-state barrier drives shutdown.
+None of its own. The scheduler's ``DPScheduleSync`` (``dp_schedule_sync.py``)
+sums the eight counts with its one ``all_reduce(SUM)`` per tick over a cpu int64
+buffer (gloo-safe), shared with DP prefill cost balancing when that is on.
+Booleans are encoded as 0/1 and read back as ``sum > 0`` (logical OR). All
+timing is tick-based (``hold_ticks``), which is deterministic across ranks — no
+per-rank wall-clock, so ranks never diverge on a timeout boundary. Fail-open
+when the sum fails (``decide(None)``: a peer dying should not crash
+schedule()); the guarded DP-state barrier drives shutdown.
 """
 
 from __future__ import annotations
@@ -88,24 +91,22 @@ from __future__ import annotations
 import logging
 import os
 
-import torch
-
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0") == "1"
 
 
 class PrefillDelayer:
+    # Length of `local_counts`: the slots a DPScheduleSync reserves for them.
+    DECISION_SLOTS = 8
+
     __slots__ = (
-        "_cost_slots",
+        # episode state
         "_decode_interval_remaining",
         "_first",
         "_hold_ticks",
         "_prefill_executed_since_last_decision",
         "_prev_pending",
-        # buffer / episode state
-        "_rank",
-        "_reduce_buf",
         "_stall_count",
         # stats
         "_stat_fire_fill",
@@ -119,14 +120,12 @@ class PrefillDelayer:
         "_stat_hold",
         "_stat_hold_decode_interval",
         "_stat_log_every",
-        "cpu_group",
         "dp_size",
         "kv_high_watermark",
         "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
         "prefill_decode_interval",
-        "rank_prefill_costs",
         "stall_ticks",
         "target_fill",
         "token_usage_low_watermark",
@@ -136,7 +135,6 @@ class PrefillDelayer:
     def __init__(
         self,
         dp_size: int,
-        cpu_group,
         max_num_batched_tokens: int,
         target_fill: float = 0.9,
         ttft_max_ticks: int = 200,
@@ -146,12 +144,8 @@ class PrefillDelayer:
         token_usage_low_watermark: float | None = None,
         max_queue_ms: float | None = None,
         prefill_decode_interval: int = 0,
-        exchange_prefill_costs: bool = False,
     ):
-        if dp_size > 1 and cpu_group is None:
-            raise ValueError("Cross-DP prefill coalescing requires a CPU group")
         self.dp_size = dp_size
-        self.cpu_group = cpu_group
         self.max_num_batched_tokens = max_num_batched_tokens
 
         # target_fill is the fraction of a full prefill batch that must be
@@ -196,30 +190,6 @@ class PrefillDelayer:
                 f"got {prefill_decode_interval}"
             )
         self.prefill_decode_interval = prefill_decode_interval
-
-        # 8-slot SUM-reduce buffer (gloo-safe). Encoding:
-        #   slot 0 = prefillable        (SUM → n_prefillable)
-        #   slot 1 = pending_tokens     (SUM → G_pending; fresh + partial remain)
-        #   slot 2 = running_decode     (SUM → G_running_dec)
-        #   slot 3 = kv_high flag       (SUM>0 → any prefillable rank KV-high)
-        #   slot 4 = kv_low flag        (SUM>0 → any prefillable rank KV-low)
-        #   slot 5 = has_partial flag   (SUM>0 → any rank mid-chunked-prefill)
-        #   slot 6 = queue_hot flag     (SUM>0 → any rank's oldest waiting prefill
-        #                                aged past max_queue_ms; TTFT SLA guard)
-        #   slot 7 = prefill_ran flag   (SUM>0 → a rank completed a prefill
-        #                                forward on the previous scheduler tick)
-        # With exchange_prefill_costs (DP prefill cost balancing), dp_size more:
-        #   slot 8 + r = rank r's prefill chunk cost (one-hot, SUM → every
-        #                rank's cost), read back as rank_prefill_costs
-        self._cost_slots = dp_size if exchange_prefill_costs else 0
-        # The DP group is stateless (no default process group): ask it directly.
-        self._rank = (
-            cpu_group.rank() if self._cost_slots and cpu_group is not None else 0
-        )
-        self._reduce_buf = torch.zeros(
-            8 + self._cost_slots, dtype=torch.int64, device="cpu"
-        )
-        self.rank_prefill_costs: list[float] = []
 
         # Episode state. All ticks decide FIRE/HOLD in lockstep, so these evolve
         # identically on every rank (deterministic).
@@ -275,7 +245,7 @@ class PrefillDelayer:
 
     @property
     def is_local(self) -> bool:
-        return self.dp_size == 1 and self.cpu_group is None
+        return self.dp_size == 1
 
     def protects_decode(self, running_decode_batch: int) -> bool:
         """Whether the local decision can skip cache probes during protection."""
@@ -300,12 +270,53 @@ class PrefillDelayer:
         kv_usage: float = 0.0,
         has_partial: bool = False,
         oldest_waiting_age_ms: float = 0.0,
-        prefill_cost: float = 0.0,
     ) -> bool:
-        """Return True iff this rank may admit new prefills this tick (FIRE).
+        """Return True iff this scheduler may admit new prefills this tick
+        (FIRE). Must be called every tick; the arguments are `local_counts`'.
 
-        MUST be called every tick on every DP rank (it runs a cross-DP
-        all_reduce) so ranks stay in lockstep.
+        The single-scheduler form (``is_local``): this rank's counts are the
+        global ones. A cross-DP delayer decides from counts summed over the DP
+        ranks instead — ``local_counts`` → ``DPScheduleSync.exchange`` →
+        ``decide``, every tick on every rank, in lockstep.
+        """
+        if not self.is_local:
+            raise RuntimeError(
+                "a cross-DP PrefillDelayer decides from counts summed over the "
+                "DP ranks: local_counts() -> DPScheduleSync.exchange() -> decide()"
+            )
+        return self.decide(
+            self.local_counts(
+                prefillable,
+                pending_tokens,
+                running_decode_batch,
+                kv_usage,
+                has_partial,
+                oldest_waiting_age_ms,
+            )
+        )
+
+    def local_counts(
+        self,
+        prefillable: bool,
+        pending_tokens: int,
+        running_decode_batch: int = 0,
+        kv_usage: float = 0.0,
+        has_partial: bool = False,
+        oldest_waiting_age_ms: float = 0.0,
+    ) -> list[int]:
+        """This rank's ``DECISION_SLOTS`` decision counts for this tick, which
+        ``decide`` reads summed over the DP ranks:
+
+          0 = prefillable        (SUM → n_prefillable)
+          1 = pending_tokens     (SUM → G_pending; fresh + partial remain)
+          2 = running_decode     (SUM → G_running_dec)
+          3 = kv_high flag       (SUM>0 → any prefillable rank KV-high)
+          4 = kv_low flag        (SUM>0 → any prefillable rank KV-low)
+          5 = has_partial flag   (SUM>0 → any rank mid-chunked-prefill)
+          6 = queue_hot flag     (SUM>0 → any rank's oldest waiting prefill
+                                  aged past max_queue_ms; TTFT SLA guard)
+          7 = prefill_ran flag   (SUM>0 → a rank completed a prefill forward
+                                  on the previous scheduler tick)
 
         Args:
             prefillable: this rank has admittable prefill work (fresh head that
@@ -331,9 +342,6 @@ class PrefillDelayer:
                 schedulable waiting prefill. If it reaches max_queue_ms, this
                 rank flags the age guard; all ranks release after decode
                 protection. No waiting prefill / max_queue_ms=None → inactive.
-            prefill_cost: this rank's estimated prefill chunk cost (0 if none).
-                With exchange_prefill_costs every rank's value is in
-                ``rank_prefill_costs`` after the call.
         """
         # KV + queue-age bounds are gated on this rank actually having prefill to
         # push (firing when this rank can't admit anything would be a no-op).
@@ -345,37 +353,25 @@ class PrefillDelayer:
             and self.max_queue_ms is not None
             and oldest_waiting_age_ms >= self.max_queue_ms
         )
+        return [
+            1 if prefillable else 0,
+            int(pending_tokens),
+            int(running_decode_batch),
+            1 if kv_high else 0,
+            1 if kv_low else 0,
+            1 if has_partial else 0,
+            1 if queue_hot else 0,
+            1 if self._prefill_executed_since_last_decision else 0,
+        ]
 
-        self._reduce_buf[0] = 1 if prefillable else 0
-        self._reduce_buf[1] = int(pending_tokens)
-        self._reduce_buf[2] = int(running_decode_batch)
-        self._reduce_buf[3] = 1 if kv_high else 0
-        self._reduce_buf[4] = 1 if kv_low else 0
-        self._reduce_buf[5] = 1 if has_partial else 0
-        self._reduce_buf[6] = 1 if queue_hot else 0
-        self._reduce_buf[7] = 1 if self._prefill_executed_since_last_decision else 0
-        if self._cost_slots:
-            self._reduce_buf[8:] = 0
-            self._reduce_buf[8 + self._rank] = int(prefill_cost)
-        if self.cpu_group is not None:
-            try:
-                torch.distributed.all_reduce(
-                    self._reduce_buf,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=self.cpu_group,
-                )
-            except RuntimeError:
-                logger.warning(
-                    "PrefillDelayer all_reduce failed (peer down?); admitting "
-                    "prefill and deferring to the DP-state shutdown barrier."
-                )
-                self._reset()
-                self.rank_prefill_costs = []
-                return True
-
-        # One readback for all slots (a single .tolist() beats per-slot .item()
-        # boundary crossings on this per-tick hot path).
-        reduced = self._reduce_buf.tolist()
+    def decide(self, counts: list[int] | None) -> bool:
+        """FIRE (True) or HOLD for this tick, from `local_counts` summed over
+        every DP rank (this rank's own under ``is_local``). None means the sum
+        failed (a peer is down): admit, and leave shutdown to the guarded
+        DP-state barrier."""
+        if counts is None:
+            self._reset()
+            return True
         (
             n_prefillable,
             g_pending,
@@ -385,8 +381,7 @@ class PrefillDelayer:
             partial_n,
             queue_hot_n,
             prefill_ran_n,
-        ) = reduced[:8]
-        self.rank_prefill_costs = [float(c) for c in reduced[8:]]
+        ) = counts
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
         self._prefill_executed_since_last_decision = False

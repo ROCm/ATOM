@@ -2,9 +2,11 @@
 
 Under DP attention every rank prefills in the same lockstep step, so the step
 lasts as long as the costliest rank's chunk. With balancing on, the ranks
-exchange their estimated chunk costs on the PrefillDelayer's per-tick
-all_reduce (`prefill_cost` in, `rank_prefill_costs` out) and aim at
-min(costliest, mean x (1 + slack)): a costlier rank shrinks its chunk.
+exchange their estimated chunk costs on the scheduler's per-tick DP schedule
+sync (`prefill_cost` in, every rank's cost out, rounded up) and aim at
+min(costliest, mean x (1 + slack)): a costlier rank shrinks its chunk. It is
+independent of the PrefillDelayer: either runs without the other, and with
+both on they share the one collective.
 
 With weight 0 a chunk of k tokens from position 0 costs k * k / 2.
 """
@@ -16,31 +18,63 @@ import pytest
 from conftest import MockConfig
 
 from atom.model_engine import block_manager as bm_module
+from atom.model_engine.dp_schedule_sync import DPScheduleSync
+from atom.model_engine.prefill_delayer import PrefillDelayer
 from atom.model_engine.scheduler import Scheduler
 
 
-class _Delayer:
-    """Delayer stub that releases prefill every tick and answers the cost
-    exchange with this rank's cost followed by `others`."""
+class _Rank0:
+    """Stand-in DP group: this process is rank 0."""
 
-    max_queue_ms = None
+    def rank(self):
+        return 0
 
-    def __init__(self, others=(), is_local=False):
-        self.others = list(others)
-        self.is_local = is_local
+
+class _Sync(DPScheduleSync):
+    """The DP schedule sync of rank 0 among `1 + len(others)` ranks. Its sum
+    adds `others`' chunk costs (ranks 1..n) and nothing to the delayer counts."""
+
+    def __init__(self, others=(), *, decision_slots=0, prefill_costs=True):
+        super().__init__(
+            _Rank0(),
+            1 + len(others),
+            decision_slots=decision_slots,
+            prefill_costs=prefill_costs,
+        )
+        self.others = [math.ceil(c) for c in others]
         self.reported = []
+        self.collectives = 0
+
+    def exchange(self, counts, prefill_cost=0.0):
+        self.reported.append(prefill_cost)
+        return super().exchange(counts, prefill_cost)
+
+    def _sum_over_ranks(self, buf):
+        self.collectives += 1
+        if self.prefill_costs:
+            for rank, cost in enumerate(self.others, start=1):
+                buf[self.decision_slots + rank] += cost
+
+
+class _LocalDelayer:
+    """Single-scheduler delayer stub that releases prefill every tick and keeps
+    the pending tokens it was shown."""
+
+    is_local = True
+    max_queue_ms = None
+    DECISION_SLOTS = PrefillDelayer.DECISION_SLOTS
+
+    def __init__(self):
         self.pending = []
-        self.rank_prefill_costs = []
 
     def protects_decode(self, running_decode_batch: int) -> bool:
         return False
 
-    def should_allow_prefill(
-        self, prefillable, pending_tokens, prefill_cost=0.0, **kwargs
-    ):
-        self.reported.append(prefill_cost)
+    def local_counts(self, prefillable, pending_tokens, **kwargs):
         self.pending.append(pending_tokens)
-        self.rank_prefill_costs = [prefill_cost, *self.others]
+        return [0] * self.DECISION_SLOTS
+
+    def decide(self, counts):
         return True
 
 
@@ -72,6 +106,20 @@ def _sched(
     )
 
 
+def _attach(sched, others=(), *, delayer=None, prefill_costs=None):
+    """Attach `delayer` (if any) and a DP schedule sync wired the way EngineCore
+    wires one: the delayer's counts when it is on, the costs when balancing is."""
+    if delayer is not None:
+        sched.set_prefill_delayer(delayer)
+    sync = _Sync(
+        others,
+        decision_slots=0 if delayer is None else delayer.DECISION_SLOTS,
+        prefill_costs=sched.cost_balance if prefill_costs is None else prefill_costs,
+    )
+    sched.set_dp_sync(sync)
+    return sync
+
+
 def _cached_prefix(sched, seq_factory, tokens):
     """Publish `tokens` in the prefix cache, release them, and return the
     blocks that hold them."""
@@ -91,22 +139,30 @@ def _prefill_tokens(sched):
 
 def test_off_without_dp_attention(monkeypatch, seq_factory):
     sched = _sched(monkeypatch, dp_attention=False)
-    delayer = _Delayer(others=[1.0] * 7)
-    sched.set_prefill_delayer(delayer)
+    sync = _attach(sched, others=[1.0] * 7, prefill_costs=True)
     sched.add(seq_factory(list(range(100, 164))))
     assert not sched.cost_balance
     assert _prefill_tokens(sched) == 64
-    assert delayer.reported == [0.0]
+    assert sync.reported == [0.0]
 
 
 def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
     sched = _sched(monkeypatch, dp_size=1)
-    delayer = _Delayer()
-    sched.set_prefill_delayer(delayer)
+    sync = _attach(sched, prefill_costs=True)
     sched.add(seq_factory(list(range(100, 164))))
     assert not sched.cost_balance
     assert _prefill_tokens(sched) == 64
-    assert delayer.reported == [0.0]
+    assert sync.reported == [0.0]
+
+
+def test_off_by_its_own_switch(monkeypatch, seq_factory):
+    monkeypatch.setenv("ATOM_DP_PREFILL_BALANCE", "0")
+    sched = _sched(monkeypatch)
+    sync = _attach(sched, others=[1.0] * 7, prefill_costs=True)
+    sched.add(seq_factory(list(range(100, 164))))
+    assert not sched.cost_balance
+    assert _prefill_tokens(sched) == 64
+    assert sync.reported == [0.0]
 
 
 def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):
@@ -144,7 +200,7 @@ def test_balanced_admission_takes_exactly_the_cached_prefix(monkeypatch, seq_fac
     """The estimate only sizes the chunk. Admission still reuses exactly the
     cached prefix blocks, and the shrunk chunk starts right after them."""
     sched = _sched(monkeypatch, prefix_caching=True)
-    sched.set_prefill_delayer(_Delayer(others=[512.0] * 7))
+    _attach(sched, others=[512.0] * 7)
     prefix = list(range(100, 132))
     resident = _cached_prefix(sched, seq_factory, prefix)
     seq = seq_factory(prefix + list(range(500, 564)))
@@ -170,43 +226,93 @@ def test_room_is_the_largest_chunk_within_the_cost_left(monkeypatch, start):
 
 
 def test_costliest_rank_shrinks_to_the_target(monkeypatch, seq_factory):
+    """No delayer here: balancing runs on the DP schedule sync alone."""
     sched = _sched(monkeypatch)
     # Own 64-token chunk costs 2048; seven ranks at 512: target =
     # min(2048, 1.1 * 704) = 774.4, i.e. 39 tokens.
-    delayer = _Delayer(others=[512.0] * 7)
-    sched.set_prefill_delayer(delayer)
+    sync = _attach(sched, others=[512.0] * 7)
     sched.add(seq_factory(list(range(100, 164))))
     assert _prefill_tokens(sched) == 39
-    assert delayer.reported == [2048.0]
+    assert sync.reported == [2048.0]
+
+
+def test_costliest_rank_shrinks_with_the_delayer_on_too(monkeypatch, seq_factory):
+    """With the delayer on, its counts and the costs share the one collective."""
+    sched = _sched(monkeypatch)
+    delayer = PrefillDelayer(dp_size=8, max_num_batched_tokens=64)
+    sync = _attach(sched, others=[512.0] * 7, delayer=delayer)
+    sched.add(seq_factory(list(range(100, 164))))
+    assert _prefill_tokens(sched) == 39  # the delayer's first decision fires
+    assert sync.collectives == 1
 
 
 def test_shrinking_never_goes_below_the_floor(monkeypatch, seq_factory):
-    # Seven near-idle ranks: target = 1.1 * (2048 + 3.5) / 8 = 282, i.e. 23
-    # tokens, under the 32-token floor.
+    # Seven near-idle ranks (0.5 each, carried as 1): target =
+    # 1.1 * (2048 + 7) / 8 = 282.6, i.e. 23 tokens, under the 32-token floor.
     sched = _sched(monkeypatch, min_tokens=32)
-    sched.set_prefill_delayer(_Delayer(others=[0.5] * 7))
+    _attach(sched, others=[0.5] * 7)
     sched.add(seq_factory(list(range(100, 164))))
     assert _prefill_tokens(sched) == 32
 
 
 def test_cheaper_rank_keeps_its_chunk_without_room_to_grow(monkeypatch, seq_factory):
     sched = _sched(monkeypatch)
-    sched.set_prefill_delayer(_Delayer(others=[1e9] * 7))
+    _attach(sched, others=[1e9] * 7)
     sched.add(seq_factory(list(range(100, 164))))
     assert _prefill_tokens(sched) == 64
 
 
-def test_idle_rank_reports_no_cost(monkeypatch):
+def test_a_lone_rank_takes_an_odd_chunk_whole(monkeypatch, seq_factory):
+    """An odd chunk costs a whole number and a half. Truncated on its way into
+    the sync, the target of the rank that set it sat half a unit below the
+    rank's own cost and cut its chunk a token short; rounded up, the rank keeps
+    the chunk it estimated."""
     sched = _sched(monkeypatch)
-    delayer = _Delayer(others=[512.0] * 7)
-    sched.set_prefill_delayer(delayer)
-    assert sched.schedule() is None
-    assert delayer.reported == [0.0]
+    sync = _attach(sched, others=[0.0] * 7)
+    sched.add(seq_factory(list(range(100, 163))))
+    # 63 tokens from 0 cost 63 * 31.5 = 1984.5, carried as 1985.
+    assert _prefill_tokens(sched) == 63
+    assert sync.reported == [1984.5]
+
+
+def test_costliest_rank_within_the_slack_takes_an_odd_chunk_whole(
+    monkeypatch, seq_factory
+):
+    sched = _sched(monkeypatch)
+    # mean = (1985 + 7 * 1900) / 8 = 1910.6, x 1.1 = 2101.7: the target is this
+    # rank's own cost, which must buy its whole 63-token chunk.
+    _attach(sched, others=[1900.0] * 7)
+    sched.add(seq_factory(list(range(100, 163))))
+    assert _prefill_tokens(sched) == 63
+
+
+@pytest.mark.parametrize(
+    "start, new", [(115_200, 6_001), (0, 9_001), (300_000, 16_383)]
+)
+def test_rounded_up_cost_buys_the_whole_chunk_at_production_scale(
+    monkeypatch, start, new
+):
+    """Production weight, contexts and budget: the target the sync hands back
+    to the rank that set it buys every token that rank estimated."""
+    sched = _sched(monkeypatch, weight=360_000, min_tokens=4096, max_tokens=16_384)
+    own = sched._chunk_cost(start, new)
+    _, rank_costs = _Sync(others=[0.0] * 7).exchange(None, own)
+    sched._balance_prefill_step(own, rank_costs)
+    assert sched._prefill_room(0, start) >= new
+
+
+def test_idle_rank_reports_no_cost_and_still_joins_the_collective(monkeypatch):
+    sched = _sched(monkeypatch)
+    sync = _attach(sched, others=[512.0] * 7)
+    for _ in range(3):
+        assert sched.schedule() is None
+    assert sync.reported == [0.0] * 3
+    assert sync.collectives == 3
 
 
 def test_no_rank_with_prefill_work_balances_nothing(monkeypatch):
     sched = _sched(monkeypatch)
-    sched.set_prefill_delayer(_Delayer(others=[0.0] * 7))
+    _attach(sched, others=[0.0] * 7)
     assert sched.schedule() is None
     assert sched._tick_cost_limit == math.inf
     assert sched._balance_stats[0] == 0
@@ -217,8 +323,8 @@ def test_local_pending_probe_ignores_the_previous_step_limit(monkeypatch, seq_fa
     the local coalescer's pending probe, `_partial_prefill_chunk`) may see the
     previous step's cost limit, or it cuts the probe down to the floor."""
     sched = _sched(monkeypatch)
-    delayer = _Delayer(others=[512.0] * 7, is_local=True)
-    sched.set_prefill_delayer(delayer)
+    delayer = _LocalDelayer()
+    _attach(sched, others=[512.0] * 7, delayer=delayer)
     s_partial = seq_factory(list(range(100, 196)))
     s_decode = seq_factory([1, 2, 3, 4])
     sched.add(s_partial)
@@ -245,46 +351,16 @@ def test_balances_a_prefill_released_inside_the_decode_window(monkeypatch, seq_f
     """With no decode on any rank the real delayer fires through its
     post-prefill decode-protection window (its usual exit under DP attention).
     The rank must have estimated its cost for that tick, or nothing balances."""
-    import torch.distributed as dist
-
-    from atom.model_engine.prefill_delayer import PrefillDelayer
-
     sched = _sched(monkeypatch)
-    group = dist.ProcessGroupGloo(dist.HashStore(), 0, 1)
     delayer = PrefillDelayer(
-        dp_size=1,
-        cpu_group=group,
+        dp_size=2,
         max_num_batched_tokens=sched.max_num_batched_tokens,
         prefill_decode_interval=5,
-        exchange_prefill_costs=True,
     )
-    sched.set_prefill_delayer(delayer)
+    sync = _attach(sched, others=[0.0], delayer=delayer)
     delayer._first = False
     delayer._decode_interval_remaining = 3
     sched.add(seq_factory(list(range(100, 164))))
     assert _prefill_tokens(sched) == 64
-    assert delayer.rank_prefill_costs == [2048.0]
+    assert sync.reported == [2048.0]
     assert sched._balance_stats[0] == 1
-
-
-def test_costs_ride_the_delayer_reduce_on_a_stateless_gloo_group():
-    """The engine's DP group is created without a default process group, so the
-    delayer takes its rank from the group, not torch.distributed.get_rank()."""
-    import torch.distributed as dist
-
-    from atom.model_engine.prefill_delayer import PrefillDelayer
-
-    assert not dist.is_initialized()
-    group = dist.ProcessGroupGloo(dist.HashStore(), 0, 1)
-    delayer = PrefillDelayer(
-        dp_size=1,
-        cpu_group=group,
-        max_num_batched_tokens=64,
-        exchange_prefill_costs=True,
-    )
-    delayer.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
-    assert delayer.rank_prefill_costs == [3.5e9]
-    # Without the exchange the buffer keeps its 8 decision slots only.
-    plain = PrefillDelayer(dp_size=1, cpu_group=group, max_num_batched_tokens=64)
-    plain.should_allow_prefill(prefillable=True, pending_tokens=8, prefill_cost=3.5e9)
-    assert plain.rank_prefill_costs == []
