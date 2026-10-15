@@ -114,11 +114,11 @@
                 }
               },
               {
-                "kv_connector": "MooncakeStoreConnector",
+                "kv_connector": "SimpleCPUOffloadConnector",
                 "kv_role": "kv_both",
                 "kv_connector_extra_config": {
-                  "load_async": true,
-                  "cache_prefix": "k3-81198e97b-dspark4-c48-20261012"
+                  "cpu_bytes_to_use": 1799000000000,
+                  "lazy_offload": false
                 }
               }
             ]
