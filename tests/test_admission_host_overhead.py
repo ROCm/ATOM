@@ -324,6 +324,7 @@ def test_shipped_chain_equals_engine_chain(seed, dcp, length):
         lambda c: (c[0], c[1], c[2][:-1]),  # too short
         lambda c: (c[0], c[1], array.array("Q", [x ^ 1 for x in c[2]])),
         lambda c: (c[0], c[1], c[2][:-1] + array.array("Q", [5])),  # last link
+        lambda c: (c[0], c[1], relinked(c[2], 5)),  # the middle link
     ],
 )
 def test_a_bad_chain_is_rehashed_with_the_same_hit(corrupt):
@@ -333,6 +334,27 @@ def test_a_bad_chain_is_rehashed_with_the_same_hit(corrupt):
     seq.prompt_hash_chain = corrupt(seq.prompt_hash_chain)
     assert bm.can_allocate(seq, record=False) == 10
     assert (bm.shipped_chains_adopted, bm.shipped_chains_rejected) == (0, 1)
+    assert bm._prompt_hashes(seq) == reference_chain(tokens, BLOCK, -1, 10)
+
+
+def relinked(chain, i):
+    chain = array.array("Q", chain)
+    chain[i] ^= 1
+    return chain
+
+
+def test_a_bad_interior_link_is_caught_where_it_is_published():
+    """Adoption checks the first, middle and last links; `hash_blocks` the rest."""
+    tokens = list(range(40)) + [900, 901, 902]
+    bm = published(range(40))
+    seq = shipped_seq(tokens)
+    seq.prompt_hash_chain = seq.prompt_hash_chain[:2] + (
+        relinked(seq.prompt_hash_chain[2], 2),
+    )
+    assert admit(bm, seq)[0] == 2  # adopted: the probe misses from block 2
+    assert (bm.shipped_chains_adopted, bm.shipped_chains_diverged) == (1, 1)
+    bm.deallocate(seq)
+    assert exact(bm, seq) == 10  # rehashed here
     assert bm._prompt_hashes(seq) == reference_chain(tokens, BLOCK, -1, 10)
 
 
@@ -359,6 +381,34 @@ def test_frontend_preprocess_ships_the_chain():
     assert dcp.preprocess(tokens, SamplingParams()).prompt_hash_chain[0] == 2 * BLOCK
     off = _processor(enable_prefix_caching=False)
     assert off.preprocess(tokens, SamplingParams()).prompt_hash_chain is None
+
+
+def test_the_frontend_drops_the_chain_once_sent():
+    with stubbed_aiter():
+        from atom.model_engine.engine_core_mgr import CoreManager
+    mgr = object.__new__(CoreManager)
+    mgr.label, mgr.pp_size, mgr.local_engine_count = "test", 1, 1
+    mgr._seq_id_to_callback, sent = {}, []
+    mgr._send_request = lambda rank, payload: sent.extend(pickle.loads(payload)[1])
+    tokens = list(range(41))
+    seqs = _processor().preprocess_fanout(tokens, SamplingParams(n=3, temperature=0.8))
+    mgr.add_request(seqs)
+    want = reference_chain(tokens, BLOCK, -1, 10)
+    assert [s.prompt_hash_chain[2].tolist() for s in sent] == [want] * 3
+    assert all(s.prompt_hash_chain is None for s in seqs)
+
+
+def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
+    from atom.model_engine import engine_stats
+
+    lines = []
+    monkeypatch.setattr(engine_stats.logger, "info", lines.append)
+    stats = engine_stats.EngineStats(enable_prefix_caching=True)
+    stats.block_manager = bm = published(range(40))
+    bm.shipped_chains_adopted, bm.shipped_chains_rejected = 3, 2
+    bm.shipped_chains_diverged = 1
+    stats._log_cache()
+    assert any("adopted 3, rejected 2, diverged 1" in line for line in lines)
 
 
 @pytest.mark.parametrize(

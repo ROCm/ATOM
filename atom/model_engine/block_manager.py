@@ -176,14 +176,18 @@ class BlockManager:
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Content hashes only: pool hits and resource fit are always rechecked.
-        # Weak keys keep this scheduler-side cache out of request serialization.
-        self._prefill_probe_hashes: WeakKeyDictionary[
-            Sequence, tuple[int, list[int]]
+        # Each seq's prompt-block hash chain, as `(cache_seed, chain, shipped)`
+        # (`_prompt_hashes`). Content hashes only: pool hits and resource fit
+        # are always rechecked. Weak keys keep this scheduler-side cache out of
+        # request serialization.
+        self._prompt_hash_chains: WeakKeyDictionary[
+            Sequence, tuple[int, list[int], bool]
         ] = WeakKeyDictionary()
-        # `_adopt_shipped_chain` outcomes; rejections should stay at 0.
+        # `_adopt_shipped_chain` outcomes, and adopted chains `hash_blocks`
+        # found wrong; rejections and divergences should stay at 0.
         self.shipped_chains_adopted: int = 0
         self.shipped_chains_rejected: int = 0
+        self.shipped_chains_diverged: int = 0
         self.total_evicted_blocks: int = 0
         # `can_allocate_estimate`'s memo, validated against recent evictions,
         # `clear_cache` calls and remaps (which move entries without one).
@@ -745,16 +749,18 @@ class BlockManager:
         """`seq`'s prompt-block hash chain, computed once per `cache_seed`;
         starts from the frontend's when it checks out (`_adopt_shipped_chain`)."""
         seed = seq.cache_seed
-        cached = self._prefill_probe_hashes.get(seq)
+        cached = self._prompt_hash_chains.get(seq)
         if cached is None or cached[0] != seed:
-            cached = (seed, self._adopt_shipped_chain(seq))
-            self._prefill_probe_hashes[seq] = cached
+            chain = self._adopt_shipped_chain(seq)
+            cached = (seed, chain, bool(chain))
+            self._prompt_hash_chains[seq] = cached
         return cached[1]
 
     def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
         """The frontend's chain for `seq` (consumed), or `[]` to hash here.
-        Adopted only if block size, seed and length match and its first and
-        last links rehash equal here; a bad chain costs time, never hits."""
+        Adopted only if block size, seed and length match and its first, middle
+        and last links rehash equal here; `hash_blocks` checks the links it
+        publishes (`_distrust_shipped_chain`)."""
         shipped = getattr(seq, "prompt_hash_chain", None)
         if shipped is None:
             return []
@@ -768,14 +774,12 @@ class BlockManager:
                 f"blocks; this engine wants {hbs}, {seq.cache_seed}, {n}"
             )
         chain = packed.tolist()
-        if n and (
-            chain[0] != self.compute_hash(self._hash_block_tokens(seq, 0), seed)
-            or chain[-1]
-            != self.compute_hash(
-                self._hash_block_tokens(seq, n - 1),
-                chain[-2] if n > 1 else seed,
-            )
-        ):
+
+        def link_holds(i: int) -> bool:
+            prev = chain[i - 1] if i else seed
+            return chain[i] == self.compute_hash(self._hash_block_tokens(seq, i), prev)
+
+        if n and not all(map(link_holds, {0, n // 2, n - 1})):
             return self._reject_shipped_chain("its hashes differ from this engine's")
         self.shipped_chains_adopted += 1
         return chain
@@ -791,6 +795,19 @@ class BlockManager:
             )
         self.shipped_chains_rejected += 1
         return []
+
+    def _distrust_shipped_chain(self, seq: Sequence, block: int) -> None:
+        """`hash_blocks` published a hash `seq`'s adopted chain disagrees with:
+        drop the chain, so later walks of `seq` hash here."""
+        if not self.shipped_chains_diverged:
+            logger.warning(
+                "Prefix cache: a prompt chain the frontend shipped differs from "
+                "this engine's at block %d; rehashing that prompt here. Its "
+                "probes may have missed cached blocks.",
+                block,
+            )
+        self.shipped_chains_diverged += 1
+        self._prompt_hash_chains[seq] = (seq.cache_seed, [], False)
 
     def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
         """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
@@ -2038,10 +2055,16 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
+        # An adopted frontend chain, checked against what is published.
+        chain = self._prompt_hash_chains.get(seq)
+        shipped = chain[1] if chain and chain[2] and chain[0] == seq.cache_seed else ()
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
             h = self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
+            if i < len(shipped) and shipped[i] != h:
+                self._distrust_shipped_chain(seq, i)
+                shipped = ()
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)

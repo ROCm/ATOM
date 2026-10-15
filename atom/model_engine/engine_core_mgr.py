@@ -171,6 +171,13 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
     return visible
 
 
+def _drop_shipped_chains(seqs: list[Sequence]) -> None:
+    """Free the prompt hash chains once sent: the engine has its copy, and the
+    API server would otherwise hold one per request until it finishes."""
+    for seq in seqs:
+        seq.prompt_hash_chain = None
+
+
 class CoreManager:
     def _init_shared_state(
         self,
@@ -941,6 +948,7 @@ class CoreManager:
             self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
         else:
             self._dispatch_to_dp_ranks(seqs)
+        _drop_shipped_chains(seqs)
 
     @property
     def _routable_engine_count(self) -> int:
@@ -2089,6 +2097,7 @@ class DisaggCoreManager(CoreManager):
             prefill_seqs.append(ps)
         prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
         self._send_request(0, prefill_payload)
+        _drop_shipped_chains(seqs)
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"

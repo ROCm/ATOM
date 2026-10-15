@@ -388,6 +388,7 @@ class Sequence:
         self.block_hashes: list[int] = []
         # `prefix_hash.ship_prompt_hash_chain`'s chain, adopted and cleared by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it.
+        # The frontend's copy is dropped once sent (`CoreManager.add_request`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
