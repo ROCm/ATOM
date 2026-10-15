@@ -191,8 +191,9 @@ class BlockPool:
 
     def count_used(self, block_ids: list[int], n: int) -> int:
         """How many of the first `n` of `block_ids` (distinct) some live
-        sequence holds. Allocates nothing."""
-        return sum(map(self._used.__contains__, islice(block_ids, n)))
+        sequence holds. No slice; the set it builds holds only the used ids,
+        and a waiting head's hit blocks are mostly free."""
+        return len(self._used.intersection(islice(block_ids, n)))
 
     def claim_many(self, block_ids) -> None:
         """`claim` each of `block_ids`, in order, with the lookups hoisted."""
