@@ -12,6 +12,7 @@ from atom.models.glm52.mono.config import (
     SUPPORTED_TP,
     Dims,
     config_refusal,
+    model_geometry_refusal,
     native_config,
 )
 from atom.models.glm52.mono.kernels.geometry_config import (
@@ -206,3 +207,41 @@ def test_piecewise_cudagraph_does_not_refuse_the_served_deployment():
     assert compilation_config.cudagraph_mode.requires_piecewise_compilation()
     atom_config = _served_tp4_fp8_mtp4_config(compilation_config=compilation_config)
     assert config_refusal(atom_config) is None
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    ("rope_interleave", "refused"),
+    [
+        (_MISSING, False),  # no field at all -> interleaved default
+        (None, False),  # explicit null -> same default
+        (True, False),  # interleaved, what the kernel implements
+        (1, False),
+        (False, True),  # NeoX -- the kernel has no branch for it
+        (0, True),
+    ],
+)
+def test_neox_rope_is_refused_but_the_interleaved_default_is_not(
+    rope_interleave, refused
+):
+    """The kernel rotates adjacent pairs with no NeoX branch, so a NeoX
+    checkpoint would be served a different position encoding silently.
+
+    The default matters as much as the refusal: production resolves a missing
+    or null `rope_interleave` to interleaved, so gating on equality with True
+    would reject checkpoints that are actually fine.
+    """
+    cfg = _served_tp4_fp8_config(
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4)
+    ).hf_config
+    if rope_interleave is not _MISSING:
+        cfg.rope_interleave = rope_interleave
+    why = model_geometry_refusal(cfg, GLM5_CONFIG, 8)
+    # `is None` on the allowed rows, not just "no rope complaint": it proves the
+    # geometry checks above the gate pass, so the gate is actually reached.
+    if refused:
+        assert why == f"rope_interleave={rope_interleave!r}"
+    else:
+        assert why is None

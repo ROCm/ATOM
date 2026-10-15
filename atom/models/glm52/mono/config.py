@@ -186,6 +186,21 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
             return f"{name}={getattr(hf_config, name, None)!r}"
     if hf_config.moe_intermediate_size != shard.inter * tp_size:
         return "expert width"
+    # The kernel rotates adjacent pairs unconditionally (`kernel.py`: x0, x1 at
+    # `pr*2` and `pr*2 + 1`), i.e. interleaved / GPT-J, with no NeoX branch. A
+    # checkpoint that asks for NeoX would get a different position encoding
+    # with no error. Deliberately NOT an `expected` entry: that dict compares
+    # for equality, and a MISSING or null `rope_interleave` is legal here --
+    # production resolves it through `default_is_neox=False`, i.e. interleaved
+    # (`deepseek_v2._is_neox_rope_style`). Only an explicit falsy value selects
+    # NeoX, so the test is on the resolved layout, not on the field.
+    # local import: `config` is reached early and must stay cheap -- module
+    # scope here would pull all of `deepseek_v2`, and that module imports GLM's
+    # mono dispatch back from inside `GlmMoeDsaForCausalLM.__init__`
+    from atom.models.deepseek_v2 import _is_neox_rope_style
+
+    if _is_neox_rope_style(hf_config, "rope_interleave", default_is_neox=False):
+        return f"rope_interleave={getattr(hf_config, 'rope_interleave', None)!r}"
     return None
 
 
