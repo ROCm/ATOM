@@ -31,6 +31,12 @@ decode/router startup, and AgentX warmup. Each case repeats the two-batch transi
 | `single-resident0` | shared pack/copy | workload only |
 | `two-resident244` | pack + copy | 244 GiB before dense gather output |
 
+All ranks run on one node. Bootstrap sockets use the exact loopback interface
+(`NCCL_SOCKET_IFNAME==lo`, IPv4); RCCL still selects GPU P2P transport. Run
+`38703620681` failed during its first barrier because automatic selection chose
+`eno1:10.13.0.134`, returning `No route to host`. That initialization failure
+occurred before long-KV replay/offload and is not evidence of the original hang.
+
 The input reproduces the consecutive 7-request / 8-request cache-length batches
 from run `38664663067`, attempt 1: total KV 794,109 -> 1,350,868. Gather uses the
 checkout's verbatim fixed Triton kernel: 16 KV heads per rank, head dimension 128,

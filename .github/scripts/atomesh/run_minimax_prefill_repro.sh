@@ -29,12 +29,17 @@ fi
 printf 'allocated_gpu_visibility=%s\n' "${visible}"
 timeout --kill-after=20 300 docker pull "${REPRO_IMAGE}"
 docker image inspect --format '{{json .RepoDigests}}' "${REPRO_IMAGE}" > "${REPRO_OUT_DIR}/image-digests.json"
+# All four ranks share this node/network namespace. Pin bootstrap sockets to
+# loopback: auto-detection chose eno1 on pit2-p03-g34, whose local address was
+# unreachable (run 38703620681). GPU P2P transport is still chosen by RCCL.
 docker run -d --name "${container}" \
   --network host --ipc host --device=/dev/kfd --device=/dev/dri \
   --group-add video --cap-add=SYS_NICE --shm-size=16G \
   -e ROCR_VISIBLE_DEVICES="${visible}" \
   -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 -e OMP_NUM_THREADS=1 \
   -e TRITON_CACHE_DIR=/tmp/m3-repro-triton \
+  -e NCCL_SOCKET_IFNAME==lo -e NCCL_SOCKET_FAMILY=AF_INET \
+  -e GLOO_SOCKET_IFNAME=lo \
   -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,COLL \
   -e TORCH_NCCL_TRACE_BUFFER_SIZE=20000 -e TORCH_NCCL_DUMP_ON_TIMEOUT=1 \
   -e TORCH_NCCL_DESYNC_DEBUG=1 -e TORCH_NCCL_ENABLE_TIMING=1 \

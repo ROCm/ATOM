@@ -140,7 +140,9 @@ def run(args):
     log("environment", torch=torch.__version__, hip=torch.version.hip,
         rccl=dist.is_nccl_available() and torch.cuda.nccl.version(),
         gpu=props.name, total_gib=props.total_memory / GIB,
-        mode=args.mode, resident_gib=args.resident_gib)
+        mode=args.mode, resident_gib=args.resident_gib,
+        nccl_socket_ifname=os.environ.get("NCCL_SOCKET_IFNAME"),
+        nccl_socket_family=os.environ.get("NCCL_SOCKET_FAMILY"))
     if args.resident_gib and props.total_memory < (args.resident_gib + 30) * GIB:
         raise RuntimeError("Insufficient HBM for the explicit resident-memory case")
     dist.init_process_group("nccl", timeout=timedelta(seconds=60))
@@ -177,7 +179,7 @@ def run(args):
            k_scales=scales, v_scales=scales, dequant=True,
            kv_cache_layout="SHUFFLE", **small)
     torch.cuda.synchronize()
-    dist.barrier(group=tp)
+    dist.barrier(group=tp, device_ids=[RANK])
     log("warmup_complete")
     copy_stream = torch.cuda.Stream()
     previous_copy, pending_save = None, None
@@ -237,7 +239,7 @@ def run(args):
     torch.testing.assert_close(key[positions], torch.ones_like(key[positions]), rtol=0, atol=0)
     torch.testing.assert_close(value[positions], -torch.ones_like(value[positions]), rtol=0, atol=0)
     torch.testing.assert_close(reduce_tensor, torch.full_like(reduce_tensor, 10), rtol=0, atol=0)
-    dist.barrier(group=tp)
+    dist.barrier(group=tp, device_ids=[RANK])
     result = dict(rank=RANK, result="completed_without_reproducing_hang",
                   mode=args.mode, resident_gib=args.resident_gib,
                   steps=args.cycles * 2, elapsed_seconds=time.monotonic() - start,
