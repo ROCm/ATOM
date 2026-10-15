@@ -1618,6 +1618,236 @@ class TestPagedCopyCheckpoint:
         assert second.block_table[4] != shared_tail
         assert second.offload_joint.load_hash == h
 
+    def _occupy_vacant_until(self, bm, free_target: int) -> None:
+        """Pin vacant blocks until `num_free` is `free_target`.
+
+        `_fresh_block` takes vacant ids before cached ones, so the published
+        prefix and its checkpoint stay put while the free list is trimmed to
+        an exact fit.
+        """
+        while bm.kv.num_free > free_target:
+            bm._fresh_block()
+        assert bm.kv.num_free == free_target
+
+    def test_a_live_tail_on_an_exact_fit_pool_keeps_the_hbm_hit(self):
+        """The partial chunk is held by a live seq and the pool fits exactly.
+
+        `can_allocate` does not count that in-use tail. Treating `num_free >=
+        extra` as room then raises from `_fresh_block`. The joint is skipped
+        instead, the request keeps the HBM hit, and the live block is claimed
+        rather than replaced.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+
+        # No lookup, so this one claims the HBM hit and stays on the tail.
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert holder_hit == 5
+        assert bm.allocate(holder, holder_hit)
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 1
+
+        num_new = bm._n_hash_blocks(holder) - holder_hit
+        self._occupy_vacant_until(bm, num_new)
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 0
+        assert bm.state_tier_boundaries == 0
+        assert bm.state_hbm_boundaries == 0
+        assert bm.joint_skips.get("partial_chunk_no_room") == 1
+        assert second.offload_joint.boundary_tokens == 0
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+        assert second.block_table[4] == shared_tail
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 2
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 0
+
+    def test_a_live_tail_stays_shared_when_the_private_copy_fits(self):
+        """Room for the private copy must not rewrite the block a live seq holds."""
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert bm.allocate(holder, holder_hit)
+        assert holder.block_table[4] == shared_tail
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert second.offload_joint.claim_tokens == chunk
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == chunk
+        assert second.block_table[4] != shared_tail
+        assert holder.block_table[4] == shared_tail
+        assert bm.kv.block(shared_tail).ref_count == 1
+        assert bm.kv.block(second.block_table[4]).hash == -1
+
+    def test_a_compressed_hit_above_the_gated_hit_keeps_its_chunk_floor(self):
+        """The KV walk's own chunk floor is a legal start when it clears the hit.
+
+        Gated hit 20, compressed hit 40, chunk 16: the claim is 32, not the
+        HBM hit's floor of 16. `[16, 32)` is still resident, so it stays shared
+        and is not refetched.
+        """
+        chunk = 16
+        tokens = list(range(64))
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, tokens)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 12)[11]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 12, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared = list(first.block_table[:8])  # tokens [0, 32)
+        victim = first.block_table[10]  # compressed hit stops at 40 tokens
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h_cpu)
+        self._with_tier(bm, h_cpu)
+        self._reset_joint_counters(bm)
+
+        second = stateful_seq(tokens)
+        second.offload_joint.kv_prefix_tokens = len(tokens)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert hbm_hit * BLOCK == 20
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert "partial_chunk_no_room" not in bm.joint_skips
+        assert second.offload_joint.claim_tokens == 32
+        assert second.offload_joint.boundary_tokens == 48
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == 20
+        # `block_table` is an `array`, which does not compare equal to a list.
+        assert list(second.block_table[:8]) == shared
+
+    def test_partial_chunk_no_room_keeps_the_hit_and_its_checkpoint(self):
+        """Skipping the joint is not also a boundary, and it does not spend the rung.
+
+        The boundary image is the only evictable checkpoint and it is the one
+        the joint would pin. Funding the private tail with it used to disown
+        the request to token 0. The skip happens before the commit, so the
+        counters count a skip and not a boundary, the HBM hit stands, and the
+        image is still there.
+        """
+        chunk = 16
+        bm = self._joint_bm(chunk=chunk)
+        first = self._admitted(bm, PROMPT)
+        bm.hash_blocks(first, first.num_prompt_tokens)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.clear_index()
+        h_hbm = bm._chain_to(first, [], 5)[4]
+        h_cpu = bm._chain_to(first, [], 8)[7]
+        bm.paged_state_checkpoints.checkpoint(first, 5, h_hbm)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        bm.paged_state_checkpoints.checkpoint(first, 8, h_cpu)
+        bm.take_state_maintenance_ops()
+        bm.complete_previous_state_batch()
+        shared_tail = first.block_table[4]
+        victim = first.block_table[6]
+        # Both images stay in HBM. The holder's restore pins the hit, so the
+        # rung image is the only evictable checkpoint, and it is the one the
+        # joint would pin (`state_from_hbm`).
+        self._with_tier(bm, h_cpu)
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+
+        holder = stateful_seq(PROMPT)
+        holder_hit = bm.can_allocate(holder)
+        assert holder_hit == 5
+        assert bm.allocate(holder, holder_hit)
+        # Hold the rung's KV block so trimming the free list cannot unindex
+        # its checkpoint. Drop every other cached free block first, then leave
+        # exactly the HBM-path demand as vacant units.
+        rung_block = bm.kv.lookup(h_cpu)
+        assert rung_block >= 0
+        bm.kv.claim(rung_block)
+        for block in list(bm.kv.blocks):
+            if block.ref_count != 0 or block.hash == -1:
+                continue
+            if block.block_id in bm.kv._free:
+                bm.kv.allocate(block.block_id)
+        num_new = bm._n_hash_blocks(holder) - holder_hit
+        self._occupy_vacant_until(bm, num_new)
+        self._reset_joint_counters(bm)
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+
+        second = stateful_seq(PROMPT)
+        second.offload_joint.kv_prefix_tokens = len(PROMPT)
+        hbm_hit = bm.can_allocate(second)
+
+        assert hbm_hit == 5
+        assert bm.joint_boundaries == 0
+        assert bm.state_hbm_boundaries == 0
+        assert bm.state_tier_boundaries == 0
+        assert bm.joint_skips.get("partial_chunk_no_room") == 1
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+        assert bm.allocate(second, hbm_hit)
+        assert second.num_cached_tokens == hbm_hit * BLOCK
+        assert second.block_table[4] == shared_tail
+        assert bm.paged_state_checkpoints.contains(h_cpu)
+        assert bm.checkpoint_funnel()["state_gate_lost_boundary"] == 0
+        assert second.offload_joint.load_hash == -1
+
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
         the CPU tier switched off, which makes it the honest test of "did this

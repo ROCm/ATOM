@@ -797,11 +797,13 @@ class BlockManager:
         hbm_tokens = hbm_boundary * hbs
         if lmc_tokens <= hbm_tokens:
             return self._no_joint("lmcache_within_hbm")
-        # The KV leg moves whole chunks. An aligned HBM hit is already a legal
-        # start. An unaligned one cannot be rounded down onto shared blocks, and
-        # rounding the start *up* would leave a hole the forward then skips.
-        # The start stays on the chunk floor; `allocate` reloads that partial
-        # chunk into private blocks and keeps the rung above the real HBM hit.
+        # The KV leg moves whole chunks. A legal start is the compressed hit's
+        # chunk floor when that floor is already at or above the gated hit, and
+        # the gated hit itself when the hit is on the grid. An unaligned hit
+        # cannot be rounded down onto shared blocks, and rounding the start
+        # *up* would leave a hole the forward then skips. The start then stays
+        # on the hit's own chunk floor; `allocate` reloads that partial chunk
+        # into private blocks and keeps the rung above the real HBM hit.
         cap = min(lmc_tokens // hbs, self._n_hash_blocks(seq) - 1)
         if cap <= hbm_boundary:
             return self._no_joint("no_room_above_hbm")
@@ -830,15 +832,17 @@ class BlockManager:
         # hit and this min is always the compressed hit. Written as a min
         # anyway: the invariant belongs to `_gated_hit`, not here.
         claim_blocks = min(len(block_hashes), candidate)
-        # Floored to the chunk grid so the KV leg starts aligned and writes
-        # only into blocks below it that nobody else can be reading.
+        # Floored to the chunk grid. A compressed hit that already reaches a
+        # chunk boundary at or above the gated hit is a legal aligned start:
+        # the blocks below it are resident and shared, and replacing that
+        # start with the HBM hit's own floor would refetch them. Only a floor
+        # still below the hit steps down to that floor; `allocate` then
+        # refills `[floor, hbm)` privately.
         claim_tokens = ((claim_blocks * hbs) // chunk) * chunk
-        if hbm_tokens % chunk == 0:
-            claim_tokens = max(claim_tokens, hbm_tokens)
-        else:
-            # Below the real HBM hit, on the chunk grid. `allocate` stops the
-            # shared claim here and refills the partial chunk privately.
-            claim_tokens = (hbm_tokens // chunk) * chunk
+        if claim_tokens < hbm_tokens:
+            claim_tokens = (
+                hbm_tokens if hbm_tokens % chunk == 0 else (hbm_tokens // chunk) * chunk
+            )
         # `allocate` claims the boundary in whole hash blocks --
         # `claim_tokens // hbs` -- but the value above is floored to
         # the *chunk* grid, not the hash-block grid. When `hbs` does not divide
@@ -1060,12 +1064,71 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
+    def _fit_unaligned_joint(
+        self,
+        seq: Sequence,
+        decision: JointBoundaryDecision,
+        num_cached_blocks: int,
+        block_hashes: list[int],
+    ) -> JointBoundaryDecision:
+        """Drop an unaligned joint the pool cannot back without spending its state.
+
+        `can_allocate` subtracts every in-use hit block from its demand, which
+        is right when those blocks are shared and wrong for the partial chunk
+        `[claim, hbm)`: that tail is refilled privately, so each in-use block
+        in it is one more unit than the fit gate counted. A check of the tail
+        alone (`num_free >= extra`) passes when the pool already fit the
+        admission exactly, and `_fresh_block` then raises. The same check used
+        to run before the restore was pinned and with no protected hash, so
+        the unit it spent could be the boundary's own HBM checkpoint and the
+        request recomputed from 0.
+
+        A cached-free tail block is not extra. It was already in the demand:
+        claiming it and allocating a fresh one cost the same unit. This only
+        re-checks when an in-use tail actually adds demand, and it does not
+        evict. The hash it protects is the checkpoint `allocate` is about to
+        pin -- the boundary when that image is in HBM, otherwise the HBM hit.
+        A miss becomes `partial_chunk_no_room` before the joint is counted, so
+        the request keeps the HBM hit.
+        """
+        if decision.skip_reason is not None:
+            return decision
+        hbs = self._hash_block_size()
+        hbm_tokens = num_cached_blocks * hbs
+        if decision.claim_tokens >= hbm_tokens:
+            return decision
+        claim_blocks = decision.claim_tokens // hbs
+        extra = 0
+        for i in range(claim_blocks, num_cached_blocks):
+            block_id = self.kv.lookup(block_hashes[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                extra += 1
+        if extra == 0:
+            return decision
+        num_new_blocks = self._n_hash_blocks(seq)
+        for i in range(num_cached_blocks):
+            block_id = self.kv.lookup(block_hashes[i])
+            if block_id != -1 and self.kv.is_used(block_id):
+                num_new_blocks -= 1
+        if decision.state_from_hbm:
+            protected: int | None = decision.boundary_hash
+        elif num_cached_blocks:
+            protected = block_hashes[num_cached_blocks - 1]
+        else:
+            protected = None
+        if self._has_page_units(num_new_blocks + extra, protected):
+            return decision
+        return self._no_joint("partial_chunk_no_room")
+
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
     ) -> None:
         """Commit the fit probe before any allocation changes the pool."""
         if self.enable_prefix_caching:
             decision = self._joint_kv_boundary(seq, num_cached_blocks, block_hashes)
+            decision = self._fit_unaligned_joint(
+                seq, decision, num_cached_blocks, block_hashes
+            )
             self._commit_joint_boundary(seq, decision)
 
     def allocate(self, seq: Sequence, num_cached_blocks: int = 0) -> bool:
@@ -1098,27 +1161,20 @@ class BlockManager:
         hbs = self._hash_block_size()
         hbm_tokens = num_cached_blocks * hbs
         claim_tokens = int(seq.offload_joint.claim_tokens or 0)
-        # Unaligned HBM hit: the joint start sits on the chunk floor, strictly
-        # below the hit. Claiming the tail would hand the KV leg shared blocks
-        # to write. Reload that partial chunk into private blocks instead, and
-        # if the pool cannot back them, drop the joint and keep the HBM hit.
+        # Unaligned HBM hit whose private tail already cleared
+        # `_fit_unaligned_joint`. Stop the shared claim at the chunk floor.
+        # The tail is filled with fresh blocks only after the restore is
+        # pinned, so that pin is not the unit those blocks are paid with.
+        # `claim_tokens % hbs == 0` holds because `_joint_kv_boundary` returns
+        # `claim_off_hash_grid` otherwise; the assert states that precondition.
         if (
             int(seq.offload_joint.boundary_tokens or 0) > hbm_tokens
             and claim_tokens < hbm_tokens
-            and claim_tokens % hbs == 0
         ):
-            extra = num_cached_blocks - claim_tokens // hbs
-            if self._ensure_page_units(extra):
-                num_cached_blocks = claim_tokens // hbs
-            else:
-                self.joint_skips["partial_chunk_no_room"] = (
-                    self.joint_skips.get("partial_chunk_no_room", 0) + 1
-                )
-                seq.offload_joint.boundary_tokens = 0
-                seq.offload_joint.boundary_hash = -1
-                seq.offload_joint.kv_tokens = 0
-                seq.offload_joint.claim_tokens = 0
-                claim_tokens = 0
+            assert (
+                claim_tokens % hbs == 0
+            ), "a joint claim below the HBM hit is hash-block aligned"
+            num_cached_blocks = claim_tokens // hbs
         # After the partial-chunk reload above, which lowers the hit on
         # purpose: what follows compares against this to catch only the claim
         # loop's own eviction clamp.

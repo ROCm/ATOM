@@ -219,8 +219,11 @@ class OffloadJointRecord:
     kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
-    # covers. `num_cached_tokens` stays at the HBM prefix until both legs
-    # report, which keeps the forward honest if either fails.
+    # covers. An aligned hit leaves `num_cached_tokens` at the HBM prefix
+    # until both legs report. An unaligned hit lowers it to the chunk floor
+    # at allocate time and refills `[floor, hbm)` privately. Either way a
+    # failed leg disowns the prefix, so the forward cannot skip tokens the
+    # state does not cover.
     boundary_tokens: int = 0
     # Content hash of that boundary's last block, for the state leg.
     boundary_hash: int = -1
@@ -228,12 +231,14 @@ class OffloadJointRecord:
     # the boundary above, which is at or past it. The request still only claims
     # the boundary -- see `_claim_after_load`.
     kv_tokens: int = 0
-    # How far `allocate` claimed straight out of the HBM prefix cache, in
-    # tokens. Above `num_cached_tokens`, not below it: the blocks in
-    # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
-    # the state gate cut the hit, the KV never went anywhere. Claiming them is
-    # what keeps the KV leg from paying LMCache to resend what the pool already
-    # has, and it is where that leg starts.
+    # How far `allocate` claimed out of the HBM prefix cache, in tokens, and
+    # where the KV leg starts. After allocate this is at or above
+    # `num_cached_tokens`. A compressed hit past the gated hit claims resident
+    # blocks above the HBM prefix. An unaligned hit lowers `num_cached_tokens`
+    # to this floor, so the partial chunk is private rather than shared. The
+    # blocks in `(hit, compressed_hit]` still hold this prompt's KV; claiming
+    # them is what keeps the KV leg from paying LMCache to resend what the
+    # pool already has.
     claim_tokens: int = 0
 
     def reset_joint(self) -> None:
