@@ -372,6 +372,9 @@ def build_dsv4_kernel(
         assert (
             TK_TRIPS * TK_PER <= 32
         ), "the top-k's candidates per thread must fit in registers"
+        # its compaction keeps the parts' trip totals and bases past the bin words
+        assert TK_PARTS * TK_TRIPS + 2 * TK_TRIPS <= TK_BC, "the top-k's bases must fit"
+        assert TK_PARTS * TK_TRIPS <= THREADS, "a thread scans each (trip, part) total"
         # its compaction packs two per-part counts into one scanned word
         assert TK_TRIPS * TK_PER * THREADS < 1 << 16, "a part's counts must fit 16 bits"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"

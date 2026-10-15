@@ -48,7 +48,6 @@ from atom.mono.device.ops import (
 from atom.mono.device.ops import (
     hw_rsq as rsq,
 )
-from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import (
     THREADS,
     WAVES,
@@ -690,71 +689,88 @@ def index_select_stages(ctx):
                 # is (trip, part, thread, slot): within a part a block scan of each trip's
                 # packed counts (above | ties << 16), across parts their trip totals.
                 n_keep = k_want - gt
-                picks, cnts = [], []
-                for j in range_constexpr(TK_TRIPS):
+
+                def ranked(j, q):
+                    """Candidate q of trip j: (index, above the threshold, tied at it).
+                    Recomputed where used, so no per-candidate state stays live across
+                    the scans (a 1M build holds 32 candidates a thread)."""
+                    c = tk_cbs[j] + q
+                    ok = c < n_live
+                    sk = tk_keys[j * TK_PER + q] ^ MIN_I32
+                    return c, ok & (sk > thr), ok & (sk == thr)
+
+                def trip_count(j):
+                    """This thread's (above | ties << 16) of trip j."""
                     n_a = fx.Int32(0)
                     n_t = fx.Int32(0)
                     for q in range_constexpr(TK_PER):
-                        c = tk_cbs[j] + q
-                        ok = c < n_live
-                        sk = tk_keys[j * TK_PER + q] ^ MIN_I32
-                        above, tie = ok & (sk > thr), ok & (sk == thr)
-                        picks.append((c, above, tie, n_a, n_t))
+                        _c, above, tie = ranked(j, q)
                         n_a = n_a + above.select(fx.Int32(1), fx.Int32(0))
                         n_t = n_t + tie.select(fx.Int32(1), fx.Int32(0))
-                    cnts.append(n_a | (n_t << 16))
-                pres, tots = block_excl_scan_n(cnts)
+                    return n_a | (n_t << 16)
+
+                # Two passes over the trips, two at a time, so only two counts are live
+                # beside the keys (the register peak of a 1M build, 32 keys a thread):
+                # the first takes each trip's total, the second, once the bases are
+                # known, rescans each trip pair for its prefixes and writes its picks.
                 # hist (free past the radix): [0, NT) the parts' trip totals, then the
-                # bases of this part's trips, above then ties
+                # bases of this part's trips, above then ties.
                 NT = TK_PARTS * TK_TRIPS
+                TRIP_PAIRS = [[j] for j in range(TK_TRIPS)]
+                my_tot = fx.Int32(0)  # thread j < TK_TRIPS: this part's trip j total
+                for js in TRIP_PAIRS:
+                    _pres, tots = block_excl_scan_n([trip_count(j) for j in js])
+                    for k in range_constexpr(len(js)):
+                        my_tot = (tid == js[k]).select(tots[k], my_tot)
                 if const_expr(TK_PARTS > 1):
                     if n_parts > 1:
                         if tid < TK_TRIPS:
                             put(
                                 mb("tk_cnt"),
                                 (s * TK_PARTS + part) * TK_TRIPS + tid,
-                                pick(tots, tid),
+                                my_tot,
                             )
                         if tid < NT:
                             w = poll([(mb("tk_cnt"), s * NT + tid, 1)])[0][0]
                             lds_st(hist, tid, w)
                     else:
                         if tid < TK_TRIPS:
-                            lds_st(hist, part * TK_TRIPS + tid, pick(tots, tid))
+                            lds_st(hist, part * TK_TRIPS + tid, my_tot)
                 else:
                     if tid < TK_TRIPS:
-                        lds_st(hist, tid, pick(tots, tid))
+                        lds_st(hist, tid, my_tot)
                 gpu.barrier()
-                if tid < TK_TRIPS:
-                    # this part's trip tid: every part's earlier trips, then the
-                    # earlier parts' same trip (one part: its own earlier trips)
-                    b_a = fx.Int32(0)
-                    b_t = fx.Int32(0)
-                    for pp in range_constexpr(TK_PARTS):
-                        for jj in range_constexpr(TK_TRIPS):
-                            v = lds_ld(hist, pp * TK_TRIPS + jj)
-                            inc = (fx.Int32(jj) < tid) | (
-                                (fx.Int32(jj) == tid) & (fx.Int32(pp) < part)
-                            )
-                            inc = inc & (fx.Int32(pp) < n_parts)
-                            b_a = b_a + inc.select(v & 0xFFFF, fx.Int32(0))
-                            b_t = b_t + inc.select(v >> 16, fx.Int32(0))
-                    lds_st(hist, NT + tid, b_a)
-                    lds_st(hist, NT + TK_TRIPS + tid, b_t)
+                # the bases: an exclusive scan of the (trip, part) totals in index order
+                # (trip-major), thread t taking trip t // TK_PARTS of part t % TK_PARTS;
+                # above and ties apart, as all the parts' ties can pass 16 bits
+                jj = fx.Int32(tid) // TK_PARTS
+                pp = fx.Int32(tid) % TK_PARTS
+                mine = (fx.Int32(tid) < NT) & (pp < n_parts)
+                v = lds_ld(hist, fx.min(pp * TK_TRIPS + jj, fx.Int32(NT - 1)))
+                v = mine.select(v, fx.Int32(0))
+                (base_a, base_t), _tb = block_excl_scan_n([v & 0xFFFF, v >> 16])
+                if mine & (pp == part):
+                    lds_st(hist, NT + jj, base_a)
+                    lds_st(hist, NT + TK_TRIPS + jj, base_t)
                 gpu.barrier()
-                for j in range_constexpr(TK_TRIPS):
-                    if trip_live(j):
-                        b_a = lds_ld(hist, NT + j) + (pres[j] & 0xFFFF)
-                        b_t = lds_ld(hist, NT + TK_TRIPS + j) + (pres[j] >> 16)
-                        for q in range_constexpr(TK_PER):
-                            c, above, tie, ia, it = picks[j * TK_PER + q]
-                            ties_before = b_t + it
-                            if above | (tie & (ties_before < n_keep)):
-                                put(
-                                    mb("i_sel"),
-                                    s * N_ISEL + b_a + ia + fx.min(ties_before, n_keep),
-                                    comp_row(s, c),
-                                )
+                for js in TRIP_PAIRS:
+                    pres, _tots = block_excl_scan_n([trip_count(j) for j in js])
+                    for k in range_constexpr(len(js)):
+                        j = js[k]
+                        if trip_live(j):
+                            # the trip's first candidate's counts; then a running count
+                            b_a = lds_ld(hist, NT + j) + (pres[k] & 0xFFFF)
+                            b_t = lds_ld(hist, NT + TK_TRIPS + j) + (pres[k] >> 16)
+                            for q in range_constexpr(TK_PER):
+                                c, above, tie = ranked(j, q)
+                                if above | (tie & (b_t < n_keep)):
+                                    put(
+                                        mb("i_sel"),
+                                        s * N_ISEL + b_a + fx.min(b_t, n_keep),
+                                        comp_row(s, c),
+                                    )
+                                b_a = b_a + above.select(fx.Int32(1), fx.Int32(0))
+                                b_t = b_t + tie.select(fx.Int32(1), fx.Int32(0))
                 gpu.barrier()
                 # part 0 fills the tail (every part writes only below k_want)
                 if part == 0:
