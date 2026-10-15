@@ -51,13 +51,30 @@ lock_args=()
 if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
+run_cargo_build() {
+  cargo build --profile "${profile}" --bin atomesh \
+    "${lock_args[@]}" \
+    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
+}
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
-if ! cargo build --profile "${profile}" --bin atomesh \
-  "${lock_args[@]}" \
-  --manifest-path "${build_dir}/source/Cargo.toml" \
-  --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1; then
-  cat "${log_dir}/mesh-build.log" >&2
-  exit 1
+if ! run_cargo_build; then
+  # Cargo never re-extracts a crate whose .cargo-ok marker exists, so an
+  # extraction cut short leaves registry/src broken for every later build on
+  # this host. registry/src is regenerated from the downloaded registry/cache.
+  registry_src="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+  if [[ -d "${registry_src}" ]] && grep -qF "${registry_src}/" "${log_dir}/mesh-build.log"; then
+    echo "[build] Cargo registry sources under ${registry_src} look corrupt; re-extracting and retrying" >&2
+    cp "${log_dir}/mesh-build.log" "${log_dir}/mesh-build.attempt1.log"
+    rm -rf "${registry_src}"
+    if run_cargo_build; then
+      build_ok=true
+    fi
+  fi
+  if [[ "${build_ok:-false}" != "true" ]]; then
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
