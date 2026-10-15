@@ -17,7 +17,8 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
 ```
 
 Slurm account and single-node placement use their defaults (`auto`). The C32
-case excludes `pit2-p03-g34`: run `38741996691` confirmed that UID 300152 cannot
+case excludes `pit2-p03-g34` and `pit2-p03-g12`: runs `38741996691` and
+`38793498618` confirmed that UID 300152 cannot
 write the node's HugeTLB controls. The scheduler selects among the remaining
 nodes. This exclusion does not imply other nodes have sufficient memory or
 administrator permissions; host preparation still validates the selected node.
@@ -144,3 +145,9 @@ case's exclusive allocation and changes no files or permissions. It is skipped
 when the node already has enough free RAM. Both advice passes and their actual
 NUMA memory deltas are recorded separately; the existing 300-second total and
 90-second step bounds remain in effect.
+
+Run 38793498618 landed on g12, which reserved 720 GiB of idle HugeTLB on NUMA0.
+Ordinary free RAM plus clean cache was only about 760 GiB, and UID 300152 could
+not lower `nr_hugepages`. No model-cache advice or model startup ran. The case
+now excludes this demonstrated incompatible node as well as g34; scheduling
+among all other nodes remains automatic, with no Slurm account specified.
