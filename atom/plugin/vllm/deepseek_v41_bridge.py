@@ -663,21 +663,7 @@ def _v41_stage_outside_forward(
             if join is not None:
                 join()
     metadata.staged_outside_forward = True
-    if synthetic and getattr(metadata.step, "tentative", False):
-        # A capture is staged tentatively so it records the verify branch, but
-        # nothing will ever sample it, so nothing will commit its prefix --
-        # and the cache refuses the next step while one is outstanding
-        # ("Commit the accepted prefix before reusing or checkpointing
-        # state"). Drop it here: a synthetic step's accepted prefix is not a
-        # quantity that exists.
-        metadata.cache.pending = None
-    elif getattr(metadata.step, "tentative", False):
-        # Held until the sampler says how much of the draft block survived.
-        # Set after staging, not at `_prepare`: a step that raised on the way
-        # here never reached the cache, and leaving a stale handle behind
-        # would commit the wrong step's prefix.
-        global _V41_PENDING_SPECULATIVE_STEP
-        _V41_PENDING_SPECULATIVE_STEP = (builder, metadata)
+    _v41_settle_tentative_step(builder, metadata, synthetic)
     return SimpleNamespace(
         metadata=metadata,
         positions=step_positions,
@@ -685,6 +671,35 @@ def _v41_stage_outside_forward(
         running_tokens=running_tokens,
         capturing=synthetic,
     )
+
+
+def _v41_settle_tentative_step(builder, metadata, synthetic) -> None:
+    """Say who owns a tentative step's accepted prefix, or that nobody does.
+
+    Called by both staging paths. It used to live inline in the builder one,
+    and the in-forward fallback -- which reaches `_prepare` through the same
+    `_v41_prepare_kwargs`, so it can produce a tentative step just as easily --
+    did neither half. A tentative step left unsettled is not a silent loss:
+    the cache refuses the *next* step while one is outstanding, so the failure
+    surfaces a step later and somewhere else.
+    """
+    if not getattr(metadata.step, "tentative", False):
+        return
+    if synthetic:
+        # A capture is staged tentatively so it records the verify branch, but
+        # nothing will ever sample it, so nothing will commit its prefix --
+        # and the cache refuses the next step while one is outstanding
+        # ("Commit the accepted prefix before reusing or checkpointing
+        # state"). Drop it here: a synthetic step's accepted prefix is not a
+        # quantity that exists.
+        metadata.cache.pending = None
+        return
+    # Held until the sampler says how much of the draft block survived. Set
+    # after staging, not at `_prepare`: a step that raised on the way here
+    # never reached the cache, and leaving a stale handle behind would commit
+    # the wrong step's prefix.
+    global _V41_PENDING_SPECULATIVE_STEP
+    _V41_PENDING_SPECULATIVE_STEP = (builder, metadata)
 
 
 def _v41_step_input_ids(running_tokens):
@@ -1689,6 +1704,7 @@ def v41_stage_step(builder, input_ids, proxy_layer_name, force_dummy, vllm_confi
         _dump_v41_state_rows(snapshot, batch, builder, exc)
         raise
     _v41_publish_metadata(metadata)
+    _v41_settle_tentative_step(builder, metadata, synthetic)
     return metadata, step_positions, running_bs, running_tokens, synthetic
 
 
