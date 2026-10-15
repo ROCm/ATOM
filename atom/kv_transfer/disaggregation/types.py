@@ -312,6 +312,9 @@ class KVTransferTensors:
     # q-th k-th of every run, concatenated in run order. None for a region
     # that cannot move between unequal TP sizes.
     slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
+    # Per slot region, whether every TP rank holds the same unit (ReplaySSM's
+    # cursor), so a peer at any TP size takes it whole instead of a shard.
+    slot_region_tp_replicated: list[bool] | None = None
     # Scheduler blocks the PAGE regions are addressed in. `init=False` because
     # a backend cannot answer it: `req.block_ids` is the scheduler's id space,
     # and a backend counts in its own page -- a different unit even where it is

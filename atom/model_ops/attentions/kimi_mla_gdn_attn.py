@@ -157,6 +157,9 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
             len(tensors.slot_regions)
         )
+        tensors.slot_region_tp_replicated = [False] * len(tensors.slot_regions)
+        if self.replayssm and tensors.slot_regions:
+            tensors.slot_region_tp_replicated[-1] = True
         if getattr(config, "pipeline_parallel_size", 1) > 1:
             # `_consumer_region_map` shifts a stage's regions onto the peer's
             # list group-major over `num_hidden_layers`, but the MLA rows and
@@ -172,11 +175,13 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
     def _kda_slot_tp_segments(self, num_regions: int) -> list:
         """How each KDA slot region's unit splits over TP ranks.
 
-        A conv unit is `W` rows of `[q | k | v]` and an SSM unit is
-        `(heads, dv, dk)`, all sharded by contiguous head blocks, so a peer at
-        k times this TP holds the same k-th of every q, k and v run and of the
-        head axis. ReplaySSM's records are left undescribed, which keeps them
-        on equal TP sizes only, and so is a conv unit not shaped as above.
+        A conv unit is `W` rows of `[q | k | v]`, an SSM unit is
+        `(heads, dv, dk)` and a ReplaySSM record unit `(heads, cache_len, d)`,
+        all sharded by contiguous head blocks, so a peer at k times this TP
+        holds the same k-th of every q, k and v run and of the head axis. A
+        conv unit not shaped as above is left undescribed, which keeps it on
+        equal TP sizes only. ReplaySSM's cursor, the last region, is the same
+        on every rank; `slot_region_tp_replicated` says so.
         """
         runner = self.model_runner
         segments: list = [None] * num_regions
@@ -195,6 +200,16 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         )
         for i in range(n_kda, min(2 * n_kda, num_regions)):
             segments[i] = (ssm_bytes,)
+        if self.replayssm:
+            records = (
+                runner.replayssm_buf_k,
+                runner.replayssm_buf_u,
+                runner.replayssm_buf_g,
+            )
+            for group, buf in enumerate(records, start=2):
+                unit = buf[0, 0].numel() * buf.element_size()
+                for i in range(group * n_kda, min((group + 1) * n_kda, num_regions)):
+                    segments[i] = (unit,)
         return segments
 
     def _pp_consumer_region_indices(
