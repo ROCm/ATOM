@@ -325,14 +325,32 @@ def test_lazy_runner_waits_out_a_capture(monkeypatch):
     assert mono.ready(6) and mono.runner is not None
 
 
-@pytest.mark.parametrize("refusal", ["create", "prepare"])
-def test_lazy_runner_refusal_is_for_good(monkeypatch, refusal):
+def test_lazy_runner_create_refusal_is_for_good(monkeypatch):
+    """A `create()` refusal is a deployment verdict: mono cannot serve at all."""
     monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def create():
-        if refusal == "create":
-            raise MonoUnsupported("TP 8")
-        return _Runner(ok=False)
+        raise MonoUnsupported("TP 8")
 
     mono = route.LazyRunner(create, "test")
     assert not mono.ready(6) and not mono.enabled and not mono.ready(6)
+
+
+def test_lazy_runner_width_refusal_spares_other_widths(monkeypatch):
+    """A `prepare(width)` refusal is about that width and nothing else.
+
+    A step padded to an uncaptured width must not take mono away from the
+    widths that do build -- the runner stays enabled and a later good width
+    still runs.
+    """
+    monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class _ByWidth:
+        def prepare(self, rows):
+            return rows != 20
+
+    mono = route.LazyRunner(_ByWidth, "test")
+    assert not mono.ready(20)  # the padded width is declined
+    assert mono.enabled  # ...but mono is not switched off
+    assert mono.ready(6)  # ...and a width that builds still runs
+    assert not mono.ready(20)  # the refused width stays refused
