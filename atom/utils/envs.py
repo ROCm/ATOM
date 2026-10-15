@@ -1000,11 +1000,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
-    # Memoise the delayer's prefix walk across hold ticks
-    # (`BlockManager.can_allocate_memoized`). "0" re-probes every tick.
-    "ATOM_PREFILL_DELAYER_PROBE_MEMO": lambda: (
-        os.getenv("ATOM_PREFILL_DELAYER_PROBE_MEMO", "1") == "1"
-    ),
+    # Memoise a waiting request's prefix walk across the per-tick probes (the
+    # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
+    # "0" re-walks every tick.
+    "ATOM_PREFIX_WALK_MEMO": lambda: (os.getenv("ATOM_PREFIX_WALK_MEMO", "1") == "1"),
     # Hash the prompt block chain in the frontend and ship it to the engine.
     # "0" leaves all hashing to the engine.
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (

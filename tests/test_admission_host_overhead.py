@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Admission host-overhead switches must not change answers: the fast prefix walk
-# (`ATOM_PREFIX_FAST_WALK`), the delayer's probe memo (`..._PROBE_MEMO`) and the
-# frontend-hashed prompt chain (`ATOM_FRONTEND_PREFIX_HASH`).
+# (`ATOM_PREFIX_FAST_WALK`), the per-tick walk memo (`ATOM_PREFIX_WALK_MEMO`) and
+# the frontend-hashed prompt chain (`ATOM_FRONTEND_PREFIX_HASH`).
 
 import array
 import pickle
@@ -491,13 +491,13 @@ def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "var", ["PREFIX_FAST_WALK", "PREFILL_DELAYER_PROBE_MEMO", "FRONTEND_PREFIX_HASH"]
+    "var", ["PREFIX_FAST_WALK", "PREFIX_WALK_MEMO", "FRONTEND_PREFIX_HASH"]
 )
 def test_off_switch(monkeypatch, var):
     monkeypatch.setenv("ATOM_" + var, "0")
     bm = published(range(40))
     assert bm.fast_prefix_walk == (var != "PREFIX_FAST_WALK")
-    assert bm.walk_memo == (var != "PREFILL_DELAYER_PROBE_MEMO")
+    assert bm.walk_memo == (var != "PREFIX_WALK_MEMO")
     seq = shipped_seq(list(range(40)) + [900])
     assert (seq.prompt_hash_chain is None) == (var == "FRONTEND_PREFIX_HASH")
     assert bm.can_allocate_memoized(seq) == exact(bm, seq) == 10
