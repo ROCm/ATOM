@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
-    from atom.utils.forward_context import DPStageReport
+    from atom.utils.forward_context import BoundedReplayDPReport
 
 import numpy as np
 import torch
@@ -174,8 +174,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 
-    def dp_stage_report(self, batch: ScheduledBatch) -> "DPStageReport | None":
-        """This rank's `DPStageReport` for the step's DP sync, or None when the
+    def dp_stage_report(self, batch: ScheduledBatch) -> "BoundedReplayDPReport | None":
+        """This rank's `BoundedReplayDPReport` for the step's DP sync, or None when the
         model runs every MoE layer on every row of the step.
 
         A model whose prefill runs some MoE layers on other rows (DeepSeek-V4.1

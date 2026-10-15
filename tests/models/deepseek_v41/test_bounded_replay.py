@@ -426,7 +426,11 @@ def _stage_forward(sizes, rank, rows, report):
     """A forward context of a DP step whose sync carried stage ``rows``
     (None: no rank's report applies), built the way `set_forward_context`
     builds it."""
-    from atom.utils.forward_context import DPMetadata, ForwardContext, _dp_stages
+    from atom.utils.forward_context import (
+        DPMetadata,
+        ForwardContext,
+        _bounded_replay_dp_stages,
+    )
 
     parallel = SimpleNamespace(data_parallel_size=len(sizes), data_parallel_rank=rank)
     sync = SimpleNamespace(dp_stage_rows=rows)
@@ -440,7 +444,7 @@ def _stage_forward(sizes, rank, rows, report):
         dp_metadata=DPMetadata.make(
             parallel, sizes[rank], torch.tensor(sizes, dtype=torch.int32)
         ),
-        dp_stages=_dp_stages(parallel, report, sync),
+        dp_stages=_bounded_replay_dp_stages(parallel, report, sync),
     )
 
 

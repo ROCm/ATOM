@@ -141,7 +141,7 @@ def replays_batch(batch) -> bool:
 
 
 def decoder_stage_report(batch, window: int):
-    """This rank's `DPStageReport` for the step: its decoder and last-layer
+    """This rank's `BoundedReplayDPReport` for the step: its decoder and last-layer
     token counts, whether it replays, and whether it has decoder work.
 
     A rank that does not replay runs all its rows through both stages. One
@@ -149,11 +149,11 @@ def decoder_stage_report(batch, window: int):
     the decoder and its last row through layer 39 -- or, when nothing
     finishes, one placeholder row while a peer has decoder work
     (`run_decoder_stages`)."""
-    from atom.utils.forward_context import DPStageReport
+    from atom.utils.forward_context import BoundedReplayDPReport
 
     total = int(batch.total_tokens_num)
     if not replays_batch(batch):
-        return DPStageReport(DECODER_STAGES, (total, total), applies=False)
+        return BoundedReplayDPReport(DECODER_STAGES, (total, total), applies=False)
     lengths = batch.num_scheduled_tokens
     finals = batch.is_final_chunk
     tails = [
@@ -162,8 +162,8 @@ def decoder_stage_report(batch, window: int):
         if n and (finals is None or finals[i])
     ]
     if not tails:
-        return DPStageReport(DECODER_STAGES, (1, 1), applies=True, active=False)
-    return DPStageReport(DECODER_STAGES, (sum(tails), len(tails)), applies=True)
+        return BoundedReplayDPReport(DECODER_STAGES, (1, 1), applies=True, active=False)
+    return BoundedReplayDPReport(DECODER_STAGES, (sum(tails), len(tails)), applies=True)
 
 
 def planned_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:

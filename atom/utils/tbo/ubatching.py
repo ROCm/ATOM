@@ -202,7 +202,7 @@ class DPSyncResult:
     # the graph-shape sync no longer needs its own separate all_reduce (halves
     # the per-step DP round-trips).
     max_seqlen_q_across_dp: int | None = None
-    # A model's per-stage rows (`DPStageReport.wire`: applies, active, then
+    # A model's per-stage rows (`BoundedReplayDPReport.wire`: applies, active, then
     # one token count per stage), one tuple per row, in DP order. Set only
     # when some rank's row applies on a step whose MoE takes the
     # variable-length gather (some rank prefills) and TBO did not split.
@@ -253,7 +253,7 @@ def sync_dp_metadata(
       row j+0.. : dp_stage_row         -> dp_stage_rows  [model stage rows only]
 
     ``dp_stage_row`` folds a model's per-stage token counts into the same
-    collective (`DPStageReport.wire`: applies, active, counts). Its length is
+    collective (`BoundedReplayDPReport.wire`: applies, active, counts). Its length is
     the model's, fixed by configuration, so every rank sends the same rows.
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
