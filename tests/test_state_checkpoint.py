@@ -2616,7 +2616,7 @@ class TestPromptEndAnchorTemplateMargin:
         198,
         151667,
     )
-    GEN_PROMPT = [IM_START, ASSISTANT, NL, THINK, NL]
+    GEN_PROMPT = (IM_START, ASSISTANT, NL, THINK, NL)
     # "<think>" "\n": not resent once the turn becomes history.
     DROPPED_SUFFIX = 2
     QWEN35_MARGIN = len(GEN_PROMPT)
@@ -2655,7 +2655,7 @@ class TestPromptEndAnchorTemplateMargin:
             history
             + [self.IM_START, self.USER, self.NL]
             + self._fresh(pad)
-            + self.GEN_PROMPT
+            + list(self.GEN_PROMPT)
         )
 
     def _as_history(self, prompt, answer):
