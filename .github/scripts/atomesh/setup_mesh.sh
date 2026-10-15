@@ -21,7 +21,10 @@ artifact_dir="${run_dir}/mesh-build"
 container_dir="/run_logs/slurm_job-${job_id}/mesh-build"
 # The same job's benchmark and eval phases consume the same build artifact.
 if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]]; then
-  cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
+  # Not the usual atomesh-mesh-cache-<uid>: on pit2-p03-g12/g34 the CI user's
+  # one holds a half-installed Rust 1.94.0 ("missing manifest in toolchain")
+  # that fails every Mesh build; this experiment branch builds in its own.
+  cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)-hugetlb}"
   mkdir -p "${artifact_dir}" "${cache_dir}"
   source_commit="$(git -C "${repo_root}" rev-parse HEAD)"
   source_dirty=false
