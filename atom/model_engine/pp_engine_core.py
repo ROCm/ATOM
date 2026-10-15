@@ -23,7 +23,7 @@ logger = logging.getLogger("atom")
 
 # Collect poll timeout when the step made no other progress: bounds both
 # new-request admission latency and busy-spinning while batches are in flight.
-_PP_HEAD_IDLE_POLL_MS = 1
+_PP_IDLE_POLL_MS = 1
 
 
 class PPEngineCoreProc(EngineCore):
@@ -147,7 +147,7 @@ class PPEngineCoreProc(EngineCore):
 
         self._poll_kv_transfer_progress()
 
-        poll_ms = 0 if launched else _PP_HEAD_IDLE_POLL_MS
+        poll_ms = 0 if launched else _PP_IDLE_POLL_MS
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
             if not needs_output:
@@ -365,6 +365,17 @@ class PPEngineCoreProc(EngineCore):
     # -- Downstream busy loop ------------------------------------------------
 
     def _downstream_busy_loop(self):
+        # Chunked P waits for every stage's D-ready report before forwarding.
+        # When all requests wait, no forward wakes recv_metadata. Poll status
+        # at the head's idle cadence instead of adding up to 100 ms to TTFT.
+        connector = getattr(self.scheduler, "kv_connector", None)
+        metadata_poll_ms = (
+            _PP_IDLE_POLL_MS
+            if self.kv_transfer_enabled
+            and getattr(connector, "is_producer", False)
+            and getattr(connector, "enable_chunked_transfer", False)
+            else 100
+        )
         shutdown = False
         metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
         next_metrics_push = 0.0
@@ -380,7 +391,7 @@ class PPEngineCoreProc(EngineCore):
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
-                batch = self.pp_transport.recv_metadata(timeout_ms=100)
+                batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()
