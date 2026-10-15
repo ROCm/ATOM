@@ -96,6 +96,10 @@ class BlockPool:
         # Bumped on every change to a hash -> id mapping: ids resolved at
         # version v are still current while it is v.
         self.index_version: int = 0
+        # Bumped when an indexed hash moves to another block id (republished
+        # elsewhere, `_adopt`): ids resolved before then can go stale with no
+        # eviction.
+        self.index_remaps: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
@@ -208,7 +212,9 @@ class BlockPool:
         """Index `block_id` under the content hash of the tokens it now holds."""
         block = self.blocks[block_id]
         block.update(h, token_ids)
+        prev = self._hash_to_block_id.get(h, block_id)
         self._hash_to_block_id[h] = block_id
+        self.index_remaps += prev != block_id
         self.index_version += 1
 
     def clear_index(self) -> None:
@@ -494,6 +500,7 @@ class BlockPool:
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
             self.index_version += 1
+            self.index_remaps += 1
         self._used.discard(source)
         self._used.add(destination)
         src.ref_count, src.hash, src.token_ids = 0, -1, array.array("i")

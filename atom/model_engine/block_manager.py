@@ -4,11 +4,12 @@
 import array
 import logging
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import islice
 from math import inf, isinf
 from time import monotonic
-from weakref import WeakKeyDictionary, ref
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import xxhash
@@ -121,11 +122,11 @@ _WALK_HASH_ROUND_MAX = 1024
 
 
 @dataclass(slots=True)
-class _AdmissionWalk:
-    """`can_allocate`'s hit, claimed by the `allocate` that follows it
-    (`_take_admission_walk` revalidates it against `index_version`)."""
+class _PrefixWalk:
+    """`_walk_prefix`'s contiguous HBM hit (`ids[i]` holds `hashes[i]`): what
+    `_evaluate` reads, the delayer memoises and, on the fast walk, `allocate`
+    claims (`_take_admission_walk` revalidates it against `index_version`)."""
 
-    seq: ref
     num_tokens: int
     cache_seed: int
     index_version: int
@@ -135,23 +136,17 @@ class _AdmissionWalk:
 
 @dataclass(slots=True)
 class _FitEstimate:
-    """One `can_allocate` walk, memoised for `can_allocate_estimate`.
-    `watched`: every hash whose index entry it read (the hit and the first
-    miss, `boundary_hash`, None if the hit reaches the last reusable block)."""
+    """A walk memoised for `can_allocate_estimate`. `watched`: every hash
+    whose index entry it read (the hit and the first miss, `boundary_hash`,
+    None if the hit reaches the last reusable block)."""
 
-    num_tokens: int
-    cache_seed: int
+    walk: _PrefixWalk
     index_clears: int
+    index_remaps: int
     evictions_seen: int
-    compressed_hit: int
-    block_hashes: list[int]
     watched: set[int]
     boundary_hash: int | None
     boundary_id: int
-    # `_gated_hit`'s answer, and the hit after `_replay_hit` widened it.
-    resumable: int
-    hit: int
-    num_new_blocks: int
 
 
 class BlockManager:
@@ -190,8 +185,8 @@ class BlockManager:
         self.shipped_chains_adopted: int = 0
         self.shipped_chains_rejected: int = 0
         self.total_evicted_blocks: int = 0
-        # `can_allocate_estimate`'s memo, validated against recent evictions
-        # and `clear_cache` calls (which drop entries without an eviction).
+        # `can_allocate_estimate`'s memo, validated against recent evictions,
+        # `clear_cache` calls and remaps (which move entries without one).
         self._fit_estimates: WeakKeyDictionary[Sequence, _FitEstimate] = (
             WeakKeyDictionary()
         )
@@ -200,7 +195,10 @@ class BlockManager:
         self.fit_estimate_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
         # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
         self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
-        self._admission_walk: _AdmissionWalk | None = None
+        # Each seq's last fast walk, for its `allocate` to claim.
+        self._admission_walks: WeakKeyDictionary[Sequence, _PrefixWalk] = (
+            WeakKeyDictionary()
+        )
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -1050,7 +1048,6 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
-        remember: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -1061,7 +1058,8 @@ class BlockManager:
         demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
-        `remember=True` memoises the walk for `can_allocate_estimate`.
+        `_walk_prefix` then `_evaluate`; `can_allocate_estimate` evaluates a
+        memoised walk the same way.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -1073,14 +1071,23 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
+        return self._evaluate(seq, self._walk_prefix, record, block_hashes)
+
+    def _evaluate(
+        self,
+        seq: Sequence,
+        walk_of: Callable[[Sequence], _PrefixWalk],
+        record: bool,
+        block_hashes: list[int] | None,
+    ) -> int:
+        """`can_allocate` over the walk `walk_of(seq)` returns; everything but
+        the walk is asked afresh on every call."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
         # gating on one slot would admit a request the pool cannot give a
         # rollback set to.
-        if block_hashes is None:
-            block_hashes = []
-        else:
+        if block_hashes is not None:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
@@ -1091,31 +1098,12 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        prompt = self._prompt_hashes(seq)
-        if self.fast_prefix_walk:
-            hit_hashes, hit_ids = self._hit_walk(seq, prompt)
-            block_hashes += hit_hashes
-            compressed_hit = len(hit_hashes)
-            self._admission_walk = _AdmissionWalk(
-                ref(seq),
-                seq.num_tokens,
-                seq.cache_seed,
-                self.kv.index_version,
-                hit_hashes,
-                hit_ids,
-            )
+        walk = walk_of(seq)
+        if block_hashes is None:
+            block_hashes = walk.hashes  # read, never extended, below
         else:
-            h = seq.cache_seed
-            compressed_hit = 0
-            for i in range(self._n_hash_blocks(seq) - 1):
-                h = self._block_hash(seq, prompt, i, h)
-                block_id = self.kv.lookup(h)
-                if block_id == -1 or self.kv.block(block_id).token_ids != (
-                    self._hash_block_tokens(seq, i)
-                ):
-                    break
-                block_hashes.append(h)
-                compressed_hit += 1
+            block_hashes += walk.hashes
+        compressed_hit = len(walk.hashes)
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -1139,26 +1127,12 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = self._n_hash_blocks(seq)
-        if self.fast_prefix_walk:
-            num_new_blocks -= self.kv.count_used(hit_ids[:num_cached_blocks])
-        else:
-            for i in range(num_cached_blocks):
-                if self.kv.is_used(self.kv.lookup(block_hashes[i])):
-                    num_new_blocks -= 1
+        num_new_blocks = self._n_hash_blocks(seq) - self.kv.count_used(
+            walk.ids[:num_cached_blocks]
+        )
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
-        if remember:
-            self._remember_walk(
-                seq,
-                prompt,
-                compressed_hit,
-                block_hashes,
-                resumable,
-                num_cached_blocks,
-                num_new_blocks,
-            )
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
@@ -1195,6 +1169,30 @@ class BlockManager:
         # place, because that is a policy decision and this is not.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
+        """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`.
+        A fast walk is kept for `seq`'s `allocate` (`_take_admission_walk`)."""
+        prompt = self._prompt_hashes(seq)
+        if self.fast_prefix_walk:
+            hashes, ids = self._hit_walk(seq, prompt)
+        else:
+            hashes, ids, h = [], [], seq.cache_seed
+            for i in range(self._n_hash_blocks(seq) - 1):
+                h = self._block_hash(seq, prompt, i, h)
+                block_id = self.kv.lookup(h)
+                if block_id == -1 or self.kv.block(block_id).token_ids != (
+                    self._hash_block_tokens(seq, i)
+                ):
+                    break
+                hashes.append(h)
+                ids.append(block_id)
+        walk = _PrefixWalk(
+            seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
+        )
+        if self.fast_prefix_walk:
+            self._admission_walks[seq] = walk
+        return walk
 
     def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
         """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
@@ -1249,14 +1247,13 @@ class BlockManager:
                     break
         return hashes, ids
 
-    def _take_admission_walk(self, seq: Sequence) -> _AdmissionWalk | None:
-        """The last `can_allocate` walk if it was of `seq` and still holds
-        (consumed either way). Past its `index_version` it holds while every
-        hash still resolves to the same id, which is all `allocate` takes."""
-        walk, self._admission_walk = self._admission_walk, None
+    def _take_admission_walk(self, seq: Sequence) -> _PrefixWalk | None:
+        """`seq`'s last fast walk if it still holds (consumed either way). Past
+        its `index_version` it holds while every hash still resolves to the
+        same id, which is all `allocate` takes."""
+        walk = self._admission_walks.pop(seq, None)
         if (
             walk is None
-            or walk.seq() is not seq
             or walk.num_tokens != seq.num_tokens
             or walk.cache_seed != seq.cache_seed
         ):
@@ -1268,83 +1265,57 @@ class BlockManager:
         return walk
 
     def can_allocate_estimate(self, seq: Sequence) -> int:
-        """`can_allocate(seq, record=False)` for the delayer, memoised per seq.
+        """`can_allocate(seq, record=False)` for the delayer and the DP chunk
+        cost, with the walk memoised per seq. The same `_evaluate`, so state
+        room, the gates, the replay, checkpoint demand/end, the used hit blocks
+        and the fit are re-asked on every call, and the answer is the exact
+        probe's.
 
         The walk is reused while nothing it read moved: no `watched` hash was
-        evicted (`_record_evicted`) or cleared (`_index_clears`), the first
-        miss still resolves the same (a hit only grows by a publish of that
-        hash), and token count and seed are unchanged. Re-asked on every call,
-        as they move independently of the index: state room, the state gate
-        and the bounded replay (a changed answer re-walks), and free-pool fit;
-        only `num_new_blocks` may lag. Advisory: Phase 2 still runs the exact
-        `can_allocate`, so a stale estimate can move FIRE/HOLD, never admit.
+        evicted (`_record_evicted`) or cleared (`_index_clears`), no indexed
+        hash moved to another block (`index_remaps`), the first miss still
+        resolves the same (a hit only grows by a publish of that hash), and
+        token count and seed are unchanged.
         """
-        if not (self.enable_prefix_caching and self.fit_estimate_memo):
+        if not self.fit_estimate_memo:
             return self.can_allocate(seq, record=False)
-        memo = self._fit_estimates.get(seq)
-        if memo is None or not self._walk_still_valid(seq, memo):
-            return self.can_allocate(seq, record=False, remember=True)
-        if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
-            return -1
-        resumable = self._gated_hit(seq, memo.compressed_hit, memo.block_hashes)
-        if resumable != memo.resumable:
-            return self.can_allocate(seq, record=False, remember=True)
-        # Also sets `seq.replays_hit` / `replay_kv_load` as the exact probe does.
-        hit = self._replay_hit(seq, memo.compressed_hit, resumable)
-        if hit != memo.hit:
-            return self.can_allocate(seq, record=False, remember=True)
-        protected_hash = memo.block_hashes[hit - 1] if hit else None
-        if not self._has_page_units(memo.num_new_blocks, protected_hash):
-            return -1
-        return hit
+        return self._evaluate(seq, self._memoised_walk, False, None)
 
-    def _remember_walk(
-        self,
-        seq: Sequence,
-        prompt: list[int],
-        compressed_hit: int,
-        block_hashes: list[int],
-        resumable: int,
-        hit: int,
-        num_new_blocks: int,
-    ) -> None:
+    def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
+        memo = self._fit_estimates.get(seq)
+        if memo is not None and self._walk_still_valid(seq, memo):
+            return memo.walk
+        walk = self._walk_prefix(seq)
+        hit = len(walk.hashes)
         boundary_hash = None
         boundary_id = -1
-        if compressed_hit < self._n_hash_blocks(seq) - 1:
-            # Read back from the prompt chain, where `_hit_walk` left it.
-            boundary_hash = self._block_hash(
-                seq,
-                prompt,
-                compressed_hit,
-                block_hashes[-1] if compressed_hit else seq.cache_seed,
-            )
+        if hit < self._n_hash_blocks(seq) - 1:
+            # Read back from the prompt chain, where the walk left it.
+            prev = walk.hashes[-1] if hit else seq.cache_seed
+            boundary_hash = self._block_hash(seq, self._prompt_hashes(seq), hit, prev)
             boundary_id = self.kv.lookup(boundary_hash)
-        watched = set(block_hashes)
+        watched = set(walk.hashes)
         if boundary_hash is not None:
             watched.add(boundary_hash)
         self._fit_estimates[seq] = _FitEstimate(
-            num_tokens=seq.num_tokens,
-            cache_seed=seq.cache_seed,
+            walk=walk,
             index_clears=self._index_clears,
+            index_remaps=self.kv.index_remaps,
             evictions_seen=self.total_evicted_blocks,
-            compressed_hit=compressed_hit,
-            # Never extended in place (`_extend_hash_chain` copies).
-            block_hashes=block_hashes,
             watched=watched,
             boundary_hash=boundary_hash,
             boundary_id=boundary_id,
-            resumable=resumable,
-            hit=hit,
-            num_new_blocks=num_new_blocks,
         )
+        return walk
 
     def _walk_still_valid(self, seq: Sequence, memo: _FitEstimate) -> bool:
         """Whether the KV index still answers `memo`'s walk the same way. Costs
         the evictions since the last check, not the prompt length."""
         if (
-            memo.num_tokens != seq.num_tokens
-            or memo.cache_seed != seq.cache_seed
+            memo.walk.num_tokens != seq.num_tokens
+            or memo.walk.cache_seed != seq.cache_seed
             or memo.index_clears != self._index_clears
+            or memo.index_remaps != self.kv.index_remaps
         ):
             return False
         new = self.total_evicted_blocks - memo.evictions_seen

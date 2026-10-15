@@ -39,6 +39,23 @@ def exact(bm, seq):
     return BlockManager.can_allocate(bm, seq, record=False)
 
 
+SIDE_EFFECTS = (
+    "checkpoint_demand_pos",
+    "checkpoint_end_pos",
+    "num_wanted_hit_blocks",
+    "num_compressed_hit_blocks",
+    "replays_hit",
+    "replay_kv_load",
+)
+
+
+def probed(probe, bm, seq):
+    """`probe`'s answer and what it wrote on `seq`, over poisoned fields."""
+    for name in SIDE_EFFECTS:
+        setattr(seq, name, -7)
+    return probe(bm, seq), [getattr(seq, name) for name in SIDE_EFFECTS]
+
+
 def pool_state(bm):
     kv = bm.kv
     blocks = [(b.ref_count, b.hash, list(b.token_ids)) for b in kv.blocks]
@@ -107,7 +124,8 @@ def churn(make, make_seq, seed, steps=150, ship=False, preempted=False):
                 bm.deallocate(live.pop(int(r * len(live))))
             log.append(pool_state(bm))
             for head in heads:
-                assert bm.can_allocate_estimate(head) == exact(bm, head)
+                estimate = probed(BlockManager.can_allocate_estimate, bm, head)
+                assert estimate == probed(exact, bm, head)
         logs.append(log)
         managers.append(bm)
     return managers, logs
@@ -171,7 +189,18 @@ def test_allocate_claims_the_probe_ids_unless_stale(monkeypatch, fast, stale):
     else:
         monkeypatch.setattr(bm.kv, "lookup", lambda h: pytest.fail("walked again"))
     assert bm.allocate(seq, 10)
-    assert list(seq.block_table[:10]) == want and bm._admission_walk is None
+    assert list(seq.block_table[:10]) == want and seq not in bm._admission_walks
+
+
+def test_the_walk_is_handed_to_its_own_allocate():
+    """Probes of other seqs, and the estimate's, do not take A's walk."""
+    bm = published(range(40))
+    a, b = (Sequence(list(range(40)) + [900 + k], BLOCK) for k in range(2))
+    assert exact(bm, a) == bm.can_allocate_estimate(a) == 10
+    assert bm.can_allocate_estimate(b) == exact(bm, b) == 10
+    assert bm.can_allocate_estimate(a) == 10
+    bm.kv.lookup = lambda h: pytest.fail("walked again")
+    assert bm.allocate(a, 10) and a.num_cached_tokens == 40
 
 
 @pytest.mark.parametrize("block,fast_hit,slow_hit", [(9, 9, 9), (4, 10, 4)])
@@ -202,6 +231,17 @@ def test_the_memo_follows_a_change_to_what_its_walk_read(change):
     assert bm.can_allocate_estimate(head) == 10
     change(bm, head)
     assert bm.can_allocate_estimate(head) == exact(bm, head) != 10
+
+
+def test_the_memo_recounts_hit_blocks_another_seq_claimed():
+    """No eviction, but the hit's blocks went from free to used."""
+    bm = published(range(40), BlockManager(prefix_config(num_kvcache_blocks=24)))
+    head = Sequence(list(range(44)), BLOCK)
+    assert bm.can_allocate_estimate(head) == 10
+    other = Sequence(list(range(40)) + list(range(500, 520)), BLOCK)
+    assert bm.can_allocate(other) == 10 and bm.allocate(other, 10)
+    assert bm.total_evicted_blocks == 0 and bm.kv.num_free == 9
+    assert bm.can_allocate_estimate(head) == exact(bm, head) == 10
 
 
 def test_the_state_gate_is_asked_again():

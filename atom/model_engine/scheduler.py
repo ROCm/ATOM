@@ -1090,7 +1090,7 @@ class Scheduler:
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch
         budget: resumable partials first, then the head of `waiting`, probing
-        the prefix cache without recording (`can_allocate(record=False)`). An
+        the prefix cache without recording (`can_allocate_estimate`). An
         estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
@@ -1121,9 +1121,9 @@ class Scheduler:
                     seq, resume, hit=seq.replays_hit
                 )
             else:
-                # Runs on every tick with prefill work, holds included; the
-                # prompt hashes are cached (`BlockManager._prompt_hashes`).
-                cached_blocks = self.block_manager.can_allocate(seq, record=False)
+                # Runs on every tick with prefill work, holds included: reuse
+                # the walk across ticks; the answer is the exact probe's.
+                cached_blocks = self.block_manager.can_allocate_estimate(seq)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission
