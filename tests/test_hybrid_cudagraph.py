@@ -462,7 +462,7 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
         af_piecewise=True,
         af_zero_copy_hidden=True,
         piecewise_outputs=outputs,
-        attention_graphs=runtime.AttentionGraphs(outputs),
+        attention_graphs=runtime.PiecewiseAFRunner(outputs),
     )
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,

@@ -11,7 +11,7 @@ pytest.importorskip("aiter")
 
 from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
-from atom.models.deepseek_v41.af_attention import AttentionGraphs
+from atom.utils.piecewise_af import PiecewiseAFRunner
 from atom.models.deepseek_v41.model import Block
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
@@ -37,26 +37,19 @@ def _forward(
         attn_metadata=metadata,
     )
     block = SimpleNamespace(attn=attention, layer_name=f"test.af.{id(graphs)}")
-    with graphs.bind(
-        attention,
+    return Block.attention_forward(
+        block,
         hidden,
-        metadata,
-        context,
+        cache,
+        step,
+        rope,
+        queries,
+        piecewise=True,
         capture=True,
-        zero_copy_hidden=zero_copy_hidden,
-    ) as arguments:
-        return Block.attention_forward(block, rope=rope, **arguments)
-
-
-def test_capture_admits_indexing_and_subset_but_excludes_dummy():
-    md = SimpleNamespace(queries=None, step=SimpleNamespace(requests=[1]), dummy=False)
-    fc = SimpleNamespace(in_hipgraph=False, context=SimpleNamespace(is_dummy_run=False))
-    assert AttentionGraphs.eligible(md, fc)
-    md.queries = object()
-    assert AttentionGraphs.eligible(md, fc)
-    md.queries = None
-    fc.in_hipgraph = True
-    assert not AttentionGraphs.eligible(md, fc)
+        forward_context=context,
+        runner=graphs,
+        zero_copy_inputs=("normed",) if zero_copy_hidden else (),
+    )
 
 
 @cuda
@@ -72,7 +65,7 @@ def test_refreshes_metadata_and_applies_state_effect_once_per_call():
             cache.pool.add_(1)
             return hidden + step.positions[None, :, None] + step.slots[0]
 
-    graphs = AttentionGraphs()
+    graphs = PiecewiseAFRunner(token_dim=1)
     for i, (lengths, position, slot) in enumerate(
         [
             ([4], 0, 0),
@@ -140,7 +133,7 @@ def test_real_window_attention_matches_eager_outputs_and_kv_across_steps(subset)
     attn.wq_b = lambda x, x_scale=None: x.repeat(1, 1, 2)
     attn._project_out = lambda out, rope, pos: out.mean(dim=-2)
     rope = RotaryEmbedding(64, 128, base=10000).to("cuda")
-    graphs = AttentionGraphs()
+    graphs = PiecewiseAFRunner(token_dim=1)
     layouts = [
         [(0, 0, 4)],
         [(0, 4, 4)],
@@ -196,7 +189,6 @@ def test_indexed_graph_matches_eager_compression_selection_and_reindex(
     from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
     from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
     from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
-    from atom.models.deepseek_v41.af_attention import AttentionGraphs
     from atom.models.deepseek_v41.attention import Attention, Indexer
     from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
     from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
@@ -270,7 +262,7 @@ def test_indexed_graph_matches_eager_compression_selection_and_reindex(
                 project=lambda x: (x.float(), -x.float()),
             )
         layers.append(attn)
-    graphs = [AttentionGraphs() for _ in layers]
+    graphs = [PiecewiseAFRunner(token_dim=1) for _ in layers]
     layouts = [
         [(0, 0, 130)],
         [(0, 130, 6)],
@@ -332,16 +324,23 @@ def test_indexed_graph_matches_eager_compression_selection_and_reindex(
 
 
 @cuda
-def test_indexed_replay_publishes_current_outputs_and_updates_state_once():
-    from atom.models.deepseek_v41.af_attention import AttentionGraphs
+@pytest.mark.parametrize("subset", [False, True])
+def test_indexed_replay_publishes_current_outputs_and_updates_state_once(subset):
+    from dataclasses import replace
+
+    from atom.models.deepseek_v41.bounded_replay import QueryRows
     from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
     cache = SimpleNamespace(pool=torch.zeros(1, device="cuda"))
 
     class Core:
-        spec = LayerAttentionSpec(2, 2, AttentionMode.REINDEX, 0, 2, 0)
+        spec = LayerAttentionSpec(2, 2, AttentionMode.REINDEX, 0, 0, 0)
 
         def __call__(self, hidden, scale, cache, step, rope, queries=None):
+            if queries is not None:
+                assert queries.index.selected is step.selected
+                assert queries.index.candidates is step.candidates
+                assert queries.index.group_indices is step.group_indices
             cache.pool.add_(1)
             selected = hidden + step.candidates[0] + step.visible[2][None, :, None]
             step.selected[2] = selected
@@ -353,7 +352,7 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once():
             step.window_rows = selected + 3
             return selected + step.positions[None, :, None] + step.slots[0]
 
-    graph = AttentionGraphs()
+    graph = PiecewiseAFRunner(token_dim=1)
     graph.max_entries = 2
     for i, count in enumerate([4, 4, 6, 4, 8, 6], 1):
         step = BatchStep(
@@ -370,7 +369,19 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once():
             indptrs={2: (torch.arange(count + 1, device="cuda"), None, 2)},
         )
         hidden = torch.full((1, count, 2), i * 3.0, device="cuda")
-        actual = _forward(graph, Core(), hidden, cache, step, None)
+        upstream = hidden + 100
+        step.selected[0] = upstream
+        queries = None
+        if subset:
+            rows = torch.arange(count, device="cuda")
+            queries = QueryRows(
+                rows,
+                step.positions,
+                replace(step, batch_ids=step.batch_ids.clone()),
+                torch.arange(count + 1, device="cuda"),
+            )
+        actual = _forward(graph, Core(), hidden, cache, step, None, queries)
+        assert step.selected[0] is upstream
         selected = hidden + i * 3
         torch.testing.assert_close(
             actual, selected + step.positions[None, :, None] + i % 2, rtol=0, atol=0
@@ -418,7 +429,7 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
         with torch.cuda.graph(producer):
             hidden.copy_(source * 2)
     torch.cuda.current_stream().wait_stream(stream)
-    graphs = AttentionGraphs()
+    graphs = PiecewiseAFRunner(token_dim=1)
     for i in range(1, 5):
         # Reuse the exact BatchStep AND device allocations with changed values.
         step.begin_forward()

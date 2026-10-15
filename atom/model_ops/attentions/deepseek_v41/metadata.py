@@ -2,7 +2,7 @@
 """Request spans shared by CSA2 paging, compression and Engram staging."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import NamedTuple, Protocol
 
@@ -143,6 +143,134 @@ class BatchStep:
 
     # AF publication memo; reset even when a BatchStep is reused.
     af_inputs: dict = field(default_factory=dict)
+
+    def piecewise_metadata(self, spec, cache, queries=None):
+        """Describe this attention's inputs/results to the common AF decorator.
+
+        Only topology-dependent inputs are staged. Other host fields remain on
+        the template; the key includes every host decision attention reads.
+        """
+        from atom.utils.piecewise_af import PiecewiseMetadata
+
+        if not self.requests:
+            return None
+        ratio = spec.ratio
+        plan = self.plans.get(ratio)
+        inputs = {
+            "step": {
+                **{
+                    name: getattr(self, name)
+                    for name in (
+                        "positions",
+                        "cu_seqlens_q",
+                        "slots",
+                        "batch_ids",
+                        "block_tables",
+                        "swa_replay_start",
+                        "swa_cached_until",
+                    )
+                },
+                "visible": {ratio: self.visible[ratio]} if ratio else {},
+                "selected": (
+                    {spec.topk_owner: self.selected[spec.topk_owner]}
+                    if spec.topk_owner is not None and spec.topk_owner != spec.layer_id
+                    else {}
+                ),
+                "candidates": (
+                    {spec.candidate_source: self.candidates[spec.candidate_source]}
+                    if spec.candidate_source is not None
+                    else {}
+                ),
+                "indptrs": {ratio: self.indptrs[ratio]},
+                **{
+                    name: {
+                        k: v
+                        for k, v in sorted(getattr(self, name).items())
+                        if k.endswith(f"_{ratio}")
+                    }
+                    for name in ("planned", "planned_host")
+                },
+            },
+            "plan": (
+                None
+                if plan is None
+                else {
+                    name: getattr(plan, name)
+                    for name in (
+                        "compress_plan_gpu",
+                        "write_plan_gpu",
+                        "key_rope_positions_gpu",
+                    )
+                }
+            ),
+            "queries": (
+                None
+                if queries is None
+                else {
+                    name: getattr(queries, name)
+                    for name in ("rows", "positions", "ptr_rows")
+                }
+            ),
+            "query_index": (
+                None
+                if queries is None
+                else {
+                    "batch_ids": queries.index.batch_ids,
+                    "indptrs": {ratio: queries.index.indptrs[ratio]},
+                }
+            ),
+        }
+
+        def rebuild(values):
+            # The engine gives warmup and recording separate input containers.
+            # Derived dictionaries must also start empty on BOTH executions.
+            step = replace(
+                self,
+                **values["step"],
+                plans={} if plan is None else {ratio: replace(plan, **values["plan"])},
+                tiles={},
+                candidate_blocks={},
+                group_indices={},
+                window_rows=None,
+                af_inputs={},
+            )
+            query = (
+                None
+                if queries is None
+                else replace(
+                    queries,
+                    **values["queries"],
+                    # Share selections and derived dictionaries with the main step;
+                    # only the query row layout differs.
+                    index=replace(step, **values["query_index"]),
+                )
+            )
+            return {"step": step, "queries": query}
+
+        def publish(arguments):
+            source = arguments["step"]
+            # Upstream selections are inputs, not this core's outputs.
+            for name in ("selected", "candidates"):
+                values = getattr(source, name)
+                if spec.layer_id in values:
+                    getattr(self, name)[spec.layer_id] = values[spec.layer_id]
+            self.group_indices.update(source.group_indices)
+            if source.window_rows is not None:
+                self.window_rows = source.window_rows
+
+        return PiecewiseMetadata(
+            key=(
+                self.decode,
+                self.width,
+                self.max_q_len,
+                bool(self.request_cached_until.any()),
+                cache.pool.data_ptr(),
+            ),
+            inputs=inputs,
+            rebuild=rebuild,
+            publish=publish,
+            memo=self.af_inputs,
+        )
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.

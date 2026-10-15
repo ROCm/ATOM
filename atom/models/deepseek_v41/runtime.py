@@ -16,9 +16,8 @@ from atom.utils.backends import set_model_tag
 from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.piecewise_af import SharedGraphInputs
+from atom.utils.piecewise_af import PiecewiseAFRunner, SharedGraphInputs
 
-from .af_attention import AttentionGraphs
 from .bounded_replay import (
     build_replay_plan,
     carry_selections,
@@ -96,15 +95,21 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
 def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     layer, rope = context.no_compile_layers[layer_name]
-    with layer.attention_graphs.bind(
-        layer.attn,
+    metadata = context.attn_metadata
+    return Block.attention_forward(
+        layer,
         hidden,
-        context.attn_metadata,
-        context,
+        metadata.cache,
+        metadata.step,
+        rope,
+        metadata.queries,
+        piecewise=context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE,
         capture=layer.af_piecewise,
-        zero_copy_hidden=layer.af_zero_copy_hidden,
-    ) as arguments:
-        return Block.attention_forward(layer, rope=rope, **arguments)
+        zero_copy_inputs=("normed",) if layer.af_zero_copy_hidden else (),
+        runner=layer.attention_graphs,
+        outputs=layer.piecewise_outputs,
+        forward_context=context,
+    )
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_fake_layer_output)
@@ -292,7 +297,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 layer.piecewise_outputs = StableOutputs(
                     capacity=buffer_tokens, token_dim=1
                 )
-                layer.attention_graphs = AttentionGraphs(
+                layer.attention_graphs = PiecewiseAFRunner(
                     layer.piecewise_outputs, attention_inputs
                 )
             layer.af_piecewise = (

@@ -110,7 +110,7 @@ def test_split_graph_replays_with_live_batch_state_and_engram(monkeypatch):
         attn=attention,
         engram=Engram(),
         piecewise_outputs=outputs,
-        attention_graphs=runtime.AttentionGraphs(outputs),
+        attention_graphs=runtime.PiecewiseAFRunner(outputs),
         af_piecewise=False,
         af_zero_copy_hidden=True,
     )

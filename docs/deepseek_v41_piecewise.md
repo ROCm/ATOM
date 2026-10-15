@@ -121,19 +121,20 @@ bounds, with the same shapes included in graph memory budgeting. For the
 
 ## AF buffers and metadata
 
-`atom.utils.piecewise_af` supplies the model-independent live AF machinery:
-`SharedGraphInputs` stages named tensors, and `PiecewiseAFRunner.bind_capture`
-adds tensor layouts/direct-read addresses to the model's key, bounds the cache,
-and retains the state used by `@piecewise_core(capture_prefill=True)`.
-The binding exposes staged inputs, decorator arguments, capture state and
-whether this is the first call. Models provide a state factory whose `bind()`
-context manager creates fresh Python arguments for warmup and recording, then
-publish model-specific results after the decorated call.
+[`@piecewise_core`](piecewise_core.md) owns live AF capture and replay through
+the common `PiecewiseMetadata` interface. Models describe an input tree, host
+branch key, metadata reconstruction and result publication. The decorator
+stages inputs, keys layouts/scalars/direct-read addresses, bounds the cache and
+chooses warmup or recorded state for publication. No model-specific graph
+runner or capture-state class is required.
 
-`models/deepseek_v41/af_attention.py` is the V4.1 adapter: it describes BatchStep,
-compression plans, incoming selections and subset queries, and publishes top-k,
-candidate and index results. The common module has no V4.1 imports or metadata
-field names. Other models can reuse it with their own keys and state objects.
+V4.1 supplies this interface in `BatchStep.piecewise_metadata`, next to the
+metadata it describes. `Block.attention_forward` selects it in the decorator;
+the runtime calls that method directly with the common `PiecewiseAFRunner`.
+The declaration selects compression plans, upstream selections and subset
+queries, then publishes only this layer's top-k, candidate and index results.
+Query indices share derived dictionaries with the main step. The common
+engine has no V4.1 imports or metadata field names.
 
 AF follows V4's producer/consumer buffer policy. It directly reads a stable
 upstream dense-graph hidden tensor and writes the persistent output slot

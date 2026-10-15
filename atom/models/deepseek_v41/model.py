@@ -107,7 +107,13 @@ class Block(nn.Module):
                 quant_config=native_quant_config(),
             )
 
-    @piecewise_core(capture_prefill=True, token_dim=1)
+    @piecewise_core(
+        capture_prefill=True,
+        token_dim=1,
+        metadata=lambda layer, args: args["step"].piecewise_metadata(
+            layer.attn.spec, args["cache"], args["queries"]
+        ),
+    )
     def attention_forward(
         self,
         normed: torch.Tensor,
