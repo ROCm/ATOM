@@ -696,6 +696,8 @@ Server: the launch above in **AgentX mode**, with prefix caching (#2532 and #253
 `ATOM_DP_SESSION_AFFINITY=1`. No EPLB of any kind: neither `--fake-eplb` nor `--enable-eplb`. Start a fresh
 server for every concurrency.
 
+**Concurrency points: 16, 32 and 64.** Concurrency 8 and 48 are no longer run.
+
 ```bash
 # inside node0's container, with ATOM main's .github/scripts/aiperf_agentic.sh copied to /logs
 export MODEL_PATH=/models/Kimi-K3 AIPERF_MODEL=moonshotai/Kimi-K3 HF_HOME=/root/.cache/huggingface
@@ -704,7 +706,8 @@ export SERVER_ARGS="--model /models/Kimi-K3 --served-model-name moonshotai/Kimi-
 --kv_cache_dtype fp8 --index-cache-dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching --disable_uvicorn_access_log"
 export AIPERF_DIR=/root/.cache/aiperf-src AIPERF_VENV=/root/.cache/aiperf-venv   # reuse the install between runs
-CONC=32; OUT=/logs/agentic/c${CONC}_$(date +%m%d-%H%M%S); mkdir -p $OUT; cd /tmp
+CONC=32   # 16, 32 or 64
+OUT=/logs/agentic/c${CONC}_$(date +%m%d-%H%M%S); mkdir -p $OUT; cd /tmp
 source /logs/aiperf_agentic.sh
 agentic_prepare
 run_aiperf_agentic http://127.0.0.1:8000 $CONC $OUT http://127.0.0.1:8000/metrics
@@ -724,6 +727,39 @@ Neither is aiperf's own per-user p90.
 ### Results
 
 Not measured with this image yet.
+
+#### Earlier sweep: concurrency 8, 16, 32 and 48 (2026-10-11)
+
+Kept for reference. Measured on CT2 + CT3 with an earlier stack:
+`rocm/atom-dev:ub24-dcgpu-rk-10.2.0a20260922.bkc.20261002-pyt2.14.0-tri-main-atomsrc-gfx1250-1009`, ATOM / aiter /
+mori `main` of 2026-10-08 (`16cc652b` / `e965ebfe` / `066fd10e`) plus ATOM #2522, with the layers in BF16 (no online
+quantization). Prefix caching was on, before #2532 and #2533 fixed its corruption.
+
+- **Server:** AgentX mode as above, with `MEGA_DISPATCH=flydsl` (the compact plan), `ATOM_MEGA_COMBINE_WIRE=fp4`,
+  `--max-num-batched-tokens 16384`, `--gpu-memory-utilization 0.90`, `ATOM_DP_SESSION_AFFINITY=1`, no EPLB, and
+  PrefillDelayer at its defaults. A fresh server for every concurrency.
+- **Client:** this section's method: ATOM CI's `aiperf_agentic.sh` with every `AIPERF_*` at its default (3600 s of
+  profiling, 10 warm-up requests per lane, scenario `inferencex-agentx-mvp`, aiperf `754356e9`).
+
+| concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | prefix cache hit | valid |
+|---|---|---|---|---|---|
+| 8 | 0.241 | 0.775 | 123.3 (987) | 96.65% | **no**: coverage TTFT 90.3%, ITL 94.6% |
+| 16 | 0.237 | 0.531 | 155.4 (1243) | 89.85% | yes |
+| 32 | **0.354** | 0.435 | 391.8 (3134) | 86.15% | yes |
+| 48 | 0.213 | 0.286 | **447.2** (3577) | 74.23% | yes |
+
+Throughput is aiperf's `total_token_throughput` (input plus output tokens) over 8 GPUs. Prefix cache hit is cached
+prompt tokens over prompt tokens, from the same export.
+
+| concurrency | warm-up | profiling: completed / cancelled, errors | TTFT p50 | ITL p50 | KV usage while profiling |
+|---|---|---|---|---|---|
+| 8 | 87 requests, 10 min | 35 / 10, 0 | 192.3 s | 1.27 s | — |
+| 16 | 177 requests, 27 min | 56 / 22, 0 | 96.1 s | 1.83 s | 69–91.5% |
+| 32 | 354 requests, 31 min | 157 / 43, 0 | 21.5 s | 2.15 s | 93–99.4% |
+| 48 | 531 requests, 59 min | 140 / 57, 0 | 42.5 s | 2.45 s | 84–99% |
+
+Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`): the last response came at
+3406 s of 3600 (94.6%).
 
 ---
 
