@@ -96,3 +96,13 @@ running, the parent also samples its state, RSS and kernel wait channel every te
 seconds, including when the child cannot print while blocked in a page fault.
 Per-attempt logs are forwarded into Actions and retained in artifacts. These
 options do not change allocation size, retry limits or benchmark settings.
+
+When the running Actions job logs cannot be downloaded, dispatch the same
+workflow with `collect_minimax_run=<original-run-id>` and
+`run_model_benchmark=false`. The separate TW runner job only queries `squeue`
+and snapshots existing C32 logs from shared storage. It does not allocate GPUs,
+start models or cancel jobs. It uploads at most 64 MiB, with at most 8 MiB from
+the tail of each allowed log, and records original sizes and truncation in
+`snapshot.json`. Environment files and paths outside the selected run are not
+collected. This snapshot has its own CI run and does not change the original
+benchmark's outcome.
