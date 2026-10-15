@@ -1716,6 +1716,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             self.kv_pools.values(), unit_ids, image_bytes=image_bytes
         )
 
+    def page_unit_segments(self, unit_ids):
+        """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_segments,
+        )
+
+        regions = self._page_unit_regions()
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        first_region = next(iter(self.kv_pools.values())).region_tensors()[0][1]
+        return mha_page_unit_segments(
+            regions,
+            unit_ids,
+            entries=int(first_region.shape[0]),
+            image_bytes=int(spec.image_bytes),
+        )
+
     def get_kv_transfer_tensors(self):
         """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
 
