@@ -15,7 +15,7 @@ from atom.models.deepseek_v4.mono.config import (
     TOP_K,
     WINDOW,
 )
-from atom.mono.plan.execution import BLOCKS, WAVES
+from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
 LAYER_SLOTS = MAX_LAYERS_PER_STEP
 QKV_A_TILE = 16
@@ -174,6 +174,15 @@ def layout(
             S * 4 * n_topk_parts(max_seq, compress_ratio, index_head_dim) * 256 * pr
             or pr,
         ),
+        # each top-k part's per-trip pick counts (above | ties << 16), for the order
+        (
+            "tk_cnt",
+            S
+            * n_topk_parts(max_seq, compress_ratio, index_head_dim)
+            * n_topk_trips(max_seq, compress_ratio, index_head_dim)
+            * pr
+            or pr,
+        ),
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
         ("sp_acc", S * n_split * heads * head_dim * pr),
         ("sp_m", S * n_split * heads * pr),
@@ -225,6 +234,18 @@ def n_topk_parts(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
     if not index_head_dim:
         return 0
     return min(16, max(1, n_compressed(max_seq, compress_ratio) // 4096))
+
+
+def n_topk_trips(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
+    """Trips a top-k part takes over its candidates: part q takes every part-th trip of
+    THREADS x 4 consecutive candidates, starting at q."""
+    n = n_compressed(max_seq, compress_ratio) if index_head_dim else 0
+    if not n:
+        return 1
+    return max(
+        1,
+        -(-n // (THREADS * 4 * n_topk_parts(max_seq, compress_ratio, index_head_dim))),
+    )
 
 
 def n_score_tiles(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:

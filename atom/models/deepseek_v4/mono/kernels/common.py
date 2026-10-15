@@ -186,6 +186,29 @@ def common_defs(ctx):
         gpu.barrier()
         return fx.Int32(pre), fx.Int32(tot)
 
+    def block_excl_scan_n(vs):
+        """``block_excl_scan`` of several per-thread int32s at once, exactly (integer
+        sums, one barrier pair for all): (prefixes, block totals)."""
+        n = len(vs)
+        xs_, pres = [fx.Int32(v) for v in vs], [fx.Int32(0)] * n
+        for sh in range_constexpr(6):
+            off = 1 << sh
+            ps = [xshfl(x, off) for x in xs_]
+            pres = [((lane & off) != 0).select(p + q, p) for p, q in zip(pres, ps)]
+            xs_ = [x + q for x, q in zip(xs_, ps)]
+        if lane == 0:
+            for i in range_constexpr(n):
+                lds_st(red, wave * n + i, xs_[i].bitcast(fx.Float32))
+        gpu.barrier()
+        tots = [fx.Int32(0)] * n
+        for w in range_constexpr(WAVES):
+            for i in range_constexpr(n):
+                t = lds_ld(red, w * n + i).bitcast(fx.Int32)
+                pres[i] = (fx.Int32(w) < wave).select(pres[i] + t, pres[i])
+                tots[i] = tots[i] + t
+        gpu.barrier()
+        return pres, tots
+
     def block_max(v):
         w = wave_max(v)
         if lane == 0:
@@ -373,6 +396,7 @@ def common_defs(ctx):
         "_other_parts": _other_parts,
         "_rmsnorm_tail_ks": _rmsnorm_tail_ks,
         "block_excl_scan": block_excl_scan,
+        "block_excl_scan_n": block_excl_scan_n,
         "block_max": block_max,
         "block_sum": block_sum,
         "block_sums": block_sums,

@@ -94,6 +94,7 @@ from atom.models.deepseek_v4.mono.layout import (
     layout,
     n_index,
     n_topk_parts,
+    n_topk_trips,
     qkv_a_rows,
     stage_tasks,
     uv_tile,
@@ -352,9 +353,7 @@ def build_dsv4_kernel(
     )  # the four words past the bins that broadcast a pass's result
     TK_PARTS = n_topk_parts(max_seq, compress_ratio, index_head_dim)
     # trips PER PART: part q takes every TK_PARTS-th trip, starting at q
-    TK_TRIPS = (
-        max(1, -(-N_COMP // (THREADS * TK_PER * max(TK_PARTS, 1)))) if N_COMP else 1
-    )
+    TK_TRIPS = n_topk_trips(max_seq, compress_ratio, index_head_dim)
     # the index list pads to a whole key tile; the surplus is -1
     N_ISEL = N_KEYS - window
     if IHD:
