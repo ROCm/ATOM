@@ -230,6 +230,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             "timeout": args.timeout,
             "step_timeout": args.step_timeout,
             "reserve_gib": args.reserve_gib,
+            "base_page_step_timeout": args.step_timeout + 30,
         },
     }
     cache_roots = getattr(args, "cache_roots", [])
@@ -259,13 +260,13 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             result["attempts"].append(row)
             save()
 
-            def step(label, command, *, attempt=attempt, row=row):
+            def step(label, command, *, release_allowance=0, attempt=attempt, row=row):
                 remaining = deadline - clock()
                 if remaining <= 0:
                     raise TimeoutError("host-memory preparation deadline exceeded")
                 completed = run(
                     command,
-                    min(args.step_timeout, remaining),
+                    min(args.step_timeout + release_allowance, remaining),
                     args.output / f"attempt-{attempt}-{label}.log",
                 )
                 row["steps"].append(completed)
@@ -385,6 +386,9 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                                 str(HERE / "reclaim_file_cache.py"),
                                 str(scratch_gib),
                             ],
+                            # On g35, 1344 GiB populated in 67s, but freeing
+                            # its base-page PTEs was still running at 90s.
+                            release_allowance=30,
                         )
                         row.setdefault("after_base_reclaim", {})[node] = take_snapshot(
                             planned

@@ -280,9 +280,10 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.prepare(run), 0)
         self.assertTrue(reclaimed)
         self.assertIn("after_base_reclaim", self.result["attempts"][0])
-        self.assertTrue(
-            all(timeout <= self.args.step_timeout for _, timeout in self.calls)
-        )
+        for command, timeout in self.calls:
+            allowance = 30 if "reclaim_file_cache.py" in str(command) else 0
+            self.assertLessEqual(timeout, self.args.step_timeout + allowance)
+            self.assertLessEqual(timeout, self.args.timeout)
 
     def test_failed_base_page_reclaim_never_starts_thp(self):
         info = self.state["numa"][0]
@@ -300,6 +301,18 @@ class PreparationTests(unittest.TestCase):
         self.assertFalse(
             any("compact_huge_pages.py" in str(cmd) for cmd, _ in self.calls)
         )
+
+    def test_base_page_release_allowance_cannot_exceed_total_deadline(self):
+        self.args.timeout = 50
+        info = self.state["numa"][0]
+        info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
+        self.assertEqual(self.prepare(), 2)  # Fake allocation does not recover RAM.
+        limits = [
+            seconds
+            for cmd, seconds in self.calls
+            if "reclaim_file_cache.py" in str(cmd)
+        ]
+        self.assertEqual(limits, [50])
 
     def test_small_base_page_allocation_is_resident_then_released(self):
         result = subprocess.run(

@@ -49,7 +49,8 @@ recovery. The code does not claim to restore node state in those cases.
 The host then runs `prepare_lmcache_host_memory.py`: direct sync/drop_caches/
 compact_memory where allowed, otherwise file-cache eviction and NUMA-bound THP
 preparation. It permits three serial attempts within 300 seconds, at most 90
-seconds per command, plus up to five seconds to reap a timed-out child. Before
+seconds for ordinary commands or 120 seconds for base-page population and
+release, plus up to five seconds to reap a timed-out child. Before
 the bounded allocation, ordinary free memory plus clean active/inactive file
 cache must cover the pool and 128 GiB reserve; dirty/writeback pages are excluded.
 This lets the preparation reclaim cache itself. After preparation, the pool
@@ -190,6 +191,15 @@ disjoint ranges with up to eight threads, so cache reclaim is not coupled to
 THP compaction on each initial fault. It checks actual RSS and frees the entire
 mapping before the existing THP helper starts. No pinning or VM setting changes
 are involved. Failure or timeout prevents model startup; the existing 90-second
-step and 300-second total bounds still apply. The previous g01 exclusion is
+ordinary-step and 300-second total bounds still apply; the base-page step
+includes an additional 30 seconds for release, as described below. The previous g01 exclusion is
 removed so this path can handle that documented fragmentation case as well.
 This is a CI preparation change; runtime improvement still requires validation.
+
+Run 38816595852 on the same g35 filled all 1344 GiB of temporary base pages
+in 66.8 seconds; RSS verification finished at 71.3 seconds with all memory resident and no huge pages.
+The 90-second timer fired during munmap, when RSS had already fallen to 366 GiB,
+and the child did not finish release within the five-second kill/reap allowance.
+No model was started. The base-page step now has a 120-second bound, including
+release, while other steps remain at 90 seconds and the total remains 300 seconds.
+The child must still finish before THP preparation or model startup can proceed.
