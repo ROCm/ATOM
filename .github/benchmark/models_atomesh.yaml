@@ -3,6 +3,10 @@ defaults:
     slurm_account: "${ATOMESH_SLURM_ACCOUNT}"
     slurm_partition: "${ATOMESH_SLURM_PARTITION}"
     slurm_submit_runner: "${ATOMESH_SLURM_SUBMIT_RUNNER}"
+    # Experiment branch only: the burst QOS (node=42, preempt=cancel) next
+    # to the full amd-atom/amd-frameworks QOS, so the fragmented-node c112
+    # starts while the node is still fragmented.
+    slurm_qos: amd-burst-qos
     gpus_per_node: 8
     cpus_per_task: 114
     time_limit: "08:00:00"
