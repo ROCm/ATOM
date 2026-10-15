@@ -2521,6 +2521,37 @@ class TestPromptEndAnchor:
         bm.can_allocate(seq)
         assert seq.checkpoint_end_pos == 0
 
+    def test_the_anchor_lands_on_the_joint_chunk_grid(self):
+        """Past an HBM eviction only the joint load can resume the anchor.
+
+        Its KV leg moves whole LMCache chunks, and the chunk covering an
+        off-grid anchor runs past the prompt, so nothing ever stored it. A
+        chunk equal to the hash block (DCP's case) or off its grid leaves the
+        anchor where it was.
+        """
+        for chunk, want in ((0, 36), (BLOCK, 36), (2 * BLOCK, 32), (4 * BLOCK, 32), (6, 36)):
+            bm = make_block_manager(demand_config())
+            bm._joint_chunk_tokens = chunk
+            seq = stateful_seq(PROMPT)
+            bm.can_allocate(seq)
+            assert seq.checkpoint_end_pos == want, chunk
+            assert bm.checkpointers_at(seq, want), chunk
+
+        bm = make_block_manager(demand_config())
+        bm._joint_chunk_tokens = 16 * BLOCK
+        seq = stateful_seq(PROMPT)
+        bm.can_allocate(seq)
+        assert seq.checkpoint_end_pos == 0  # shorter than one chunk
+
+        # The serving regime: no grid, no demand, the anchor is the only rung.
+        bm = make_block_manager(
+            demand_config(state_checkpoint_interval_tokens=-1, state_checkpoint_demand=False)
+        )
+        bm._joint_chunk_tokens = 4 * BLOCK
+        assert run_prompt_on_the_ladder(bm, stateful_seq(PROMPT)) == [32]
+        second = stateful_seq(CONTINUATION)
+        assert bm.can_allocate(second) == 8  # resumes at the chunk-aligned 32
+
     def test_the_cut_and_the_keep_agree_at_every_anchor(self):
         """Swept, because a cut nothing keeps is a forward spent on nothing."""
         for n in range(BLOCK, 80):
