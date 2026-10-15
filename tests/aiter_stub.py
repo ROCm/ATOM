@@ -70,19 +70,49 @@ def stubbed_aiter():
         # present nothing was poisoned, and dropping modules the caller still
         # holds references to is how two copies of one class appear.
         if installed:
-            tainted = {id(obj) for obj in handed_out}
-            for name in set(sys.modules) - before:
-                if name != "atom" and not name.startswith("atom."):
-                    continue
-                module = sys.modules.get(name)
-                # shortcut: only module-level bindings are checked, so a stub
-                # reached through a class attribute or a container survives.
-                # Widen this if such a leak ever shows up -- not pre-emptively,
-                # because every name dropped here is one a caller may hold.
-                if module is not None and any(
-                    id(value) in tainted for value in vars(module).values()
-                ):
-                    _drop(name)
+            handed = {id(obj) for obj in handed_out}
+            fresh = {
+                name
+                for name in set(sys.modules) - before
+                if name == "atom" or name.startswith("atom.")
+            }
+            # Seed: modules that bound something a stub handed out.
+            tainted = {
+                name for name in fresh if _binds_any(sys.modules.get(name), handed)
+            }
+            # Closure: a module holding a class from a tainted module is just
+            # as stale once that module is dropped and re-imported -- the
+            # second copy lands in the holder, not in `sys.modules`, which is
+            # what `conftest.atom_modules_are_imported_once` catches.
+            # `engine_core` binds `async_proc.AsyncIOProcManager` and takes
+            # nothing from AITER itself, so only the closure reaches it.
+            while True:
+                more = {
+                    name
+                    for name in fresh - tainted
+                    if _binds_from(sys.modules.get(name), tainted)
+                }
+                if not more:
+                    break
+                tainted |= more
+            for name in tainted:
+                _drop(name)
+
+
+def _binds_any(module, ids: set[int]) -> bool:
+    """True if the module holds, at module level, one of these objects."""
+    if module is None:
+        return False
+    return any(id(value) in ids for value in vars(module).values())
+
+
+def _binds_from(module, modules: set[str]) -> bool:
+    """True if the module holds something defined in one of these modules."""
+    if module is None:
+        return False
+    return any(
+        getattr(value, "__module__", None) in modules for value in vars(module).values()
+    )
 
 
 def _drop(name: str) -> None:

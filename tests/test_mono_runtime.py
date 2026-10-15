@@ -410,19 +410,40 @@ def test_aiter_stub_teardown_spares_modules_that_took_nothing():
     }
     clean = types.ModuleType("atom.took_nothing")
     poisoned = types.ModuleType("atom.took_a_mock")
+    # Holds a class *from* the poisoned module and nothing from AITER itself,
+    # which is how `engine_core` relates to `async_proc`. Keeping it would
+    # leave the stale second copy `conftest.atom_modules_are_imported_once`
+    # fails on, so the taint has to reach it transitively.
+    importer = types.ModuleType("atom.imports_the_poisoned_one")
+
+    class Borrowed:
+        pass
+
+    Borrowed.__module__ = "atom.took_a_mock"
     try:
         with stubbed_aiter():
             import aiter
 
             poisoned.borrowed = aiter.some_symbol
+            poisoned.Borrowed = Borrowed
+            importer.Borrowed = Borrowed
             sys.modules["atom.took_nothing"] = clean
             sys.modules["atom.took_a_mock"] = poisoned
+            sys.modules["atom.imports_the_poisoned_one"] = importer
 
         assert (
             sys.modules.get("atom.took_nothing") is clean
         ), "a module that never touched AITER was dropped"
         assert "atom.took_a_mock" not in sys.modules, "a poisoned module survived"
+        assert "atom.imports_the_poisoned_one" not in sys.modules, (
+            "a module holding a class from a dropped module survived; that is "
+            "the stale second copy the conftest guard fails on"
+        )
     finally:
-        sys.modules.pop("atom.took_nothing", None)
-        sys.modules.pop("atom.took_a_mock", None)
+        for name in (
+            "atom.took_nothing",
+            "atom.took_a_mock",
+            "atom.imports_the_poisoned_one",
+        ):
+            sys.modules.pop(name, None)
         sys.modules.update(saved)
