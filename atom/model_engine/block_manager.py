@@ -2174,7 +2174,11 @@ class BlockManager:
                 )
             )
         pos = base + num_new_tokens
-        kept = self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+        kept = (
+            self.checkpointers_at(seq, pos, next_forward_tokens, aimed)
+            if pos > seq.scheduled_checkpoint_pos
+            else []
+        )
         for cache in kept:
             cache.checkpoint(seq, end, h)
         if kept:
@@ -2185,6 +2189,47 @@ class BlockManager:
         # is precisely when the reserved bytes exist. A no-op with nothing
         # reserved, so decode and unreadable backends pay a branch.
         self.commit_midstep(seq)
+
+    def checkpoint_when_scheduled(self, seq: Sequence, pos: int) -> bool:
+        """Decide the checkpoint a prefill chunk ending at `pos` lands on, as
+        the chunk is scheduled rather than when it retires.
+
+        With several forwards in flight, the chunk after the rung is issued
+        before this one retires and writes the slot retire would file from.
+        A PAGE image is a copy the runner makes out of the slot, so filing it
+        now, to be carried by the next batch, puts the copy between the two
+        forwards. A fork hands the slot itself over at filing time, which only
+        retire can do: False when any class kept here is of that kind, and the
+        caller holds the next chunk back instead.
+
+        True also covers keeping nothing; either way retire files nothing up
+        to `pos`.
+        """
+        kept = self.checkpointers_at(seq, pos)
+        if any(c is not self.paged_state_checkpoints for c in kept):
+            return False
+        seq.scheduled_checkpoint_pos = max(seq.scheduled_checkpoint_pos, pos)
+        if kept:
+            h = self._prompt_chain_hash(seq, pos // self.hash_block_size)
+            self.paged_state_checkpoints.checkpoint_when_scheduled(seq, h)
+            seq.last_checkpoint_pos = pos
+        return True
+
+    def _prompt_chain_hash(self, seq: Sequence, blocks: int) -> int:
+        """Chained hash of the first `blocks` blocks of `seq`'s tokens.
+
+        Blocks still in flight are not hashed yet, so this resumes from the
+        last one that is, or from the seed when none is.
+        """
+        start, h = 0, seq.cache_seed
+        for i in range(min(blocks, len(seq.block_table)) - 1, -1, -1):
+            published = self.kv.block(seq.block_table[i]).hash
+            if published != -1:
+                start, h = i + 1, published
+                break
+        for i in range(start, blocks):
+            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+        return h
 
     def hash_decode_blocks(
         self, seq: Sequence, committed_kv_len: int, next_forward_tokens: int = 0
@@ -3248,6 +3293,7 @@ class BlockManager:
         # re-validated against the current `state_caches`.
         seq.checkpoint_end_pos = 0
         seq.last_checkpoint_pos = 0
+        seq.scheduled_checkpoint_pos = 0
         # An uncommitted checkpoint describes state in a slot that is about to
         # go back on the free list, so the intent dies with it.
         if self.paged_state_checkpoints is not None:
