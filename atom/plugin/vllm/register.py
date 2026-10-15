@@ -261,7 +261,17 @@ def _install_shared_vllm_patches() -> None:
     # Which forwards are vLLM's own, for a model that keeps per-request state.
     global _DUMMY_RUN_COVERAGE_LOGGED
     covered = apply_vllm_dummy_run_patch()
-    if covered and not _DUMMY_RUN_COVERAGE_LOGGED:
+    if not covered:
+        # Said out loud, every time. Covering nothing is the failure this count
+        # exists to expose -- synthetic batches then take the STATE slots real
+        # requests hold -- and logging only the good case trades a misleading
+        # number for an ambiguous silence: "did not install" and "installed,
+        # and this is the second call" read identically when neither prints.
+        logger.warning(
+            "ATOM plugin: dummy-run marking covers no runner class; vLLM's "
+            "synthetic batches will not be recognised as synthetic"
+        )
+    elif not _DUMMY_RUN_COVERAGE_LOGGED:
         _DUMMY_RUN_COVERAGE_LOGGED = True
         logger.info(
             "ATOM plugin: dummy-run marking covers %d runner class(es)", covered

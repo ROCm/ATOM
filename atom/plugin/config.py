@@ -341,24 +341,38 @@ def _vllm_kv_transfer_config(config: Any) -> dict:
     if kv_transfer_config is None:
         return {}
     if isinstance(kv_transfer_config, dict):
-        return dict(kv_transfer_config)
-    model_dump = getattr(kv_transfer_config, "model_dump", None)
-    if callable(model_dump):
-        return model_dump()
-    # Older pydantic / a plain namespace: name the fields ATOM's gates read
-    # rather than reflecting over everything, so an unexpected shape is an
-    # empty dict here instead of a surprise key downstream.
-    return {
-        field: getattr(kv_transfer_config, field)
-        for field in (
-            "kv_connector",
-            "kv_role",
-            "kv_connector_module_path",
-            "kv_load_failure_policy",
-            "kv_connector_extra_config",
-        )
-        if getattr(kv_transfer_config, field, None) is not None
-    }
+        translated = dict(kv_transfer_config)
+    else:
+        model_dump = getattr(kv_transfer_config, "model_dump", None)
+        if callable(model_dump):
+            translated = model_dump()
+        else:
+            # The pinned vLLM's `KVTransferConfig` is a pydantic *dataclass*
+            # and has no `model_dump`, so this is the branch that runs. Name
+            # the fields ATOM's gates read rather than reflecting over
+            # everything, so an unexpected shape is an empty dict here instead
+            # of a surprise key downstream.
+            translated = {
+                field: getattr(kv_transfer_config, field)
+                for field in (
+                    "kv_connector",
+                    "kv_role",
+                    "kv_connector_module_path",
+                    "kv_load_failure_policy",
+                    "kv_connector_extra_config",
+                )
+                if getattr(kv_transfer_config, field, None) is not None
+            }
+    # No connector is no transport, whatever else the object carries. vLLM
+    # builds a `KVTransferConfig` before deciding what goes in it, and its
+    # defaults alone (`kv_load_failure_policy`, an empty extra-config) made
+    # this return a truthy dict -- which every reader takes as "a transport is
+    # configured". That is what this docstring has always promised not to do,
+    # and the readers are not all V4.1's: `qwen4_exp_attn` refuses outright on
+    # a truthy value, and `EngineCore` sets `kv_transfer_enabled` from one.
+    if not translated.get("kv_connector"):
+        return {}
+    return translated
 
 
 def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
