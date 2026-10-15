@@ -415,9 +415,11 @@ A checkpoint the seq resumed from is not released here — it went back to the f
 
 ```python
 def can_allocate(self, seq: Sequence, record: bool = True, *,
-                 block_hashes: list[int] | None = None,
-                 reuse_hashes: bool = False) -> int:
+                 block_hashes: list[int] | None = None) -> int:
     """Return cache-hit hash blocks (>=0) if seq fits, else -1."""
+
+def can_allocate_estimate(self, seq: Sequence) -> int:
+    """can_allocate(seq, record=False) over a walk memoised per seq."""
 
 def record_allocation(self, seq: Sequence, num_cached_blocks: int,
                       block_hashes: list[int]) -> None:
@@ -431,9 +433,20 @@ def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
 capacity. Its cache hit incorporates KV, SWA and state-checkpoint availability.
 With `record=False`, it leaves joint-load fields and joint-boundary counters
 uncommitted; checkpoint demand/end and hit instrumentation still refresh.
-Checkpoint demand counters deduplicate per request. With `reuse_hashes=True`,
-immutable prompt hashes are memoized, but pool lookup, token equality and fit
-are checked on every call. Mutable completion tokens are never memoized.
+Checkpoint demand counters deduplicate per request.
+
+A probe is a walk followed by an evaluation. The walk (`_walk_prefix`) finds
+the contiguous run of prompt blocks in the KV index. Each prompt block is
+hashed once per request (or adopted from the chain the frontend shipped), and
+completion tokens are never cached. The evaluation applies the SWA and state
+gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
+already in use, and the fit. `allocate` claims the block ids the seq's last
+walk found, unless the index changed under them.
+
+The delayer and the DP chunk-cost estimate call `can_allocate_estimate`. It
+reuses a seq's walk until a block the walk read is evicted, moved or published,
+and runs the same evaluation on every call, so it returns what `can_allocate`
+would.
 
 `can_append` checks whether the next decode extension needs additional blocks,
 including speculative tokens and the active cache layout.
@@ -480,13 +493,12 @@ Blocks form a hash chain: each block's hash incorporates the previous block's ha
 
 ### Cache lookup during allocation
 
-During `allocate()`, for each full block:
+`can_allocate` walks the prompt's hash chain against the KV index once; `allocate()` then:
 
-1. Compute the block hash via the chain.
-2. Look up `kv.lookup(h)` (-1 on a miss).
-3. If found, verify `kv.block(block_id).token_ids == token_ids` (guard against hash collisions).
-4. **Hit:** `kv.claim(block_id)`. Add `block_size` to `seq.num_cached_tokens`.
-5. **Miss (or first miss in chain):** Once a cache miss occurs, all subsequent blocks in the sequence are also misses (`cache_miss = True` is sticky). Allocate fresh blocks from the free list.
+1. **Hit:** claims the block ids that walk found (`kv.claim_many`), unless the index changed since. Otherwise it looks each block's hash up again (`kv.lookup(h)`, -1 on a miss).
+2. **Miss (or first miss in chain):** once a block misses, all later blocks miss too (the hash is chained). Fresh blocks come from the free list.
+
+Hash collisions: by default (`ATOM_PREFIX_FAST_WALK=1`) the walk compares tokens only on the last hit block (`kv.block(block_id).token_ids == token_ids`), and every block if that one differs. A collision on an interior block alone is not caught, and the request reuses another prompt's KV. `ATOM_PREFIX_FAST_WALK=0` compares every hit block's tokens.
 
 ### Reference counting
 
