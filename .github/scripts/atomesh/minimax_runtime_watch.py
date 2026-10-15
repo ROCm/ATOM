@@ -188,6 +188,68 @@ def empty_gather_kv(shape, *, dtype, device):
     return k, v
 
 
+def ipc_compatible_kv_zeros(size, *, dtype, device):
+    """Keep the startup-only shared KV pool exportable through HIP IPC.
+
+    aiter supports expandable segments for inference, but the pinned Mooncake
+    build also registers an IPC handle even when protocol=rdma. Only the paged
+    pool needs native storage. This runs before request/offload threads start;
+    never toggle the process-wide allocator during live inference.
+    """
+    import torch
+
+    conf = next(
+        (
+            os.environ[name]
+            for name in (
+                "PYTORCH_CUDA_ALLOC_CONF",
+                "PYTORCH_HIP_ALLOC_CONF",
+                "PYTORCH_ALLOC_CONF",
+            )
+            if os.environ.get(name)
+        ),
+        "",
+    )
+    fields = [
+        field
+        for field in conf.split(",")
+        if field.partition(":")[0].strip() != "expandable_segments"
+    ]
+    expandable = any(
+        field.replace(" ", "").lower() == "expandable_segments:true"
+        for field in conf.split(",")
+    )
+    if not expandable:
+        return torch.zeros(size, dtype=dtype, device=device)
+    native = ",".join(
+        [field for field in fields if field] + ["expandable_segments:False"]
+    )
+    print(
+        f"[runtime-watch] Native IPC-compatible KV pool: {size} bytes on {device}",
+        flush=True,
+    )
+    torch.cuda.memory._set_allocator_settings(native)
+    try:
+        return torch.zeros(size, dtype=dtype, device=device)
+    finally:
+        torch.cuda.memory._set_allocator_settings(conf)
+        print(
+            "[runtime-watch] Restored expandable segments for inference allocations",
+            flush=True,
+        )
+
+
+def instrument_kv_pool(path):
+    source = path.read_text()
+    old = "            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)"
+    new = """            from atom._ci_runtime_watch import ipc_compatible_kv_zeros
+
+            buf = ipc_compatible_kv_zeros(total, dtype=torch.uint8, device=self.device)"""
+    if source.count(old) != 1:
+        raise ValueError("Expected exactly one shared paged KV allocation")
+    path.write_text(source.replace(old, new))
+
+
 def instrument_gather(path):
     source = path.read_text()
     old = """        k_full = torch.empty(
@@ -220,6 +282,7 @@ def prepare(source, runtime, output):
         "_ci_watch_start()\n" + init.read_text()
     )
     instrument_gather(runtime / "atom/model_ops/attention_mha.py")
+    instrument_kv_pool(runtime / "atom/model_engine/model_runner.py")
     output.mkdir(parents=True, exist_ok=True)
     (output / "runtime-watch-source.py").write_text(helper)
     (output / "runtime-overlay.json").write_text(
@@ -227,7 +290,7 @@ def prepare(source, runtime, output):
             {
                 "source": str(source),
                 "runtime": str(runtime),
-                "change": "Python stack sampler and draft KV allocation statistics; no GPU synchronization",
+                "change": "Native shared KV pool; expandable inference allocations; Python stacks and allocation statistics",
             },
             indent=2,
         )

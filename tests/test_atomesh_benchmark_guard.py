@@ -180,6 +180,57 @@ class RuntimeWatchTests(unittest.TestCase):
             fake.cuda.synchronize.assert_not_called()
             self.assertEqual(fake.empty.call_count, 2)
 
+    def test_native_kv_scope_restores_allocator_even_on_failure(self):
+        for fail in (False, True):
+            fake = Mock()
+            settings = []
+            fake.cuda.memory._set_allocator_settings.side_effect = settings.append
+
+            def allocate(*args, settings=settings, fail=fail, **kwargs):
+                self.assertEqual(
+                    settings[-1], "max_split_size_mb:512,expandable_segments:False"
+                )
+                if fail:
+                    raise RuntimeError("KV allocation failed")
+                return "native KV"
+
+            fake.zeros.side_effect = allocate
+            with (
+                patch.dict(sys.modules, {"torch": fake}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:512,expandable_segments:True"
+                    },
+                ),
+            ):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "KV allocation failed"):
+                        watch.ipc_compatible_kv_zeros(
+                            100, dtype="uint8", device="cuda:0"
+                        )
+                else:
+                    self.assertEqual(
+                        watch.ipc_compatible_kv_zeros(
+                            100, dtype="uint8", device="cuda:0"
+                        ),
+                        "native KV",
+                    )
+            self.assertEqual(
+                settings[-1], "max_split_size_mb:512,expandable_segments:True"
+            )
+            fake.cuda.empty_cache.assert_not_called()
+
+    def test_native_kv_scope_keeps_default_allocator_unchanged(self):
+        fake = Mock()
+        with (
+            patch.dict(sys.modules, {"torch": fake}),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            watch.ipc_compatible_kv_zeros(100, dtype="uint8", device="cuda:0")
+        fake.cuda.memory._set_allocator_settings.assert_not_called()
+        fake.zeros.assert_called_once_with(100, dtype="uint8", device="cuda:0")
+
     def test_runtime_copy_preserves_source_and_starts_python_sampler(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -193,7 +244,19 @@ class RuntimeWatchTests(unittest.TestCase):
                 SCRIPTS.parents[2] / "atom/model_ops/attention_mha.py"
             ).read_text()
             attention.write_text(original_attention)
+            runner = source / "atom/model_engine/model_runner.py"
+            runner.parent.mkdir()
+            original_runner = (
+                SCRIPTS.parents[2] / "atom/model_engine/model_runner.py"
+            ).read_text()
+            runner.write_text(original_runner)
             watch.prepare(source, runtime, output)
+            self.assertEqual(runner.read_text(), original_runner)
+            instrumented_runner = (
+                runtime / "atom/model_engine/model_runner.py"
+            ).read_text()
+            compile(instrumented_runner, "model_runner.py", "exec")
+            self.assertIn("buf = ipc_compatible_kv_zeros(", instrumented_runner)
             self.assertEqual(attention.read_text(), original_attention)
             instrumented = (runtime / "atom/model_ops/attention_mha.py").read_text()
             compile(instrumented, "attention_mha.py", "exec")
