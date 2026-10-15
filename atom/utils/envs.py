@@ -154,6 +154,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
+    # does not serve): pages per producer slot that repacks MLA KV for a DCP
+    # consumer below a page of interleave; 0 writes each token run in place.
+    "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 128
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
