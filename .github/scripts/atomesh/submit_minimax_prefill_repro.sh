@@ -22,26 +22,6 @@ workspace_out="${GITHUB_WORKSPACE}/minimax-prefill-repro-out"
 mkdir -p "${workspace_out}"
 echo "workspace_out=${workspace_out}" >> "${GITHUB_OUTPUT}"
 
-# GPU nodes must see the checkout; mirror onto NFS (same pattern as
-# atomesh-cicd-mi350 shared workspace), even on TW where the Actions
-# workspace may not be node-visible.
-shared_repo="${run_dir}/repo"
-rm -rf "${shared_repo}"
-mkdir -p "${shared_repo}"
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete "${GITHUB_WORKSPACE}/" "${shared_repo}/"
-else
-  tar -C "${GITHUB_WORKSPACE}" -cf - . | tar -C "${shared_repo}" -xf -
-fi
-chmod -R a+rX "${shared_repo}"
-chmod +x "${shared_repo}/.github/scripts/atomesh/"*.sh \
-  "${shared_repo}/.github/scripts/"*.sh 2>/dev/null || true
-
-export REPRO_REPO_ROOT="${shared_repo}"
-export REPRO_OUT_DIR="${run_dir}/out"
-mkdir -p "${REPRO_OUT_DIR}"
-chmod 0777 "${REPRO_OUT_DIR}"
-
 CURRENT_USER="${current_user}"
 ATOMESH_CELL_ID="minimax-prefill-repro"
 RESULT_DIR="${run_dir}"
@@ -75,6 +55,40 @@ fi
 source "${GITHUB_WORKSPACE}/.github/scripts/slurm_submit_helpers.sh"
 detect_slurm_backend
 install_slurm_cancel_traps
+
+if [[ "${1:-}" == "--preflight" ]]; then
+  source "${GITHUB_WORKSPACE}/.github/scripts/atomesh/cleanup_minimax_prefill_repro.sh"
+  exec > >(tee "${workspace_out}/scheduler-preflight.log") 2>&1
+  echo "account=${SLURM_ACCOUNT} partition=${SLURM_PARTITION} qos=${SLURM_QOS}"
+  cleanup_previous_minimax_repro "${REPRO_CLEANUP_RUN_ID:-}"
+  echo 'GPU allocation limit: 20 minutes after scheduling. Actions/queueing ceiling: 24 hours.'
+  exit 0
+fi
+if [[ "$#" != 0 ]]; then
+  echo 'ERROR: expected no arguments or --preflight' >&2
+  exit 1
+fi
+
+# GPU nodes must see the checkout; mirror onto NFS (same pattern as
+# atomesh-cicd-mi350 shared workspace), even on TW where the Actions
+# workspace may not be node-visible.
+shared_repo="${run_dir}/repo"
+rm -rf "${shared_repo}"
+mkdir -p "${shared_repo}"
+if command -v rsync >/dev/null 2>&1; then
+  rsync -a --delete "${GITHUB_WORKSPACE}/" "${shared_repo}/"
+else
+  tar -C "${GITHUB_WORKSPACE}" -cf - . | tar -C "${shared_repo}" -xf -
+fi
+chmod -R a+rX "${shared_repo}"
+chmod +x "${shared_repo}/.github/scripts/atomesh/"*.sh \
+  "${shared_repo}/.github/scripts/"*.sh 2>/dev/null || true
+
+export REPRO_REPO_ROOT="${shared_repo}"
+export REPRO_OUT_DIR="${run_dir}/out"
+mkdir -p "${REPRO_OUT_DIR}"
+chmod 0777 "${REPRO_OUT_DIR}"
+
 
 rank_script="${run_dir}/run-minimax-prefill-repro-rank.sh"
 cat > "${rank_script}" <<EOF

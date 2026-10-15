@@ -13,7 +13,12 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
 ```
 
 The job uses one Slurm node, TP4, a 20-minute allocation limit, and four sequential
-subcases, each capped at 180 seconds (plus 15 seconds for termination). The existing
+subcases, each capped at 180 seconds (plus 15 seconds for termination). The 20-minute
+Slurm limit starts after allocation, excluding time in PENDING. The Actions ceiling
+is 24 hours, allowing long waits under `amd-atom-qos`. To clean up a previous
+completed CI run before submitting, pass `-f repro_cleanup_run_id=<GitHub-run-ID>`;
+only this user's reproduction jobs matching that exact run are cancelled. The
+preflight log is uploaded before entering the queue. The existing
 TW workflow uses an exclusive node allocation, so this does **not** promise a
 half-node billing reduction. Savings come from removing model downloads/loading,
 decode/router startup, and AgentX warmup. Each case repeats the two-batch transition
