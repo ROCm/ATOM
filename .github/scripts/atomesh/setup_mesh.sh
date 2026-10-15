@@ -8,6 +8,15 @@ image="${3:?Build image is required}"
 env_file="${4:?Container environment file is required}"
 job_id="${5:?Job ID is required}"
 
+# Match pd_server_atom.sh: AGG serves directly without a Mesh router.
+# Both Slurm launch paths call this helper before starting the service.
+topology="${TOPOLOGY:-unknown}"
+if [[ "${topology,,}" == agg* ]]; then
+  echo "[setup] Skipping Mesh build for aggregated topology ${topology}" >&2
+  printf '%s\n' "${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
+  exit 0
+fi
+
 if [[ -n "${ATOMESH_MESH_BINARY:-}" ]]; then
   printf '%s\n' "${ATOMESH_MESH_BINARY}"
   exit 0
