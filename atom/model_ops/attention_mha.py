@@ -18,6 +18,7 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     gluon_decode_over_limit,
+    gluon_decode_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )
@@ -463,16 +464,29 @@ class PagedAttentionImpl(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        aiter.reshape_and_cache_with_pertoken_quant(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            k_scale,
-            v_scale,
-            attn_metadata.slot_mapping,
-            asm_layout=True,
-        )
+        if self.kv_cache_dtype == "fp8":
+            aiter.reshape_and_cache_with_pertoken_quant(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                attn_metadata.slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            aiter.reshape_and_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
         return q, k, v
 
     def _gather_prefix_and_concat_kv(
@@ -1041,7 +1055,7 @@ class PagedAttentionImpl(nn.Module):
         # Clamped once here so both gates see the same value; the predicate
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
-        over_gluon = gluon_decode_over_limit(
+        over_gluon = not gluon_decode_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (
