@@ -12,7 +12,8 @@ def common_refusals(atom_config, dims, supported_tp) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``;
     no expert, data, pipeline or context parallelism, no TBO, not a plugin, no
-    piecewise cudagraph."""
+    piecewise cudagraph, no routed-expert capture (the fused kernels route
+    in-kernel and never write it)."""
     tp = atom_config.tensor_parallel_size
     shard = shard_refusal(dims, tp)
     return [
@@ -29,6 +30,7 @@ def common_refusals(atom_config, dims, supported_tp) -> list[tuple[bool, str]]:
             not atom_config.compilation_config.cudagraph_mode.requires_piecewise_compilation(),
             "piecewise cudagraph",
         ),
+        (not atom_config.enable_return_routed_experts, "routed-expert capture"),
     ]
 
 

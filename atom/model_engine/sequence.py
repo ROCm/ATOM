@@ -461,6 +461,9 @@ class Sequence:
         # `_routed_expert_rows` is the live length; the tail is unused.
         self._routed_expert_buf: np.ndarray | None = None
         self._routed_expert_rows: int = 0
+        # Set at finish: the buffer is trimmed to its rows, read-only, and
+        # handed out without a copy; late patches are dropped.
+        self._routed_experts_final: bool = False
         # Positions some scheduled forward already returns routes for; a
         # prefix-cache hit past it must have its rows read from the cache.
         self.routed_forwarded_end: int = 0
@@ -581,11 +584,16 @@ class Sequence:
 
     @property
     def routed_experts(self) -> np.ndarray | None:
-        """Materialized int16 [rows, layers, top_k], or None if empty."""
+        """int16 [rows, layers, top_k], or None if empty.
+
+        A copy while the request runs; the shared read-only array once
+        ``finish_routed_experts`` has run.
+        """
         return self.materialize_routed_experts()
 
     @routed_experts.setter
     def routed_experts(self, value: np.ndarray | None) -> None:
+        self._routed_experts_final = False
         if value is None:
             self._routed_expert_buf = None
             self._routed_expert_rows = 0
@@ -619,7 +627,7 @@ class Sequence:
         Rows a gap skips are filled with -1 (uncaptured) rather than failing
         the engine loop, and warned about once.
         """
-        if rows is None:
+        if rows is None or self._routed_experts_final:
             return
         arr = np.ascontiguousarray(rows, dtype=np.int16)
         n = int(arr.shape[0])
@@ -642,11 +650,25 @@ class Sequence:
             return
         self._routed_expert_rows = keep
 
+    def finish_routed_experts(self, keep_rows: int) -> None:
+        """Trim to ``keep_rows`` and freeze, so the pickle and every read
+        share the live rows instead of copying the growable buffer."""
+        self.truncate_routed_experts(keep_rows)
+        self._routed_experts_final = True
+        buf = self._routed_expert_buf
+        if buf is None:
+            return
+        buf = buf[: self._routed_expert_rows]
+        buf.flags.writeable = False
+        self._routed_expert_buf = buf
+
     def materialize_routed_experts(self) -> np.ndarray | None:
         buf = self._routed_expert_buf
         n = self._routed_expert_rows
         if buf is None or n <= 0:
             return None
+        if self._routed_experts_final:
+            return buf
         return buf[:n].copy()
 
     @property

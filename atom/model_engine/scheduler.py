@@ -532,6 +532,7 @@ class Scheduler:
 
     _ENGINE_LABEL = ""
     _METRICS_ROLE = ""
+    _return_routed_experts: bool = False
 
     def __init__(
         self,
@@ -2601,6 +2602,8 @@ class Scheduler:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
+        if self._return_routed_experts:
+            seq.finish_routed_experts(seq.num_tokens - 1)
         seq.multimodal_data = None
         self._rejected.append(seq)
         if not has_inflight_load:
@@ -3477,9 +3480,8 @@ class Scheduler:
             # chunks and the first deferred step may have none; waiting for
             # one keeps an aborted request alive without advancing its tokens.
             if seq.status == SequenceStatus.ABORTED:
-                self._mark_finished(
-                    seq, "aborted", seq.num_tokens - seq.num_placeholder_tokens
-                )
+                num_tokens = seq.num_tokens - seq.num_placeholder_tokens
+                self._mark_finished(seq, "aborted", num_tokens)
                 finished_seqs.append(seq)
                 continue
             # Update the running status
@@ -3488,7 +3490,7 @@ class Scheduler:
                 continue
             # Middle-chunk prefill returns req_ids with no sampled tokens so
             # route patches can merge without advancing generation.
-            if idx >= len(prev_token_ids):
+            if not prev_token_ids:
                 continue
             # An immediate preempt/resume can retain the same request ID in
             # the runner's deferred output. That result belongs to execution
@@ -3773,11 +3775,9 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
-            if leave_reason is not None:
-                if seq.routed_expert_rows > 0:
-                    seq.truncate_routed_experts(max(int(num_tokens) - 1, 0))
-            elif (
-                seq.routed_expert_rows > 0
+            if (
+                leave_reason is None
+                and seq.routed_expert_rows > 0
                 and not seq.is_partial_prefill
                 and seq.id not in pp_middle_chunk_ids
             ):
@@ -3923,6 +3923,9 @@ class Scheduler:
                 # No peer will report a send for a cancelled request.
                 self._connector_send_finished(seq.id)
         seq.num_tokens = num_tokens
+        if self._return_routed_experts:
+            # Routes cover every position but the last token's, which never ran.
+            seq.finish_routed_experts(int(num_tokens) - 1)
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
         self.total_finished_requests += 1

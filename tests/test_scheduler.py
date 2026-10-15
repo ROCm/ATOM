@@ -3439,6 +3439,7 @@ class TestRoutedExpertPatches:
         assert seq.routed_expert_rows == 3
 
     def test_postprocess_trim_overlong_routes_on_eos(self, scheduler, seq_factory):
+        scheduler._return_routed_experts = True
         seq = seq_factory([1, 2, 3, 4])
         scheduler.add(seq)
         scheduler.schedule()
@@ -3503,3 +3504,30 @@ class TestRoutedExpertPatches:
         )
         assert finished == [seq]
         np.testing.assert_array_equal(seq.routed_experts, rows)
+
+    def test_abort_trims_overlong_routes_and_freezes_them(self, scheduler, seq_factory):
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        extra = np.arange(16, dtype=np.int16).reshape(8, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, extra))),
+        )
+        seq.status = SequenceStatus.ABORTED
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+        assert finished == [seq]
+        routes = seq.routed_experts
+        assert routes.shape[0] == seq.num_tokens - 1
+        assert routes is seq.routed_experts
+        assert not routes.flags.writeable

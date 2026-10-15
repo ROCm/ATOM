@@ -128,6 +128,11 @@ class AttentionBackend(ABC):
 class AttentionMetadataBuilder(ABC, Generic[T]):
     """Abstract class for attention metadata builders."""
 
+    # Every forward's `attn_metadata.slot_mapping` holds one KV slot per token
+    # the step runs, graph capture included. Routed-expert capture indexes by
+    # it, so `enable_return_routed_experts` refuses a builder that does not.
+    supplies_token_slots: ClassVar[bool] = False
+
     @abstractmethod
     def __init__(self, block_size: int) -> None:
         """Create the builder, remember some configuration and parameters."""

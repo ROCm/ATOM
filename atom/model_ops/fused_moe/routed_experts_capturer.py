@@ -129,7 +129,7 @@ def prefix_slots(block_table: AbcSequence[int], lo: int, hi: int, block_size: in
     )
 
 
-def _current_slot_mapping() -> torch.Tensor | None:
+def current_slot_mapping() -> torch.Tensor | None:
     from atom.utils.forward_context import get_forward_context
 
     ctx = get_forward_context()
@@ -202,8 +202,8 @@ def topk_ids_from_triton_routing(
 class RoutedExpertsCapturer:
     """Persistent GPU buffer: ``[num_kv_slots + 1, num_layers, top_k]``.
 
-    The extra row is a sacrificial pad target for graph dummy slots (``-1``).
-    Each step's rows are gathered in batch token order by ``store_step``,
+    The extra row is a sacrificial pad target: slots index the buffer directly,
+    so a graph dummy slot (``PAD_SLOT_ID``, -1) wraps to it. Each step's rows are gathered in batch token order by ``store_step``,
     which returns them as ``PendingRoutes`` for the caller to keep.
     """
 
@@ -223,18 +223,14 @@ class RoutedExpertsCapturer:
         self.num_slots = int(num_slots)
         self.num_layers = int(num_layers)
         self.top_k = int(top_k)
-        # Last row is a sacrificial pad target. Graph dummy slots are -1;
-        # mapping them to 0 and then index-putting would clobber a real write
-        # to physical slot 0 in the same capture (duplicate indices).
-        self._pad_slot = self.num_slots
+        # Index -1 is this last row, so pad slots never alias physical slot 0.
+        # Any other negative slot would land on a real row.
         self.buffer = torch.full(
             (self.num_slots + 1, self.num_layers, self.top_k),
             UNCAPTURED,
             dtype=dtype,
             device=device,
         )
-        # (slot key, last layer id, dest) shared by the MoE layers of one forward.
-        self._dest_cache: tuple[tuple, int, torch.Tensor] | None = None
 
     @classmethod
     def init(
@@ -267,47 +263,20 @@ class RoutedExpertsCapturer:
         topk_ids: torch.Tensor,
         slot_mapping: torch.Tensor | None = None,
     ) -> None:
-        """Scatter logical expert ids. Pad slots (``-1``) keep prior values."""
+        """Scatter logical expert ids. Pad slots (``-1``) write the pad row."""
         if layer_id < 0 or layer_id >= self.num_layers:
             return
-        slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
+        slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
         if slots is None or slots.numel() == 0 or topk_ids.numel() == 0:
             return
         n = min(int(slots.shape[0]), int(topk_ids.shape[0]))
         k = min(int(topk_ids.shape[-1]), self.top_k)
         ids = topk_ids[:n, :k].to(device=self.buffer.device, dtype=self.buffer.dtype)
-        dest = self._forward_dest_slots(layer_id, slots, n)
         if k < self.top_k:
             row = self.buffer.new_full((n, self.top_k), UNCAPTURED)
             row[:, :k] = ids
             ids = row
-        self.buffer[dest, layer_id, :] = ids
-
-    def _forward_dest_slots(
-        self, layer_id: int, slots: torch.Tensor, n: int
-    ) -> torch.Tensor:
-        """``_dest_slots(slots[:n])`` computed once per forward, not per layer.
-
-        The slot_mapping staging buffer is rewritten in place between forwards,
-        so tensor identity alone cannot invalidate. MoE layers run in increasing
-        id order within a forward; a non-increasing id starts a new forward.
-        Under CUDA-graph capture the first layer records the computation and
-        later layers read its output, so replay stays correct.
-        """
-        key = (id(slots), slots.data_ptr(), tuple(slots.shape), n)
-        cached = self._dest_cache
-        if cached is not None and cached[0] == key and layer_id > cached[1]:
-            self._dest_cache = (key, layer_id, cached[2])
-            return cached[2]
-        dest = self._dest_slots(slots[:n])
-        self._dest_cache = (key, layer_id, dest)
-        return dest
-
-    def _dest_slots(self, slot_mapping: torch.Tensor) -> torch.Tensor:
-        slots_i = slot_mapping.reshape(-1).to(dtype=torch.long)
-        valid = slots_i >= 0
-        phys = slots_i.clamp(min=0, max=self.num_slots - 1)
-        return torch.where(valid, phys, torch.full_like(phys, self._pad_slot))
+        self.buffer[slots.reshape(-1)[:n], layer_id, :] = ids
 
     def store_step(
         self,
@@ -330,7 +299,7 @@ class RoutedExpertsCapturer:
         staging buffer, and the next forward rewrites it in order after this
         stream only. With ``stream`` the D2H is non-blocking on it.
         """
-        slots = slot_mapping if slot_mapping is not None else _current_slot_mapping()
+        slots = slot_mapping if slot_mapping is not None else current_slot_mapping()
         lens = np.asarray(lens, dtype=np.int64)
         total = int(lens.sum())
         if slots is None or total == 0:
@@ -338,15 +307,17 @@ class RoutedExpertsCapturer:
         req_ids = np.asarray(req_ids, dtype=np.int64)
         starts = np.asarray(starts, dtype=np.int64)
         captured = min(int(slots.shape[0]), total)
-        dest = self._dest_slots(slots[:captured])
+        rows_at = slots.reshape(-1)[:captured]
         if prefix is not None:
             p_req, p_starts, p_lens, p_slots = prefix
-            p_dest = torch.from_numpy(np.clip(p_slots, 0, self.num_slots - 1))
-            dest = torch.cat([p_dest.to(dest.device), dest])
+            p_at = torch.from_numpy(np.asarray(p_slots)).to(
+                rows_at.device, rows_at.dtype
+            )
+            rows_at = torch.cat([p_at, rows_at])
             req_ids = np.concatenate([p_req, req_ids])
             starts = np.concatenate([p_starts, starts])
             lens = np.concatenate([p_lens, lens])
-        rows = self.buffer[dest].to(dtype=torch.int16)
+        rows = self.buffer[rows_at].to(dtype=torch.int16)
         if captured < total:
             # A metadata builder exposed fewer slots than the step ran.
             rows = torch.cat(
@@ -367,13 +338,15 @@ class RoutedExpertsCapturer:
 
 
 def maybe_capture_routed_experts(layer: Any, topk_ids: torch.Tensor) -> None:
-    """No-op when capture is off, uninitialized, or still in dummy warmup."""
+    """No-op when capture is off, uninitialized, or still in dummy warmup.
+
+    Only the target model's FusedMoE layers carry ``moe_capture_layer_id``; a
+    drafter's MoE has none and must not write over the target's routes.
+    """
     capturer = RoutedExpertsCapturer.get()
     if capturer is None or topk_ids is None:
         return
     layer_id = getattr(layer, "moe_capture_layer_id", None)
-    if layer_id is None:
-        layer_id = getattr(layer, "layer_id", None)
     if layer_id is None:
         return
     capturer.capture(int(layer_id), topk_ids)

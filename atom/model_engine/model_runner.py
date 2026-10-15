@@ -77,6 +77,15 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    capture_bytes_per_kv_block,
+    capture_pad_row_bytes,
+    check_return_routed_experts,
+    current_slot_mapping,
+    fused_moe_modules,
+    prefix_slots,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
@@ -724,9 +733,12 @@ def _profile_runner_stage(method):
 
 
 class ModelRunner:
+    # Read on every step; the per-step route hooks run only when it is set.
+    _return_routed_experts: bool = False
 
     def __init__(self, rank: int, config: Config):
         self.config = config
+        self._return_routed_experts = bool(config.enable_return_routed_experts)
         from atom.model_engine.multimodal_runtime import VisionEmbeddingCache
 
         self.vision_embeddings = VisionEmbeddingCache()
@@ -1157,10 +1169,6 @@ class ModelRunner:
             del self.model
         if hasattr(self, "drafter"):
             del self.drafter
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
         RoutedExpertsCapturer.reset()
         torch.cuda.empty_cache()
         return True
@@ -1687,10 +1695,6 @@ class ModelRunner:
             specs += self.draft_kv_builder.sub_pool_specs()
         geo = self._routed_experts_geometry()
         if geo is not None:
-            from atom.model_ops.fused_moe.routed_experts_capturer import (
-                capture_bytes_per_kv_block,
-            )
-
             num_layers, top_k = geo
             specs.append(
                 page_pool(
@@ -1867,10 +1871,6 @@ class ModelRunner:
 
         geo = self._routed_experts_geometry()
         if geo is not None:
-            from atom.model_ops.fused_moe.routed_experts_capturer import (
-                capture_pad_row_bytes,
-            )
-
             available_for_kv = max(
                 0, int(available_for_kv) - capture_pad_row_bytes(*geo)
             )
@@ -2335,14 +2335,12 @@ class ModelRunner:
         """
         if hasattr(self, "_routed_experts_geo"):
             return self._routed_experts_geo
-        if not getattr(self.config, "enable_return_routed_experts", False):
+        if not self._return_routed_experts:
             self._routed_experts_geo = None
             return None
         if not hasattr(self, "model"):
             return None
         import re
-
-        from atom.model_ops.fused_moe.routed_experts_capturer import fused_moe_modules
 
         moes: list = fused_moe_modules(self.model)
         if not moes:
@@ -2350,6 +2348,13 @@ class ModelRunner:
                 "enable_return_routed_experts requires at least one FusedMoE "
                 "module; this model has none (dense checkpoints cannot "
                 "return routed_experts)"
+            )
+        builder_cls = type(self.attn_metadata_builder)
+        if not builder_cls.supplies_token_slots:
+            raise ValueError(
+                "enable_return_routed_experts requires per-token KV slots in the "
+                f"attention metadata; {builder_cls.__name__} does not supply them, "
+                "so routes would never be written"
             )
         layer_ids: list[int] = []
         for ordinal, moe in enumerate(moes):
@@ -2373,10 +2378,6 @@ class ModelRunner:
         geo = self._routed_experts_geometry()
         if geo is None:
             return
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
         num_layers, top_k = geo
         num_slots = int(num_kvcache_blocks) * int(self.block_size)
         RoutedExpertsCapturer.init(
@@ -2398,14 +2399,10 @@ class ModelRunner:
         Must run in the same forward as ``prepare_model``: each request's first
         position is read from that forward's ``positions`` mirror.
         """
-        if not getattr(self.config, "enable_return_routed_experts", False):
+        if not self._return_routed_experts:
             return
         if getattr(batch, "is_dummy_run", False) or self.rank != 0:
             return
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            RoutedExpertsCapturer,
-        )
-
         capturer = RoutedExpertsCapturer.get()
         if capturer is None:
             return
@@ -2425,8 +2422,6 @@ class ModelRunner:
         ranges = getattr(batch, "routed_prefix_ranges", None)
         if not ranges:
             return None
-        from atom.model_ops.fused_moe.routed_experts_capturer import prefix_slots
-
         req_ids = np.asarray([batch.req_ids[i] for i, _, _ in ranges], np.int64)
         starts = np.asarray([lo for _, lo, _ in ranges], np.int64)
         lens = np.asarray([hi - lo for _, lo, hi in ranges], np.int64)
@@ -3520,27 +3515,25 @@ class ModelRunner:
         deferred = self.tokenID_processor.is_deferred_out
         # Capture before prepare_sampled_ids(), which advances self.prev_batch.
         prev_batch = self.tokenID_processor.prev_batch
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            _current_slot_mapping,
-        )
-
-        slots = _current_slot_mapping()
-
-        def _queue_routed_store_after_recv() -> None:
-            self._store_routed_experts_step(
-                batch,
-                stream=self.tokenID_processor.async_copy_stream,
-                slot_mapping=slots,
-            )
+        store_routes_after_recv = None
+        if self._return_routed_experts:
+            slots = current_slot_mapping()
+            if deferred:
+                store_routes_after_recv = partial(
+                    self._store_routed_experts_step,
+                    batch,
+                    stream=self.tokenID_processor.async_copy_stream,
+                    slot_mapping=slots,
+                )
 
         token_id_dict, logprobs_map = self.tokenID_processor.prepare_sampled_ids(
             batch,
             sampled_tokens,
             self.forward_done_event,
             sampled_logprobs,
-            after_recv=_queue_routed_store_after_recv if deferred else None,
+            after_recv=store_routes_after_recv,
         )
-        if not deferred:
+        if self._return_routed_experts and not deferred:
             self._store_routed_experts_step(batch, slot_mapping=slots)
         # Extract req_ids and token_ids from dict (key -1 is the is_deferred_out flag)
         req_ids_out = [k for k in token_id_dict if k != -1]
@@ -3617,9 +3610,8 @@ class ModelRunner:
             logprobs=logprobs_map,
             dspark_ell=dspark_ell,
         )
-        attach_batch = prev_batch if deferred and prev_batch is not None else batch
-        if not (deferred and prev_batch is None):
-            self._attach_routed_experts(attach_batch, output)
+        if self._return_routed_experts and not (deferred and prev_batch is None):
+            self._attach_routed_experts(prev_batch if deferred else batch, output)
         return output
 
     def _record_kv_cache_ready(self, batch: ScheduledBatch) -> None:
@@ -3725,7 +3717,8 @@ class ModelRunner:
                 num_bonus=None,
                 draft_token_ids=None,
             )
-            self._attach_routed_experts(batch, output)
+            if self._return_routed_experts:
+                self._attach_routed_experts(batch, output)
             return output
 
         fwd_output = self.postprocess(
@@ -4737,12 +4730,8 @@ class RapidServeModelRunner(ModelRunner):
         return 4 * safety_margin
 
     def _refuse_routed_experts_capture(self) -> None:
-        if not getattr(self.config, "enable_return_routed_experts", False):
+        if not self._return_routed_experts:
             return
-        from atom.model_ops.fused_moe.routed_experts_capturer import (
-            check_return_routed_experts,
-        )
-
         check_return_routed_experts(
             getattr(self.config, "decode_context_parallel_size", 1),
             getattr(self.config, "prefill_context_parallel_size", 1),

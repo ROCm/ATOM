@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 from atom.config import Config
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence
+from atom.model_ops.fused_moe import routed_experts_capturer as cap_mod
 from atom.model_ops.fused_moe.routed_experts_capturer import (
     UNCAPTURED,
     RoutedExpertsCapturer,
@@ -175,7 +176,7 @@ def test_graph_dummy_does_not_clobber_slot_zero():
     ids = torch.tensor([[9, 8], [1, 2]], dtype=torch.int32, device=device)
     capturer.capture(0, ids, slot_mapping=slots)
     assert capturer.buffer[0, 0].tolist() == [9, 8]
-    assert capturer.buffer[capturer._pad_slot, 0].tolist() == [1, 2]
+    assert capturer.buffer[capturer.num_slots, 0].tolist() == [1, 2]
 
 
 def test_graph_dummy_negative_slots_ignored():
@@ -230,6 +231,25 @@ def test_maybe_capture_skips_when_uninitialized():
 
     maybe_capture_routed_experts(_Layer(), torch.zeros((2, 2), dtype=torch.int32))
     assert RoutedExpertsCapturer.get() is None
+
+
+def test_moe_outside_the_target_model_never_captures(monkeypatch):
+    """A drafter's MoE has a `layer_id` but no `moe_capture_layer_id`."""
+    device = _device()
+    capturer = RoutedExpertsCapturer.init(
+        num_slots=8, num_layers=2, top_k=2, device=device
+    )
+    monkeypatch.setattr(
+        cap_mod, "current_slot_mapping", lambda: torch.tensor([0], device=device)
+    )
+
+    class _DraftMoE:
+        layer_id = 0
+
+    maybe_capture_routed_experts(
+        _DraftMoE(), torch.tensor([[5, 6]], dtype=torch.int32, device=device)
+    )
+    assert (capturer.buffer == UNCAPTURED).all()
 
 
 def test_prefix_slots_match_gpu_formula():
@@ -404,9 +424,9 @@ def test_triton_routing_ids_match_packed_histogram():
     assert ids.tolist() == [[1, 4], [3, 5], [3, 4]]
 
 
-def test_dest_cache_invalidates_on_in_place_slot_rewrite():
-    """Staging slot buffer is rewritten in place between forwards; the
-    per-forward dest cache must not reuse the previous forward's slots."""
+def test_in_place_slot_rewrite_between_forwards():
+    """The staging slot buffer is rewritten in place between forwards; each
+    forward's layers write and read that forward's slots."""
     device = _device()
     capturer = RoutedExpertsCapturer.init(
         num_slots=32, num_layers=3, top_k=2, device=device
@@ -512,6 +532,49 @@ def test_apply_patch_grows_capacity_across_many_decode_steps():
     assert out.shape == (64, 2, 2)
     np.testing.assert_array_equal(out[-2:], np.full((2, 2, 2), 63, dtype=np.int16))
     assert seq._routed_expert_buf.shape[0] >= 64
+
+
+def _grown_seq(rows: int) -> Sequence:
+    seq = Sequence([1, 2, 3], 3)
+    for i in range(rows):
+        seq.apply_routed_expert_patch(i, np.full((1, 4, 2), i, dtype=np.int16))
+    return seq
+
+
+def test_finished_routes_are_read_without_copying():
+    seq = _grown_seq(9)
+    seq.finish_routed_experts(7)
+    first, second = seq.routed_experts, seq.routed_experts
+    assert first is second
+    assert first.shape == (7, 4, 2)
+    assert not first.flags.writeable
+
+
+def test_finished_routes_pickle_without_the_spare_capacity():
+    import pickle
+
+    seq = _grown_seq(9)
+    assert seq._routed_expert_buf.shape[0] > 9
+    live = seq.routed_experts.nbytes
+    seq.finish_routed_experts(9)
+    restored = pickle.loads(pickle.dumps(seq))
+    assert restored._routed_expert_buf.nbytes == live
+    np.testing.assert_array_equal(restored.routed_experts, seq.routed_experts)
+
+
+def test_late_patch_after_finish_is_dropped():
+    """A deferred step scheduled before the finish still reports its routes."""
+    seq = _grown_seq(5)
+    seq.finish_routed_experts(4)
+    seq.apply_routed_expert_patch(4, np.full((2, 4, 2), 99, dtype=np.int16))
+    assert seq.routed_expert_rows == 4
+    assert (seq.routed_experts != 99).all()
+
+
+def test_running_routes_are_still_copies():
+    seq = _grown_seq(3)
+    seq.routed_experts[0] = 99
+    assert seq.routed_experts[0, 0, 0] == 0
 
 
 def test_incremental_decode_payload_smaller_than_full_history():
