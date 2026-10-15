@@ -110,30 +110,20 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
-# Eviction hashes kept for `_FitEstimate` revalidation. An estimate older than
-# this many evictions is re-walked rather than checked. A decode tick at c32
-# evicts a handful of blocks and a full 16k-token admission ~1k, so 8192 spans
-# a delayer hold with room to spare; ~64 KB of ints.
+# Eviction hashes kept for `_FitEstimate` revalidation; an estimate older than
+# this many evictions is re-walked.
 _RECENT_EVICTIONS = 8192
 
-# Blocks the hit walk hashes per round when the prompt chain runs out (no
-# frontend chain): the first round is small so a short hit hashes little past
-# its miss, and later rounds grow to keep the per-round overhead down. The cap
-# bounds the hashing wasted past the first miss.
+# Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
+# from MIN to MAX; bounds the hashing wasted past the first miss.
 _WALK_HASH_ROUND_MIN = 64
 _WALK_HASH_ROUND_MAX = 1024
 
 
 @dataclass(slots=True)
 class _AdmissionWalk:
-    """`can_allocate`'s hit, kept for the `allocate` that follows it.
-
-    The scheduler probes and then allocates the same seq within one Phase-2
-    iteration, with nothing in between that changes the KV index, so
-    `allocate` claims these ids instead of hashing and looking up the prompt
-    a second time. `index_version` says whether that held
-    (`_take_admission_walk`).
-    """
+    """`can_allocate`'s hit, claimed by the `allocate` that follows it
+    (`_take_admission_walk` revalidates it against `index_version`)."""
 
     seq: ref
     num_tokens: int
@@ -145,13 +135,9 @@ class _AdmissionWalk:
 
 @dataclass(slots=True)
 class _FitEstimate:
-    """One `can_allocate` prefix walk, kept for `can_allocate_estimate`.
-
-    Holds what the walk read from the KV index, so a later call can tell
-    whether the index still answers the same, plus the two numbers the walk
-    produced. `watched` is every hash whose index entry the walk relied on:
-    the hit's chain and the first miss.
-    """
+    """One `can_allocate` walk, memoised for `can_allocate_estimate`.
+    `watched`: every hash whose index entry it read (the hit and the first
+    miss, `boundary_hash`, None if the hit reaches the last reusable block)."""
 
     num_tokens: int
     cache_seed: int
@@ -160,13 +146,9 @@ class _FitEstimate:
     compressed_hit: int
     block_hashes: list[int]
     watched: set[int]
-    # The first block past the hit, and what the index held for it then: -1
-    # for a plain miss, a block id when the hash matched but the tokens did
-    # not. None when the hit already reaches the last reusable block.
     boundary_hash: int | None
     boundary_id: int
-    # The state gate's answer (`_gated_hit`) and the hit the walk returned,
-    # which a bounded replay (`_replay_hit`) may have widened past it.
+    # `_gated_hit`'s answer, and the hit after `_replay_hit` widened it.
     resumable: int
     hit: int
     num_new_blocks: int
@@ -199,30 +181,24 @@ class BlockManager:
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Each seq's chained prompt-block hashes, computed once and shared by
-        # every prefix walk of its admission (`_block_hash`). Content hashes
-        # only: pool hits and resource fit are always rechecked.
+        # Content hashes only: pool hits and resource fit are always rechecked.
         # Weak keys keep this scheduler-side cache out of request serialization.
         self._prefill_probe_hashes: WeakKeyDictionary[
             Sequence, tuple[int, list[int]]
         ] = WeakKeyDictionary()
-        # Frontend-hashed chains taken as-is vs. refused and rehashed here
-        # (`_adopt_shipped_chain`). Rejections should stay at 0.
+        # `_adopt_shipped_chain` outcomes; rejections should stay at 0.
         self.shipped_chains_adopted: int = 0
         self.shipped_chains_rejected: int = 0
         self.total_evicted_blocks: int = 0
-        # The delayer's per-seq probe memo (`can_allocate_estimate`) and what
-        # validates it: the hashes evicted most recently, positioned by
-        # `total_evicted_blocks`, and a count of whole-index clears, which drop
-        # entries without an eviction callback.
+        # `can_allocate_estimate`'s memo, validated against recent evictions
+        # and `clear_cache` calls (which drop entries without an eviction).
         self._fit_estimates: WeakKeyDictionary[Sequence, _FitEstimate] = (
             WeakKeyDictionary()
         )
         self._recent_evictions: deque[int] = deque(maxlen=_RECENT_EVICTIONS)
         self._index_clears = 0
         self.fit_estimate_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
-        # `can_allocate`'s hit walk at C speed, handed to `allocate`
-        # (`_hit_walk`). Off: the per-block walk and `allocate`'s re-walk.
+        # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
         self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
         self._admission_walk: _AdmissionWalk | None = None
 
@@ -768,20 +744,8 @@ class BlockManager:
         seq.replay_kv_load = False
 
     def _prompt_hashes(self, seq: Sequence) -> list[int]:
-        """`seq`'s cached chain of prompt-block hashes, for `_block_hash`.
-
-        An admission walks the prompt's chain several times -- the delayer's
-        pending-work probe on every pass it waits (and the DP balancer's
-        chunk-cost estimate), the lookup-detach probe and its re-probe after
-        the tier answer, the fit probe, `allocate`'s claim -- and xxhash over a
-        186k-token prompt is ~9 ms of the scheduler thread each time, which
-        the GPU waits out. Prompt blocks never change, so the chain is
-        computed once. Keyed on `cache_seed` too, since a different seed is a
-        different chain.
-
-        Starts from the chain the frontend shipped with the request when it
-        checks out (`_adopt_shipped_chain`), so this thread hashes nothing.
-        """
+        """`seq`'s prompt-block hash chain, computed once per `cache_seed`;
+        starts from the frontend's when it checks out (`_adopt_shipped_chain`)."""
         seed = seq.cache_seed
         cached = self._prefill_probe_hashes.get(seq)
         if cached is None or cached[0] != seed:
@@ -790,16 +754,9 @@ class BlockManager:
         return cached[1]
 
     def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
-        """The prompt chain `seq` brought from the frontend, or `[]` to hash here.
-
-        Taken only when it was minted for this engine's hash block size and
-        seed and covers exactly the full prompt blocks, and when its first and
-        last links rehash to the same values here -- a check of the encoding
-        (dtype, byte order, seeding) at two blocks' cost. Anything else falls
-        back to hashing on this thread, so a stale or foreign chain costs time,
-        never a wrong hit. Consumed either way: the array is a prompt's worth
-        of ints the request would otherwise carry for its lifetime.
-        """
+        """The frontend's chain for `seq` (consumed), or `[]` to hash here.
+        Adopted only if block size, seed and length match and its first and
+        last links rehash equal here; a bad chain costs time, never hits."""
         shipped = getattr(seq, "prompt_hash_chain", None)
         if shipped is None:
             return []
@@ -826,8 +783,7 @@ class BlockManager:
         return chain
 
     def _reject_shipped_chain(self, why: str) -> list[int]:
-        # Latched: a frontend/engine disagreement is a property of the build or
-        # the launch, so it would repeat on every request.
+        # Warn once: a frontend/engine mismatch repeats on every request.
         if not self.shipped_chains_rejected:
             logger.warning(
                 "Prefix cache: rehashing a prompt chain the frontend shipped, "
@@ -839,12 +795,8 @@ class BlockManager:
         return []
 
     def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
-        """Chained hash of block `i` given block `i - 1`'s hash `prev`.
-
-        `chain` is `_prompt_hashes(seq)`, filled front to back: block `i` is
-        read from it when present, else computed and appended while it is
-        still a prompt block (those past the prompt can still change).
-        """
+        """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
+        from or appended to `chain` (`_prompt_hashes`, full prompt blocks)."""
         if i < len(chain):
             return chain[i]
         h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
@@ -1076,8 +1028,7 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         prompt = self._prompt_hashes(seq)
-        # `block_hashes` is a prefix of the prompt's own chain, so the rest of
-        # the prompt's cached hashes continue it as one slice.
+        # `block_hashes` is a prefix of the prompt chain: continue it in one slice.
         chain = list(block_hashes)
         chain += prompt[len(chain) : blocks]
         h = chain[-1] if chain else seq.cache_seed
@@ -1110,8 +1061,7 @@ class BlockManager:
         demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
-        `remember=True` files the walk for `can_allocate_estimate`, its only
-        caller; the answer is unchanged.
+        `remember=True` memoises the walk for `can_allocate_estimate`.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -1249,19 +1199,12 @@ class BlockManager:
     def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
         """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
 
-        The per-block walk at C speed: the cached prompt chain is resolved with
-        one `map` over the index's `dict.get`, and the hit ends at the first
-        `None`. Where the chain stops short (no frontend chain, or a preempted
-        seq's generated blocks) it is hashed ahead in rounds and resolved the
-        same way, so hashing stops within one round of the first miss.
-
-        Tokens are compared on the last hit block only, not on every block.
-        A hit block's contents cannot change while it stays indexed (`publish`
-        writes fresh blocks, `allocate` unindexes first), so a mismatch means a
-        64-bit chained-hash collision; vLLM does not compare at all. If that
-        one block does differ, every block is compared and the hit cut at the
-        first mismatch, as the per-block walk did. The miss block's hash is
-        left in the prompt chain, where `_remember_walk` reads it.
+        Resolves the chain with one `map`, hashing ahead in rounds past the
+        cached prompt chain. Tokens are compared on the last hit block only:
+        indexed contents cannot change (`publish` writes fresh blocks,
+        `allocate` unindexes first), so a mismatch is a 64-bit hash collision,
+        and then every block is compared as the per-block walk did. A collision
+        on an interior block alone goes undetected (vLLM compares none).
         """
         n = self._n_hash_blocks(seq) - 1
         get = self.kv.index_get
@@ -1307,14 +1250,9 @@ class BlockManager:
         return hashes, ids
 
     def _take_admission_walk(self, seq: Sequence) -> _AdmissionWalk | None:
-        """The last `can_allocate` walk, if it was of `seq` and still holds.
-
-        Consumed whatever the answer. Holds while the KV index is at the
-        version the walk read; past that, while every hash still resolves to
-        the id the walk found (one `map`), which is all `allocate` takes from
-        it. A hit block cannot change contents while indexed, so its tokens
-        need no second look. `None` sends `allocate` down the per-block walk.
-        """
+        """The last `can_allocate` walk if it was of `seq` and still holds
+        (consumed either way). Past its `index_version` it holds while every
+        hash still resolves to the same id, which is all `allocate` takes."""
         walk, self._admission_walk = self._admission_walk, None
         if (
             walk is None
@@ -1332,45 +1270,14 @@ class BlockManager:
     def can_allocate_estimate(self, seq: Sequence) -> int:
         """`can_allocate(seq, record=False)` for the delayer, memoised per seq.
 
-        Its one caller is `Scheduler._local_prefill_pending_work`, the
-        PrefillDelayer's pending-work estimate, which probes the head of
-        `waiting` on every coalescing hold tick. The prompt does not change
-        between those ticks and the index rarely changes under it, yet each
-        probe re-walked the whole hit: at c32 on Qwen3.5 AgentX a 186k-token
-        head is ~11.6k blocks, a p50 14.5 ms `schedule()`, and the GPU idles
-        for whatever exceeds the ~8.5 ms the host runs ahead of it (130 s of
-        253 s idle per hour, 14,861 such ticks).
-
-        So the walk is reused while nothing it read can have moved:
-          - no hash in `watched` left the index. `_record_evicted` sees every
-            removal but `clear_cache`'s, which `_index_clears` counts. A global
-            eviction count alone is useless: at steady state every decode
-            block allocation evicts some LRU block, just rarely one of these.
-          - the first miss is still the same miss. A hit only grows by a
-            publish of exactly that hash; publishes elsewhere cannot reach it
-            through the chain.
-          - same token count and seed (a preempted seq returns longer).
-        A hit block's contents cannot change without its eviction (`publish`
-        writes fresh blocks, `allocate` unindexes first), so the per-block
-        token compare holds as well.
-
-        Asked again on every call, because each moves independently of the KV
-        index: per-request state room, the state gate (`_gated_hit` -- PAGE
-        checkpoints are stored and evicted on their own; a changed answer
-        re-walks), the bounded-replay widening (`_replay_hit`, which reads the
-        tier's answer and records the replay on `seq`; a changed hit
-        re-walks), and free-pool fit. Not asked again: which hit blocks some
-        live seq references, i.e. `num_new_blocks`. That only moves the fit
-        test by the blocks that changed hands.
-
-        Advisory by construction. Admission (Phase 2) still calls the exact
-        `can_allocate` and only that allocates, so a stale estimate can move a
-        FIRE/HOLD decision but never admit a request the pool cannot hold.
-        A reuse also skips `can_allocate`'s checkpoint demand/end refresh and
-        `num_compressed_hit_blocks`; the same walk would rewrite the same
-        values, and Phase 2's probe refreshes them before anything acts on
-        them. A refusal is never served from the memo: fit is retested.
-        `ATOM_PREFILL_DELAYER_PROBE_MEMO=0` probes exactly every call.
+        The walk is reused while nothing it read moved: no `watched` hash was
+        evicted (`_record_evicted`) or cleared (`_index_clears`), the first
+        miss still resolves the same (a hit only grows by a publish of that
+        hash), and token count and seed are unchanged. Re-asked on every call,
+        as they move independently of the index: state room, the state gate
+        and the bounded replay (a changed answer re-walks), and free-pool fit;
+        only `num_new_blocks` may lag. Advisory: Phase 2 still runs the exact
+        `can_allocate`, so a stale estimate can move FIRE/HOLD, never admit.
         """
         if not (self.enable_prefix_caching and self.fit_estimate_memo):
             return self.can_allocate(seq, record=False)
@@ -1382,9 +1289,7 @@ class BlockManager:
         resumable = self._gated_hit(seq, memo.compressed_hit, memo.block_hashes)
         if resumable != memo.resumable:
             return self.can_allocate(seq, record=False, remember=True)
-        # Asked again too: it reads the tier's answer, which lands between
-        # ticks, and it sets `seq.replays_hit` / `replay_kv_load` as the exact
-        # probe would. A different hit means a different `num_new_blocks`.
+        # Also sets `seq.replays_hit` / `replay_kv_load` as the exact probe does.
         hit = self._replay_hit(seq, memo.compressed_hit, resumable)
         if hit != memo.hit:
             return self.can_allocate(seq, record=False, remember=True)
@@ -1406,8 +1311,7 @@ class BlockManager:
         boundary_hash = None
         boundary_id = -1
         if compressed_hit < self._n_hash_blocks(seq) - 1:
-            # The walk computed this hash before it stopped, so on a prompt
-            # block it is read back from the chain, not hashed again.
+            # Read back from the prompt chain, where `_hit_walk` left it.
             boundary_hash = self._block_hash(
                 seq,
                 prompt,
@@ -1424,8 +1328,7 @@ class BlockManager:
             index_clears=self._index_clears,
             evictions_seen=self.total_evicted_blocks,
             compressed_hit=compressed_hit,
-            # `can_allocate` extends nothing in place (`_extend_hash_chain`
-            # copies), so the list is the hit and stays it.
+            # Never extended in place (`_extend_hash_chain` copies).
             block_hashes=block_hashes,
             watched=watched,
             boundary_hash=boundary_hash,
@@ -1436,12 +1339,8 @@ class BlockManager:
         )
 
     def _walk_still_valid(self, seq: Sequence, memo: _FitEstimate) -> bool:
-        """Whether the KV index still answers `memo`'s walk the same way.
-
-        Cost is the evictions since the last check, not the prompt: each call
-        consumes them, so a hold tick pays for the handful its decode step
-        evicted.
-        """
+        """Whether the KV index still answers `memo`'s walk the same way. Costs
+        the evictions since the last check, not the prompt length."""
         if (
             memo.num_tokens != seq.num_tokens
             or memo.cache_seed != seq.cache_seed
@@ -1486,8 +1385,7 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
-        # Admitted: the delayer no longer estimates this seq, and the memo's
-        # `watched` set is a prompt's worth of ints to hold for its lifetime.
+        # Admitted: the delayer no longer estimates this seq.
         self._fit_estimates.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
@@ -1508,9 +1406,8 @@ class BlockManager:
         )
         h = seq.cache_seed
         hit_hash = -1
-        # The ids the probe just found, claimed as one run; the loop below
-        # walks only what it did not cover (a joint tail past the HBM hit, or
-        # everything when the walk is missing or stale).
+        # Claim the probe's ids as one run; the loop walks only the rest (a
+        # joint tail past the HBM hit, or everything if the walk is stale).
         claimed = 0
         walk = self._take_admission_walk(seq)
         if walk is not None and (claimed := min(claim_blocks, len(walk.ids))):

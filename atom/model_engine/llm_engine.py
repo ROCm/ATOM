@@ -686,8 +686,7 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
-    # See `__init__`; a class default so a processor built without it ships
-    # nothing rather than failing.
+    # Class default: a processor built without `__init__` ships nothing.
     prefix_hash_block_size = 0
 
     def __init__(self, config, tokenizer, block_size):
@@ -713,10 +712,8 @@ class InputOutputProcessor:
             )
         if self.config.hf_config.model_type in self._per_req_cache_model_types():
             self.has_per_req_cache = True
-        # The engine's prefix-cache hash block (`BlockManager.hash_block_size`),
-        # for hashing the prompt chain here rather than on the scheduler thread.
-        # 0 = no prefix cache, nothing to ship. The engine checks it against its
-        # own and rehashes on a mismatch, so a wrong value costs speed only.
+        # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
+        # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
         if getattr(config, "enable_prefix_caching", False):
             self.prefix_hash_block_size = int(block_size) * int(
@@ -885,9 +882,8 @@ class InputOutputProcessor:
                 self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
 
-        # Off the engine thread: every caller runs this in an executor or its
-        # own submit thread, never on the API server's event loop. Siblings
-        # share a prompt and a seed, so one chain serves them all.
+        # Runs in an executor or submit thread, not the event loop. Siblings
+        # share a prompt and seed, so one chain serves them all.
         if self.prefix_hash_block_size:
             ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
             for seq in seqs[1:]:

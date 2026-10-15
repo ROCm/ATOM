@@ -1122,8 +1122,7 @@ class Scheduler:
                 )
             else:
                 # Runs on every tick with prefill work, holds included; the
-                # head's prompt-block hashes come from its cached chain
-                # (`BlockManager._prompt_hashes`), not a rehash each time.
+                # prompt hashes are cached (`BlockManager._prompt_hashes`).
                 cached_blocks = self.block_manager.can_allocate(seq, record=False)
                 if cached_blocks < 0:
                     break

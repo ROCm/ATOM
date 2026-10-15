@@ -93,10 +93,8 @@ class BlockPool:
         self._on_evict = on_evict
         self.blocks: list[Block] = [Block(i) for i in range(self.max_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
-        # Bumped by every change to which block a hash names: a publish, an
-        # unindex that drops an entry, a relocation, a clear. A reader that
-        # resolved hashes to ids at version v holds the index's current answer
-        # while it is still v (`BlockManager._take_admission_walk`).
+        # Bumped on every change to a hash -> id mapping: ids resolved at
+        # version v are still current while it is v.
         self.index_version: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
@@ -191,8 +189,7 @@ class BlockPool:
         return len(self._used.intersection(block_ids))
 
     def claim_many(self, block_ids) -> None:
-        """`claim` each of `block_ids`, in order; the loop with its lookups
-        hoisted, for an admission claiming a whole hit."""
+        """`claim` each of `block_ids`, in order, with the lookups hoisted."""
         blocks, used, take = self.blocks, self._used, self._take_named
         slru = self.cache_policy == "slru"
         for block_id in block_ids:
