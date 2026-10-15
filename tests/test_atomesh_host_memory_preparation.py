@@ -194,6 +194,39 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(len(self.result["attempts"]), 1)
         self.assertEqual(self.result["method"], "file_cache_and_numa")
 
+    def test_reclaims_other_models_before_compacting_cache_saturated_node(self):
+        self.args.cache_roots = [str(self.root)]
+        info = self.state["numa"][0]
+        info.update(MemFree=58 * PREP.GIB, **{"Inactive(file)": 1404 * PREP.GIB})
+        broader_seen = False
+
+        def reclaim(command, seconds, output):
+            nonlocal broader_seen
+            result = self.run_step(command, seconds, output)
+            if "model-cache" in output.name:
+                broader_seen = True
+                info["MemFree"] = 1400 * PREP.GIB
+                info["Inactive(file)"] = 62 * PREP.GIB
+            if "numa_exec.py" in str(command):
+                self.assertTrue(broader_seen)
+            return result
+
+        self.assertEqual(self.prepare(reclaim), 0)
+        self.assertTrue(broader_seen)
+        self.assertEqual(len(self.result["attempts"]), 1)
+        self.assertIn("model_cache_delta", self.result["attempts"][0])
+
+    def test_other_model_cache_is_untouched_when_ram_is_already_free(self):
+        self.args.cache_roots = [str(self.root)]
+        touched = []
+
+        def record(command, seconds, output):
+            touched.append(output.name)
+            return self.run_step(command, seconds, output)
+
+        self.assertEqual(self.prepare(record), 0)
+        self.assertFalse(any("model-cache" in name for name in touched))
+
     def test_full_thp_message_without_recovered_free_memory_is_not_ready(self):
         info = self.state["numa"][0]
         info.update(MemFree=769 * PREP.GIB, **{"Inactive(file)": 701 * PREP.GIB})

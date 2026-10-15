@@ -404,6 +404,11 @@ prepare_lmcache_memory_on_host() {
   fi
   local scripts="${REPO_ROOT}/.github/scripts/atomesh"
   local output="${RUN_DIR}/benchmark_results/lmcache-host-memory"
+  local -a cache_root_args=()
+  if [[ "${MODEL_PATH}" == /share_nfs/models/* && -d /share_nfs/models ]]; then
+    # fadvise drops only this host's clean pages; no files or mount settings change.
+    cache_root_args=(--cache-root /share_nfs/models)
+  fi
   local -a model_dirs=("${MODEL_PATH}")
   [[ -n "${DRAFT_MODEL_PATH:-}" ]] && model_dirs+=("${DRAFT_MODEL_PATH}")
   local excluded_node
@@ -423,7 +428,7 @@ prepare_lmcache_memory_on_host() {
     --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
     --per-gpu-gib "${ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE}" \
     --attempts 3 --timeout 300 --step-timeout 90 --reserve-gib 128 \
-    --output "${output}" "${model_dirs[@]}" || return $?
+    --output "${output}" "${cache_root_args[@]}" "${model_dirs[@]}" || return $?
   export ATOMESH_LMCACHE_HOST_PREPARED=true
 }
 

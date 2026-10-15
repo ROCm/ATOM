@@ -194,6 +194,8 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             "reserve_gib": args.reserve_gib,
         },
     }
+    cache_roots = getattr(args, "cache_roots", [])
+    result["settings"]["cache_roots"] = cache_roots
     began = clock()
     deadline = began + args.timeout
 
@@ -202,7 +204,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
         (args.output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
 
     try:
-        for directory in args.directories:
+        for directory in [*args.directories, *cache_roots]:
             if not Path(directory).is_dir():
                 raise ValueError(f"model directory is missing: {directory}")
         planned = budget.plan_pins([], args.gpus, args.per_gpu_gib, Path("/sys"))
@@ -285,6 +287,38 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                 }:
                     break
                 continue
+            # Other models can occupy nearly all of an idle node's RAM. On
+            # g08 (38788119513), advising only MiniMax left 1.4 TiB of cache;
+            # repeatedly faulting THP then reclaimed just 84 GiB in 270 s.
+            if cache_roots and capacity_error(
+                row["after_drop"], planned, args.reserve_gib, require_free=True
+            ):
+                row["after_target_drop"] = row["after_drop"]
+                broader = step(
+                    "model-cache",
+                    [
+                        sys.executable,
+                        str(HERE / "drop_page_cache.py"),
+                        "--stats",
+                        *cache_roots,
+                    ],
+                )
+                row["after_drop"] = take_snapshot(planned)
+                row["model_cache_delta"] = file_cache_delta(
+                    row["after_target_drop"], row["after_drop"]
+                )
+                print(
+                    "[host-memory][model-cache-delta] "
+                    + json.dumps(row["model_cache_delta"]),
+                    flush=True,
+                )
+                if broader["timed_out"] or broader["returncode"]:
+                    row["status"] = result["status"] = "model_cache_step_failed"
+                    continue
+                problem = capacity_error(row["after_drop"], planned, args.reserve_gib)
+                if problem:
+                    row["status"] = result["status"] = problem
+                    break
             complete = direct_ok and not capacity_error(
                 row["after_drop"], planned, args.reserve_gib, require_free=True
             )
@@ -360,6 +394,13 @@ def main():
     parser.add_argument("--timeout", type=budget.positive_seconds, default=120)
     parser.add_argument("--step-timeout", type=budget.positive_seconds, default=35)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--cache-root",
+        dest="cache_roots",
+        action="append",
+        default=[],
+        help="additional model-cache directory to advise only when free RAM is insufficient",
+    )
     parser.add_argument("directories", nargs="+")
     return prepare(parser.parse_args())
 

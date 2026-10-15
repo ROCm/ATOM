@@ -130,3 +130,17 @@ that timer. Successful request returns, scheduled prefill batches, output sends,
 and completed offload saves do reset it. This avoids occupying an allocation
 for hours after a worker has died. Artifacts include `benchmark-guard.json` and
 `benchmark_results/runtime-diagnostics/`; read-only collection supports both.
+
+Run 38788119513 landed on g08, whose prefill NUMA node had only 58 GiB free
+and 1404 GiB of clean file cache. Advice on all 160 target and 6 draft files
+succeeded but released essentially no memory: the cache belonged to other
+files. Three THP attempts timed out after 90 seconds each, recovering only
+84 GiB total, and the model was never started.
+
+When advising the selected model directories still leaves less ordinary free
+RAM than the LMCache pool, the host preparation now also advises clean cached
+files under the existing `/share_nfs/models` mount. This is confined to the
+case's exclusive allocation and changes no files or permissions. It is skipped
+when the node already has enough free RAM. Both advice passes and their actual
+NUMA memory deltas are recorded separately; the existing 300-second total and
+90-second step bounds remain in effect.
