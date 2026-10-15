@@ -84,6 +84,8 @@ def main() -> None:
                 record["versions"][name] = None
         assert "81198e97b" in record["versions"]["vllm"], record["versions"]
         record["engine_startup_patch"] = verify_port_patch(Path(vllm.__file__).parent)
+        from pd_c48_quant_patch import verify_quant_patch
+        record["online_quant_loading_patch"] = verify_quant_patch(Path(vllm.__file__).parent)
         record["loading_memory_evidence"] = {"interval_seconds": 2, "active_only_during_load_model": True}
         record["gpu_state_before_worker_start"] = {}
         command = shutil.which("rocm-smi")

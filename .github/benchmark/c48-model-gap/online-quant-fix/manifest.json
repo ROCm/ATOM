@@ -1,0 +1,22 @@
+{
+  "name": "kimi_kda_online_quant_padding_coverage",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "Exclude KDA alignment rows from expected checkpoint coverage",
+    "Zero declared padding when materializing meta weights"
+  ],
+  "files": [
+    {
+      "relative_path": "models/kimi_k3/amd/kda.py",
+      "mount_source": "kda.py",
+      "base_sha256": "8d9fb5f714b1cf3b18692b18c69a5a115fa448abb3b772ea27c3a31ba0e25208",
+      "patched_sha256": "8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed"
+    },
+    {
+      "relative_path": "model_executor/model_loader/reload/meta.py",
+      "mount_source": "meta.py",
+      "base_sha256": "749d03cc94639c6e0133c1f0e326eaec2b43ee7d8fe3288963982bf50a1aeed4",
+      "patched_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d"
+    }
+  ]
+}

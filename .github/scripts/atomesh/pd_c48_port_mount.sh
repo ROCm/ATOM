@@ -11,4 +11,18 @@ c48_append_port_mount() {
     return 2
   fi
   docker_args+=(--mount "type=bind,source=${c48_source},target=${c48_target},readonly")
+  # The loading fix is fixed to this experiment branch and mounted read-only.
+  local c48_fix_source c48_fix_target c48_fix_digest
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/online-quant-fix/kda.py"
+  c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/kda.py"
+  [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+  c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+  [[ "${c48_fix_digest%% *}" == "8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed" ]] || return 2
+  docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/online-quant-fix/meta.py"
+  c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/reload/meta.py"
+  [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+  c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+  [[ "${c48_fix_digest%% *}" == "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d" ]] || return 2
+  docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }
