@@ -252,7 +252,7 @@ WAIT_ROUTER_TIMEOUT="${WAIT_ROUTER_TIMEOUT:-300}"
 
 BENCHMARK_KIND="${BENCHMARK_KIND:-random}"
 # The AgentX client InferenceX benchmarks with (infx/bench/agentic/requirements.txt).
-AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.7}"
+AGENTX_HARNESS_VERSION="${AGENTX_HARNESS_VERSION:-1.0.9}"
 AGENTX_VENV="${AGENTX_VENV:-/tmp/atomesh-agentx-venv}"
 AIPERF_SCENARIO="${AIPERF_SCENARIO:-agentx}"
 AIPERF_PUBLIC_DATASET="${AIPERF_PUBLIC_DATASET:-semianalysis_cc_traces_weka_062126_256k}"
@@ -2089,10 +2089,16 @@ run_benchmark() {
 }
 
 ensure_agentx_harness() {
-  if [[ -x "${AGENTX_VENV}/bin/agentx" \
-    && "$("${AGENTX_VENV}/bin/agentx" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
-    return
-  fi
+  # The ATOM image ships this release in its own venv and links `agentx` onto
+  # PATH; reuse it, or an earlier install, on an exact match.
+  local bin
+  for bin in "$(command -v agentx 2>/dev/null)" "${AGENTX_VENV}/bin/agentx"; do
+    if [[ -x "${bin}" && "$("${bin}" --version 2>/dev/null)" == "${AGENTX_HARNESS_VERSION}" ]]; then
+      AGENTX_VENV="$(dirname "$(dirname "$(readlink -f "${bin}")")")"
+      echo "[agentx] using agentx-harness ${AGENTX_HARNESS_VERSION} in ${AGENTX_VENV}"
+      return
+    fi
+  done
 
   echo "[agentx] installing agentx-harness==${AGENTX_HARNESS_VERSION} into ${AGENTX_VENV}"
   mkdir -p "$(dirname "${AGENTX_VENV}")"
