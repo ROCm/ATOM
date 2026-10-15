@@ -82,10 +82,16 @@ The follow-up case is
 Use the same dispatch command above with this case name. It retains the same
 model configuration and 20-minute allocation limit. The original case remains
 available as the control.
-For this diagnostic case, a fallback Rust toolchain used to build Mesh is
-installed into a fresh build-local Rustup home; Cargo crates and build outputs
-stay cached. This avoids reusing a node cache with an interrupted toolchain
-installation. Toolchain setup still counts toward the 20-minute limit.
+Both full-model replay cases use the Mesh release binary already installed in
+`rocm/atom-dev:nightly_202610141644` at
+`/app/ATOM/atom/mesh/target/release/atomesh`. The image's ATOM revision
+`6e9b3e1c5` and this replay branch have the same `atom/mesh` source tree
+(`55ad15ac25935554c211538e0611bbca26bc567c`). The workflow therefore skips
+Mesh compilation for `minimax_full_model_replay`, avoiding Rust installation
+and the shared Cargo source cache that failed in run `38728945101`
+(`aws-lc-rs-1.18.2/Cargo.toml` missing). No cache deletion is needed.
+Recheck Mesh compatibility if the image or router source changes. Agentic
+benchmark cells still build their reviewed Mesh source.
 
 After all eight primers return, the client atomically creates `armed.json`.
 The prefill EngineCore continues receiving requests and draining idle connector

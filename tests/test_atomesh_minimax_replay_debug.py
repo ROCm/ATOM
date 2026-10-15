@@ -225,47 +225,6 @@ printf '%s\n' "${ATOMESH_M3_REPLAY_PIPE_DIR}"
             self.assertEqual(before, {p: p.read_bytes() for p in before})
             self.assertIn("_m3debug", (runtime / patcher.ROOT_FILES[0]).read_text())
 
-    def test_replay_uses_a_fresh_rustup_home_after_broken_cached_toolchain(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            build, cache = root / "build", root / "cache"
-            build.mkdir()
-            (cache / "rustup-home").mkdir(parents=True)
-            cached = cache / "rustup-home/interrupted-install"
-            cached.write_text("preserve")
-            installer = root / "rustup-init"
-            installer.write_text(
-                '#!/bin/bash\nmkdir -p "$RUSTUP_HOME"\ntouch "$RUSTUP_HOME/ready"\n'
-            )
-            source = (SCRIPTS / "build_mesh.sh").read_text()
-            start = source.index("if ! cargo --version")
-            block = source[start : source.index("lock_args=()", start)]
-            # Stub only the external Rust commands; execute the real fallback
-            # branch and installer invocation without network or a GPU.
-            stubs = r"""cargo() { [[ -f "${RUSTUP_HOME:-/missing}/ready" ]]; }
-rustc() { [[ -f "${RUSTUP_HOME:-/missing}/ready" ]]; }
-curl() { cp "$TEST_RUSTUP_INIT" "${@: -1}"; }
-"""
-            result = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", stubs + block],
-                env={
-                    **os.environ,
-                    "build_dir": str(build),
-                    "target_dir": str(cache),
-                    "TEST_RUSTUP_INIT": str(installer),
-                    "RUSTUP_HOME": str(cache / "rustup-home"),
-                    "ATOMESH_M3_REPLAY_GATE": "true",
-                },
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertTrue((build / "rustup-home/ready").is_file())
-            self.assertFalse((cache / "rustup-home/ready").exists())
-            self.assertEqual(cached.read_text(), "preserve")
-
     def test_inactive_hook_does_not_create_trace_or_import_gpu(self):
         with (
             patch.dict(os.environ, {"ATOM_M3_REPLAY_DIR": ""}),
