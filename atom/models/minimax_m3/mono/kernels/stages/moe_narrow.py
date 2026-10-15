@@ -17,7 +17,7 @@ from atom.models.minimax_m3.mono.layout import (
     XSC_ROW,
     shared_after_routing,
 )
-from atom.mono.device.mx import FP4, mfma_scaled
+from atom.mono.device.mx import FP4, FP8, mfma_scaled
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
@@ -274,7 +274,7 @@ def moe_narrow_defs(k4ctx):
                     + g4
                 ),
                 c=fx.Vector.filled(4, 0.0, fx.Float32),
-                a_fmt=FP4,
+                a_fmt=FP8 if const_expr(k4ctx.get("shared_fp8", False)) else FP4,
             )
             sh = [sh[j4] + cu[j4] * wgt for j4 in range(4)]
         fx.ptr_store(

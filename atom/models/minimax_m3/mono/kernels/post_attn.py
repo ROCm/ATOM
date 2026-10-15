@@ -139,6 +139,10 @@ K4_ABI = KernelAbi(
         "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
     )
 )  # fmt: skip
+# The shared-FP8 variant carries its four extra pointers in the layer's immutable
+# K1 descriptor, after K1_ARGS. Keeping a distinct ABI object prevents a runner
+# from pairing the variant with an ordinary K4 build.
+K4_SHARED_FP8_ABI = KernelAbi(K4_ABI.names)
 
 
 @dataclass(frozen=True)
@@ -163,6 +167,11 @@ class K4Build:
     debug: bool
 
 
+@dataclass(frozen=True)
+class K4SharedFP8Build(K4Build):
+    shared_fp8: bool = field(default=True, metadata={"sym": "sf8"})
+
+
 def build_post_attn_kernel(
     npes: int,
     sm_scale: float,
@@ -178,6 +187,7 @@ def build_post_attn_kernel(
     heads: IndexHeads = ONE_INDEX_HEAD,
     debug: bool = False,
     index_topk: bool = True,
+    _shared_fp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -190,7 +200,9 @@ def build_post_attn_kernel(
     path's ``skip_index_topk`` layer) it attends over the sparse table the last
     selecting layer of the step left in scratch."""
     assert 1 <= tokens <= MAX_TOKENS
-    key = K4Build(
+    assert not _shared_fp8 or fuse_k1
+    build_cls = K4SharedFP8Build if _shared_fp8 else K4Build
+    key = build_cls(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
         index_topk=index_topk, fuse_k1=fuse_k1, sm_scale=sm_scale, eps=eps,
@@ -200,7 +212,10 @@ def build_post_attn_kernel(
     build_key = key_tuple(key, SOURCES)  # the launcher references it: keyed
     # a debug build's wait records name a region by its ``region_id``
     REGION_IDS = region_ids(
-        d.name for d in mailbox_regions(tokens, heads.count, fuse_k1, index_topk)
+        d.name
+        for d in mailbox_regions(
+            tokens, heads.count, fuse_k1, index_topk, shared_fp8=_shared_fp8
+        )
     )
     W = npes
     G = BLOCKS
@@ -211,6 +226,7 @@ def build_post_attn_kernel(
     WIDE = wide_moe(tokens)
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
+    shared_fp8 = _shared_fp8
 
     @fx.struct
     class Smem:
@@ -406,6 +422,12 @@ def build_post_attn_kernel(
                 ar_in, g_in, w_qkv, s_qkv, g_q, g_k, g_iq, g_ik, cos_sin, index_cache,
                 iq_out, scratch1,
             ) = [load_ptr64(k1_args, i) for i in range(len(K1_ARGS))]  # fmt: skip
+            if const_expr(shared_fp8):
+                shared_w13, shared_s13, shared_w2, shared_s2 = [
+                    load_ptr64(k1_args, len(K1_ARGS) + i) for i in range(4)
+                ]
+            else:
+                shared_w13 = shared_s13 = shared_w2 = shared_s2 = None
             qs_k1 = lds.qs.ptr
             if const_expr(ih_count > 1):
                 qs_k1 = fpool + QS_CP
@@ -627,5 +649,43 @@ def build_post_attn_kernel(
             batch_ids,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
-    K4_ABI.check(post_attn_kernel, launch_post_attn)
+    (K4_SHARED_FP8_ABI if shared_fp8 else K4_ABI).check(
+        post_attn_kernel, launch_post_attn
+    )
     return launch_post_attn
+
+
+def build_post_attn_shared_fp8_kernel(
+    npes: int,
+    sm_scale: float,
+    eps: float,
+    route_scale: float,
+    swiglu_limit: float,
+    init_blocks: int,
+    local_blocks: int,
+    tokens: int = 1,
+    timeline: bool = False,
+    fuse_k1: bool = True,
+    heads: IndexHeads = ONE_INDEX_HEAD,
+    debug: bool = False,
+    index_topk: bool = True,
+):
+    """M3.1 K4 with 128 MXFP4 routed experts and one independent MXFP8 shared MLP."""
+    launch = build_post_attn_kernel(
+        npes,
+        sm_scale,
+        eps,
+        route_scale,
+        1.0,
+        swiglu_limit,
+        init_blocks,
+        local_blocks,
+        tokens,
+        timeline,
+        fuse_k1,
+        heads,
+        debug,
+        index_topk,
+        _shared_fp8=True,
+    )
+    return launch

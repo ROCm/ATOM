@@ -70,6 +70,27 @@ def fp4_tile_load(r_w, base, rg, k, st, at):
     )
 
 
+def mxfp8_a_tiles(r_w, rg, k, st, lane):
+    """A lane's two 64-k halves of a row-major FP8 16x128 weight tile.
+
+    Native Quark per-block [1, 32] weights are not shuffled.  The MFMA lane
+    mapping takes one 16-byte K segment from one of the tile's 16 rows in each
+    64-column half.
+    """
+    row = rg * 16 + lane % 16
+    k16 = st * 128 + (lane // 16) * 16
+    half = (row * k + k16) // 4
+    lo = fx.Vector(
+        bo.buffer_load(r_w, half, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    hi = fx.Vector(
+        bo.buffer_load(r_w, half + 16, vec_width=4, dtype=T.i32, cache_modifier=CM_NT)
+    )
+    return fx.Vector.from_elements(
+        [lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32
+    )
+
+
 def mfma_scaled(a, b, c, sa, sb, a_fmt=FP8, b_fmt=FP8, sa_byte=0, sb_byte=0):
     """One 16x16x128 scaled MFMA (gfx950 f8f6f4): A ``a`` (``a_fmt``) with E8M0
     ``sa`` (its byte ``sa_byte``), B ``b`` (``b_fmt``) with E8M0 ``sb`` (its

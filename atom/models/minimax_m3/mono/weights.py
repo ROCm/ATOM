@@ -61,6 +61,33 @@ def _ptpc_fp8(
     return w.data, s.data.view(rows)
 
 
+def _mxfp8(
+    linear, rows: int, cols: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Native Quark [1, 32] MXFP8 weight and its row-major E8M0 scales."""
+    w, s = linear.weight, getattr(linear, "weight_scale", None)
+    _need(
+        linear.quant_type.value == QuantType.per_1x32.value
+        and linear.params_dtype == dtypes.fp8
+        and getattr(linear, "native_a8_group_rows", None) == 1,
+        f"{name}: not MXFP8",
+    )
+    _need(
+        w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
+        f"{name}: weight {w.dtype} {tuple(w.shape)}",
+    )
+    _need(not getattr(w, "is_shuffled", False), f"{name}: weight shuffled")
+    _need(not getattr(linear, "is_output_padded", False), f"{name}: output padded")
+    _need(
+        s is not None
+        and s.dtype == dtypes.fp8_e8m0
+        and tuple(s.shape) == (rows, cols // 32)
+        and s.is_contiguous(),
+        f"{name}: scale",
+    )
+    return w.data, s.data
+
+
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
     _need(
         t.dtype == torch.bfloat16 and t.numel() == n and t.is_contiguous(),
@@ -109,6 +136,14 @@ class SparseMoeLayer:
     s13: torch.Tensor
     w2: torch.Tensor
     s2: torch.Tensor
+    shared_w13: torch.Tensor | None = None
+    shared_s13: torch.Tensor | None = None
+    shared_w2: torch.Tensor | None = None
+    shared_s2: torch.Tensor | None = None
+
+    @property
+    def shared_fp8(self) -> bool:
+        return self.shared_w13 is not None
 
     @staticmethod
     def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
@@ -146,11 +181,11 @@ class SparseMoeLayer:
         moe = layer.block_sparse_moe
         experts = moe.experts
         qm = experts.quant_method
-        E = N_ROUTED + 1
-        _need(
-            moe.fuse_shared_experts and experts.num_fused_shared_experts == 1,
-            f"layer {layer_id}: shared expert",
-        )
+        shared = getattr(moe, "shared_experts", None)
+        fused_shared = moe.fuse_shared_experts and experts.num_fused_shared_experts == 1
+        independent_shared = not moe.fuse_shared_experts and shared is not None
+        _need(fused_shared or independent_shared, f"layer {layer_id}: shared expert")
+        E = N_ROUTED + int(fused_shared)
         _need(
             experts.top_k == TOP_K and not getattr(qm, "is_guinterleave", True),
             f"layer {layer_id}: moe layout",
@@ -176,6 +211,21 @@ class SparseMoeLayer:
             and s2.numel() == E * HIDDEN * INTER // 32,
             f"layer {layer_id}: expert scale bytes",
         )
+        if independent_shared:
+            shared_w13, shared_s13 = _mxfp8(
+                shared.gate_up_proj,
+                2 * INTER,
+                HIDDEN,
+                f"layer {layer_id} shared gate_up_proj",
+            )
+            shared_w2, shared_s2 = _mxfp8(
+                shared.down_proj,
+                HIDDEN,
+                INTER,
+                f"layer {layer_id} shared down_proj",
+            )
+        else:
+            shared_w13 = shared_s13 = shared_w2 = shared_s2 = None
         gate = moe.gate.weight
         _need(
             gate.dtype == torch.bfloat16 and tuple(gate.shape) == (N_ROUTED, HIDDEN),
@@ -213,6 +263,10 @@ class SparseMoeLayer:
             s13=s13.data,
             w2=w2.data,
             s2=s2.data,
+            shared_w13=shared_w13,
+            shared_s13=shared_s13,
+            shared_w2=shared_w2,
+            shared_s2=shared_s2,
         )
 
 

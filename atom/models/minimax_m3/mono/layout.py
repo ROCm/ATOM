@@ -152,7 +152,11 @@ def sym_layout(npes: int):
 
 
 def mailbox_regions(
-    tokens: int, index_heads: int, fuse_k1: bool, index_topk: bool = True
+    tokens: int,
+    index_heads: int,
+    fuse_k1: bool,
+    index_topk: bool = True,
+    shared_fp8: bool = False,
 ) -> list[RegionDecl]:
     """The fused layer kernel's mailbox regions for a build: each one's space and
     the one stage that puts it (``atom.mono.plan.check``; the stages are the ones
@@ -188,6 +192,8 @@ def mailbox_regions(
     regions.append(RegionDecl("scores", S, "router"))
     if wide_moe(tokens):
         regions += [RegionDecl("xndone", S, "router"), RegionDecl("ugdone", S, "ug")]
+        if shared_fp8:
+            regions.append(RegionDecl("mid", S, "ug"))
     else:
         regions += [RegionDecl(n, S, "router") for n in ("xn8", "xsc")]
         regions.append(RegionDecl("mid", S, "ug"))

@@ -37,11 +37,12 @@ from atom.models.minimax_m3.mono.layout import (
     XN8_ROW,
     XSC_ROW,
 )
-from atom.mono.device.mx import FP4, fp4_tile_load, mfma_scaled
+from atom.mono.device.mx import FP4, FP8, fp4_tile_load, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
     ballot,
     bf16_round,
+    fp8_pack4,
     lanes_below,
     popcount,
     row_live,
@@ -98,6 +99,10 @@ def moe_wide_defs(k4ctx):
     mr = k4ctx["mr"]
     mx8_q = k4ctx["mx8_q"]
     mx8_scale = k4ctx["mx8_scale"]
+    shared_fp8 = k4ctx.get("shared_fp8", False)
+    sh_compute = k4ctx.get("sh_compute")
+    sh_load = k4ctx.get("sh_load")
+    down_load_shared = k4ctx.get("down_load_shared")
     red = k4ctx["red"]
     route = k4ctx["route"]
     route_top4 = k4ctx["route_top4"]
@@ -150,8 +155,12 @@ def moe_wide_defs(k4ctx):
             if tid == N_ROUTED - 1:
                 nu_ = off + popcount(bal)
                 fx.ptr_store(nu_, uexp + (U_MAX + 1))
-                fx.ptr_store(fx.Int32(SHARED_EXPERT), uexp + nu_)
-                fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + nu_)
+                if const_expr(not shared_fp8):
+                    fx.ptr_store(fx.Int32(SHARED_EXPERT), uexp + nu_)
+                    fx.ptr_store(fx.Int32((1 << tokens) - 1), umask + nu_)
+                else:
+                    fx.ptr_store(fx.Int32(0), uexp + nu_)
+                    fx.ptr_store(fx.Int32(0), umask + nu_)
         gpu.barrier()
 
     def wug_load(t, has, scales=True):
@@ -266,6 +275,7 @@ def moe_wide_defs(k4ctx):
         (the zero row where the column's token is not routed there) and route
         weight. Routing only: built while the first up / gate weights land."""
         nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+        n_exp = nu + (0 if shared_fp8 else 1)
         for i in range_constexpr((U_MAX * 16 + THREADS - 1) // THREADS):
             ix = tid + THREADS * i
             if ix < U_MAX * 16:
@@ -275,7 +285,7 @@ def moe_wide_defs(k4ctx):
                 xm = fx.Int32(fx.ptr_load(umask + fx.min(xu, nu)))
                 xt = fx.min(xk, tokens - 1)
                 xs_ = slot_of(xt, xe)
-                xh = (((xm >> xk) & 1) != 0) & (xu <= nu)
+                xh = (((xm >> xk) & 1) != 0) & (xu < n_exp)
                 fx.ptr_store(
                     xh.select(xt * MOE_SLOTS + xs_, fx.Int32(MID_ROWS)), urow + ix
                 )
@@ -288,6 +298,10 @@ def moe_wide_defs(k4ctx):
         td = start("down")  # this CTA's down task (the split tasks come first)
         has_dn = td < N_DN
         td = fx.min(td, N_DN - 1)
+        if const_expr(shared_fp8):
+            has_sh = start("shared") < k4ctx["SH_TASKS"]
+            sh_j = fx.min(start("shared"), k4ctx["SH_TASKS"] - 1)
+            sh_w = sh_load(sh_j, has_sh)
         # every token's routing: wave w routes tokens w, w + WAVES, .., their
         # scores polled in one batch
         mine = bid % SCORE_COPIES
@@ -335,12 +349,14 @@ def moe_wide_defs(k4ctx):
                 sk * 2 * MOE_SLOTS + MOE_SLOTS + sj,
                 fx.ptr_load(rwt + (8 * sk + sj)),
             )
-        n_pairs = (uniform(fx.ptr_load(uexp + (U_MAX + 1))) + 1) * UG_PAIRS
+        n_pairs = (
+            uniform(fx.ptr_load(uexp + (U_MAX + 1))) + (0 if shared_fp8 else 1)
+        ) * UG_PAIRS
 
         def task(it):
             """Iteration it's task: pair bid + (it / 2) G's half it % 2."""
             pr = fx.Int32(bid + it // 2 * G)
-            return fx.min(pr, n_pairs - 1) * 2 + it % 2, pr < n_pairs
+            return fx.min(pr, fx.max(n_pairs, 1) - 1) * 2 + it % 2, pr < n_pairs
 
         t0, h0 = task(0)
         cur = wug_load(t0, h0)  # task 0: a lo half, with the pair's scales
@@ -365,6 +381,9 @@ def moe_wide_defs(k4ctx):
         ):
             rows_to_lds(tid, base_w, tokens, n_row, xs + lds_w, lds_row)
         gpu.barrier()
+        if const_expr(shared_fp8):  # noqa: SIM102
+            if has_sh:
+                sh_compute(sh_j, sh_w[0], sh_w[1])
         y_lo = fx.Float32(0.0)  # the pair's first half, until the second's
         for it in range_constexpr(UGW_ITERS):
             t, has_t = task(it)
@@ -393,6 +412,7 @@ def moe_wide_defs(k4ctx):
         token l % 16's mid for it, the zero row where the token is not routed
         there), route-weighted per column -> ffn_finish."""
         nu = uniform(fx.ptr_load(uexp + (U_MAX + 1)))
+        n_exp = nu + (0 if shared_fp8 else 1)
         rg_d = td * 2 + wave // 4
         # wave q of the row group takes chunks q and q + 4 of every expert, unit i
         # being expert i // 2 for all 4: which wave adds a chunk, and in what
@@ -404,7 +424,7 @@ def moe_wide_defs(k4ctx):
             """(weights, scale, unit) of this wave's i-th (expert, 128-k chunk)
             unit, zero-sized reads past the last."""
             dkc = q + 4 * (i % 2)
-            ok = (dkc < DN_KC) & (fx.Int32(i // 2) <= nu)
+            ok = (dkc < DN_KC) & (fx.Int32(i // 2) < n_exp)
             # clamped into the table: a unit past the last reads a real or zero
             # row, never past urow (a garbage row is garbage B, and 0 * NaN)
             du = fx.Int32(min(i // 2, U_MAX - 1))
@@ -441,7 +461,7 @@ def moe_wide_defs(k4ctx):
         inflight = [unit_load(i) for i in range(min(DN_DEPTH, DN_WITERS))]
         # every up / gate task pair's flag, then the MXFP8 mid rows and their
         # scales, the pool's layout (plain words, 16 B a load)
-        n_ug = (nu + 1) * UG_PAIRS
+        n_ug = n_exp * UG_PAIRS
         mb_poll(
             [
                 (mr("ugdone"), fx.min(tid + THREADS * i, n_ug - 1), 1)
@@ -455,12 +475,36 @@ def moe_wide_defs(k4ctx):
             (mb("midsp"), MIDSC_ROW_WORDS, W_MIDSC, MIDSC_ROW),
         ):
             rows_to_lds(tid, base_w, MID_ROWS, n_row, xs + lds_w, lds_row)
+        if const_expr(shared_fp8):
+            for k in range_constexpr(tokens):
+                mids = mb_poll(
+                    [
+                        (
+                            mr("mid"),
+                            (k * MOE_SLOTS + TOP_K) * INTER
+                            + fx.min(tid * 8 + i * 2, INTER - 2),
+                            2,
+                        )
+                        for i in range(4)
+                    ]
+                )
+                if tid < INTER // 8:
+                    f = [v.bitcast(fx.Float32) for pair in mids for v in pair]
+                    sc, inv = mx8_scale(f, (1, 2))
+                    qv = [mx8_q(v, inv) for v in f]
+                    row = k * MOE_SLOTS + TOP_K
+                    fx.ptr_store(fp8_pack4(*qv[:4]), xs + (row * MID_ROW + tid * 2))
+                    fx.ptr_store(fp8_pack4(*qv[4:]), xs + (row * MID_ROW + tid * 2 + 1))
+                    if tid % 4 == 0:
+                        fx.ptr_store(sc, xs + (W_MIDSC + row * MIDSC_ROW + tid // 4))
         if tid < MID_ROW_WORDS:
             fx.ptr_store(fx.Int32(0), xs + (MID_ROWS * MID_ROW + tid))
         if tid < MIDSC_ROW_WORDS:
             fx.ptr_store(fx.Int32(0), xs + (W_MIDSC + MID_ROWS * MIDSC_ROW + tid))
         gpu.barrier()
         stamp(10)
+        if const_expr(shared_fp8):
+            sh_units = down_load_shared(td, fx.Int32(1))
         for i in range_constexpr(DN_WITERS):
             if const_expr(i == 0):  # the tables are in: the early units' rows
                 inflight = [with_rows(u) for u in inflight]
@@ -478,6 +522,23 @@ def moe_wide_defs(k4ctx):
             # a unit past the last (or a wave's missing second chunk) adds
             # nothing, whatever its MFMA gave
             acc = [acc[e] + ok.select(dcu[e] * dw, fx.Float32(0.0)) for e in range(4)]
+        if const_expr(shared_fp8):
+            col_tok = fx.min(l16, tokens - 1)
+            for wv, sc, kc, wgt in sh_units:
+                cu = mfma_scaled(
+                    a=wv,
+                    sa=sc,
+                    b=lds_b8((col_tok * MOE_SLOTS + TOP_K) * MID_ROW + kc * 32),
+                    sb=lds_i32(
+                        W_MIDSC
+                        + (col_tok * MOE_SLOTS + TOP_K) * MIDSC_ROW
+                        + kc * 4
+                        + g4
+                    ),
+                    c=fx.Vector.filled(4, 0.0, fx.Float32),
+                    a_fmt=FP8,
+                )
+                acc = [acc[e] + cu[e] * wgt for e in range(4)]
         a0, a1, a2, a3 = acc
         fx.ptr_store(
             fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32),

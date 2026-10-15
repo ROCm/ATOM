@@ -57,8 +57,10 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
+    K4_SHARED_FP8_ABI,
     TL_POINTS,
     build_post_attn_kernel,
+    build_post_attn_shared_fp8_kernel,
 )
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     K1_ABI,
@@ -170,11 +172,11 @@ class MonoDecodeRunner:
             kernels["dense_post"] = self._build_dense_post(n)
         return kernels
 
-    @staticmethod
-    def _layer_kernels(kernels: dict) -> list:
+    def _layer_kernels(self, kernels: dict) -> list:
         """A width's layer kernels, each with its ABI."""
         return [
-            (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
+            (launch, _KERNEL_ABI.get(kind, self.k4_abi))
+            for kind, launch in kernels.items()
         ]
 
     def _bind(self, causal_lm, drafter, require_aux: bool) -> None:
@@ -202,6 +204,11 @@ class MonoDecodeRunner:
             SparseMoeLayer.from_layer(layers[i], i, heads)
             for i in range(N_DENSE, len(layers))
         ]
+        shared_modes = {lw.shared_fp8 for lw in self.sparse}
+        if len(shared_modes) != 1:
+            raise MonoUnsupported(f"mixed shared-expert layouts {shared_modes}")
+        self.shared_fp8 = shared_modes.pop()
+        self.k4_abi = K4_SHARED_FP8_ABI if self.shared_fp8 else K4_ABI
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -229,10 +236,13 @@ class MonoDecodeRunner:
         route_scale = float(layers[N_DENSE].block_sparse_moe.routed_scaling_factor)
         # the fused shared expert's routing weight is whatever the topK metadata holds
         # read through the module: the metadata is assigned after this file is imported
-        total_w, total_ids = topk_meta.aiter_topK_meta_data
-        if int(total_ids[0, TOP_K].item()) != N_ROUTED:
-            raise MonoUnsupported("fused shared expert id")
-        shared_weight = float(total_w[0, TOP_K].item())
+        if self.shared_fp8:
+            shared_weight = 1.0
+        else:
+            total_w, total_ids = topk_meta.aiter_topK_meta_data
+            if int(total_ids[0, TOP_K].item()) != N_ROUTED:
+                raise MonoUnsupported("fused shared expert id")
+            shared_weight = float(total_w[0, TOP_K].item())
         self.sm_scale = impl.scale
         if abs(self.sm_scale - HEAD_DIM**-0.5) > 1e-12:
             raise MonoUnsupported(f"softmax scale {self.sm_scale}")
@@ -252,21 +262,37 @@ class MonoDecodeRunner:
             else None
         )
         # the s-token layer kernel is ``self._build_k4(s)`` (``WidthBuilds``)
-        self._build_k4 = functools.partial(
-            build_post_attn_kernel,
-            npes,
-            self.sm_scale,
-            eps,
-            route_scale,
-            shared_weight,
-            experts.swiglu_limit,
-            impl.init_blocks,
-            impl.local_blocks,
-            fuse_k1=True,
-            timeline=self.timeline is not None,
-            heads=heads,
-            debug=self.debug,
-        )
+        if self.shared_fp8:
+            self._build_k4 = functools.partial(
+                build_post_attn_shared_fp8_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
+        else:
+            self._build_k4 = functools.partial(
+                build_post_attn_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                shared_weight,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
         # a dense layer's kernels around its original attention
         if self.dense_mono:
             self._build_dense_pre = functools.partial(
@@ -330,7 +356,21 @@ class MonoDecodeRunner:
                 "scratch": _ptr(self.scratch1),
             }  # fmt: skip
             self.k1_args.append(
-                torch.tensor([ptrs[a] for a in K1_ARGS], dtype=torch.int64, device=dev)
+                torch.tensor(
+                    [ptrs[a] for a in K1_ARGS]
+                    + (
+                        [
+                            _ptr(lw.shared_w13),
+                            _ptr(lw.shared_s13),
+                            _ptr(lw.shared_w2),
+                            _ptr(lw.shared_s2),
+                        ]
+                        if self.shared_fp8
+                        else []
+                    ),
+                    dtype=torch.int64,
+                    device=dev,
+                )
             )
 
     def prepare(self, n: int) -> bool:
@@ -499,7 +539,7 @@ class MonoDecodeRunner:
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
         }  # fmt: skip
-        self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
+        self.k4[n][lw.index_topk](*self.k4_abi.pack(args), stream=stream)
         return self.h_mids[(i + 1) % 2][:n]
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:

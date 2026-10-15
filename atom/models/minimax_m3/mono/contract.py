@@ -17,7 +17,12 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
     DENSE_POST_ABI,
     build_dense_post_kernel,
 )
-from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI, build_post_attn_kernel
+from atom.models.minimax_m3.mono.kernels.post_attn import (
+    K4_ABI,
+    K4_SHARED_FP8_ABI,
+    build_post_attn_kernel,
+    build_post_attn_shared_fp8_kernel,
+)
 from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
 from atom.mono.runtime.compile import check_traced
 
@@ -37,6 +42,32 @@ def build_layer(
 def build_dense(tokens: int):
     """The dense layer kernel (dense_post) for ``tokens``."""
     return build_dense_post_kernel(TP, 1e-6, 1.702, 1.0, 7.0, tokens)
+
+
+def build_shared_fp8_layer(tokens: int, index_heads: int, index_topk: bool = True):
+    """The M3.1 independent-MXFP8-shared layer kernel."""
+    return build_post_attn_shared_fp8_kernel(
+        TP,
+        0.088,
+        1e-6,
+        1.0,
+        7.0,
+        1,
+        1,
+        tokens,
+        heads=IndexHeads(index_heads, 0),
+        index_topk=index_topk,
+    )
+
+
+def check_shared_fp8_build(
+    tokens: int, index_heads: int, index_topk: bool = True
+) -> None:
+    check_traced(
+        build_shared_fp8_layer(tokens, index_heads, index_topk),
+        K4_SHARED_FP8_ABI,
+        mailbox_regions(tokens, index_heads, True, index_topk, shared_fp8=True),
+    )
 
 
 def check_build(

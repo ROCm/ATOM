@@ -18,7 +18,10 @@ pytest.importorskip("flydsl")
 from atom.models.minimax_m3.mono import contract
 from atom.models.minimax_m3.mono.config import TP
 from atom.models.minimax_m3.mono.kernels.dense_post import DENSE_POST_ABI
-from atom.models.minimax_m3.mono.kernels.post_attn import K4_ABI
+from atom.models.minimax_m3.mono.kernels.post_attn import (
+    K4_ABI,
+    K4_SHARED_FP8_ABI,
+)
 from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
 from atom.mono.plan.check import ContractError, check
 from atom.mono.runtime.compile import trace
@@ -34,6 +37,10 @@ def traces():
         patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
         return {
             "layer": trace(contract.build_layer(TOKENS, INDEX_HEADS), K4_ABI),
+            "shared_fp8": trace(
+                contract.build_shared_fp8_layer(TOKENS, INDEX_HEADS),
+                K4_SHARED_FP8_ABI,
+            ),
             "dense": trace(contract.build_dense(TOKENS), DENSE_POST_ABI),
         }
 
@@ -44,6 +51,13 @@ def test_the_layer_kernel_holds(traces):
 
 def test_the_dense_layer_kernel_holds(traces):
     check(traces["dense"], dense_mailbox_regions(TOKENS))
+
+
+def test_the_shared_fp8_layer_kernel_holds(traces):
+    check(
+        traces["shared_fp8"],
+        mailbox_regions(TOKENS, INDEX_HEADS, True, True, shared_fp8=True),
+    )
 
 
 def test_a_wrong_declaration_is_caught(traces):
