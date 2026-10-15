@@ -670,6 +670,9 @@ models:
               TOPK_FORCE_PATH: "one"
             prefill: &glm52_agentic_dcp8_env_prefill
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              # Sparse prefill builds the DCP group's query heads locally (#2437)
+              # instead of all-gathering them.
+              ATOM_DCP_PREFILL_QREP: "1"
               LMCACHE_LOCAL_CPU: "True"
               LMCACHE_NUMA_MODE: "auto"
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
@@ -703,6 +706,7 @@ models:
             prefill:
               <<: *glm52_agentic_dcp8_env_prefill
               VLLM_PP_LAYER_PARTITION: "10,10,10,10,10,10,10,8"
+              ATOM_DCP_PREFILL_QREP: "0"
             decode: *glm52_agentic_dcp8_env_decode
 
       # Manual accuracy suite: the two deployments above, GSM8K only and without
