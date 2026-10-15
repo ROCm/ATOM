@@ -6,11 +6,10 @@
 import array
 import pickle
 import random
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
+from aiter_stub import stubbed_aiter
 from conftest import MockConfig
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
 from test_state_checkpoint import (
@@ -338,11 +337,8 @@ def test_a_bad_chain_is_rehashed_with_the_same_hit(corrupt):
 
 
 def _processor(**config):
-    if "atom.model_engine.engine_core_mgr" not in sys.modules:
-        stub = types.ModuleType("atom.model_engine.engine_core_mgr")
-        stub.CoreManager = stub.DisaggCoreManager = object
-        sys.modules["atom.model_engine.engine_core_mgr"] = stub
-    from atom.model_engine.llm_engine import InputOutputProcessor
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import InputOutputProcessor
 
     cfg = SimpleNamespace(
         hf_config=SimpleNamespace(model_type="qwen3_5_moe_text"),
