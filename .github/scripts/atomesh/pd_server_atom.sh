@@ -350,6 +350,35 @@ apply_prefixed_env() {
   done < <(env)
 }
 
+# The deterministic replay modifies only this job's mounted checkout. Keep the
+# patch and per-role diagnostics in uploaded artifacts; no production patch is
+# committed by this experiment. Enable before either service imports the code.
+if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
+  if [[ "${BENCHMARK_KIND}" != "minimax_full_model_replay" || "${ATOMESH_ATOM_SOURCE}" != "mounted" || "${SINGLE_NODE_PD}" != "1" ]]; then
+    echo "ERROR: gated replay requires its dedicated kind and a mounted single-node P/D service" >&2
+    exit 2
+  fi
+  ATOMESH_M3_REPLAY_DIR="${RUN_DIR}/benchmark_results/stalled-lengths-replay/diagnostics"
+  ATOMESH_M3_REPLAY_PIPE_DIR="$(mktemp -d /tmp/atomesh-m3-replay.XXXXXX)"
+  mkdir -p "${ATOMESH_M3_REPLAY_DIR}"/{prefill,decode} "${ATOMESH_M3_REPLAY_PIPE_DIR}"/{prefill,decode}
+  python3 "${ATOMESH_SCRIPT_DIR}/prepare_minimax_replay_debug.py" \
+    --root "${PWD}" --output "${ATOMESH_M3_REPLAY_DIR}"
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_ROLE=prefill
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_ROLE=decode
+  export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_GATE=1
+  export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_GATE=0
+  for replay_role in PREFILL DECODE; do
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_TRACE_BUFFER_SIZE=8192"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DUMP_ON_TIMEOUT=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_TRACE_CPP_STACK=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_ENABLE_TIMING=1"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${ATOMESH_M3_REPLAY_DIR}/${replay_role,,}/nccl-trace-"
+    export "ATOMESH_${replay_role}_ENV_TORCH_NCCL_DEBUG_INFO_PIPE_FILE=${ATOMESH_M3_REPLAY_PIPE_DIR}/${replay_role,,}/nccl-pipe-"
+  done
+fi
+
 # Names the last apply_role_env() exported for a role.
 ROLE_ENV_NAMES=()
 
@@ -2049,11 +2078,16 @@ start_router() {
 
 run_benchmark() {
   if [[ "${BENCHMARK_KIND}" == "minimax_full_model_replay" ]]; then
+    local -a replay_args=()
+    if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
+      replay_args=(--gate-dir "${ATOMESH_M3_REPLAY_DIR}" --nccl-pipe-dir "${ATOMESH_M3_REPLAY_PIPE_DIR}" --target-timeout 75)
+    fi
     python3 -u "${ATOMESH_SCRIPT_DIR}/minimax_full_model_replay.py" \
       --model "${MODEL_PATH}" \
       --base-url "http://127.0.0.1:${ROUTER_PORT}" \
       --output-dir "${RUN_DIR}/benchmark_results/stalled-lengths-replay" \
-      --prefill-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log"
+      --prefill-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log" \
+      "${replay_args[@]}"
     return
   fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then

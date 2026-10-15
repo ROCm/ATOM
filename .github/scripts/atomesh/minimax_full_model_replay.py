@@ -9,8 +9,10 @@ import gzip
 import hashlib
 import http.client
 import json
+import os
 import random
 import re
+import stat
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -215,6 +217,40 @@ def extract_batches(log_path):
     return batches
 
 
+def write_control(path, payload):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
+def trigger_dumps(directory, stop, record):
+    # Give a stalled batch 30 seconds, then request Flight Recorder dumps while
+    # native faulthandler independently captures all Python thread stacks.
+    if stop.wait(30):
+        return
+    outcomes = []
+    for path in directory.rglob("nccl-pipe-*"):
+        try:
+            if not stat.S_ISFIFO(path.stat().st_mode):
+                continue
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"1")
+            finally:
+                os.close(fd)
+            outcomes.append({"pipe": str(path), "status": "requested"})
+        except OSError as exc:
+            outcomes.append({"pipe": str(path), "status": "failed", "error": str(exc)})
+    record(
+        {
+            "phase": "diagnostics",
+            "status": "dump_requested",
+            "pipes": outcomes,
+            "note": "An empty pipe list means this PyTorch build did not expose the configured FIFO.",
+        }
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
@@ -222,9 +258,14 @@ def main():
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--prefill-log", required=True, type=Path)
     parser.add_argument("--request-timeout", type=float, default=660)
+    parser.add_argument("--gate-dir", type=Path)
+    parser.add_argument("--nccl-pipe-dir", type=Path)
+    parser.add_argument("--target-timeout", type=float, default=75)
     args = parser.parse_args()
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
+    if args.gate_dir is not None:
+        args.gate_dir.mkdir(parents=True, exist_ok=True)
     # CPU tokenizer only. No model or GPU operation is run by this client.
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
@@ -256,7 +297,8 @@ def main():
         "source_line": 3329,
         "original_batch_total_kv": 1350868,
         "original_inputs_recovered": False,
-        "note": "Eight fresh primers replace original history. HTTP order and batch packing are not guaranteed.",
+        "note": "Eight fresh primers replace original history; the optional CI gate orders target admission and validates the first batch.",
+        "gated": args.gate_dir is not None,
         "requests": [],
     }
     prepared = []
@@ -321,7 +363,9 @@ def main():
             args.base_url,
             item["warm_body" if is_warm else "full_body"],
             len(item["warm_ids" if is_warm else "ids"]),
-            args.request_timeout,
+            args.target_timeout
+            if args.gate_dir is not None and not is_warm
+            else args.request_timeout,
             output / f"{phase}-{original_id}.response.sse",
             barrier,
         )
@@ -329,11 +373,34 @@ def main():
         return result["status"] == "completed"
 
     ok = False
+    dump_stop = threading.Event()
+    dump_thread = None
     try:
         # Sequential primers avoid target batch pressure while building caches.
         for item in prepared:
             if not run_one(item, "warm"):
                 return 1
+        if args.gate_dir is not None:
+            args.gate_dir.mkdir(parents=True, exist_ok=True)
+            if (args.gate_dir / "armed.json").exists() or (
+                args.gate_dir / "client-done.json"
+            ).exists():
+                raise RuntimeError("Refusing to reuse a stale replay gate directory")
+            write_control(
+                args.gate_dir / "armed.json",
+                {
+                    "lengths": [target[1] for target in TARGETS],
+                    "done": [target[2] for target in TARGETS],
+                    "new": [target[3] for target in TARGETS],
+                },
+            )
+            record({"phase": "gate", "status": "armed"})
+            dump_thread = threading.Thread(
+                target=trigger_dumps,
+                args=(args.nccl_pipe_dir or args.gate_dir, dump_stop, record),
+                daemon=True,
+            )
+            dump_thread.start()
         barrier = threading.Barrier(len(prepared))
         with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
             futures = [
@@ -341,8 +408,26 @@ def main():
             ]
             outcomes = [future.result() for future in futures]
             ok = all(outcomes)
+        if args.gate_dir is not None:
+            gate_file = args.gate_dir / "gate-batch.json"
+            matched = (
+                gate_file.exists()
+                and json.loads(gate_file.read_text()).get("matched") is True
+            )
+            ok = ok and matched
+            record({"phase": "gate", "status": "verified" if matched else "failed"})
         return 0 if ok else 1
     finally:
+        dump_stop.set()
+        if dump_thread is not None:
+            dump_thread.join(timeout=2)
+        if args.gate_dir is not None:
+            write_control(
+                args.gate_dir / "client-done.json",
+                {"requests_completed": ok, "unix_time": time.time()},
+            )
+            # Let each process query its final GPU markers before service cleanup.
+            time.sleep(2)
         batches = extract_batches(args.prefill_log) if args.prefill_log.exists() else []
         desired_done = [target[2] for target in TARGETS]
         desired_new = [target[3] for target in TARGETS]

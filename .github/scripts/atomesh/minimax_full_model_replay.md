@@ -74,3 +74,56 @@ A green job means these 16 requests completed without reproducing the hang;
 it does not prove the original C32 issue is fixed. A red job must be classified
 from the first error and actual batch shapes. A timeout alone does not establish
 the same NCCL/offload failure.
+
+## Deterministic admission and stage diagnostics
+
+The follow-up case is
+`minimax-m3-fp4-1p1d-tp4-eagle3-stalled-lengths-gated-replay`.
+Use the same dispatch command above with this case name. It retains the same
+model configuration and 20-minute allocation limit. The original case remains
+available as the control.
+
+After all eight primers return, the client atomically creates `armed.json`.
+The prefill EngineCore continues receiving requests and draining idle connector
+work, but holds target scheduling until all eight distinct prompt lengths are
+present. It then orders them as 68,65,69,70,73,71,72,74 and calls the normal
+scheduler. Before dispatching any target GPU work it verifies request IDs,
+`done`, and `new` against the original batch. The gate releases only once.
+Unexpected requests, a 30-second admission timeout, or a shape mismatch fail the
+case; `gate-batch.json` records the observed shape. No dummy GPU barrier is added.
+
+`prepare_minimax_replay_debug.py` applies exact-anchor hooks to **this CI job's
+mounted checkout only**, after validating all source anchors and Python syntax.
+The committed `atom/` sources are unchanged. Artifacts include the runtime diff,
+before/after source hashes, and the copied debug module. This is diagnostic code,
+not a production bugfix. Startup and primer execution pass through the hooks
+without enabling diagnostic GPU events.
+
+Once armed, both service roles record per-process JSONL with rank, PID, thread,
+request IDs and stage. Hooks cover model input preparation, target forward,
+draft context KV, sampling/postprocess, sampled-token broadcast, draft propose,
+result copy and previous-result wait, offload producer wait/store, and staging
+allocation/pack/copy/final wait. They sit outside compiled model operator bodies.
+CPU arrival is persisted before HIP/allocator calls. Independent GPU events are
+recorded on the relevant stream and queried by a background thread, without any
+new synchronize/wait dependency. Allocator allocated/reserved bytes, retry and
+OOM counters are sampled at model-stage boundaries. This instrumentation can
+still perturb timing, so a successful diagnostic run is not proof of absence.
+
+The client requests Flight Recorder dumps after 30 seconds without completion
+of the target group. Native faulthandler independently dumps all Python thread
+stacks every 35 seconds while the target phase is active, including when an
+event-query thread itself blocks. A 75-second target-request timeout leaves time
+for diagnostics; primers retain their original timeout. Slurm's 20-minute limit
+still overrides all of these. Source-stage tracebacks and Python stacks do not
+replace GPU kernel traces or native C++ thread stacks.
+
+Flight Recorder uses a buffer of 8192 entries, C++ stack capture and timing.
+Trigger FIFOs live in a fresh container-local `/tmp` directory (not NFS or the
+artifact tree); dumps go into `diagnostics/prefill/` and `diagnostics/decode/`.
+If the installed PyTorch build does not expose the configured FIFO, the client
+records an empty pipe list instead of claiming a successful dump. Normal run
+completion writes `client-done.json`, stops the diagnostic watchdogs and permits
+normal service cleanup. CPU unit tests cover gate ordering, premature release,
+shape mismatches, bounded admission, atomic patch failure, event record/query,
+and FIFO triggering; actual model execution remains CI-only.
