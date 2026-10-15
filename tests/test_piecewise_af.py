@@ -53,9 +53,11 @@ class _State:
 def test_failed_or_skipped_capture_does_not_keep_state():
     runner = PiecewiseAFRunner()
     sources = {"x": torch.ones(4), "offsets": torch.ones(4)}
-    with pytest.raises(RuntimeError, match="failed"):
-        with runner.bind_capture((), sources, _State):
-            raise RuntimeError("failed")
+    with (
+        pytest.raises(RuntimeError, match="failed"),
+        runner.bind_capture((), sources, _State),
+    ):
+        raise RuntimeError("failed")
     with runner.bind_capture((), sources, _State):
         pass  # The decorated core can decline capture, too.
     assert not runner._captures and not runner._graphs

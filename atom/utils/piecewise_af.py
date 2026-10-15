@@ -128,13 +128,13 @@ class PiecewiseAFRunner(CudagraphCaptureRunner):
         state = make_state(inputs) if first_call else self._captures[key]
         yield CaptureBinding(
             inputs,
-            dict(
-                capture=True,
-                capture_key=key,
-                prepare=state.bind,
-                runner=self,
-                outputs=self.outputs,
-            ),
+            {
+                "capture": True,
+                "capture_key": key,
+                "prepare": state.bind,
+                "runner": self,
+                "outputs": self.outputs,
+            },
             state,
             first_call,
         )
