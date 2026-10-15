@@ -805,8 +805,11 @@ models:
               # disjoint from the stages' own NICs (their GPUs' rdma0-3) and
               # from each other. Resize by overriding
               # ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS, at most 832 GiB per
-              # owner (an ionic NIC's registration limit).
-              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              # owner (an ionic NIC's registration limit). 720 GiB is all of the
+              # HugeTLB pool the Spur prolog reserves per NUMA node (368640
+              # pages), which the owners take.
+              MOONCAKE_STORE_OWNERS: "0:720:rdma4,rdma5;1:720:rdma6,rdma7"
+              MOONCAKE_STORE_HUGETLB: "1"
               # The clean page cache of every model on the node goes before the
               # owners pin huge pages, not just this one's: compaction would
               # reclaim it otherwise.
