@@ -95,3 +95,65 @@ def test_real_device_agrees_with_aiter(monkeypatch):
     budget = cus * pa_decode_gluon.get_occupancy()
     expected = max(1, budget // pa_decode_gluon.get_recommended_splits(1, 1))
     assert sparse_attn._gluon_one_pass_max_rows(0) == expected
+
+
+def test_gfx1250_sparse_fallback_uses_unified_attention(monkeypatch):
+    import importlib
+
+    seen = {}
+
+    def fake_unified(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+    module = importlib.import_module("aiter.ops.triton.unified_attention")
+    monkeypatch.setattr(module, "unified_attention", fake_unified)
+
+    q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
+    k_cache = torch.empty((32, 1, 16, 16, 8), dtype=torch.bfloat16, device="meta")
+    v_cache = torch.empty((32, 1, 2, 128, 8), dtype=torch.bfloat16, device="meta")
+    sparse_bt = torch.empty((4, 128), dtype=torch.int32, device="meta")
+    sparse_ctx = torch.empty((4,), dtype=torch.int32, device="meta")
+    output = torch.empty_like(q)
+    scale = torch.ones((1,), dtype=torch.float32, device="meta")
+
+    sparse_attn._sparse_unified_per_row(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        128**-0.5,
+        output,
+        scale,
+        scale,
+    )
+
+    kwargs = seen["kwargs"]
+    assert kwargs["cu_seqlens_q"].shape == (5,)
+    assert kwargs["seqused_k"] is sparse_ctx
+    assert kwargs["block_table"] is sparse_bt
+    assert kwargs["max_seqlen_q"] == 1
+    assert kwargs["max_seqlen_k"] == 2048
+    assert kwargs["shuffled_kv_cache"] is True
+
+
+def test_gfx1250_sparse_fallback_rejects_per_token_fp8_scales():
+    q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
+    k_cache = torch.empty((32, 1, 16, 16, 8), dtype=torch.bfloat16, device="meta")
+    v_cache = torch.empty((32, 1, 2, 128, 8), dtype=torch.bfloat16, device="meta")
+    sparse_bt = torch.empty((4, 128), dtype=torch.int32, device="meta")
+    sparse_ctx = torch.empty((4,), dtype=torch.int32, device="meta")
+
+    with pytest.raises(NotImplementedError, match="per-token fp8 KV scales"):
+        sparse_attn._sparse_unified_per_row(
+            q,
+            k_cache,
+            v_cache,
+            sparse_bt,
+            sparse_ctx,
+            128**-0.5,
+            torch.empty_like(q),
+            torch.empty((32, 16), dtype=torch.float32, device="meta"),
+            torch.empty((32, 16), dtype=torch.float32, device="meta"),
+        )
