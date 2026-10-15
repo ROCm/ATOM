@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "purpose": "User-authorized pre-service cleanup of this C48 task only; verify current scheduler inactivity before removing each container",
+  "targets": [
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v0-vllm",
+      "slurm_job_id": "8068",
+      "terminal_state": "FAILED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38397016530"
+    },
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-s1-vllm",
+      "slurm_job_id": "8154",
+      "terminal_state": "FAILED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38397016530"
+    },
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-q-vllm",
+      "slurm_job_id": "8284",
+      "terminal_state": "FAILED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38542448475"
+    },
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-q-vllm",
+      "slurm_job_id": "8439",
+      "terminal_state": "CANCELLED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38672221569"
+    },
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-q-safe-vllm",
+      "slurm_job_id": "8505",
+      "terminal_state": "CANCELLED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38708150753"
+    },
+    {
+      "cell_id": "kimi-k3-c48-gap-kimi-k3-vllm-c48-gap-v-q-vllm",
+      "slurm_job_id": "8484",
+      "terminal_state": "CANCELLED",
+      "run_url": "https://github.com/ROCm/ATOM/actions/runs/38708150753"
+    }
+  ]
+}

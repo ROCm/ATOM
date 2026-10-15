@@ -1701,7 +1701,7 @@ models:
         env:
           common:
             ATOMESH_C48_CASE: V-Q
-            ATOMESH_PRE_CLEAN_GPU: '0'
+            ATOMESH_PRE_CLEAN_GPU: '1'
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
           prefill:
             VLLM_ROCM_USE_AITER: '1'

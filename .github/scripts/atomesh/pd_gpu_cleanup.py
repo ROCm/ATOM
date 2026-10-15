@@ -71,13 +71,44 @@ def command(args, timeout=10):
 class Cleanup:
     def __init__(self, args):
         self.args = args
+        self.targets = None
+        if args.targets:
+            manifest = json.loads(args.targets.read_text())
+            if manifest.get("schema_version") != 1:
+                raise ValueError("Unsupported cleanup target manifest")
+            self.targets = {}
+            terminal = {
+                "COMPLETED",
+                "FAILED",
+                "CANCELLED",
+                "TIMEOUT",
+                "NODE_FAIL",
+                "OUT_OF_MEMORY",
+            }
+            for target in manifest["targets"]:
+                cell, job = target["cell_id"], target["slurm_job_id"]
+                if (
+                    not re.fullmatch(r"[a-zA-Z0-9_.-]+", cell)
+                    or not re.fullmatch(r"[0-9]+", job)
+                    or target["terminal_state"] not in terminal
+                    or job == args.job_id
+                ):
+                    raise ValueError(
+                        "Cleanup targets must identify archived terminal jobs"
+                    )
+                self.targets[(cell, job)] = target
+            if not self.targets:
+                raise ValueError("Explicit cleanup target manifest is empty")
         self.report = {
             "job_id": args.job_id,
             "run_token": args.run_token,
             "node": args.node,
             "rank": args.rank,
             "cell_id": args.cell_id,
-            "required_free_ratio": 0.88,
+            "required_free_ratio": args.required_free_ratio,
+            "targets": (
+                list(self.targets.values()) if self.targets is not None else None
+            ),
             "docker_host": "unix:///var/run/docker.sock",
             "events": [],
             "passed": False,
@@ -113,11 +144,20 @@ class Cleanup:
         return set(rows)
 
     def stop_containers(self):
-        pattern = re.compile(
-            rf"atomesh-{re.escape(self.args.cell_id)}-([0-9]+)-[0-9]+"
-            r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
-        )
+        suffix = r"(?:-benchmark|-eval|-router|-benchmark-router|-eval-router)?"
+        if self.targets is None:
+            patterns = [
+                re.compile(
+                    rf"atomesh-{re.escape(self.args.cell_id)}-([0-9]+)-[0-9]+" + suffix
+                )
+            ]
+        else:
+            patterns = [
+                re.compile(rf"atomesh-{re.escape(cell)}-({job})-[0-9]+" + suffix)
+                for cell, job in self.targets
+            ]
         user = f"{os.getuid()}:{os.getgid()}"
+        self.active_jobs()  # Validate the current allocation before any cleanup.
         for cid in command(
             ["docker", "ps", "-a", "--no-trunc", "--format", "{{.ID}}"]
         ).split():
@@ -143,8 +183,14 @@ class Cleanup:
                 if cid not in active:
                     continue
                 raise
-            match = pattern.fullmatch(name.removeprefix("/"))
-            if match is None or owner != user:
+            matches = [
+                pattern.fullmatch(name.removeprefix("/")) for pattern in patterns
+            ]
+            match = next((match for match in matches if match is not None), None)
+            if match is None:
+                continue
+            if owner != user:
+                self.event("skip_different_owner", container=cid, name=name, user=owner)
                 continue
             old_job = match[1]
             if old_job in self.active_jobs():
@@ -184,7 +230,8 @@ class Cleanup:
         while True:
             current = self.snapshot("check")
             if not current["processes"] and all(
-                p["free"] >= 0.88 * p["total"] for p in current["memory"]
+                p["free"] >= args.required_free_ratio * p["total"]
+                for p in current["memory"]
             ):
                 self.report["passed"] = True
                 self.event("complete")
@@ -204,6 +251,12 @@ def main():
     parser.add_argument("--rank", type=int)
     parser.add_argument("--cell-id")
     parser.add_argument("--out", type=Path)
+    parser.add_argument(
+        "--targets",
+        type=Path,
+        help="Optional exact cell/job allowlist from terminal archives",
+    )
+    parser.add_argument("--required-free-ratio", type=float, default=0.88)
     args = parser.parse_args()
     if None in (
         args.job_id,
@@ -214,6 +267,8 @@ def main():
         args.out,
     ):
         parser.error("cleanup requires allocation, node, rank, token and output path")
+    if not 0 < args.required_free_ratio < 1:
+        parser.error("required-free-ratio must be between zero and one")
     cleanup = Cleanup(args)
     try:
         cleanup.run()
