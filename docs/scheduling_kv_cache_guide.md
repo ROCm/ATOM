@@ -442,9 +442,11 @@ size, seed, length and prompt-token fingerprint match and three of its links
 rehash equal here, or else hashes the engine computed, up to a little past the
 first miss. `hash_blocks` publishes prompt blocks under the chain's hashes and
 hashes only the blocks it does not cover (the rest of a cold prompt with no
-shipped chain, and completion tokens, which never enter the chain). So each
-prompt block is hashed at most once on the scheduler thread, and not at all
-when the shipped chain is adopted. The evaluation applies the SWA and state
+shipped chain, and completion tokens, which never enter the chain). So a
+prefill hashes each prompt block at most once on the scheduler thread, and none
+when the shipped chain is adopted (`publish_loaded_prefix`,
+`register_received_prefix` and `acquire_offload_prefix` still hash the blocks
+they handle). The evaluation applies the SWA and state
 gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
 already in use, and the fit. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.
