@@ -9,10 +9,9 @@ from typing import Any, NamedTuple
 from unittest.mock import patch
 
 import torch
-from aiter import logger
 
 from atom.config import Config, CUDAGraphMode
-from atom.utils import compilation_counter, weak_ref_tensors
+from atom.utils import compilation_counter, logger, weak_ref_tensors
 from atom.utils.forward_context import get_forward_context
 from atom.utils.graph_holders import register_graph_holder
 
