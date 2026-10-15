@@ -386,7 +386,7 @@ host_name="$(hostname)"
 apply_prefixed_env "ATOMESH_ENV_" "${host_ip}"
 
 # GPU timing is opt-in; agentic reports need it on both service roles.
-if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" || "${BENCHMARK_KIND}" == "minimax_full_model_replay" ]]; then
   export ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_PREFILL_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
   export ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER="${ATOMESH_DECODE_ENV_ATOM_ENABLE_METRICS_DEVICE_TIMER:-${ATOM_ENABLE_METRICS_DEVICE_TIMER:-1}}"
 fi
@@ -2048,6 +2048,14 @@ start_router() {
 }
 
 run_benchmark() {
+  if [[ "${BENCHMARK_KIND}" == "minimax_full_model_replay" ]]; then
+    python3 -u "${ATOMESH_SCRIPT_DIR}/minimax_full_model_replay.py" \
+      --model "${MODEL_PATH}" \
+      --base-url "http://127.0.0.1:${ROUTER_PORT}" \
+      --output-dir "${RUN_DIR}/benchmark_results/stalled-lengths-replay" \
+      --prefill-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log"
+    return
+  fi
   if [[ "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
     run_aiperf_agentic_benchmark
     return
