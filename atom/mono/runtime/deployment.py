@@ -4,6 +4,7 @@
 shares (one TP group on one node, decode steps in the model's own graph), which
 a model's own list extends."""
 
+from atom.config import CompilationLevel
 from atom.mono.plan.shard import shard_refusal
 from atom.plugin.prepare import is_sglang, is_vllm
 
@@ -52,6 +53,23 @@ def common_refusals(
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
+        # `model_runner.py` wraps the model -- and the drafter, which K3 mono
+        # needs -- in `torch.compile(fullgraph=True)` at this level and only
+        # this level (levels 2 and 3 go through the decorator instead, and
+        # `fullgraph` appears nowhere else). Under `fullgraph` a graph break
+        # raises, and every mono path calls `Tensor.data_ptr()` -- GLM's
+        # contract checks and buffer aliasing, K3's kernel argument packing.
+        # Unconditional, not folded into the piecewise check below: that one
+        # is opt-out for GLM-5.2, while this applies to every mono model.
+        # Read like `_requires_piecewise_compilation`: an absent
+        # `compilation_config` is a real production state (SGLang builds one
+        # without it), and it means no `torch.compile` wrapper at all, so
+        # absent reads as "not this level" rather than as a refusal.
+        (
+            getattr(getattr(atom_config, "compilation_config", None), "level", None)
+            != CompilationLevel.DYNAMO_AS_IS,
+            "DYNAMO_AS_IS compilation (fullgraph breaks on data_ptr)",
+        ),
     ]
     if piecewise_cudagraph_required:
         checks.append(

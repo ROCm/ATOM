@@ -72,10 +72,37 @@ def test_supported_deployment_has_no_refusal(native):
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
             "piecewise",
         ),
+        # `model_runner` wraps the model and the drafter in
+        # `torch.compile(fullgraph=True)` at this level only, and mono calls
+        # `Tensor.data_ptr()`, which graph-breaks -- a break under `fullgraph`
+        # raises instead of falling back, so this has to refuse rather than
+        # crash a qualified deployment mid-request.
+        (
+            {
+                "compilation_config": SimpleNamespace(
+                    level=1, cudagraph_mode=_Mode(False)
+                )
+            },
+            "DYNAMO_AS_IS",
+        ),
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):
     assert reason in dispatch._config_refusal(_atom_config(**overrides))
+
+
+@pytest.mark.parametrize("level", [0, 2, 3])
+def test_other_compilation_levels_are_not_refused(native, level):
+    """Only level 1 wraps in `fullgraph`; 2 and 3 go through the decorator.
+
+    Pinning the complement matters more than the refusal: copying copilot's
+    boundary without checking it would have refused every non-zero level and
+    turned mono off for the served `--level 3` launch.
+    """
+    cfg = _atom_config(
+        compilation_config=SimpleNamespace(level=level, cudagraph_mode=_Mode(False))
+    )
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_the_model_s_full_context_is_served(native):
