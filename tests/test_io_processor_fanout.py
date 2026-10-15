@@ -6,7 +6,7 @@
 These tests bypass ``__init__`` because the real processor needs a full
 engine config, a loaded tokenizer, and mamba-detection helpers. We only
 need to exercise ``preprocess_fanout`` / ``preprocess`` here — both of
-those touch just ``self.tokenizer.encode``, ``self.block_size``, and a
+those touch just ``self.tokenizer.encode`` and a
 handful of instance attributes, which we wire up by hand.
 """
 
@@ -34,7 +34,16 @@ if "atom.model_engine.engine_core_mgr" not in sys.modules:
     _stub.DisaggCoreManager = _StubCoreManager
     sys.modules["atom.model_engine.engine_core_mgr"] = _stub
 
+from types import SimpleNamespace
+
 from atom.model_engine.llm_engine import InputOutputProcessor
+from atom.model_engine.protocol.codec import (
+    AdmissionContext,
+    build_sequence,
+    decode_client_message,
+    encode_submit,
+)
+from atom.model_engine.protocol.requests import IngressRequest
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -54,16 +63,15 @@ def _make_processor() -> InputOutputProcessor:
     proc.tokenizer = tokenizer
     proc.block_size = 4
     proc.requests = {}
-    proc.has_per_req_cache = False
     proc.num_speculative_tokens = 0
     return proc
 
 
 class TestPreprocessSingle:
-    def test_returns_single_sequence(self):
+    def test_returns_single_request(self):
         proc = _make_processor()
         seq = proc.preprocess("hello", SamplingParams(n=1))
-        assert isinstance(seq, Sequence)
+        assert isinstance(seq, IngressRequest)
         assert seq.needs_independent_noise is False
         assert seq.sibling_index == 0
         assert seq.parent_request_id is None
@@ -105,10 +113,20 @@ class TestPreprocessFanout:
 
     def test_fanout_shares_prompt_tokens(self):
         proc = _make_processor()
-        seqs = proc.preprocess_fanout("hello", SamplingParams(n=2, temperature=0.8))
+        reqs = proc.preprocess_fanout("hello", SamplingParams(n=2, temperature=0.8))
+        # One tokenization, one array, sent once.
+        assert reqs[0].prompt_token_ids is reqs[1].prompt_token_ids
+        # The engine builds each sibling's Sequence with its own copy, so a
+        # token appended to one does not leak to the other.
+        config = SimpleNamespace(
+            kv_cache_block_size=4,
+            speculative_config=None,
+            hf_config=SimpleNamespace(model_type="llama"),
+        )
+        _, specs, _ = decode_client_message(encode_submit(reqs))
+        context = AdmissionContext(config)
+        seqs = [build_sequence(spec, context) for spec in specs]
         assert seqs[0].token_ids == seqs[1].token_ids
-        # Mutations on one sibling must not leak to the others (Sequence
-        # copies the input token list internally).
         seqs[0].append_token(999)
         assert seqs[1].token_ids != seqs[0].token_ids
 

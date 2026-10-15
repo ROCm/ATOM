@@ -294,7 +294,7 @@ class AtomEngineService:
             seqs = [self._preprocess_single_stream_request(request)]
         with self._stream_seqs_lock:
             # Checked again: the close may have arrived while this was
-            # preprocessing. Sequences built and never added to the engine
+            # preprocessing. Requests built and never added to the engine
             # cost nothing to drop -- there is no abort to do.
             if request.request_id in self._abandoned:
                 self._abandoned.discard(request.request_id)
