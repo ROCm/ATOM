@@ -5,11 +5,11 @@ on two 8×MI355X nodes. This recipe uses DSpark3, ReplaySSM, native prefix
 caching, and LMCache CPU offload on the prefill node for the SemiAnalysis/Weka
 AgentX workload.
 
-The prefill CPU pool is **256 GiB per TP rank**, shared by paged KV and KDA
+The prefill CPU pool remains **224 GiB per TP rank**, shared by paged KV and KDA
 state. `OFFLOAD_STATE_CPU_SIZE=128` caps retained state at **128 GiB per rank**;
-when state reaches that cap, approximately 128 GiB of the pool remains for KV.
+when state reaches that cap, approximately 96 GiB of the pool remains for KV.
 This is a shared allocator, not two separately reserved pools. Plan for
-**2 TiB of CPU cache capacity across the eight prefill ranks**, plus process
+**1.75 TiB of CPU cache capacity across the eight prefill ranks**, plus process
 and model-loading memory.
 
 `ATOM_STATE_CHECKPOINT_DEMAND=1` enables checkpoints at observed shared-prefix
@@ -30,7 +30,7 @@ The matching cases are in
 | 88 | `dspark3-agentic-lmcache-1m-c88` | 176 | 1…704 | 1 |
 
 Every case has the prefix `kimi-k3-mxfp4-1p1d-tp8-dcp8-` and uses the same
-128 GiB state cap, 256 GiB shared CPU pool, and on-demand setting. The
+128 GiB state cap, 224 GiB shared CPU pool, and on-demand setting. The
 commands below default to C72. Start fresh servers for each concurrency.
 These are configuration recommendations; performance at the 128 GiB state
 cap must be measured with the corresponding CI run.
@@ -109,7 +109,7 @@ KV/state locally through LMCache. The CPU size settings apply only here.
 
 ```bash
 export LMCACHE_LOCAL_CPU=True
-export LMCACHE_MAX_LOCAL_CPU_SIZE=256
+export LMCACHE_MAX_LOCAL_CPU_SIZE=224
 export OFFLOAD_STATE_CPU_SIZE=128
 export LMCACHE_CHUNK_SIZE=1024
 export LMCACHE_NUMA_MODE=auto

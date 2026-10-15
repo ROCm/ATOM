@@ -1047,8 +1047,8 @@ models:
           env: *kimi_k3_agentic_lmcache192_env
 
         # High-concurrency DSpark3 PD recipe: recipes/mesh/Agentic-Kimi-K3.md.
-        # State and paged KV share the CPU allocator. A 256 GiB per-rank pool
-        # leaves 128 GiB for KV when state reaches its 128 GiB retention cap.
+        # State and paged KV share the existing 224 GiB per-rank CPU pool.
+        # Raise only the state retention cap to 128 GiB.
         # On-demand keeps observed shared-prefix checkpoints in addition to
         # prompt-end anchors; the fixed-interval ladder remains disabled.
         - &kimi_k3_agentic_hc_dspark3
@@ -1070,7 +1070,7 @@ models:
               ATOM_STATE_CHECKPOINT_DEMAND: "1"
             prefill: &kimi_k3_agentic_hc_dspark3_prefill_env
               <<: *kimi_k3_agentic_lmcache128_env
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "128"
 
         - <<: *kimi_k3_agentic_hc_dspark3
