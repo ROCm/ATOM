@@ -148,29 +148,119 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
                 f"{model_type} disaggregated serving requires the mooncake "
                 f"connector, but kv_connector={connector!r} is configured. Only "
                 "mooncake transfers the slot-indexed regions the KDA recurrent "
-                f"state lives in; every other connector would move the "
-                f"{len(self.mla_idx_by_layer)} full-attention layers and "
-                f"silently drop the state of the other "
-                f"{len(self.kda_idx_by_layer)}. Set "
-                'kv_transfer_config["kv_connector"] = "mooncake".'
-            )
-
-        if getattr(config, "pipeline_parallel_size", 1) > 1:
-            # `_consumer_region_map` shifts a stage's regions onto the peer's
-            # list group-major over `num_hidden_layers`. The slot regions below
-            # are group-major over the KDA layers only, a shorter axis, so the
-            # shift would land them on the wrong peer regions -- writing one
-            # layer's state over another's rather than failing.
-            raise NotImplementedError(
-                f"{model_type} disaggregated serving does not support pipeline "
-                f"parallelism (pipeline_parallel_size="
-                f"{config.pipeline_parallel_size}): the KDA state regions are "
-                "keyed by KDA layer index, which `_consumer_region_map` cannot "
-                "align across stages. Run the P and D instances with PP=1."
+                "state lives in; every other connector would move the "
+                "full-attention layers and silently drop the state of the "
+                'KDA layers. Set kv_transfer_config["kv_connector"] = "mooncake".'
             )
 
         tensors.slot_regions, tensors.num_slots = self.state_slot_regions()
+        tensors.slot_region_tp_segments = self._kda_slot_tp_segments(
+            len(tensors.slot_regions)
+        )
+        if getattr(config, "pipeline_parallel_size", 1) > 1:
+            # `_consumer_region_map` shifts a stage's regions onto the peer's
+            # list group-major over `num_hidden_layers`, but the MLA rows and
+            # KDA slots are each numbered over their own kind only; the shift
+            # would write one layer's KV or state over another's.
+            mla, slots = self._pp_consumer_region_indices(
+                len(tensors.block_regions), len(tensors.slot_regions)
+            )
+            tensors.block_region_consumer_indices = mla
+            tensors.slot_region_consumer_indices = slots
         return tensors
+
+    def _kda_slot_tp_segments(self, num_regions: int) -> list:
+        """How each KDA slot region's unit splits over TP ranks.
+
+        A conv unit is `W` rows of `[q | k | v]` and an SSM unit is
+        `(heads, dv, dk)`, all sharded by contiguous head blocks, so a peer at
+        k times this TP holds the same k-th of every q, k and v run and of the
+        head axis. ReplaySSM's records are left undescribed, which keeps them
+        on equal TP sizes only, and so is a conv unit not shaped as above.
+        """
+        runner = self.model_runner
+        segments: list = [None] * num_regions
+        n_kda = runner.mamba_k_cache.shape[0]
+        conv = runner.mamba_k_cache[0, 0]
+        width, channels = conv.shape
+        expected_width = (
+            runner.config.hf_config.linear_conv_kernel_dim - 1 + self.num_spec
+        )
+        if width == expected_width and channels % 3 == 0:
+            run = channels // 3 * conv.element_size()
+            for i in range(min(n_kda, num_regions)):
+                segments[i] = (run,) * (3 * width)
+        ssm_bytes = runner.mamba_v_cache[0, 0].numel() * (
+            runner.mamba_v_cache.element_size()
+        )
+        for i in range(n_kda, min(2 * n_kda, num_regions)):
+            segments[i] = (ssm_bytes,)
+        return segments
+
+    def _pp_consumer_region_indices(
+        self, num_block_regions: int, num_slot_regions: int
+    ) -> tuple[list[int], list[int]]:
+        """This stage's MLA and KDA regions, placed in a PP=1 peer's lists.
+
+        Each row is placed by its module's own layer number: the peer numbers
+        its MLA rows over the full-attention layers and its slots over the KDA
+        layers, group by group (conv, SSM, then ReplaySSM's records and its
+        one cursor), the same order `state_slot_regions` publishes here.
+        """
+        runner = self.model_runner
+        num_hidden_layers = runner.config.hf_config.num_hidden_layers
+        full = sorted(set(runner.full_attention_layers))
+        if not full:
+            raise RuntimeError(
+                "PP disaggregation needs the hybrid's full-attention layer "
+                "list to place this stage's rows; it is empty"
+            )
+        mla_pos = {layer: i for i, layer in enumerate(full)}
+        kda_pos = {
+            layer: i
+            for i, layer in enumerate(
+                layer for layer in range(num_hidden_layers) if layer not in mla_pos
+            )
+        }
+
+        def place(kind: str, positions: dict, drafts_from: int | None) -> list[int]:
+            rows = self.pool_rows.get(kind, {})
+            placed = [-1] * len(rows)
+            drafts = 0
+            for module, row in rows.items():
+                layer = module.layer_num
+                if layer in positions:
+                    placed[row] = positions[layer]
+                elif drafts_from is not None and layer >= num_hidden_layers:
+                    placed[row] = drafts_from + drafts
+                    drafts += 1
+                else:
+                    raise RuntimeError(
+                        f"PP disaggregation cannot place {kind} row {row}: "
+                        f"layer {layer} is not one of the model's "
+                        f"{len(positions)} layers of that kind"
+                    )
+            return placed
+
+        mla = place(MLA_ROWS, mla_pos, len(full))
+        if len(mla) != num_block_regions:
+            raise RuntimeError(
+                f"{num_block_regions} PAGE regions published for {len(mla)} "
+                "MLA rows; PP disaggregation places one region per row"
+            )
+        kda = place(LINEAR_STATE_ROWS, kda_pos, None)
+        if not kda:
+            return mla, []
+        groups, cursor = divmod(num_slot_regions, len(kda))
+        if cursor != int(bool(self.replayssm)):
+            raise RuntimeError(
+                f"{num_slot_regions} slot regions over {len(kda)} KDA rows "
+                f"(replayssm={self.replayssm}) are not whole per-layer groups"
+            )
+        slots = [g * len(kda_pos) + pos for g in range(groups) for pos in kda]
+        if cursor:
+            slots.append(groups * len(kda_pos))
+        return mla, slots
 
     # Every PP stage scatters its own layers' state into the unit ids the head
     # names; `ModelRunner._agree_pipeline_checkpoint_spec` sizes them.
