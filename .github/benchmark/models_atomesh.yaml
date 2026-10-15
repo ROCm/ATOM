@@ -1017,6 +1017,25 @@ models:
               <<: *kimi_k3_agentic_agg_pp8_decode_env
               OFFLOAD_MAX_PENDING_SAVES: "64"
 
+        # The PP8 pure-prefill cell with three of the 24 MLA layers per stage.
+        # The default split gives the last stage four, and its KV bytes per
+        # token then set the block count every stage shares and fill its
+        # LMCache pool first; the only split with three everywhere is this one.
+        # Stage boundaries land on AttnRes blocks, so GSM8K runs after the replay.
+        - <<: *kimi_k3_agentic_agg_pp8_cg
+          name: kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1-part12
+          display_topology: AGG-PP8-TP1-CG-OSL1-PART12
+          benchmark:
+            <<: *kimi_k3_agentic_aiperf
+            max_output_tokens: 1
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: *kimi_k3_agentic_agg_pp8_decode_env
+              VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
