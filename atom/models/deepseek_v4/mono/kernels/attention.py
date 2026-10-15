@@ -212,12 +212,32 @@ def attention_stages(ctx):
                     ),
                 )
 
-    def gather_old_kv():
+    def gather_old_kv(s):
         """Each wave copies its KPW keys' KV rows (absolute plane rows) into the tile;
         unwritten slots (-1) are clamped to 0 here and masked in the softmax."""
-        krows = [
-            fx.max(lds_ld(keys, wave * KPW + jj), fx.Int32(0)) for jj in range(KPW)
-        ]
+        krows, pending = [], []
+        sp = ld_pos(s)
+        j_tok = s % TOK
+        for jj in range_constexpr(KPW):
+            kr = lds_ld(keys, wave * KPW + jj)
+            fresh = kr == ld_dest(0, s)
+            for d in range_constexpr(TOK):
+                sd = s - fx.min(fx.Int32(d), j_tok)
+                pd = sp - d
+                inl = fx.Int32(d) <= j_tok
+                fresh = fresh | (inl & (kr == ld_dest(0, sd)))
+                if const_expr(CR):
+                    fresh = fresh | (
+                        inl
+                        & ((pd + 1) % CR == 0)
+                        & (kr == comp_row(sd, fx.max(pd, fx.Int32(0)) // CR))
+                    )
+            # Cache producers run concurrently with this gather. A new row
+            # must not be validated or consumed before its tagged mailbox is
+            # ready: allocator bytes can contain Inf (0 * Inf is NaN).
+            # patch_new_kv supplies the complete row after polling its tag.
+            pending.append(fresh)
+            krows.append(fresh.select(fx.Int32(0), fx.max(kr, fx.Int32(0))))
         for jj in range_constexpr(KPW):
             j = wave * KPW + jj
             if const_expr(KV_FP8):
@@ -259,8 +279,10 @@ def attention_stages(ctx):
                 bad = sb == fx.Int32(0xFF)
                 for w_ in words:
                     bad = bad | bf16x2_has_nan(w_)
+                bad = bad & ~pending[jj]
                 kv8 = fx.Vector.from_elements(
-                    [bad.select(fx.Int32(0), w_) for w_ in words], fx.Int32
+                    [(bad | pending[jj]).select(fx.Int32(0), w_) for w_ in words],
+                    fx.Int32,
                 )
                 if wave_any(bad) & (lane == 0):
                     lds_st(keys, j, fx.Int32(-1))
@@ -272,6 +294,10 @@ def attention_stages(ctx):
                         vec_width=WPL,
                         dtype=T.i32,
                     )
+                )
+                kv8 = fx.Vector.from_elements(
+                    [pending[jj].select(fx.Int32(0), kv8[m]) for m in range(WPL)],
+                    fx.Int32,
                 )
             fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
@@ -358,7 +384,7 @@ def attention_stages(ctx):
     def load_tile(t, s):
         split_keys(t, s)
         gpu.barrier()
-        gather_old_kv()
+        gather_old_kv(s)
 
     def fold_head(carry, hg, h, m, lsum):
         """Fold one head's tile max / sum into the running pair; leave the two
