@@ -960,8 +960,8 @@ class Scheduler:
             else:
                 if probed_tokens >= budget:
                     break
-                # Memoised across hold ticks; Phase 2 re-probes exactly.
-                cached_blocks = self.block_manager.can_allocate_estimate(seq)
+                # The exact probe's answer; the walk is memoised across ticks.
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 probed_tokens += seq.num_tokens
                 if cached_blocks < 0:
                     break  # Phase 2 also stops at the first allocation refusal.
@@ -1090,7 +1090,7 @@ class Scheduler:
     def _estimate_prefill_chunk_cost(self) -> float:
         """Cost of the chunk this rank would prefill with the whole batch
         budget: resumable partials first, then the head of `waiting`, probing
-        the prefix cache without recording (`can_allocate_estimate`). An
+        the prefix cache without recording (`can_allocate_memoized`). An
         estimate -- the real admission may park or skip some of these seqs."""
         token_cap = self.max_num_batched_tokens
         tokens, cost = 0, 0.0
@@ -1123,7 +1123,7 @@ class Scheduler:
             else:
                 # Runs on every tick with prefill work, holds included: reuse
                 # the walk across ticks; the answer is the exact probe's.
-                cached_blocks = self.block_manager.can_allocate_estimate(seq)
+                cached_blocks = self.block_manager.can_allocate_memoized(seq)
                 if cached_blocks < 0:
                     break
                 # From where the forward will really start, as admission

@@ -418,7 +418,7 @@ def can_allocate(self, seq: Sequence, record: bool = True, *,
                  block_hashes: list[int] | None = None) -> int:
     """Return cache-hit hash blocks (>=0) if seq fits, else -1."""
 
-def can_allocate_estimate(self, seq: Sequence) -> int:
+def can_allocate_memoized(self, seq: Sequence) -> int:
     """can_allocate(seq, record=False) over a walk memoised per seq."""
 
 def record_allocation(self, seq: Sequence, num_cached_blocks: int,
@@ -443,7 +443,7 @@ gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
 already in use, and the fit. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.
 
-The delayer and the DP chunk-cost estimate call `can_allocate_estimate`. It
+The delayer and the DP chunk-cost estimate call `can_allocate_memoized`. It
 reuses a seq's walk until a block the walk read is evicted, moved or published,
 and runs the same evaluation on every call, so it returns what `can_allocate`
 would.

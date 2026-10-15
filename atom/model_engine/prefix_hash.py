@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""The chained prompt-block hash, shared by the frontend and the BlockManager.
-Must match `BlockManager.compute_hash` bit for bit."""
+"""The chained prompt-block hash, shared by the frontend and the BlockManager
+(`BlockManager.compute_hash` is `block_hash`)."""
 
 import array
 
@@ -13,27 +13,49 @@ from atom.utils import envs
 _xxh64 = xxhash.xxh64_intdigest
 
 
+def hash_block_size_for(block_size: int, dcp_world_size: int) -> int:
+    """Tokens per prefix-cache hash block: one block-table entry under DCP."""
+    return block_size * dcp_world_size
+
+
+def full_prompt_blocks(seq, hash_block_size: int) -> int:
+    """Hash blocks `seq`'s prompt fills: the part of its chain that cannot change."""
+    return seq.num_prompt_tokens // hash_block_size
+
+
+def _token_bytes(token_ids) -> bytes:
+    # int64 whatever the caller passes: `np.asarray` alone infers int32 from an
+    # `array("i")` and int64 from a list.
+    return np.asarray(token_ids, dtype=np.int64).tobytes()
+
+
+def _link(prev: int, raw) -> int:
+    """Hash of one block's token bytes `raw` after `prev` (-1: no parent)."""
+    return _xxh64(raw) if prev == -1 else _xxh64(prev.to_bytes(8, "little") + raw)
+
+
+def block_hash(token_ids, prev: int = -1) -> int:
+    """Chained hash of one block's tokens."""
+    return _link(prev, _token_bytes(token_ids))
+
+
 def chained_block_hashes(
     token_ids, hash_block_size: int, start: int, end: int, prev: int
 ) -> list[int]:
-    """Chained hashes of hash blocks `[start, end)` of `token_ids`, from `prev`
-    (block `start - 1`'s hash, or the seed; `-1`: no parent). Same bytes as
-    `BlockManager.compute_hash`; a short final block hashes what it holds."""
+    """`block_hash` of hash blocks `[start, end)` of `token_ids`, chained from
+    `prev` (block `start - 1`'s hash, or the seed); a short final block hashes
+    what it holds."""
     if end <= start:
         return []
     step = hash_block_size * 8
     raw = memoryview(
-        np.asarray(
-            token_ids[start * hash_block_size : end * hash_block_size],
-            dtype=np.int64,
-        ).tobytes()
+        _token_bytes(token_ids[start * hash_block_size : end * hash_block_size])
     )
     out: list[int] = []
     append = out.append
     h = prev
     for off in range(0, (end - start) * step, step):
-        block = raw[off : off + step]
-        h = _xxh64(block) if h == -1 else _xxh64(h.to_bytes(8, "little") + block)
+        h = _link(h, raw[off : off + step])
         append(h)
     return out
 
@@ -43,6 +65,6 @@ def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
     cache_seed, array("Q"))`, for `BlockManager._adopt_shipped_chain`."""
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
-    n = seq.num_prompt_tokens // hash_block_size
+    n = full_prompt_blocks(seq, hash_block_size)
     chain = chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed)
     seq.prompt_hash_chain = (hash_block_size, seq.cache_seed, array.array("Q", chain))

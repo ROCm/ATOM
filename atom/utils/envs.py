@@ -980,8 +980,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
-    # Memoise the delayer's fit probe across hold ticks
-    # (`BlockManager.can_allocate_estimate`). "0" re-probes every tick.
+    # Memoise the delayer's prefix walk across hold ticks
+    # (`BlockManager.can_allocate_memoized`). "0" re-probes every tick.
     "ATOM_PREFILL_DELAYER_PROBE_MEMO": lambda: (
         os.getenv("ATOM_PREFILL_DELAYER_PROBE_MEMO", "1") == "1"
     ),

@@ -112,7 +112,7 @@ def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
 def test_estimate_keeps_the_head_walk(monkeypatch, seq_factory):
     """The estimate probes the waiting head on every tick with prefill work.
     Its prompt-block hashes and its prefix walk are kept between ticks
-    (`can_allocate_estimate`), so a repeat probe walks and hashes nothing and
+    (`can_allocate_memoized`), so a repeat probe walks and hashes nothing and
     costs the same."""
     sched = _sched(monkeypatch, prefix_caching=True)
     prefix = list(range(100, 132))

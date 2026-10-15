@@ -12,7 +12,6 @@ from time import monotonic
 from weakref import WeakKeyDictionary
 
 import numpy as np
-import xxhash
 
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
@@ -26,7 +25,12 @@ from atom.distributed.kv_events import (
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
-from atom.model_engine.prefix_hash import chained_block_hashes
+from atom.model_engine.prefix_hash import (
+    block_hash,
+    chained_block_hashes,
+    full_prompt_blocks,
+    hash_block_size_for,
+)
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
@@ -111,8 +115,8 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
-# Eviction hashes kept for `_FitEstimate` revalidation; an estimate older than
-# this many evictions is re-walked.
+# Eviction hashes kept for `_CachedWalk` revalidation; a memo older than this
+# many evictions is re-walked.
 _RECENT_EVICTIONS = 8192
 
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
@@ -135,8 +139,8 @@ class _PrefixWalk:
 
 
 @dataclass(slots=True)
-class _FitEstimate:
-    """A walk memoised for `can_allocate_estimate`. `watched`: every hash
+class _CachedWalk:
+    """A walk memoised for `can_allocate_memoized`. `watched`: every hash
     whose index entry it read (the hit and the first miss, `boundary_hash`,
     None if the hit reaches the last reusable block)."""
 
@@ -172,7 +176,7 @@ class BlockManager:
         # Prefix-cache hashing / reuse granularity: under DCP one block_table
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
-        self.hash_block_size = self.block_size * self.dcp_world_size
+        self.hash_block_size = hash_block_size_for(self.block_size, self.dcp_world_size)
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -189,14 +193,14 @@ class BlockManager:
         self.shipped_chains_rejected: int = 0
         self.shipped_chains_diverged: int = 0
         self.total_evicted_blocks: int = 0
-        # `can_allocate_estimate`'s memo, validated against recent evictions,
+        # `can_allocate_memoized`'s memo, validated against recent evictions,
         # `clear_cache` calls and remaps (which move entries without one).
-        self._fit_estimates: WeakKeyDictionary[Sequence, _FitEstimate] = (
+        self._cached_walks: WeakKeyDictionary[Sequence, _CachedWalk] = (
             WeakKeyDictionary()
         )
         self._recent_evictions: deque[int] = deque(maxlen=_RECENT_EVICTIONS)
         self._index_clears = 0
-        self.fit_estimate_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
+        self.walk_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
         # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
         self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
         # Each seq's last fast walk, for its `allocate` to claim.
@@ -459,17 +463,7 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        # dtype pinned even though every caller now passes an `array("i")`:
-        # `np.array` infers int64 from a list and int32 from an array, so the
-        # digest used to depend on the caller's Python type. int64 is what
-        # lists gave, which leaves every hash recorded before that where it
-        # was -- and keeps a caller who does pass a list from silently
-        # computing a different one.
-        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
-        return h.intdigest()
+        return block_hash(token_ids, prefix)
 
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
@@ -699,6 +693,9 @@ class BlockManager:
         hbs = self.hash_block_size
         return (len(seq) + hbs - 1) // hbs
 
+    def _n_prompt_blocks(self, seq: Sequence) -> int:
+        return full_prompt_blocks(seq, self.hash_block_size)
+
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
@@ -766,7 +763,7 @@ class BlockManager:
             return []
         seq.prompt_hash_chain = None
         hbs = self.hash_block_size
-        n = seq.num_prompt_tokens // hbs
+        n = self._n_prompt_blocks(seq)
         block_size, seed, packed = shipped
         if block_size != hbs or seed != seq.cache_seed or len(packed) != n:
             return self._reject_shipped_chain(
@@ -815,7 +812,7 @@ class BlockManager:
         if i < len(chain):
             return chain[i]
         h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
-        if i == len(chain) and (i + 1) * self.hash_block_size <= seq.num_prompt_tokens:
+        if i == len(chain) and i < self._n_prompt_blocks(seq):
             chain.append(h)
         return h
 
@@ -1075,7 +1072,7 @@ class BlockManager:
         demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
-        `_walk_prefix` then `_evaluate`; `can_allocate_estimate` evaluates a
+        `_walk_prefix` then `_evaluate`; `can_allocate_memoized` evaluates a
         memoised walk the same way.
 
         The hit count is the contiguous run of cache hits starting at the
@@ -1241,8 +1238,7 @@ class BlockManager:
                 )
                 if k == len(prompt):
                     # Prompt blocks only: those past it can still change.
-                    full = seq.num_prompt_tokens // self.hash_block_size
-                    prompt += new[: max(0, full - k)]
+                    prompt += new[: max(0, self._n_prompt_blocks(seq) - k)]
                 hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
             new_ids = list(map(get, new))
             try:
@@ -1281,7 +1277,7 @@ class BlockManager:
             return None
         return walk
 
-    def can_allocate_estimate(self, seq: Sequence) -> int:
+    def can_allocate_memoized(self, seq: Sequence) -> int:
         """`can_allocate(seq, record=False)` for the delayer and the DP chunk
         cost, with the walk memoised per seq. The same `_evaluate`, so state
         room, the gates, the replay, checkpoint demand/end, the used hit blocks
@@ -1294,12 +1290,12 @@ class BlockManager:
         resolves the same (a hit only grows by a publish of that hash), and
         token count and seed are unchanged.
         """
-        if not self.fit_estimate_memo:
+        if not self.walk_memo:
             return self.can_allocate(seq, record=False)
         return self._evaluate(seq, self._memoised_walk, False, None)
 
     def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
-        memo = self._fit_estimates.get(seq)
+        memo = self._cached_walks.get(seq)
         if memo is not None and self._walk_still_valid(seq, memo):
             return memo.walk
         walk = self._walk_prefix(seq)
@@ -1314,7 +1310,7 @@ class BlockManager:
         watched = set(walk.hashes)
         if boundary_hash is not None:
             watched.add(boundary_hash)
-        self._fit_estimates[seq] = _FitEstimate(
+        self._cached_walks[seq] = _CachedWalk(
             walk=walk,
             index_clears=self._index_clears,
             index_remaps=self.kv.index_remaps,
@@ -1325,7 +1321,7 @@ class BlockManager:
         )
         return walk
 
-    def _walk_still_valid(self, seq: Sequence, memo: _FitEstimate) -> bool:
+    def _walk_still_valid(self, seq: Sequence, memo: _CachedWalk) -> bool:
         """Whether the KV index still answers `memo`'s walk the same way. Costs
         the evictions since the last check, not the prompt length."""
         if (
@@ -1373,8 +1369,8 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
-        # Admitted: the delayer no longer estimates this seq.
-        self._fit_estimates.pop(seq, None)
+        # Admitted: the delayer no longer probes this seq.
+        self._cached_walks.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
         # it. `claim_blocks` is what it may point its block table at: every

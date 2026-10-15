@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
-from atom.model_engine.prefix_hash import ship_prompt_hash_chain
+from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
@@ -716,8 +716,8 @@ class InputOutputProcessor:
         # 0 = no prefix cache. The engine rehashes on a mismatch.
         self.prefix_hash_block_size = 0
         if getattr(config, "enable_prefix_caching", False):
-            self.prefix_hash_block_size = int(block_size) * int(
-                getattr(config, "decode_context_parallel_size", 1) or 1
+            self.prefix_hash_block_size = hash_block_size_for(
+                block_size, config.decode_context_parallel_size
             )
 
     @staticmethod

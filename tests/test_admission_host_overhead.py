@@ -88,8 +88,8 @@ def published(tokens, bm=None):
 
 def churn(make, make_seq, seed, steps=150, ship=False, preempted=False):
     """The same admissions, frees and filler against the fast and the per-block
-    walk; after each step the delayer's estimate for three waiting heads must
-    equal the exact probe. Returns the managers and their logs."""
+    walk; after each step the memoised probe of three waiting heads must equal
+    the exact probe. Returns the managers and their logs."""
     logs, managers = [], []
     for fast in (True, False):
         rng = random.Random(seed)
@@ -123,8 +123,8 @@ def churn(make, make_seq, seed, steps=150, ship=False, preempted=False):
                 bm.deallocate(live.pop(int(r * len(live))))
             log.append(pool_state(bm))
             for head in heads:
-                estimate = probed(BlockManager.can_allocate_estimate, bm, head)
-                assert estimate == probed(exact, bm, head)
+                memoized = probed(BlockManager.can_allocate_memoized, bm, head)
+                assert memoized == probed(exact, bm, head)
         logs.append(log)
         managers.append(bm)
     return managers, logs
@@ -192,12 +192,12 @@ def test_allocate_claims_the_probe_ids_unless_stale(monkeypatch, fast, stale):
 
 
 def test_the_walk_is_handed_to_its_own_allocate():
-    """Probes of other seqs, and the estimate's, do not take A's walk."""
+    """Probes of other seqs, and memoised ones, do not take A's walk."""
     bm = published(range(40))
     a, b = (Sequence(list(range(40)) + [900 + k], BLOCK) for k in range(2))
-    assert exact(bm, a) == bm.can_allocate_estimate(a) == 10
-    assert bm.can_allocate_estimate(b) == exact(bm, b) == 10
-    assert bm.can_allocate_estimate(a) == 10
+    assert exact(bm, a) == bm.can_allocate_memoized(a) == 10
+    assert bm.can_allocate_memoized(b) == exact(bm, b) == 10
+    assert bm.can_allocate_memoized(a) == 10
     bm.kv.lookup = lambda h: pytest.fail("walked again")
     assert bm.allocate(a, 10) and a.num_cached_tokens == 40
 
@@ -227,20 +227,20 @@ def test_hash_collision(block, fast_hit, slow_hit):
 def test_the_memo_follows_a_change_to_what_its_walk_read(change):
     bm = published(range(40))
     head = Sequence(list(range(56)) + [900], BLOCK)
-    assert bm.can_allocate_estimate(head) == 10
+    assert bm.can_allocate_memoized(head) == 10
     change(bm, head)
-    assert bm.can_allocate_estimate(head) == exact(bm, head) != 10
+    assert bm.can_allocate_memoized(head) == exact(bm, head) != 10
 
 
 def test_the_memo_recounts_hit_blocks_another_seq_claimed():
     """No eviction, but the hit's blocks went from free to used."""
     bm = published(range(40), BlockManager(prefix_config(num_kvcache_blocks=24)))
     head = Sequence(list(range(44)), BLOCK)
-    assert bm.can_allocate_estimate(head) == 10
+    assert bm.can_allocate_memoized(head) == 10
     other = Sequence(list(range(40)) + list(range(500, 520)), BLOCK)
     assert bm.can_allocate(other) == 10 and bm.allocate(other, 10)
     assert bm.total_evicted_blocks == 0 and bm.kv.num_free == 9
-    assert bm.can_allocate_estimate(head) == exact(bm, head) == 10
+    assert bm.can_allocate_memoized(head) == exact(bm, head) == 10
 
 
 def test_the_state_gate_is_asked_again():
@@ -250,26 +250,26 @@ def test_the_state_gate_is_asked_again():
     publisher_has_read_its_source(bm)
     bm.deallocate(first)
     head = stateful_seq(list(range(40)) + list(range(500, 520)))
-    hit = bm.can_allocate_estimate(head)
+    hit = bm.can_allocate_memoized(head)
     assert hit == exact(bm, head) > 0
     bm.state.unindex(h)  # the checkpoint goes; its KV block stays
-    assert bm.can_allocate_estimate(head) == exact(bm, head) < hit
+    assert bm.can_allocate_memoized(head) == exact(bm, head) < hit
 
 
 def test_the_replay_is_asked_again(monkeypatch):
-    """The tier's answer lands between ticks; the estimate follows, flags too."""
+    """The tier's answer lands between ticks; the memoised probe follows, flags too."""
     bm = _mp_bm(monkeypatch)
     # 32 tokens in HBM with no checkpoint; LMCache holds 44 with state.
     head = _mp_seq(bm, reach_with_state=44, reach_kv_only=48)
 
-    def estimate():
-        return bm.can_allocate_estimate(head), head.replays_hit, head.replay_kv_load
+    def memoized():
+        return bm.can_allocate_memoized(head), head.replays_hit, head.replay_kv_load
 
-    assert estimate() == estimate() == (0, False, False)  # loading 44 wins
+    assert memoized() == memoized() == (0, False, False)  # loading 44 wins
     head.offload_joint.kv_prefix_tokens = 0  # only the KV-only reach left
-    assert estimate() == (8, True, True) and exact(bm, head) == 8
+    assert memoized() == (8, True, True) and exact(bm, head) == 8
     head.offload_joint.kv_prefix_tokens = 44
-    assert estimate() == (0, False, False) and exact(bm, head) == 0
+    assert memoized() == (0, False, False) and exact(bm, head) == 0
 
 
 def reference_chain(tokens, hbs, seed, n):
@@ -418,8 +418,8 @@ def test_off_switch(monkeypatch, var):
     monkeypatch.setenv("ATOM_" + var, "0")
     bm = published(range(40))
     assert bm.fast_prefix_walk == (var != "PREFIX_FAST_WALK")
-    assert bm.fit_estimate_memo == (var != "PREFILL_DELAYER_PROBE_MEMO")
+    assert bm.walk_memo == (var != "PREFILL_DELAYER_PROBE_MEMO")
     seq = shipped_seq(list(range(40)) + [900])
     assert (seq.prompt_hash_chain is None) == (var == "FRONTEND_PREFIX_HASH")
-    assert bm.can_allocate_estimate(seq) == exact(bm, seq) == 10
+    assert bm.can_allocate_memoized(seq) == exact(bm, seq) == 10
     assert bm.allocate(seq, 10) and seq.num_cached_tokens == 40
