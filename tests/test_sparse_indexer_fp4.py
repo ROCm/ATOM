@@ -1017,20 +1017,23 @@ def test_v4_fp4_decode_scores_a_dp_padded_batch_wider_than_its_rows(
 def _qsplit_roundtrip(full_topk, world_size, sentinel=-7):
     """Replay what the DCP prefill path does to a selection, on one process.
 
-    Each rank keeps its own row slice in a buffer of the uniform stride, the
-    stride-sized buffers are concatenated rank-major (what ``all_gather(dim=0)``
-    produces), and the first ``num_rows`` rows are taken. The padding is filled
-    with a sentinel so a test failure tells us whether an unwritten row leaked
-    into the result rather than just that something moved.
+    Modelled the way the path actually runs it: ONE buffer of
+    ``world_size`` strides, each rank writing the rows it scored into its own
+    slot, which is what the in-place all-gather makes the ranks agree on. The
+    first ``num_rows`` rows are then the result. Everything else is filled with
+    a sentinel, so a failure tells us whether an unwritten row leaked into the
+    result rather than just that something moved.
     """
     num_rows, topk = full_topk.shape
-    sends = []
+    stride = dcp_qsplit_rows(num_rows, 0, world_size)[0]
+    gathered = torch.full((stride * world_size, topk), sentinel, dtype=full_topk.dtype)
     for rank in range(world_size):
-        rows_per_rank, row_lo, row_hi = dcp_qsplit_rows(num_rows, rank, world_size)
-        send = torch.full((rows_per_rank, topk), sentinel, dtype=full_topk.dtype)
-        send[: row_hi - row_lo] = full_topk[row_lo:row_hi]
-        sends.append(send)
-    return torch.cat(sends, dim=0)[:num_rows]
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
+        assert rows_per_rank == stride
+        gathered[slot_lo : slot_lo + (row_hi - row_lo)] = full_topk[row_lo:row_hi]
+    return gathered[:num_rows]
 
 
 @pytest.mark.parametrize("world_size", [4, 8])
@@ -1055,10 +1058,8 @@ def test_qsplit_reassembles_the_unsplit_selection_exactly(num_rows, world_size):
     Compared element-wise against the unsplit tensor, not against a tolerance --
     there is no arithmetic here to be approximate about.
 
-    This does NOT cover the scorer under a restricted row range. The FP4 scorer
-    rebuilds its ragged schedule for a partial batch because cta_info encodes
-    absolute row ids, and the caller sets that flag accordingly; that wiring is
-    exercised end to end, not here.
+    The scorer under a restricted row range is the other half, and it needs a
+    GPU: see test_prefill_scores_a_restricted_row_range_the_same_as_the_whole_batch.
     """
     torch.manual_seed(num_rows * 100 + world_size)
     full = torch.randint(0, 1 << 20, (num_rows, 2048), dtype=torch.int32)
@@ -1080,18 +1081,35 @@ def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
     """
     seen = []
     strides = set()
+    slots = []
     for rank in range(world_size):
-        rows_per_rank, row_lo, row_hi = dcp_qsplit_rows(num_rows, rank, world_size)
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
         strides.add(rows_per_rank)
         assert row_lo <= row_hi <= num_rows
         assert row_hi - row_lo <= rows_per_rank
+        # The slot is where the in-place all-gather reads this rank's input
+        # from, so it must be the rank's OWN stride -- including for a rank
+        # with no rows, whose clamped row range sits in a lower rank's slot.
+        assert slot_lo == rank * rows_per_rank
+        # A rank with rows scores at the head of its own slot; one without
+        # rows has a clamped, empty range that must NOT be read as a slot.
+        assert row_lo == row_hi or (
+            row_lo == slot_lo and row_hi <= slot_lo + rows_per_rank
+        )
+        slots.append((slot_lo, slot_lo + rows_per_rank))
         seen.extend(range(row_lo, row_hi))
     assert seen == list(range(num_rows))
     assert len(strides) == 1
-    gathered_rows = strides.pop() * world_size
+    stride = strides.pop()
+    gathered_rows = stride * world_size
     assert num_rows <= gathered_rows < num_rows + world_size
+    # The slots tile the gathered buffer exactly, in rank order: no two ranks
+    # read from the same rows, and the last slot ends at the buffer's end.
+    assert slots == [(r * stride, (r + 1) * stride) for r in range(world_size)]
 
 
 def test_qsplit_degenerates_to_the_whole_range_without_dcp():
     """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
-    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 4096)
+    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)

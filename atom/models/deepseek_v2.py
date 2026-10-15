@@ -1839,7 +1839,7 @@ def sparse_attn_indexer(
         # full key set, so the top-k is the EXACT global one, and the
         # [rows, topk] selections are all-gathered back below. At dcp=1 this
         # degenerates to the whole range, which is the original behaviour.
-        rows_per_rank, row_lo, row_hi = dcp_qsplit_rows(
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
             num_rows, get_dcp_rank(), get_dcp_world_size()
         )
         chunk_tokens = sparse_indexer_row_chunk(
@@ -1920,9 +1920,12 @@ def sparse_attn_indexer(
             # process group directly because the group wrapper's `all_gather`
             # only has an out-of-place form, which would allocate and copy --
             # the two things this is removing.
+            # `slot_lo`, not `row_lo`: the input must be this rank's OWN slot,
+            # and `row_lo` is clamped to the row count for scoring, so a rank
+            # with no rows would hand in a lower rank's slot instead.
             torch.distributed.all_gather_into_tensor(
                 gather_region,
-                gather_region[row_lo : row_lo + rows_per_rank],
+                gather_region[slot_lo : slot_lo + rows_per_rank],
                 group=get_dcp_group().device_group,
             )
             # The filter below must be handed the WHOLE `topk_indices`: it calls
