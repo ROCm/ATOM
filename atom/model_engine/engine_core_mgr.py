@@ -172,6 +172,10 @@ def _resolve_dp_engine_count(config: Config, logical: int) -> int:
 
 
 class CoreManager:
+    # Class-level default so managers built without `_init_shared_state` (unit
+    # tests, subclasses that route their own way) keep strict affinity.
+    _dp_session_migrate_ratio: float = 0.0
+
     def _init_shared_state(
         self,
         config: Config,
@@ -260,6 +264,7 @@ class CoreManager:
         # is built after env/args are finalized), not a runtime-tunable knob.
         self._dp_lb_req_equiv = envs.ATOM_DP_LB_REQ_EQUIV
         self._dp_session_affinity_enabled = envs.ATOM_DP_SESSION_AFFINITY
+        self._dp_session_migrate_ratio = envs.ATOM_DP_SESSION_MIGRATE_RATIO
         # Session id -> rank whose local prefix cache owns the session. Owners
         # are immutable for the lifetime of the process: moving one turn to a
         # light rank discards the dominant optimization in agentic workloads,
@@ -273,9 +278,9 @@ class CoreManager:
         self._dp_route_counters = {
             "affinity_new_total": 0,
             "affinity_owner_hit_total": 0,
-            # Kept as an explicit invariant/metric: strict affinity must leave
-            # this at zero. It makes an accidental reintroduction of spill
-            # visible in benchmark artifacts.
+            # Sessions moved off their owner (ATOM_DP_SESSION_MIGRATE_RATIO).
+            # Strict affinity (the default) leaves this at zero, which keeps an
+            # accidental spill visible in benchmark artifacts.
             "affinity_spill_total": 0,
             "affinity_parent_ignored_total": 0,
             "explicit_total": 0,
@@ -1219,7 +1224,47 @@ class CoreManager:
             )
             return self._record_dp_route_locked("affinity_new_total", owner)
 
+        target = self._session_migration_target_locked(seq, owner)
+        if target is not None:
+            # The new rank does not hold the session's prefix: charge the whole
+            # prompt there, and make it the owner of the turns that follow.
+            self._dp_session_prompt_tokens.pop(session_id, None)
+            self._dp_session_owners[session_id] = target
+            logger.debug(
+                "%s: DPA affinity moved session=%s rank%d -> rank%d "
+                "(queued prefill %d vs %d, prompt %d)",
+                self.label,
+                session_id,
+                owner,
+                target,
+                self._rank_tokens[owner],
+                self._rank_tokens[target],
+                int(getattr(seq, "num_prompt_tokens", 0) or 0),
+            )
+            return self._record_dp_route_locked("affinity_spill_total", target)
         return self._record_dp_route_locked("affinity_owner_hit_total", owner)
+
+    def _session_migration_target_locked(self, seq: Sequence, owner: int) -> int | None:
+        """A lighter rank to move a sticky session to, or None to stay.
+
+        Staying costs this turn the prefill already queued on its owner ahead
+        of it; moving costs recomputing its whole prompt on a rank that holds
+        none of its prefix. Move only when the owner's queued prefill exceeds
+        the lightest rank's by more than ``ATOM_DP_SESSION_MIGRATE_RATIO``
+        times the prompt -- a backlog the session would otherwise wait out,
+        which bounds the cache it gives up. Off (never move) at 0.
+        """
+        ratio = self._dp_session_migrate_ratio
+        if ratio <= 0:
+            return None
+        target = min(
+            range(self._routable_engine_count), key=lambda r: self._rank_tokens[r]
+        )
+        if target == owner:
+            return None
+        prompt = int(getattr(seq, "num_prompt_tokens", 0) or 0)
+        backlog = self._rank_tokens[owner] - self._rank_tokens[target]
+        return target if backlog > ratio * prompt else None
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""

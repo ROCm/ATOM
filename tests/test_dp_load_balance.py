@@ -188,6 +188,44 @@ def test_affinity_existing_session_always_uses_cache_owner():
     assert mgr._dp_route_counters["affinity_spill_total"] == 0
 
 
+def test_migration_moves_a_session_past_a_backlog_bigger_than_its_prompt():
+    """With ATOM_DP_SESSION_MIGRATE_RATIO, a session whose owner is buried under
+    far more queued prefill than its own prompt moves to the lightest rank,
+    which becomes its owner and is charged the whole prompt."""
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_session_migrate_ratio = 1.0
+    mgr._dp_session_owners["s"] = 0
+    mgr._dp_session_prompt_tokens["s"] = 30_000
+    mgr._rank_tokens = [371_000, 82_000]
+    assert _route(mgr, [_FakeSeq("turn", 31_000, dp_session_id="s")]) == [1]
+    assert mgr._dp_session_owners["s"] == 1
+    assert mgr._dp_route_counters["affinity_spill_total"] == 1
+    assert mgr._seq_load["turn"][2] == 31_000  # whole prompt, not the growth
+    # the next turn stays on its new owner and is charged its growth only
+    assert _route(mgr, [_FakeSeq("next", 32_000, dp_session_id="s")]) == [1]
+    assert mgr._seq_load["next"][2] == 1_000
+
+
+def test_migration_keeps_a_session_whose_prompt_outweighs_the_backlog():
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_session_migrate_ratio = 1.0
+    mgr._dp_session_owners["s"] = 0
+    mgr._rank_tokens = [300_000, 100_000]
+    # moving would recompute 250k tokens to skip 200k of queue: stay
+    assert _route(mgr, [_FakeSeq("turn", 250_000, dp_session_id="s")]) == [0]
+    assert mgr._dp_route_counters["affinity_spill_total"] == 0
+
+
+def test_migration_ratio_scales_the_backlog_a_move_needs():
+    mgr = _make_mgr(2, session_affinity=True)
+    mgr._dp_session_owners["s"] = 0
+    mgr._rank_tokens = [250_000, 100_000]  # 150k backlog, 100k prompt
+    mgr._dp_session_migrate_ratio = 2.0
+    assert _route(mgr, [_FakeSeq("a", 100_000, dp_session_id="s")]) == [0]
+    mgr._dp_session_migrate_ratio = 1.0
+    assert _route(mgr, [_FakeSeq("b", 100_000, dp_session_id="s")]) == [1]
+
+
 def test_affinity_later_turn_charges_only_prompt_growth():
     mgr = _make_mgr(2, session_affinity=True, req_equiv=512)
     first = _FakeSeq("first", 100_000, dp_session_id="s")

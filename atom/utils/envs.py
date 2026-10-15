@@ -195,6 +195,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DP_SESSION_AFFINITY", "0"
     ).lower()
     in {"1", "true", "yes", "on"},
+    # With ATOM_DP_SESSION_AFFINITY: move a sticky session to the lightest DP
+    # rank when its owner's queued prefill exceeds that rank's by more than this
+    # many times the request's prompt (the recompute the move costs). 0 = never.
+    "ATOM_DP_SESSION_MIGRATE_RATIO": lambda: _finite_float_env(
+        "ATOM_DP_SESSION_MIGRATE_RATIO", 0.0, allow_zero=True
+    ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
