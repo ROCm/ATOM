@@ -116,7 +116,7 @@ def candidate_block_table(
     visible,
     *,
     rows_per_block,
-    out=None
+    out=None,
 ):
     """`(table, context)` for scoring only the blocks `candidates` kept.
 
