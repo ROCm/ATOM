@@ -19,7 +19,9 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
 Slurm account and single-node placement use their defaults (`auto`). The C32
 case excludes `pit2-p03-g34` and `pit2-p03-g12`: runs `38741996691` and
 `38793498618` confirmed that UID 300152 cannot
-write the node's HugeTLB controls. The scheduler selects among the remaining
+write the node's HugeTLB controls. It also excludes `pit2-p03-g01` after run
+`38805249199` exhausted bounded THP preparation despite sufficient ordinary
+free RAM (details below). The scheduler selects among the remaining
 nodes. This exclusion does not imply other nodes have sufficient memory or
 administrator permissions; host preparation still validates the selected node.
 
@@ -161,3 +163,16 @@ has been removed, including its fatal-signal and fork hooks. The replacement
 uses regular Python thread/frame APIs with strong frame references and bounded,
 rotated output. If a native call holds the GIL, Python stack sampling may pause;
 the external host-memory/thread-wait sampler and NCCL recorder remain available.
+
+Run 38805249199 selected g01. Target/draft file advice recovered 98 GiB;
+advising the broader model directory recovered another 579 GiB, raising NUMA0
+free RAM to 1110 GiB. All 5917 opened files were advised; sixteen files
+were inaccessible, and no symlink directories were skipped. THP preparation
+then slowed around 820 GiB. The second attempt reached only 825 GiB of actual
+THP in 90 seconds despite 1156 GiB ordinary free RAM at its start. Roughly
+300 GiB file cache and many smaller free blocks remained. The third attempt
+was bounded by the remaining 27 seconds of the 300-second total budget.
+The case excludes this demonstrated preparation failure for subsequent runs;
+it does not increase the budget or accept partial THP coverage. No model
+service started, so this run provides no runtime validation of the stack
+sampler or the earlier NCCL stall.
