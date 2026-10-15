@@ -27,6 +27,11 @@ logger = logging.getLogger("atom")
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
+    # No model needs that gate when PCP is disabled. In particular, avoid
+    # importing DeepSeek-only optional kernels for Qwen MTP in this case.
+    if get_pcp_world_size() == 1:
+        return False
+
     from atom.models.deepseek_v2 import _pcp_active
 
     if _pcp_active():

@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Qwen MTP history recovery must equal execution of accepted tokens only."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,14 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
 )
+
+
+def test_qwen_mtp_does_not_import_deepseek_when_pcp_disabled(monkeypatch):
+    from atom.spec_decode import eagle_proposer
+
+    monkeypatch.setattr(eagle_proposer, "get_pcp_world_size", lambda: 1)
+    monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", None)
+    assert not eagle_proposer._pcp_active_for_draft_model(SimpleNamespace())
 
 
 @pytest.fixture
