@@ -110,7 +110,7 @@
                 "kv_load_failure_policy": "fail",
                 "kv_connector_extra_config": {
                   "mooncake_protocol": "rdma",
-                  "num_workers": 1
+                  "num_workers": 10
                 }
               },
               {
@@ -181,7 +181,7 @@
           "kv_load_failure_policy": "fail",
           "kv_connector_extra_config": {
             "mooncake_protocol": "rdma",
-            "num_workers": 1
+            "num_workers": 10
           }
         },
         "speculative-config": {

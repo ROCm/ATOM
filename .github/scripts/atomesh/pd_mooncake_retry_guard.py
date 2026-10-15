@@ -5,8 +5,8 @@ from pathlib import Path
 import subprocess
 import time
 
-JOB_ID = "8245"
-JOB_NAME = "kimi-k3-mooncake-c48-kimi-k3-mooncake-inferencex-c48-vllm-38524320232-1"
+JOB_ID = "8328"
+JOB_NAME = "kimi-k3-mooncake-c48-kimi-k3-mooncake-inferencex-c48-vllm-38582923623-1"
 ACCOUNT = "amd-frameworks"
 OWNER = "junyan.yang@amd.com"
 CONTROLLER = os.environ.get("SPUR_CONTROLLER_ADDR") or (
@@ -59,9 +59,9 @@ def reconcile(report):
 
 
 def main():
-    report = {"prior_run_id": 38524320232, "job_id": JOB_ID,
+    report = {"prior_run_id": 38582923623, "job_id": JOB_ID,
               "cancel_attempted": False, "result": "unverified"}
-    path = Path("atomesh-results/prior-slurm-8245.json")
+    path = Path("atomesh-results/prior-slurm-8328.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         reconcile(report)
