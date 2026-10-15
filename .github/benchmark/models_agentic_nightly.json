@@ -24,15 +24,6 @@
           "concurrency": [
             128
           ]
-        },
-        {
-          "label": "DSpark5 TP2 DPA replay interval2 AL3.51",
-          "suffix": "-agentic-dspark5-tp2-dpa-replay-i2-al351",
-          "extra_args": "-tp 2 --enable-dp-attention --dp-load-balance least_tokens",
-          "env_vars": "HIP_VISIBLE_DEVICES=0,1\nGPU_MAX_HW_QUEUES=5\nATOM_DP_SESSION_AFFINITY=1\nATOM_DP_LB_REQ_EQUIV=512\nATOM_ENABLE_PREFILL_DELAYER=1\nATOM_PREFILL_DECODE_INTERVAL=2",
-          "concurrency": [
-            128
-          ]
         }
       ]
     }
