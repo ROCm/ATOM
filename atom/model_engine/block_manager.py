@@ -2693,6 +2693,17 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
+        # Onto the LMCache chunk grid when the joint load serves this tier. HBM
+        # keeps a checkpoint only as long as its KV (`_record_evicted`), so past
+        # an eviction the anchor resumes only through `_joint_kv_boundary`,
+        # whose KV leg needs the whole chunk covering it -- and for an off-grid
+        # anchor that chunk runs past this prompt, so no store ever holds it.
+        # A hash block finer than the chunk (PP: 128 against 1024) otherwise
+        # loses 7 anchors in 8 once the prompt leaves HBM; flooring costs under
+        # one chunk of reuse while it is still there.
+        chunk = self._joint_chunk_tokens
+        if chunk > self.hash_block_size and chunk % self.hash_block_size == 0:
+            end -= end % chunk
         if end > 0:
             seq.checkpoint_end_pos = end
 
