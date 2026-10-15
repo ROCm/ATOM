@@ -520,13 +520,36 @@ class V4MonoSession:
                 binding.assert_current()
             from atom.models.deepseek_v4.mono.weights import _signature
 
-            if any(
-                getattr(owner, name) is not value or _signature(value) != signature
-                for owner, name, value, signature in self.entry_sources
-            ):
-                raise MonoUnsupported(
-                    "embedding/head owner changed; retire graphs and reprepare Mono"
-                )
+            for owner, name, value, signature in self.entry_sources:
+                current = getattr(owner, name, None)
+                if current is not value:
+                    raise MonoUnsupported(
+                        f"{type(owner).__name__}.{name} owner changed; "
+                        "retire graphs and reprepare Mono"
+                    )
+                actual = _signature(value)
+                if actual != signature:
+                    changes = ", ".join(
+                        field
+                        for field, before, after in zip(
+                            (
+                                "pointer",
+                                "version",
+                                "shape",
+                                "stride",
+                                "dtype",
+                                "device",
+                                "shuffled",
+                            ),
+                            signature,
+                            actual,
+                        )
+                        if before != after
+                    )
+                    raise MonoUnsupported(
+                        f"{type(owner).__name__}.{name} changed ({changes}); "
+                        "retire graphs and reprepare Mono"
+                    )
         # Owner and adapter checks raise backend-specific errors; convert every
         # one into the same TP-agreed native fallback decision.
         except Exception as error:  # noqa: BLE001

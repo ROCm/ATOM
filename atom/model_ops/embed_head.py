@@ -97,14 +97,27 @@ def _masked_embedding_fake(
     )
 
 
-@torch_compile_guard(gen_fake=_masked_embedding_fake)
-def masked_embedding(
+# Both inputs are read-only. Declaring weight mutable makes Inductor copy it
+# back and increment its version on every prefill, invalidating Mono bindings.
+# Use a new op name as well: AOT caches can reuse the old mutation metadata
+# when only the schema changes under an existing custom-op name.
+@torch_compile_guard(mutates_args=[], gen_fake=_masked_embedding_fake)
+def _masked_embedding_read_only(
     x: torch.Tensor,
     weight: torch.Tensor,
     vocab_start_idx: int,
     vocab_end_idx: int,
 ) -> torch.Tensor:
     return _masked_embedding_launcher(x, weight, vocab_start_idx, vocab_end_idx)
+
+
+def masked_embedding(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_start_idx: int,
+    vocab_end_idx: int,
+) -> torch.Tensor:
+    return _masked_embedding_read_only(x, weight, vocab_start_idx, vocab_end_idx)
 
 
 def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -116,8 +129,10 @@ def _replicated_embedding_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.T
     )
 
 
-@torch_compile_guard(gen_fake=_replicated_embedding_fake)
-def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+@torch_compile_guard(mutates_args=[], gen_fake=_replicated_embedding_fake)
+def _replicated_embedding_read_only(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
     # Keep the lookup opaque to torch.compile: inductor otherwise fuses the
     # embedding gather into the surrounding graph, which corrupts the MTP draft
     # rollout (acceptance collapses ~69%->45%) — the same reason
@@ -136,6 +151,10 @@ def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     # unverified -1 slots — whose output is discarded/corrected by async
     # spec-decode — see the same value native does. No accuracy change.
     return _masked_embedding_launcher(x, weight, 0, weight.shape[0])
+
+
+def replicated_embedding(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _replicated_embedding_read_only(x, weight)
 
 
 class VocabParallelEmbedding(nn.Module):

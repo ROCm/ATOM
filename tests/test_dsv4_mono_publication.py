@@ -479,6 +479,52 @@ def test_live_prefill_bypasses_mono_admission():
     assert not session.capture_publication
 
 
+@pytest.mark.parametrize("mutation", ["version", "pointer", "owner"])
+def test_entry_change_is_named_and_refused_before_cache_write(monkeypatch, mutation):
+    from atom.models.deepseek_v4.mono import session as session_module
+    from atom.models.deepseek_v4.mono.weights import _signature
+
+    value = torch.ones(8)
+    owner = SimpleNamespace(hc_head_fn=value)
+    session = object.__new__(V4MonoSession)
+    session.entry_sources = ((owner, "hc_head_fn", value, _signature(value)),)
+    session.adapter = SimpleNamespace(
+        clear_publication=lambda: None,
+        supported=lambda context: True,
+        assert_current=lambda: None,
+        max_rows=1,
+        write=lambda *args, **kwargs: pytest.fail(
+            "refused weights must not write cache"
+        ),
+    )
+    session.runner = SimpleNamespace(bindings=())
+    session.batch_continuation = None
+    session.owns_live_session = lambda: True
+    session.weights_ready = True
+    session.group = None
+    session.decode_attempts = session.fallback_steps = 0
+    session.fallback_reasons = {}
+    session.refusal = None
+    monkeypatch.setattr(session_module, "tp_agree", lambda supported, group: supported)
+    if mutation == "version":
+        value.add_(1)
+    elif mutation == "pointer":
+        value.data = value.clone()
+    else:
+        owner.hc_head_fn = value.clone()
+    context = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=False, is_dummy_run=False, running_bs=1),
+        attn_metadata=SimpleNamespace(max_seqlen_q=1),
+    )
+
+    assert not session.publish(torch.tensor([1]), torch.tensor([32]), context)
+    assert "hc_head_fn" in session.refusal
+    assert mutation in session.refusal
+    assert "retire graphs and reprepare" in session.refusal
+    assert session.decode_attempts == session.fallback_steps == 1
+    assert session.fallback_reasons == {session.refusal: 1}
+
+
 def test_close_retires_graph_generation_and_publication(monkeypatch):
     events = []
     session = object.__new__(V4MonoSession)
