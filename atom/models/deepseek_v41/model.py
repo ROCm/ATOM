@@ -29,7 +29,7 @@ from atom.utils.attn_ffn_piecewise import piecewise_core
 from atom.utils.forward_context import get_forward_context
 
 from .attention import Attention
-from .config import build_attention_topology
+from .config import PIECEWISE_ATTENTION_METADATA, build_attention_topology
 from .layers import native_quant_config
 from .moe import MoE
 
@@ -110,9 +110,7 @@ class Block(nn.Module):
     @piecewise_core(
         capture_prefill=True,
         token_dim=1,
-        metadata=lambda layer, args: args["step"].piecewise_metadata(
-            layer.attn.spec, args["cache"], args["queries"]
-        ),
+        metadata=PIECEWISE_ATTENTION_METADATA,
     )
     def attention_forward(
         self,

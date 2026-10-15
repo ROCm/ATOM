@@ -153,14 +153,16 @@ def piecewise_core(
     copy_per_step: tuple[str, ...] = (),
     capture_prefill: bool = False,
     token_dim: int = 0,
-    metadata: Callable[[Any, dict], Any] | None = None,
+    metadata: dict | Callable[[Any, dict], Any] | None = None,
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
     By default only DECODE steps are captured. ``capture_prefill=True`` also
-    permits live prefill capture. ``metadata(layer, arguments)`` returns a
+    permits live prefill capture. A ``metadata={...}`` declaration uses the common
+    field-selection, reconstruction and publication schema. Advanced providers
+    may instead use ``metadata(layer, arguments)`` to return a
     ``PiecewiseMetadata`` describing dynamic inputs, reconstruction and result
     publication, or None to run eagerly. The decorator stages those inputs,
     keys their structure/layouts and owns the warmup/record/replay lifecycle.
@@ -220,6 +222,10 @@ def piecewise_core(
     copied = frozenset(copy_per_step)
     if metadata is not None and not capture_prefill:
         raise ValueError("metadata requires capture_prefill=True")
+    if isinstance(metadata, dict):
+        from atom.utils.piecewise_metadata import PiecewiseMetadataSchema
+
+        metadata = PiecewiseMetadataSchema(**metadata)
 
     def decorate(fn: Callable) -> Callable:
         input_names, passthrough_names = _partition_inputs(fn)

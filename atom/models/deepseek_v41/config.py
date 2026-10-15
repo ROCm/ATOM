@@ -8,6 +8,82 @@ from itertools import groupby
 
 from transformers import PretrainedConfig
 
+# The common decorator owns input staging, fresh capture views and publication.
+# Keep only CSA2's field/topology contract here; no model capture callbacks.
+PIECEWISE_ATTENTION_METADATA = {
+    "bindings": {
+        "spec": "layer.attn.spec",
+        "ratio": "spec.ratio",
+        "plan": lambda s: s["step"].plans.get(s["ratio"]),
+    },
+    "when": "step.requests",
+    "key": (
+        "step.decode",
+        "step.width",
+        "step.max_q_len",
+        lambda s: bool(s["step"].request_cached_until.any()),
+        lambda s: s["cache"].pool.data_ptr(),
+    ),
+    "memo": "step.af_inputs",
+    "objects": {
+        "plan": {
+            "inputs": ("compress_plan_gpu", "write_plan_gpu", "key_rope_positions_gpu"),
+        },
+        "step": {
+            "inputs": (
+                "positions",
+                "cu_seqlens_q",
+                "slots",
+                "batch_ids",
+                "block_tables",
+                "swa_replay_start",
+                "swa_cached_until",
+            ),
+            "select": {
+                "visible": {"keys": ("ratio",), "when": "ratio"},
+                "selected": {
+                    "keys": ("spec.topk_owner",),
+                    "when": lambda s: s["spec"].topk_owner is not None
+                    and s["spec"].topk_owner != s["spec"].layer_id,
+                },
+                "candidates": {
+                    "keys": ("spec.candidate_source",),
+                    "when": lambda s: s["spec"].candidate_source is not None,
+                },
+                "indptrs": {"keys": ("ratio",)},
+                "planned": {"suffix": lambda s: f"_{s['ratio']}"},
+                "planned_host": {"suffix": lambda s: f"_{s['ratio']}"},
+            },
+            "reset": {
+                "tiles": {},
+                "candidate_blocks": {},
+                "group_indices": {},
+                "window_rows": None,
+                "af_inputs": {},
+            },
+            "bind": {"plans": {"object": "plan", "key": "ratio"}},
+        },
+        "query_index": {
+            "source": "queries.index",
+            # Clone the captured step so its selections/derived dicts stay aliased.
+            "template": "step",
+            "inputs": ("batch_ids",),
+            "select": {"indptrs": {"keys": ("ratio",)}},
+        },
+        "queries": {
+            "inputs": ("rows", "positions", "ptr_rows"),
+            "bind": {"index": "query_index"},
+        },
+    },
+    "arguments": ("step", "queries"),
+    "publish": {
+        "step.selected": {"keys": ("spec.layer_id",)},
+        "step.candidates": {"keys": ("spec.layer_id",)},
+        "step.group_indices": "update",
+        "step.window_rows": "if_not_none",
+    },
+}
+
 
 class AttentionMode(str, Enum):
     WINDOW = "window"

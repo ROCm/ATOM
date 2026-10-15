@@ -5,49 +5,107 @@
 `capture=True` also captures/replays the core when eligible. FULL/eager calls
 use `piecewise=False` and execute the original method directly.
 
-## Live prefill metadata interface
+## Declarative live prefill metadata
 
-Use `capture_prefill=True` and a metadata provider to opt into live prefill.
-The provider receives the layer and bound arguments, including defaults, and
-returns `PiecewiseMetadata` or `None` to fall back to eager execution. Put it
-on the model's existing metadata or attention class; no graph runner subclass
-or per-model capture-state class is needed.
+Use `capture_prefill=True` and a `metadata` dictionary. The decorator compiles
+it into the common `PiecewiseMetadataSchema`; models only declare their
+fields and rules. No per-model staging, reconstruction, publication method
+or graph runner subclass is needed.
 
 ```python
-from dataclasses import replace
 import torch
 from atom.utils.attn_ffn_piecewise import piecewise_core
-from atom.utils.piecewise_af import PiecewiseMetadata
 
-# Method on the model's existing metadata class:
-def piecewise_metadata(self, cache):
-    def rebuild(values):
-        return {"step": replace(self, **values, indices={})}
-
-    def publish(arguments):
-        self.indices.update(arguments["step"].indices)
-
-    return PiecewiseMetadata(
-        key=(self.is_decode, cache.pool.data_ptr()),
-        inputs={"positions": self.positions, "lengths": self.lengths},
-        rebuild=rebuild,
-        publish=publish,
-    )
-
-# Method on the model's existing layer:
 @piecewise_core(
     capture_prefill=True,
-    metadata=lambda layer, args: args["step"].piecewise_metadata(args["cache"]),
+    metadata={
+        "when": "step.enabled",
+        "key": ("step.is_decode", lambda s: s["cache"].pool.data_ptr()),
+        "objects": {
+            "step": {
+                "inputs": ("positions", "lengths"),
+                "reset": {"indices": {}},
+            },
+        },
+        "arguments": ("step",),
+        "publish": {"step.indices": "update"},
+    },
 )
 def attention_forward(self, x: torch.Tensor, step: BatchStep, cache: Cache):
     return self.attention(x, step, cache)
 
-# At the splitting boundary:
 result = layer.attention_forward(
     hidden, step, cache,
     piecewise=True, capture=True, forward_context=forward_context,
 )
 ```
+
+Selectors are dotted paths rooted at bound core arguments (including their
+defaults) or `layer`. Ordered `bindings` add reusable names. A callable taking
+that scope may express a model's host predicate or derived scalar, such as a
+KV pool address. Strings are field paths, never evaluated Python expressions.
+A path through `None` yields `None`; missing fields raise an error.
+
+| Declaration | Common behavior |
+|---|---|
+| `objects[name].source` | Live template path, defaulting to `name`; `None` creates no view. |
+| `inputs` | Names of fields to stage. Dict/list/tuple trees, tensor and scalar leaves are supported. |
+| `select` | Select dictionary fields with `{"keys": (selector, ...)}` or `{"suffix": selector}` and optional `when`. Missing requested keys fail; disabled selections are empty. |
+| `reset` | Fresh scalar/container values for derived fields on each warmup and recording, for example `{"indices": {}, "window": None}`. |
+| `bind` | Attach an earlier captured object by name, or use `{"object": name, "key": selector}` to attach a one-entry dictionary, empty if the object is `None`. |
+| `template` | Clone an earlier captured object, with inputs from this object's `source`; unchanged fields keep their aliases. |
+| `arguments` | Object names to pass as non-tensor keyword overrides to the core. |
+| `publish` | Field paths mapped to `update`, `replace`, `if_not_none`, or `{"keys": (selector, ...)}` for scoped dictionary writes. |
+| `when`, `key`, `memo`, `copy_each_call` | Eligibility, extra host decisions, optional per-forward copy memo and metadata paths refreshed on each call. |
+
+Objects are declared in dependency order. Dataclasses (including frozen
+ones), dictionaries and shallow-copyable attribute objects are supported.
+Undeclared fields stay on the template; all mutable derived fields that the
+core changes must be declared as `reset`, selected inputs or explicit aliases.
+Tensor inputs are read-only. Persistent device state such as a KV pool remains
+outside the staged input tree and its identity belongs in the key.
+
+For a subset view sharing the main step's result dictionaries:
+
+```python
+"objects": {
+    "step": {
+        "inputs": ("positions",),
+        "reset": {"selected": {}, "indices": {}},
+    },
+    "query_index": {
+        "source": "queries.index",
+        "template": "step",
+        "inputs": ("batch_ids",),
+    },
+    "queries": {
+        "inputs": ("rows",),
+        "bind": {"index": "query_index"},
+    },
+},
+"arguments": ("step", "queries"),
+"publish": {
+    "step.selected": {"keys": ("layer.layer_id",)},
+    "step.indices": "update",
+},
+```
+
+Warmup and recording get separate fresh dictionaries; each query index shares
+its dictionaries with its own captured step. Keyed publication skips absent
+outputs and preserves upstream entries in the current live request. Input
+layouts/scalars, object presence/types, attachment keys and publication keys
+are included in the graph key. Other host branches must be declared in `key`.
+
+Reconstruction runs only on a cache miss, once for warmup and once for
+recording. Replay refreshes tensors and publishes recorded results without
+rebuilding metadata. Schema compilation happens at decoration, not per step.
+
+## Runner and advanced callback interface
+
+A callable metadata provider remains supported for unusual cases. It receives
+`(layer, bound_arguments)` and returns `PiecewiseMetadata` or `None`. Prefer the
+schema for standard field selection, cloning and updates. The low-level
+callback contract below describes what the common schema implements.
 
 The decorator lazily owns a runner/output store per layer method. Supply a
 common `PiecewiseAFRunner` when sharing input storage across layers or using

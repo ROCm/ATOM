@@ -122,19 +122,21 @@ bounds, with the same shapes included in graph memory budgeting. For the
 ## AF buffers and metadata
 
 [`@piecewise_core`](piecewise_core.md) owns live AF capture and replay through
-the common `PiecewiseMetadata` interface. Models describe an input tree, host
-branch key, metadata reconstruction and result publication. The decorator
-stages inputs, keys layouts/scalars/direct-read addresses, bounds the cache and
-chooses warmup or recorded state for publication. No model-specific graph
-runner or capture-state class is required.
+the common `PiecewiseMetadataSchema` interface. Models declare input fields,
+host keys, fresh caches and publication rules in a dictionary. The common
+schema reconstructs capture views and updates current-request results; the
+runner stages inputs, keys layouts/scalars/direct-read addresses, bounds the
+cache and chooses warmup or recorded state for publication.
 
-V4.1 supplies this interface in `BatchStep.piecewise_metadata`, next to the
-metadata it describes. `Block.attention_forward` selects it in the decorator;
-the runtime calls that method directly with the common `PiecewiseAFRunner`.
-The declaration selects compression plans, upstream selections and subset
-queries, then publishes only this layer's top-k, candidate and index results.
-Query indices share derived dictionaries with the main step. The common
-engine has no V4.1 imports or metadata field names.
+V4.1 declares `PIECEWISE_ATTENTION_METADATA` in its existing `config.py` and
+passes it to the decorator on `Block.attention_forward`. There is no model
+reconstruction/publication method, graph runner subclass or capture-state
+class. The runtime calls the decorated method with the common
+`PiecewiseAFRunner`. Field selectors cover compression plans, upstream
+selections and subset queries. Keyed publication writes only this layer's
+top-k/candidate outputs; query-index templates share derived dictionaries
+with the captured main step. All of these operations are common schema
+features, with no V4.1 imports or field names in the implementation.
 
 AF follows V4's producer/consumer buffer policy. It directly reads a stable
 upstream dense-graph hidden tensor and writes the persistent output slot
@@ -178,6 +180,7 @@ Run the regression suite in an ATOM ROCm environment:
 
 ```bash
 python -m pytest -q \
+  tests/test_piecewise_metadata.py \
   tests/test_piecewise_af.py \
   tests/test_hybrid_cudagraph.py \
   tests/test_forward_mode.py \
