@@ -177,12 +177,21 @@ def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
 
 
-def test_a_kernel_no_rank_could_build_turns_mono_off(monkeypatch):
-    """``prepare`` is the TP-wide verdict: false on every rank, so every rank falls
-    back, now and for the steps after."""
+def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
+    """``prepare`` is the TP-wide verdict: false on every rank, so every rank
+    falls back.
+
+    Asserted as behaviour rather than on ``_mono.enabled``. A width refusal
+    stopped latching the flag in `3b50fa529` -- it is memoized per width
+    instead -- and the flag is still the right assertion for a *create*
+    refusal, which is why the sibling check in `test_native_monokernel`
+    keeps it. What a caller can observe here is that no width is served,
+    this step and the ones after, because this runner builds nothing.
+    """
     mono = _mono(monkeypatch, _forward_context(_decode_md(rows=16)), builds=False)
     assert not mono.supports(*_step(4), None, None)
-    assert not mono._mono.enabled
+    assert not mono.supports(*_step(4), None, None)  # the memoized refusal
+    assert not mono.supports(*_step(8), None, None)  # and any other width
 
 
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
