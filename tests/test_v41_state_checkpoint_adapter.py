@@ -157,7 +157,7 @@ def config(**overrides):
 
 
 def test_the_shipped_configuration_is_accepted():
-    adapter_mod.register_v41_state_checkpoint_adapter().check_images_supported(config())
+    adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(config())
 
 
 @pytest.mark.parametrize(
@@ -172,20 +172,20 @@ def test_the_shipped_configuration_is_accepted():
 )
 def test_each_unsupported_setting_is_refused(overrides, expected):
     with pytest.raises(ValueError, match=expected):
-        adapter_mod.register_v41_state_checkpoint_adapter().check_images_supported(
+        adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(
             config(**overrides)
         )
 
 
 def test_a_matching_prefix_match_unit_is_fine():
-    adapter_mod.register_v41_state_checkpoint_adapter().check_images_supported(
+    adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(
         config(prefix_match_unit=BLOCK)
     )
 
 
 def test_every_problem_is_reported_not_just_the_first():
     with pytest.raises(ValueError) as caught:
-        adapter_mod.register_v41_state_checkpoint_adapter().check_images_supported(
+        adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(
             config(mamba_cache_mode="none", prefix_match_unit=32)
         )
     assert "mamba_cache_mode" in str(caught.value)
@@ -193,7 +193,7 @@ def test_every_problem_is_reported_not_just_the_first():
 
 
 def test_a_missing_attribute_is_a_version_difference_not_a_refusal():
-    adapter_mod.register_v41_state_checkpoint_adapter().check_images_supported(
+    adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(
         SimpleNamespace(cache_config=SimpleNamespace())
     )
 

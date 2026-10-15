@@ -352,10 +352,10 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
     def checkpoint_defaults(self) -> tuple[int, bool]:
         return _native_checkpoint_defaults()
 
-    def drafter_state_in_image(self, vllm_config) -> bool:
+    def drafter_state_in_checkpoint(self, vllm_config) -> bool:
         return v41_drafter_in_target_slot(vllm_config)
 
-    def check_images_supported(self, vllm_config) -> None:
+    def check_state_checkpoints_supported(self, vllm_config) -> None:
         """Refuse at startup what this design cannot serve. Never degrade.
 
         Each clause is a configuration under which vLLM would offer a prefix
@@ -539,7 +539,7 @@ def install_v41_runner_state_events() -> int:
         original = getattr(cls, name, None)
         if original is None:
             continue
-        if getattr(original, "_atom_state_image_patched", False) or getattr(
+        if getattr(original, "_atom_state_checkpoint_patched", False) or getattr(
             original, "_atom_v41_state_events", False
         ):
             continue
@@ -559,11 +559,11 @@ def install_v41_runner_state_events() -> int:
             PSI._event_counts["resumed"] += len(resumed)
             PSI._store_plan.clear()
             PSI._store_plan.update(
-                getattr(scheduler_output, "atom_image_stores", None) or {}
+                getattr(scheduler_output, "atom_state_checkpoint_stores", None) or {}
             )
             PSI._decode_plan.clear()
             PSI._decode_plan.update(
-                getattr(scheduler_output, "atom_image_decode_candidates", None) or {}
+                getattr(scheduler_output, "atom_state_checkpoint_decode_candidates", None) or {}
             )
             copies = getattr(scheduler_output, "kv_cache_block_copies", None)
             if copies and PSI._config_has_proxy(getattr(self, "kv_cache_config", None)):
@@ -590,7 +590,7 @@ def install_v41_state_checkpoint_group_ids() -> int:
     Same gap as `install_v41_store_sites`, on a different site and with a
     worse failure: the vendored installer wraps
     `vllm.v1.worker.gpu_model_runner.GPUModelRunner.initialize_kv_cache` to
-    write `_atom_image_group_id`, but DeepSeek-V4.1 runs on the V2 runner, so
+    write `_atom_state_checkpoint_group_id`, but DeepSeek-V4.1 runs on the V2 runner, so
     the write never happened and the hook still reported success -- the image
     worker then refused to start, with the pool already sized for images.
 
@@ -618,7 +618,7 @@ def install_v41_state_checkpoint_group_ids() -> int:
                 for name in group.layer_names:
                     layer = sfc.get(name)
                     if isinstance(layer, PagedStateCheckpointLayer):
-                        layer._atom_image_group_id = gid
+                        layer._atom_state_checkpoint_group_id = gid
             return _orig(self, kv_cache_config, *args, **kwargs)
 
         initialize_kv_cache._atom_v41_image_gids = True
@@ -664,7 +664,7 @@ def install_v41_store_sites() -> int:
     for cls in gpu_model_runner_classes():
         original = getattr(cls, "_model_forward", None)
         if original is not None:
-            if getattr(original, "_atom_state_image_patched", False):
+            if getattr(original, "_atom_state_checkpoint_patched", False):
                 continue
             install_store_sites(cls)
             patched += 1
