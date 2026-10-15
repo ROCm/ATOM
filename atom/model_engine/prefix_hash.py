@@ -90,3 +90,22 @@ def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
         prompt_fingerprint(seq),
         array.array("Q", chain),
     )
+
+
+def take_shipped_chains(seqs) -> list | None:
+    """`seqs`' shipped chains, detached for the ADD frame that carries them
+    beside the seqs (a pickled `Sequence` drops its chain); None if none has
+    one. The frontend keeps no copy."""
+    chains = [getattr(seq, "prompt_hash_chain", None) for seq in seqs]
+    if not any(chains):
+        return None
+    for seq in seqs:
+        seq.prompt_hash_chain = None
+    return chains
+
+
+def attach_shipped_chains(seqs, chains=None) -> None:
+    """Hand an ADD frame's chains (`take_shipped_chains`) back to its seqs."""
+    if chains:
+        for seq, chain in zip(seqs, chains, strict=True):
+            seq.prompt_hash_chain = chain
