@@ -127,8 +127,9 @@ class _GlmFusedLayerOp:
 
     Index Q/K/W projection, paged FP8 index-cache update, scoring and top-k
     selection all run inside this one launch (``kernels/{kernel,layout,op}.py``,
-    vendored, not edited here; ``tp4_op.py`` is
-    the thin subclass that pins the TP4 positional API). Never built
+    vendored into this repo and maintained here since -- ``kernel.py``'s
+    index-cache writes were changed in this PR; ``tp4_op.py`` is the thin
+    subclass that pins the TP4 positional API). Never built
     unless ``envs.ATOM_GLM52_FUSED_INDEXER`` is on and
     ``atom.models.glm52.mono.config.fused_indexer_refusal`` returns None --
     see ``Glm52MonoRunner.__init__``. "Shared" layers always build

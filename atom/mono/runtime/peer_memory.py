@@ -181,10 +181,10 @@ class SymmetricPeerBuffer:
             if failed:
                 detail = "; ".join(f"rank {peer}: {error}" for peer, error in failed)
                 # MonoUnsupported, not RuntimeError: the GLM runner's _build
-                # catches (MonoUnsupported, ValueError) and LazyRunner catches
-                # MonoUnsupported, so an OOM or a failed IPC export here must
-                # disable mono, not take the server down with it. The old
-                # PeerBuffer raised MonoUnsupported for the same reason.
+                # and LazyRunner both route on MonoUnsupported, so an OOM or a
+                # failed IPC export here must disable mono, not take the server
+                # down with it. The old PeerBuffer raised MonoUnsupported for
+                # the same reason.
                 raise MonoUnsupported(
                     f"symmetric peer allocation/export failed: {detail}"
                 )

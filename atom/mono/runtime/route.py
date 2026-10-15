@@ -35,7 +35,13 @@ class LazyRunner:
             try:
                 self.runner = self._create()
             except MonoUnsupported as why:
-                logger.warning("%s off: %s", self.what, why)
+                # exc_info: a refusal raised deliberately carries no cause, but
+                # one converted from another failure (consensus.bind_agreed
+                # chains the original) would otherwise lose its traceback and
+                # read as a plain "mono is off" line.
+                logger.warning(
+                    "%s off: %s", self.what, why, exc_info=why.__cause__ is not None
+                )
                 self.enabled = False
                 return False
             logger.info("%s on", self.what)

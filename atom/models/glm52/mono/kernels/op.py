@@ -340,10 +340,10 @@ class Glm5MonoKernel:
             if failed:
                 self.scratch = None
                 self.step = None
-                # MonoUnsupported, not RuntimeError: `_build` catches
-                # (MonoUnsupported, ValueError), so a RuntimeError here skipped
-                # the uniform fallback this whole consensus exists to give and
-                # took the server down instead. Safe to fall back on because
+                # MonoUnsupported, not RuntimeError: `_build` routes on
+                # MonoUnsupported, so a RuntimeError here skipped the uniform
+                # fallback this whole consensus exists to give and took the
+                # server down instead. Safe to fall back on because
                 # the verdict is already agreed -- every rank sees the same
                 # `failed` list and raises together.
                 raise MonoUnsupported(

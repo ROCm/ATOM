@@ -312,7 +312,11 @@ if [[ "${ENABLE_MTP4_MONO}" == "1" ]]; then
     exit 2
   fi
   MTP_K=4
-  MTP_AL=3.61
+  # the golden AL for depth 4, per the table above. 3.61 is MTP5's, and
+  # pinning it on a 4-token draft forces more accepted tokens than the depth
+  # can produce -- which overstates the mono arm in the very A/B this flag is
+  # for. MTP_K and MTP_AL move together.
+  MTP_AL=3.33
   ATOM_MONO_ENABLE=1
 fi
 
