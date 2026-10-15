@@ -831,8 +831,17 @@ def _hf_context_len(config: Any) -> int:
     return max(explicit, int(factor * base))
 
 
+# id(atom_config) -> (atom_config, length). The config walk costs ~13 us and
+# runs on every decode replay and draft step. The checkpoint never changes,
+# and allocate_once already fixed the page tables to the first answer.
+_CHECKPOINT_CONTEXT_LEN: dict[int, tuple[Any, int]] = {}
+
+
 def _checkpoint_context_len(atom_config: Any) -> int:
     """Model context when ``--context-length`` was omitted."""
+    cached = _CHECKPOINT_CONTEXT_LEN.get(id(atom_config))
+    if cached is not None and cached[0] is atom_config:
+        return cached[1]
     hf = _hf_text_config(atom_config) if atom_config is not None else None
     root = getattr(atom_config, "hf_config", None) if atom_config is not None else None
     n = _hf_context_len(hf)
@@ -847,6 +856,7 @@ def _checkpoint_context_len(atom_config: Any) -> int:
             _positive_int(getattr(model_config, "context_len", None)),
             _hf_context_len(getattr(model_config, "hf_text_config", None)),
         )
+    _CHECKPOINT_CONTEXT_LEN[id(atom_config)] = (atom_config, n)
     return n
 
 

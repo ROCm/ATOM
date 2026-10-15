@@ -7,6 +7,7 @@ import torch
 
 from atom.plugin.sglang.attention_backend.backend_resolver import real_batch_size
 from atom.plugin.sglang.qwen4_exp_bridge import (
+    _CHECKPOINT_CONTEXT_LEN,
     _DECODE_GRAPH,
     _DRAFT_QSA,
     _NO_WRITE,
@@ -26,9 +27,11 @@ from atom.plugin.sglang.qwen4_exp_bridge import (
 def _reset_decode_graph():
     _DECODE_GRAPH.reset()
     _DRAFT_QSA.reset()
+    _CHECKPOINT_CONTEXT_LEN.clear()
     yield
     _DECODE_GRAPH.reset()
     _DRAFT_QSA.reset()
+    _CHECKPOINT_CONTEXT_LEN.clear()
 
 
 class _DecodeMode:
@@ -1269,3 +1272,23 @@ def test_graph_and_draft_pages_follow_checkpoint_context(monkeypatch):
     assert device == torch.device("cpu")
     bridge._ensure_draft_qsa(device, 64, bridge._serving_context_len(config, 2048))
     assert bridge._DRAFT_QSA.max_pages == 262144 // 64
+
+
+def test_checkpoint_context_resolved_once_per_config(monkeypatch):
+    """Every decode replay and draft step asks; only the first walks the config."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_server_args", lambda: None)
+    real = bridge._hf_context_len
+    walks = []
+    monkeypatch.setattr(bridge, "_hf_context_len", lambda c: walks.append(c) or real(c))
+    config = _flash_checkpoint_config()
+    assert bridge._serving_context_len(config, 2048) == 262144
+    first = len(walks)
+    assert first > 0
+    assert bridge._serving_context_len(config, 2048) == 262144
+    assert len(walks) == first
+
+    other = _flash_checkpoint_config(max_position_embeddings=32768)
+    assert bridge._serving_context_len(other, 2048) == 32768
+    assert len(walks) > first
