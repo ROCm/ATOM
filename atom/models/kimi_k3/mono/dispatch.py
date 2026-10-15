@@ -24,6 +24,7 @@ from torch import nn
 
 from atom.models.kimi_k3.mono.config import config_refusal
 from atom.models.kimi_k3.mono.plan import kda_metadata, step_shape
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
 
@@ -49,7 +50,16 @@ class MonoDecodeModel(nn.Module):
         # ``glm52/mono/kernels/__init__`` keeps its GPU wrappers lazy for
         # the same reason.
         def _build_runner():
-            from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+            # An absent FlyDSL must refuse, not raise: `LazyRunner.ready`
+            # catches only `MonoUnsupported`, so a bare ImportError here would
+            # escape it and abort the decode warmup instead of leaving the
+            # deployment on the production path. Converted at the import, which
+            # is before this runner reaches any collective, so every rank
+            # refuses at the same point.
+            try:
+                from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+            except ImportError as error:
+                raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
 
             return K3MonoDecodeRunner(model)
 

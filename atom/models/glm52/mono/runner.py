@@ -448,13 +448,20 @@ class Glm52MonoRunner:
             )
             return False
 
-        from atom.models.glm52.mono.kernels.op import prepare_glm5_weights
-
         mapped = []
         validation_error = None
         rank = self.rank
         npes = get_tensor_model_parallel_world_size()
         try:
+            # Imported inside the agreed-refusal path, not above it: an absent
+            # FlyDSL raises ImportError, and `_build`'s caller `prepare` is
+            # invoked outside `LazyRunner.ready`'s try, so raising from above
+            # here would abort the decode warmup instead of leaving the
+            # deployment on the production path. In here it becomes
+            # `validation_error` like any other local failure, is agreed across
+            # ranks below, and every rank refuses at the same point.
+            from atom.models.glm52.mono.kernels.op import prepare_glm5_weights
+
             bf16_vector(
                 self._lm.model.norm.weight, "model.norm.weight", self._shard.hidden
             )
