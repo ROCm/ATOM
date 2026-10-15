@@ -119,6 +119,7 @@ on:
             kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1-saves64,
             kimi-k3-mxfp4-agg-pp8-tp1-cg-agentic-lmcache-1m-c72-osl1-part12,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-agentic-lmcache-1m-c72,
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256

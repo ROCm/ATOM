@@ -1070,6 +1070,43 @@ models:
           run_eval: true
           eval_concurrency: [72]
 
+        # The cell above with yajizhan/k3-hc-dspark's C72 DSpark3 settings:
+        # three drafts at InferenceX's golden AL (3.00, forced), ReplaySSM on,
+        # the prefill GEMM bucket warmup, and a 96 GiB KDA state tier in a
+        # 224 GiB pool. Only the last prefill stage holds the drafter; the
+        # others relay its aux hidden states forward.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72
+          topology: 1p1d_pp8_dcp8
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3
+          concurrency: [72]
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+              method: dspark
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 3.00
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+          run_eval: true
+          eval_concurrency: [72]
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
