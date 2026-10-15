@@ -25,6 +25,8 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
 )
 from atom.plugin.vllm.state_slot_allocator import (
     SharedSlotLookup as _V4SharedSlotLookup,
+)
+from atom.plugin.vllm.state_slot_allocator import (
     StateSlotAllocator as _V4StateSlotAllocator,
 )
 
