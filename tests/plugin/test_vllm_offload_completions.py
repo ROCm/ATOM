@@ -36,6 +36,7 @@ class _FakeScheduler:
         self.loads: list[str] = []
         self.failed_loads: list[str] = []
         self.finished: list[str] = []
+        self.released: list[str] = []
         self.cancelled: list[str] = []
         self.defer = set(defer)
 
@@ -55,6 +56,9 @@ class _FakeScheduler:
 
     def request_finished(self, seq) -> None:
         self.finished.append(str(seq.id))
+
+    def source_blocks_released(self, seq) -> None:
+        self.released.append(str(seq.id))
 
     def cancel_pending_load(self, seq) -> None:
         self.cancelled.append(str(seq.id))
@@ -97,6 +101,10 @@ def _adapter(world_size: int = 1, defer=()) -> tuple[object, _FakeScheduler]:
     scheduler = _FakeScheduler(defer)
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
+    adapter._requests = {}
+    adapter._kda_planner = None
+    adapter._v41_planner = None
+    adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
     adapter._deferred_frees = set()
     adapter._deferred_free_at = {}
@@ -237,8 +245,10 @@ def test_a_deferred_free_is_released_once_the_save_lands():
     scheduler.defer.clear()
     assert adapter._collect_releases() == ["a"]
 
-    # The final `request_finished` is what pops ATOM's save tracker.
-    assert scheduler.finished == ["a", "a"]
+    # Completion and source release are distinct scheduler callbacks; the
+    # latter retires the save tracker once its blocks are safe to return.
+    assert scheduler.finished == ["a"]
+    assert scheduler.released == ["a"]
     assert len(adapter._seqs) == 0
     assert adapter._deferred_frees == set()
     # Released, but not yet freed: the worker still has to echo it back.
@@ -324,10 +334,23 @@ class _FakeWorker:
 def _worker_adapter(worker):
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
     adapter._worker = worker
+    # No recurrent tier on this worker, as in a real non-hybrid construction.
+    adapter._kv_cache_config = None
+    adapter._kda_tier = None
+    adapter._v41_slots = None
+    adapter._kda_error_blocks = set()
+    adapter._kda_error_reqs = set()
+    adapter._abandoned_loads = set()
+    adapter._abandoned_error_blocks = set()
+    adapter._pending_failed_recving = set()
     adapter._pending_release_ids = []
     adapter._worker_saved = {}
     adapter._worker_load_failed = {}
     adapter._worker_completions = []
+    adapter._worker_state_stored = {}
+    adapter._worker_state_store_failed = {}
+    adapter._worker_state_load_failed = {}
+    adapter._v41_refusals_to_report = {}
     return adapter
 
 
@@ -391,11 +414,19 @@ class _ParkScheduler:
         self.asked_park += 1
         return self._park
 
+    def last_load_skip_reason(self, req_id) -> str:
+        return "unknown"
+
 
 def _lookup_adapter(scheduler):
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)
+    adapter._config = SimpleNamespace(kv_cache_block_size=64)
     adapter._scheduler = scheduler
     adapter._seqs = SeqViewRegistry()
+    adapter._requests = {}
+    adapter._kda_planner = None
+    adapter._v41_planner = None
+    adapter._state_load_failure_reports = {}
     adapter._promised_loads = {}
     return adapter
 
@@ -458,7 +489,9 @@ def test_a_dispatched_load_is_not_reported():
     adapter.get_num_new_matched_tokens(_req("ok"), 0)
 
     adapter._check_promised_loads(
-        SimpleNamespace(requests=[SimpleNamespace(req_id="ok")])
+        SimpleNamespace(
+            requests=[SimpleNamespace(req_id="ok", load_operation=object())]
+        )
     )
 
     assert adapter._promised_loads == {}

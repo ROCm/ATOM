@@ -2,6 +2,7 @@
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -53,6 +54,76 @@ def _compress_plan_buffer_names(ratio):
         "write": f"v4_write_plan_{ratio}",
         "key_rope": f"v41_key_rope_positions_{ratio}",
     }
+
+def _staging_advances(staged) -> bool:
+    """Whether this step's Engram staging will advance the cursor itself.
+
+    The advance has to happen exactly once, down one path or the other.
+    `EngramStaging._advance_cursor` does it on the way past, and stands down on
+    a step carrying candidate cursors -- a verify step's cursor is the accepted
+    prefix's, which only the sampler knows.
+
+    Takes the `EngramStep`, which is the object that answers both halves. An
+    earlier version of this took the batch step instead and asked it for
+    `candidates`: both types carry that name, but the batch step's is the
+    indexer's per-layer block ids, a `dict` with a `default_factory`, so
+    `is None` was false for every step ever built. The gate was a constant,
+    and what it silently dropped was the `staged is None` test it had
+    replaced -- leaving the caller to advance a cursor the staging was about
+    to advance too.
+    """
+    if staged is None:
+        return False
+    return staged.candidates is None
+
+
+def build_v41_pool_geometry(
+    hf_config,
+    block_size: int,
+    *,
+    packed: bool,
+    speculative_tokens: int = 0,
+    index_fp4: bool = False,
+) -> V41PoolGeometry:
+    """The pool geometry a CSA2 configuration runs, from its text config alone.
+
+    The single authority for it. The pool is declared twice -- once by the
+    scheduler that sizes it and once by whoever hands the runtime its backing
+    store -- and the two only describe the same bytes if they derive the shape
+    the same way. The vLLM plugin sizes a proxy KV pool from here and the
+    native builder below builds its cache from here, so a change to the
+    topology reaches both or neither.
+
+    ``packed`` is the main pool's FP4 layout (native's ``kv_cache_dtype ==
+    "fp4"``), and ``speculative_tokens`` the draft width a verify step retains;
+    both move the geometry, so neither has a default that guesses.
+    """
+    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
+    return V41PoolGeometry(
+        len(topology)
+        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
+        tuple(
+            (spec.layer_id, spec.ratio)
+            for spec in topology
+            if spec.mode == AttentionMode.FULL
+        ),
+        block_size,
+        hf_config.sliding_window,
+        hf_config.head_dim,
+        hf_config.index_head_dim,
+        hf_config.engram_max_ngram_size - 1,
+        packed=packed,
+        speculative_tokens=speculative_tokens,
+        # Only the ratios the built layers run: a configuration with no
+        # window-only layer gets no buffer for one.
+        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
+        index_topk=hf_config.index_topk,
+        # Paged at the length candidates are picked in, which is what lets
+        # a candidate list be a block table. A GPU that cannot page that
+        # short refuses when asked, so there is nothing to pre-empt here.
+        index_block_rows=hf_config.candidate_block_size,
+        index_fp4=index_fp4,
+    )
 
 
 class DeepseekV41Backend(AttentionBackend):
@@ -120,9 +191,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
-        topology = build_attention_topology(self.config)[
-            : self.config.num_hidden_layers
-        ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         from atom.models.deepseek_v41.bounded_replay import (
@@ -138,28 +206,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "enable_decoder_swa_bounded_replay", False)
             and decoder_replay_unsupported(self.config) is None
         )
-        self.geometry = V41PoolGeometry(
-            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
-            tuple(
-                (spec.layer_id, spec.ratio)
-                for spec in topology
-                if spec.mode == AttentionMode.FULL
-            ),
+        self.geometry = build_v41_pool_geometry(
+            self.config,
             self.block_size,
-            self.config.sliding_window,
-            self.config.head_dim,
-            self.config.index_head_dim,
-            self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
             speculative_tokens=num_drafts,
-            # Only the ratios the built layers run: a configuration with no
-            # window-only layer gets no buffer for one.
-            layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-            index_topk=self.config.index_topk,
-            # Paged at the length candidates are picked in, which is what lets
-            # a candidate list be a block table. A GPU that cannot page that
-            # short refuses when asked, so there is nothing to pre-empt here.
-            index_block_rows=self.config.candidate_block_size,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
         )
         model_runner.forward_vars.update(
@@ -495,6 +546,64 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.engram = None
         self.release_kv_pools()
 
+    # Whether to render the stale-slot verdict in the step that asks for it.
+    # False is ATOM's own answer; a frontend that needs the other overrides
+    # the attribute rather than the method, so the env override below stays
+    # written once. See `_state_probe_blocking`.
+    _state_probe_blocking_default = False
+
+    def _state_probe_blocking(self) -> bool:
+        """Whether this step's stale-state verdict is rendered now or later.
+
+        `prepare_state` can ship the cursor rows asynchronously and judge them
+        a step later, which takes one blocking D2H (~58 us) off each decode
+        step. That deferred path is wrong under concurrency, and wrong in the
+        direction that costs most: it refuses correct state and takes the
+        engine down with it. Measured on the vLLM plugin, FULL_AND_PIECEWISE,
+        64 concurrent GSM8K requests, no KV connector of any kind:
+
+            needs state at 952, found 951
+
+        while the state-row dump for that same request, printed beside it,
+        reads `computed 953, cursor 953` -- self-consistent. The verdict is
+        rendered against a claim from one step and a `_probe` buffer that
+        later steps have already reused, so the two describe different
+        moments.
+
+        A guard, not a fix: the register slip in the deferred probe is still
+        not understood, and a check that fails closed on correct state is
+        worse than the microseconds it saves.
+
+        `ATOM_V41_BLOCKING_STATE_PROBE` overrides either way.
+        """
+        override = os.environ.get("ATOM_V41_BLOCKING_STATE_PROBE")
+        if override is not None and override != "":
+            return override not in ("0", "false", "False")
+        return self._state_probe_blocking_default
+
+    def _dummy_cache(self, pages, slots, running_tokens):
+        """Scratch for a dummy batch, allocated per call.
+
+        A dummy run must never touch a live PAGE or STATE slot, so it gets its
+        own cache, and allocating a fresh one each time is right here: it is
+        freed again immediately and nothing outlives the call that asked for
+        it. ATOM's own capture entry fabricates its batch with
+        ``is_dummy_run=False`` against the serving cache, so no graph ever
+        records an address of one of these.
+
+        A frontend whose captures do run dummy batches overrides this -- a
+        cache freed while a recorded kernel still holds its addresses is read
+        back as an illegal access on the first replay.
+        """
+        return PagedAttentionCache(
+            self.geometry,
+            pages,
+            slots,
+            self.device,
+            max_tokens=running_tokens,
+            workspace=self.score_workspace,
+        )
+
     def _prepare_idle(
         self,
         batch,
@@ -608,14 +717,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             else self._replay_layout(batch.replaying, scheduled, spans)
         )
         cache = (
-            PagedAttentionCache(
-                self.geometry,
-                max(next_page, 1),
-                max(len(spans), 1),
-                self.device,
-                max_tokens=running_tokens,
-                workspace=self.score_workspace,
-            )
+            self._dummy_cache(max(next_page, 1), max(len(spans), 1), running_tokens)
             if batch.is_dummy_run
             else self.cache
         )
@@ -1091,6 +1193,23 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
 
     def prepare_model_inputs(self, input_ids, metadata):
+        """One CSA2 step's host-side work: Engram rows, state, cursor.
+
+        Called by the metadata builder, before the forward and outside any
+        capture, which is what lets this model be captured at all. None of
+        this can be replayed from a graph -- the Engram row staging hashes
+        token ids, `prepare_state` resets the
+        slots this batch recycled, and `advance_cursor` writes the committed
+        position -- and it has to happen once, in order, per step.
+
+        It meets the decorator's contract without restructuring: it returns no
+        tensor and writes only into `forward_vars` buffers that were reserved
+        once and never reallocated, precisely so a replay (which reruns no host
+        code) finds the addresses its kernels recorded. See `_reserve_indptrs`.
+
+        Outside a capture context the decorator is identity, so the native
+        engine's path is unchanged.
+        """
         step, cache = metadata.step, metadata.cache
         # The rows the requests own, not the rows the forward runs: the padding
         # tail is zeroed inside `run_model`, after this, so what stands there
@@ -1108,7 +1227,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         histories = (
             np.full((step.scheduled_bs, self.geometry.history_size), -1, np.int64)
             if metadata.dummy
-            else cache.prepare_state(step, histories=not on_device)
+            else cache.prepare_state(
+                step, histories=not on_device or self._state_probe_blocking()
+            )
         )
         if self.engram is not None:
             prepared = self.engram.prepare(
@@ -1145,7 +1266,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif staged is None and not metadata.dummy and not step.tentative:
+        elif (
+            not metadata.dummy and not step.tentative and not _staging_advances(staged)
+        ):
+            # Owed to `EngramStaging.start` only when there is a staging to do
+            # it. The condition used to be `staged is None`, which assumed the
+            # two always travel together -- and where they did not, the step
+            # advanced nothing at all: no error, no trace, the request simply
+            # one behind its own position for the rest of its life. Measured
+            # under FULL_AND_PIECEWISE at 64 concurrent requests, where every
+            # step deferred to staging and the ones without it leaked an
+            # advance each ("needs state at 828, found 818").
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True

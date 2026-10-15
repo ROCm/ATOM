@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from contextlib import ExitStack
 from typing import Any
 
 import torch
@@ -31,7 +32,7 @@ _ATOM_OWNED_TP: Any | None = None
 _ATOM_INSTALLED_GROUPS: dict[str, Any] = {}
 
 
-def _create_aiter_device_communicator(vllm_tp: Any) -> Any:
+def _create_aiter_device_communicator(vllm_tp: Any, cleanup: ExitStack) -> Any:
     """Create AITER collectives without creating a duplicate PyNccl communicator."""
     from aiter.dist.device_communicators.base_device_communicator import (
         DeviceCommunicatorBase,
@@ -60,6 +61,13 @@ def _create_aiter_device_communicator(vllm_tp: Any) -> Any:
             self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             self.use_torch_symm_mem = False
             self.pynccl_comm = pynccl_comm
+            # PyNccl and ProcessGroups are borrowed, but ca/qr are ours. The
+            # parent destroy only drops PyNccl's reference; it never closes it.
+            self._owns_comms = True
+            self.ca_comm = None
+            self.qr_comm = None
+            self.symm_mem_comm = None
+            cleanup.callback(self.destroy)
             self.ca_comm = (
                 CustomAllreduce(group=self.cpu_group, device=self.device)
                 if self.use_custom_allreduce and self.world_size > 1
@@ -70,22 +78,16 @@ def _create_aiter_device_communicator(vllm_tp: Any) -> Any:
                 if self.world_size > 1
                 else None
             )
-            self.symm_mem_comm = None
 
     return ReusedPyNcclCudaCommunicator()
 
 
-def _create_aiter_tp_adapter_from_vllm() -> Any:
+def _create_aiter_tp_adapter_from_vllm(vllm_tp: Any, cleanup: ExitStack) -> Any:
     """Create aiter-compatible TP adapter using vLLM's TP groups and aiter's ca_comm."""
-    import vllm.distributed.parallel_state as vllm_ps
-
-    vllm_tp = vllm_ps.get_tp_group()
     if vllm_tp.world_size == 1:
         return None
 
-    from aiter.dist.parallel_state import _register_group
-
-    device_communicator = _create_aiter_device_communicator(vllm_tp)
+    device_communicator = _create_aiter_device_communicator(vllm_tp, cleanup)
 
     if device_communicator.ca_comm is None or device_communicator.ca_comm.disabled:
         logger.warning(
@@ -106,7 +108,9 @@ def _create_aiter_tp_adapter_from_vllm() -> Any:
             # Skip GroupCoordinator.__init__ (it creates new ProcessGroups).
             # Set attributes directly to match what parent expects.
             self.unique_name = "tp:0"
-            _register_group(self)
+            self._owns_cpu_group = False
+            self._owns_device_group = False
+            self._owns_device_communicator = True
             self.rank = vllm_tp.rank
             self.local_rank = vllm_tp.local_rank
             self.ranks = vllm_tp.ranks
@@ -283,24 +287,74 @@ def init_aiter_dist_from_vllm(tensor_model_parallel_size: int) -> bool:
 
     Returns True if reuse succeeded, False if fallback to init_aiter_dist is needed.
     """
-    try:
-        import vllm.distributed.parallel_state as vllm_ps
+    import vllm.distributed.parallel_state as vllm_ps
+    from aiter.dist import parallel_state as aiter_ps
 
-        adapter = _create_aiter_tp_adapter_from_vllm()
-        if adapter is None:
+    vllm_tp = vllm_ps.get_tp_group()
+    existing = getattr(vllm_tp, "_atom_aiter_tp_adapter", None)
+    if existing is not None:
+        if aiter_ps._TP is existing and not getattr(existing, "_atom_closing", False):
+            return True
+        raise RuntimeError(
+            "Cannot reinitialize an AITER TP adapter after replacement/close"
+        )
+
+    # Cleanup is outside the fallback handler: failed cleanup must propagate,
+    # not create a second group on top of resources we could not release.
+    with ExitStack() as cleanup:
+        try:
+            adapter = _create_aiter_tp_adapter_from_vllm(vllm_tp, cleanup)
+            if adapter is None:
+                return False
+            groups = {
+                "_TP": adapter,
+                "_PP": vllm_ps.get_pp_group(),
+                "_DP": vllm_ps.get_dp_group(),
+                "_EP": getattr(vllm_ps, "_EP", None),
+            }
+            _setup_ca_comm_signal(adapter, tensor_model_parallel_size)
+            aiter_ps.set_custom_all_reduce(True)
+        except Exception as e:
+            logger.warning(
+                "ATOM tp_group_reuse failed (%s), caller will fall back to standard "
+                "aiter distributed initialization (e.g., via aiter.init_dist_env(...))",
+                e,
+                exc_info=True,
+            )
             return False
 
-        from aiter.dist import parallel_state as aiter_ps
+        original_destroy = vllm_tp.destroy
+        plugin_closed = owner_closed = False
+        owner_result = None
 
-        aiter_ps._TP = adapter  # type: ignore[attr-defined]
-        aiter_ps._PP = vllm_ps.get_pp_group()  # type: ignore[attr-defined]
-        aiter_ps._DP = vllm_ps.get_dp_group()  # type: ignore[attr-defined]
-        aiter_ps._EP = getattr(
-            vllm_ps, "_EP", None
-        )  # EP may not exist in all vLLM configs
-        _setup_ca_comm_signal(adapter, tensor_model_parallel_size)
+        @functools.wraps(original_destroy)
+        def destroy(*args, **kwargs):
+            nonlocal plugin_closed, owner_closed, owner_result
+            if not plugin_closed:
+                adapter._atom_closing = True
+                # vLLM reaches TP.destroy after synchronizing the runner and
+                # clearing its graphs. Close our IPC buffers while its borrowed
+                # communicators/groups still exist. On failure, retain both the
+                # globals and owner so close can be retried without double-free.
+                adapter.destroy()
+                for name, group in groups.items():
+                    if getattr(aiter_ps, name, None) is group:
+                        setattr(aiter_ps, name, None)
+                plugin_closed = True
+                logger.info("ATOM plugin: closed reused AITER TP collectives")
+            if not owner_closed:
+                owner_result = original_destroy(*args, **kwargs)
+                owner_closed = True
+            return owner_result
 
-        from aiter.dist.parallel_state import set_custom_all_reduce
+        # Publish only after setup succeeds. Never call AITER's global destroy:
+        # PP/DP/EP are bare borrowed vLLM groups, not owned adapters.
+        aiter_ps._register_group(adapter)
+        vllm_tp.destroy = destroy
+        vllm_tp._atom_aiter_tp_adapter = adapter
+        for name, group in groups.items():
+            setattr(aiter_ps, name, group)
+        cleanup.pop_all()
 
         set_custom_all_reduce(True)
 

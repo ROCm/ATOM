@@ -79,7 +79,17 @@ def get_current_input_batch():
     Callers must treat None as "fall back to the device-side tensors", and must
     not hold the reference past the call that exposed it.
     """
-    return getattr(_req_id_local, "input_batch", None)
+    batch = getattr(_req_id_local, "input_batch", None)
+    if batch is None or hasattr(batch, "block_table"):
+        return batch
+    tables = getattr(_req_id_local, "block_tables", None)
+    if tables is None:
+        return batch
+    view = getattr(_req_id_local, "input_batch_view", None)
+    if view is None or view._batch is not batch or view._tables is not tables:
+        view = _V2InputBatchView(batch, tables)
+        _req_id_local.input_batch_view = view
+    return view
 
 
 def get_current_req_ids() -> list[str] | None:

@@ -64,6 +64,7 @@ def _adapter(monkeypatch, calls, *, min_load):
     adapter._promised_loads = {}
     adapter._requests = {}
     adapter._kda_planner = None
+    adapter._v41_planner = None
     adapter._attn_group_id = 0
     return adapter
 
@@ -181,7 +182,7 @@ def test_a_repeatedly_answered_promise_does_not_cry_wolf(caplog):
     assert "cannot be released" not in caplog.text
     # One, not zero: the last step re-promised and the watchdog then aged that
     # promise once. It never gets further than that, which is the point.
-    assert adapter._promised_loads == {"r0": 1}
+    assert adapter._promised_loads == {"r0": [1, 0, HIT]}
 
 
 def test_admission_spends_the_memo():

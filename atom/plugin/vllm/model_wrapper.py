@@ -360,6 +360,31 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _maybe_register_v41_state_images(vllm_config) -> None:
+    """Register the V4.1 checkpoint-image layers, behind a switch, off by default.
+
+    Off until the binding question is settled by measurement rather than by a
+    model of it: the layers change how vLLM sizes and splits the pool, so a
+    run with them registered is not the run every other measurement on this
+    branch was taken on. `ATOM_V41_STATE_IMAGES=1` turns them on.
+
+    The layers themselves, their count and their spec all come from
+    `paged_state_checkpoint` through the V4.1 adapter -- there is no second sizing
+    here any more. The alignment knob is gone with it: the mechanism's layers
+    take the adapter's block size, which is the grid vLLM's own validity test
+    measures against.
+    """
+    import os
+
+    if os.environ.get("ATOM_V41_STATE_IMAGES") not in ("1", "true", "True"):
+        return
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_deepseek_v41_state_checkpoint_layers,
+    )
+
+    register_deepseek_v41_state_checkpoint_layers(vllm_config)
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 

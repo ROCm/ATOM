@@ -321,32 +321,167 @@ silently if they are wrong:
   would mean this model is not on the kernel-block path and the check above is
   the one that matters.
 
-## Client
+## Multiprocess tier (alternative to the in-process connector)
 
-The workload is an **agentic trace replay**, not a synthetic prefix pool — there
-is no `--prompt-prefix-pool-size` to reason about, and reuse comes from the
-trace's own multi-turn structure. Identical on both arms:
+Everything above pins the CPU tier inside each TP worker through
+`AtomLMCacheOffloadConnector`. LMCache can instead hold the tier in a separate
+process that every worker reaches over ZMQ. The model, the quantisation and the
+client are unchanged; three things move.
+
+**1. Start the tier before the server.**
 
 ```bash
-aiperf profile --scenario inferencex-agentx-mvp \
-  --public-dataset semianalysis_cc_traces_weka_062126 \
-  --url "http://127.0.0.1:8713" --endpoint /v1/chat/completions \
-  --endpoint-type chat --streaming --model "${MODEL}" \
-  --concurrency 16 --benchmark-duration 1800 --random-seed 1234 \
-  --num-dataset-entries 800 --max-context-length 65536 \
-  --warmup-requests-per-lane 10 --warmup-grace-period 1800 \
-  --trajectory-start-min-ratio 0.25 --trajectory-start-max-ratio 0.75 \
-  --trace-idle-gap-cap-seconds 300 --use-server-token-count \
-  --tokenizer "${MODEL}" --tokenizer-trust-remote-code \
-  --server-metrics "http://127.0.0.1:8713/metrics" --no-gpu-telemetry
+LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5555 --chunk-size 1536 \
+  --l1-size-gb 720 --l1-init-size-gb 600 --l1-align-bytes 16384 \
+  --eviction-policy LRU \
+  --max-gpu-workers 8 --max-cpu-workers 8 \
+  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
+# wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
 ```
 
+Four of those flags are sized rather than copied:
 
-### The second client: a controlled-prefix synthetic pool
+* `--max-gpu-workers` / `--max-cpu-workers` must be **TP**, not the default 1.
+  One worker thread per pool serialises every STORE/RETRIEVE (GPU pool) and
+  every LOOKUP (CPU pool) across all eight ranks.
+* `--l1-init-size-gb` pre-reserves the pinned pool at startup instead of growing
+  it during the run. Size it to the tier's steady-state footprint, which the
+  `/status` endpoint reports as `memory_used_bytes` once the run has plateaued
+  (234 GB on the arm below); the 600 here is what was measured and is larger
+  than needed.
+* `--l1-align-bytes 16384` aligns tier objects to the DMA granularity.
 
-*A controlled-prefix client* under *Measured* used this instead. It exists
-because the trace replay above puts its reuse **inside** HBM, so it cannot
-measure the tier; here the reuse distance is a chosen number.
+`--chunk-size` must equal the effective KV block (1536 on K3), exactly as
+`LMCACHE_CHUNK_SIZE` did. `--l1-size-gb` is the **whole** tier, not a per-rank
+share: an in-process `LMCACHE_MAX_LOCAL_CPU_SIZE=N` at TP8 is the same capacity
+as `--l1-size-gb 8N`, so the 720 above is the 90 GiB/rank the throughput arms
+use.
+
+**2. Swap the connector.** Replace the `--kv-transfer-config` from the Server
+section with:
+
+```
+--kv-transfer-config '{"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555,"lmcache.mp.eager_prefetch":true,"lmcache.mp.lazy_offload":true}}'
+```
+
+Both `lmcache.mp.*` booleans default to **false** and both are load-bearing:
+`eager_prefetch` submits the tier lookup when the request arrives instead of
+waiting for the scheduler to poll for it, and `lazy_offload` moves the store
+submission out of the forward pass. Neither prints an `lmcache.mp.X = ...` line
+at startup — confirm them in the server log's
+`kv_connector_extra_config={...}` echo instead.
+
+**3. Drop the environment that no longer applies.** `LMCACHE_*` are not read in
+MP mode and `OFFLOAD_*` belong to `AtomLMCacheOffloadConnector`. Unset them
+rather than leaving them set, where they read as load-bearing but are not.
+
+### Verifying an MP run
+
+The `Stored`/`Retrieved` counters in the worker log are **structurally zero**
+here -- the worker never touches the tier -- so the checks from
+[Verify it booted right](#verify-it-booted-right) do not transfer. Use instead:
+
+```bash
+curl -s http://127.0.0.1:8080/status | python3 -m json.tool
+```
+
+* `storage_manager.l1_manager.total_object_count` and `memory_used_bytes` rising
+  across a run is the tier taking writes.
+* `memory_total_bytes` is **not** the capacity -- the pinned pool is grown on
+  demand, so it climbs toward the ceiling during warmup. The ceiling is
+  `memory_configured_bytes`.
+* `storage_manager.l1_eviction_controller.trigger_watermark` (0.8) is the
+  fraction of `memory_configured_bytes` at which LRU starts evicting.
+
+Server-side hit accounting still comes from vLLM:
+
+```bash
+curl -s http://127.0.0.1:8331/metrics | grep -E '^vllm:external_prefix_cache_(hits|queries)_total'
+```
+
+Note that this arm does **not** exercise the staging fence or the lookup memo,
+both of which live in `AtomLMCacheOffloadConnector`.
+
+### ATOM MP backend (`atom.offload.backend: mp`)
+
+`LMCacheMPConnector` above is LMCache's own connector: it replaces
+`AtomLMCacheOffloadConnector` outright, and with it the staging fence, the
+lookup memo and K3's recurrent-state leg. The alternative is to keep
+`AtomLMCacheOffloadConnector` and move only its *KV tier* into the
+`lmcache server` process, by setting `atom.offload.backend` to `mp`. K3's
+recurrent state stays on a per-rank in-process pool, which is what
+`lmcache.mp.state_transport: own-pool` selects.
+
+**1. Start the tier.** Same binary as above, different flags — this backend
+needs the shared-memory pool, and the SHM pool is incompatible with LMCache's
+default lazy L1 allocator:
+
+```bash
+LMCACHE_DISABLE_BANNER=1 lmcache server \
+  --host localhost --port 5555 --chunk-size 1536 \
+  --l1-size-gb 192 --eviction-policy LRU \
+  --supported-transfer-mode auto --shm-name k3mp_5555 --no-l1-use-lazy \
+  --max-gpu-workers 8 \
+  --http-host 127.0.0.1 --http-port 8080 --prometheus-port 9000
+# wait for http://127.0.0.1:8080/healthcheck to answer before starting vLLM
+```
+
+* `--no-l1-use-lazy` is not optional. With the default lazy allocator
+  `_compute_shm_pool_info` returns an empty pool, an empty pool silently
+  selects `PickleTransferStrategy`, and every chunk then travels over ZMQ —
+  the run measures the fallback rather than the path. `--shm-name` is
+  likewise inert under the default, with no warning.
+* The server drops SHM silently if `/dev/shm` cannot hold `--l1-size-gb`.
+  Grep `mpserver.log` for that warning rather than assuming.
+* `--l1-size-gb` is the whole tier, not a per-rank share.
+
+**2. Keep the ATOM connector, add the backend key.**
+
+```
+--kv-transfer-config '{"kv_connector":"AtomLMCacheOffloadConnector","kv_connector_module_path":"atom.plugin.vllm.kv_transfer.connector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"atom.offload.backend":"mp","lmcache.mp.host":"tcp://localhost","lmcache.mp.port":5555,"lmcache.mp.state_transport":"own-pool","lmcache.mp.state_cpu_size_gb":24,"lmcache.mp.tp_rank_collapse":true}}'
+```
+
+* `lmcache.mp.tp_rank_collapse` makes the eight ranks publish one replicated
+  KV object instead of eight per-rank ones. Without it the tier holds eight
+  copies of the same bytes and the effective capacity is `--l1-size-gb / TP`.
+* `lmcache.mp.state_cpu_size_gb` is **per rank** (the state tier is still
+  in-process), unlike `--l1-size-gb`.
+* `LMCACHE_*` are not exported in this mode — the tier process parses its own
+  storage options from its command line. `OFFLOAD_*` still apply, because the
+  connector is still ATOM's.
+
+**3. Transfer mode.** `lmcache.mp.mp_transfer_mode` picks which process owns
+the gather/scatter kernels: `lmcache_driven` (the default) runs them in the
+`lmcache server` process, `engine_driven` runs them in the TP worker. Both are
+correct; `lmcache_driven` is what the numbers below use.
+
+### Verifying an ATOM MP run
+
+The worker's `Stored`/`Retrieved` lines are zero here, same as for
+`LMCacheMPConnector`, so read the tier from its own endpoint and the hit
+accounting from vLLM:
+
+```bash
+curl -s http://127.0.0.1:8080/status | python3 -m json.tool   # objects, bytes
+curl -s http://127.0.0.1:8331/metrics | \
+  grep -E '^vllm:external_prefix_cache_(hits|queries)_total'
+```
+
+* `storage_manager.l1_manager.total_object_count` rising across the run is the
+  tier taking writes; `write_locked_count` must stay **0**. A non-zero
+  `write_locked_count` means a store failed and orphaned its object, and the
+  tier fills with objects that can never be read or evicted.
+* `grep -c 'ATOM LMCache offload: publishing PAGE layout' server.log` must be
+  TP (8), and the recurrent-state leg must report `state tier up` once per rank.
+
+## Client
+
+A controlled-prefix synthetic pool, run once per concurrency rung of the sweep
+under *Measured* with `--concurrency` set to the row (16, 20, 24, 32) and
+everything else held byte-for-byte. The reuse distance has to be a *chosen*
+number for the tier to be measurable at all — a trace replay puts its reuse
+inside HBM and never asks the tier. Identical on both arms:
 
 ```bash
 aiperf profile --url "http://127.0.0.1:8713" \
@@ -374,244 +509,164 @@ ends do not land on prefix boundaries.
 `--max-context-length` is deliberately **not** passed: aiperf implements it only
 for trace datasets and rejects it on a synthetic one.
 
-`--num-dataset-entries 800` is sized to the window, not copied from a shorter
-run: 900 s drew 416 records against 400 entries, already at the replay edge, so
-doubling the duration without doubling the pool would have replayed prompts and
-inflated the late window on both arms.
+Four of these flags are load-bearing and none is cosmetic:
 
-Four of these are load-bearing and none is cosmetic:
-
-* `--random-seed` fixes the replay, so both arms draw the same trajectories.
-  Pass it explicitly; a default would let the arms diverge silently.
+* `--random-seed` fixes the dataset, so both arms replay the same prompts. Pass
+  it explicitly; a default would let the arms diverge silently.
 * `--use-server-token-count` makes every hit rate below a ratio of two
   server-side counters rather than of a client-side estimate, so the
   denominator cannot drift between arms.
-* `--max-context-length 65536` must equal the server's `--max-model-len`. This
-  trace's input sequences run past it (median ISL ~74k against a 65,536
-  window), so the two numbers disagreeing truncates the workload asymmetrically
-  rather than the pool.
-* `--warmup-requests-per-lane 10` is a **count** budget, not a time budget, and
-  `--warmup-grace-period` does not cap it. At this ISL warmup ran for minutes;
-  it is excluded from the exported records (`benchmark_phase`) and must not be
-  extrapolated into the measured window.
+* `--osl-stddev 0` with `ignore_eos:true` pins every response at exactly 512
+  tokens; otherwise the length distribution contaminates ITL and throughput.
+* `--num-dataset-entries 256` is sized to the window rather than copied from a
+  shorter run: a pool that the duration exhausts replays prompts and inflates
+  the late window on both arms.
 
 `--enable-prompt-tokens-details` is in the launch above. Without it
 `usage.prompt_tokens_details.cached_tokens` is absent from every exported
 record, aiperf's own prompt-cache columns come back empty, and it says so at the
-foot of its summary. The pair in *Measured* ran without it, which is why every
+foot of its summary. The arms in *Measured* ran without it, which is why every
 hit rate there is read from the server's `/metrics` instead. Whichever way you
 go, set it on both arms — never on one.
 
 ## Measured
 
-A matched ON/OFF pair, back to back in the same slot, TP8 on MI355, 1800 s per
-arm, conc 16, seed 1234, 800 client entries. This pair **is** the launch in
-*Server*: no `--num-gpu-blocks-override`, `LMCACHE_MAX_LOCAL_CPU_SIZE=64`,
-`LMCACHE_CACHE_POLICY=ATOM_SLRU` (read back from the rank-0 config dump, not
-from the launch env), `--enable-prompt-tokens-details` on. The arms differ in
-exactly one thing: whether the connector is loaded. That is checked rather than
-asserted — the pair check reads the effective tier out of each arm's **log**
-and diffs every other knob.
+All numbers below were taken on the PR #2369 tree, vLLM 0.28
+plugin path, image `rocm/atom-dev:vllm-0.28.0`, TP8 on eight gfx950 GPUs.
 
-Both arms ran `atom_head=cd4c5153c`. One uncontrolled difference is recorded
-rather than hidden: `atom_dirty` was 0 on ON and 1 on OFF, because this recipe
-file itself was edited between the arms. The dirty path is
-`recipes/atom_vllm/Kimi-K3-LMCache-Byte-Offload.md` — documentation, no code.
+### Throughput and latency
 
-### The result: no measurable difference
+Matched ON/OFF pairs, 1800 s per arm, one arm at a time in the same slot, arm
+order alternated within each pair. Client: the controlled-prefix synthetic pool
+from *Client* above — `PREFIX_LEN=27648`, `GEN_ISL=4608`, `GEN_OSL=512`,
+`PREFIX_POOL=16`, `ENTRIES=256`, `SEED=530419`, `--max-model-len 65536`. Server:
+the launch in *Server*, tier 90 GiB/rank, `LMCACHE_CHUNK_SIZE=1536`,
+`LMCACHE_CACHE_POLICY=ATOM_SLRU`. The two arms differ in exactly one knob —
+whether the connector is loaded — and every other knob is diffed out of the two
+arms' `run.env` rather than assumed equal.
 
-| full window, 1800 s | req/s | out tok/s | TTFT p50 / p90 | ITL p50 / p90 | preempt | n |
-|---|---|---|---|---|---|---|
-| OFF | 0.2645 | 116.26 | 519 / 1156 ms | 16.46 / 28.52 ms | 0 | 484 |
-| ON | 0.2650 | 119.84 | 543 / 1225 ms | 16.68 / 29.23 ms | 0 | 485 |
-| | +0.21% | +3.08% | +4.4% / +6.0% | +1.3% / +2.5% | | |
-
-**Do not read +3.08% as a gain.** Two rulers over the same two arms straddle
-zero: aiperf's own `req/s` gives **+0.21%**, and recomputing the rate over each
-arm's first-to-last record span gives **−3.73%** (the arms' record spans are
-not equal). With `n=1` per arm and no noise floor, the *sign* is undetermined.
-The honest reading is that the tier changed nothing measurable here.
-
-The validity control also fails, so no steady-state row is quoted either: the
-start-cut sweep is licensed only when the OFF arm is flat, and OFF drifts
-−6.58% across cuts (ON −9.11%). The ON/OFF ratio stays negative at every cut
-(−1.7% to −6.3%), which is at least consistent — it does not turn positive if
-you pick a later window.
-
-### Why the tier had nothing to do
-
-`vllm:prompt_tokens_by_source_total`, whose three components sum to
-`vllm:prompt_tokens_total` exactly on both arms:
-
-| source | OFF | ON |
-|---|---|---|
-| `local_compute` | 4,074,976 (14.89%) | 3,969,906 (14.65%) |
-| `local_cache_hit` | 23,288,832 (85.11%) | 23,049,216 (85.05%) |
-| `external_kv_transfer` | 0 | **81,408 (0.30%)** |
-| total | 27,363,808 | 27,100,530 |
-
-**The unpinned HBM pool already answers 85.05% of prompt tokens by itself.** On
-the plugin path vLLM asks the connector only about what the pool missed, so the
-tier's entire addressable market is the remaining 14.9% — and within that miss
-tail it answered **2.01%**. Prefill recompute moved 14.89% → 14.65%, i.e. by
-0.24 pp.
-
-This is the structural point of this configuration, and it is not a tier-sizing
-problem. Compare the pinned-pool pair at the end of *Sizing the tier*: with the
-pool cut to 320 blocks the same tier supplied **44.12%** of prompt tokens and
-bought +10.81% req/s. Same model, same client, same connector — the only
-difference is how much of the working set HBM was allowed to keep. **The tier's
-power is set by the HBM pool, not by `LMCACHE_MAX_LOCAL_CPU_SIZE`.**
-
-### The instruments agreed, for once
-
-| ruler | ON | meaning |
-|---|---|---|
-| `vllm:external_prefix_cache_hits` | 81,408 | what scheduler-side lookup **promised** |
-| LMCache `Retrieved` sum / TP=8 | 81,408 | what the ranks **delivered** |
-| `prompt_tokens_by_source` external | 81,408 | what the engine **counted** |
-
-Gap 0 on both hops: 392 retrieve lines, all full, no partials, and
-`Sum(required − retrieved)` is 0 — no chunk was evicted between lookup and
-load, so `kv_load_failure_policy: recompute` was never exercised. On the OFF
-arm every external counter is exactly 0, which is the control this pair needs.
-
-`Failed to allocate memory block ... no memory is available` appears 1,992
-times on the ON arm. Read it against *Sizing the tier* rather than as an
-under-size verdict: the per-request cache-bust tails are stored, never reused,
-and evicted, which is what the tier should do with them. The reusable set here
-is 30.5 GiB/rank and the tier was 64.
-
-**Cost of this configuration.** Pre-allocating 8 x 64 GiB of pinned host memory
-took about 30 minutes, with host `MemFree` falling 838 → 191 GiB. That is the
-real gate at TP8, and it is why GLM-5.3's 256 GiB/rank cannot be copied across
-(see *Sizing the tier*).
-
-**Throughput is all that was measured; accuracy was not.** When it is run, use
-the two-pass method: a single SAVE-only pass measures nothing, so salt the
-prefixes to defeat the GPU prefix cache, size the HBM pool below the working
-set to force read-back, and take the noise floor from the OFF arm's own
-two-pass delta. The baseline to beat is the one in
-[Kimi-K3.md](Kimi-K3.md#accuracy-validation).
-
-### A second working point: a controlled-prefix client (2026-09-22)
-
-The null above is a property of that **client**, not of the tier. Re-measured at
-the same natural 0.85 pool with a controlled-prefix synthetic workload, the tier
-goes from supplying 0.30% of prompt tokens to supplying **82-88%**, and throughput
-moves with it. Each row is 1800 s, TP8, seed 530419, `PREFIX_POOL=16`,
-`--prompt-prefix-length 27648`, `--num-dataset-entries 256`, tier **90 GiB/rank**,
-n=1.
-
-| conc | arm | requests | req/s | out tok/s | ITL p50 (ms) | TTFT mean (ms) | tier % of prompt tok | HBM hit % |
+| conc | arm | tok/s/GPU | req/s | TTFT p50/p90 (ms) | ITL p50/p90 (ms) | HBM hit | tier share | n |
 |---|---|---|---|---|---|---|---|---|
-| 16 | ON  | 2226 | 1.23 | 630.12 | 23.17 |  836.08 | 81.62 | 11.08 |
-| 16 | OFF | 1847 | 1.02 | 522.66 | 28.55 |  953.84 |  0    | 79.83 |
-| 20 | ON  | 2320 | 1.28 | 655.98 | 27.99 |  780.81 | 82.01 | 10.82 |
-| 20 | OFF | 1895 | 1.05 | 536.43 | 35.07 | 1018.62 |  0    | 79.86 |
-| 24 | ON  | 2707 | 1.50 | 766.07 | 28.59 |  909.09 | 82.65 | 10.42 |
-| 24 | OFF | 2118 | 1.17 | 599.62 | 37.74 | 1105.80 |  0    | 79.93 |
-| 32 | ON  | 3028 | 1.67 | 856.28 | 34.55 |  989.26 | 87.73 |  5.70 |
-| 32 | OFF | 2283 | 1.26 | 646.09 | 47.00 | 1288.97 |  0    | 80.04 |
+| 16 | OFF | 65.24 | 1.0194 | 629/1182 | 28.66/30.84 | 79.82% | 0.00% | 1843 |
+| 16 | ON | 85.05 | 1.3289 | 670/879 | 20.96/25.46 | 10.65% | 82.19% | 2403 |
+| 16 | delta | **+30.36%** | +30.36% | +6.44%/-25.67% | -26.87%/-17.44% | | | |
+| 20 | OFF | 66.91 | 1.0455 | 642/1307 | 35.19/37.70 | 79.89% | 0.00% | 1890 |
+| 20 | ON | 88.28 | 1.3794 | 586/873 | 25.76/29.39 | 9.36% | 83.60% | 2493 |
+| 20 | delta | **+31.93%** | +31.93% | -8.69%/-33.15% | -26.82%/-22.02% | | | |
+| 24 | OFF | 75.25 | 1.1758 | 777/1443 | 37.47/40.54 | 79.93% | 0.00% | 2127 |
+| 24 | ON | 103.27 | 1.6136 | 682/948 | 26.32/29.40 | 8.21% | 85.08% | 2918 |
+| 24 | delta | **+37.23%** | +37.23% | -12.25%/-34.32% | -29.74%/-27.49% | | | |
+| 32 | OFF | 80.78 | 1.2622 | 792/1457 | 46.90/50.30 | 80.02% | 0.00% | 2283 |
+| 32 | ON | 115.69 | 1.8076 | 709/1043 | 31.47/34.46 | 8.37% | 85.02% | 3270 |
+| 32 | delta | **+43.21%** | +43.21% | -10.53%/-28.40% | -32.89%/-31.49% | | | |
 
-Deltas are taken from **request counts** over identical 1800 s windows, not from
-the reported `req/s`: aiperf prints that to two decimals, which at ~1.1 req/s is
-already +/-0.5%.
+`HBM hit` and `tier share` are both fractions of prompt tokens, computed from
+the server counters as end-minus-start deltas over the measured window.
 
-- conc 16: **+20.5%**  (2226 vs 1847)
-- conc 20: **+22.4%**  (2320 vs 1895)
-- conc 24: **+27.8%**  (2707 vs 2118)
-- conc 32: **+32.6%**  (3028 vs 2283)
+#### Multiprocess tier
 
-Recompute (`1 - local_HBM_hit - tier_supplied`) is what moves: ON
-7.29 / 7.17 / 6.93 / 6.57% against OFF 20.17 / 20.14 / 20.07 / 19.96%, i.e.
-**2.8x to 3.0x** less work recomputed, the ratio widening with concurrency.
+The three arms below were taken together in the same slot on image
+`rocm/atom-dev:vllm-v0.28.0-nightly_20260928-lmcache-v0.10`, so they are
+comparable to each other but not to the table above, which is a different
+image. Client as in *Client*, `--concurrency 16`, 1800 s per arm, seed 530419.
+The MP arm uses the `lmcache server` flags and the two `lmcache.mp.*` booleans
+from *Multiprocess tier* above.
 
-The conc-32 ON arm ran a day after the other seven (2026-09-23 03:17). The sweep
-itself never reached it: `wait_for_gpus.sh` gates on 756 GiB of raw `MemFree`
-(8 ranks x 90 GiB x 1.05) and the host was at 553. The GPUs were idle; what held
-the gate was 1,068 GiB of K3 weights resident in the page cache, one arm's NFS
-re-read at a time, measured per-file with `fincore`. Releasing them with
-`posix_fadvise(POSIX_FADV_DONTNEED)` -- clean pages only, no `drop_caches`, no
-peer's memory touched -- moved `MemFree` 467 -> 1539 GiB and the gate cleared on
-the next poll. The arm is otherwise identical to the other seven: same container,
-image digest, `atom_head`, tier, seed and client geometry, and the same
-`GPU KV cache size: 1,886,245 tokens / 28.78x`.
+| arm | tok/s/GPU | req/s | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
+|---|---|---|---|---|---|---|---|
+| OFF | 66.44 | 1.038 | 626 | 28.16 | 78.4% | 0.00% | 1877 |
+| ON in-process | **87.01** | 1.359 | 651 | 20.54 | 18.6% | 81.5% | 2457 |
+| ON multiprocess | 64.60 | 1.010 | 1127 | 28.47 | 38.3% | 56.3% | 1824 |
 
-One cosmetic difference in its log: an `EngineDeadError` from `AsyncLLM
-output_handler` at 03:47:27. It is teardown, not a fault -- the same second
-carries `[shutdown] API server: shutdown triggered` and the driver's own SIGTERM
-(`run_k3_arm.sh` tears down only after `verdict.txt` is written, i.e. after
-aiperf and the metrics scrape), the last engine log 5 s earlier is healthy
-(`Running: 1 reqs`, 734.9 tok/s), and aiperf reports `was_cancelled=False` with
-an empty `error_summary` over all 3,028 requests. The other arms simply won the
-race between output-handler cancellation and the engine's exit.
+The multiprocess tier reaches the in-process tier's total cache coverage but not
+its throughput: its residual cost is TTFT, which stays ~500 ms above OFF because
+a tier lookup is a cross-process round trip. Use the in-process connector unless
+the tier has to be shared across engines.
 
-**What differs from the pair above, and what does not.** The HBM pool is *not*
-the difference: both working points ran with no `--num-gpu-blocks-override`, and
-the engine reports the same pool to within 0.06% (1,887,436 vs 1,886,245 tokens;
-`Maximum concurrency ... 28.80x` vs `28.78x`). What differs is the **client**
-(seed 1234 / 800 generic dataset entries / mean ISL 40,403, versus seed 530419 /
-16 controlled prefixes of 27,648 tokens / 256 entries / mean ISL 32,334), the
-tier (64 -> 90 GiB/rank), and `atom_head` (`cd4c5153c` -> `6f66121b7d`). Three
-knobs moved, so nothing here is isolated to one of them.
+#### ATOM MP backend
 
-The reading that survives all three is the one *Sizing the tier* already argues
-from the pinned-pool pair: what the tier can do is set by **how much of the
-working set HBM keeps**, and the client decides that as much as the pool size
-does. The earlier client's reuse fell inside HBM (85.1% local hit, leaving the
-connector a 14.9% miss tail); this client's does not (10.4-11.1% local hit), and
-the tier collects the difference.
+Three arms taken in the same slot, one at a time, on image
+`rocm/atom-dev:vllm-v0.28.0-nightly_20260928-lmcache-v0.10`
+(vLLM `0.28.1.dev0+g2cf0a6915`, LMCache `0.5.5rc3+rocm7.2.4.torch2.10`), TP8 on
+eight gfx950 GPUs, **900 s** per arm, `--concurrency 16`, `SEED=1234`,
+`--max-model-len 65536`, `--gpu-memory-utilization 0.85`, `--block-size 128`,
+`cudagraph_mode=FULL_AND_PIECEWISE`. Client: the controlled-prefix synthetic
+pool from *Client* — `PREFIX_LEN=27648`, `GEN_ISL=4608`, `GEN_OSL=512`,
+`PREFIX_POOL=16`, `ENTRIES=256`; measured ISL p50 32334, OSL 512. Tier: 90
+GiB/rank in-process (`LMCACHE_MAX_LOCAL_CPU_SIZE=90`), 192 GiB whole-tier for
+MP (`--l1-size-gb 192`) plus 24 GiB/rank for the recurrent state.
 
-**The band arithmetic from *Sizing the tier* predicts this, including the
-trend.** The client's reuse distance is `d = 15 x (27648 + 4608) = 483,840`
-tokens. The lower band edge is *not* the 1.886M-token `GPU KV cache size` line
-but the reusable prefix left after the live requests take theirs, and it falls
-as lanes are added:
+| arm | tok/s/GPU | req/s | per-user tok/s p50 | TTFT p50 (ms) | ITL p50 (ms) | HBM hit | tier share | n |
+|---|---|---|---|---|---|---|---|---|
+| OFF (no connector) | 65.02 | 1.0159 | 35.46 | 627 | 28.20 | 78.88% | 0.00% | 923 |
+| ON in-process | **81.57** | 1.2745 | **48.12** | 670 | 20.78 | 23.04% | 67.43% | 1158 |
+| ON ATOM MP | 74.24 | 1.1600 | **42.76** | 848 | 23.38 | 22.45% | 67.79% | 1054 |
 
-| conc | blocks left | reusable prefix | `d` in band? |
+The two ON arms reach the same cache coverage — tier share 67.4% vs 67.8% of
+prompt tokens, HBM hit 23.0% vs 22.5% — so the throughput difference is not a
+hit-rate difference. The MP backend recovers 58% of the in-process arm's gain
+over OFF; its residual cost shows up as +180 ms TTFT and +2.6 ms ITL, both of
+which are the cross-process round trip the in-process tier does not pay.
+
+`HBM hit` and `tier share` are fractions of prompt tokens, computed from the
+server counters as end-minus-start deltas over the measured window;
+`tok/s/GPU` is `req/s x OSL / TP`.
+
+### Accuracy
+
+gsm8k, all 1319 questions, 12-shot, greedy:
+
+```bash
+lm_eval run --model local-chat-completions \
+  --model_args "model=amd/Kimi-K3,base_url=http://127.0.0.1:8331/v1/chat/completions,num_concurrent=64,max_retries=3,max_gen_toks=16384,timeout=1800,tokenized_requests=False" \
+  --tasks gsm8k --num_fewshot 12 --apply_chat_template --fewshot_as_multiturn \
+  --gen_kwargs temperature=0,top_p=1 --seed 0,1234,1234,1234 --limit 1319 \
+  --log_samples --output_path <run>/<label>
+```
+
+Server for the accuracy points: `--num-gpu-blocks-override 64`,
+`--max-model-len 32768`, tier 24 GiB/rank. The small HBM pool is the point: it
+cannot hold the corpus, so pass 2 can only come back from the CPU tier.
+
+| point | connector | pass | gsm8k exact_match (flexible) |
 |---|---|---|---|
-| 16 | 704 | 270,336 tok | yes |
-| 20 | 484 | 185,856 tok | yes |
-| 24 | 264 | 101,376 tok | yes |
-| 32 | -176 | none | yes (no HBM floor) |
+| m1_base | off | single | 0.9644 ± 0.0051 |
+| m2_store | on | 1 (fills the tier) | 0.9606 ± 0.0054 |
+| m3_load | on | 2 (reads the tier) | 0.9689 ± 0.0048 |
 
-The upper edge is the tier: 90 GiB/rank at 56,448 B/token is 1,711,961 tokens,
-well above `d`. So `d` sits inside `[reusable prefix, tier)` at every
-concurrency -- which is why HBM answers only ~11% and the tier collects ~82% --
-and the band's lower edge drops as concurrency rises, which is the direction the
-gain moves (+20.5% -> +32.6%).
+`m2_store`/`m3_load` ran in 7 chunks of 189 questions, one server boot per
+chunk, because a 64-block pool plus a 24 GiB tier cannot hold 1319 questions at
+once; the figures are the aggregate over all 1319.
 
-At conc 32 the formula goes negative (`1584 - 32 x 55 = -176`): the live requests
-claim more blocks than the pool holds, so no reusable prefix survives between
-turns and every reuse must come from the tier. That was written as a prediction
-before the arm ran, and the arm confirms it: conc 32 is the most tier-dependent
-point of the set by a clear margin -- tier **87.73%** against 81.6-82.7% at the
-other three, HBM local hit **5.70%** against 10.4-11.1% -- and it carries the
-largest gain (+32.6%). The prediction was directional only; the size of the step
-was not predicted.
+#### How this run measures LMCache
 
-Comparability *within* this table was checked rather than asserted. Mean input
-length is identical to the digit across all eight arms (32,333.87 tokens); a
-per-pair `run.env` diff shows only `arm=` differing (plus 1 GiB of host
-`MemFree` on the conc-16 pair, and the conc-32 pair's 1437 vs 1539 GiB from
-the page-cache release above -- an observation, not a knob); `atom_head` is
-`6f66121b7d` in every arm.
-`atom_dirty` is 2 on the conc-16 pair and 3 on the later ones -- the extra file
-is an untracked `scheduler.py` that no arm imported, so every arm ran the same
-code.
+An accuracy run only tests the tier if the bytes it read actually came from the
+tier. Three things make that true, and all three have to hold:
 
-Every arm is **n=1**. There is no repetition at any single working point, so no
-noise floor: the +20.5/22.4/27.8/32.6% figures carry no error bar. They are
-reported because the direction is the same at four concurrencies, the trend is
-monotone in the direction the band arithmetic predicts, and the recompute
-identity moves with them -- not because a single pair would be conclusive.
+1. **Two passes over the same corpus, one server boot each.** Pass 1
+   (`m2_store`) starts with an empty tier, so it can only compute -- its job is
+   to fill the tier. Pass 2 (`m3_load`) replays the identical questions with
+   the identical `--seed` and `--num_fewshot`, so every prompt already has an
+   entry.
+2. **An HBM pool too small to hold the corpus** -- that is what
+   `--num-gpu-blocks-override 64` is for. Without it pass 2's hits land in
+   vLLM's own prefix cache and the tier is never asked; with it the prefix is
+   evicted long before it is reused, so the CPU tier is the only place it can
+   come back from. The same constraint is why the corpus is split into chunks:
+   the pool plus the tier has to hold one chunk, not the whole 1319.
+3. **Confirm on the server side, not from the score.** The run counts as a tier
+   measurement only if the pass-2 window actually shows tier traffic:
 
-The trend also runs *with* the known bias recorded in `run_sweep.sh`: holding the
-prefix pool fixed puts `d` further above the floor as concurrency rises, which
-favours hits at high concurrency. A rising gain is therefore the direction that
-bias would also produce, and this table cannot separate the two. A falling trend
-would have been the bias-free reading.
+```bash
+curl -s http://127.0.0.1:8331/metrics | \
+  grep -E 'vllm:external_prefix_cache_(hits|queries)_total'   # hits > 0 on pass 2
+grep -c 'Retrieved' server.log                                # 0 on pass 1, > 0 on pass 2
+```
+
+Only then is the score comparison meaningful: `m1_base` is the no-connector
+reference and `m3_load` is the same questions answered from restored bytes. A
+real KV corruption moves gsm8k by much more than one standard error, so
+agreement inside one standard error is the pass criterion.
 
 ## Related
 

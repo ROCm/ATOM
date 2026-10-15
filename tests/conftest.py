@@ -255,3 +255,44 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+@pytest.fixture(autouse=True)
+def v41_image_module_state_is_restored():
+    """Put `paged_state_checkpoint`'s module globals back after every test.
+
+    They are process-wide: registered adapters, the per-process image
+    workers, the slot allocators the runner hook releases into, and the store
+    counters. A test that sets one leaves every later test looking at a model
+    with checkpoint images on -- measured on the module this replaced, where
+    two tests in other files failed in the full suite and passed alone.
+
+    A no-op when the module was never imported, which is most runs.
+    """
+    mod = sys.modules.get("atom.plugin.vllm.paged_state_checkpoint")
+    if mod is None:
+        yield
+        return
+    saved = {}
+    for name in (
+        "_adapters",
+        "_workers",
+        "_slot_allocators",
+        "_store_counts",
+        "_store_plan",
+    ):
+        value = getattr(mod, name, None)
+        if isinstance(value, list):
+            saved[name] = list(value)
+        elif isinstance(value, dict):
+            saved[name] = dict(value)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            current = getattr(mod, name)
+            if isinstance(current, list):
+                current[:] = value
+            else:
+                current.clear()
+                current.update(value)

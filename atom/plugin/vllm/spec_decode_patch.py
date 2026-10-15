@@ -337,6 +337,47 @@ def _groups_are_heterogeneous_mla_mha(kv_cache_groups) -> bool:
     return (_is_mla(g0) and _is_mha(g1)) or (_is_mla(g1) and _is_mha(g0))
 
 
+def _v41_overlay_split(kv_cache_groups):
+    """Split the layers into the overlaid pool and the per-layer slices.
+
+    V4.1's proxy and its checkpoint-image layers are one pool: they have the
+    same page and the block manager hands each group its own block ids, so a
+    block index costs ONE page across all of them and every one of them starts
+    at byte 0 (this is what vLLM's own allocator does, and what
+    `check_state_checkpoint_groups` requires). The draft's layers are a second, genuinely
+    separate pool -- its page is not a multiple of the proxy's -- so each gets
+    its own slice.
+
+    Returns ``(overlay_names, overlay_page, slice_pairs)``. With no image
+    layers the overlay is the proxy alone, which is the previous behaviour
+    (one page, one slice) layer for layer.
+    """
+    from atom.plugin.vllm.deepseek_v41_bridge import (
+        ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+    )
+
+    overlay_names: list[str] = []
+    overlay_pages: set[int] = set()
+    slice_pairs: list[tuple[str, object]] = []
+    for group in kv_cache_groups:
+        if getattr(group, "host_resident", False):
+            continue
+        for layer_name, layer_spec in _iter_group_layer_specs(group):
+            if layer_name.endswith(
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+            ) or _is_v41_image_layer(layer_name):
+                overlay_names.append(layer_name)
+                overlay_pages.add(int(layer_spec.page_size_bytes))
+            else:
+                slice_pairs.append((layer_name, layer_spec))
+    if len(overlay_pages) > 1:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy and checkpoint-image layers must share one "
+            f"page to be overlaid on one pool; got {sorted(overlay_pages)}"
+        )
+    return overlay_names, (overlay_pages.pop() if overlay_pages else 0), slice_pairs
+
+
 def _build_heterogeneous_kv_cache_config_from_groups(
     vllm_config, kv_cache_groups, available_memory
 ):
@@ -359,10 +400,10 @@ def _build_heterogeneous_kv_cache_config_from_groups(
             for layer_name in group.layer_names:
                 yield layer_name, spec
 
-    bytes_per_block_all_layers = 0
-    for group in kv_cache_groups:
-        for _layer_name, layer_spec in _iter_layer_specs(group):
-            bytes_per_block_all_layers += layer_spec.page_size_bytes
+    overlay_names, overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)
+    bytes_per_block_all_layers = overlay_page + sum(
+        int(spec.page_size_bytes) for _name, spec in slice_pairs
+    )
 
     assert bytes_per_block_all_layers > 0, "Zero per-block bytes"
     num_blocks = available_memory // bytes_per_block_all_layers
@@ -378,21 +419,42 @@ def _build_heterogeneous_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     offset = 0
-    for group in kv_cache_groups:
-        for layer_name, layer_spec in _iter_layer_specs(group):
-            layer_stride, block_stride = compute_layout_strides(
-                layer_spec, num_blocks, 1, layout
-            )[:2]
-            kv_cache_tensors.append(
-                KVCacheTensor(
-                    size=total_size,
-                    layers=[layer_name],
-                    layer_stride=layer_stride,
-                    block_stride=block_stride,
-                    offset=offset,
-                )
+    specs_by_name = {
+        name: spec
+        for group in kv_cache_groups
+        for name, spec in _iter_layer_specs(group)
+    }
+    # The overlaid pool first, every member at byte 0.
+    for layer_name in overlay_names:
+        layer_spec = specs_by_name[layer_name]
+        layer_stride, block_stride = compute_layout_strides(
+            layer_spec, num_blocks, 1, layout
+        )[:2]
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=total_size,
+                layers=[layer_name],
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                offset=0,
             )
-            offset += layer_spec.page_size_bytes * num_blocks
+        )
+    offset = overlay_page * num_blocks
+    # Then one slice per draft layer, after the overlaid pool.
+    for layer_name, layer_spec in slice_pairs:
+        layer_stride, block_stride = compute_layout_strides(
+            layer_spec, num_blocks, 1, layout
+        )[:2]
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=total_size,
+                layers=[layer_name],
+                layer_stride=layer_stride,
+                block_stride=block_stride,
+                offset=offset,
+            )
+        )
+        offset += int(layer_spec.page_size_bytes) * num_blocks
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -407,22 +469,23 @@ def _build_heterogeneous_kv_cache_config_from_groups(
 def _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups):
     # Max bytes needed for both groups to hold max_model_len tokens
     from vllm.utils.math_utils import cdiv
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
     max_model_len = vllm_config.model_config.max_model_len
+    # Same split as the builder and the divisor: the proxy and its image
+    # layers are one overlaid pool and cost one page per block between them,
+    # so counting them per layer would overstate the requirement k+1 times.
+    overlay_names, overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)
+    specs_by_name = {
+        name: spec
+        for group in kv_cache_groups
+        for name, spec in _iter_group_layer_specs(group)
+    }
     total = 0
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            block_size = spec.block_size
-            per_block_bytes = sum(
-                s.page_size_bytes for s in spec.kv_cache_specs.values()
-            )
-        else:
-            block_size = spec.block_size
-            per_block_bytes = spec.page_size_bytes * len(group.layer_names)
-        num_blocks_for_len = cdiv(max_model_len, block_size)
-        total += num_blocks_for_len * per_block_bytes
+    if overlay_names:
+        block_size = int(specs_by_name[overlay_names[0]].block_size)
+        total += cdiv(max_model_len, block_size) * overlay_page
+    for name, spec in slice_pairs:
+        total += cdiv(max_model_len, int(spec.block_size)) * int(spec.page_size_bytes)
     return total
 
 
