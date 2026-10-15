@@ -1075,8 +1075,8 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
     import json
     from pathlib import Path
 
-    from atom.model_ops.attentions.backends import CommonAttentionBuilder
     from atom.config import CompilationConfig
+    from atom.model_ops.attentions.backends import CommonAttentionBuilder
     from atom.models.deepseek_v41.config import normalize_hf_config
 
     fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
