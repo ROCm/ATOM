@@ -1452,6 +1452,7 @@ models:
           benchmark:
             kind: minimax_full_model_replay
             replay_gate: true
+            prepare_lmcache_host_memory: true
             wait_server_timeout: 1100
             wait_router_timeout: 60
 
