@@ -354,3 +354,30 @@ def test_lazy_runner_width_refusal_spares_other_widths(monkeypatch):
     assert mono.enabled  # ...but mono is not switched off
     assert mono.ready(6)  # ...and a width that builds still runs
     assert not mono.ready(20)  # the refused width stays refused
+
+
+def test_aiter_stub_teardown_leaves_no_second_copy():
+    """Dropping a module must clear its parent's attribute too.
+
+    `sys.modules.pop` alone leaves the parent package bound to the same object,
+    so a later import builds a fresh module while attribute access still finds
+    the old one -- two copies of every class in it, and a dotted-path
+    monkeypatch can reach the copy the test is not holding.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import _drop
+
+    pkg = types.ModuleType("fake_pkg")
+    sub = types.ModuleType("fake_pkg.sub")
+    pkg.sub = sub
+    sys.modules["fake_pkg"] = pkg
+    sys.modules["fake_pkg.sub"] = sub
+    try:
+        _drop("fake_pkg.sub")
+        assert "fake_pkg.sub" not in sys.modules
+        assert not hasattr(pkg, "sub"), "parent still points at the dropped module"
+    finally:
+        sys.modules.pop("fake_pkg.sub", None)
+        sys.modules.pop("fake_pkg", None)

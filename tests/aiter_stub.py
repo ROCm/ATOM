@@ -46,7 +46,32 @@ def stubbed_aiter():
         yield
     finally:
         for name in installed:
-            sys.modules.pop(name, None)
-        for name in set(sys.modules) - before:
-            if name == "atom" or name.startswith("atom."):
-                sys.modules.pop(name, None)
+            _drop(name)
+        # Only when this context actually stubbed something: with a real AITER
+        # present nothing was poisoned, and dropping modules the caller still
+        # holds references to is how two copies of one class appear.
+        if installed:
+            for name in set(sys.modules) - before:
+                if name == "atom" or name.startswith("atom."):
+                    _drop(name)
+
+
+def _drop(name: str) -> None:
+    """Remove a module from ``sys.modules`` *and* from its parent package.
+
+    Popping ``sys.modules`` alone is not enough: the parent package keeps an
+    attribute bound to the same module object, so a later
+    ``import a.b.c`` rebuilds ``sys.modules["a.b.c"]`` while ``a.b.c`` as an
+    attribute still resolves to the stubbed one. The process then holds two
+    copies of every class in it, and a dotted-path monkeypatch can patch the
+    copy the test is not holding.
+    """
+    sys.modules.pop(name, None)
+    parent, _, child = name.rpartition(".")
+    if parent:
+        module = sys.modules.get(parent)
+        if module is not None and hasattr(module, child):
+            try:
+                delattr(module, child)
+            except AttributeError:
+                pass
