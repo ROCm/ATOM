@@ -18,7 +18,9 @@ L1 check their own pages).
 
 from __future__ import annotations
 
+import argparse
 import ctypes
+import json
 import re
 import sys
 import time
@@ -31,9 +33,9 @@ MADV_HUGEPAGE = 14
 SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 
 
-def anon_huge_page_bytes(start: int, end: int, smaps: str = "/proc/self/smaps") -> int:
-    """AnonHugePages of the mappings that overlap [start, end)."""
-    total = 0
+def mapping_memory(start: int, end: int, smaps: str = "/proc/self/smaps") -> dict:
+    """Read RSS/THP bytes of VMAs overlapping the preparation mapping."""
+    totals = {"Rss": 0, "AnonHugePages": 0}
     inside = False
     with open(smaps, "rb") as f:
         for raw in f:
@@ -42,12 +44,41 @@ def anon_huge_page_bytes(start: int, end: int, smaps: str = "/proc/self/smaps") 
             if header:
                 low, high = int(header.group(1), 16), int(header.group(2), 16)
                 inside = low < end and high > start
-            elif inside and line.startswith("AnonHugePages:"):
-                total += int(line.split()[1]) * 1024
-    return total
+            elif inside:
+                key, _, value = line.partition(":")
+                if key in totals:
+                    totals[key] += int(value.split()[0]) * 1024
+    return totals
 
 
-def fault_huge_pages(gib: float) -> tuple[int, int, float]:
+def anon_huge_page_bytes(start: int, end: int, smaps: str = "/proc/self/smaps") -> int:
+    return mapping_memory(start, end, smaps)["AnonHugePages"]
+
+
+def report_progress(start, size, touched, began):
+    row = {
+        "target_gib": size / GIB,
+        # One byte is touched per 2 MiB interval. This range is not the RSS:
+        # a THP fallback may have allocated only one 4 KiB page in an interval.
+        "touched_range_gib": round(touched / GIB, 3),
+        "elapsed_seconds": round(time.monotonic() - began, 3),
+    }
+    try:
+        memory = mapping_memory(start, start + size)
+        row.update(
+            rss_gib=round(memory["Rss"] / GIB, 3),
+            anon_huge_gib=round(memory["AnonHugePages"] / GIB, 3),
+            base_page_rss_gib=round(
+                max(0, memory["Rss"] - memory["AnonHugePages"]) / GIB, 3
+            ),
+        )
+    except OSError as exc:
+        row["smaps_error"] = str(exc)
+    # Keep progress distinct from the full-THP completion marker.
+    print("[thp-progress] " + json.dumps(row), flush=True)
+
+
+def fault_huge_pages(gib: float, *, progress: bool = False) -> tuple[int, int, float]:
     """Fault and free ``gib`` GiB under MADV_HUGEPAGE.
 
     Returns:
@@ -75,9 +106,20 @@ def fault_huge_pages(gib: float) -> tuple[int, int, float]:
         if libc.madvise(start, size, MADV_HUGEPAGE) != 0:
             raise OSError(ctypes.get_errno(), "madvise(MADV_HUGEPAGE) failed")
         began = time.monotonic()
+        if progress:
+            report_progress(start, size, 0, began)
+        last_time, last_range = began, 0
         pages = (ctypes.c_char * size).from_address(start)
         for offset in range(0, size, HUGE_PAGE):
             pages[offset] = b"\1"
+            touched = offset + HUGE_PAGE
+            if progress and (
+                touched - last_range >= 32 * GIB or time.monotonic() - last_time >= 10
+            ):
+                report_progress(start, size, touched, began)
+                last_time, last_range = time.monotonic(), touched
+        if progress:
+            report_progress(start, size, size, began)
         seconds = time.monotonic() - began
         return size, anon_huge_page_bytes(start, start + size), seconds
     finally:
@@ -85,10 +127,15 @@ def fault_huge_pages(gib: float) -> tuple[int, int, float]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 1:
-        print(__doc__, file=sys.stderr)
-        return 2
-    size, huge, seconds = fault_huge_pages(float(argv[0]))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="log every 32 GiB or 10 seconds of first-touch",
+    )
+    parser.add_argument("gib", type=float)
+    args = parser.parse_args(argv)
+    size, huge, seconds = fault_huge_pages(args.gib, progress=args.progress)
     share = 100 * huge / size if size else 100.0
     tag = "[thp-compact]" if huge >= size else "[thp-compact][WARN]"
     print(

@@ -384,7 +384,8 @@ stream_spur_shared_logs_once() {
   shopt -s nullglob
   # Container logs already include the server/router output via tee. Reading
   # logs/ as well would print the same messages twice.
-  for log_file in "${run_dir}"/rank-*/container*.log "${run_dir}"/rank-*/host-memory.log; do
+  for log_file in "${run_dir}"/rank-*/container*.log "${run_dir}"/rank-*/host-memory.log \
+    "${run_dir}"/benchmark_results/lmcache-host-memory/attempt-*.log; do
     rel_path="${log_file#"${run_dir}/"}"
     current_offset="${SPUR_SHARED_LOG_OFFSETS[${log_file}]:-0}"
     SPUR_SHARED_LOG_OFFSETS["${log_file}"]="$(

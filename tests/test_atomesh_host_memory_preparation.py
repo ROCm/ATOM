@@ -2,13 +2,16 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU-only checks: VM writes and large allocations are replaced by fake steps."""
 
+import errno
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -97,6 +100,52 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.prepare(), 2)
         self.assertEqual(self.result["status"], "numa_preparation_incomplete")
         self.assertEqual(len(self.result["attempts"]), 3)
+
+    def test_progress_only_cannot_pass_full_thp_gate(self):
+        def run(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "numa_exec.py" in str(command):
+                result["text"] = (
+                    '[thp-progress] {"touched_range_gib": 1024, "anon_huge_gib": 800}'
+                )
+            return result
+
+        self.assertEqual(self.prepare(run), 2)
+        self.assertEqual(self.result["status"], "numa_preparation_incomplete")
+        self.assertEqual(len(self.result["attempts"]), 3)
+
+    def test_file_advice_counts_success_separately_from_errors(self):
+        spec = importlib.util.spec_from_file_location(
+            "drop_page_cache", SCRIPTS / "drop_page_cache.py"
+        )
+        drop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(drop)
+        for name in ("weight1", "weight2"):
+            (self.root / name).write_bytes(b"x" * 4096)
+        (self.root / "broken-link").symlink_to(self.root / "missing")
+        with (
+            patch.object(
+                drop.os,
+                "posix_fadvise",
+                side_effect=[None, PermissionError(errno.EACCES, "denied")],
+            ),
+            redirect_stdout(io.StringIO()) as log,
+        ):
+            result = drop.drop_page_cache(str(self.root), stats=True)
+        self.assertEqual(result["files_seen"], 3)
+        self.assertEqual(result["files_opened"], 2)
+        self.assertEqual(result["files_advised"], 1)
+        self.assertEqual(result["advised_file_bytes"], 4096)
+        self.assertEqual(result["advice_errors"], 1)
+        self.assertEqual(result["open_errors"], 1)
+        self.assertEqual(
+            {e["operation"] for e in result["error_examples"]}, {"open", "advice"}
+        )
+        self.assertIn('"event": "complete"', log.getvalue())
+        with redirect_stdout(io.StringIO()):
+            result = drop.drop_page_cache(str(self.root / "missing"), stats=True)
+        self.assertEqual(result["walk_errors"], 1)
+        self.assertEqual(result["files_advised"], 0)
 
     def test_low_numa_free_or_cgroup_limit_never_starts_large_allocation(self):
         for kind in ("numa", "cgroup", "unknown_cgroup"):
@@ -221,12 +270,18 @@ start_prefill prefill-rank-0
 
     def test_real_small_child_timeout_is_reaped(self):
         result = PREP.run_step(
-            [sys.executable, "-c", "import time; time.sleep(5)"],
+            [
+                sys.executable,
+                "-c",
+                "import time; print('progress before timeout', flush=True); time.sleep(5)",
+            ],
             0.05,
             self.root / "child.log",
         )
         self.assertTrue(result["timed_out"])
         self.assertEqual(result["returncode"], -9)
+        self.assertIn("progress before timeout", result["text"])
+        self.assertTrue(result["heartbeats"])
 
     def test_cgroup_v2_includes_visible_ancestor_limit(self):
         root = self.root / "cgroup"

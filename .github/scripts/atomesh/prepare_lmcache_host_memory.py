@@ -105,10 +105,38 @@ def capacity_error(state, planned, reserve_gib, *, require_free=False):
     return None
 
 
+def child_state(pid, elapsed):
+    row = {"pid": pid, "elapsed_seconds": round(elapsed, 3)}
+    for line in read_optional(f"/proc/{pid}/status").splitlines():
+        key, _, value = line.partition(":")
+        if key in {"State", "VmRSS", "RssAnon"}:
+            row[key] = value.strip()
+    row["wchan"] = read_optional(f"/proc/{pid}/wchan").strip()
+    return row
+
+
+def file_cache_delta(before, after):
+    fields = ("MemFree", "Active(file)", "Inactive(file)", "Dirty", "Writeback")
+    return {
+        node: {
+            field: {
+                "before_gib": round(info.get(field, 0) / GIB, 3),
+                "after_gib": round(after["numa"][node].get(field, 0) / GIB, 3),
+                "delta_gib": round(
+                    (after["numa"][node].get(field, 0) - info.get(field, 0)) / GIB, 3
+                ),
+            }
+            for field in fields
+        }
+        for node, info in before["numa"].items()
+    }
+
+
 def run_step(command, seconds, output):
     """Bound each child; never launch a model while a timed-out child remains."""
     print(f"[host-memory] {output.name}: {command}", flush=True)
     started = time.monotonic()
+    heartbeats = []
     with output.open("w") as log:
         child = subprocess.Popen(
             command,
@@ -119,7 +147,19 @@ def run_step(command, seconds, output):
         )
         timed_out = False
         try:
-            child.wait(timeout=seconds)
+            while True:
+                remaining = seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, seconds)
+                try:
+                    child.wait(timeout=min(10, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    row = child_state(child.pid, time.monotonic() - started)
+                    heartbeats.append(row)
+                    print("[host-memory][child] " + json.dumps(row), flush=True)
+                    if time.monotonic() - started >= seconds:
+                        raise
         except subprocess.TimeoutExpired:
             timed_out = True
             os.killpg(child.pid, signal.SIGKILL)
@@ -132,6 +172,7 @@ def run_step(command, seconds, output):
                 ) from exc
     return {
         "command": command,
+        "heartbeats": heartbeats,
         "returncode": child.returncode,
         "timed_out": timed_out,
         "seconds": time.monotonic() - started,
@@ -212,11 +253,25 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                         "[host-memory] Direct VM preparation unavailable; using file-cache and NUMA helpers",
                         flush=True,
                     )
+            row["before_drop"] = take_snapshot(planned)
             dropped = step(
                 "file-cache",
-                [sys.executable, str(HERE / "drop_page_cache.py"), *args.directories],
+                [
+                    sys.executable,
+                    str(HERE / "drop_page_cache.py"),
+                    "--stats",
+                    *args.directories,
+                ],
             )
             row["after_drop"] = take_snapshot(planned)
+            row["file_cache_delta"] = file_cache_delta(
+                row["before_drop"], row["after_drop"]
+            )
+            print(
+                "[host-memory][file-cache-delta] "
+                + json.dumps(row["file_cache_delta"]),
+                flush=True,
+            )
             problem = capacity_error(row["after_drop"], planned, args.reserve_gib)
             if dropped["timed_out"] or dropped["returncode"]:
                 problem = "file_cache_step_failed"
@@ -245,6 +300,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                             str(node),
                             sys.executable,
                             str(HERE / "compact_huge_pages.py"),
+                            "--progress",
                             str(gib),
                         ],
                     )

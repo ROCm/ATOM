@@ -79,3 +79,20 @@ Run `38745966243` selected g19 successfully, but the former free-only pool check
 rejected 769 GiB free plus 701 GiB clean cache before running NUMA preparation.
 The bounded reclaim path now handles that state and verifies recovered free
 memory afterward; g34's 470 GiB free plus 268 GiB cache still fails capacity checks.
+
+
+Host preparation enables `drop_page_cache.py --stats`: per-directory scanned,
+opened and advised file counts, advised file sizes (not reclaimed bytes),
+walk/open/advice errors with up to ten examples, and skipped symlink directories.
+The parent records NUMA memory immediately before and after this step, so direct
+VM cleanup is not counted as file-advice reclamation.
+
+`compact_huge_pages.py --progress` flushes a `[thp-progress]` record at the start,
+after each 32 GiB or ten seconds of first-touch progress, and at the end. The
+touched address range is distinct from actual RSS and AnonHugePages; one-byte
+faults that fall back to 4 KiB pages do not populate a whole 2 MiB interval.
+Progress records never satisfy the full-THP completion check. While the child is
+running, the parent also samples its state, RSS and kernel wait channel every ten
+seconds, including when the child cannot print while blocked in a page fault.
+Per-attempt logs are forwarded into Actions and retained in artifacts. These
+options do not change allocation size, retry limits or benchmark settings.
