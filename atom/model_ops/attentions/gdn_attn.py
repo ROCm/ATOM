@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
+import triton
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
@@ -20,11 +21,16 @@ from atom.model_ops.fla_ops.replayssm import (
     replayssm_commit,
 )
 from atom.utils import CpuGpuBuffer, envs
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+    get_forward_context,
+)
 
 from .aiter_attention import (
     AiterAttentionMetadataBuilder,
     AiterBackend,
+    _mtp_prepare_decode_metadata_kernel,
     kv_indices_generate_triton,
 )
 from .pool_layout.paged_state_copy import (
@@ -1548,6 +1554,49 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 )
 
 
+def draft_kv_write_slots(
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+    num_rows: int,
+) -> torch.Tensor:
+    """KV slot of each row's newest token, `context_lens - 1`, written to `out`.
+
+    `block_tables[row, pos // block_size] * block_size + pos % block_size`,
+    the slot the target's own `slot_mapping` gives that position. Rows from
+    `num_rows` on are padding and get -1, which the cache kernels skip.
+
+    On the GPU this is the MHA builder's one-launch kernel; elsewhere (CPU
+    tests) the same arithmetic in torch.
+    """
+    rows = out.shape[0]
+    if out.is_cuda:
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(rows, 128)),)](
+            context_lens,
+            block_tables,
+            out,
+            context_lens,  # positions_in: unread, update_positions is False
+            context_lens,  # positions_out: unread
+            out,  # last_token_indices: unread
+            num_rows,
+            False,  # skip_update
+            False,  # update_context_lens: the proposer already bumped them
+            False,  # update_positions
+            False,  # select_positions
+            block_size,
+            block_tables.stride(0),
+            1,
+            BLOCK=128,
+        )
+    else:
+        pos = (context_lens[:num_rows].to(torch.int64) - 1).clamp(min=0)
+        page = block_tables[:num_rows].gather(1, (pos // block_size).unsqueeze(1))
+        out[:num_rows] = page.squeeze(1).to(torch.int64) * block_size + pos % block_size
+    out[num_rows:] = -1
+    return out
+
+
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
@@ -1901,6 +1950,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # shape guard only compares batch and kv-head count.
         result["flydsl_work_plan"] = self.refresh_flydsl_plan(
             var["context_lens"].gpu[:running_bs]
+        )
+        # Where the draft token this step writes goes. Returned, because a
+        # builder that returns no `slot_mapping` sends `EagleProposer` down its
+        # MLA branch, `kv_indices[kv_indptr[1:] - 1]`: a token slot at page
+        # size 1, but here a PAGE id, which the draft's KV write then treats as
+        # a token slot. That lands the MTP layer's K/V in block `id //
+        # block_size` -- some other request's KV, or the units of a PAGE state
+        # checkpoint, whose image then restores corrupted.
+        # A dummy run's synthetic context_lens can point past block_tables, and
+        # its draft writes nowhere anyway: every row is padding.
+        dummy = get_forward_context().context.is_dummy_run
+        result["slot_mapping"] = draft_kv_write_slots(
+            var["context_lens"].gpu[:running_bs],
+            var["block_tables"].gpu,
+            self.model_runner.block_size,
+            var["slot_mapping"].gpu[:running_bs],
+            0 if dummy else bs,
         )
         return result
 
