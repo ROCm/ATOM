@@ -816,6 +816,10 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
         norm_topk_prob=True,
         rms_norm_eps=EPS,
         moe_intermediate_size=cfg.inter * 8,
+        # as `amd/GLM-5.2-MXFP4` sets it: the flag's default is NeoX, which
+        # the fused indexer kernel cannot serve, so omitting it here would
+        # make this test refuse for a reason it is not about.
+        indexer_rope_interleave=True,
     )
     atom_config = SimpleNamespace(
         hf_config=hf_config,
