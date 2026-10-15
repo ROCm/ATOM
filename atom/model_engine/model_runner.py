@@ -2726,8 +2726,8 @@ class ModelRunner:
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             graph_shapes=self._producer_graph_shapes(),
-            local_stage_tokens=(
-                self.attn_metadata_builder.dp_stage_tokens(batch)
+            dp_stage_report=(
+                self.attn_metadata_builder.dp_stage_report(batch)
                 if dp_size > 1
                 else None
             ),

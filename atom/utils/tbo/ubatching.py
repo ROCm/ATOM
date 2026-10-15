@@ -202,12 +202,11 @@ class DPSyncResult:
     # the graph-shape sync no longer needs its own separate all_reduce (halves
     # the per-step DP round-trips).
     max_seqlen_q_across_dp: int | None = None
-    # A model whose prefill runs some layers on fewer rows than the step
-    # (DeepSeek-V4.1 decoder bounded replay): every rank's
-    # (decoder tokens, last-layer tokens, replaying, decoder active), one tuple
-    # per row, in DP order. Set only when some rank replays on a prefill step
-    # TBO did not split; the MoE collectives of those layers are sized by it.
-    stage_tokens_across_dp: tuple[tuple[int, ...], ...] | None = None
+    # A model's per-stage rows (`DPStageReport.wire`: applies, active, then
+    # one token count per stage), one tuple per row, in DP order. Set only
+    # when some rank's row applies on a step whose MoE takes the
+    # variable-length gather (some rank prefills) and TBO did not split.
+    dp_stage_rows: tuple[tuple[int, ...], ...] | None = None
 
 
 def sync_dp_metadata(
@@ -223,7 +222,7 @@ def sync_dp_metadata(
     local_can_split: bool = False,
     local_ub_tokens: tuple[int, int] = (0, 0),
     max_seqlen_q: int | None = None,
-    stage_tokens: tuple[int, int, int, int] | None = None,
+    dp_stage_row: tuple[int, ...] | None = None,
 ) -> DPSyncResult:
     """Single packed DP all_gather over all per-rank scalars a decode/prefill
     step needs synchronized: DP token padding, the prefill fan-out, whether the
@@ -251,12 +250,11 @@ def sync_dp_metadata(
       row 6 : ub0_tokens               -> ub_{max,total}_tokens_across_dp[0]      [TBO only]
       row 7 : ub1_tokens               -> ub_{max,total}_tokens_across_dp[1]      [TBO only]
       row k+0 : max_seqlen_q           -> max_seqlen_q_across_dp (MAX)  [DSpark only]
-      row j+0..3 : stage_tokens        -> stage_tokens_across_dp  [stage rows only]
+      row j+0.. : dp_stage_row         -> dp_stage_rows  [model stage rows only]
 
-    ``stage_tokens`` folds a model's per-stage row counts into the same
-    collective (DeepSeek-V4.1 decoder bounded replay, `bounded_replay`). Like
-    ``max_seqlen_q`` it is gated on configuration alone, so every rank sends
-    the same rows.
+    ``dp_stage_row`` folds a model's per-stage token counts into the same
+    collective (`DPStageReport.wire`: applies, active, counts). Its length is
+    the model's, fixed by configuration, so every rank sends the same rows.
 
     Rows 0 and 1 are the same batch in ATOM's two units; both ride this one
     collective because agreeing on only one of them still leaves two shapes.
@@ -273,9 +271,10 @@ def sync_dp_metadata(
     """
     tbo_fields = 8 if tbo_on else 4
     dspark_on = max_seqlen_q is not None
-    stage_on = stage_tokens is not None
+    stage_on = dp_stage_row is not None
     stage_field = tbo_fields + (1 if dspark_on else 0)
-    n_fields = stage_field + (4 if stage_on else 0)
+    n_stage = len(dp_stage_row) if stage_on else 0
+    n_fields = stage_field + n_stage
     local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
     local[0] = scheduled_tokens
     local[1] = scheduled_bs
@@ -289,9 +288,7 @@ def sync_dp_metadata(
     if dspark_on:
         local[tbo_fields + 0] = max_seqlen_q
     if stage_on:
-        local[stage_field : stage_field + 4] = torch.tensor(
-            stage_tokens, dtype=torch.int32
-        )
+        local[stage_field:] = torch.tensor(dp_stage_row, dtype=torch.int32)
 
     gathered = [
         torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
@@ -330,15 +327,15 @@ def sync_dp_metadata(
     if dspark_on:
         max_seqlen_q_across_dp = int(sync[tbo_fields + 0].max())
 
-    stage_tokens_across_dp = None
+    dp_stage_rows = None
     if (
         stage_on
         and any_rank_has_prefill
         and not tbo_collective_active
-        and bool(sync[stage_field + 2].any())
+        and bool(sync[stage_field].any())
     ):
-        stage_tokens_across_dp = tuple(
-            tuple(sync[stage_field + i].tolist()) for i in range(4)
+        dp_stage_rows = tuple(
+            tuple(sync[stage_field + i].tolist()) for i in range(n_stage)
         )
 
     return DPSyncResult(
@@ -350,7 +347,7 @@ def sync_dp_metadata(
         ub_max_tokens_across_dp=ub_max_tokens_across_dp,
         ub_tokens_across_dp=ub_tokens_across_dp,
         max_seqlen_q_across_dp=max_seqlen_q_across_dp,
-        stage_tokens_across_dp=stage_tokens_across_dp,
+        dp_stage_rows=dp_stage_rows,
     )
 
 
