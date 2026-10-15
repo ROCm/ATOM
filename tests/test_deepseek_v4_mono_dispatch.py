@@ -10,7 +10,7 @@ import torch
 pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
-from atom.models.deepseek_v4.mono import dispatch, runner
+from atom.models.deepseek_v4.mono import config, dispatch, runner
 from atom.mono.runtime import deployment
 
 
@@ -22,10 +22,23 @@ class _Mode:
         return self.piecewise
 
 
-# V4-Pro's widths the dispatch reads
+# V4-Pro's config.json (the values the kernel is built for; one MTP layer's ratio last)
 _V4_PRO = SimpleNamespace(
-    num_attention_heads=128, o_groups=16, moe_intermediate_size=3072
+    **config.V4_PRO_CONFIG, compress_ratios=list(config.compress_ratios(61, n_mtp=1))
 )
+# V4-Flash: the same architecture name, other widths and a ratio-0 (sliding-only) start
+_V4_FLASH = {
+    "hidden_size": 4096,
+    "q_lora_rank": 1024,
+    "num_attention_heads": 64,
+    "o_groups": 8,
+    "n_routed_experts": 256,
+    "moe_intermediate_size": 2048,
+    "routed_scaling_factor": 1.5,
+    "index_topk": 512,
+    "num_hidden_layers": 43,
+    "compress_ratios": [0, 0] + [4 if i % 2 == 0 else 128 for i in range(2, 43)] + [0],
+}
 
 
 def _atom_config(**overrides):
@@ -40,6 +53,7 @@ def _atom_config(**overrides):
         "kv_cache_dtype": "fp8",
         "index_cache_dtype": "fp4",
         "load_dummy": False,
+        "kv_cache_block_size": 256,
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "speculative_config": None,
@@ -98,11 +112,38 @@ def test_each_unsupported_setting_is_refused(native, overrides, reason):
 
 
 def test_heads_a_rank_the_kernel_does_not_hold_are_refused(native):
-    hf = SimpleNamespace(
-        num_attention_heads=256, o_groups=16, moe_intermediate_size=3072
-    )
+    hf = SimpleNamespace(**{**vars(_V4_PRO), "num_attention_heads": 256})
     why = dispatch.config_refusal(_atom_config(hf_config=hf))
     assert "32 attention heads a rank at TP 8" in why
+
+
+def test_v4_flash_is_refused(native):
+    hf = SimpleNamespace(**{**vars(_V4_PRO), **_V4_FLASH})
+    assert "checkpoint:" in dispatch.config_refusal(_atom_config(hf_config=hf))
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [
+        ("routed_scaling_factor", 1.5),
+        ("rms_norm_eps", 1e-5),
+        ("index_topk", 512),
+        ("hidden_size", 4096),
+        ("q_lora_rank", 1024),
+        ("n_routed_experts", 256),
+        ("swiglu_limit", 7.0),
+        ("compress_ratios", [0, 0] + [4 if i % 2 == 0 else 128 for i in range(2, 61)]),
+    ],
+)
+def test_a_checkpoint_value_the_kernel_bakes_in_is_compared(native, key, value):
+    hf = SimpleNamespace(**{**vars(_V4_PRO), key: value})
+    why = dispatch.config_refusal(_atom_config(hf_config=hf))
+    assert why.startswith("checkpoint:") and (key in why or "compress_ratios" in why)
+
+
+def test_another_kv_block_size_is_refused(native):
+    why = dispatch.config_refusal(_atom_config(kv_cache_block_size=64))
+    assert "kv block size 64" in why
 
 
 def test_plugin_mode_is_refused(native, monkeypatch):

@@ -384,13 +384,14 @@ class Dsv4MonoDecodeRunner:
             out[:, window:] = torch.where(ok, flat[src.clamp(max=flat.numel() - 1)], -1)
         return out
 
-    def _state(self, li, slots):
+    def _state(self, li, slots, slots_in):
         attn = self.model.layers[li].attn
         comp = attn.compressor
         st = {
             "kv_state": comp.kv_state,
             "score_state": comp.score_state,
             "state_slots": slots,
+            "state_slots_in": slots_in,
             "st_kv": comp.kv_state.stride(0),
         }
         if attn.indexer is not None:
@@ -400,9 +401,8 @@ class Dsv4MonoDecodeRunner:
                 i_score_state=ic.score_state,
                 st_i=ic.kv_state.stride(0),
                 i_cache=attn.indexer.kv_cache,
+                # one pool shared by every sequence: the block id alone places an entry
                 i_cache_s=attn.indexer.kv_scale,
-                # the pool is shared: the physical block id alone places an entry
-                st_ic=0,
             )
         return st
 
@@ -458,7 +458,9 @@ class Dsv4MonoDecodeRunner:
         pos = take(positions[:rows].to(torch.int32))
         tokens = take(input_ids[:rows].to(torch.int32))
         seq = take(seq)
+        # a fork reads the source's state (state_slot_in) and writes a fresh slot
         slots = md.state_slot_out[seq].to(torch.int32).contiguous()
+        slots_in = md.state_slot_in[seq].to(torch.int32).contiguous()
         bt = md.block_tables[seq].to(torch.int32).contiguous()
         run = take(run_positions(seq[:rows] if bid is None else bid[:rows].long()))
         env = int(md.envelope_rows)
@@ -493,7 +495,7 @@ class Dsv4MonoDecodeRunner:
                 tokens=tokens,
                 block_tables=bt,
                 env_rows=env,
-                state=self._state(li, slots),
+                state=self._state(li, slots, slots_in),
                 run_pos=run,
             )
             tap = self.aux.by_layer.get(li)

@@ -200,9 +200,6 @@ def build_dsv4_kernel(
     INTER = inter
     NOPE_DIM = HEAD_DIM - ROPE_DIM
     MOE_SLOTS = 1 + TOP_K
-    assert (
-        TOP_K <= 8
-    ), "ug keeps the routing weights in misc[:8], below the quant scales"
     SHARED_EXPERT = N_EXPERTS
     QKV_A_ROWS = (
         Q_LORA + HEAD_DIM
@@ -214,7 +211,6 @@ def build_dsv4_kernel(
     ) // QKV_A_TILE
     N_ROW_TILES = HIDDEN // ROW_TILE
     N_ROUTER = N_EXPERTS // ROUTER_TILE
-    N_UG_PER_SLOT = INTER // UG_TILE
     # the routed experts run A8W4, as the original decode: MXFP4 weights on MXFP8
     # activations, one E8M0 scale per 32-value block
     XQ_BLOCKS = HIDDEN // 32
@@ -298,8 +294,8 @@ def build_dsv4_kernel(
             HC_NKC % HC_WPR == 0
         ), "hc_pre chunks must divide over the waves of a row group"
 
-    down_scale_words = S * MOE_SLOTS * INTER // 32
-    HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
+    # misc[:WAVES]: the KV row's per-wave FP8 scale bytes (put_kv_row); the mHC coefficients after
+    HC_MISC = WAVES
     # `uv` stores one per-split weight in misc, so it must hold N_SPLIT of them
     misc_words = max(HC_MISC + S * max(HC_COEF, 1), n_keys // SPLIT_KEYS)
     H = heads
@@ -341,7 +337,6 @@ def build_dsv4_kernel(
         f"n_keys {N_KEYS} = window {window} + the compressed list, so this is a max_seq limit"
     )
     N_QB = H * HEAD_DIM // Q_B_TILE
-    QB_PER_HEAD = HEAD_DIM // Q_B_TILE
     IH = index_heads if IHD else 0
     N_IQB = IH * IHD // Q_B_TILE
     N_IHG = -(-IH // 16)  # 16-head MFMA column groups of the score
@@ -378,6 +373,8 @@ def build_dsv4_kernel(
         assert (
             TK_TRIPS * TK_PER <= 32
         ), "the top-k's candidates per thread must fit in registers"
+        # its compaction packs two per-part counts into one scanned word
+        assert TK_TRIPS * TK_PER * THREADS < 1 << 16, "a part's counts must fit 16 bits"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert (
             K_PB == 64
@@ -391,12 +388,8 @@ def build_dsv4_kernel(
     N_OA = S * O_GROUPS * O_LORA // ROW_TILE
     OA_PER_GROUP = O_LORA // ROW_TILE
     OB_K = O_GROUPS * O_LORA
-    # selection key: order-preserving score bits, low ID_BITS = ID_MASK - id (ties to the lower id)
-    ID_BITS = max(8, (N_EXPERTS - 1).bit_length())
-    ID_MASK = (1 << ID_BITS) - 1
     UG_PER_SLOT = INTER // UG8
     N_UG_TASKS = TOP_K * UG_PER_SLOT
-    N_UG = S * MOE_SLOTS * N_UG_PER_SLOT
     # route weight sum over lanes 0..TOP_K-1 (lanes >= TOP_K hold 0)
     _off, TOPK_SUM_OFFS = 1, []
     while _off < TOP_K:
@@ -541,6 +534,7 @@ def build_dsv4_kernel(
         peers: Int64,
         step: Int64,
         state_slots: Int64,
+        state_slots_in: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
         block_tables: Int64,
@@ -549,7 +543,6 @@ def build_dsv4_kernel(
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
-        st_ic: Int32,
         use_hash: Int32,
         bt_stride: Int32,
         env_rows: Int32,
@@ -617,17 +610,14 @@ def build_dsv4_kernel(
             """Plane row of sequence ``s``'s compressed entry ``e`` (see K_PB)."""
             return ld_dest(1, s) + bt_block(s, e) * env_rows + e % K_PB
 
-        r_slot = rsrc(state_slots)
-
-        def ld_slot(s, stride):
-            """Element offset of sample ``s``'s slot of a rolling-state pool; ``stride``
-            is the whole pool entry, which interleaves several fields."""
-            return uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32)) * stride
+        # a step writes a sequence's rolling state at state_slots and reads its ring at
+        # state_slots_in: they differ on a fork (ATOM's state_slot_out / state_slot_in)
+        r_slot, r_slot_in = rsrc(state_slots), rsrc(state_slots_in)
 
         # serving pools exceed a buffer resource's 4 GB reach: row / slot bases are 64-bit
-        def slot_rsrc(ptr, s, stride):
+        def slot_rsrc(ptr, s, stride, slots=r_slot):
             """A resource at sample ``s``'s slot of an f32 rolling-state pool."""
-            slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
+            slot = uniform(bo.buffer_load(slots, s, vec_width=1, dtype=T.i32))
             return rsrc(ptr + fx.Int64(slot) * fx.Int64(stride) * 4)
 
         def row_rsrc(ptr, row, row_bytes):
@@ -711,6 +701,7 @@ def build_dsv4_kernel(
         peers: Int64,
         step: Int64,
         state_slots: Int64,
+        state_slots_in: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
         block_tables: Int64,
@@ -719,7 +710,6 @@ def build_dsv4_kernel(
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
-        st_ic: Int32,
         use_hash: Int32,
         bt_stride: Int32,
         env_rows: Int32,
@@ -781,6 +771,7 @@ def build_dsv4_kernel(
             peers,
             step,
             state_slots,
+            state_slots_in,
             tok_ids,
             tid2eid,
             block_tables,
@@ -789,7 +780,6 @@ def build_dsv4_kernel(
             layer,
             st_kv,
             st_i,
-            st_ic,
             use_hash,
             bt_stride,
             env_rows,

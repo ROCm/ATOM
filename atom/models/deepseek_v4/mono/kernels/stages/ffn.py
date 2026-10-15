@@ -13,6 +13,7 @@ from flydsl.expr.typing import T
 from atom.models.deepseek_v4.mono.config import SCALE_BM
 from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
 from atom.models.deepseek_v4.mono.kernels.ops import (
+    fp8_block_dequant,
     ld_bf16,
     lds_ld,
     lds_st,
@@ -20,7 +21,6 @@ from atom.models.deepseek_v4.mono.kernels.ops import (
 from atom.models.deepseek_v4.mono.layout import (
     ROUTER_TILE,
     UG8,
-    UG_TILE,
     ffn_hcc,
     router_spt,
 )
@@ -52,8 +52,6 @@ def ffn_stages(ctx):
     N_DN_TILES = ctx["N_DN_TILES"]
     N_EXPERTS = ctx["N_EXPERTS"]
     N_ROUTER = ctx["N_ROUTER"]
-    N_UG = ctx["N_UG"]
-    N_UG_PER_SLOT = ctx["N_UG_PER_SLOT"]
     N_UG_TASKS = ctx["N_UG_TASKS"]
     S = ctx["S"]
     SHARED_EXPERT = ctx["SHARED_EXPERT"]
@@ -95,6 +93,7 @@ def ffn_stages(ctx):
     s_sug = ctx["s_sug"]
     s_ug = ctx["s_ug"]
     stage_moe_input = ctx["stage_moe_input"]
+    stage_x_pairs = ctx["stage_x_pairs"]
     stage_x_rmsnorm = ctx["stage_x_rmsnorm"]
     start = ctx["start"]
     swiglu_limit = ctx["swiglu_limit"]
@@ -163,7 +162,7 @@ def ffn_stages(ctx):
             )
 
         pre = [u_r(c) for c in range(R_CPW)]
-        hint_wait(0, None)
+        hint_wait()
         # this task's expert-activation blocks ride along (MXFP8: 4 16-lane groups a wave)
         r_gp = rsrc(g_post)
         x_blk = (wave * N_ROUTER + t) * 4 + lane // 16
@@ -230,7 +229,12 @@ def ffn_stages(ctx):
                 x_s = rs0 + s_l
                 x_rstd = rstds[s_l]
                 a0, a1 = xa[s_l]
-                v0, v1 = a0 * x_rstd * xg[0], a1 * x_rstd * xg[1]
+                # ATOM's MoE input is the bf16 x: the routed experts quantize it MXFP8
+                # (1x32), the shared expert's FP8 GEMM 1x128 (a wave holds one block)
+                v0 = bf16_round(a0 * x_rstd * xg[0])
+                v1 = bf16_round(a1 * x_rstd * xg[1])
+                s0, s1 = fp8_block_dequant([v0, v1], 64)
+                put(mb("x_sh"), (x_s * HIDDEN + xk) // 2, bf16_pair(s0, s1))
                 d0, d1, qs = quant_mxfp8(v0, v1)
                 w8 = (
                     fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, d0, d1, fx.Int32(0), False))
@@ -368,20 +372,6 @@ def ffn_stages(ctx):
                         swiglu(g0, v0, swiglu_limit),
                         swiglu(g1, v1, swiglu_limit),
                     )
-            if (c == 0) & (tid < S if shared else tid == 0):
-                sn = tid if shared else fx.Int32(sample)
-                sl = fx.Int32(0) if shared else slot
-                if live:
-                    put(
-                        mb("sel"),
-                        sn * MOE_SLOTS + sl,
-                        lds_ld(keys, sn * MOE_SLOTS + sl),
-                    )
-                    put(
-                        mb("prob"),
-                        sn * MOE_SLOTS + sl,
-                        lds_ld(dnw, sn * MOE_SLOTS + sl),
-                    )
 
         def ug8_tile(u):
             """Tile ``u`` (clamped; ``live`` masks a dead one): (live, uu, c, slot, has_sh, w_rg, w_ln, s_rg)."""
@@ -418,9 +408,10 @@ def ffn_stages(ctx):
         cur = ug8_units(
             c_, wr, wl, sr, uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv
         )
-        stage_moe_input(list(range(S)))
-        gpu.barrier()
         if has_sh0 & live0:
+            # the shared expert's own FP8 input (1x128 blocks) first, then the routed one
+            stage_x_pairs("x_sh", S * HIDDEN, lambda k: k)
+            gpu.barrier()
             reduce_rows(
                 1,
                 mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre),
@@ -428,6 +419,8 @@ def ffn_stages(ctx):
             )
             gpu.barrier()
             ug8_emit(c0, slot0, 0, True, live0)
+        stage_moe_input(list(range(S)))
+        gpu.barrier()
         for k in range_constexpr(UG_ITEMS):
             live, _uu, sample, c, slot, _w_rg, _w_ln, _s_rg = items[k]
             pre = cur
@@ -556,20 +549,7 @@ def ffn_stages(ctx):
 
         # the experts are known: stream their down weights while up/gate finishes
         pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_CPW))]
-        hint_wait(
-            N_UG,
-            lambda k: (
-                mb("mid"),
-                (
-                    k // (MOE_SLOTS * N_UG_PER_SLOT) * MOE_SLOTS
-                    + (k // N_UG_PER_SLOT) % MOE_SLOTS
-                )
-                * INTER
-                + (k % N_UG_PER_SLOT) * UG_TILE
-                + UG_TILE
-                - 1,
-            ),
-        )
+        hint_wait()
         mids = get2_many(
             [
                 (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
@@ -579,8 +559,16 @@ def ffn_stages(ctx):
         for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
             blk = wave + b * WAVES
             if blk < DN_BLK:
-                d0, d1, qs = quant_mxfp8(mids[b][0], mids[b][1])
-                lds_st(xs, blk * 64 + lane, bf16_pair(d0 * qs, d1 * qs))
+                # ATOM's SiLU-mul output is bf16; the routed experts' down input is MXFP8
+                # (1x32), the shared expert's FP8 GEMM's 1x128 (a block is this wave's)
+                m0, m1 = bf16_round(mids[b][0]), bf16_round(mids[b][1])
+                # wave-uniform: a block is one slot's
+                if (blk // (INTER // 128)) % MOE_SLOTS == MOE_SLOTS - 1:
+                    s0, s1 = fp8_block_dequant([m0, m1], 64)
+                    lds_st(xs, blk * 64 + lane, bf16_pair(s0, s1))
+                else:
+                    d0, d1, qs = quant_mxfp8(m0, m1)
+                    lds_st(xs, blk * 64 + lane, bf16_pair(d0 * qs, d1 * qs))
         gpu.barrier()
         acc = run_units(u_dn, DN_CPW, DN_BATCH, pre)
 

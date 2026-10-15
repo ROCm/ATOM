@@ -22,7 +22,9 @@ from atom.models.deepseek_v4.mono.kernels.ops import (
     lds_ld,
     lds_st,
     mxfp8_to_bf16x8,
+    pow2_ceil,
     wave_umax,
+    wave_umin,
     write_lane_i32,
 )
 from atom.models.deepseek_v4.mono.layout import (
@@ -91,18 +93,12 @@ def fp4_roundtrip(a, b):
     return out[0], out[1], word
 
 
-def pow2_ceil(x):
-    """Smallest power of two >= x: V4's FP4 block scale (reference.quant_dequant_fp4)."""
-    bits = fx.Float32(x).bitcast(fx.Int32)
-    man = bits & ((1 << 23) - 1)
-    e = ((bits >> 23) & 0xFF) - 127 + (man != 0).select(fx.Int32(1), fx.Int32(0))
-    return ((e + 127) << 23).bitcast(fx.Float32)
-
-
-def bf16x2_has_nan(w):
-    """Whether either bf16 half of a word is NaN."""
+def bf16x2_not_finite(w):
+    """Whether either bf16 half of a word is NaN or infinite."""
     w = fx.Int32(w)
-    return ((w & 0x7FFF) > fx.Int32(0x7F80)) | (((w >> 16) & 0x7FFF) > fx.Int32(0x7F80))
+    return ((w & 0x7FFF) >= fx.Int32(0x7F80)) | (
+        ((w >> 16) & 0x7FFF) >= fx.Int32(0x7F80)
+    )
 
 
 @traced
@@ -111,8 +107,6 @@ def common_defs(ctx):
     activation staging, routing and the TP peer reduce."""
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
-    ID_BITS = ctx["ID_BITS"]
-    ID_MASK = ctx["ID_MASK"]
     N_COMP = ctx["N_COMP"]
     N_EXPERTS = ctx["N_EXPERTS"]
     S = ctx["S"]
@@ -264,26 +258,28 @@ def common_defs(ctx):
             raws = getf_many(
                 [(mb("scores"), s * N_EXPERTS + lane + i * 64) for i in range(KPL)]
             )
-        ks = []
+        # (key, id): the full f32 of score + bias, order-preserving as u32, and the
+        # expert id; equal keys go to the lower id
+        ks, ids = [], []
         for i in range_constexpr(KPL):
             kb = (raws[i] + bs[i]).bitcast(fx.Int32)
-            ok = (kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)
-            ks.append(
-                fx.Uint32(
-                    (ok & fx.Int32(-(1 << ID_BITS))) | (ID_MASK - (lane + i * 64))
-                )
-            )
-        # sort each lane's keys descending; a round takes the wave max of the heads
+            ks.append(fx.Uint32((kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)))
+            ids.append(fx.Int32(lane + i * 64))
+        # sort each lane's pairs, best first; a round takes the wave's best head
         for a, b in sort_network(KPL):
-            ks[a], ks[b] = fx.max(ks[a], ks[b]), fx.min(ks[a], ks[b])
+            first = (ks[a] > ks[b]) | ((ks[a] == ks[b]) & (ids[a] < ids[b]))
+            ks[a], ks[b] = first.select(ks[a], ks[b]), first.select(ks[b], ks[a])
+            ids[a], ids[b] = first.select(ids[a], ids[b]), first.select(ids[b], ids[a])
         ks = [fx.Int32(k) for k in ks] + [fx.Int32(0)]
-        mv = fx.Int32(0)  # lane k: the key of pick k
+        ids = ids + [fx.Int32(N_EXPERTS)]
+        e = fx.Int32(0)  # lane k: the id of pick k
         for k in range_constexpr(TOP_K):
             m = wave_umax(ks[0])
-            hit = ks[0] == m
+            best = wave_umin((ks[0] == m).select(ids[0], fx.Int32(N_EXPERTS)))
+            hit = ids[0] == best
             ks = [hit.select(ks[i + 1], ks[i]) for i in range(KPL)] + [ks[KPL]]
-            mv = write_lane_i32(m, k, mv)
-        e = ID_MASK - (mv & ID_MASK)
+            ids = [hit.select(ids[i + 1], ids[i]) for i in range(KPL)] + [ids[KPL]]
+            e = write_lane_i32(best, k, e)
         # a scored layer passes null tables: zero records makes the loads return 0
         nrec = (use_hash != 0).select(fx.Int32(0x7FFFFFF0), fx.Int32(0))
         r_tok = bo.create_buffer_resource_from_addr(tok_ids, num_records_bytes=nrec)
@@ -306,7 +302,7 @@ def common_defs(ctx):
         tot = raw
         for off in TOPK_SUM_OFFS:
             tot = xred(tot, off, lambda a, b: a + b)
-        return e, raw * (rcp(tot) * ROUTE_SCALE)
+        return e, raw / tot * ROUTE_SCALE
 
     launch_state = LaunchState(
         source_key=SHARED_SOURCE_KEY,

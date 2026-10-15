@@ -19,6 +19,7 @@ from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS, SCALE_BM
 from atom.models.deepseek_v4.mono.kernels.ops import (
+    fp8_block_dequant,
     fp8_to_bf16x8,
     ld_f32,
     lds_ld,
@@ -34,6 +35,7 @@ from atom.mono.device.ops import (
     CM_SYS,
     bf2_f32,
     bf16_pair,
+    bf16_round,
     rsrc,
     traced,
     wave_sum,
@@ -203,7 +205,7 @@ def pre_poll(st, n, addr_of):
 # ------------------------------------------------------------------------------- task placement
 
 
-def hint_wait(st, n, addr_of):
+def hint_wait(st):
     """Block barrier before a stage polls its inputs; consumers poll their payload
     directly (tight per-wave spins)."""
     gpu.barrier()
@@ -497,14 +499,20 @@ def load_x_rmsnorm(st, ld4s, n, gamma, count=None):
     return gs, ld4s([(s, k) for s in range(count) for k in ks])
 
 
-def stage_x_rmsnorm(st, ld4s, n, gamma, loaded=None, count=None, exact_bf16=False):
+def stage_x_rmsnorm(
+    st, ld4s, n, gamma, loaded=None, count=None, exact_bf16=False, quant=None
+):
     """LDS bf16 X[s][0:n] = bf16(rmsnorm(x_s) * gamma) for every sample s, where
     ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])] (one batched load); returns the rstds.
     ``loaded``: the (gamma, x) loads already issued by load_x_rmsnorm.
     ``exact_bf16``: every x is a bf16 value, so x parks in its LDS slot as bf16
     across the block reduction instead of in registers (4 x 4 values a sample: the
     register peak of a build past 4 samples) and is read back for the scaling, bit
-    for bit the same."""
+    for bit the same.
+    ``quant``: the activation of an FP8 GEMM, staged as ATOM quantizes it (per sample,
+    1x128 blocks, ``fp8_block_dequant``) from the bf16 value ("bf16": a norm whose output
+    ATOM stores) or straight from the f32 one ("f32": a norm ATOM fuses with the quant).
+    """
     S = st.S
     eps = st.eps
     xs = st.xs
@@ -534,6 +542,28 @@ def stage_x_rmsnorm(st, ld4s, n, gamma, loaded=None, count=None, exact_bf16=Fals
                         xs, (s * n + ks[i]) // 2 + j, bf16_pair(a[2 * j], a[2 * j + 1])
                     )
     rstds = [rsq(tot * (1.0 / n) + eps) for tot in block_sums(sss)]
+    if const_expr(quant is not None):
+        # a thread's 4 values are k .. k + 3 of k = (tid + i * THREADS) * 4: 32 lanes hold
+        # one 128 block, so the block's amax is a 32-lane reduction (no divergence)
+        assert n % 128 == 0 and quant in ("bf16", "f32")
+        for s in range_constexpr(count):
+            for i in range_constexpr(per):
+                at = (s * n + ks[i]) // 2
+                if const_expr(exact_bf16):
+                    a = list(bf2_f32(lds_ld(xs, at).bitcast(fx.Int32)))
+                    a += list(bf2_f32(lds_ld(xs, at + 1).bitcast(fx.Int32)))
+                else:
+                    a = vals[s * per + i]
+                v = [a[k] * rstds[s] * gs[i][k] for k in range(4)]
+                if const_expr(quant == "bf16"):
+                    v = [bf16_round(x) for x in v]
+                v = fp8_block_dequant(v, 32)
+                w = [bf16_pair(v[0], v[1]), bf16_pair(v[2], v[3])]
+                if const_expr(active is not None and i == per - 1):
+                    _store_pairs_if(active, xs, at, w)
+                else:
+                    _store_pairs(xs, at, w)
+        return rstds
     for s in range_constexpr(count):
         for i in range_constexpr(per):
             a = vals[s * per + i]
@@ -557,6 +587,19 @@ def stage_x_rmsnorm(st, ld4s, n, gamma, loaded=None, count=None, exact_bf16=Fals
     return rstds
 
 
+def _store_pairs(xs, at, w):
+    for j in range_constexpr(len(w)):
+        lds_st(xs, at + j, w[j])
+
+
+@traced
+def _store_pairs_if(pred, xs, at, w):
+    """``_store_pairs`` on the lanes where ``pred`` holds (a tail's inactive lanes share
+    its last group's slots)."""
+    if pred:
+        _store_pairs(xs, at, w)
+
+
 def _scale_parked(xs, at, rstd, g, j):
     """LDS pair ``at``, parked as bf16 x, := bf16(x * rstd * gamma)."""
     x0, x1 = bf2_f32(lds_ld(xs, at).bitcast(fx.Int32))
@@ -571,9 +614,11 @@ def _scale_parked_if(pred, xs, at, rstd, g, j):
 
 
 @traced
-def stage_x_pairs(st, name, n_total, src_of):
+def stage_x_pairs(st, name, n_total, src_of, quant=False):
     """LDS bf16 X[k] = packed bf16 mailbox ``name`` element src_of(k) for k < n_total
-    (src_of contiguous over aligned groups of 4): one 16-byte poll per 4 elements."""
+    (src_of contiguous over aligned groups of 4): one 16-byte poll per 4 elements.
+    ``quant``: the activation of an FP8 GEMM, staged as ATOM quantizes it (1x128 blocks
+    of src_of order, ``fp8_block_dequant``); 32 lanes hold a block."""
     tid = st.tid
     xs = st.xs
     mb = st.mb
@@ -583,15 +628,35 @@ def stage_x_pairs(st, name, n_total, src_of):
     vals = poll(
         [(mb(name), src_of((tid + i * THREADS) * 4) // 2, 2) for i in range(full)]
     )
-    for i in range_constexpr(full):
-        for j in range_constexpr(2):
-            lds_st(xs, (tid + i * THREADS) * 2 + j, vals[i][j].bitcast(fx.Float32))
-    if const_expr(nq % THREADS):
-        w = tid + full * THREADS
-        if w < nq:
-            v = poll([(mb(name), src_of(w * 4) // 2, 2)])[0]
+    if const_expr(quant):
+        # a block's 32 lanes are all in the tail or all out of it
+        assert n_total % 128 == 0, "a quantized staging is whole 128 blocks"
+        for i in range_constexpr(full):
+            _stage_block_quant(xs, (tid + i * THREADS) * 2, vals[i])
+        if const_expr(nq % THREADS):
+            w = tid + full * THREADS
+            if w < nq:
+                v = poll([(mb(name), src_of(w * 4) // 2, 2)])[0]
+                _stage_block_quant(xs, w * 2, v)
+    else:
+        for i in range_constexpr(full):
             for j in range_constexpr(2):
-                lds_st(xs, w * 2 + j, v[j].bitcast(fx.Float32))
+                lds_st(xs, (tid + i * THREADS) * 2 + j, vals[i][j].bitcast(fx.Float32))
+        if const_expr(nq % THREADS):
+            w = tid + full * THREADS
+            if w < nq:
+                v = poll([(mb(name), src_of(w * 4) // 2, 2)])[0]
+                for j in range_constexpr(2):
+                    lds_st(xs, w * 2 + j, v[j].bitcast(fx.Float32))
+
+
+def _stage_block_quant(xs, at, words):
+    """LDS pairs ``at``, ``at + 1`` := the 4 packed bf16 ``words`` quantized as a 1x128
+    block's part (``fp8_block_dequant`` over 32 lanes)."""
+    a = list(bf2_f32(words[0])) + list(bf2_f32(words[1]))
+    v = fp8_block_dequant(a, 32)
+    for j in range_constexpr(2):
+        lds_st(xs, at + j, bf16_pair(v[2 * j], v[2 * j + 1]))
 
 
 def load_bias(st):

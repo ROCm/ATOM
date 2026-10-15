@@ -250,7 +250,7 @@ class Dsv4MonoKernel:
                 f"block_tables must be int32 [{self.S}, blocks] with unit-stride rows, "
                 f"got {tuple(block_tables.shape)} {block_tables.dtype} strides {block_tables.stride()}"
             )
-        need = {"state_slots"}
+        need = {"state_slots", "state_slots_in"}
         if cfg.compress_ratio:
             need |= {"kv_state", "score_state", "st_kv"}
         if cfg.indexed:
@@ -260,7 +260,6 @@ class Dsv4MonoKernel:
                 "i_cache",
                 "i_cache_s",
                 "st_i",
-                "st_ic",
             }
         missing = need - set(state)
         if missing:
@@ -328,6 +327,7 @@ class Dsv4MonoKernel:
             p(var.peers),
             p(var.step),
             p(state["state_slots"]),
+            p(state["state_slots_in"]),
             p(tokens) if use_hash else 0,
             q(t, "tid2eid"),
             p(block_tables),
@@ -336,7 +336,6 @@ class Dsv4MonoKernel:
             layer,
             state.get("st_kv", 0),
             state.get("st_i", 0),
-            state.get("st_ic", 0),
             int(use_hash),
             block_tables.stride(0),
             env_rows,

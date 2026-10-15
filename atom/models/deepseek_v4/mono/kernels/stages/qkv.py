@@ -105,6 +105,7 @@ def qkv_stages(ctx):
     run_units = ctx["run_units"]
     s_qkv_a = ctx["s_qkv_a"]
     score_state = ctx["score_state"]
+    r_slot_in = ctx["r_slot_in"]
     slot_rsrc = ctx["slot_rsrc"]
     st_kv = ctx["st_kv"]
     stage_x_rmsnorm = ctx["stage_x_rmsnorm"]
@@ -175,7 +176,15 @@ def qkv_stages(ctx):
             pre = [u_qa(c) for c in range(QA_BATCH)]
             # a build past 4 samples parks h (bf16, or hc_pre's bf16 pairs) in LDS across
             # the reduction: its register peak
-            stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld, exact_bf16=S > 4)
+            # wqkv_a is ATOM's FP8 GEMM on the bf16 x; the compressors' BF16 GEMM takes x as is
+            stage_x_rmsnorm(
+                ld_h,
+                HIDDEN,
+                g_in,
+                loaded=h_ld,
+                exact_bf16=S > 4,
+                quant=None if bf16_w else "bf16",
+            )
             gpu.barrier()
             acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
             reduce_rows(QA_R, acc, emit_out(QA_ROWS))
@@ -183,7 +192,7 @@ def qkv_stages(ctx):
             if tid < S * QA_ROWS:
                 s = tid // QA_ROWS
                 row = row0 + t * QA_ROWS + tid % QA_ROWS
-                v = lds_ld(outs, tid)
+                v = bf16_round(lds_ld(outs, tid))  # a bf16 GEMM output, as ATOM's
                 # column ranges of the fused GEMV (reference.qkv_a_split())
                 if row < Q_LORA:
                     put(mb("q_a"), s * Q_LORA + row, v)
@@ -253,13 +262,7 @@ def qkv_stages(ctx):
         ps = [ld_pos(sx) for sx in range(S)]
         cs = [ld_f32(rsrc(rope_cos), ps[sx] * (ROPE_DIM // 2) + ri) for sx in range(S)]
         sns = [ld_f32(rsrc(rope_sin), ps[sx] * (ROPE_DIM // 2) + ri) for sx in range(S)]
-        hint_wait(
-            HEAD_DIM // QKV_A_TILE,
-            lambda k: (
-                mb("kv_a"),
-                (S - 1) * HEAD_DIM + k * QKV_A_TILE + QKV_A_TILE - 1,
-            ),
-        )
+        hint_wait()
         vs = getf_many(
             [(mb("kv_a"), s * HEAD_DIM + fx.min(tid, HEAD_DIM - 1)) for s in range(S)]
         )
@@ -358,6 +361,8 @@ def qkv_stages(ctx):
                 slot_rsrc(score_state, tt, st_kv),
                 0,
             )
+            ri_kv = slot_rsrc(kv_state, tt, st_kv, r_slot_in)
+            ri_sc = slot_rsrc(score_state, tt, st_kv, r_slot_in)
             slot = p % CR
             ap0 = [
                 ld_f32(rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)
@@ -391,7 +396,7 @@ def qkv_stages(ctx):
 
                 def c_ring(i):
                     wi = sb + ring_row(p, i) * CW + c_half(i) * HEAD_DIM + ch
-                    return ld_f32(rs_sc, wi), ld_f32(rs_kv, wi)
+                    return ld_f32(ri_sc, wi), ld_f32(ri_kv, wi)
 
                 def c_own(i):
                     h = 1 if (OVERLAP and i >= CR) else 0
@@ -476,10 +481,7 @@ def q_b_stage(ctx):
             )
 
         pre = [u_qb(c) for c in range(QB_BATCH)]
-        hint_wait(
-            Q_LORA // QKV_A_TILE,
-            lambda k: (mb("q_a"), (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1),
-        )
+        hint_wait()
 
         def ld_qa(sks):
             v = get2_many(
@@ -487,18 +489,18 @@ def q_b_stage(ctx):
             )
             return [list(v[2 * i]) + list(v[2 * i + 1]) for i in range(len(sks))]
 
-        stage_x_rmsnorm(ld_qa, Q_LORA, g_q)
+        # q_norm fused with wq_b's FP8 quant, as ATOM's (from the f32 norm)
+        stage_x_rmsnorm(ld_qa, Q_LORA, g_q, quant="f32")
         gpu.barrier()
         acc = run_units(u_qb, QB_UPW, QB_BATCH, pre)
         reduce_rows(QB_R, acc, emit_out(QB_ROWS))
         gpu.barrier()
-        # f32: the per-head RMS sees the unrounded output; bf16 rounding comes after RoPE
         if tid < S * QB_ROWS:
             s = tid // QB_ROWS
             row = t * QB_ROWS + tid % QB_ROWS
             put(
                 mb("q_raw"),
                 (s * H + row // HEAD_DIM) * HEAD_DIM + row % HEAD_DIM,
-                lds_ld(outs, tid),
+                bf16_round(lds_ld(outs, tid)),  # a bf16 GEMM output, as ATOM's
             )
     return {}

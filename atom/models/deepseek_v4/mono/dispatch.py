@@ -25,7 +25,12 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from atom.models.deepseek_v4.mono.config import MAX_TOKENS, SUPPORTED_HEADS
+from atom.models.deepseek_v4.mono.config import (
+    BLOCK_TOKENS,
+    MAX_TOKENS,
+    SUPPORTED_HEADS,
+    checkpoint_refusal,
+)
 from atom.mono.plan.shard import Shard, ShardError
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -76,7 +81,13 @@ def config_refusal(atom_config) -> str | None:
     spec = atom_config.speculative_config
     k = spec_steps(atom_config)
     dims = functools.partial(Dims, atom_config.hf_config)
+    checkpoint = checkpoint_refusal(atom_config.hf_config)
     checks = common_refusals(atom_config, dims, SUPPORTED_TP) + [
+        (checkpoint is None, f"checkpoint: {checkpoint}"),
+        (
+            atom_config.kv_cache_block_size == BLOCK_TOKENS,
+            f"kv block size {atom_config.kv_cache_block_size}",
+        ),
         (atom_config.kv_cache_dtype == "fp8", f"kv cache {atom_config.kv_cache_dtype}"),
         (
             atom_config.index_cache_dtype == "fp4",

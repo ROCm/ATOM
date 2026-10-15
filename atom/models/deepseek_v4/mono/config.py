@@ -70,6 +70,49 @@ INDEX_HEAD_DIM = 128
 INDEX_TOPK = 1024
 KEY_BLOCK = 64  # the split-attention key tile; the index list is padded to it
 
+# The checkpoint the kernel is built for (DeepSeek-V4-Pro): every config.json value it
+# bakes in, global (before the TP8 split). A checkpoint differing in any is refused.
+V4_PRO_CONFIG = {
+    "hidden_size": HIDDEN,
+    "q_lora_rank": Q_LORA,
+    "o_lora_rank": O_LORA,
+    "head_dim": HEAD_DIM,
+    "qk_rope_head_dim": ROPE_DIM,
+    "num_attention_heads": 128,
+    "o_groups": 16,
+    "n_routed_experts": N_EXPERTS,
+    "num_experts_per_tok": TOP_K,
+    "moe_intermediate_size": 3072,
+    "n_shared_experts": 1,
+    "sliding_window": WINDOW,
+    "routed_scaling_factor": ROUTE_SCALE,
+    "swiglu_limit": SWIGLU_LIMIT,
+    "rms_norm_eps": EPS,
+    "scoring_func": "sqrtsoftplus",
+    "norm_topk_prob": True,
+    "index_n_heads": INDEX_HEADS,
+    "index_head_dim": INDEX_HEAD_DIM,
+    "index_topk": INDEX_TOPK,
+    "hc_mult": HC_MULT,
+    "hc_sinkhorn_iters": HC_SINKHORN_ITERS,
+    "hc_eps": HC_EPS,
+    "compress_rope_theta": COMPRESS_ROPE_THETA,
+    "num_hidden_layers": 61,
+}
+
+
+def checkpoint_refusal(hf_config) -> str | None:
+    """Why a checkpoint is not the one the kernel is built for, or None."""
+    for key, want in V4_PRO_CONFIG.items():
+        got = getattr(hf_config, key, None)
+        if got != want:
+            return f"{key} {got!r}, the kernel's is {want!r}"
+    n = hf_config.num_hidden_layers
+    ratios = tuple(getattr(hf_config, "compress_ratios", ()))[:n]
+    if ratios != compress_ratios(n, n_mtp=0):
+        return "compress_ratios differ from V4-Pro's layer schedule"
+    return None
+
 
 def validate_shard(
     samples: int,

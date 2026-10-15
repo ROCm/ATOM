@@ -29,7 +29,6 @@ from atom.models.deepseek_v4.mono.layout import (
     IH_TASK,
     MIN_I32,
     Q_B_TILE,
-    QKV_A_TILE,
     SCORE_TILE,
     q_b_groups,
 )
@@ -96,7 +95,6 @@ def index_query_stages(ctx):
     i_w = ctx["i_w"]
     lane = ctx["lane"]
     ld_pos = ctx["ld_pos"]
-    ld_slot = ctx["ld_slot"]
     load_x_rmsnorm = ctx["load_x_rmsnorm"]
     mb = ctx["mb"]
     n_sel = ctx["n_sel"]
@@ -110,9 +108,9 @@ def index_query_stages(ctx):
     rope_sin = ctx["rope_sin"]
     run_units = ctx["run_units"]
     s_i_q_b = ctx["s_i_q_b"]
+    r_slot_in = ctx["r_slot_in"]
     slot_rsrc = ctx["slot_rsrc"]
     st_i = ctx["st_i"]
-    st_ic = ctx["st_ic"]
     stage_x_rmsnorm = ctx["stage_x_rmsnorm"]
     start = ctx["start"]
     tid = ctx["tid"]
@@ -160,7 +158,8 @@ def index_query_stages(ctx):
                 slot_rsrc(i_score_state, tt, st_i),
                 0,
             )
-            icb = ld_slot(tt, st_ic)  # the indexer's key cache slot (bytes)
+            ri_ikv = slot_rsrc(i_kv_state, tt, st_i, r_slot_in)
+            ri_isc = slot_rsrc(i_score_state, tt, st_i, r_slot_in)
             slot = p % CR
             chs = [ln, ln + 64]
             ap0 = [
@@ -195,7 +194,7 @@ def index_query_stages(ctx):
                             else 0
                         )
                         wi = isb + ring_row(p, i) * IW + coff + chs[e]
-                        return ld_f32(rs_isc, wi), ld_f32(rs_ikv, wi)
+                        return ld_f32(ri_isc, wi), ld_f32(ri_ikv, wi)
 
                     def i_own(i, e=e):
                         h = 1 if (OVERLAP and i >= CR) else 0
@@ -241,7 +240,7 @@ def index_query_stages(ctx):
                     e_i = p // CR
                     blk_i = bt_block(tt, e_i)
                     sl = e_i % K_PB
-                    dbase = icb // 4 + blk_i * IC_BLK_WORDS + sl * 4
+                    dbase = blk_i * IC_BLK_WORDS + sl * 4
                     if ln % 8 == 0:
                         for h in range_constexpr(2):
                             w = ln // 8 + 8 * h
@@ -251,12 +250,7 @@ def index_query_stages(ctx):
                                 dbase + (w // 4) * IC_GRP_WORDS + w % 4,
                             )
                     if ln == 0:
-                        sbase = (
-                            icb // 16
-                            + blk_i * IC_S_BLK
-                            + (sl % 16) * 4
-                            + (sl % K_PB) // 16
-                        )
+                        sbase = blk_i * IC_S_BLK + (sl % 16) * 4 + (sl % K_PB) // 16
                         for g in range_constexpr(IHD // 32):
                             bo.buffer_store(
                                 fx.Int8((sw >> (8 * g)) & 0xFF),
@@ -292,13 +286,7 @@ def index_query_stages(ctx):
                 )
 
             pre = [u_iqb(c) for c in range(IQB_NKC // WAVES)]
-            hint_wait(
-                Q_LORA // QKV_A_TILE,
-                lambda k: (
-                    mb("q_a"),
-                    (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1,
-                ),
-            )
+            hint_wait()
 
             def ld_iqa(sks):
                 v = get2_many(
@@ -306,7 +294,7 @@ def index_query_stages(ctx):
                 )
                 return [list(v[2 * i]) + list(v[2 * i + 1]) for i in range(len(sks))]
 
-            stage_x_rmsnorm(ld_iqa, Q_LORA, g_q)
+            stage_x_rmsnorm(ld_iqa, Q_LORA, g_q, quant="f32")
             gpu.barrier()
             acc = run_units(u_iqb, IQB_UPW, IQB_NKC // WAVES, pre)
             reduce_rows(IQB_R, acc, emit_out(IQB_ROWS))
@@ -314,7 +302,7 @@ def index_query_stages(ctx):
             if tid < S * IQB_ROWS:
                 s = tid // IQB_ROWS
                 row = t * IQB_ROWS + tid % IQB_ROWS  # row of the [IH * IHD] query
-                put(mb("i_q_raw"), s * IH * IHD + row, lds_ld(outs, tid))
+                put(mb("i_q_raw"), s * IH * IHD + row, bf16_round(lds_ld(outs, tid)))
 
         # ---- rope -> Hadamard -> FP4, one whole index head per wave
         for tt in range(start("i_q"), S * IH // IH_TASK, G):
@@ -331,12 +319,13 @@ def index_query_stages(ctx):
                 v = getf_many([(mb("i_q_raw"), base_i + c) for c in chs])
                 partner = xshfl(v[1], 1)
                 even = ln % 2 == 0
-                v[1] = bf16_round(
-                    even.select(v[1] * rc - partner * rs2, partner * rs2 + v[1] * rc)
-                )
-                v[0] = bf16_round(v[0])
-                h0, h1 = had_pair(v[0], v[1], ln)
-                o0, o1 = fp4_block(bf16_round(h0))[0], fp4_block(bf16_round(h1))[0]
+                r1 = even.select(v[1] * rc - partner * rs2, partner * rs2 + v[1] * rc)
+                if const_expr(INDEXER_HADAMARD):
+                    h0, h1 = had_pair(v[0], bf16_round(r1), ln)
+                    o0, o1 = fp4_block(bf16_round(h0))[0], fp4_block(bf16_round(h1))[0]
+                else:
+                    # ATOM's (rope_rotate_activation, no rotation): FP4 from the f32 RoPE
+                    o0, o1 = fp4_block(v[0])[0], fp4_block(r1)[0]
                 put(mb("i_q"), base_i + chs[0], o0)
                 put(mb("i_q"), base_i + chs[1], o1)
 
@@ -448,14 +437,12 @@ def index_select_stages(ctx):
     i_cache_s = ctx["i_cache_s"]
     lane = ctx["lane"]
     ld_pos = ctx["ld_pos"]
-    ld_slot = ctx["ld_slot"]
     mb = ctx["mb"]
     part_keys = ctx["part_keys"]
     pl = ctx["pl"]
     poll = ctx["poll"]
     put = ctx["put"]
     red = ctx["red"]
-    st_ic = ctx["st_ic"]
     start = ctx["start"]
     tid = ctx["tid"]
     v4f = ctx["v4f"]
@@ -501,7 +488,6 @@ def index_select_stages(ctx):
                 n_live = (sp + 1) // CR
                 r_ic2 = rsrc(i_cache)
                 r_ics = rsrc(i_cache_s)
-                icb = ld_slot(s, st_ic)  # bytes; the scale pool's base is 1/16 of it
                 j_tok = ld_run(s)
                 # MFMA: a wave's 64 entries as 4 x 16 A rows, the heads as B columns, 16 per group
                 hn = lane % 16
@@ -520,8 +506,8 @@ def index_select_stages(ctx):
                     )
                     blk_e = bt_block(s, ec)
                     sl_e = ec % K_PB
-                    db = icb // 4 + blk_e * IC_BLK_WORDS + sl_e * 4 + lane // 16
-                    sdb = icb // 64 + blk_e * (IC_S_BLK // 4) + sl_e % 16
+                    db = blk_e * IC_BLK_WORDS + sl_e * 4 + lane // 16
+                    sdb = blk_e * (IC_S_BLK // 4) + sl_e % 16
                     kds = [
                         bo.buffer_load(
                             r_ic2, db + kb * IC_GRP_WORDS, vec_width=1, dtype=T.i32
@@ -714,43 +700,45 @@ def index_select_stages(ctx):
                     gpu.barrier()
                 thr = pfx ^ MIN_I32  # back to the signed-comparable domain
 
-                # Compaction: picks above the threshold go to [gt_b, ..) of [0, gt), ties
-                # to [gt + eq_b, ..) below k_want. The gather polls every i_sel slot, so
-                # a radix bug that leaves one unwritten is a hang, not a wrong answer.
-                if tid == 0:
-                    lds_st(hist, TK_BC, fx.Int32(0))
-                    lds_st(hist, TK_BC + 1, fx.Int32(0))
-                gpu.barrier()
+                # Compaction in a fixed order (thread, then its candidates): picks above the
+                # threshold go to [gt_b, ..) of [0, gt), ties to [gt + eq_b, ..) below
+                # k_want, each thread's slots from a block scan of its counts, so the
+                # selection and its order are the same every run. The gather polls every
+                # i_sel slot, so a radix bug that leaves one unwritten is a hang, not a
+                # wrong answer.
+                # the counts and each candidate's slot are straight-line (no branch); only
+                # the writes sit under trip_live, as a dead trip has nothing to write
+                picks = []
+                n_above = fx.Int32(0)
+                n_tie = fx.Int32(0)
+                for j in range_constexpr(TK_TRIPS):
+                    for q in range_constexpr(TK_PER):
+                        c = tk_cbs[j] + q
+                        ok = c < n_live
+                        sk = tk_keys[j * TK_PER + q] ^ MIN_I32
+                        above, tie = ok & (sk > thr), ok & (sk == thr)
+                        picks.append((c, above, tie, n_above, n_tie))
+                        n_above = n_above + above.select(fx.Int32(1), fx.Int32(0))
+                        n_tie = n_tie + tie.select(fx.Int32(1), fx.Int32(0))
+                # one scan for both counts: each fits 16 bits (a part holds at most
+                # TK_TRIPS * TK_PER * THREADS candidates, asserted in the build)
+                off, _tot = block_excl_scan(n_above | (n_tie << 16))
+                w_above = (off & 0xFFFF) + gt_b
+                w_tie = (off >> 16) + gt + eq_b
                 for j in range_constexpr(TK_TRIPS):
                     if trip_live(j):
                         for q in range_constexpr(TK_PER):
-                            c = tk_cbs[j] + q
-                            ok = c < n_live
-                            sk = tk_keys[j * TK_PER + q] ^ MIN_I32
-                            if ok & (sk > thr):
-                                w = fx.Int32(
-                                    fx.atomic_add(
-                                        hist + TK_BC,
-                                        fx.Int32(1),
-                                        syncscope=fx.rocdl.SyncScope.Workgroup,
-                                    )
+                            c, above, tie, ia, it = picks[j * TK_PER + q]
+                            if above:
+                                put(
+                                    mb("i_sel"),
+                                    s * N_ISEL + w_above + ia,
+                                    comp_row(s, c),
                                 )
-                                put(mb("i_sel"), s * N_ISEL + gt_b + w, comp_row(s, c))
-                            if ok & (sk == thr):
-                                w = fx.Int32(
-                                    fx.atomic_add(
-                                        hist + TK_BC + 1,
-                                        fx.Int32(1),
-                                        syncscope=fx.rocdl.SyncScope.Workgroup,
-                                    )
+                            if tie & (w_tie + it < k_want):
+                                put(
+                                    mb("i_sel"), s * N_ISEL + w_tie + it, comp_row(s, c)
                                 )
-                                if (gt + eq_b + w) < k_want:
-                                    put(
-                                        mb("i_sel"),
-                                        s * N_ISEL + gt + eq_b + w,
-                                        comp_row(s, c),
-                                    )
-                # the next task's first digit re-zeroes these counters
                 gpu.barrier()
                 # part 0 fills the tail (every part writes only below k_want)
                 if part == 0:

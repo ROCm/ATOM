@@ -20,7 +20,7 @@ from atom.mono.plan.execution import BLOCKS, WAVES
 LAYER_SLOTS = MAX_LAYERS_PER_STEP
 QKV_A_TILE = 16
 Q_B_TILE = 16
-UV_TILE = 64  # output dims merged per uv task, at least: see uv_tile
+UV_TILE = 128  # output dims merged per uv task, at least (one o_a quant block): uv_tile
 ROW_TILE = 32  # rows per o_a / o_b / attention peer-reduce tile
 ROUTER_TILE = 8  # experts per router task (a part of a 16-row MFMA group)
 UG_TILE = 16  # intermediates per up/gate task (16 gate rows + 16 up rows)
@@ -85,9 +85,6 @@ def router_spt(S: int, n_experts: int = N_EXPERTS) -> int:
     while S * n_router > BLOCKS * spt and spt < ROUTER_TILE and S % (2 * spt) == 0:
         spt *= 2
     return spt
-
-
-N_UG_PER_SLOT = INTER // UG_TILE
 
 
 # CPol scope: SC1 = device (past the per-XCD caches), SC0|SC1 = system (peers over XGMI)
@@ -190,8 +187,8 @@ def layout(
         ("scores", S * n_experts * pr),
         ("xq", S * hidden // 4 * pr),
         ("xqs", S * xq_blocks * pr),
-        ("sel", S * (1 + top_k) * pr),
-        ("prob", S * (1 + top_k) * pr),
+        # the shared expert's FP8 input (1x128 blocks), dequantized, as packed bf16 pairs
+        ("x_sh", S * hidden // 2 * pr),
         ("mid", S * (1 + top_k) * inter * pr),
     ]
     off, scratch = 0, {}

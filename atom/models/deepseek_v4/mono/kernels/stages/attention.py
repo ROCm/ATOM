@@ -11,17 +11,17 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v4.mono.config import EPS, ROPE_DIM
-from atom.models.deepseek_v4.mono.kernels.common import bf16x2_has_nan, wave_any
+from atom.models.deepseek_v4.mono.kernels.common import bf16x2_not_finite, wave_any
 from atom.models.deepseek_v4.mono.kernels.ops import (
     NEG,
     exp,
+    fp8_block_dequant,
     fp8_to_bf16x8,
     ld_f32,
     lds_ld,
     lds_st,
 )
 from atom.models.deepseek_v4.mono.layout import (
-    Q_B_TILE,
     ROW_TILE,
     SPLIT_KEYS,
     o_a_spt,
@@ -29,6 +29,7 @@ from atom.models.deepseek_v4.mono.layout import (
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
+    bf16_round,
     rsrc,
     traced,
     wave_max,
@@ -74,7 +75,6 @@ def attention_stages(ctx):
     OB_K = ctx["OB_K"]
     O_GROUPS = ctx["O_GROUPS"]
     O_LORA = ctx["O_LORA"]
-    QB_PER_HEAD = ctx["QB_PER_HEAD"]
     QK_DIM = ctx["QK_DIM"]
     QS = ctx["QS"]
     S = ctx["S"]
@@ -143,13 +143,7 @@ def attention_stages(ctx):
         sp = ld_pos(s)
         c = ld_f32(rsrc(rope_cos), sp * (ROPE_DIM // 2) + ri)
         sn = ld_f32(rsrc(rope_sin), sp * (ROPE_DIM // 2) + ri)
-        hint_wait(
-            QB_PER_HEAD,
-            lambda k: (
-                mb("q_raw"),
-                (s * H + head) * HEAD_DIM + k * Q_B_TILE + Q_B_TILE - 1,
-            ),
-        )
+        hint_wait()
         qv = getf(mb("q_raw"), (s * H + head) * HEAD_DIM + fx.min(tid, HEAD_DIM - 1))
         live = tid < HEAD_DIM
         ssq = block_sum(live.select(qv * qv, fx.Float32(0.0)))
@@ -242,17 +236,20 @@ def attention_stages(ctx):
             nw = nope.bitcast(fx.Int32)
             is_n = lane < NOPE_DIM // EPL
             # ATOM leaves some rows unwritten (0xFF) or NaN; as its attention, mask
-            # the key (-1) and zero it. A 0xFF scale is checked on its own (inf x FP8
-            # is not NaN); one bad lane masks the whole key.
+            # the key and zero it. A 0xFF scale is checked on its own (inf x FP8
+            # is not NaN); one bad lane masks the whole key. The masked key keeps its
+            # row as -2 - row (still < 0): this launch may have just written the row,
+            # and patch_new_kv matches it to restore the key.
             words = [is_n.select(nw[m], rope[m]) for m in range(WPL)]
             bad = sb == fx.Int32(0xFF)
             for w_ in words:
-                bad = bad | bf16x2_has_nan(w_)
+                bad = bad | bf16x2_not_finite(w_)
             kv8 = fx.Vector.from_elements(
                 [bad.select(fx.Int32(0), w_) for w_ in words], fx.Int32
             )
             if wave_any(bad) & (lane == 0):
-                lds_st(keys, j, fx.Int32(-1))
+                kr = lds_ld(keys, j)
+                lds_st(keys, j, (kr >= 0).select(fx.Int32(-2) - kr, kr))
             fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
     def patch_new_kv(s):
@@ -274,7 +271,8 @@ def attention_stages(ctx):
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
-                if inl & (kr == w_row):
+                # a row gather_old_kv masked (-2 - row) is this launch's to restore
+                if inl & ((kr == w_row) | (kr == fx.Int32(-2) - w_row)):
                     kvp = get2_many(
                         [
                             (mb("kvnew"), sd * HEAD_DIM + lane * EPL + m * 2)
@@ -286,8 +284,14 @@ def attention_stages(ctx):
                         fx.Vector.from_elements(w, fx.Float32),
                         ktile + (j * KS + lane * WPL),
                     )
+                    if lane == 0:
+                        lds_st(keys, j, w_row)
                 if const_expr(CR):  # noqa: SIM102
-                    if inl & ((pd + 1) % CR == 0) & (kr == c_row):
+                    if (
+                        inl
+                        & ((pd + 1) % CR == 0)
+                        & ((kr == c_row) | (kr == fx.Int32(-2) - c_row))
+                    ):
                         cvp = get2_many(
                             [
                                 (mb("cnew"), sd * HEAD_DIM + lane * EPL + m * 2)
@@ -296,9 +300,9 @@ def attention_stages(ctx):
                         )
                         # NaN when ATOM's compressor state is: masked (see gather_old_kv)
                         words = [bf16_pair(a0, a1).bitcast(fx.Int32) for a0, a1 in cvp]
-                        bad = bf16x2_has_nan(words[0])
+                        bad = bf16x2_not_finite(words[0])
                         for w_ in words[1:]:
-                            bad = bad | bf16x2_has_nan(w_)
+                            bad = bad | bf16x2_not_finite(w_)
                         w = [
                             bad.select(fx.Int32(0), w_).bitcast(fx.Float32)
                             for w_ in words
@@ -307,8 +311,11 @@ def attention_stages(ctx):
                             fx.Vector.from_elements(w, fx.Float32),
                             ktile + (j * KS + lane * WPL),
                         )
-                        if wave_any(bad) & (lane == 0):
-                            lds_st(keys, j, fx.Int32(-1))
+                        any_bad = wave_any(
+                            bad
+                        )  # the whole wave, before the lane branch
+                        if lane == 0:
+                            lds_st(keys, j, any_bad.select(fx.Int32(-1), c_row))
 
     def live_splits(s):
         """Splits of sample ``s`` that can hold a live key: the window's plus the
@@ -428,7 +435,7 @@ def attention_stages(ctx):
             ml += fold_head(carry, hg, h, m, lsum) if multi else [m, lsum]
             # trace-time; nothing assigned here is used after it
             if not multi:  # noqa: SIM102
-                if lane == 0:  # written last: the merge's readiness hint
+                if lane == 0:
                     put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
                     put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
         gpu.barrier()
@@ -506,10 +513,7 @@ def attention_stages(ctx):
         load_tile(
             t * TPT, s
         )  # before waiting for q: these rows are from earlier launches
-        hint_wait(
-            H,
-            lambda k: (mb("q"), ((s * H + k) * HEAD_DIM + HEAD_DIM - 2) // 2),
-        )
+        hint_wait()
         # q of all heads -> bf16 Q[h][HEAD_DIM] at words h * QS + d / 2 (padded stride)
         NQ_TOT = H * HEAD_DIM // 4
         NQ = NQ_TOT // THREADS
@@ -552,7 +556,7 @@ def attention_stages(ctx):
         n_sp = (
             live_splits(s) + TPT - 1
         ) // TPT  # the tile groups written: see the split stage
-        hint_wait(n_sp, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+        hint_wait()
         pre_poll(n_sp, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
         dp = fx.min(tid, UV_PAIRS - 1)
         # one thread per split: a lane of wave 0, or of the block when UV_WIDE
@@ -621,8 +625,10 @@ def attention_stages(ctx):
                 o0 = o0 + a0 * wj
                 o1 = o1 + a1 * wj
             res = yield [o0, o1]
-        o0 = fx.Float32(res[0])
-        o1 = fx.Float32(res[1])
+        # ATOM's attention emits o as bf16; its inverse RoPE + FP8 quant (wo_a's input)
+        # runs in f32 from there
+        o0 = bf16_round(fx.Float32(res[0]))
+        o1 = bf16_round(fx.Float32(res[1]))
         # de-rotate the RoPE lanes (inverse rotation: sin negated)
         d0 = doff + dp * 2
         ri = fx.max(d0 - NOPE_DIM, fx.Int32(0)) // 2
@@ -632,6 +638,8 @@ def attention_stages(ctx):
         rot = d0 >= NOPE_DIM
         v0 = rot.select(o0 * c + o1 * sn, o0)
         v1 = rot.select(o1 * c - o0 * sn, o1)
+        # a wave holds 64 pairs: one 1x128 block of wo_a's FP8 activation
+        v0, v1 = fp8_block_dequant([v0, v1], 64)
         if tid < UV_PAIRS:
             put(
                 mb("o"), ((s * H + head) * HEAD_DIM + doff) // 2 + dp, bf16_pair(v0, v1)
@@ -665,13 +673,7 @@ def attention_stages(ctx):
             )
 
         pre = [u_oa(c) for c in range(OA_NKC // OA_WPR)]
-        hint_wait(
-            H // O_GROUPS,
-            lambda k: (
-                mb("o"),
-                ((s * H + grp * (H // O_GROUPS) + k) * HEAD_DIM + HEAD_DIM - 2) // 2,
-            ),
-        )
+        hint_wait()
         stage_x_pairs(
             "o",
             OA_SPT * OA_K,
@@ -712,17 +714,8 @@ def attention_stages(ctx):
             )
 
         pre = [u_ob(c) for c in range(OB_NKC // OB_WPR)]
-        hint_wait(
-            S * O_GROUPS * OA_PER_GROUP,
-            lambda k: (
-                mb("o_lora"),
-                (k // (O_GROUPS * OA_PER_GROUP)) * OB_K
-                + (k % (O_GROUPS * OA_PER_GROUP)) * ROW_TILE
-                + ROW_TILE
-                - 1,
-            ),
-        )
-        stage_x_pairs("o_lora", S * OB_K, lambda k: k)
+        hint_wait()
+        stage_x_pairs("o_lora", S * OB_K, lambda k: k, quant=True)  # wo_b's FP8 input
         gpu.barrier()
         acc = run_units(u_ob, OB_NKC // OB_WPR, OB_NKC // OB_WPR, pre)
         reduce_rows(OB_R, acc, emit_out(ROW_TILE))
