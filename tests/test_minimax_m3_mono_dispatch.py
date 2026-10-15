@@ -10,7 +10,9 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
+from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS
 from atom.mono.runtime import deployment
+from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
 
 
@@ -363,3 +365,77 @@ def test_an_unresolvable_runner_is_refused(native, monkeypatch):
 def test_a_config_without_a_runner_qualname_is_unaffected(native):
     """SGLang builds its own `atom_config` and sets no runner."""
     assert dispatch._config_refusal(_atom_config()) is None
+
+
+# ------------------------------------------------------------------ the prefix layers
+
+
+def _layers(count, sparse_prefix=False, moe_prefix=False):
+    """A layer stack shaped like M3's: a dense-MLP prefix, MoE sparse-attention
+    layers after it. ``sparse_prefix`` makes the prefix M3.1's."""
+    return [
+        SimpleNamespace(
+            is_moe_layer=moe_prefix if i < runner.N_DENSE else True,
+            self_attn=SimpleNamespace(
+                is_indexed_sparse_attention=(
+                    sparse_prefix if i < runner.N_DENSE else True
+                )
+            ),
+        )
+        for i in range(count)
+    ]
+
+
+def test_a_dense_attention_prefix_runs_on_the_mono_kernels():
+    assert runner.dense_prefix_mono(_layers(8))
+
+
+def test_a_sparse_attention_prefix_runs_on_the_original_modules():
+    assert not runner.dense_prefix_mono(_layers(8, sparse_prefix=True))
+
+
+@pytest.mark.parametrize(
+    "layers",
+    [_layers(8, moe_prefix=True), _layers(runner.N_DENSE)],
+    ids=["moe_prefix", "nothing_left_for_mono"],
+)
+def test_a_prefix_mono_cannot_hand_over_from_is_refused(layers):
+    with pytest.raises(MonoUnsupported, match="dense-MLP"):
+        runner.dense_prefix_mono(layers)
+
+
+def _dense_runner(n):
+    """A runner holding only what ``run_dense`` touches: ``ars`` and a model
+    whose prefix layers add one to the hidden and stamp the residual."""
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    stub.ars = [torch.zeros(MAX_TOKENS, HIDDEN) for _ in range(2)]
+
+    def layer(i):
+        def call(positions, hidden, residual, capture_aux=False):
+            out = (hidden + 1, torch.full((n, HIDDEN), float(i)))
+            return (*out, torch.full((n, HIDDEN), 10.0 + i)) if capture_aux else out
+
+        return call
+
+    stub.model = SimpleNamespace(
+        get_input_embeddings=lambda ids: torch.zeros(n, HIDDEN),
+        layers=[layer(i) for i in range(runner.N_DENSE)],
+    )
+    return stub
+
+
+def test_run_dense_hands_the_first_mono_layer_its_ar_and_residual(monkeypatch):
+    monkeypatch.setattr(runner, "tensor_model_parallel_all_reduce", lambda t: t)
+    stub = _dense_runner(2)
+    res = runner.MonoDecodeRunner.run_dense(stub, *_step(2), (), [])
+    assert float(res[0, 0]) == runner.N_DENSE - 1  # the last prefix layer's residual
+    assert float(stub.ars[0][0, 0]) == runner.N_DENSE  # its reduced hidden
+
+
+def test_run_dense_collects_the_aux_hidden_states_eagle3_asked_for(monkeypatch):
+    """The prefix is the only place these layers run on M3.1, so the aux list it
+    fills is the draft model's whole view of them."""
+    monkeypatch.setattr(runner, "tensor_model_parallel_all_reduce", lambda t: t)
+    aux = []
+    runner.MonoDecodeRunner.run_dense(_dense_runner(2), *_step(2), (0, 2), aux)
+    assert [float(a[0, 0]) for a in aux] == [10.0, 12.0]
