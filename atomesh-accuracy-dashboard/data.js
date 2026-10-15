@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1791997605126,
+  "lastUpdate": 1792086494061,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4020,6 +4020,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8984,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38597007157 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610141459 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2206 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yifehuan-amd",
+            "username": "yifehuan",
+            "email": "Yifeng.Huang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "67c54da4e0cb55954a69382f20c1f747604f29d3",
+          "message": "[ATOM] Enable DPA comm-fused MoE reduce-scatter with compact ragged gathers (#2429)\n\n* feat(comm-fused-moe): enable DPA reduce-scatter\n\nIntegrate DPA comm-fused reduce-scatter with model dispatch and tests. Pad gathered inputs inside each rank shard so bucket slack cannot cross reduce-scatter rank boundaries.\n\n* feat(comm-fused-moe): gather compact DPA inputs\n\nUse grouped all-gatherv for compact ragged inputs and enable the Direct path when the DPA input-gather phase proves prior partial reuse is synchronized. Reuse Aiter runtime bucket selection and expose explicit backend capability contracts.\n\n* fix(comm-fused-moe): use row-aware Stage2 callback\n\n* fix(comm-fused-moe): harden runtime integration\n\n* fix(comm-fused-moe): gate unsupported gfx950 hardware\n\n* fix(v41): align comm-fused Stage2 callbacks\n\n* fix(comm-fused-moe): defer device gating to aiter",
+          "timestamp": "2026-10-15T15:53:46Z",
+          "url": "https://github.com/ROCm/ATOM/commit/67c54da4e0cb55954a69382f20c1f747604f29d3"
+        },
+        "date": 1792086493491,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38767909404 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610151507 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9522,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38767909404 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610151507 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 66.01,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38767909404 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610151507 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8923,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38767909404 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610151507 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1547 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
