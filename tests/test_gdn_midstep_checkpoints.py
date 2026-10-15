@@ -15,15 +15,6 @@ Qwen3.5 runs on.
 import random
 
 import pytest
-
-from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import (
-    StateRuntime,
-    StateTransfer,
-    midstep_checkpoint_targets,
-    midstep_target_ok,
-    snap_midstep_position,
-)
 from test_state_checkpoint import (
     BLOCK,
     MIN_FORK,
@@ -32,6 +23,15 @@ from test_state_checkpoint import (
     demand_config,
     make_block_manager,
     stateful_seq,
+)
+
+from atom.model_engine.scheduler import ScheduledBatch
+from atom.model_engine.state_runtime import (
+    StateRuntime,
+    StateTransfer,
+    midstep_checkpoint_targets,
+    midstep_target_ok,
+    snap_midstep_position,
 )
 
 #: Four hash blocks, as GDN's 64 is four of its 16-token blocks.

@@ -37,13 +37,14 @@ def test_the_paged_coordinator_is_not_midstep_readable_by_default():
     The image is copied out of a slot, and only a backend whose kernel exposes
     interior states (GDN's `h`) can fill that slot from inside a forward.
     """
-    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
     from test_state_checkpoint import (
         PAGED_COPY_RUNTIME,
         PAGED_COPY_SPEC,
         make_block_manager,
         paged_copy_config,
     )
+
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 
     bm = make_block_manager(paged_copy_config(), state_runtime=PAGED_COPY_RUNTIME)
     assert not bm.paged_state_checkpoints.readable_midstep
