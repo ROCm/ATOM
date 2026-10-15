@@ -350,9 +350,9 @@ apply_prefixed_env() {
   done < <(env)
 }
 
-# The deterministic replay modifies only this job's mounted checkout. Keep the
-# patch and per-role diagnostics in uploaded artifacts; no production patch is
-# committed by this experiment. Enable before either service imports the code.
+# The checkout is mounted read-only. Instrument a container-local package copy
+# and launch both services from it so `python -m` resolves the patched package.
+# Keep the patch and per-role diagnostics in uploaded artifacts.
 if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
   if [[ "${BENCHMARK_KIND}" != "minimax_full_model_replay" || "${ATOMESH_ATOM_SOURCE}" != "mounted" || "${SINGLE_NODE_PD}" != "1" ]]; then
     echo "ERROR: gated replay requires its dedicated kind and a mounted single-node P/D service" >&2
@@ -360,9 +360,18 @@ if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
   fi
   ATOMESH_M3_REPLAY_DIR="${RUN_DIR}/benchmark_results/stalled-lengths-replay/diagnostics"
   ATOMESH_M3_REPLAY_PIPE_DIR="$(mktemp -d /tmp/atomesh-m3-replay.XXXXXX)"
+  ATOMESH_M3_REPLAY_SOURCE="$(mktemp -d /tmp/atomesh-m3-source.XXXXXX)"
   mkdir -p "${ATOMESH_M3_REPLAY_DIR}"/{prefill,decode} "${ATOMESH_M3_REPLAY_PIPE_DIR}"/{prefill,decode}
   python3 "${ATOMESH_SCRIPT_DIR}/prepare_minimax_replay_debug.py" \
-    --root "${PWD}" --output "${ATOMESH_M3_REPLAY_DIR}"
+    --root "${PWD}" --runtime-root "${ATOMESH_M3_REPLAY_SOURCE}" --output "${ATOMESH_M3_REPLAY_DIR}"
+  ATOM_SOURCE_ENV=(--chdir="${ATOMESH_M3_REPLAY_SOURCE}")
+  replay_atom_origin="$(env "${ATOM_SOURCE_ENV[@]}" python3 -c \
+    'import importlib.util as u; print(u.find_spec("atom").origin)')"
+  if [[ "${replay_atom_origin}" != "${ATOMESH_M3_REPLAY_SOURCE}/atom/__init__.py" ]]; then
+    echo "ERROR: gated replay resolves the wrong ATOM package: ${replay_atom_origin}" >&2
+    exit 2
+  fi
+  echo "[replay-debug] Runtime package=${replay_atom_origin}; mounted checkout remains read-only"
   export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
   export ATOMESH_DECODE_ENV_ATOM_M3_REPLAY_DIR="${ATOMESH_M3_REPLAY_DIR}"
   export ATOMESH_PREFILL_ENV_ATOM_M3_REPLAY_ROLE=prefill

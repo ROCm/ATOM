@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -160,6 +161,69 @@ class PatchTests(unittest.TestCase):
                 before,
                 {name: (root / name).read_bytes() for name in patcher.ROOT_FILES},
             )
+
+    def test_launcher_patches_a_copy_and_resolves_it_before_mounted_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, logs = root / "mounted", root / "logs"
+            self.checkout(source)
+            (source / "atom/__init__.py").write_text("")
+            (source / "atom/resource.txt").write_text("package resource")
+            before = {p: p.read_bytes() for p in source.rglob("*") if p.is_file()}
+            for path in before:
+                path.chmod(0o444)
+            script = (SCRIPTS / "pd_server_atom.sh").read_text()
+            start = script.index(
+                'if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then'
+            )
+            stop = script.index("# Names the last apply_role_env()", start)
+            probe = (
+                "\n"
+                + r"""env "${ATOM_SOURCE_ENV[@]}" python3 -c 'import atom; from atom import _minimax_replay_debug as d; print(atom.__file__); print(d.__file__)'
+printf '%s\n' "${ATOMESH_M3_REPLAY_PIPE_DIR}"
+"""
+            )
+            completed = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script[start:stop] + probe],
+                cwd=source,
+                env={
+                    **os.environ,
+                    "ATOMESH_SCRIPT_DIR": str(SCRIPTS),
+                    "ATOMESH_M3_REPLAY_GATE": "true",
+                    "BENCHMARK_KIND": "minimax_full_model_replay",
+                    "ATOMESH_ATOM_SOURCE": "mounted",
+                    "SINGLE_NODE_PD": "1",
+                    "RUN_DIR": str(logs),
+                    # The mounted checkout deliberately remains earlier than any
+                    # installed package. Only the launch cwd must select the copy.
+                    "PYTHONPATH": str(source),
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                completed.returncode, 0, completed.stdout + completed.stderr
+            )
+            evidence = logs / "benchmark_results/stalled-lengths-replay/diagnostics"
+            runtime = Path(
+                json.loads((evidence / "runtime-source.json").read_text())[
+                    "runtime_source"
+                ]
+            )
+            self.addCleanup(shutil.rmtree, runtime)
+            self.addCleanup(shutil.rmtree, completed.stdout.splitlines()[-1])
+            self.assertIn(str(runtime / "atom/__init__.py"), completed.stdout)
+            self.assertIn(
+                str(runtime / "atom/_minimax_replay_debug.py"), completed.stdout
+            )
+            self.assertEqual(
+                (runtime / "atom/resource.txt").read_text(), "package resource"
+            )
+            self.assertFalse((source / "atom/_minimax_replay_debug.py").exists())
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+            self.assertIn("_m3debug", (runtime / patcher.ROOT_FILES[0]).read_text())
 
     def test_inactive_hook_does_not_create_trace_or_import_gpu(self):
         with (

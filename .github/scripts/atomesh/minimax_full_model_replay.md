@@ -92,9 +92,12 @@ scheduler. Before dispatching any target GPU work it verifies request IDs,
 Unexpected requests, a 30-second admission timeout, or a shape mismatch fail the
 case; `gate-batch.json` records the observed shape. No dummy GPU barrier is added.
 
-`prepare_minimax_replay_debug.py` applies exact-anchor hooks to **this CI job's
-mounted checkout only**, after validating all source anchors and Python syntax.
-The committed `atom/` sources are unchanged. Artifacts include the runtime diff,
+`prepare_minimax_replay_debug.py` copies the read-only mounted `atom/` package
+into a fresh container-local `/tmp` directory and applies exact-anchor hooks
+there, after validating all source anchors and Python syntax. Both services
+launch with that directory as their working directory; the launcher verifies
+package resolution before startup. The mounted and committed `atom/` sources
+are unchanged. Artifacts include the source paths, runtime diff,
 before/after source hashes, and the copied debug module. This is diagnostic code,
 not a production bugfix. Startup and primer execution pass through the hooks
 without enabling diagnostic GPU events.

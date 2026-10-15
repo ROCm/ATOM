@@ -8,6 +8,7 @@ import ast
 import difflib
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 ROOT_FILES = (
@@ -189,9 +190,28 @@ def apply(root, output):
     )
 
 
+def prepare_runtime(source, runtime, output):
+    """Copy the read-only mounted package before applying any instrumentation."""
+    shutil.copytree(
+        source / "atom",
+        runtime / "atom",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        copy_function=shutil.copyfile,
+    )
+    apply(runtime, output)
+    (output / "runtime-source.json").write_text(
+        json.dumps(
+            {"mounted_source": str(source), "runtime_source": str(runtime)},
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--runtime-root", required=True, type=Path)
     args = parser.parse_args()
-    apply(args.root, args.output)
+    prepare_runtime(args.root, args.runtime_root, args.output)
