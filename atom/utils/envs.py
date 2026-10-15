@@ -133,6 +133,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_H2D_BACKEND": lambda: os.getenv("ATOM_H2D_BACKEND", "packed"),
     # Opt-in single-HCA engine pool: "auto" or explicit comma-separated HCAs.
     "ATOM_MOONCAKE_MATCHED_RAILS": lambda: os.getenv("ATOM_MOONCAKE_MATCHED_RAILS", ""),
+    # Pages per producer slot that repacks MLA KV for a DCP consumer below a
+    # page of interleave; 0 writes each token run in place.
+    "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 128
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

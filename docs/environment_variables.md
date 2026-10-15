@@ -540,3 +540,9 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
+
+## Mooncake PD MLA staging
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_STAGING_CHUNK_PAGES** | int | 128 | Destination pages per producer staging slot when a producer without DCP pushes MLA KV to a DCP consumer interleaved below a page (e.g. a PP×TP1 prefill to a TP8/DCP8 decode). The producer gathers each consumer rank's tokens into whole pages on the GPU and writes one RDMA descriptor per page instead of one per token run per layer. One slot per send worker (`num_worker_threads`, default 16), allocated at KV registration. `0` writes token runs in place. |

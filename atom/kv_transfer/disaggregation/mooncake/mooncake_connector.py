@@ -33,6 +33,10 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
 )
+from atom.kv_transfer.disaggregation.kv_staging import (
+    MLAShardStaging,
+    mla_staging_for,
+)
 from atom.kv_transfer.disaggregation.mooncake.rail_engine_pool import RailEnginePool
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
@@ -781,6 +785,7 @@ class MooncakeConnector(KVConnectorBase):
         self._prepare_sharded_index = None
         self._gather_sharded_index = None
         self._index_staging_stream = None
+        self._kv_staging: MLAShardStaging | None = None
 
         # --- Producer: completed prefill block_ids cache ---
         # Populated from ConnectorMetadata.reqs_to_save each step.
@@ -843,11 +848,12 @@ class MooncakeConnector(KVConnectorBase):
 
         # --- Producer: thread pool for RDMA writes ---
         self._cuda_device = torch.cuda.current_device()
+        self._send_workers = kv_transfer_config.get(
+            "num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS
+        )
         if self.is_producer:
             self._send_executor = ThreadPoolExecutor(
-                max_workers=kv_transfer_config.get(
-                    "num_worker_threads", DEFAULT_SHARDED_STAGING_WORKERS
-                ),
+                max_workers=self._send_workers,
                 thread_name_prefix="mooncake-send-worker",
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
@@ -939,6 +945,24 @@ class MooncakeConnector(KVConnectorBase):
             self._prepare_sharded_index = tt.prepare_sharded_index
             self._gather_sharded_index = tt.gather_sharded_index
             self._index_staging_stream = torch.cuda.Stream(device=self._cuda_device)
+        chunk_pages = envs.ATOM_PD_MLA_STAGING_CHUNK_PAGES
+        if self.is_producer and self.dcp_size == 1 and chunk_pages:
+            self._kv_staging = MLAShardStaging.build(
+                tt.pages,
+                block_size=self.block_size,
+                pool_size=self._send_workers,
+                chunk_pages=chunk_pages,
+                device=torch.device("cuda", self._cuda_device),
+            )
+            if self._kv_staging is not None:
+                logger.info(
+                    "MLA DCP staging: %d slots x %d pages (%.1f MiB) for %d "
+                    "MLA regions",
+                    self._kv_staging.pool_size,
+                    chunk_pages,
+                    self._kv_staging.region.total_bytes / 2**20,
+                    sum(map(self._kv_staging.stages, range(len(tt.pages)))),
+                )
 
         # Populate block/slot region lists for transfer offset computation
         self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
@@ -1037,6 +1061,8 @@ class MooncakeConnector(KVConnectorBase):
             all_regions.append(tt.staging_region)
         if tt.index_staging_region is not None:
             all_regions.append(tt.index_staging_region)
+        if self._kv_staging is not None:
+            all_regions.append(self._kv_staging.region)
         for r in all_regions:
             offset = 0
             for chunk in self._rdma_chunk_sizes(r.total_bytes, r.unit_bytes):
@@ -1149,8 +1175,15 @@ class MooncakeConnector(KVConnectorBase):
     # -----------------------------------------------------------------
 
     def record_kv_cache_ready(self, req_ids: list[ReqId]) -> None:
-        """Record when this prefill batch's index-cache writes become visible."""
-        if not self.is_producer or self._index_staging_stream is None or not req_ids:
+        """Record when this prefill batch's KV writes become visible to staging."""
+        if (
+            not self.is_producer
+            or (
+                self._index_staging_stream is None
+                and getattr(self, "_kv_staging", None) is None
+            )
+            or not req_ids
+        ):
             return
         ready_event = torch.cuda.Event()
         ready_event.record(torch.cuda.current_stream(self._cuda_device))
@@ -1735,6 +1768,7 @@ class MooncakeConnector(KVConnectorBase):
                     dst_block_ids,
                     prefill_data,
                     req_id,
+                    kv_cache_ready_event,
                     engine=engine,
                 )
             else:
@@ -1912,6 +1946,7 @@ class MooncakeConnector(KVConnectorBase):
         interleave = request_data.get("consumer_dcp_interleave", 1)
         sharded_plan = None
         sharded_runs = None
+        staging = None
         stages_sharded_index = False
         if self.dcp_size > 1:
             if dcp_size != self.dcp_size:
@@ -1929,6 +1964,7 @@ class MooncakeConnector(KVConnectorBase):
                 dst_pages=len(dst_block_ids),
             )
             sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            staging = mla_staging_for(getattr(self, "_kv_staging", None), sharded_plan)
             stages_sharded_index = (
                 interleave < self.block_size
                 and INDEX_CACHE_ROLE in self._block_region_roles
@@ -1949,6 +1985,7 @@ class MooncakeConnector(KVConnectorBase):
                 )
 
         staged_regions: list[tuple[int, int, int]] = []
+        staged_kv: list[tuple[int, int, int]] = []
         # The plan comes from this stage's region order but the bytes land at
         # cmap[region_idx], and equal region counts do not make the two orders
         # match. Validate both semantic role and physical width so incompatible
@@ -2009,6 +2046,9 @@ class MooncakeConnector(KVConnectorBase):
                     "a single token needs its bytes contiguous, which holds for "
                     "the MLA layout the token-unit relayout is built on."
                 )
+            if staging is not None and staging.stages(region_idx):
+                staged_kv.append((region_idx, dst_base, bpb))
+                continue
             unit = bpb // self.block_size
             run_src, run_dst, run_len = sharded_runs
             run_start = 0
@@ -2033,6 +2073,16 @@ class MooncakeConnector(KVConnectorBase):
 
         if not flush_block_descriptors():
             logger.error("[PRODUCER] block transfer failed for req %s", req_id)
+            return False
+        if staged_kv and not self._execute_staged_kv_transfer(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_kv,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+        ):
             return False
         if debug_block_transfer and block_descriptor_count:
             logger.debug(
@@ -2150,6 +2200,70 @@ class MooncakeConnector(KVConnectorBase):
         finally:
             self._release_index_staging_slot(pool_idx)
 
+    def _execute_staged_kv_transfer(
+        self,
+        target: str,
+        plan,
+        dst_block_ids: list[int],
+        regions: list[tuple[int, int, int]],
+        req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
+        *,
+        engine=None,
+    ) -> bool:
+        """Write MLA ``(region, dst_base, bpb)`` regions as GPU-repacked pages."""
+        staging = self._kv_staging
+        dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
+        descriptors = 0
+        slot = staging.acquire()
+        try:
+            shard = staging.prepare(plan, kv_cache_ready_event)
+            for region_idx, dst_base, bpb in regions:
+                for start in range(0, shard.pages, staging.chunk_pages):
+                    stop = min(start + staging.chunk_pages, shard.pages)
+                    slot_addr, page_bytes = staging.gather(
+                        region_idx, shard, start, stop, slot
+                    )
+                    if page_bytes != bpb:
+                        raise RuntimeError(
+                            f"Staged region {region_idx} packs {page_bytes}-byte "
+                            f"pages, but its blocks are {bpb} bytes"
+                        )
+                    src, dst, sizes = coalesce_contiguous(
+                        slot_addr
+                        + np.arange(stop - start, dtype=np.int64) * page_bytes,
+                        dst_base + dst_ids[start:stop] * bpb,
+                        shard.page_tokens(start, stop) * (bpb // self.block_size),
+                    )
+                    descriptors += src.size
+                    if not self._rdma_write_with_retry(
+                        target,
+                        src.tolist(),
+                        dst.tolist(),
+                        sizes.tolist(),
+                        req_id,
+                        "staged-kv",
+                        engine=engine,
+                    ):
+                        logger.error(
+                            "[PRODUCER] staged MLA transfer failed for req %s "
+                            "region %d",
+                            req_id,
+                            region_idx,
+                        )
+                        return False
+        finally:
+            staging.release(slot)
+        logger.debug(
+            "[PRODUCER] staged MLA RDMA write: req=%s, regions=%d, pages=%d, "
+            "descriptors=%d",
+            req_id,
+            len(regions),
+            shard.pages,
+            descriptors,
+        )
+        return True
+
     def _execute_block_slot_transfer(
         self,
         request_data: dict,
@@ -2158,6 +2272,7 @@ class MooncakeConnector(KVConnectorBase):
         dst_block_ids: list[int],
         prefill_data: dict,
         req_id: str,
+        kv_cache_ready_event: torch.cuda.Event | None = None,
         *,
         engine=None,
     ) -> bool:
@@ -2259,16 +2374,21 @@ class MooncakeConnector(KVConnectorBase):
         # producer pushes its token runs instead of whole blocks, exactly as
         # the block-only path does.
         consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
+        sharded_plan = None
         sharded_runs = None
+        staging = None
         if consumer_dcp_size > 1 and self.dcp_size == 1:
-            sharded_runs = build_dcp_shard_plan(
+            sharded_plan = build_dcp_shard_plan(
                 src_block_ids,
                 block_size=self.block_size,
                 dcp_size=consumer_dcp_size,
                 dcp_rank=request_data["consumer_dcp_rank"],
                 interleave_size=request_data.get("consumer_dcp_interleave", 1),
                 dst_pages=len(dst_block_ids),
-            ).token_runs(dst_block_ids)
+            )
+            sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            staging = mla_staging_for(getattr(self, "_kv_staging", None), sharded_plan)
+        staged_kv: list[tuple[int, int, int]] = []
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
             cidx = block_cmap[region_idx]
             dst_base = consumer_block_addrs[cidx]
@@ -2297,6 +2417,9 @@ class MooncakeConnector(KVConnectorBase):
                     f"(semantic_role={role!r}, {bpb} bytes per block): it "
                     f"needs token-contiguous {MLA_KV_ROLE} pages"
                 )
+            if staging is not None and staging.stages(region_idx):
+                staged_kv.append((region_idx, dst_base, bpb))
+                continue
             unit = bpb // self.block_size
             run_src, run_dst, run_len = sharded_runs
             block_src.extend((src_base + run_src * unit).tolist())
@@ -2332,6 +2455,16 @@ class MooncakeConnector(KVConnectorBase):
             sum(block_sizes),
         )
 
+        if staged_kv and not self._execute_staged_kv_transfer(
+            target,
+            sharded_plan,
+            dst_block_ids,
+            staged_kv,
+            req_id,
+            kv_cache_ready_event,
+            engine=engine,
+        ):
+            return False
         if not self._rdma_write_with_retry(
             target, block_src, block_dst, block_sizes, req_id, "block", engine=engine
         ):
