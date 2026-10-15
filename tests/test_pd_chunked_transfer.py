@@ -1652,6 +1652,16 @@ def test_d_reserves_full_prompt_without_max_new_tokens(
             decode_context_parallel_size=dcp_size,
         )
     )
+    if dcp_size > 1:
+        bm = d.block_manager
+        # Isolate this reservation test from GPU-only dcp_ops imports. With
+        # rank 0 and token interleaving, this is the equivalent pool count;
+        # admission and allocation still run through the real scheduler.
+        monkeypatch.setattr(
+            bm,
+            "num_pool_blocks",
+            lambda seq_len: (seq_len + bm.hash_block_size - 1) // bm.hash_block_size,
+        )
     d.kv_connector = scheduler_connector(monkeypatch, False, dcp_size=dcp_size)
     seq = pd_sequence(seq_factory, producer=False)
     seq.max_tokens = 32
