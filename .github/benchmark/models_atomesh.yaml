@@ -1429,6 +1429,9 @@ models:
         - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
           name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32
           concurrency: [32]
+          runner:
+            # 38741996691: idle HugeTLB pool, but the CI UID cannot release it.
+            exclude_nodes: [pit2-p03-g34]
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400

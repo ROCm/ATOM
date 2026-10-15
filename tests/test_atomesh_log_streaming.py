@@ -80,6 +80,7 @@ class SharedLogStreamingTest(unittest.TestCase):
         run_dir = self.root / "slurm_job-42"
         for name, text in (
             ("rank-0/container.log", "benchmark progress\n"),
+            ("rank-0/host-memory.log", "host preparation failed\n"),
             ("rank-1/container-prefill.log", "prefill ready\n"),
             ("rank-2/container-decode.log", "decode ready\n"),
             ("logs/router.log", "duplicate server output\n"),
@@ -131,6 +132,7 @@ class SharedLogStreamingTest(unittest.TestCase):
                 if spur == "1":
                     for message in (
                         "benchmark progress",
+                        "host preparation failed",
                         "prefill ready",
                         "decode ready",
                     ):

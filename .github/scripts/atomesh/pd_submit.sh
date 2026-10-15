@@ -120,6 +120,10 @@ elif not spur_controller_addr:
         if slurm_submit_runner == "atomesh-cicd-mi350" else ""
     )
 
+excluded_nodes = csv_value(runner.get("exclude_nodes", ""))
+if excluded_nodes and cell["nodes"]:
+    raise ValueError("exclude_nodes requires automatic node selection")
+
 exports = {
     "ATOMESH_CELL_ID": cell["id"],
     "MODEL_NAME": cell["model"],
@@ -131,6 +135,7 @@ exports = {
     "DISPLAY_TOPOLOGY": cell.get("display_topology", cell["topology"]),
     "ATOMESH_PD_WORKER_LAYOUT": cell.get("pd_worker_layout", "multi_node"),
     "NODE_LIST": ",".join(cell["nodes"]),
+    "SLURM_EXCLUDE_NODES": excluded_nodes,
     "NUM_NODES": cell["num_nodes"],
     "ISL_LIST": ",".join(str(v) for v in cell["isl"]),
     "OSL": cell["osl"],
@@ -322,6 +327,7 @@ echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "excluded_nodes=${SLURM_EXCLUDE_NODES}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
@@ -378,7 +384,7 @@ stream_spur_shared_logs_once() {
   shopt -s nullglob
   # Container logs already include the server/router output via tee. Reading
   # logs/ as well would print the same messages twice.
-  for log_file in "${run_dir}"/rank-*/container*.log; do
+  for log_file in "${run_dir}"/rank-*/container*.log "${run_dir}"/rank-*/host-memory.log; do
     rel_path="${log_file#"${run_dir}/"}"
     current_offset="${SPUR_SHARED_LOG_OFFSETS[${log_file}]:-0}"
     SPUR_SHARED_LOG_OFFSETS["${log_file}"]="$(
@@ -458,6 +464,11 @@ else
     --error "${SLURM_ERROR}"
     "${JOB_SCRIPT}"
   )
+fi
+
+if [[ -n "${SLURM_EXCLUDE_NODES}" ]]; then
+  submit_script_index=$((${#SBATCH_CMD[@]} - 1))
+  SBATCH_CMD=("${SBATCH_CMD[@]:0:${submit_script_index}}" --exclude "${SLURM_EXCLUDE_NODES}" "${SBATCH_CMD[submit_script_index]}")
 fi
 
 echo "=== submitting Slurm job ==="

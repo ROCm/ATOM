@@ -406,6 +406,15 @@ prepare_lmcache_memory_on_host() {
   local output="${RUN_DIR}/benchmark_results/lmcache-host-memory"
   local -a model_dirs=("${MODEL_PATH}")
   [[ -n "${DRAFT_MODEL_PATH:-}" ]] && model_dirs+=("${DRAFT_MODEL_PATH}")
+  local excluded_node
+  local -a excluded_nodes=()
+  IFS=',' read -r -a excluded_nodes <<< "${SLURM_EXCLUDE_NODES:-}"
+  for excluded_node in "${excluded_nodes[@]}"; do
+    if [[ "${excluded_node}" == "$(hostname -s)" ]]; then
+      echo "ERROR: scheduler selected excluded node ${excluded_node}; refusing memory preparation" >&2
+      return 2
+    fi
+  done
   echo "[host-memory] Preparing on host $(hostname) as uid=$(id -u), before the service container"
   python3 "${scripts}/lmcache_hugetlb.py" prepare --job-id "${JOB_ID}" \
     --output "${output}/host" --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
@@ -527,7 +536,12 @@ EOF
   trap 'cleanup_spur 143; exit 143' TERM
 
   # Install cleanup traps before any host VM change, including failed setup.
-  prepare_lmcache_memory_on_host || return $?
+  local host_memory_log="${RUN_DIR}/rank-${node_rank}/host-memory.log"
+  local preparation_rc=0
+  mkdir -p "${RUN_DIR}/rank-${node_rank}"
+  prepare_lmcache_memory_on_host > "${host_memory_log}" 2>&1 || preparation_rc=$?
+  tail -c 16384 "${host_memory_log}" || true
+  [[ "${preparation_rc}" -eq 0 ]] || return "${preparation_rc}"
   write_env_file "${env_file}"
 
   local execution_phase service_port_offset

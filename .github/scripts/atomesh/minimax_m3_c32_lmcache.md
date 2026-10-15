@@ -12,10 +12,15 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
   -f suite=nightly \
   -f case_names=minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32 \
   -f atomesh_image=rocm/atom-dev:nightly_202610141644 \
-  -f atomesh_slurm_account=amd-atom \
   -f atomesh_slurm_partition=amd-spur \
   -f run_model_benchmark=true -f publish_dashboard=false
 ```
+
+Slurm account and single-node placement use their defaults (`auto`). The C32
+case excludes `pit2-p03-g34`: run `38741996691` confirmed that UID 300152 cannot
+write the node's HugeTLB controls. The scheduler selects among the remaining
+nodes. This exclusion does not imply other nodes have sufficient memory or
+administrator permissions; host preparation still validates the selected node.
 
 Only this C32 case enables `benchmark.prepare_lmcache_host_memory`. The Spur
 worker executes preparation on the **allocated host**, after the existing
