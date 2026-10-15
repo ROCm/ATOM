@@ -401,9 +401,9 @@ if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" && "${BENCHMARK_
     mkdir -p "${minimax_diagnostics}/${minimax_role,,}"
     export "ATOMESH_${minimax_role}_ENV_ATOM_CI_RUNTIME_DIAGNOSTICS=${minimax_diagnostics}"
     export "ATOMESH_${minimax_role}_ENV_ATOM_CI_RUNTIME_ROLE=${minimax_role,,}"
-    export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_TRACE_BUFFER_SIZE=4096"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_FR_BUFFER_SIZE=4096"
     export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_DUMP_ON_TIMEOUT=1"
-    export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_TRACE_CPP_STACK=1"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_FR_CPP_STACK=1"
     export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${minimax_diagnostics}/${minimax_role,,}/nccl-trace-"
   done
   python3 "${ATOMESH_SCRIPT_DIR}/minimax_runtime_watch.py" --output "${minimax_diagnostics}" \

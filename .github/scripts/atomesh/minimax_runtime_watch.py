@@ -130,6 +130,82 @@ def sample(root):
     return result
 
 
+def empty_gather_kv(shape, *, dtype, device):
+    """Observe allocator entry/return without synchronizing GPU work."""
+    import torch
+
+    root = os.environ.get("ATOM_CI_RUNTIME_DIAGNOSTICS")
+    role = os.environ.get("ATOM_CI_RUNTIME_ROLE", "unknown")
+    path = Path(root) / role / f"pid-{os.getpid()}.allocations.jsonl" if root else None
+    started = time.monotonic()
+
+    def record(stage):
+        if path is None:
+            return
+        stats = torch.cuda.memory_stats(device)
+        row = {
+            "unix_time": time.time(),
+            "elapsed_s": time.monotonic() - started,
+            "stage": stage,
+            "shape": list(shape),
+            "dtype": str(dtype),
+            "device": str(device),
+            "allocator_config": {
+                name: os.environ.get(name)
+                for name in (
+                    "PYTORCH_CUDA_ALLOC_CONF",
+                    "PYTORCH_HIP_ALLOC_CONF",
+                    "PYTORCH_ALLOC_CONF",
+                )
+            },
+            "memory": {
+                name: stats.get(name)
+                for name in (
+                    "allocated_bytes.all.current",
+                    "reserved_bytes.all.current",
+                    "active_bytes.all.current",
+                    "inactive_split_bytes.all.current",
+                    "num_alloc_retries",
+                    "num_ooms",
+                    "num_device_alloc",
+                    "num_device_free",
+                )
+            },
+        }
+        try:
+            if path.exists() and path.stat().st_size > 8 << 20:
+                path.replace(path.with_suffix(".previous.jsonl"))
+            with path.open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
+        except OSError:
+            pass  # A full diagnostics disk must not stop inference.
+
+    record("before_k")
+    k = torch.empty(shape, dtype=dtype, device=device)
+    record("after_k_before_v")
+    v = torch.empty(shape, dtype=dtype, device=device)
+    record("after_v")
+    return k, v
+
+
+def instrument_gather(path):
+    source = path.read_text()
+    old = """        k_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )
+        v_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )"""
+    new = """        from atom._ci_runtime_watch import empty_gather_kv
+
+        k_full, v_full = empty_gather_kv(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )"""
+    if source.count(old) != 1:
+        raise ValueError("Expected exactly one draft KV allocation block")
+    path.write_text(source.replace(old, new))
+
+
 def prepare(source, runtime, output):
     shutil.copytree(
         source / "atom",
@@ -143,6 +219,7 @@ def prepare(source, runtime, output):
         "from atom._ci_runtime_watch import start as _ci_watch_start\n"
         "_ci_watch_start()\n" + init.read_text()
     )
+    instrument_gather(runtime / "atom/model_ops/attention_mha.py")
     output.mkdir(parents=True, exist_ok=True)
     (output / "runtime-watch-source.py").write_text(helper)
     (output / "runtime-overlay.json").write_text(
@@ -150,7 +227,7 @@ def prepare(source, runtime, output):
             {
                 "source": str(source),
                 "runtime": str(runtime),
-                "change": "start Python stack sampler at atom import; no model hooks",
+                "change": "Python stack sampler and draft KV allocation statistics; no GPU synchronization",
             },
             indent=2,
         )

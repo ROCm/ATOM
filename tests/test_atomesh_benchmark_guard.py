@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / ".github/scripts/atomesh"
 
@@ -147,6 +148,38 @@ class RuntimeWatchTests(unittest.TestCase):
             self.assertIn("Thread ", text)
             self.assertIn("dump_stacks", text)
 
+    def test_allocation_log_identifies_incomplete_allocation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "prefill").mkdir()
+            fake = Mock()
+            fake.cuda.memory_stats.return_value = {"num_alloc_retries": 2}
+            fake.empty.side_effect = [object(), RuntimeError("allocation failed")]
+            with (
+                patch.dict(sys.modules, {"torch": fake}),
+                patch.dict(
+                    os.environ,
+                    {
+                        "ATOM_CI_RUNTIME_DIAGNOSTICS": str(root),
+                        "ATOM_CI_RUNTIME_ROLE": "prefill",
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "allocation failed"),
+            ):
+                watch.empty_gather_kv((2046761, 16, 128), dtype="bf16", device="cuda:0")
+            rows = [
+                json.loads(line)
+                for line in next(root.rglob("*.allocations.jsonl"))
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(
+                [row["stage"] for row in rows], ["before_k", "after_k_before_v"]
+            )
+            self.assertEqual(rows[0]["memory"]["num_alloc_retries"], 2)
+            fake.cuda.synchronize.assert_not_called()
+            self.assertEqual(fake.empty.call_count, 2)
+
     def test_runtime_copy_preserves_source_and_starts_python_sampler(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -154,7 +187,17 @@ class RuntimeWatchTests(unittest.TestCase):
             (source / "atom").mkdir(parents=True)
             original = "VALUE = 42\n"
             (source / "atom/__init__.py").write_text(original)
+            attention = source / "atom/model_ops/attention_mha.py"
+            attention.parent.mkdir()
+            original_attention = (
+                SCRIPTS.parents[2] / "atom/model_ops/attention_mha.py"
+            ).read_text()
+            attention.write_text(original_attention)
             watch.prepare(source, runtime, output)
+            self.assertEqual(attention.read_text(), original_attention)
+            instrumented = (runtime / "atom/model_ops/attention_mha.py").read_text()
+            compile(instrumented, "attention_mha.py", "exec")
+            self.assertIn("k_full, v_full = empty_gather_kv(", instrumented)
             env = {
                 **os.environ,
                 "ATOM_CI_RUNTIME_DIAGNOSTICS": str(output),

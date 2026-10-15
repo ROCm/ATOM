@@ -1381,7 +1381,7 @@ models:
               ATOM_PREFIX_CACHE_POLICY: slru
               ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
               ATOM_AITER_SCATTER_REF: 5eb866a95d66a38d64eecf151ac4ef3567a07ac5
-            prefill:
+            prefill: &minimax_m3_scatter_bounds_prefill_env
               HIP_VISIBLE_DEVICES: 0,1,2,3
               LMCACHE_LOCAL_CPU: 'True'
               LMCACHE_NUMA_MODE: auto
@@ -1429,6 +1429,14 @@ models:
         - <<: *minimax_m3_agentic_lmcache_tp4_eagle3
           name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32
           concurrency: [32]
+          env:
+            <<: *minimax_m3_scatter_bounds_env
+            prefill:
+              <<: *minimax_m3_scatter_bounds_prefill_env
+              # Avoid repeated large hipMalloc/hipFree during dynamic draft KV
+              # gather. Pinned aiter supports VMM via custom-allreduce copy-in.
+              PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+              PYTORCH_HIP_ALLOC_CONF: expandable_segments:True
           runner:
             # These nodes reserve idle HugeTLB that the CI UID cannot release:
             # 38741996691 (g34), 38793498618 (g12, 720 GiB on prefill NUMA0).
