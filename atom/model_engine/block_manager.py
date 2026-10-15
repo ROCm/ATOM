@@ -199,7 +199,7 @@ class BlockManager:
         self._recent_index_changes: deque[int] = deque(maxlen=_RECENT_INDEX_CHANGES)
         self._index_changes = 0
         self._index_clears = 0
-        self.walk_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
+        self.walk_memo: bool = envs.ATOM_PREFIX_WALK_MEMO
         # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
         self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
         # Each seq's last fast walk, for its `allocate` to claim.
