@@ -29,6 +29,56 @@
       "variants": [
         { "label": "", "suffix": "", "conc_max": 256 },
         {
+          "label": "Mono ordinary OFF",
+          "suffix": "-mono-ordinary-off",
+          "extra_args": "--mono-decode off --hf-overrides '{\"use_index_cache\":true,\"index_topk_freq\":4}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1,4,8]' --max-num-seqs 8",
+          "env_vars": "ATOM_V4_MONO_PROFILE=ordinary\nATOM_V4_MONO_POLICY=off",
+          "conc_min": 1,
+          "conc_max": 8,
+          "scenarios": [
+            { "cadence": "weekly", "isl": 1024, "osl": 1024, "concurrency": [1,4,8], "random_range_ratio": 0.8 },
+            { "isl": 8192, "osl": 1024, "concurrency": [1,4,8], "random_range_ratio": 0.8 }
+          ]
+        },
+        {
+          "label": "Mono ordinary AUTO",
+          "suffix": "-mono-ordinary-auto",
+          "extra_args": "--mono-decode auto --hf-overrides '{\"use_index_cache\":true,\"index_topk_freq\":4}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1,4,8]' --max-num-seqs 8",
+          "env_vars": "ATOM_V4_MONO_PROFILE=ordinary\nATOM_V4_MONO_POLICY=auto",
+          "conc_min": 1,
+          "conc_max": 8,
+          "scenarios": [
+            { "cadence": "weekly", "isl": 1024, "osl": 1024, "concurrency": [1,4,8], "random_range_ratio": 0.8 },
+            { "isl": 8192, "osl": 1024, "concurrency": [1,4,8], "random_range_ratio": 0.8 }
+          ]
+        },
+        {
+          "label": "Mono MTP3 OFF",
+          "suffix": "-mono-mtp3-off",
+          "extra_args": "--mono-decode off --method mtp --num-speculative-tokens 3 --hf-overrides '{\"use_index_cache\":false,\"index_topk_freq\":1}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1]' --max-num-seqs 1",
+          "bench_args": "--use-chat-template",
+          "env_vars": "ATOM_V4_MONO_PROFILE=mtp3_target\nATOM_V4_MONO_POLICY=off",
+          "conc_min": 1,
+          "conc_max": 1,
+          "scenarios": [
+            { "cadence": "weekly", "isl": 1024, "osl": 1024, "concurrency": [1], "random_range_ratio": 0.8 },
+            { "isl": 8192, "osl": 1024, "concurrency": [1], "random_range_ratio": 0.8 }
+          ]
+        },
+        {
+          "label": "Mono MTP3 AUTO",
+          "suffix": "-mono-mtp3-auto",
+          "extra_args": "--mono-decode auto --method mtp --num-speculative-tokens 3 --hf-overrides '{\"use_index_cache\":false,\"index_topk_freq\":1}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1]' --max-num-seqs 1",
+          "bench_args": "--use-chat-template",
+          "env_vars": "ATOM_V4_MONO_PROFILE=mtp3_target\nATOM_V4_MONO_POLICY=auto",
+          "conc_min": 1,
+          "conc_max": 1,
+          "scenarios": [
+            { "cadence": "weekly", "isl": 1024, "osl": 1024, "concurrency": [1], "random_range_ratio": 0.8 },
+            { "isl": 8192, "osl": 1024, "concurrency": [1], "random_range_ratio": 0.8 }
+          ]
+        },
+        {
           "label": "MTP3",
           "suffix": "-mtp3",
           "extra_args": "--method mtp --num-speculative-tokens 3",

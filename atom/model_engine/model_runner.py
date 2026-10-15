@@ -944,6 +944,13 @@ class ModelRunner:
                 ),
             )
 
+    def get_mono_statistics(self) -> dict:
+        from atom.mono.runtime.statistics import serving_statistics
+
+        return serving_statistics(
+            getattr(self.model, "_v4_mono", None), self.config.mono_decode, self.rank
+        )
+
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()

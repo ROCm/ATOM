@@ -474,6 +474,17 @@ jobs:
             pip show torch | grep -E '^(Name|Version):'
           "
 
+      - name: Check V4 Mono imports and fresh compiler cache
+        if: ${{ contains(matrix.env_vars, 'ATOM_V4_MONO_PROFILE=') }}
+        timeout-minutes: 15
+        run: |
+          docker exec "$CONTAINER_NAME" bash -lc '
+            set -euo pipefail
+            python -c "import atom.models.deepseek_v4.model; import atom.models.deepseek_v4_mtp; import flydsl; import torch; from importlib.metadata import version; print({name: version(name) for name in (\"amd-aiter\", \"flydsl\", \"torch\")}); assert torch.cuda.device_count() == 8; assert all(torch.cuda.get_device_properties(i).gcnArchName.startswith(\"gfx950\") and torch.cuda.get_device_properties(i).multi_processor_count == 256 for i in range(8))"
+            python -m pytest -q tests/test_dsv4_mono_build_key.py
+            python -m atom.benchmarks.v4_mono_compile --output /workspace/v4-mono-compile.json
+          '
+
       - name: Download models
         timeout-minutes: 150
         run: |
@@ -703,6 +714,32 @@ jobs:
           name: accuracy-${{ matrix.model_name }}
           path: accuracy_test_results/*.json
           if-no-files-found: ignore
+
+      - name: Upload V4 Mono execution evidence
+        if: ${{ always() && contains(matrix.env_vars, 'ATOM_V4_MONO_PROFILE=') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: mono-evidence-${{ matrix.model_name }}
+          path: |
+            accuracy_test_results/
+            v4-mono-compile.json
+          if-no-files-found: warn
+
+      - name: Save server and client logs
+        if: always()
+        run: |
+          docker cp "$CONTAINER_NAME:/tmp/atom_server.log" atom_server.log || true
+          docker cp "$CONTAINER_NAME:/tmp/atom_client.log" atom_client.log || true
+
+      - name: Upload runtime logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-logs-${{ matrix.model_name }}
+          path: |
+            atom_server.log
+            atom_client.log
+          if-no-files-found: warn
 
       - name: Clean Up
         if: always()

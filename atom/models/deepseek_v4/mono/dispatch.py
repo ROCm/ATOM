@@ -54,6 +54,7 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
             or atom_config.enable_expert_parallel
             or atom_config.enable_dp_attention
             or atom_config.enable_tbo
+            or getattr(atom_config, "enable_tbo_decode", False)
             or atom_config.pipeline_parallel_size != 1
             or atom_config.prefill_context_parallel_size != 1
             or atom_config.decode_context_parallel_size != 1

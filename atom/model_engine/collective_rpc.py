@@ -33,6 +33,7 @@ COLLECTIVE_RPC_METHODS = frozenset(
         "configure_hidden_states",
         # capability discovery itself
         "get_worker_capabilities",
+        "get_mono_statistics",
     }
 )
 

@@ -474,6 +474,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path supports is ever routed to it; every other batch keeps the original
     # model. 0 disables it.
     "ATOM_MONO_ENABLE": lambda: os.getenv("ATOM_MONO_ENABLE", "1") == "1",
+    # Validation clients only: expected V4 profile and policy for measured
+    # per-rank execution evidence. These do not enable the server's backend.
+    "ATOM_V4_MONO_PROFILE": lambda: os.getenv("ATOM_V4_MONO_PROFILE", ""),
+    "ATOM_V4_MONO_POLICY": lambda: os.getenv("ATOM_V4_MONO_POLICY", "auto"),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",

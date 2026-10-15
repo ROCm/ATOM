@@ -549,6 +549,7 @@ def _install_config(policy="auto", *, tp=8):
         enable_expert_parallel=False,
         enable_dp_attention=False,
         enable_tbo=False,
+        enable_tbo_decode=False,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=1,
         decode_context_parallel_size=1,
@@ -573,6 +574,28 @@ def _mtp_install_config(policy="auto"):
     config.hf_config.use_index_cache = False
     config.hf_config.index_topk_freq = 1
     return config
+
+
+@pytest.mark.parametrize("policy", ["auto", "force"])
+@pytest.mark.parametrize("mtp", [False, True])
+def test_decode_only_tbo_cannot_install_mono(monkeypatch, policy, mtp):
+    monkeypatch.setattr(
+        mono_dispatch,
+        "V4MonoSession",
+        lambda *args: pytest.fail("decode TBO must not install Mono"),
+    )
+    config = _mtp_install_config(policy) if mtp else _install_config(policy)
+    config.enable_tbo_decode = True
+    drafter = SimpleNamespace(mtp_k=3, is_block_drafter=False) if mtp else None
+    model = SimpleNamespace()
+    if policy == "force":
+        with pytest.raises(MonoUnsupported, match="pure TP8 without TBO"):
+            mono_dispatch.install_mono_decode(model, config, drafter, object())
+    else:
+        assert (
+            mono_dispatch.install_mono_decode(model, config, drafter, object()) is model
+        )
+        assert not hasattr(model, "_v4_mono")
 
 
 def test_mono_policy_defaults_to_auto_install(monkeypatch):

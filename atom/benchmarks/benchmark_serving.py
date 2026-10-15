@@ -46,6 +46,8 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
+from atom.benchmarks.mono_env import configured_policy, configured_profile
+
 from .backend_request_func import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
@@ -589,6 +591,12 @@ async def benchmark(
 
     print("Starting main benchmark run...")
 
+    mono_before = None
+    if configured_profile():
+        from atom.benchmarks.mono_stats import snapshot
+
+        mono_before = await asyncio.to_thread(snapshot, base_url)
+
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate, burstiness):
@@ -623,6 +631,17 @@ async def benchmark(
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
+    mono_execution = None
+    if mono_before is not None:
+        from atom.benchmarks.mono_stats import execution_delta, snapshot
+
+        mono_after = await asyncio.to_thread(snapshot, base_url)
+        mono_execution = execution_delta(
+            mono_before,
+            mono_after,
+            configured_profile(),
+            configured_policy(),
+        )
 
     if profile:
         print("Stopping profiler...")
@@ -713,6 +732,8 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if mono_execution is not None:
+        result["atom_ci_metadata"] = {"mono_execution": mono_execution}
 
     def process_one_metric(
         # E.g., "ttft"

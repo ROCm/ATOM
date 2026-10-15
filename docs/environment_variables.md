@@ -138,6 +138,20 @@ cannot affect a server that does not use the feature.
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
 
+### DeepSeek-V4 validation clients
+
+These settings control execution-evidence checks in the benchmark/evaluation
+client, not server admission. Select the server backend with `--mono-decode`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_V4_MONO_PROFILE** | string | empty | Enable TP8 measured-execution evidence for `ordinary` or `mtp3_target`. Empty leaves other model benchmarks unchanged. |
+| **ATOM_V4_MONO_POLICY** | string | auto | Expected server policy (`auto`, `force`, or `off`); a mismatch or missing rank fails verification. |
+
+`python -m atom.benchmarks.mono_stats verify --min-hit-rate 0.95` additionally
+enforces the controlled fixed-width coverage target. Mixed full-network runs
+report coverage without applying that fixed-width threshold.
+
 ### MiniMax-M3
 
 | Variable | Type | Default | Description |

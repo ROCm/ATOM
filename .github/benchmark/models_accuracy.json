@@ -24,6 +24,35 @@
     "_baseline_note": "Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059"
   },
   {
+    "model_name": "DeepSeek-V4-Pro Mono ordinary C8",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --no-enable_prefix_caching --mono-decode auto --hf-overrides '{\"use_index_cache\":true,\"index_topk_freq\":4}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1,4,8]' --max-num-seqs 8 --max-model-len 32768",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING\nATOM_V4_MONO_PROFILE=ordinary\nATOM_V4_MONO_POLICY=auto",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "accuracy_timeout_minutes": 180,
+    "client_command": "lm_eval --model local-completions --model_args 'model=${MODEL_PATH},base_url=http://localhost:${ATOM_SERVER_PORT}/v1/completions,num_concurrent=8,max_retries=3,tokenized_requests=False,trust_remote_code=True' --tasks gsm8k --num_fewshot 3 --gen_kwargs temperature=0,max_gen_toks=8192 --log_samples --output_path ${OUTPUT_PATH}",
+    "_baseline_note": "Full 1319-question Mono qualification; matched native-off control is required for final non-inferiority, and measured per-rank Mono execution must be present."
+  },
+  {
+    "model_name": "DeepSeek-V4-Pro Mono MTP3 C1",
+    "model_path": "deepseek-ai/DeepSeek-V4-Pro",
+    "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --no-enable_prefix_caching --mono-decode auto --method mtp --num-speculative-tokens 3 --hf-overrides '{\"use_index_cache\":false,\"index_topk_freq\":1}' --cudagraph-mode FULL --level 3 --cudagraph-capture-sizes '[1]' --max-num-seqs 1 --max-model-len 32768",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nAITER_LOG_LEVEL=WARNING\nATOM_V4_MONO_PROFILE=mtp3_target\nATOM_V4_MONO_POLICY=auto",
+    "runner": "linux-atom-do-mi350x-8",
+    "test_level": "pr",
+    "accuracy_threshold": 0.94,
+    "mtp_accept_threshold": 0.622,
+    "accuracy_baseline": 0.96,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4-Pro",
+    "accuracy_timeout_minutes": 240,
+    "client_command": "lm_eval --model local-completions --model_args 'model=${MODEL_PATH},base_url=http://localhost:${ATOM_SERVER_PORT}/v1/completions,num_concurrent=1,max_retries=3,tokenized_requests=False,trust_remote_code=True' --tasks gsm8k --num_fewshot 3 --gen_kwargs temperature=0,max_gen_toks=8192 --log_samples --output_path ${OUTPUT_PATH}",
+    "_baseline_note": "Real MTP3, no synthetic acceptance; full 1319-question target qualification with q4 Mono execution and the unchanged acceptance gate."
+  },
+  {
     "model_name": "DeepSeek-V4-Pro DEP RCCL",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--kv_cache_dtype fp8 --index_cache_dtype fp4 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --enable-dp-attention --enable-expert-parallel --all2all-backend rccl",
