@@ -32,6 +32,7 @@ from atom.models.minimax_m3.mono.layout import (
     N_DN,
     N_ROUTER,
     SCORE_COPIES,
+    SH_TASKS,
     UG_PER_SLOT,
     UG_ROWS,
     XN8_ROW,
@@ -299,8 +300,8 @@ def moe_wide_defs(k4ctx):
         has_dn = td < N_DN
         td = fx.min(td, N_DN - 1)
         if const_expr(shared_fp8):
-            has_sh = start("shared") < k4ctx["SH_TASKS"]
-            sh_j = fx.min(start("shared"), k4ctx["SH_TASKS"] - 1)
+            has_sh = start("shared") < SH_TASKS
+            sh_j = fx.min(start("shared"), SH_TASKS - 1)
             sh_w = sh_load(sh_j, has_sh)
         # every token's routing: wave w routes tokens w, w + WAVES, .., their
         # scores polled in one batch

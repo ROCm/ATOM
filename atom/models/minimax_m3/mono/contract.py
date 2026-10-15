@@ -19,9 +19,9 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
-    K4_SHARED_FP8_ABI,
+    K4_M31_ABI,
+    build_post_attn_m31_kernel,
     build_post_attn_kernel,
-    build_post_attn_shared_fp8_kernel,
 )
 from atom.models.minimax_m3.mono.layout import dense_mailbox_regions, mailbox_regions
 from atom.mono.runtime.compile import check_traced
@@ -44,9 +44,9 @@ def build_dense(tokens: int):
     return build_dense_post_kernel(TP, 1e-6, 1.702, 1.0, 7.0, tokens)
 
 
-def build_shared_fp8_layer(tokens: int, index_heads: int, index_topk: bool = True):
-    """The M3.1 independent-MXFP8-shared layer kernel."""
-    return build_post_attn_shared_fp8_kernel(
+def build_m31_layer(tokens: int, index_heads: int, index_topk: bool = True):
+    """The M3.1 native-MXFP8 attention and independent-shared layer kernel."""
+    return build_post_attn_m31_kernel(
         TP,
         0.088,
         1e-6,
@@ -60,12 +60,12 @@ def build_shared_fp8_layer(tokens: int, index_heads: int, index_topk: bool = Tru
     )
 
 
-def check_shared_fp8_build(
+def check_m31_build(
     tokens: int, index_heads: int, index_topk: bool = True
 ) -> None:
     check_traced(
-        build_shared_fp8_layer(tokens, index_heads, index_topk),
-        K4_SHARED_FP8_ABI,
+        build_m31_layer(tokens, index_heads, index_topk),
+        K4_M31_ABI,
         mailbox_regions(tokens, index_heads, True, index_topk, shared_fp8=True),
     )
 
@@ -93,3 +93,5 @@ if __name__ == "__main__":
             for it in (True, False):
                 check_build(s, ih, index_topk=it)
                 print(f"S={s} index heads={ih} index_topk={it}: contract holds")
+                check_m31_build(s, ih, index_topk=it)
+                print(f"S={s} M3.1 index heads={ih} index_topk={it}: contract holds")

@@ -12,7 +12,15 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.minimax_m3.mono.config import HEAD_DIM, HIDDEN, MAX_TOKENS, PAGE16
-from atom.models.minimax_m3.mono.kernels.common import ld_bf16x4, per_token_fp8_scale
+from atom.models.minimax_m3.mono.kernels.common import (
+    e8m0_load,
+    ld_bf16x4,
+    mx8_b_tiles,
+    mx8_q,
+    mx8_scale_quant,
+    per_token_fp8_scale,
+    row_major_scale_index,
+)
 from atom.models.minimax_m3.mono.kernels.pre_attn import N_HEAD_TASKS as K1_HEAD_TASKS
 from atom.models.minimax_m3.mono.kernels.stages.shared import NEG, PAGE_BYTES
 from atom.models.minimax_m3.mono.layout import (
@@ -21,10 +29,16 @@ from atom.models.minimax_m3.mono.layout import (
     O_K,
     O_ROW,
     O_ROWS,
+    OSC_ROW,
     SPLIT_KEYS,
     H,
 )
-from atom.mono.device.mx import FP8_MAX, UNIT_SCALE, mfma_scaled
+from atom.mono.device.mx import (
+    FP8_MAX,
+    UNIT_SCALE,
+    mfma_scaled,
+    mxfp8_a_tiles,
+)
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -314,6 +328,7 @@ def split_defs(k4ctx):
 def merge_defs(k4ctx):
     """The functions of the partitions' merge and per-token FP8 quantization."""
     G = k4ctx["G"]
+    attn_mxfp8 = k4ctx.get("attn_mxfp8", False)
     block_max = k4ctx["block_max"]
     lane = k4ctx["lane"]
     mb = k4ctx["mb"]
@@ -329,7 +344,9 @@ def merge_defs(k4ctx):
     def merge_token(k):
         """Token k's partitions merged (the gluon decode's reduce; thread = 4 dims
         of one head) and quantized per token (standalone quant: scale = amax *
-        (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 word, scale)."""
+        (1 / FP8_MAX), x * rcp(scale)) -> (this thread's fp8 word, scale).
+        ``attn_mxfp8``: quantized per 1x32 instead -- eight consecutive threads
+        hold a block -> (fp8 word, that block's E8M0 code)."""
         hm = tid // (HEAD_DIM // 4)
         e0 = tid * 4
         sp0 = k * N_SPLIT  # token k's partitions
@@ -376,6 +393,9 @@ def merge_defs(k4ctx):
                 av[3] + wi * o23[1],
             ]
         a0, a1, a2, a3 = (bf16_round(x) for x in av)
+        if const_expr(attn_mxfp8):
+            e, inv = mx8_scale_quant([a0, a1, a2, a3], (1, 2, 4))
+            return fp8_pack4(*[mx8_q(v, inv) for v in (a0, a1, a2, a3)]), e
         amax = block_max(
             fx.max(
                 fx.max(fmath.absf(a0), fmath.absf(a1)),
@@ -393,7 +413,6 @@ def merge_defs(k4ctx):
             for k in range(start("merge"), tokens, G):
                 k = fx.Int32(k)
                 word, x_scale = merge_token(k)
-                # plain words, then the scale: its pair is the flag
                 bo.buffer_store(
                     word,
                     rsrc(mb("attnq")),
@@ -402,7 +421,30 @@ def merge_defs(k4ctx):
                 )
                 publish(mb_put, mr("attnq_s"), k, x_scale, tid == 0)
 
-    return {"merge_token": merge_token, "stage_merge": stage_merge}
+    def stage_merge_mxfp8():
+        if const_expr(tokens > 1):
+            for k in range(start("merge"), tokens, G):
+                k = fx.Int32(k)
+                word, x_scale = merge_token(k)
+                bo.buffer_store(
+                    word,
+                    rsrc(mb("attnq")),
+                    k * (O_K // 4) + tid,
+                    cache_modifier=CM_DEV,
+                )
+                if tid % 8 == 0:
+                    bo.buffer_store(
+                        x_scale,
+                        rsrc(mb("attnq_sc")),
+                        k * (O_K // 32) + tid // 8,
+                        cache_modifier=CM_DEV,
+                    )
+                publish(mb_put, mr("attnq_s"), k, fx.Float32(1.0), tid == 0)
+
+    return {
+        "merge_token": merge_token,
+        "stage_merge": stage_merge_mxfp8 if attn_mxfp8 else stage_merge,
+    }
 
 
 @traced
@@ -411,9 +453,11 @@ def o_defs(k4ctx):
     AG_RS = k4ctx["AG_RS"]
     CM_K1 = k4ctx["CM_K1"]
     G = k4ctx["G"]
+    OSC_LDS = k4ctx.get("OSC_LDS", 0)
     SY = k4ctx["SY"]
     W = k4ctx["W"]
     acquire = k4ctx["acquire"]
+    attn_mxfp8 = k4ctx.get("attn_mxfp8", False)
     fuse_k1 = k4ctx["fuse_k1"]
     g4 = k4ctx["g4"]
     h_in = k4ctx["h_in"]
@@ -447,35 +491,60 @@ def o_defs(k4ctx):
     def stage_o():
         r_wo = rsrc(w_o)
         O_CPW = O_K // 64 // 4  # 64-k chunks per wave: 4 waves per 16-row group
+        MX_CPW = O_K // 128 // 4  # attn_mxfp8: 128-k chunks per wave
         for t in range(start("o"), N_O, G):
             t = fx.Int32(t)
             rg = t * 2 + wave // 4
             wts = []
-            for cc in range_constexpr(O_CPW):
-                kc = (wave % 4) * O_CPW + cc
-                wts.append(
-                    fx.Vector(
-                        bo.buffer_load(
-                            r_wo,
-                            ((rg * (O_K // 32) + kc * 2) * 512 + lane * 16) // 4,
-                            vec_width=4,
-                            dtype=T.i32,
-                            cache_modifier=CM_NT,
+            if const_expr(attn_mxfp8):
+                for p in range_constexpr(MX_CPW):
+                    kc = (wave % 4) * MX_CPW + p
+                    wts.append(mxfp8_a_tiles(r_wo, rg, O_K, kc, lane))
+            else:
+                for cc in range_constexpr(O_CPW):
+                    kc = (wave % 4) * O_CPW + cc
+                    wts.append(
+                        fx.Vector(
+                            bo.buffer_load(
+                                r_wo,
+                                ((rg * (O_K // 32) + kc * 2) * 512 + lane * 16)
+                                // 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=CM_NT,
+                            )
                         )
                     )
+            # this task's scales, before the wait: a per-row f32, or (attn_mxfp8)
+            # this lane's E8M0 byte of each 128-k chunk
+            if const_expr(attn_mxfp8):
+                ws = None
+                wsc = [
+                    e8m0_load(
+                        rsrc(s_o),
+                        row_major_scale_index(
+                            rg * 16 + l16,
+                            ((wave % 4) * MX_CPW + p) * 4 + g4,
+                            O_K // 32,
+                        ),
+                    )
+                    for p in range(MX_CPW)
+                ]
+            else:
+                ws = fx.Float32(
+                    bo.buffer_load(
+                        rsrc(s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32
+                    )
                 )
-            # this task's row scales, before the wait
-            ws = fx.Float32(
-                bo.buffer_load(
-                    rsrc(s_o), t * O_ROWS + tid % O_ROWS, vec_width=1, dtype=T.f32
-                )
-            )
 
             if const_expr(tokens == 1):
                 # the merge folded in: the partitions -> this CTA's fp8 input
                 word, x_scale = merge_token(0)
                 x_scales = [x_scale]
                 fx.ptr_store(word, xs + tid)
+                if const_expr(attn_mxfp8):  # noqa: SIM102
+                    if tid % 8 == 0:
+                        fx.ptr_store(x_scale, xs + (OSC_LDS + tid // 8))
             else:
                 # the merge tasks' fp8 inputs: every token's scale (published
                 # after its plain words), then the words, 16 B a load
@@ -484,6 +553,15 @@ def o_defs(k4ctx):
                 x_scales = [got[k][0].bitcast(fx.Float32) for k in range(tokens)]
                 acquire()
                 rows_to_lds(tid, mb("attnq"), tokens, O_K // 4, xs, O_ROW)
+                if const_expr(attn_mxfp8):
+                    rows_to_lds(
+                        tid,
+                        mb("attnq_sc"),
+                        tokens,
+                        O_K // 32,
+                        xs + OSC_LDS,
+                        OSC_ROW,
+                    )
             gpu.barrier()
             # B column l % 16 is token l % 16 (token 0 past the last): C column k
             # is token k's rows, the weight stream is the same for any token count
@@ -492,31 +570,52 @@ def o_defs(k4ctx):
             # chunks kc, kc + 1 in one 16x16x128 FP8 MFMA (unit scales): its lane
             # holds k 16 (l / 16) .. + 16 of each 64-k half -- the chunks' packing
             for p in range_constexpr(O_CPW // 2):
-                xb = [
-                    fx.Vector(
-                        fx.ptr_load(
-                            xs
-                            + (
-                                col_tok * O_ROW
-                                + ((wave % 4) * O_CPW + 2 * p + h) * 16
-                                + g4 * 4
-                            ),
-                            result_type=v4f,
+                if const_expr(attn_mxfp8):
+                    sa = wsc[p]
+                    sb = fx.ptr_load(
+                        xs
+                        + (
+                            OSC_LDS
+                            + col_tok * OSC_ROW
+                            + ((wave % 4) * MX_CPW + p) * 4
+                            + g4
                         )
                     ).bitcast(fx.Int32)
-                    for h in range(2)
-                ]
-                c = mfma_scaled(
-                    fx.Vector.from_elements(
+                    wa = wts[p]
+                    xb = mx8_b_tiles(
+                        xs + col_tok * O_ROW,
+                        ((wave % 4) * MX_CPW + p) * 32,
+                        g4,
+                    )
+                else:
+                    sa = sb = fx.Int32(UNIT_SCALE)
+                    xh = [
+                        fx.Vector(
+                            fx.ptr_load(
+                                xs
+                                + (
+                                    col_tok * O_ROW
+                                    + ((wave % 4) * O_CPW + 2 * p + h) * 16
+                                    + g4 * 4
+                                ),
+                                result_type=v4f,
+                            )
+                        ).bitcast(fx.Int32)
+                        for h in range(2)
+                    ]
+                    wa = fx.Vector.from_elements(
                         [wts[2 * p + h][e] for h in range(2) for e in range(4)],
                         fx.Int32,
-                    ),
-                    fx.Vector.from_elements(
-                        [xb[h][e] for h in range(2) for e in range(4)], fx.Int32
-                    ),
+                    )
+                    xb = fx.Vector.from_elements(
+                        [xh[h][e] for h in range(2) for e in range(4)], fx.Int32
+                    )
+                c = mfma_scaled(
+                    wa,
+                    xb,
                     c,
-                    fx.Int32(UNIT_SCALE),
-                    fx.Int32(UNIT_SCALE),
+                    sa,
+                    sb,
                 )
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
@@ -525,7 +624,9 @@ def o_defs(k4ctx):
                 grp = (tid % O_ROWS) // 16
                 rr = tid % 16
                 tot = row_sum(red, rr, tk, [grp * 4 + w for w in range(4)])
-                fx.ptr_store(bf16_round(tot * pick(x_scales, tk) * ws), misc + tid)
+                if const_expr(not attn_mxfp8):  # both operands carried their scales
+                    tot = tot * pick(x_scales, tk) * ws
+                fx.ptr_store(bf16_round(tot), misc + tid)
             gpu.barrier()
             # push bf16 partial rows, wave w -> peer w (to itself too); with AG_RS
             # to the row group's owner rank only

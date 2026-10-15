@@ -61,17 +61,20 @@ def _ptpc_fp8(
     return w.data, s.data.view(rows)
 
 
+def _is_mxfp8(linear) -> bool:
+    return (
+        linear.quant_type.value == QuantType.per_1x32.value
+        and linear.params_dtype == dtypes.fp8
+        and getattr(linear, "native_a8_group_rows", None) == 1
+    )
+
+
 def _mxfp8(
     linear, rows: int, cols: int, name: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Native Quark [1, 32] MXFP8 weight and its row-major E8M0 scales."""
     w, s = linear.weight, getattr(linear, "weight_scale", None)
-    _need(
-        linear.quant_type.value == QuantType.per_1x32.value
-        and linear.params_dtype == dtypes.fp8
-        and getattr(linear, "native_a8_group_rows", None) == 1,
-        f"{name}: not MXFP8",
-    )
+    _need(_is_mxfp8(linear), f"{name}: not MXFP8")
     _need(
         w.dtype == dtypes.fp8 and tuple(w.shape) == (rows, cols) and w.is_contiguous(),
         f"{name}: weight {w.dtype} {tuple(w.shape)}",
@@ -86,6 +89,14 @@ def _mxfp8(
         f"{name}: scale",
     )
     return w.data, s.data
+
+
+def attention_mxfp8(layer, layer_id: int) -> bool:
+    """Whether this layer's QKV and O projections use native [1, 32] MXFP8."""
+    attn = layer.self_attn
+    qkv, out = _is_mxfp8(attn.qkv_proj), _is_mxfp8(attn.o_proj)
+    _need(qkv == out, f"layer {layer_id}: mixed attention quantization")
+    return qkv
 
 
 def _bf16_vec(t: torch.Tensor, n: int, name: str) -> torch.Tensor:
@@ -119,6 +130,7 @@ class SparseMoeLayer:
     # the layer selects its blocks; else it reuses the step's last selecting
     # layer's (the original path's ``skip_index_topk``)
     index_topk: bool
+    attn_mxfp8: bool
     g_in: torch.Tensor
     w_qkv: torch.Tensor
     s_qkv: torch.Tensor
@@ -146,7 +158,9 @@ class SparseMoeLayer:
         return self.shared_w13 is not None
 
     @staticmethod
-    def from_layer(layer, layer_id: int, heads: IndexHeads) -> "SparseMoeLayer":
+    def from_layer(
+        layer, layer_id: int, heads: IndexHeads, attn_mxfp8: bool = False
+    ) -> "SparseMoeLayer":
         """``heads``: the index q heads the deployment's fused projection holds."""
         attn = layer.self_attn
         _need(
@@ -173,10 +187,13 @@ class SparseMoeLayer:
             impl.index_cache.dtype == dtypes.fp8,
             f"layer {layer_id}: index cache {impl.index_cache.dtype}",
         )
-        w_qkv, s_qkv = _ptpc_fp8(
+        bind_attn = _mxfp8 if attn_mxfp8 else _ptpc_fp8
+        w_qkv, s_qkv = bind_attn(
             attn.qkv_proj, heads.rows, HIDDEN, f"layer {layer_id} qkv_proj"
         )
-        w_o, s_o = _ptpc_fp8(attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj")
+        w_o, s_o = bind_attn(
+            attn.o_proj, HIDDEN, O_K, f"layer {layer_id} o_proj"
+        )
 
         moe = layer.block_sparse_moe
         experts = moe.experts
@@ -242,6 +259,7 @@ class SparseMoeLayer:
             layer_id=layer_id,
             attn_impl=impl,
             index_topk=not attn.skip_index_topk,
+            attn_mxfp8=attn_mxfp8,
             g_in=_bf16_vec(layer.input_layernorm.weight, HIDDEN, "input_layernorm"),
             w_qkv=w_qkv,
             s_qkv=s_qkv,

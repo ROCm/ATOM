@@ -57,8 +57,10 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
+    K4_M31_ABI,
     K4_SHARED_FP8_ABI,
     TL_POINTS,
+    build_post_attn_m31_kernel,
     build_post_attn_kernel,
     build_post_attn_shared_fp8_kernel,
 )
@@ -72,7 +74,11 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 )
 from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
-from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
+from atom.models.minimax_m3.mono.weights import (
+    DenseLayer,
+    SparseMoeLayer,
+    attention_mxfp8,
+)
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
@@ -188,6 +194,12 @@ class MonoDecodeRunner:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
         self.dense_mono = dense_prefix_mono(layers)
+        attn_modes = {
+            attention_mxfp8(layers[i], i) for i in range(N_DENSE, len(layers))
+        }
+        if len(attn_modes) != 1:
+            raise MonoUnsupported(f"mixed attention layouts {attn_modes}")
+        self.native_mxfp8_attn = attn_modes.pop()
         if require_aux and drafter is None:
             raise MonoUnsupported("no DSpark drafter")
         self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
@@ -201,14 +213,24 @@ class MonoDecodeRunner:
         # bounded mailbox waits, their records raised after the step (finish_step)
         self.debug = envs.ATOM_MONO_DEBUG
         self.sparse = [
-            SparseMoeLayer.from_layer(layers[i], i, heads)
+            SparseMoeLayer.from_layer(
+                layers[i], i, heads, attn_mxfp8=self.native_mxfp8_attn
+            )
             for i in range(N_DENSE, len(layers))
         ]
         shared_modes = {lw.shared_fp8 for lw in self.sparse}
         if len(shared_modes) != 1:
             raise MonoUnsupported(f"mixed shared-expert layouts {shared_modes}")
         self.shared_fp8 = shared_modes.pop()
-        self.k4_abi = K4_SHARED_FP8_ABI if self.shared_fp8 else K4_ABI
+        if self.native_mxfp8_attn and not self.shared_fp8:
+            raise MonoUnsupported("native-MXFP8 attention needs independent shared MLP")
+        self.k4_abi = (
+            K4_M31_ABI
+            if self.native_mxfp8_attn
+            else K4_SHARED_FP8_ABI
+            if self.shared_fp8
+            else K4_ABI
+        )
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -262,7 +284,22 @@ class MonoDecodeRunner:
             else None
         )
         # the s-token layer kernel is ``self._build_k4(s)`` (``WidthBuilds``)
-        if self.shared_fp8:
+        if self.native_mxfp8_attn:
+            self._build_k4 = functools.partial(
+                build_post_attn_m31_kernel,
+                npes,
+                self.sm_scale,
+                eps,
+                route_scale,
+                experts.swiglu_limit,
+                impl.init_blocks,
+                impl.local_blocks,
+                fuse_k1=True,
+                timeline=self.timeline is not None,
+                heads=heads,
+                debug=self.debug,
+            )
+        elif self.shared_fp8:
             self._build_k4 = functools.partial(
                 build_post_attn_shared_fp8_kernel,
                 npes,
@@ -565,6 +602,8 @@ class MonoDecodeRunner:
         off = SCRATCH["diag"]
         waits = given_up_waits(
             self.scratch4[off : off + DIAG_BYTES],
-            region_namer(diag_region_names(n, self.index_heads)),
+            region_namer(
+                diag_region_names(n, self.index_heads, shared_fp8=self.shared_fp8)
+            ),
         )
         raise_if_given_up("MiniMax-M3 mono", self.rank, n, waits, self.mailboxes)

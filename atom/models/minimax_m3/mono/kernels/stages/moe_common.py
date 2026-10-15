@@ -16,6 +16,7 @@ from atom.models.minimax_m3.mono.config import (
     SHARED_EXPERT,
     TOP_K,
 )
+from atom.models.minimax_m3.mono.kernels.common import row_major_scale_index
 from atom.models.minimax_m3.mono.kernels.stages.shared import (
     S2_BYTES,
     S13_BYTES,
@@ -193,7 +194,11 @@ def moe_common_defs(k4ctx):
                     scs[gu].append(
                         e8m0_load(
                             r_s,
-                            (rg_gu * 16 + l16) * (HIDDEN // 32) + kc * 4 + g4,
+                            row_major_scale_index(
+                                rg_gu * 16 + l16,
+                                kc * 4 + g4,
+                                HIDDEN // 32,
+                            ),
                         )
                     )
             return wts, (scs, half)
@@ -340,7 +345,9 @@ def moe_common_defs(k4ctx):
                 wv = mxfp8_a_tiles(rsrc(shared_w2, dn_bytes), rg_d, INTER, kc, lane)
                 sc = e8m0_load(
                     rsrc(shared_s2, dn_scale_bytes),
-                    (rg_d * 16 + l16) * W2_SCALE_COLS + kc * 4 + g4,
+                    row_major_scale_index(
+                        rg_d * 16 + l16, kc * 4 + g4, W2_SCALE_COLS
+                    ),
                 )
                 wgt = (j < DN_KC).select(fx.Float32(1.0), fx.Float32(0.0))
             else:

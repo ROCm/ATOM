@@ -113,9 +113,10 @@ SCRATCH = _layout(
         # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
         ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
         ("dmids", MAX_TOKENS),
-        # a debug build's wait records, one a CTA; last, so the regions above
-        # keep their offsets in every build
+        # a debug build's wait records, one a CTA
         ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
+        # M3.1 attention scales stay past every existing scratch region.
+        ("attnq_sc", O_K // 32 * MAX_TOKENS // 2),
     ]
 )
 SCRATCH_BYTES = SCRATCH["_bytes"]
@@ -227,11 +228,18 @@ def dense_mailbox_regions(tokens: int) -> list[RegionDecl]:
     return regions
 
 
-def diag_region_names(tokens: int, index_heads: int) -> list[str]:
+def diag_region_names(
+    tokens: int, index_heads: int, shared_fp8: bool = False
+) -> list[str]:
     """Every region a debug step's layer kernels may record a wait on (they share
     one ``diag`` record, a region named by its ``region_id``): K4's full table,
     then the dense kernel's own regions."""
-    names = [d.name for d in mailbox_regions(tokens, index_heads, fuse_k1=True)]
+    names = [
+        d.name
+        for d in mailbox_regions(
+            tokens, index_heads, fuse_k1=True, shared_fp8=shared_fp8
+        )
+    ]
     return names + [
         d.name for d in dense_mailbox_regions(tokens) if d.name not in names
     ]
@@ -341,6 +349,7 @@ MID_ROW = INTER // 4 + 4
 MIDSC_ROW = INTER // 32 + 4
 # and the o stage's FP8 attention rows (512 words: the same 16-way conflict)
 O_ROW = O_K // 4 + 4
+OSC_ROW = O_K // 32 + 4  # attn_mxfp8: and that row's E8M0 scales, a word each
 # the dense layers' (dense_post) per-token FP8 rows: the gate / up input and the
 # down stage's mids
 DX_ROW = HIDDEN // 4 + 4

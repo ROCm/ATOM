@@ -55,14 +55,17 @@ def test_every_routed_up_gate_task_runs_once(tokens):
 
 @pytest.mark.parametrize("tokens", TOKEN_COUNTS)
 def test_shared_fp8_mailboxes_cover_narrow_and_wide_widths(tokens):
-    names = {
+    names = [
         d.name for d in layout.mailbox_regions(tokens, 1, fuse_k1=True, shared_fp8=True)
-    }
+    ]
     assert "mid" in names
     assert ("ugdone" in names) == layout.wide_moe(tokens)
+    assert layout.diag_region_names(tokens, 1, shared_fp8=True)[: len(names)] == names
 
 
-@pytest.mark.parametrize("row", ["XN8_ROW", "XSC_ROW", "MID_ROW", "MIDSC_ROW", "O_ROW"])
+@pytest.mark.parametrize(
+    "row", ["XN8_ROW", "XSC_ROW", "MID_ROW", "MIDSC_ROW", "O_ROW", "OSC_ROW"]
+)
 def test_padded_lds_rows_put_sixteen_rows_in_distinct_bank_groups(row):
     """The 16 rows an MFMA operand gathers (16 B a lane) hit 16 different groups
     of 4 of the 64 LDS banks; an unpadded pitch puts them all in one."""

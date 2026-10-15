@@ -98,7 +98,9 @@ from atom.models.minimax_m3.mono.layout import (
     AG_RS_FROM,
     MID_ROW,
     O_K,
+    O_ROW,
     O_ROWS,
+    OSC_ROW,
     SCRATCH,
     SPLIT_KEYS,
     UG_PER_SLOT,
@@ -139,10 +141,11 @@ K4_ABI = KernelAbi(
         "q_len", "tl", "k1_args", "positions", "slot_mapping", "res", "batch_ids",
     )
 )  # fmt: skip
-# The shared-FP8 variant carries its four extra pointers in the layer's immutable
-# K1 descriptor, after K1_ARGS. Keeping a distinct ABI object prevents a runner
-# from pairing the variant with an ordinary K4 build.
+# Variant ABIs name semantic pointer formats; their build-key classes select
+# distinct binaries even though the launcher argument names are unchanged.
 K4_SHARED_FP8_ABI = KernelAbi(K4_ABI.names)
+# M3.1 also changes ``w_o`` / ``s_o`` and K1's QKV pointers to row-major MXFP8.
+K4_M31_ABI = KernelAbi(K4_ABI.names)
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,12 @@ class K4SharedFP8Build(K4Build):
     shared_fp8: bool = field(default=True, metadata={"sym": "sf8"})
 
 
+@dataclass(frozen=True)
+class K4M31Build(K4Build):
+    shared_fp8: bool = field(default=True, metadata={"sym": "sf8"})
+    attn_mxfp8: bool = field(default=True, metadata={"sym": "am8"})
+
+
 def build_post_attn_kernel(
     npes: int,
     sm_scale: float,
@@ -188,6 +197,7 @@ def build_post_attn_kernel(
     debug: bool = False,
     index_topk: bool = True,
     _shared_fp8: bool = False,
+    _attn_mxfp8: bool = False,
 ):
     """``@flyc.jit`` launcher of K4 for one rank of an ``npes``-way TP group and a
     decode step of ``tokens`` (<= MAX_TOKENS) rows, ``q_len`` consecutive rows a
@@ -201,7 +211,13 @@ def build_post_attn_kernel(
     selecting layer of the step left in scratch."""
     assert 1 <= tokens <= MAX_TOKENS
     assert not _shared_fp8 or fuse_k1
-    build_cls = K4SharedFP8Build if _shared_fp8 else K4Build
+    assert not _attn_mxfp8 or fuse_k1
+    assert not _attn_mxfp8 or _shared_fp8
+    build_cls = K4Build
+    if _attn_mxfp8:
+        build_cls = K4M31Build
+    elif _shared_fp8:
+        build_cls = K4SharedFP8Build
     key = build_cls(
         npes=npes, tokens=tokens, init_blocks=init_blocks, local_blocks=local_blocks,
         index_heads=heads.count, index_own=heads.own, timeline=timeline,
@@ -227,6 +243,7 @@ def build_post_attn_kernel(
     POOL = pool_words(tokens)
     U_MAX = TOP_K * tokens + 1  # distinct routed experts at most, then the shared
     shared_fp8 = _shared_fp8
+    attn_mxfp8 = _attn_mxfp8
 
     @fx.struct
     class Smem:
@@ -267,6 +284,14 @@ def build_post_attn_kernel(
     QS_CP = tokens * HIDDEN // 4
     assert not (fuse_k1 and heads.count > 1) or (
         QS_CP + HEAD_DIM // 2 * tokens * heads.count <= POOL
+    )
+    # attn_mxfp8: K1's E8M0 input codes past its x8 rows and any index q, then the
+    # o stage's past its attention rows (the pool's stages take turns)
+    X8SC_LDS = QS_CP + (HEAD_DIM // 2 * tokens * heads.count if heads.count > 1 else 0)
+    OSC_LDS = tokens * O_ROW
+    assert not attn_mxfp8 or (
+        X8SC_LDS + tokens * (HIDDEN // 32) <= POOL
+        and OSC_LDS + tokens * OSC_ROW <= POOL
     )
 
     # every builder name, for the stage factories (``stages``)
@@ -445,6 +470,10 @@ def build_post_attn_kernel(
                 diag,
                 REGION_IDS,
                 index_topk,
+                False,
+                False,
+                attn_mxfp8,
+                xs + X8SC_LDS,
             )  # fmt: skip
             gpu.barrier()
             k1_mbox = Mailbox(layer, diag, REGION_IDS)
@@ -649,9 +678,12 @@ def build_post_attn_kernel(
             batch_ids,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
-    (K4_SHARED_FP8_ABI if shared_fp8 else K4_ABI).check(
-        post_attn_kernel, launch_post_attn
-    )
+    abi = K4_ABI
+    if attn_mxfp8:
+        abi = K4_M31_ABI
+    elif shared_fp8:
+        abi = K4_SHARED_FP8_ABI
+    abi.check(post_attn_kernel, launch_post_attn)
     return launch_post_attn
 
 
@@ -689,3 +721,39 @@ def build_post_attn_shared_fp8_kernel(
         _shared_fp8=True,
     )
     return launch
+
+
+def build_post_attn_m31_kernel(
+    npes: int,
+    sm_scale: float,
+    eps: float,
+    route_scale: float,
+    swiglu_limit: float,
+    init_blocks: int,
+    local_blocks: int,
+    tokens: int = 1,
+    timeline: bool = False,
+    fuse_k1: bool = True,
+    heads: IndexHeads = ONE_INDEX_HEAD,
+    debug: bool = False,
+    index_topk: bool = True,
+):
+    """M3.1 K4 with native-MXFP8 attention and independent shared MLP."""
+    return build_post_attn_kernel(
+        npes,
+        sm_scale,
+        eps,
+        route_scale,
+        1.0,
+        swiglu_limit,
+        init_blocks,
+        local_blocks,
+        tokens,
+        timeline,
+        fuse_k1,
+        heads,
+        debug,
+        index_topk,
+        _shared_fp8=True,
+        _attn_mxfp8=True,
+    )

@@ -10,10 +10,16 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.minimax_m3.mono.config import HIDDEN, N_ROUTED, SHARED_EXPERT, TOP_K
-from atom.models.minimax_m3.mono.kernels.common import ld_bf16x12
+from atom.models.minimax_m3.mono.kernels.common import (
+    e8m0_load,
+    ld_bf16x12,
+    mx8_b_tiles,
+    mx8_q,
+    mx8_scale,
+    shuffled_scale_index,
+)
 from atom.models.minimax_m3.mono.kernels.stages.shared import XN_SLICE
 from atom.models.minimax_m3.mono.layout import N_ROUTER, SCORE_COPIES
-from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, pow2
 from atom.mono.device.ops import (
     CM_DEV,
     bf2_f32,
@@ -77,17 +83,8 @@ def router_defs(k4ctx):
     xs = k4ctx["xs"]
 
     # ======================================================= MoE helpers
-    def e8m0_load(r_s, byte_idx):
-        """An e8m0 scale byte, still in flight (the MFMA takes it as is)."""
-        return fx.Int32(bo.buffer_load(r_s, byte_idx, vec_width=1, dtype=T.i8))
-
     def group_scale_byte(expert, rows, rg, kc, cols):
-        """scale_index(expert rows + 16 rg + l16, 4 kc + g4, cols): this lane's
-        byte for row group rg, 128-k chunk kc, folded to wave-uniform terms plus
-        the lane (the general form's per-lane arithmetic cost the S = 16 up /
-        gate loop ~8 us)."""
-        base = (expert * (rows // 32) + rg // 2) * (cols // 8) + kc // 2
-        return (base * 64 + lane) * 4 + (kc % 2) * 2 + rg % 2
+        return shuffled_scale_index(lane, expert, rows, rg, kc, cols)
 
     def route_top4(k, k0, sc0, k1, sc1, sig, wave_mask=None, mask_bit=0):
         """route[8k : 8k+4] / rwt[..] := token k's sigmoid top-k gating from the
@@ -125,32 +122,8 @@ def router_defs(k4ctx):
                 fx.ptr_store(fx.Int32(SHARED_EXPERT), route + (8 * k + TOP_K))
                 fx.ptr_store(fx.Float32(shared_weight), rwt + (8 * k + TOP_K))
 
-    def mx8_scale(vals, offsets):
-        """E8M0 byte (>= 1) of the 32-block the lanes xor-``offsets`` apart share,
-        aiter's MXFP8 RoundUp rule ceil_pow2(amax / 448), and its reciprocal."""
-        amax = fx.max(vals[0], -vals[0])
-        for v in vals[1:]:
-            amax = fx.max(amax, fx.max(v, -v))
-        amax = butterfly(amax, offsets, fx.max)
-        e = code_ceil(amax * fx.Float32(1.0 / FP8_MAX))
-        return e, hw_rcp(pow2(e))
-
-    def mx8_q(v, inv):
-        return clamp_fp8(v * inv)
-
     def lds_b8(chunk_word):
-        """This lane's B operand of the 128-k chunk at LDS word ``chunk_word``:
-        fp8 k 16 g .. + 16 then 64 + 16 g .. + 16 (g = lane // 16), the
-        f8f6f4 MFMA's B layout (harness/mfma_f4f8_probe.py)."""
-        h = [
-            fx.Vector(
-                fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f)
-            ).bitcast(fx.Int32)
-            for j in range(2)
-        ]
-        return fx.Vector.from_elements(
-            [h[j][e] for j in range(2) for e in range(4)], fx.Int32
-        )
+        return mx8_b_tiles(xs, chunk_word, g4)
 
     def bf16x2(word):
         return fx.Vector.from_elements([word], fx.Int32).bitcast(fx.BFloat16)
