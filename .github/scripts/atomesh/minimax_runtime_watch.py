@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CI-only native Python stack dumps and read-only host memory sampling."""
+"""CI-only Python thread snapshots and read-only host memory sampling."""
 
 import argparse
-import faulthandler
 import json
 import os
 import shutil
+import sys
+import threading
 import time
+import traceback
 from pathlib import Path
 
-_STACK_FILE = None
 _STARTED_PID = None
 
 
@@ -21,7 +22,7 @@ def process_start(pid):
 
 
 def start():
-    global _STACK_FILE, _STARTED_PID
+    global _STARTED_PID
     root = os.environ.get("ATOM_CI_RUNTIME_DIAGNOSTICS")
     if not root or _STARTED_PID == os.getpid():
         return
@@ -29,26 +30,54 @@ def start():
     folder = Path(root) / role
     folder.mkdir(parents=True, exist_ok=True)
     pid = os.getpid()
-    _STACK_FILE = (folder / f"pid-{pid}.stacks.log").open("a")
-    # Native watchdog works even while another thread holds the GIL in a C call.
-    faulthandler.enable(file=_STACK_FILE)
-    faulthandler.dump_traceback_later(120, repeat=True, file=_STACK_FILE)
+    stack_path = folder / f"pid-{pid}.stacks.log"
+    stack_path.touch()
     (folder / f"pid-{pid}.json").write_text(
         json.dumps(
             {
                 "pid": pid,
                 "start_ticks": process_start(pid),
                 "role": role,
+                "stack_sampler": "python_thread",
                 "unix_time": time.time(),
             }
         )
         + "\n"
     )
     _STARTED_PID = pid
+    threading.Thread(
+        target=watch_stacks, args=(stack_path,), daemon=True, name="ci-stack-sampler"
+    ).start()
 
 
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=start)
+def dump_stacks(path):
+    # Public Python APIs retain frame references and run with the GIL. Do not
+    # use an asynchronous native frame walker: on Python 3.12 the first native
+    # timeout dump coincided with SIGSEGV during threaded loading (38795325170).
+    frames = sys._current_frames()
+    lines = [f"unix_time={time.time()} pid={os.getpid()} sampler=python_thread\n"]
+    try:
+        for ident, frame in list(frames.items())[:128]:
+            lines.append(f"Thread {ident}:\n")
+            lines.extend(traceback.format_stack(frame, limit=40))
+    finally:
+        # The sampler's own frame is in this dictionary; break that cycle.
+        frames.clear()
+        frame = None
+        del frames
+    if path.stat().st_size > 8 << 20:
+        path.replace(path.with_suffix(".previous.log"))
+    with path.open("a") as stream:
+        stream.write("".join(lines))
+
+
+def watch_stacks(path):
+    while True:
+        time.sleep(120)
+        try:
+            dump_stacks(path)
+        except OSError:
+            return  # Diagnostics must not terminate a model worker.
 
 
 def read(path):
@@ -121,7 +150,7 @@ def prepare(source, runtime, output):
             {
                 "source": str(source),
                 "runtime": str(runtime),
-                "change": "start native stack watchdog at atom import; no model hooks",
+                "change": "start Python stack sampler at atom import; no model hooks",
             },
             indent=2,
         )

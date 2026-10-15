@@ -409,7 +409,7 @@ if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" && "${BENCHMARK_
   python3 "${ATOMESH_SCRIPT_DIR}/minimax_runtime_watch.py" --output "${minimax_diagnostics}" \
     > "${minimax_diagnostics}/sampler.log" 2>&1 &
   minimax_runtime_sampler_pid=$!
-  echo "[runtime-watch] Native stacks every 120s, memory counters every 30s: ${minimax_diagnostics}"
+  echo "[runtime-watch] Python thread stacks every 120s, memory counters every 30s: ${minimax_diagnostics}"
 fi
 
 # Names the last apply_role_env() exported for a role.

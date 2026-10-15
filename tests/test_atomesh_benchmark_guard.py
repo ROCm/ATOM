@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -121,7 +122,32 @@ class RuntimeWatchTests(unittest.TestCase):
             self.assertTrue(result["processes"][0]["threads"])
             self.assertTrue(result["vmstat"])
 
-    def test_runtime_copy_preserves_source_and_starts_native_watchdog(self):
+    def test_python_stack_snapshot_with_changing_threads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "stacks.log"
+            path.touch()
+            done = threading.Event()
+
+            def churn():
+                while not done.is_set():
+                    child = threading.Thread(target=lambda: sum(range(100)))
+                    child.start()
+                    child.join()
+
+            thread = threading.Thread(target=churn)
+            thread.start()
+            try:
+                for _ in range(10):
+                    watch.dump_stacks(path)
+            finally:
+                done.set()
+                thread.join(timeout=5)
+            text = path.read_text()
+            self.assertEqual(text.count("sampler=python_thread"), 10)
+            self.assertIn("Thread ", text)
+            self.assertIn("dump_stacks", text)
+
+    def test_runtime_copy_preserves_source_and_starts_python_sampler(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             source, runtime, output = root / "source", root / "runtime", root / "out"

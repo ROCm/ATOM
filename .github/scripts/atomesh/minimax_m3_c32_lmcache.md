@@ -117,8 +117,8 @@ all TP ranks timed out at broadcast sequence 95. Pre-start memory preparation
 alone therefore does not establish that the runtime pin/copy path is healthy.
 
 The C32 CI service now uses a temporary copy of the same ATOM package with a
-native Python stack watchdog added at import. It dumps every 120 seconds, even
-if a native call holds the GIL. A separate process samples host/NUMA memory,
+Python stack sampler added at import. It snapshots threads every 120 seconds
+using `sys._current_frames()` and normal Python traceback formatting. A separate process samples host/NUMA memory,
 compaction/THP counters and registered workers' thread wait channels every
 30 seconds. It checks process start times before reading a PID. NCCL's bounded
 4096-entry trace buffer dumps on timeout. No model, scheduling, concurrency,
@@ -151,3 +151,13 @@ Ordinary free RAM plus clean cache was only about 760 GiB, and UID 300152 could
 not lower `nr_hugepages`. No model-cache advice or model startup ran. The case
 now excludes this demonstrated incompatible node as well as g34; scheduling
 among all other nodes remains automatic, with no Slurm account specified.
+
+Run 38795325170 prepared 1024 GiB on g03 successfully, but a prefill worker
+exited with SIGSEGV at 20:36:23 while loading weights. Its first native timeout
+stack dump was due at exactly 20:36:22.981 (120 seconds after registration),
+and the dump ended in a partial frame with an invalid line number. This strongly
+implicates the CI diagnostic's asynchronous native frame walk. That diagnostic
+has been removed, including its fatal-signal and fork hooks. The replacement
+uses regular Python thread/frame APIs with strong frame references and bounded,
+rotated output. If a native call holds the GIL, Python stack sampling may pause;
+the external host-memory/thread-wait sampler and NCCL recorder remain available.
