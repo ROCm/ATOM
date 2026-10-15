@@ -308,33 +308,39 @@ def test_shipped_chain_equals_engine_chain(seed, dcp, length):
     engine_chain = engine_bm._prompt_hashes(engine_seq)
     assert engine_chain == whole[: length // hbs]
     seq = pickle.loads(pickle.dumps(shipped_seq(tokens, seed, hbs)))  # the IPC
-    assert seq.prompt_hash_chain[:2] == (hbs, seed)
-    assert seq.prompt_hash_chain[2].tolist() == engine_chain
+    assert seq.prompt_hash_chain[:3] == (hbs, seed, length)
+    assert seq.prompt_hash_chain.hashes.tolist() == engine_chain
     bm = BlockManager(prefix_config(decode_context_parallel_size=dcp))
     assert bm._prompt_hashes(seq) == engine_chain
     assert (bm.shipped_chains_adopted, bm.shipped_chains_rejected) == (1, 0)
     assert seq.prompt_hash_chain is None  # consumed
 
 
+PROMPT = list(range(40)) + [900, 901, 902]
+
+
 @pytest.mark.parametrize(
     "corrupt",
     [
-        lambda c: (c[0] * 2, c[1], c[2]),  # another hash block size
-        lambda c: (c[0], c[1] + 1, c[2]),  # another seed
-        lambda c: (c[0], c[1], c[2][:-1]),  # too short
-        lambda c: (c[0], c[1], array.array("Q", [x ^ 1 for x in c[2]])),
-        lambda c: (c[0], c[1], c[2][:-1] + array.array("Q", [5])),  # last link
-        lambda c: (c[0], c[1], relinked(c[2], 5)),  # the middle link
+        lambda c: c._replace(hash_block_size=c.hash_block_size * 2),
+        lambda c: c._replace(cache_seed=c.cache_seed + 1),
+        lambda c: c._replace(hashes=c.hashes[:-1]),  # too short
+        lambda c: c._replace(hashes=array.array("Q", [x ^ 1 for x in c.hashes])),
+        lambda c: c._replace(hashes=c.hashes[:-1] + array.array("Q", [5])),
+        lambda c: c._replace(hashes=relinked(c.hashes, 5)),  # the middle link
+        lambda c: c._replace(num_prompt_tokens=c.num_prompt_tokens - 1),
+        # Another prompt that differs at block 2 only: every sampled link
+        # (0, 5, 9) holds, only the fingerprint tells.
+        lambda c: shipped_seq(PROMPT[:9] + [777] + PROMPT[10:]).prompt_hash_chain,
     ],
 )
 def test_a_bad_chain_is_rehashed_with_the_same_hit(corrupt):
-    tokens = list(range(40)) + [900, 901, 902]
     bm = published(range(40))
-    seq = shipped_seq(tokens)
+    seq = shipped_seq(PROMPT)
     seq.prompt_hash_chain = corrupt(seq.prompt_hash_chain)
     assert bm.can_allocate(seq, record=False) == 10
     assert (bm.shipped_chains_adopted, bm.shipped_chains_rejected) == (0, 1)
-    assert bm._prompt_hashes(seq) == reference_chain(tokens, BLOCK, -1, 10)
+    assert bm._prompt_hashes(seq) == reference_chain(PROMPT, BLOCK, -1, 10)
 
 
 def relinked(chain, i):
@@ -343,19 +349,22 @@ def relinked(chain, i):
     return chain
 
 
-def test_a_bad_interior_link_is_caught_where_it_is_published():
-    """Adoption checks the first, middle and last links; `hash_blocks` the rest."""
-    tokens = list(range(40)) + [900, 901, 902]
-    bm = published(range(40))
-    seq = shipped_seq(tokens)
-    seq.prompt_hash_chain = seq.prompt_hash_chain[:2] + (
-        relinked(seq.prompt_hash_chain[2], 2),
-    )
-    assert admit(bm, seq)[0] == 2  # adopted: the probe misses from block 2
-    assert (bm.shipped_chains_adopted, bm.shipped_chains_diverged) == (1, 1)
-    bm.deallocate(seq)
-    assert exact(bm, seq) == 10  # rehashed here
-    assert bm._prompt_hashes(seq) == reference_chain(tokens, BLOCK, -1, 10)
+@pytest.mark.parametrize("ship", [0, 1])
+def test_prompt_blocks_are_published_under_the_chain(monkeypatch, ship):
+    """A preempted seq: 10 prompt blocks from the chain, 2 hashed at publish."""
+    seq = shipped_seq(PROMPT) if ship else Sequence(PROMPT, BLOCK)
+    for t in range(5):
+        seq.append_token(50 + t)
+    bm = BlockManager(prefix_config())
+    hit = bm.can_allocate(seq, record=False)
+    assert hit == 0 and bm.allocate(seq, hit)
+    hashed = []
+    real = bm.compute_hash
+    monkeypatch.setattr(bm, "compute_hash", lambda *a: hashed.append(a) or real(*a))
+    bm.hash_blocks(seq, seq.num_tokens)
+    names = [bm.kv.block(b).hash for b in seq.block_table[:12]]
+    assert names == reference_chain(PROMPT + list(range(50, 55)), BLOCK, -1, 12)
+    assert len(hashed) == 2  # each prompt block was hashed once, before
 
 
 def _processor(**config):
@@ -373,8 +382,8 @@ def _processor(**config):
 def test_frontend_preprocess_ships_the_chain():
     tokens = list(range(41))
     chain = _processor().preprocess(tokens, SamplingParams()).prompt_hash_chain
-    assert chain[0] == BLOCK
-    assert chain[2].tolist() == reference_chain(tokens, BLOCK, -1, 10)
+    assert chain.hash_block_size == BLOCK
+    assert chain.hashes.tolist() == reference_chain(tokens, BLOCK, -1, 10)
     seqs = _processor().preprocess_fanout(tokens, SamplingParams(n=3, temperature=0.8))
     assert all(s.prompt_hash_chain is seqs[0].prompt_hash_chain for s in seqs)
     dcp = _processor(decode_context_parallel_size=2)
@@ -394,8 +403,40 @@ def test_the_frontend_drops_the_chain_once_sent():
     seqs = _processor().preprocess_fanout(tokens, SamplingParams(n=3, temperature=0.8))
     mgr.add_request(seqs)
     want = reference_chain(tokens, BLOCK, -1, 10)
-    assert [s.prompt_hash_chain[2].tolist() for s in sent] == [want] * 3
+    assert [s.prompt_hash_chain.hashes.tolist() for s in sent] == [want] * 3
     assert all(s.prompt_hash_chain is None for s in seqs)
+
+
+def test_the_engine_sends_seqs_back_without_a_chain(tmp_path):
+    """A seq aborted while waiting never reached a probe to consume it."""
+    import queue
+    import threading
+
+    import zmq
+
+    with stubbed_aiter():
+        from atom.model_engine.engine_core import EngineCore
+    from atom.model_engine.sequence import get_exit_sequence
+
+    address = f"ipc://{tmp_path}/out"
+    ctx = zmq.Context()
+    pull = ctx.socket(zmq.PULL)
+    pull.setsockopt(zmq.LINGER, 0)
+    pull.setsockopt(zmq.RCVTIMEO, 10_000)
+    pull.bind(address)
+    core = SimpleNamespace(label="test", output_queue=queue.Queue())
+    core.output_queue.put([shipped_seq(range(41)), get_exit_sequence()])
+    out = threading.Thread(
+        target=EngineCore.process_output_sockets, args=(core, address)
+    )
+    out.start()
+    try:
+        sent = pickle.loads(pull.recv())[1]
+    finally:
+        out.join(10)
+        pull.close()
+        ctx.term()
+    assert [s.prompt_hash_chain for s in sent] == [None]
 
 
 def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
@@ -406,9 +447,8 @@ def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
     stats = engine_stats.EngineStats(enable_prefix_caching=True)
     stats.block_manager = bm = published(range(40))
     bm.shipped_chains_adopted, bm.shipped_chains_rejected = 3, 2
-    bm.shipped_chains_diverged = 1
     stats._log_cache()
-    assert any("adopted 3, rejected 2, diverged 1" in line for line in lines)
+    assert any("adopted 3, rejected 2" in line for line in lines)
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,7 @@ from atom.model_engine.prefix_hash import (
     chained_block_hashes,
     full_prompt_blocks,
     hash_block_size_for,
+    prompt_fingerprint,
 )
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache, StateCheckpointCache
@@ -180,18 +181,16 @@ class BlockManager:
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Each seq's prompt-block hash chain, as `(cache_seed, chain, shipped)`
+        # Each seq's prompt-block hash chain, as `(cache_seed, chain)`
         # (`_prompt_hashes`). Content hashes only: pool hits and resource fit
         # are always rechecked. Weak keys keep this scheduler-side cache out of
         # request serialization.
-        self._prompt_hash_chains: WeakKeyDictionary[
-            Sequence, tuple[int, list[int], bool]
-        ] = WeakKeyDictionary()
-        # `_adopt_shipped_chain` outcomes, and adopted chains `hash_blocks`
-        # found wrong; rejections and divergences should stay at 0.
+        self._prompt_hash_chains: WeakKeyDictionary[Sequence, tuple[int, list[int]]] = (
+            WeakKeyDictionary()
+        )
+        # `_adopt_shipped_chain` outcomes; rejections should stay at 0.
         self.shipped_chains_adopted: int = 0
         self.shipped_chains_rejected: int = 0
-        self.shipped_chains_diverged: int = 0
         self.total_evicted_blocks: int = 0
         # `can_allocate_memoized`'s memo, validated against recent evictions,
         # `clear_cache` calls and remaps (which move entries without one).
@@ -748,28 +747,34 @@ class BlockManager:
         seed = seq.cache_seed
         cached = self._prompt_hash_chains.get(seq)
         if cached is None or cached[0] != seed:
-            chain = self._adopt_shipped_chain(seq)
-            cached = (seed, chain, bool(chain))
+            cached = (seed, self._adopt_shipped_chain(seq))
             self._prompt_hash_chains[seq] = cached
         return cached[1]
 
     def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
         """The frontend's chain for `seq` (consumed), or `[]` to hash here.
-        Adopted only if block size, seed and length match and its first, middle
-        and last links rehash equal here; `hash_blocks` checks the links it
-        publishes (`_distrust_shipped_chain`)."""
+        Adopted only if it was minted for this block size and seed from these
+        prompt tokens (`prompt_fingerprint`), and its first, middle and last
+        links rehash equal here (the same hash function). Then trusted whole:
+        walks, `allocate` and `hash_blocks` read it."""
         shipped = getattr(seq, "prompt_hash_chain", None)
         if shipped is None:
             return []
         seq.prompt_hash_chain = None
-        hbs = self.hash_block_size
+        hbs, seed = self.hash_block_size, seq.cache_seed
         n = self._n_prompt_blocks(seq)
-        block_size, seed, packed = shipped
-        if block_size != hbs or seed != seq.cache_seed or len(packed) != n:
+        packed = shipped.hashes
+        if (shipped.hash_block_size, shipped.cache_seed, len(packed)) != (hbs, seed, n):
             return self._reject_shipped_chain(
-                f"minted for hash block {block_size}, seed {seed}, {len(packed)} "
-                f"blocks; this engine wants {hbs}, {seq.cache_seed}, {n}"
+                f"minted for hash block {shipped.hash_block_size}, seed "
+                f"{shipped.cache_seed}, {len(packed)} blocks; this engine wants "
+                f"{hbs}, {seed}, {n}"
             )
+        if (shipped.num_prompt_tokens, shipped.fingerprint) != (
+            seq.num_prompt_tokens,
+            prompt_fingerprint(seq),
+        ):
+            return self._reject_shipped_chain("it was minted from other tokens")
         chain = packed.tolist()
 
         def link_holds(i: int) -> bool:
@@ -792,19 +797,6 @@ class BlockManager:
             )
         self.shipped_chains_rejected += 1
         return []
-
-    def _distrust_shipped_chain(self, seq: Sequence, block: int) -> None:
-        """`hash_blocks` published a hash `seq`'s adopted chain disagrees with:
-        drop the chain, so later walks of `seq` hash here."""
-        if not self.shipped_chains_diverged:
-            logger.warning(
-                "Prefix cache: a prompt chain the frontend shipped differs from "
-                "this engine's at block %d; rehashing that prompt here. Its "
-                "probes may have missed cached blocks.",
-                block,
-            )
-        self.shipped_chains_diverged += 1
-        self._prompt_hash_chains[seq] = (seq.cache_seed, [], False)
 
     def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
         """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
@@ -2051,16 +2043,16 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
-        # An adopted frontend chain, checked against what is published.
-        chain = self._prompt_hash_chains.get(seq)
-        shipped = chain[1] if chain and chain[2] and chain[0] == seq.cache_seed else ()
+        # Prompt blocks the seq's chain covers (`_prompt_hashes`) are named
+        # from it; only the rest are hashed here.
+        known = self._prompt_hash_chains.get(seq)
+        known = known[1] if known and known[0] == seq.cache_seed else ()
+        if 0 < start <= len(known) and known[start - 1] != h:
+            known = ()
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = known[i] if i < len(known) else self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
-            if i < len(shipped) and shipped[i] != h:
-                self._distrust_shipped_chain(seq, i)
-                shipped = ()
             if record:
                 store_run_hashes.append(h)
                 store_run_tokens.extend(token_ids)

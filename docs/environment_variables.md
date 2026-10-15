@@ -331,7 +331,7 @@ and catches it; set it when chasing a corruption that does not reproduce.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine, which checks its block size, seed, length and first, middle and last block and adopts it instead of hashing the prompt on the scheduler thread; each block published later is checked against it too. Any mismatch falls back to engine-side hashing. Read in the API server process. |
+| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens. The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks, so the scheduler thread hashes no prompt block (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens). Any mismatch falls back to engine-side hashing. Read in the API server process. |
 | **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's whole chain up in one pass, compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
 
 ## State checkpoints

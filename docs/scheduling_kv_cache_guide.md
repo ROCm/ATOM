@@ -436,9 +436,15 @@ uncommitted; checkpoint demand/end and hit instrumentation still refresh.
 Checkpoint demand counters deduplicate per request.
 
 A probe is a walk followed by an evaluation. The walk (`_walk_prefix`) finds
-the contiguous run of prompt blocks in the KV index. Each prompt block is
-hashed once per request (or adopted from the chain the frontend shipped), and
-completion tokens are never cached. The evaluation applies the SWA and state
+the contiguous run of prompt blocks in the KV index. It reads the seq's prompt
+chain (`_prompt_hashes`): the chain the frontend shipped, adopted once its block
+size, seed, length and prompt-token fingerprint match and three of its links
+rehash equal here, or else hashes the engine computed, up to a little past the
+first miss. `hash_blocks` publishes prompt blocks under the chain's hashes and
+hashes only the blocks it does not cover (the rest of a cold prompt with no
+shipped chain, and completion tokens, which never enter the chain). So each
+prompt block is hashed at most once on the scheduler thread, and not at all
+when the shipped chain is adopted. The evaluation applies the SWA and state
 gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
 already in use, and the fit. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.

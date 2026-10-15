@@ -386,9 +386,10 @@ class Sequence:
         # `BlockManager._extend_hash_chain` for why it cannot simply be the
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
-        # `prefix_hash.ship_prompt_hash_chain`'s chain, adopted and cleared by
+        # `prefix_hash.ShippedChain`, consumed by
         # `BlockManager._adopt_shipped_chain`; None = the engine hashes it.
-        # The frontend's copy is dropped once sent (`CoreManager.add_request`).
+        # Dropped by the frontend once sent (`CoreManager.add_request`) and by
+        # the engine before a seq goes back (`EngineCore.process_output_sockets`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never

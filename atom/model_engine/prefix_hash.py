@@ -4,6 +4,7 @@
 (`BlockManager.compute_hash` is `block_hash`)."""
 
 import array
+from typing import NamedTuple
 
 import numpy as np
 import xxhash
@@ -60,11 +61,32 @@ def chained_block_hashes(
     return out
 
 
+def prompt_fingerprint(seq) -> int:
+    """xxh64 of `seq`'s prompt token bytes, without a copy."""
+    return _xxh64(memoryview(seq.token_ids)[: seq.num_prompt_tokens])
+
+
+class ShippedChain(NamedTuple):
+    """`seq.prompt_hash_chain`: its full-prompt-block chain as the frontend
+    hashed it, and what it was minted from."""
+
+    hash_block_size: int
+    cache_seed: int
+    num_prompt_tokens: int
+    fingerprint: int  # `prompt_fingerprint`
+    hashes: array.array  # "Q"
+
+
 def ship_prompt_hash_chain(seq, hash_block_size: int) -> None:
-    """Attach `seq`'s full-prompt-block hash chain as `(hash_block_size,
-    cache_seed, array("Q"))`, for `BlockManager._adopt_shipped_chain`."""
+    """Attach `seq`'s chain for `BlockManager._adopt_shipped_chain`."""
     if not envs.ATOM_FRONTEND_PREFIX_HASH or hash_block_size <= 0:
         return
     n = full_prompt_blocks(seq, hash_block_size)
     chain = chained_block_hashes(seq.token_ids, hash_block_size, 0, n, seq.cache_seed)
-    seq.prompt_hash_chain = (hash_block_size, seq.cache_seed, array.array("Q", chain))
+    seq.prompt_hash_chain = ShippedChain(
+        hash_block_size,
+        seq.cache_seed,
+        seq.num_prompt_tokens,
+        prompt_fingerprint(seq),
+        array.array("Q", chain),
+    )
