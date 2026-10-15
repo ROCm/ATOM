@@ -1187,12 +1187,28 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
+        """Publish `num_bonus + 1` per request, 1 everywhere else, in one copy.
 
-        if self.model_runner.tokenID_processor.num_bonus is None:
+        The counts arrive on the host, and assigning them element by element
+        made each one a blocking `hipMemcpyWithStream`: the first drained the
+        stream, the rest cost ~13us each, so the decode prep grew with batch.
+
+        One non-blocking copy of the whole row replaces the reset and the
+        writes. The destination stays the same tensor -- a captured graph and
+        `replayssm_commit` read it by address -- and a pageable source of this
+        size (4 B x max_bs, far below `_PAGEABLE_H2D_LIMIT`) is staged by the
+        driver and returns without waiting on queued work. A pinned
+        `CpuGpuBuffer` is not used: its GPU half would be per PP ring slot,
+        while this destination is one tensor shared by every slot.
+        """
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is None:
+            self.num_accepted_tokens.fill_(1)
             return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        num_bonus = np.asarray(num_bonus, dtype=np.int32)
+        host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
+        host[: num_bonus.shape[0]] = num_bonus + 1
+        self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
 
     def prepare_gdn_metadata(
         self,
