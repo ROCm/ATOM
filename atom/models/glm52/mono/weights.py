@@ -16,6 +16,7 @@ from aiter import dtypes
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
+    SOFTMAX_SCALE,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
     glm5_tp_config,
@@ -204,6 +205,19 @@ def layer_weights(
     experts = moe.experts
     physical_experts = cfg.n_experts + cfg.num_shared_experts
 
+    # The kernel bakes `SOFTMAX_SCALE` in; it takes no scale from the caller.
+    # Production derives the same value, but then squares a YaRN mscale into it
+    # (`deepseek_v2.py`: `self.scaling = self.scaling * mscale * mscale`), so a
+    # config with `factor=32, mscale_all_dim=1` serves 0.11333 while the kernel
+    # would use 0.0625 -- different attention probabilities, silently. Refuse
+    # rather than serve it: propagating the scale into the build is a real
+    # feature and would need GPU numerics to confirm, while this costs nothing
+    # on a config that does not adjust the scale.
+    need(
+        attn.scaling == SOFTMAX_SCALE,
+        f"attention scale {attn.scaling} != the kernel's {SOFTMAX_SCALE} "
+        "(YaRN mscale?)",
+    )
     need(experts.global_num_experts == cfg.n_experts, "routed expert count")
     need(
         experts.local_num_experts == physical_experts,
