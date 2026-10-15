@@ -2039,6 +2039,71 @@ def test_a_consumer_outside_this_rank_s_head_group_is_refused():
         _run_slot_transfer(mc, connector, _dcp_tp_request(4, 2))
 
 
+_REC_SRC, _REC_BPS = 1024, 16
+_CUR_SRC, _CUR_BPS = 2048, 4
+_REC_DST, _CUR_DST = 14336, 15360
+
+
+def _replayssm_stage(mc, nic):
+    """The stage above plus one ReplaySSM record region and the cursor."""
+    np = pytest.importorskip("numpy")
+    nic.mem[_REC_SRC : _REC_SRC + _SRC_SLOTS * _REC_BPS] = 100 + np.arange(
+        _SRC_SLOTS * _REC_BPS, dtype=np.uint8
+    )
+    nic.mem[_CUR_SRC : _CUR_SRC + _SRC_SLOTS * _CUR_BPS] = 7 + np.arange(
+        _SRC_SLOTS * _CUR_BPS, dtype=np.uint8
+    )
+    connector = _pp_stage_connector(mc, nic)
+    connector._slot_regions += [(_REC_SRC, _REC_BPS), (_CUR_SRC, _CUR_BPS)]
+    connector._slot_region_consumer_indices = [2, 5, 6, 7]
+    connector._slot_region_tp_segments += [(_REC_BPS,), None]
+    connector._slot_region_tp_replicated = [False, False, False, True]
+    return connector
+
+
+def _replayssm_request(cursor_bps=_CUR_BPS):
+    request = _dcp_tp_request()
+    request["consumer_slot_base_addrs"] = _DST_SLOT + [_REC_DST, _CUR_DST]
+    request["consumer_slot_bps"] = request["consumer_slot_bps"] + [
+        _REC_BPS // 2,
+        cursor_bps,
+    ]
+    return request
+
+
+def test_pp_stage_splits_replayssm_records_and_copies_the_cursor_whole():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    _fill_producer(nic)
+    connector = _replayssm_stage(mc, nic)
+    before = nic.mem.copy()
+
+    assert _run_slot_transfer(mc, connector, _replayssm_request())
+
+    # Source slot 5 lands in destination slot 3. TP rank 1 of 2 holds the
+    # second half of the record's heads, and the cursor every rank shares.
+    rec = before[_REC_SRC + 5 * _REC_BPS : _REC_SRC + 6 * _REC_BPS]
+    half = _REC_BPS // 2
+    got = nic.mem[_REC_DST + 3 * half : _REC_DST + 4 * half]
+    assert (got == rec[half:]).all()
+    cur = before[_CUR_SRC + 5 * _CUR_BPS : _CUR_SRC + 6 * _CUR_BPS]
+    got = nic.mem[_CUR_DST + 3 * _CUR_BPS : _CUR_DST + 4 * _CUR_BPS]
+    assert (got == cur).all()
+
+
+def test_a_replicated_slot_region_of_another_size_is_refused():
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    nic = _ByteNic()
+    connector = _replayssm_stage(mc, nic)
+
+    with pytest.raises(RuntimeError, match="TP-replicated"):
+        _run_slot_transfer(mc, connector, _replayssm_request(_CUR_BPS // 2))
+
+
 def test_a_slot_region_without_tp_segments_is_refused_across_tp_sizes():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"

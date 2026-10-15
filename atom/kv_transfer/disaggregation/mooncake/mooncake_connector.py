@@ -1057,6 +1057,7 @@ class MooncakeConnector(KVConnectorBase):
         self._slot_regions: list[tuple[int, int]] = []
         self._slot_region_consumer_indices: list[int] | None = None
         self._slot_region_tp_segments: list[tuple[int, ...] | None] | None = None
+        self._slot_region_tp_replicated: list[bool] | None = None
         self._gather_slot = None
         self._scatter_slot = None
         self._staging_base_addr: int = 0
@@ -1330,9 +1331,11 @@ class MooncakeConnector(KVConnectorBase):
         self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
         self._slot_region_consumer_indices = tt.slot_region_consumer_indices
         self._slot_region_tp_segments = tt.slot_region_tp_segments
+        self._slot_region_tp_replicated = tt.slot_region_tp_replicated
         for name, values in (
             ("slot_region_consumer_indices", self._slot_region_consumer_indices),
             ("slot_region_tp_segments", self._slot_region_tp_segments),
+            ("slot_region_tp_replicated", self._slot_region_tp_replicated),
         ):
             if values is not None and len(values) != len(self._slot_regions):
                 raise ValueError(
@@ -3607,6 +3610,7 @@ class MooncakeConnector(KVConnectorBase):
             1 if consumer_tp_size is None else max(1, consumer_tp_size // self.tp_size)
         )
         tp_segments = getattr(self, "_slot_region_tp_segments", None)
+        tp_replicated = getattr(self, "_slot_region_tp_replicated", None)
         split = tp_ratio > 1 and tp_segments is not None
         # A split slot is a k-th of this one; Phase 2a sizes it against its
         # segments.
@@ -3835,7 +3839,14 @@ class MooncakeConnector(KVConnectorBase):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
             dst_bps = consumer_slot_bps[cidx]
-            if not split:
+            replicated = split and bool(tp_replicated and tp_replicated[region_idx])
+            if replicated and dst_bps != bps:
+                raise RuntimeError(
+                    f"Slot region {region_idx} is TP-replicated, but its "
+                    f"consumer unit differs for req {req_id}: {bps} B here, "
+                    f"{dst_bps} B there"
+                )
+            if not split or replicated:
                 if dst_bps < bps:
                     raise RuntimeError(
                         f"Slot region {region_idx} would overrun its consumer "

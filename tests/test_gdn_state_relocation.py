@@ -494,8 +494,8 @@ def test_a_single_stage_leaves_region_placement_to_the_connector():
 
 def test_kda_slot_regions_publish_their_tp_shards():
     """A conv unit is rows of [q | k | v], each run sharded by head blocks; an
-    SSM unit is sharded along its leading head axis. ReplaySSM's records are
-    not described, so they stay on equal TP sizes."""
+    SSM unit and a ReplaySSM record unit are sharded along their leading head
+    axis. The cursor cannot be split; every rank holds the same one."""
     builder = kimi_builder({"kv_connector": "mooncake"}, replayssm=True)
 
     tensors = builder.get_kv_transfer_tensors()
@@ -503,13 +503,27 @@ def test_kda_slot_regions_publish_their_tp_shards():
     rows, channels = SHAPE_K
     conv_run = channels // 3 * 4
     ssm_unit = SHAPE_V[0] * SHAPE_V[1] * SHAPE_V[2] * 4
+    rec_k = CAP * REC_K[0] * REC_K[1] * 4
+    rec_u = CAP * REC_V[0] * REC_V[1] * 4
     segments = tensors.slot_region_tp_segments
     assert segments[:LAYERS] == [(conv_run,) * (3 * rows)] * LAYERS
     assert segments[LAYERS : 2 * LAYERS] == [(ssm_unit,)] * LAYERS
-    assert segments[2 * LAYERS :] == [None] * (3 * LAYERS + 1)
+    assert segments[2 * LAYERS : 5 * LAYERS] == (
+        [(rec_k,)] * LAYERS + [(rec_u,)] * LAYERS + [(rec_k,)] * LAYERS
+    )
+    assert segments[5 * LAYERS :] == [None]
+    assert tensors.slot_region_tp_replicated == [False] * (5 * LAYERS) + [True]
     for region, seg in zip(tensors.slot_regions, segments):
         if seg is not None:
             assert sum(seg) == region.unit_bytes
+
+
+def test_without_replayssm_no_slot_region_is_tp_replicated():
+    builder = kimi_builder({"kv_connector": "mooncake"})
+
+    tensors = builder.get_kv_transfer_tensors()
+
+    assert tensors.slot_region_tp_replicated == [False] * (2 * LAYERS)
 
 
 # ---- the producer's guard on a transfer that carries no slot ----------------
