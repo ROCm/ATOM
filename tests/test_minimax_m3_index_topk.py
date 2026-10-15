@@ -111,8 +111,9 @@ class TestTheAiterDependencyIsDeferred:
     A module-scope `from aiter.ops.flydsl import minimax_m3_*` would therefore
     take down far more than MiniMax-M3.
 
-    Decode still has no fallback, so using it must fail loudly; these two tests
-    pin both halves of that.
+    Neither phase has a production fallback, so using one without the kernel
+    must fail loudly and name what to install; these tests pin that for the
+    import itself, for decode, and for prefill.
     """
 
     def test_the_symbols_are_not_imported_at_module_scope(self):
@@ -157,6 +158,24 @@ class TestTheAiterDependencyIsDeferred:
             # The resolver memoizes across tests; a stubbed entry left behind
             # would fail every later GPU test in this file.
             m._flydsl.cache_clear()
+
+    def test_prefill_without_the_kernel_names_the_dependency(self, monkeypatch):
+        # The guarded import leaves `score_prefill_flydsl` None on an older
+        # aiter, and the default route is the only production route, so an
+        # unguarded call site would surface this as a bare TypeError.
+        monkeypatch.setattr(m, "score_prefill_flydsl", None)
+        with pytest.raises(RuntimeError, match="aiter#5626"):
+            m.prefill_index_score(
+                torch.empty((1, 1, 1)),
+                torch.empty((1, 128, 1)),
+                torch.empty((1, 1), dtype=torch.int32),
+                torch.zeros(2, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                1,
+                128,
+                1.0,
+            )
 
 
 # The shape the non-monotonicity shows up at: at max_block 256 a batch of 8

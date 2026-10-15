@@ -1167,6 +1167,19 @@ def prefill_index_score(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
     if resolved == "flydsl":
+        if score_prefill_flydsl is None:
+            # The import above is guarded so a missing kernel cannot take the
+            # MLA prefill backends down at import; it was never a fallback.
+            # Triton is the tests' reference, not a production route, so say
+            # what to install rather than calling None.
+            raise RuntimeError(
+                "MiniMax-M3 prefill needs aiter.ops.flydsl.kernels."
+                "minimax_m3_index_score_prefill, which this aiter does not "
+                "carry. The prefill index scorer has no Triton fallback in "
+                "production, so this is not recoverable at runtime -- install "
+                "an aiter that includes the FlyDSL M3 index-score kernels "
+                "(ROCm/aiter#5626)."
+            )
         # sm_scale passes through as-is: the kernel folds `log2(e)` in itself,
         # exactly as the Triton one does. The fp8 MFMA needs no switch here --
         # `fp8_mfma` resolves itself from the cache dtype.
