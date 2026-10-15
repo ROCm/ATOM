@@ -381,3 +381,48 @@ def test_aiter_stub_teardown_leaves_no_second_copy():
     finally:
         sys.modules.pop("fake_pkg.sub", None)
         sys.modules.pop("fake_pkg", None)
+
+
+def test_aiter_stub_teardown_spares_modules_that_took_nothing():
+    """The teardown must drop poisoned `atom` modules and only those.
+
+    Dropping every `atom` module imported under the stub is the two-copies
+    bug from the other end: a caller still holding a module that never
+    touched AITER gets a second copy of its classes on the next import.
+    `test_scheduler_metrics` hit exactly that -- `engine_core_protocol` has
+    no AITER dependency, and pickling an enum member out of it raised
+    `PicklingError` once the module had been dropped and re-imported.
+
+    Synthetic modules, so the assertion does not depend on which real module
+    some earlier test happened to import first.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import stubbed_aiter
+
+    # Force the stub path: with a real AITER present nothing is installed and
+    # the sweep under test never runs.
+    saved = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == "aiter" or name.startswith("aiter.")
+    }
+    clean = types.ModuleType("atom.took_nothing")
+    poisoned = types.ModuleType("atom.took_a_mock")
+    try:
+        with stubbed_aiter():
+            import aiter
+
+            poisoned.borrowed = aiter.some_symbol
+            sys.modules["atom.took_nothing"] = clean
+            sys.modules["atom.took_a_mock"] = poisoned
+
+        assert (
+            sys.modules.get("atom.took_nothing") is clean
+        ), "a module that never touched AITER was dropped"
+        assert "atom.took_a_mock" not in sys.modules, "a poisoned module survived"
+    finally:
+        sys.modules.pop("atom.took_nothing", None)
+        sys.modules.pop("atom.took_a_mock", None)
+        sys.modules.update(saved)

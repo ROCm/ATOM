@@ -24,9 +24,21 @@ def stubbed_aiter():
     That is a cross-file failure with no connection to the test that caused
     it, so the ``atom`` modules first imported under the stub are dropped too
     and re-imported for real by whoever needs them next.
+
+    Only the ones that actually took something, though. Dropping every
+    ``atom`` module imported under the stub also drops the ones that never
+    touched ``aiter``, and a caller still holding such a module gets the
+    two-copies problem described in ``_drop`` -- from the other side. It bit
+    ``test_scheduler_metrics``: ``engine_core_protocol`` has no AITER
+    dependency, but it was dropped anyway, so pickling an enum member
+    re-imported the module, got a different class, and raised
+    ``PicklingError``.
     """
     before = set(sys.modules)
     installed = []
+    # every object the stubs handed out, by identity: a module that bound one
+    # is poisoned, a module that bound none is not.
+    handed_out = []
     for name in (
         "aiter",
         "aiter.dist",
@@ -39,9 +51,16 @@ def stubbed_aiter():
         if name in sys.modules:
             continue
         module = types.ModuleType(name)
-        module.__getattr__ = lambda _attr: MagicMock()
+
+        def _stub_attr(_attr, _sink=handed_out):
+            mock = MagicMock()
+            _sink.append(mock)
+            return mock
+
+        module.__getattr__ = _stub_attr
         sys.modules[name] = module
         installed.append(name)
+        handed_out.append(module)  # bound by a plain ``import aiter``
     try:
         yield
     finally:
@@ -51,8 +70,18 @@ def stubbed_aiter():
         # present nothing was poisoned, and dropping modules the caller still
         # holds references to is how two copies of one class appear.
         if installed:
+            tainted = {id(obj) for obj in handed_out}
             for name in set(sys.modules) - before:
-                if name == "atom" or name.startswith("atom."):
+                if name != "atom" and not name.startswith("atom."):
+                    continue
+                module = sys.modules.get(name)
+                # shortcut: only module-level bindings are checked, so a stub
+                # reached through a class attribute or a container survives.
+                # Widen this if such a leak ever shows up -- not pre-emptively,
+                # because every name dropped here is one a caller may hold.
+                if module is not None and any(
+                    id(value) in tainted for value in vars(module).values()
+                ):
                     _drop(name)
 
 
