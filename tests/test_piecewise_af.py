@@ -48,17 +48,15 @@ def test_cache_transaction_rolls_back_and_publishes_only_its_writes():
 def test_exception_restores_caches_and_recording_context():
     cache = ReplayCache()
     state = PiecewiseState((), (), {"cache": cache})
-    with pytest.raises(RuntimeError, match="failed"):
-        with state.record():
-            cache[0] = 1
-            raise RuntimeError("failed")
+    with pytest.raises(RuntimeError, match="failed"), state.record():
+        cache[0] = 1
+        raise RuntimeError("failed")
     assert not cache
     with state.record():
         cache[1] = 2
     assert not cache
-    with pytest.raises(ValueError, match="outside"):
-        with state.record():
-            ReplayCache()[0] = 1
+    with pytest.raises(ValueError, match="outside"), state.record():
+        ReplayCache()[0] = 1
 
 
 @cuda
@@ -163,12 +161,12 @@ def test_cross_layer_stable_results_survive_producer_capture_and_fallback():
         x = torch.full((4,), float(i), device="cuda")
         cache = ReplayCache(stable=True)
         state = PiecewiseState((), (), {"cache": cache}, storage=storage)
-        opts = dict(
-            piecewise=True,
-            capture=True,
-            capture_state=state,
-            forward_context=_context(),
-        )
+        opts = {
+            "piecewise": True,
+            "capture": True,
+            "capture_state": state,
+            "forward_context": _context(),
+        }
         produce(layer, x, cache, runner=producer, **opts)
         actual = consume(layer, x, cache, runner=consumer, zero_copy_inputs=(), **opts)
         torch.testing.assert_close(actual, x * 2 + 3)
