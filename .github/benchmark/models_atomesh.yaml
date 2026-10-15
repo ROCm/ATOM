@@ -872,7 +872,8 @@ models:
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *kimi_k3_agentic_hc_dspark3_prefill_env
 
-        - <<: *kimi_k3_agentic_hc_dspark3
+        - &kimi_k3_agentic_pd_dspark3_c72_on_demand
+          <<: *kimi_k3_agentic_hc_dspark3
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72
           concurrency: [72]
           server:
@@ -885,6 +886,15 @@ models:
               ATOM_ENABLE_REPLAYSSM: "1"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
               ATOM_STATE_CHECKPOINT_DEMAND: "1"
+
+        # Lower-concurrency counterpart to the C72 on-demand experiment.
+        - <<: *kimi_k3_agentic_pd_dspark3_c72_on_demand
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48-on-demand
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 96
 
         - <<: *kimi_k3_agentic_hc_dspark3
           name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
@@ -944,7 +954,8 @@ models:
         # AGG counterpart to the DSpark3 C72 on-demand cell: keep the AGG
         # scheduling settings and standalone offload connector, with the same
         # draft, warmup, and 128 GiB KV + 96 GiB state CPU tier as 1P1D.
-        - <<: *kimi_k3_agentic_agg
+        - &kimi_k3_agentic_agg_dspark3_c72_on_demand
+          <<: *kimi_k3_agentic_agg
           name: kimi-k3-mxfp4-agg-tp8-dcp8-dspark3-agentic-lmcache-1m-c72-on-demand
           display_topology: AGG-TP8-DCP8-DSPARK3
           server:
@@ -961,6 +972,14 @@ models:
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "96"
               ATOM_WARMUP_GEMM_M_BUCKETS: "1"
+
+        - <<: *kimi_k3_agentic_agg_dspark3_c72_on_demand
+          name: kimi-k3-mxfp4-agg-tp8-dcp8-dspark3-agentic-lmcache-1m-c48-on-demand
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 96
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
