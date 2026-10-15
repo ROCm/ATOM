@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
+from functools import wraps
 
 import torch
 
@@ -29,6 +29,20 @@ _FUSED_EXPERT_LEAVES = {
 }
 
 _EXPERTS_PREFIX_SUFFIX = ".experts"
+
+
+def _discard_sync_state_on_error(method):
+    """A failed bucket may leave no scratch for the next sync to inherit."""
+
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self._discard_failed_weight_sync()
+            raise
+
+    return guarded
 
 
 def _unwrap_once(module) -> torch.nn.Module | None:
@@ -110,6 +124,28 @@ class WeightUpdaterMixin:
                 f"sender's names against the model's own "
                 f"(`model.named_parameters()`)."
             )
+
+    def _discard_failed_weight_sync(self) -> None:
+        """Drop reusable transport scratch after a failed update.
+
+        The generic RPC path reports an exception without killing the worker,
+        so this state now outlives a failed call unless it is explicitly
+        cleared. Expert-relayout bookkeeping is recovery state rather than
+        scratch and deliberately survives. Parameters already written cannot
+        be rolled back; EngineCore fences serving until a complete sync.
+        """
+        if hasattr(self, "_ipc_buffer"):
+            self._ipc_buffer = None
+        if hasattr(self, "_packed_weight_accum"):
+            self._packed_weight_accum.clear()
+        # Do not clear _expert_relayout_pending. A weight already written
+        # row-major still needs the later complete sync's finalizer to restore
+        # the layout its kernel reads, even if that sync does not touch it.
+
+    def discard_failed_weight_sync(self) -> bool:
+        """Worker RPC used to clear every peer after any one rank failed."""
+        self._discard_failed_weight_sync()
+        return True
 
     def _get_param_to_module_mapping(self) -> dict[str, tuple]:
         """
@@ -877,6 +913,7 @@ class WeightUpdaterMixin:
             quant_type,
             getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
+            native_group_rows=getattr(module, "native_a8_group_rows", None),
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
@@ -890,6 +927,7 @@ class WeightUpdaterMixin:
             self._await_readers_of(param)
             shuffle_weights(param)
 
+    @_discard_sync_state_on_error
     def update_weights(
         self, named_tensors: list[tuple[str, torch.Tensor]], clear_kv_cache: bool = True
     ) -> int:
@@ -989,6 +1027,7 @@ class WeightUpdaterMixin:
         self._warn_if_nothing_matched(updated, skipped)
         return updated
 
+    @_discard_sync_state_on_error
     def update_weights_from_shm(
         self,
         shm_name: str,
@@ -1120,12 +1159,13 @@ class WeightUpdaterMixin:
         finally:
             shm.close()
 
+    @_discard_sync_state_on_error
     def update_weights_from_ipc(
         self,
         ipc_handle,
         bucket_meta: dict,
         is_last: bool = True,
-        ipc_handles: Optional[dict] = None,
+        ipc_handles: dict | None = None,
     ) -> int:
         """Update model weights by reading tensor data from a CUDA IPC shared buffer.
 
@@ -1267,8 +1307,9 @@ class WeightUpdaterMixin:
             self._ipc_buffer = None
             try:
                 torch.cuda.ipc_collect()
-            except Exception:
-                pass  # ipc_collect may not be available on all platforms
+            except (AttributeError, RuntimeError) as e:
+                # ipc_collect may not be available on all platforms
+                logger.debug("torch.cuda.ipc_collect skipped: %s", e)
 
             self.clear_kv_cache()
             if hasattr(self, "_packed_weight_accum"):

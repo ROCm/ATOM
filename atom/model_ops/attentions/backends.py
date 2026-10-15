@@ -4,6 +4,7 @@
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
@@ -23,6 +24,7 @@ from atom.model_engine.page_unit_checkpoint import (
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attentions.pool_layout.paged_state_copy import DescriptorStaging
 from atom.model_ops.attentions.pool_layout.pool_rows import PoolRowsMixin
 from atom.model_ops.attentions.pool_layout.sub_pool_spec import SubPoolSpec
 from atom.model_ops.attentions.token_layout.batch_ids import (
@@ -164,8 +166,19 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return
 
+    def ubatch_forward(self, metadata):
+        """Keep parent resources alive until all microbatch work is enqueued."""
+        return nullcontext()
+
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
+
+    def step_needs_eager(self, batch: ScheduledBatch) -> bool:
+        """True when this backend cannot run `batch`'s decode from a captured
+        graph, whatever its width. Read before the step's metadata is built,
+        from the batch alone: every TP rank holds the same batch, so every
+        rank answers alike, and `ForwardMode.decide` agrees it across DP."""
+        return False
 
     def close(self):
         """Release backend-owned host workers and mapped resources."""
@@ -342,12 +355,65 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         self,
         store_ops: Sequence[CheckpointStoreOp],
         restore_ops: Sequence[CheckpointRestoreOp],
+        descriptor_slot: int = 0,
     ) -> None:
-        """Copy checkpoints between Active Slots and arbitrary PAGEs."""
+        """Copy checkpoints between Active Slots and arbitrary PAGEs.
+
+        Stateful backends use ``descriptor_slot`` to isolate concurrent copy
+        descriptors. The default implementation only handles the empty no-op
+        case, so it intentionally leaves that interface argument unused.
+        """
         if store_ops or restore_ops:
             raise NotImplementedError(
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
+
+    def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
+        """Allocate staging for out-of-band copy slots before serving.
+
+        Allocating pinned memory synchronizes, so a slot first touched by a
+        mid-serving restore would stall its thread. A connector that will pass
+        these slots to `execute_paged_state_copies` reserves them up front.
+        """
+        self._checkpoint_staging().reserve(descriptor_slots)
+
+    def _checkpoint_descriptor_device(self) -> torch.device:
+        """Device of the planes `execute_paged_state_copies` copies between."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement PAGE-backed state copy"
+        )
+
+    def _checkpoint_staging(self) -> DescriptorStaging:
+        """Pinned staging for a step's whole descriptor, sized for the worst step.
+
+        Pinned because the alternative synchronizes: a pageable H2D from
+        `build()` makes the host wait out the forward already enqueued, which
+        measured 2.9 ms behind 4 ms of work against 0.1 ms staged. Reused
+        because allocating pinned memory is itself a synchronizing call.
+
+        A step can carry at most one store and one restore per sequence, so two
+        per sequence bounds it. The caller checks that bound rather than growing
+        on demand: a descriptor that did not fit would otherwise be silently
+        truncated into a copy of the wrong shape.
+
+        The store half of that bound is not a property of the batch -- it is
+        held by `PagedStateCheckpointCoordinator._supersede`, which keeps one
+        pending boundary per sequence. A change that let two of a sequence's
+        boundaries drain together would raise from `build()` here, and would be
+        storing one of them from the wrong slot besides; the two constraints
+        have the same owner and move together.
+
+        Slot 0 serves `build()`; each other descriptor slot is a separate,
+        separately fenced buffer (see `DescriptorStaging`).
+        """
+        staging = getattr(self, "_checkpoint_staging_cache", None)
+        if staging is None:
+            plan = self._checkpoint_copy_plan()
+            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            staging = self._checkpoint_staging_cache = DescriptorStaging(
+                max_ops * plan.num_spans, self._checkpoint_descriptor_device()
+            )
+        return staging
 
     def warmup_per_req_cache(self) -> None:
         """Pay whatever the first checkpoint copy would pay, before serving.
@@ -535,15 +601,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         self.model_runner.forward_vars.update(attn_metadata)
         self.has_sliding_window = hasattr(hf_config, "sliding_window")
 
-    def _publish_indexer_fp4_decode_schedule(
-        self, attn_metadata, bs: int, next_n: int, ubatch: int = 0
+    def _publish_dcp_token_block_tables(
+        self, attn_metadata, running_bs: int, max_seqlen_q: int
     ) -> None:
-        """Nothing to refresh: this backend has no FP4 sparse indexer.
+        """Nothing to publish: this backend has no DCP sparse indexer.
 
         `EagleProposer` publishes on whatever builder the target uses, so every
         backend a draft can run against has to answer. Only the MLA one
-        overrides. Inert by contract, not just by accident -- the draft reuses
-        the target's metadata, so a write here would reach the verify step.
+        overrides.
         """
 
     def prepare_block_tables(self, batch: ScheduledBatch, running_bs=None):

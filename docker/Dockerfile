@@ -5,7 +5,7 @@ ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 # LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
 # LMCache section of atom_image.
-ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev98-g05fc77a0-rocm-torch210@sha256:d3cfe74f42d78a188992cae98efbe23053610216e7b247632d6be772e9d465d6"
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
@@ -174,7 +174,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.17"
+ARG SGLANG_REF="v0.5.20"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -225,7 +225,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; extras = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']; blocked = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar==', 'transformers'); seen = set(); out = []; walk = lambda names: [None for dep in names for key in [dep.strip()] if key and key not in seen and not seen.add(key) and (walk(extras[key[len('sglang['):-1]]) if key.startswith('sglang[') and key.endswith(']') else out.append(key))]; pkg = lambda dep: dep.split('[')[0].split('=')[0].split('<')[0].split('>')[0].split('!')[0].strip(); walk(extras['runtime_common']); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in out if pkg(dep) != 'numpy' and not any(dep.startswith(p) or pkg(dep) == p.split('=', 1)[0] for p in blocked)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -253,6 +253,18 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
       "z3-solver==4.15.4.0" && \
     rm -f /tmp/sglang-runtime-common.txt && \
+    TORCH_HIP="$("${VENV_PYTHON}" -c "import torch; print(torch.version.hip or '')")" && \
+    test -n "${TORCH_HIP}" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps "transformers==5.16.1" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      "huggingface-hub==1.5.0" \
+      "tokenizers==0.23.1" \
+      "safetensors>=0.8.0" \
+      "regex>=2025.10.22" \
+      "typer" \
+      "packaging>=20.0" \
+      "pyyaml>=5.1" \
+      "tqdm>=4.60" && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
@@ -280,7 +292,8 @@ RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" 
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
-    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer && \
+    "${VENV_PYTHON}" -c "import importlib.metadata as m; import torch; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch'; assert m.version('transformers') == '5.16.1', m.version('transformers'); assert m.version('tokenizers') == '0.23.1', m.version('tokenizers'); assert m.version('huggingface-hub') == '1.5.0', m.version('huggingface-hub'); cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type"
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
@@ -536,10 +549,12 @@ RUN pip install rocm-trace-lite && \
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
@@ -560,7 +575,7 @@ RUN echo "========== Install atomesh binary ==========" && \
 # follows from the wheel name; the ABI suffix and wheel tag are the workflow's
 # ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
 # image's torch.
-ARG LMCACHE_WHEEL_SHA256=a5fe8f3f5b9dee602ac7d11241f65a1640cd3d26c101f2d1d0e0d8aee88b7aab
+ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
 RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
     echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
     set -- /tmp/lmcache-wheel/*.whl && \

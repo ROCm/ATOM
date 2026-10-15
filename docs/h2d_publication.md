@@ -1,7 +1,8 @@
 # Packed metadata publication
 
-Set `ATOM_H2D_BACKEND=packed` before starting the runner to combine small
-metadata uploads. The default, `direct`, copies each member separately.
+By default (`ATOM_H2D_BACKEND=packed`) the runner combines small metadata
+uploads. Set `ATOM_H2D_BACKEND=direct` before starting it to copy each member
+separately.
 Packing is selected once for eligible groups; noncontiguous bindings use direct
 copies. A single active member also uses a direct copy to avoid an extra kernel.
 It neither borrows the packed arena nor releases an earlier packed read.

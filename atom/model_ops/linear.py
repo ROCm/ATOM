@@ -22,6 +22,7 @@ from aiter import (
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.quant import per_group_quant_hip
 from aiter.tuned_gemm import tgemm
 from aiter.utility import fp4_utils
 from torch import nn
@@ -63,6 +64,23 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
+def _require_mxfp4_preshuffle_triton() -> Callable:
+    global gemm_afp4wfp4_preshuffle
+
+    if gemm_afp4wfp4_preshuffle is None:
+        try:
+            from aiter.ops.triton.gemm_afp4wfp4 import (
+                gemm_afp4wfp4_preshuffle as preshuffle_gemm,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "The selected preshuffled MXFP4 backend requires "
+                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
+            ) from exc
+        gemm_afp4wfp4_preshuffle = preshuffle_gemm
+    return gemm_afp4wfp4_preshuffle
+
+
 if use_fp4_non_shuffle_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
@@ -75,9 +93,7 @@ else:
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import (
-            gemm_afp4wfp4_preshuffle,
-        )
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
@@ -105,6 +121,25 @@ else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
+
+
+def use_mxfp4_preshuffle_triton_gemm(
+    params_dtype: torch.dtype,
+    *,
+    arch: str | None = None,
+) -> bool:
+    """Select the consumer compatible with the stored MXFP4 preshuffle layout."""
+    if params_dtype != dtypes.fp4x2 or use_fp4_non_shuffle_triton_gemm():
+        return False
+    if arch is None:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+    return arch == "gfx1250" or (
+        use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None
+    )
+
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 
@@ -113,6 +148,44 @@ def divide(numerator, denominator):
         numerator % denominator == 0
     ), f"numerator {numerator} denominator {denominator}"
     return numerator // denominator
+
+
+def per_1x128_e8m0_quant_fake(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    transpose_scale: bool,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty(x.shape, dtype=quant_dtype, device=x.device),
+        torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 128),
+            dtype=dtypes.fp8_e8m0,
+            device=x.device,
+        ),
+    )
+
+
+# Per-1x128 activation quant with an E8M0 scale, as a functional op. aiter's
+# per_group_quant_hip allocates the scale as E8M0 and fills it through a
+# mutating op; Inductor declines to decompose an auto_functionalized_v2 that
+# touches E8M0 ("auto_functionalized_v2 was not removed"), so the mutation
+# must stay inside this op.
+@torch_compile_guard(gen_fake=per_1x128_e8m0_quant_fake, mutates_args=[])
+def per_1x128_e8m0_quant(
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    transpose_scale: bool,
+    scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return per_group_quant_hip(
+        x,
+        scale=scale,
+        quant_dtype=quant_dtype,
+        group_size=128,
+        transpose_scale=transpose_scale,
+        scale_type=dtypes.fp8_e8m0,
+    )
 
 
 def gemm_a4w4_quant_fake(
@@ -178,14 +251,9 @@ def gemm_a4w4_quant(
             otype,
             y,
         )
-    # Preshuffle FP4 Triton path: used when ATOM_USE_TRITON_GEMM is enabled
-    # and the non-shuffle path is disabled. This expects preshuffled weights.
-    elif (
-        params_dtype == dtypes.fp4x2
-        and use_triton_gemm()
-        and not use_fp4_non_shuffle_triton_gemm()
-        and gemm_afp4wfp4_preshuffle is not None
-    ):
+    # Consume ATOM's stored preshuffled weight/scale layout directly.
+    elif use_mxfp4_preshuffle_triton_gemm(params_dtype):
+        preshuffle_gemm = _require_mxfp4_preshuffle_triton()
         m, _ = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
@@ -216,7 +284,7 @@ def gemm_a4w4_quant(
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
 
-        y = gemm_afp4wfp4_preshuffle(
+        y = preshuffle_gemm(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
@@ -441,6 +509,7 @@ def weight_is_stored_preshuffled(
     params_dtype: torch.dtype,
     *,
     needs_preshuffled_weight: bool = False,
+    native_group_rows: int | None = None,
 ) -> bool:
     """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
 
@@ -455,6 +524,11 @@ def weight_is_stored_preshuffled(
     qkv_a_proj) needs the 16x16-shuffled weight even when the global
     preshuffle path is off, so it is shuffled once at load rather than per
     forward.
+
+    ``native_group_rows`` marks a native group32 weight, otherwise read as
+    checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
+    preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
+    and always under ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -473,6 +547,14 @@ def weight_is_stored_preshuffled(
     sync side from ``.value``; unifying on ``==`` would have taken the sync
     side backwards.
     """
+    if native_group_rows is not None:
+        if native_group_rows != 32 or params_dtype != dtypes.fp8:
+            return False
+        if needs_preshuffled_weight:
+            return True
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return envs.ATOM_GROUP32_WEIGHT_PRESHUFFLE and get_gfx() == "gfx950"
     quant_value = quant_type.value
     if quant_value == QuantType.per_Token.value:
         # The triton a8w8 per_Token GEMM consumes the unshuffled (N, K)
@@ -603,6 +685,12 @@ class LinearBase(nn.Module):
             self.register_parameter("bias", None)
         self.quant_type = quant_type
         self.params_dtype = params_dtype
+        # E8M0 rather than FP32 128x128 block scales, for the weight and the
+        # activation quantized for it alike (QuantizationConfig decides).
+        self.blockscale_e8m0_scale = (
+            quant_type.value == QuantType.per_1x128.value
+            and quant_config.blockscale_e8m0_scale
+        )
         self.native_a8_group_rows = None
         source_block = layer_quant_config.weight_block_size
         native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
@@ -701,9 +789,7 @@ class LinearBase(nn.Module):
                 )
             elif quant_type == QuantType.per_1x128:
                 scale_dtype = (
-                    dtypes.fp8_e8m0
-                    if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-                    else dtypes.fp32
+                    dtypes.fp8_e8m0 if self.blockscale_e8m0_scale else dtypes.fp32
                 )
                 self.weight_scale = atom_parameter(
                     torch.empty(
@@ -1088,9 +1174,18 @@ class LinearBase(nn.Module):
         shuffled and its N left unpadded, with the RuntimeError that exists to
         catch exactly that skipped along with the padding.
         """
-        # The native group32 kernel consumes checkpoint bytes and compact
-        # scales, so there is no layout to settle.
+        # A native group32 weight keeps its compact scales, and its bytes too
+        # unless it is one the preshuffled group32 GEMM reads.
         if self.native_a8_group_rows is not None:
+            if self.weight.numel() and weight_is_stored_preshuffled(
+                self.quant_type,
+                self.params_dtype,
+                needs_preshuffled_weight=getattr(
+                    self, "needs_preshuffled_weight", False
+                ),
+                native_group_rows=self.native_a8_group_rows,
+            ):
+                shuffle_weights(self.weight)
             return
         if self.weight.numel() == 0:
             return
@@ -1285,6 +1380,7 @@ class LinearBase(nn.Module):
                 self.weight_scale,
                 x_scale=x_scale,
                 weight_group_rows=self.native_a8_group_rows,
+                weight_preshuffled=getattr(self.weight, "is_shuffled", False),
                 dtype=otype,
             )
             if self.bias is not None:
@@ -1303,13 +1399,12 @@ class LinearBase(nn.Module):
                     # preshuffle GEMM expects column-major x_scale;
                     # non-preshuffle GEMM expects row-major x_scale
                     quant_func = functools_partial(
-                        self.quant_func,
-                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
-                        **(
-                            {"scale_type": dtypes.fp8_e8m0}
-                            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-                            else {}
+                        (
+                            per_1x128_e8m0_quant
+                            if self.blockscale_e8m0_scale
+                            else self.quant_func
                         ),
+                        transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
                     x, x_scale = quant_func(

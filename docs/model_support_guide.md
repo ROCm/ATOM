@@ -44,7 +44,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
 | `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
-| `DeepseekV41ForCausalLM` | `atom.models.deepseek_v41` | `DeepseekV41ForCausalLM` | Yes | Yes | CSA2 topology, Single-Pass mHC, Engram n-gram memory, FP8 index plane with a paged scorer, native W4A8/FP4 weights, vision tower, native DSpark speculation |
+| `DeepseekV41ForCausalLM` | `atom.models.deepseek_v41` | `DeepseekV41ForCausalLM` | Yes | Yes | CSA2 topology, Single-Pass mHC, Engram n-gram memory, FP8 or FP4 index plane with a paged scorer, native W4A8/FP4 weights, vision tower, native DSpark speculation |
 
 **Note:** `DeepSeekMTP` (`atom.models.deepseek_mtp.DeepSeekMTP`), `Qwen3NextMTP` (`atom.models.qwen3_next_mtp.Qwen3NextMTP`), and `Qwen3_5MTP` (`atom.models.qwen3_5_mtp.Qwen3_5MTP`) are not in the registry — they are used exclusively as speculative draft models and are loaded separately via `EagleProposer`.
 
@@ -160,7 +160,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 ### DeepSeek-V4.1 (`DeepseekV41ForCausalLM`)
 
 - **Architecture:** Its own package, `atom/models/deepseek_v41/`, rather than a reshape of V4 — CSA2 attention topology with compressor/indexer ownership per layer, single-pass mHC, Engram n-gram memory and an optional vision tower. The V4 BF16 sparse attention and inverse RoPE kernels are reused unmodified.
-- **Cache:** A paged main KV plane plus an FP8 index plane; `index_cache_dtype="fp8"` is the only index format, and the runtime refuses any other before loading weights. Main storage takes `bf16` or a packed `fp4` layout. Geometry is declared in `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py` with no model or scheduler imports.
+- **Cache:** A paged main KV plane plus an index plane: `index_cache_dtype="fp8"` (default), or `"fp4"` -- the official E2M1 + E8M0 arithmetic in `flydsl_pa_mqa_logits_fp4_rowgroup`'s page-8 layout, values and scales in two planes (`atom/model_ops/deepseek_v41/index_plane.py`), written by aiter's fused `k_norm_rope_mxfp4_cache`. The runtime refuses any other format before loading weights. Main storage takes `bf16` or a packed `fp4` layout. Geometry is declared in `atom/model_ops/attentions/pool_layout/v41_pool_geometry.py` with no model or scheduler imports.
 - **MoE:** V4's `FusedMoE`, subclassed only to flatten the offline caller's batch dimension and declare `bias_vl`. There is no second expert backend.
 - **Graphs:** `CUDAGraphMode.FULL` captures the whole decode forward, one graph per `(batch size, query bucket)`; `PIECEWISE` records the dense pieces with attention eager between them. `torch.compile` is not supported.
 - **Speculation:** Native DSpark proposes five tokens from the checkpoint's three draft stages. Implemented and tested, with quality acceptance still open — see [the DSpark guide](deepseek_v41_dspark.md).

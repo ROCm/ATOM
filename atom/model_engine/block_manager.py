@@ -131,6 +131,8 @@ class BlockManager:
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
+        self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
+        self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
         # Content hashes only: pool hits and resource fit are always rechecked.
         # Weak keys keep this scheduler-side cache out of request serialization.
@@ -637,6 +639,48 @@ class BlockManager:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
 
+    def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
+        """`hit` widened to `compressed_hit` when replaying is cheaper.
+
+        Without a replay the forward resumes at the checkpoint `hit`, or at the
+        LMCache MP hit (`kv_prefix_tokens`) if that is further, which brings its
+        state image along. A replay resumes `state_replay_tokens` below the
+        furthest full-attention KV: the HBM `compressed_hit`, or LMCache's
+        KV-only reach (`kv_only_tokens`) when that is further, in which case
+        the connector loads the KV past the HBM hit first (`replay_kv_load`).
+        Records on `seq` whether the hit it returns replays (`replay_start`).
+        """
+        hbs = self.hash_block_size
+        seq.replays_hit = seq.replay_kv_load = False
+        if not self.state_replay_tokens or not seq.has_per_req_cache:
+            return hit
+        # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
+        # LMCache figure counts unless it clears that above where it starts.
+        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        resume = hit * hbs
+        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if tier_hit - resume >= min_load:
+            resume = tier_hit
+        in_hbm = compressed_hit * hbs
+        end = in_hbm
+        tier_kv = int(seq.offload_joint.kv_only_tokens or 0)
+        if tier_kv - in_hbm >= min_load:
+            end = tier_kv
+        if end - resume <= self.state_replay_tokens:
+            return hit
+        seq.replays_hit = True
+        seq.replay_kv_load = end > in_hbm
+        return compressed_hit
+
+    def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
+        """A replay's KV-only load will not run: replay below the HBM hit.
+
+        The state slot is fresh (`allocate` restored no checkpoint), so the HBM
+        hit is no place to resume; the forward replays below it instead, and
+        rewrites the blocks past it the load would have filled.
+        """
+        seq.replay_kv_load = False
+
     def _gated_hit(
         self,
         seq: Sequence,
@@ -867,6 +911,13 @@ class BlockManager:
             chain.append(h)
         return chain
 
+    def prefix_hash_chain(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, for callers outside
+        the manager. Seeded from `seq.cache_seed` like every chain it mints."""
+        return self._chain_to(seq, block_hashes, blocks)
+
     def can_allocate(
         self,
         seq: Sequence,
@@ -878,9 +929,10 @@ class BlockManager:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
         `record=False` returns the same fit and HBM hit without committing
-        joint-load fields or joint-boundary counters. Checkpoint demand/end
-        and hit instrumentation still refresh; demand counters deduplicate per
-        request. An optional `block_hashes` output
+        joint-load fields or joint-boundary counters. Checkpoint demand/end,
+        hit instrumentation and `Sequence.replays_hit` (whether the hit it
+        returns replays, which `replay_start` reads for it) still refresh;
+        demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
 
@@ -947,7 +999,10 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A checkpoint far below the compressed hit loses to a bounded replay,
+        # which keeps the whole hit and rebuilds the state at its end.
+        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
@@ -964,9 +1019,12 @@ class BlockManager:
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
+        #
+        # `resumable`, not the replayed hit: the counterfactual is asked of the
+        # gates, whose answer a replay does not change.
         self._record_checkpoint_demand(
             seq,
-            hit=num_cached_blocks,
+            hit=resumable,
             compressed_hit=compressed_hit,
             block_hashes=block_hashes,
             live_blocks=num_new_blocks,
@@ -1031,6 +1089,7 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
+        requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
@@ -1080,6 +1139,13 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
+        if self.state_replay_tokens and seq.replays_hit:
+            # A replay starts from a fresh state slot, never a checkpoint: it
+            # rebuilds the state below whatever the claim above reached.
+            hit_hash = -1
+            if num_cached_blocks < requested_blocks:
+                # A KV-only load past the hit would start above a gap.
+                seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1160,6 +1226,27 @@ class BlockManager:
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
         return True
+
+    def replay_start(self, seq: Sequence, start: int, *, hit: bool) -> int:
+        """Where a prefill resuming at `start` begins, early enough to rebuild
+        what its forward reads below `start`: under a `replay` state transfer
+        and at a `hit`, the state (one hash block); and in a forward finishing
+        the prompt, `min_final_prefill_rows` rows before its end (decoder
+        bounded replay), on the hash-block grid. `start` itself everywhere
+        else. And at a hit `can_allocate` admitted with no checkpoint behind
+        its state (`_replay_hit`, DeepSeek-V4), the state's receptive field,
+        `state_replay_tokens`."""
+        if not (seq.has_per_req_cache and start):
+            return start
+        hbs = self.hash_block_size
+        if hit and self.state.transfer.replays:
+            start -= hbs
+        elif hit and self.state_replay_tokens and seq.replays_hit:
+            start -= self.state_replay_tokens
+        short = self.min_final_prefill_rows - (seq.num_tokens - start)
+        if short > 0:
+            start = (start - short) // hbs * hbs
+        return max(0, start)
 
     def _state_leg_secured(self, seq: Sequence) -> bool:
         """Whether something will really put state behind this seq's boundary.
@@ -1249,6 +1336,10 @@ class BlockManager:
             self.state_gate_lost_boundary += 1
             return False
 
+        if self.state.transfer.replays:
+            # Nothing to resume or load: a fresh slot, as for a cold start; the
+            # forward rebuilds the state (`replay_start`).
+            hit_hash = -1
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             wants_load = self._tier_can_serve(hit_hash)
@@ -1601,6 +1692,7 @@ class BlockManager:
         start_tokens: int | None = None,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        replay_until: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -1619,17 +1711,30 @@ class BlockManager:
 
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
+
+        `replay_until`: where the forward resumed if it started below that
+        point, as the batch was scheduled (`ScheduledBatch.replaying`). Nothing
+        below it is published or checkpointed: those blocks are the hit's, and
+        a forward ending below it leaves a replay's state still inexact. One
+        ending right at it publishes nothing either, but a DeepSeek-V4 bounded
+        replay has rebuilt the state whole there, so that may be checkpointed.
+        Left unset it reads `seq.replay_until`, which under pipeline
+        parallelism a later chunk's scheduling may already have moved.
         """
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
-        start = base // hbs
+        # A replaying forward's rows below where it resumed are published.
+        until = seq.replay_until if replay_until is None else replay_until
+        start = max(base, until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
         end = min(end, len(seq.block_table))
-        if start >= end:
+        if start >= end and not (
+            seq.replays_hit and until and base + num_new_tokens == until
+        ):
             return
         h = self._chain_parent_hash(seq, start)
         if h is None:
@@ -1837,6 +1942,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -1912,6 +2025,10 @@ class BlockManager:
         )
         if isinf(room):
             return
+        # A forward resuming there and finishing the prompt with fewer rows
+        # than the model's final forward runs would back off below it
+        # (`replay_start`), recomputing what the checkpoint saves.
+        room = max(room, self.min_final_prefill_rows)
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the
@@ -2499,7 +2616,11 @@ class BlockManager:
         return num_full - start
 
     def deallocate_partial(
-        self, seq: Sequence, protected_block_ids: frozenset[int]
+        self,
+        seq: Sequence,
+        protected_block_ids: frozenset[int],
+        *,
+        per_request_state_safe: bool = False,
     ) -> None:
         """Deallocate `seq` now, except block IDs a pending offload save reads.
 
@@ -2517,20 +2638,15 @@ class BlockManager:
         request is deallocated normally. This makes ownership explicit: shared
         prefix blocks retain their other owners, while the save owns exactly
         one refcount share until ``free_leased_blocks`` releases it.
+
+        Per-request recurrent state is fail-closed: its active slots may be
+        released here only when the connector explicitly confirms that every
+        state source needed after request teardown has an independent lease.
         """
-        if seq.has_per_req_cache:
-            # Per-request recurrent state (GDN/hybrid checkpoints) has release
-            # ordering this simplified path never replicates (orphan load
-            # slots, `state_offload.abandon_load`, fork-source pins -- see
-            # `deallocate` below). Not reachable today: every offload connector
-            # that can drive early release sets `_permit_per_request_state =
-            # False` and rejects such a model at `register_kv_caches`. Kept as
-            # an explicit guard rather than a silent skip, so a future
-            # hybrid connector that both permits per-request state and enables
-            # early release fails loudly here instead of freeing a leased PAGE
-            # or leaking a state slot.
+        if seq.has_per_req_cache and not per_request_state_safe:
             raise RuntimeError(
-                "partial PAGE deallocation is unsupported for per-request state"
+                "partial PAGE deallocation is unsupported for per-request "
+                "state without an explicit connector safety capability"
             )
         table = set(seq.block_table)
         unknown = set(protected_block_ids) - table
@@ -2541,6 +2657,57 @@ class BlockManager:
         for block_id in protected_block_ids:
             self.kv.claim(block_id)
         self.deallocate(seq)
+
+    def acquire_offload_prefix(
+        self,
+        seq: Sequence,
+        start_tokens: int,
+        end_tokens: int,
+    ) -> tuple[list[int], int, tuple[int, ...]]:
+        """Claim the still-resident contiguous prefix used by a late save.
+
+        A finished request no longer owns its old physical block table. Each
+        block is therefore resolved again through the content hash index and
+        token-checked before it is claimed. The scan stops at the first gap so
+        the returned range can never describe a cache object with a hole.
+        """
+        hbs = self._hash_block_size()
+        if (
+            start_tokens < 0
+            or end_tokens < start_tokens
+            or start_tokens % hbs
+            or end_tokens % hbs
+        ):
+            raise ValueError(
+                f"offload source range [{start_tokens}, {end_tokens}) must "
+                f"align to hash block size {hbs}"
+            )
+        end_block = end_tokens // hbs
+        start_block = start_tokens // hbs
+        block_ids = [-1] * end_block
+        claimed: list[int] = []
+        parent_hash = seq.cache_seed
+        available_end = start_tokens
+        for index in range(end_block):
+            token_ids = self._hash_block_tokens(seq, index)
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            parent_hash = block_hash
+            if index < start_block:
+                continue
+            block_id = self.kv.lookup(block_hash)
+            if block_id < 0:
+                break
+            block = self.kv.block(block_id)
+            if block.hash != block_hash or block.token_ids != token_ids:
+                break
+            self.kv.claim(block_id)
+            claimed.append(block_id)
+            block_ids[index] = block_id
+            available_end = (index + 1) * hbs
+        # The caller may have to trim a partial LMCache chunk from the tail.
+        # Preserve token order until that trim is complete; a set is suitable
+        # only after the exact ordered prefix has been selected.
+        return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
         """Return block IDs a `deallocate_partial` lease held back, to the pool.
@@ -2563,6 +2730,8 @@ class BlockManager:
         # The block table is gone, so nothing of this seq is hashed any more.
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
+        seq.replay = None
+        seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+import inspect
 
 import aiter
 import torch
@@ -178,6 +180,7 @@ def _aiter_rms_quant_fake(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter.utility.dtypes import fp8
 
@@ -200,16 +203,13 @@ def _aiter_rms_quant_fake(
             (scale_m, scale_n), dtype=torch.float8_e8m0fnu, device=x.device
         )
     elif quant_type_value == _QV_PER_1X128:
-        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32. Preshuffle GEMM expects
+        # FP8 per-block: scale=(M, ⌈N/128⌉) fp32, or E8M0 when the consuming
+        # linear's weight scales are (`e8m0_scale`). Preshuffle GEMM expects
         # column-major; allocate (num_groups, M) row-major then view as
         # (M, num_groups). Matches GemmaRMSNorm._forward_fused_fp8.
         out = torch.empty((M, N), dtype=fp8, device=x.device)
         num_groups = N // 128
-        scale_dtype = (
-            torch.float8_e8m0fnu
-            if envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
-            else torch.float32
-        )
+        scale_dtype = torch.float8_e8m0fnu if e8m0_scale else torch.float32
         if transpose_scale:
             scale = torch.empty(
                 (num_groups, M), dtype=scale_dtype, device=x.device
@@ -232,11 +232,12 @@ def _aiter_rms_quant(
     transpose_scale: bool,
     res1: torch.Tensor | None = None,
     value_dtype: torch.dtype | None = None,
+    e8m0_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from aiter import add_rmsnorm_quant, rmsnorm_quant
 
     out, scale, out_res1 = _aiter_rms_quant_fake(
-        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype
+        x, weight, eps, quant_type_value, transpose_scale, res1, value_dtype, e8m0_scale
     )
     if _is_mxfp8(quant_type_value, value_dtype):
         # The FP8 width is carried by `out`'s dtype and the UE8M0 format by
@@ -304,6 +305,10 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
+        # per_1x128 scale dtype, matching the consuming linear's weight scales.
+        self._aiter_e8m0_scale = (
+            quant_type.value == _QV_PER_1X128 and quant_config.blockscale_e8m0_scale
+        )
 
     def process_weights_after_loading(self):
         """Post-load hook invoked by the model loader for every module.
@@ -357,6 +362,10 @@ class RMSNorm(nn.Module):
         self._aiter_transpose_scale = (
             self.quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        self._aiter_e8m0_scale = (
+            self.quant_type.value == _QV_PER_1X128
+            and self.quant_config.blockscale_e8m0_scale
         )
         # Surfaced by the loader's online-quant report alongside Linear layers.
         self._online_quant_info = {
@@ -506,6 +515,7 @@ class RMSNorm(nn.Module):
                         else residual
                     ),
                     self.params_dtype,
+                    self._aiter_e8m0_scale,
                 )
                 if batched:
                     x = x.view(*lead, -1)
@@ -568,6 +578,21 @@ class RMSNormGated(nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate
+        # The gate activation, as a name, for callers that introspect the
+        # module instead of the math. vLLM 0.31's Qwen GDN Triton warmup
+        # (model_executor/warmup/qwen_triton_warmup.py) reads
+        # `layer.norm.activation` to build its kernel config; 0.29 hard-coded
+        # "silu" there instead, so ATOM's module never needed to say so and
+        # 0.31 raised AttributeError during compile_or_warm_up_model, taking
+        # down every TP rank of the Qwen3.5-397B cell.
+        #
+        # "silu" is a statement of fact about this class, not a value chosen to
+        # silence the warmup: both forward paths apply silu to the gate
+        # unconditionally (`out = norm(x) * silu(z)` when norm_before_gate,
+        # else `norm(x * silu(z))`), and there is no setting that changes it.
+        # It is also exactly what 0.29 assumed, so the warmup compiles the same
+        # kernel config it did before.
+        self.activation = "silu"
         self.reset_parameters()
 
         # Determine if we should use fused FP8 group quantization
@@ -724,6 +749,21 @@ class RMSNormGated(nn.Module):
         return self.forward_native(x, z)
 
 
+@functools.lru_cache(maxsize=1)
+def fused_ar_gemma_per_group_supported() -> bool:
+    """Whether aiter's fused AR + RMSNorm + per-group FP8 quant takes `gemma_norm`.
+
+    Older aiter accepts `gemma_norm` on the public
+    `tensor_model_parallel_fused_allreduce_rmsnorm_quant` but drops it on the
+    per-group branch and returns a plain `x * w` norm with no error, so support
+    is read off the group method that has to forward it.
+    """
+    from aiter.dist.parallel_state import GroupCoordinator
+
+    method = GroupCoordinator.fused_allreduce_rmsnorm_quant_per_group
+    return "gemma_norm" in inspect.signature(method).parameters
+
+
 class GemmaRMSNorm(nn.Module):
     """RMS normalization for Gemma.
 
@@ -738,6 +778,7 @@ class GemmaRMSNorm(nn.Module):
         eps: float = 1e-6,
         quant_config: LayerQuantConfig | None = None,
         write_bf16: bool = False,
+        fused_allreduce: bool = False,
     ) -> None:
         super().__init__()
         self.weight = atom_parameter(torch.zeros(hidden_size))
@@ -749,6 +790,21 @@ class GemmaRMSNorm(nn.Module):
 
             if quant_config.quant_type == QuantType.per_1x128:
                 self.use_fused_quant = True
+        # Fold the TP all-reduce of the input (the un-reduced output of the
+        # previous row-parallel layer) into this norm.
+        self.fused_allreduce = (
+            fused_allreduce and get_tensor_model_parallel_world_size() > 1
+        )
+        if (
+            self.fused_allreduce
+            and self.use_fused_quant
+            and not fused_ar_gemma_per_group_supported()
+        ):
+            raise ValueError(
+                "GemmaRMSNorm(fused_allreduce=True) with per-group FP8 quant needs "
+                "an aiter whose fused AR + RMSNorm + per-group quant takes "
+                "gemma_norm; this one would silently normalize with x * w"
+            )
 
     @staticmethod
     def forward_static(
@@ -866,11 +922,41 @@ class GemmaRMSNorm(nn.Module):
             return out_fp8, out_scale, out_bf16, res_out
         return out_fp8, out_scale, out_bf16
 
+    def _forward_fused_allreduce(self, x, residual):
+        # Same return contracts as _forward_fused_fp8 / forward_cuda. The kernel
+        # reads the raw weight and applies (1 + w) itself (gemma_norm), so an
+        # in-place weight update (rollout sync) is seen on the next call.
+        if self.use_fused_quant:
+            outs = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                x.contiguous(),
+                residual,
+                self.weight,
+                self.variance_epsilon,
+                quant_type="per_group",
+                group_size=128,
+                emit_bf16=self.write_bf16,
+                transpose_scale=envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE,
+                gemma_norm=True,
+            )
+            out_fp8, res_out, out_scale = outs[:3]
+            out_bf16 = outs[3] if self.write_bf16 else None
+            return out_fp8, out_scale, out_bf16, res_out
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            x.contiguous(),
+            residual,
+            self.weight,
+            self.variance_epsilon,
+            gemma_norm=True,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.fused_allreduce:
+            assert residual is not None, "fused all-reduce norm needs a residual"
+            return self._forward_fused_allreduce(x, residual)
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)

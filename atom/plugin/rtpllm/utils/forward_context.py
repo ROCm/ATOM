@@ -83,6 +83,39 @@ class AiterFlashAttentionMetadataForPluginMode:
 if triton is not None:
 
     @triton.jit
+    def _previous_state_slots_graph_kernel(
+        block_table,
+        positions,
+        query_lengths,
+        output_slots,
+        input_slots,
+        rows,
+        table_stride_row,
+        table_stride_col,
+        table_cols: tl.constexpr,
+        block_size: tl.constexpr,
+        tile: tl.constexpr,
+        has_query_lengths: tl.constexpr,
+        unit_query_length: tl.constexpr,
+    ):
+        row = tl.program_id(0) * tile + tl.arange(0, tile)
+        live = row < rows
+        position = tl.load(positions + row, live, -1)
+        if has_query_lengths:
+            position -= tl.load(query_lengths + row, live, 0)
+        elif unit_query_length:
+            position -= 1
+        output_slot = tl.load(output_slots + row, live, -1)
+        column = tl.minimum(tl.maximum(position - 1, 0) // block_size, table_cols - 1)
+        previous = tl.load(
+            block_table + row * table_stride_row + column * table_stride_col,
+            live & (position > 0),
+            -1,
+        )
+        input_slot = tl.where(position > 0, previous, output_slot)
+        tl.store(input_slots + row, tl.where(position >= 0, input_slot, -1), live)
+
+    @triton.jit
     def _expand_block_table_for_atom_indexer_kernel(
         block_table,
         output,
@@ -106,18 +139,24 @@ if triton is not None:
         kernel_cols: tl.constexpr,
         physical_cols: tl.constexpr,
         block_ratio: tl.constexpr,
+        kernel_row_stride: tl.constexpr,
+        kernel_col_stride: tl.constexpr,
+        output_row_stride: tl.constexpr,
+        output_col_stride: tl.constexpr,
     ):
         row = tl.program_id(0)
         col = tl.program_id(1)
         kernel_col = col * block_ratio
         value = tl.load(
-            kernel_block_table + row * kernel_cols + kernel_col,
+            kernel_block_table
+            + row * kernel_row_stride
+            + kernel_col * kernel_col_stride,
             mask=kernel_col < kernel_cols,
             other=-1,
         )
         physical = value // block_ratio
         physical = tl.where(value >= 0, physical, -1)
-        tl.store(output + row * physical_cols + col, physical)
+        tl.store(output + row * output_row_stride + col * output_col_stride, physical)
 
 
 @dataclass(frozen=True)
@@ -427,6 +466,10 @@ class RTPForwardContext:
                 kernel_cols,
                 physical_cols,
                 block_ratio,
+                kernel_block_table.stride(0),
+                kernel_block_table.stride(1),
+                out_view.stride(0),
+                out_view.stride(1),
             )
             return out_view
 
@@ -513,6 +556,7 @@ class RTPForwardContext:
         num_tokens: int,
         state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
         layer_group_map: dict[int, int] | None = None,
+        cg_bufs: dict | None = None,
     ) -> GDNAttentionMetadata:
         block_table = getattr(attn_inputs, "kv_cache_kernel_block_id_device", None)
         if block_table is None or block_table.numel() == 0:
@@ -521,9 +565,22 @@ class RTPForwardContext:
             )
         target_device = block_table.device
         is_prefill = bool(getattr(attn_inputs, "is_prefill", False))
-        query_start_loc = RTPForwardContext._query_start_loc(
-            attn_inputs, device=target_device
-        )
+        if (
+            not is_prefill
+            and torch.cuda.is_current_stream_capturing()
+            and cg_bufs is not None
+            and "query_start_loc" in cg_bufs
+        ):
+            # Graph decode captures one token per request. Host sequence lengths
+            # are fixed at capture time, while device lengths change on replay.
+            batch_size = int(attn_inputs.input_lengths.numel())
+            if num_tokens != batch_size:
+                raise ValueError("GDN Graph decode requires one token per request")
+            query_start_loc = cg_bufs["query_start_loc"][: batch_size + 1]
+        else:
+            query_start_loc = RTPForwardContext._query_start_loc(
+                attn_inputs, device=target_device
+            )
         state_indices = RTPForwardContext._state_indices(
             attn_inputs=attn_inputs,
             is_prefill=is_prefill,
@@ -1606,6 +1663,7 @@ class RTPForwardContext:
                 num_tokens=int(positions.numel()),
                 state_indices_cache=state_indices_cache,
                 layer_group_map=layer_group_map,
+                cg_bufs=cg_bufs,
             )
             # Keep raw RTP attention inputs in metadata so GDN can resolve per-layer
             # block-map/state-index semantics (same idea as RTP's select_block_map_for_layer).
@@ -1881,6 +1939,142 @@ class RTPForwardMLAContext(RTPForwardContext):
 
 @dataclass(frozen=True)
 class RTPForwardQwen35HybridContext(RTPForwardContext):
+    @staticmethod
+    def _previous_state_slots(
+        block_table: torch.Tensor,
+        positions: torch.Tensor,
+        output_slots: torch.Tensor,
+        block_size: int,
+        graph_output: torch.Tensor | None = None,
+        query_lengths: torch.Tensor | None = None,
+        unit_query_length: bool = False,
+    ) -> torch.Tensor:
+        """Read the state before the first new token, write the final block."""
+        if block_size <= 0 or block_table.ndim != 2 or block_table.shape[1] == 0:
+            raise ValueError(
+                "GDN requires a nonempty two-dimensional state block table"
+            )
+        positions = positions.reshape(-1)
+        if (
+            positions.numel() != output_slots.numel()
+            or block_table.shape[0] != positions.numel()
+        ):
+            raise ValueError(
+                "GDN requires one starting position and output state per request"
+            )
+        if graph_output is not None:
+            if (
+                graph_output.shape != output_slots.shape
+                or graph_output.dtype != torch.int32
+            ):
+                raise ValueError("GDN Graph previous-state buffer has wrong shape")
+            _previous_state_slots_graph_kernel[(triton.cdiv(positions.numel(), 128),)](
+                block_table,
+                positions,
+                query_lengths,
+                output_slots,
+                graph_output,
+                positions.numel(),
+                block_table.stride(0),
+                block_table.stride(1),
+                block_table.shape[1],
+                block_size,
+                128,
+                query_lengths is not None,
+                unit_query_length,
+            )
+            return graph_output
+        positions = positions.to(torch.int64)
+        if query_lengths is not None:
+            positions = positions - query_lengths
+        elif unit_query_length:
+            positions = positions - 1
+        previous_columns = torch.div(
+            torch.clamp(positions - 1, min=0), block_size, rounding_mode="floor"
+        )
+        rows = torch.arange(output_slots.numel(), device=block_table.device)
+        previous_slots = block_table[
+            rows, previous_columns.clamp(max=block_table.shape[1] - 1)
+        ]
+        invalid = (positions > 0) & (
+            (previous_columns >= block_table.shape[1]) | (previous_slots < 0)
+        )
+        if bool(torch.any(invalid)):
+            raise ValueError("GDN previous state block is invalid or out of range")
+        return torch.where(positions > 0, previous_slots, output_slots).to(torch.int32)
+
+    @classmethod
+    def _build_gdn_metadata(
+        cls,
+        attn_inputs: Any,
+        *,
+        seq_size_per_block: int,
+        num_tokens: int,
+        state_indices_cache: dict[tuple[int, bool], torch.Tensor] | None = None,
+        layer_group_map: dict[int, int] | None = None,
+        cg_bufs: dict | None = None,
+    ) -> GDNAttentionMetadata:
+        metadata = super()._build_gdn_metadata(
+            attn_inputs,
+            seq_size_per_block=seq_size_per_block,
+            num_tokens=num_tokens,
+            state_indices_cache=state_indices_cache,
+            layer_group_map=layer_group_map,
+            cg_bufs=cg_bufs,
+        )
+        output_slots = metadata.non_spec_state_indices_tensor
+        device = output_slots.device
+        next_lengths = None
+        query_lengths = None
+        unit_query_length = False
+        if bool(getattr(attn_inputs, "is_prefill", False)):
+            positions = cls._non_empty_int32(
+                getattr(attn_inputs, "prefix_lengths_device", None), device=device
+            )
+            if positions is None:
+                positions = cls._non_empty_int32(
+                    getattr(attn_inputs, "prefix_lengths", None), device=device
+                )
+        else:
+            next_lengths = cls._non_empty_int32(
+                getattr(attn_inputs, "sequence_lengths_plus_1_device", None),
+                device=device,
+            )
+            if next_lengths is not None:
+                positions = next_lengths
+                batch_size = int(output_slots.numel())
+                if num_tokens == batch_size:
+                    unit_query_length = True
+                else:
+                    query_start_loc = metadata.non_spec_query_start_loc
+                    query_lengths = (
+                        query_start_loc[1:] - query_start_loc[:-1]
+                    ).contiguous()
+            else:
+                positions = cls._non_empty_int32(
+                    getattr(attn_inputs, "sequence_lengths", None), device=device
+                )
+        if positions is None:
+            raise ValueError(
+                "GDN requires per-request prefix or decode starting lengths"
+            )
+        graph_output = None
+        if torch.cuda.is_current_stream_capturing():
+            if cg_bufs is None or "previous_state_slots_i32" not in cg_bufs:
+                raise RuntimeError("GDN Graph requires prewarmed previous-state slots")
+            graph_output = cg_bufs["previous_state_slots_i32"][: output_slots.numel()]
+        block_table = cls._select_block_table_for_layer(attn_inputs=attn_inputs)
+        metadata.non_spec_state_indices_in_tensor = cls._previous_state_slots(
+            block_table,
+            positions,
+            output_slots,
+            seq_size_per_block,
+            graph_output,
+            query_lengths,
+            unit_query_length,
+        )
+        return metadata
+
     @staticmethod
     def _build_seq_lens(attn_inputs: Any, *, device: torch.device) -> torch.Tensor:
         """Qwen3.5 decode-cudagraph compatible seq_lens priority."""

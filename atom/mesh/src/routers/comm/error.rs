@@ -6,7 +6,7 @@ use axum::{
 use serde::Serialize;
 
 #[derive(Serialize)]
-struct ErrorResponse<'a> {
+pub struct ErrorResponse<'a> {
     error: ErrorDetail<'a>,
 }
 
@@ -16,6 +16,16 @@ struct ErrorDetail<'a> {
     error_type: &'static str,
     code: &'a str,
     message: &'a str,
+}
+
+pub fn payload<'a>(status: StatusCode, code: &'a str, message: &'a str) -> ErrorResponse<'a> {
+    ErrorResponse {
+        error: ErrorDetail {
+            error_type: status_code_to_str(status),
+            code,
+            message,
+        },
+    }
 }
 
 pub const HEADER_X_MESH_ERROR_CODE: &str = "X-Mesh-Error-Code";
@@ -69,13 +79,7 @@ pub fn create_error(
     (
         status,
         headers,
-        Json(ErrorResponse {
-            error: ErrorDetail {
-                error_type: status_code_to_str(status),
-                code: &code_str,
-                message: &message_str,
-            },
-        }),
+        Json(payload(status, &code_str, &message_str)),
     )
         .into_response()
 }

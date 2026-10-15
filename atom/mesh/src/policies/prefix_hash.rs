@@ -223,6 +223,9 @@ impl PrefixHashPolicy {
 
 #[async_trait::async_trait]
 impl LoadBalancingPolicy for PrefixHashPolicy {
+    fn needs_tokens(&self) -> bool {
+        true
+    }
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],

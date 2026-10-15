@@ -267,6 +267,40 @@ def _save_operation_meta(*operations):
     return meta
 
 
+def test_partial_state_deallocation_requires_an_explicit_capable_subconnector():
+    seq = SimpleNamespace(has_per_req_cache=True)
+    unsupported = SimpleNamespace(should_defer_free=lambda _seq: True)
+    declined = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: False,
+    )
+    inactive_capable = SimpleNamespace(
+        should_defer_free=lambda _seq: False,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+    capable = SimpleNamespace(
+        should_defer_free=lambda _seq: True,
+        can_partially_deallocate_state=lambda _seq: True,
+    )
+
+    inactive_unsupported = SimpleNamespace(should_defer_free=lambda _seq: False)
+
+    def allowed(*subs):
+        return _sched(list(subs)).can_partially_deallocate_state(seq)
+
+    assert allowed(unsupported, declined) is False
+    assert allowed(unsupported, inactive_capable) is False
+    # A deferring sub without the guarantee still needs the request alive, even
+    # though another deferring sub declares its own state safe (all, not any).
+    assert allowed(unsupported, capable) is False
+    assert allowed(capable, declined) is False
+    # Subs that no longer defer do not veto.
+    assert allowed(inactive_unsupported, capable) is True
+    assert allowed(capable, capable) is True
+    # Nothing deferring is not a guarantee either.
+    assert allowed(inactive_unsupported, inactive_capable) is False
+
+
 # ---------------------------------------------------------------------------
 # Scheduler-side
 # ---------------------------------------------------------------------------
@@ -440,7 +474,7 @@ def test_process_completions_refuses_two_offload_subs():
     # destructive over the FULL sets it is handed -- it cannot partition. There
     # is no shared key by which the composite could split the completions per
     # sub, so one sub would retire the other's saves and clear its channels.
-    # That composite is refused at startup (`_offload_subconfig`); reaching this
+    # That composite is refused at startup (`_build_subconnectors`); reaching this
     # method with two offload handlers is a should-never-happen guarded loudly,
     # because silently corrupting saves is the worse failure.
     dense = DestructiveSub(owned_load="dense_load", owned_channel="dense_ch")
@@ -630,7 +664,7 @@ def test_state_calls_route_by_tier_ownership_not_method_presence():
     no tier; the kimi_k3-like shell is second and does. Every state call must
     land on the second.
 
-    A two-offload composite is refused at startup (`_offload_subconfig`, finding
+    A two-offload composite is refused at startup (`_build_subconnectors`, finding
     0), so this shape does not reach a running engine; the test exercises the
     selector directly to keep it robust if that refusal is ever bypassed.
     """
@@ -932,6 +966,46 @@ def test_only_one_producer_sub_is_allowed(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "sub_names",
+    [
+        ("mooncake_store", "mooncake_store"),
+        ("mooncake_store", "lmcache_mp"),
+        # Aliases count as the backend they name.
+        ("mooncake", "mooncake_store", "LMCacheConnectorV1"),
+    ],
+)
+def test_two_offload_subs_are_refused_before_either_is_built(monkeypatch, sub_names):
+    """Each offload scheduler rewrites the completion sets it is handed, and no
+    completion names its sub, so two would retire each other's saves and
+    loads. Refused before any sub is built, rather than at the first poll."""
+    built = []
+    import atom.kv_transfer.disaggregation.factory as factory_mod
+
+    monkeypatch.setattr(
+        factory_mod.KVConnectorFactory,
+        "create_connector",
+        staticmethod(lambda config, role: built.append(config)),
+    )
+    with pytest.raises(ValueError, match="at most one offload sub-connector"):
+        mc_module._build_subconnectors(_factory_config(*sub_names), role="scheduler")
+    assert built == []
+
+
+def test_one_offload_sub_beside_a_producer_is_built(monkeypatch):
+    _patch_factory(
+        monkeypatch,
+        {
+            "mooncake": lambda: FakeSchedSub(is_producer=True),
+            "mooncake_store": lambda: FakeSchedSub(is_offload=True),
+        },
+    )
+    subs = mc_module._build_subconnectors(
+        _factory_config("mooncake", "mooncake_store"), role="scheduler"
+    )
+    assert [c.is_producer for c in subs] == [True, False]
+
+
 def test_send_finished_reaches_the_producer_sub():
     """The composite has to reach whichever sub owns the claim, or
     `should_defer_free` never clears and the blocks park until shutdown."""
@@ -959,3 +1033,29 @@ def test_should_defer_free_holds_while_any_sub_claims_the_source():
     assert sched.should_defer_free(seq) is True, "the send still claims it"
     producer.defer = False
     assert sched.should_defer_free(seq) is False
+
+
+def test_waits_for_transfer_report_needs_every_deferring_sub():
+    """Clock reclaim is skipped only if no deferring sub would act on it."""
+    from types import SimpleNamespace
+
+    from atom.kv_transfer.disaggregation.multi.multi_connector import (
+        MultiConnectorScheduler,
+    )
+
+    def sub(defers, waits=None):
+        fields = {"should_defer_free": lambda _seq: defers}
+        if waits is not None:
+            fields["waits_for_transfer_report"] = lambda _seq: waits
+        return SimpleNamespace(**fields)
+
+    def multi(*subs):
+        connector = object.__new__(MultiConnectorScheduler)
+        connector._connectors = list(subs)
+        return connector
+
+    seq = object()
+    assert multi(sub(True, True), sub(False)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True)).waits_for_transfer_report(seq)
+    assert not multi(sub(True, True), sub(True, False)).waits_for_transfer_report(seq)
+    assert not multi(sub(False, True)).waits_for_transfer_report(seq)

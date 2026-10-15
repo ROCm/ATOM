@@ -19,14 +19,14 @@ if not torch.cuda.is_available():
     pytest.skip("requires GPU", allow_module_level=True)
 
 from atom.model_ops.engram.device.hashing import (
+    EngramBatch,
     EngramHashTables,
     engram_cursor_rows_reference,
     engram_row_indices_reference,
     engram_snapshot,
     engram_snapshot_indices,
 )
-from atom.model_ops.engram.device.runtime import EngramBatch
-from atom.model_ops.engram.device.staging import EngramStaging
+from atom.model_ops.engram.device.staging import EngramStaging, EngramStep
 from atom.model_ops.engram.mapping import EngramConfig
 from atom.model_ops.engram.tables import HostEmbeddingTable
 from tests.model_ops.engram.test_hash_bounds import V41_FLASH, build, tiny_config
@@ -209,13 +209,75 @@ def make_staging(mapping, group=None):
     return EngramStaging(uva), backing
 
 
-def exercise_replay(group=None):
+MAX_BS = 8
+
+
+def make_step(tables, max_tokens, verify):
+    """``EngramStep`` over fixed buffers, as the V4.1 metadata publishes them."""
+    device = torch.device("cuda")
+
+    def zeros(*shape, dtype=torch.int32):
+        return torch.zeros(*shape, dtype=dtype, device=device)
+
+    rows = zeros(max_tokens + 1)
+    candidates = (
+        torch.full((MAX_BS, max_tokens, tables.ngram), -99, dtype=torch.int64,
+                   device=device)
+        if verify
+        else None
+    )  # fmt: skip
+    return EngramStep(
+        input_ids=zeros(max_tokens),
+        live=rows[:1],
+        dead=rows[1:],
+        batch_ids=zeros(max_tokens),
+        cu_seqlens=zeros(MAX_BS + 1),
+        positions=zeros(max_tokens),
+        cursor=zeros(MAX_BS, tables.ngram, dtype=torch.int64),
+        history_index=zeros(MAX_BS),
+        candidates=candidates,
+    )
+
+
+def fill_step(step, tokens, histories, masks, starts, live=True):
+    """One step's metadata into the fixed buffers (what a replay reads)."""
+    lengths = [len(t) for t in tokens]
+    count, n = sum(lengths), len(lengths)
+    keep = np.concatenate(masks) if masks is not None else np.ones(count, bool)
+    # Deliberately permuted slots; padding requests get no tokens.
+    slots = np.arange(n - 1, -1, -1)
+    step.input_ids.zero_()
+    step.input_ids[:count] = torch.as_tensor(np.concatenate(tokens))
+    step.live.fill_(count if live else 0)
+    step.dead.zero_()
+    step.dead[:count] = torch.as_tensor((~keep).astype(np.int32))
+    step.batch_ids.fill_(-1)
+    step.batch_ids[:count] = torch.as_tensor(np.repeat(np.arange(n), lengths))
+    cu = np.concatenate(([0], np.cumsum(lengths)))
+    step.cu_seqlens.fill_(count)
+    step.cu_seqlens[: n + 1] = torch.as_tensor(cu)
+    step.positions[:count] = torch.as_tensor(
+        np.concatenate([np.arange(a, a + k) for a, k in zip(starts, lengths)])
+    )
+    step.cursor.fill_(-7)
+    step.cursor[torch.as_tensor(slots, device="cuda"), 1:] = torch.as_tensor(
+        np.stack(histories), device="cuda"
+    )
+    step.history_index.zero_()
+    step.history_index[:n] = torch.as_tensor(slots)
+    if step.candidates is not None:
+        step.candidates.fill_(-99)
+    return slots
+
+
+def exercise_replay(group=None, verify=False):
     from contextlib import nullcontext
 
     from aiter.dist.parallel_state import graph_capture
 
     mapping = build(tiny_config())
     staging, _ = make_staging(mapping, group)
+    tables = staging.uva.hash_tables
     if group is not None:
         assert staging.collective is not None
         assert staging.collective is not group.device_communicator.ca_comm
@@ -227,6 +289,7 @@ def exercise_replay(group=None):
     y = torch.empty_like(x)
     reduced = torch.empty_like(x)
     rank = 0 if group is None else group.rank_in_group
+    step = make_step(tables, staging.host.max_num_tokens, verify)
 
     def forward(rows):
         rows.stage()
@@ -241,12 +304,50 @@ def exercise_replay(group=None):
             output[layer][: rows.width].copy_(rows.get(layer)[0])
         rows.join()
 
+    def check(tokens, histories, masks, starts, slots, width):
+        lengths = [len(t) for t in tokens]
+        count = sum(lengths)
+        for layer, table in staging.host.prefetcher._tables.items():
+            indices = engram_row_indices_reference(
+                mapping, layer, tokens, histories, masks
+            )
+            expected = table._tensor[torch.as_tensor(indices)].reshape(
+                count, staging.host.embed_width
+            )
+            torch.testing.assert_close(
+                output[layer][:count].cpu(), expected, rtol=0, atol=0
+            )
+            assert torch.all(output[layer][count:width] == 0)
+        cursors = engram_cursor_rows_reference(
+            mapping, tokens, histories, starts, masks
+        )
+        if verify:
+            # every accepted prefix staged, the committed history untouched
+            for i, (length, rows) in enumerate(zip(lengths, cursors)):
+                got = step.candidates[i, :length].cpu().numpy()
+                np.testing.assert_array_equal(got, rows)
+                assert torch.all(step.candidates[i, length:] == -99)
+            assert torch.all(step.candidates[len(lengths) :] == -99)
+            for i, slot in enumerate(slots):
+                np.testing.assert_array_equal(
+                    step.cursor[slot, 1:].cpu().numpy(), histories[i]
+                )
+        else:
+            # the cursor advanced in the forward, after the snapshot read it
+            for i, slot in enumerate(slots):
+                np.testing.assert_array_equal(
+                    step.cursor[slot].cpu().numpy(), cursors[i][lengths[i] - 1]
+                )
+
     try:
         graphs = {}
-        # One prepare followed by warmup AND capture, just like ModelRunner.
+        # One prepare followed by warmup AND capture, just like ModelRunner;
+        # the capture's step has no live token, so it writes nothing.
         with graph_capture() if group is not None else nullcontext() as ctx:
             for width in (8, 16):
-                rows = staging.prepare(None, width)
+                fill_step(step, [[1, 2]], [[3] * tables.width], None, [5], live=False)
+                before = step.cursor.clone()
+                rows = staging.prepare(step, width)
                 forward(rows)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
@@ -255,20 +356,20 @@ def exercise_replay(group=None):
                 ):
                     forward(rows)
                 graphs[width] = graph
+                assert torch.equal(step.cursor, before)
         for iteration in range(120):
             width = (8, 16)[iteration % 2]
             lengths = ([1, 2], [1, 6, 3], [1, 1])[iteration % 3]
             if sum(lengths) > width:
                 lengths = [2, 3]
-            batch, tokens, histories, masks = make_batch(
-                mapping, lengths, iteration + 3
-            )
-            staging.prepare(batch, width)
+            tokens, histories, masks = case(
+                mapping, lengths, seed=iteration + 3, dead=[(0, -1)],
+                masked=[(len(lengths) - 1, lengths[-1] - 1)],
+            )  # fmt: skip
+            starts = list(np.arange(len(lengths)) * 31 + 2)
+            slots = fill_step(step, tokens, histories, masks, starts)
             value = iteration % 5 + 1
             x.fill_(value + rank)
-            # Must not hash the cursor after prepare updates it.
-            batch.history.fill_(91)
-            batch.compressed.fill_(23)
             graphs[width].replay()
             if group is not None:
                 expected_sum = 128 * sum(
@@ -277,29 +378,24 @@ def exercise_replay(group=None):
                 torch.testing.assert_close(
                     reduced, torch.full_like(reduced, expected_sum), rtol=0, atol=0
                 )
-            for layer, table in staging.host.prefetcher._tables.items():
-                indices = engram_row_indices_reference(
-                    mapping, layer, tokens, histories, masks
-                )
-                expected = table._tensor[torch.as_tensor(indices)].reshape(
-                    sum(lengths), staging.host.embed_width
-                )
-                torch.testing.assert_close(
-                    output[layer][: sum(lengths)].cpu(), expected, rtol=0, atol=0
-                )
-                assert torch.all(output[layer][sum(lengths) : width] == 0)
+            check(tokens, histories, masks, starts, slots, width)
+        # A DP dummy replays a graph with no live token: nothing moves.
+        tokens, histories, masks = case(mapping, [2, 3], seed=7)
+        fill_step(step, tokens, histories, masks, [4, 9], live=False)
+        cursor, staged = step.cursor.clone(), (
+            None if step.candidates is None else step.candidates.clone()
+        )
+        graphs[8].replay()
+        torch.cuda.synchronize()
+        assert torch.equal(step.cursor, cursor)
+        if staged is not None:
+            assert torch.equal(step.candidates, staged)
         # The eager path also reads fresh inputs after graphs have been used.
-        batch, tokens, histories, masks = make_batch(mapping, [4, 5], 99)
-        rows = staging.prepare(batch, 12)
+        tokens, histories, masks = case(mapping, [4, 5], seed=99)
+        slots = fill_step(step, tokens, histories, masks, [6, 40])
+        rows = staging.prepare(step, 12)
         forward(rows)
-        for layer, table in staging.host.prefetcher._tables.items():
-            indices = engram_row_indices_reference(
-                mapping, layer, tokens, histories, masks
-            )
-            expected = table._tensor[torch.as_tensor(indices)].reshape(9, -1)
-            torch.testing.assert_close(
-                output[layer][:9].cpu(), expected, rtol=0, atol=0
-            )
+        check(tokens, histories, masks, [6, 40], slots, 12)
         torch.cuda.synchronize()
     finally:
         torch.cuda.synchronize()
@@ -309,8 +405,9 @@ def exercise_replay(group=None):
             table.disable_uva()
 
 
-def test_uva_graph_replay_uses_each_steps_inputs():
-    exercise_replay()
+@pytest.mark.parametrize("verify", [False, True])
+def test_uva_graph_replay_uses_each_steps_inputs(verify):
+    exercise_replay(verify=verify)
 
 
 if __name__ == "__main__":

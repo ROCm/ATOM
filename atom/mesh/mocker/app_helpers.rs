@@ -37,19 +37,12 @@ pub fn create_mocker_app_with_context(
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
-        concurrency_queue_tx: None,
         router_manager: None,
     });
 
     let router_config = &app_context.router_config;
-    let request_id_headers = router_config.request_id_headers.clone().unwrap_or_else(|| {
-        vec![
-            "x-request-id".to_string(),
-            "x-correlation-id".to_string(),
-            "x-trace-id".to_string(),
-            "request-id".to_string(),
-        ]
-    });
+    let request_id_headers =
+        mesh::observability::request_id::header_names(router_config.request_id_headers.as_deref());
 
     build_app(
         app_state,
@@ -58,10 +51,7 @@ pub fn create_mocker_app_with_context(
     )
 }
 
-async fn create_mocker_context_inner(
-    config: RouterConfig,
-    with_parsers: bool,
-) -> Arc<AppContext> {
+async fn create_mocker_context_inner(config: RouterConfig, with_parsers: bool) -> Arc<AppContext> {
     let client = reqwest::Client::new();
     let rate_limiter = match config.max_concurrent_requests {
         n if n <= 0 => None,

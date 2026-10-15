@@ -1263,7 +1263,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.fp8_activations = moe.mxfp4_fp8_activations
+        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
@@ -2061,6 +2062,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if self.fp8_activations:
+            moe_extra_args["quant_dtype_a"] = dtypes.fp8
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
             moe_extra_args["linear_beta"] = getattr(
@@ -3323,6 +3326,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_prefix: str | None = None,
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
+        mxfp4_fp8_activations: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3555,6 +3559,7 @@ class FusedMoE(torch.nn.Module):
             expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
+            mxfp4_fp8_activations=mxfp4_fp8_activations,
             max_num_tokens=moe_token_capacity,
             has_bias=self.has_bias,
             # is_act_and_mul=True,

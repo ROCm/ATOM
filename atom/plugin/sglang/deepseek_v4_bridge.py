@@ -162,9 +162,9 @@ def _layer_counts(compress_ratios) -> tuple[list[int], int, int, int]:
 
 def _resolve_sglang_spec_steps() -> int:
     try:
-        from sglang.srt.server_args import get_global_server_args
+        from atom.plugin.config import get_sglang_server_args
 
-        server_args = get_global_server_args()
+        server_args = get_sglang_server_args()
         value = getattr(server_args, "speculative_num_steps", None)
         if value is not None:
             return max(0, int(value))
@@ -440,6 +440,17 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # create full/SWA index allocators and then call register_mapping().
         self.full_kv_pool = None
         self.swa_kv_pool = None
+        # Upstream DeepSeekV4TokenToKVPool always publishes these flags. After
+        # install_deepseek_v4_proxy_pool_patch(), isinstance(proxy, DeepSeekV4TokenToKVPool)
+        # is True, and 0.5.19/0.5.20 paths (PD draft-state transfer, hybrid
+        # assemblers) read pool._unified_kv directly. ATOM owns its own arena
+        # views and does not enter SGLang's unified_kv_triton pool layout, so
+        # keep both False while still exposing the ABI.
+        self._unified_kv = False
+        self._unified_kv_fp8 = False
+        self.unified_kv_pool = None
+        self.c4_kv_pool = None
+        self.c128_kv_pool = None
 
         self.num_slots = max(
             1, int(num_req_slots) if num_req_slots is not None else self.max_num_reqs
@@ -793,6 +804,21 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # DSV4 pools do not use the generic precomputed SWA location path, and
         # ATOM writes the proxy arena through its own bridge metadata.
         pass
+
+    def get_unified_kv(self, layer_id: int) -> torch.Tensor:
+        """Expose ATOM's carved unified plane for SGLang duck-typed readers.
+
+        ``_unified_kv`` stays False so SGLang does not take its own
+        unified_kv_triton allocation path; callers that still ask for the
+        plane (env-gated backends, diagnostics) get the proxy view.
+        """
+        local = int(layer_id) - int(self.start_layer)
+        return self.views["unified"][local]
+
+    def get_unified_kv_rope(self, layer_id: int) -> torch.Tensor | None:
+        local = int(layer_id) - int(self.start_layer)
+        rope = self.views["unified_rope"][local]
+        return rope
 
     def get_state_buf_infos(self):
         return ([], [], [])
@@ -1218,6 +1244,9 @@ class _V4SGLangDecodeGraphBuffers:
         self.indptr_hca = i32(t + 1)
         self.qo_indptr = i32(t + 1)
         self.kv_last_page_lens = i32(t)
+        # Immutable empty extend CSR. Native stages this for the optional
+        # H=128 prefill-ASM decode route; the model always reads the attribute.
+        self.empty_kv_indptr = i32(t + 1)
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
@@ -1303,6 +1332,9 @@ class _V4SGLangVerifyGraphBuffers:
         self.block_tables = i32(s, self.max_blocks)
 
         self.indptr_extend = i32(t + 1)
+        # Decode always reads this CSR, including when MTP verify/draft-extend
+        # metadata is captured before the decode graph buffers exist.
+        self.empty_kv_indptr = i32(t + 1)
         self.indptr_prefix_swa = i32(t + 1)
         self.indptr_prefix_csa = i32(t + 1)
         self.indptr_prefix_hca = i32(t + 1)
@@ -1351,6 +1383,24 @@ def _make_decode_graph_compress_plans(extend_lens_cpu, context_lens_cpu, bufs):
         max_q_len=bufs.decode_q_len,
         extra_write=0,  # See `_make_compress_plans`: K_pool already covers it.
     )
+
+
+def _publish_empty_kv_indptr(md, padded_total: int, *, bufs=None) -> None:
+    """Publish the all-zero extend CSR the V4 decode path always reads.
+
+    Native ATOM stores this on ``AttentionMetaData_DSV4``. The SGLang bridge
+    builds the base ``AttentionMetaData``, which does not declare the field, so
+    ``attn_md.empty_kv_indptr`` raises during CUDA graph capture unless it is
+    attached here. The tensor is unused unless
+    ``ATOM_USE_V4_PREFILL_ASM_FOR_DECODE`` is on.
+    """
+    n = max(0, int(padded_total)) + 1
+    zeros = np.zeros(n, dtype=np.int32)
+    if bufs is not None:
+        md.empty_kv_indptr = bufs.stage(bufs.empty_kv_indptr, zeros, n)
+        return
+    device = md.cu_seqlens_q.device
+    md.empty_kv_indptr = torch.zeros(n, dtype=torch.int32, device=device)
 
 
 def _stage_decode_fp8_page_metadata(md, total: int, padded_total: int, *, bufs=None):
@@ -1761,6 +1811,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.kv_indptr_hca = hca_indptr
     if proxy_pool.use_fp8_kv:
         _stage_decode_fp8_page_metadata(md, total, t_pad, bufs=bufs)
+    _publish_empty_kv_indptr(md, t_pad, bufs=bufs)
     cu_committed_cpu = np.concatenate(
         [
             np.zeros(1, dtype=np.int32),
@@ -2067,6 +2118,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         "cu_starts_gpu": seq_base_gpu,
         "cu_ends_gpu": visible_end_gpu,
     }
+    _publish_empty_kv_indptr(md, total, bufs=bufs)
     return md
 
 
@@ -2218,6 +2270,7 @@ def build_atom_v4_attention_metadata_from_sglang(
         _populate_decode_indices(md, block_tables, batch_np, pos_np, device)
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
+        _publish_empty_kv_indptr(md, total)
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)

@@ -65,6 +65,10 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    fn needs_tokens(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -154,19 +158,16 @@ mod tests {
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w2:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key2")
                     .build(),
             ),
             Arc::new(
                 BasicWorkerBuilder::new("http://w3:8000")
                     .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
                     .build(),
             ),
         ];

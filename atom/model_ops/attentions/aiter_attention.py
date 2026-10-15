@@ -773,33 +773,29 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
-        from atom.kv_transfer.disaggregation.types import (
-            KVTransferRegion,
-            KVTransferTensors,
-        )
+        from atom.kv_transfer.disaggregation.page_region import page_region
+        from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
         if not self.kv_pools:
             return None
-        # Every field of every pool, indexer cache included: a region per
-        # (pool, field, layer), in declared order.
         return KVTransferTensors(
-            block_regions=[
-                KVTransferRegion(
-                    base_addr=tensor.data_ptr(),
-                    total_bytes=tensor.numel() * tensor.element_size(),
-                    unit_bytes=tensor.stride(0) * tensor.element_size(),
-                    # The geometry, because a hybrid declares two pools whose
-                    # per-layer regions are otherwise named alike.
-                    semantic_role=f"mha.{geometry}.{role}",
-                )
+            # Every field of every pool, indexer cache included: a unit per
+            # (pool, field, layer), in declared order. The geometry is in the
+            # role because a hybrid declares two pools whose per-layer regions
+            # are otherwise named alike.
+            pages=[
+                page_region(tensor, semantic_role=f"mha.{geometry}.{role}")
                 for geometry, pool in self.kv_pools.items()
                 for role, tensor in pool.region_tensors()
             ],
-            slot_regions=[],
+            # GQA/MQA KV heads are sharded or only partially replicated across
+            # TP. In particular MiniMax-M3 must keep one stored shard per rank;
+            # whole-object TP collapse is unsafe for this PAGE layout.
+            tp_replication_factor=1,
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
-        """Build or refresh aiter #5546's work plan for this forward.
+        """Build or refresh aiter's FlyDSL work plan for this forward.
 
         Depends only on context_lens, which every layer of one forward shares,
         so it is built here rather than per pa_decode call. Decode replays a
@@ -807,12 +803,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         (see build_for_cudagraph_capture) and its tensors must never be
         reallocated afterwards -- hence one entry per batch, kept forever, and
         refreshed in place before each replay. The refresh is a GPU kernel with
-        no readback. None when FlyDSL or the planner is off, or when the batch
-        is out of range.
+        no readback. None when FlyDSL is off, or when the batch is out of range.
         """
         # The plan only feeds FlyDSL; building one with FlyDSL off is a
         # refresh kernel per step that nothing reads.
-        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
+        if not envs.ATOM_PA_FLYDSL:
             return None
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
@@ -838,20 +833,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
-            # Plans are only ever minted during cudagraph capture, where the
+            # This builder mints plans only during cudagraph capture, where the
             # batch is a ladder rung and the cost lands at startup. aiter's
             # planner takes batch as a tl.constexpr, so a new value is a kernel
             # specialization -- 65-72 ms cold -- and a plan that is never freed
             # because some captured graph may have baked its pointers in. A
-            # runtime batch with no plan is one no graph will replay, so the
-            # static path is the right answer for it rather than a stall.
+            # runtime batch with no capture-owned plan gets a runtime plan in
+            # run_pa_decode.
             # Only once a capture has happened: before the first one every
             # call lands here (profile run, eager warmup), and logging then
             # burns the one shot on a step that says nothing.
             if self._flydsl_plans and not self._flydsl_plan_unplanned:
                 self._flydsl_plan_unplanned = True
                 logger.info(
-                    "flydsl: batch %d has no plan, running the static path; "
+                    "flydsl: batch %d has no capture-owned plan; an explicit "
+                    "runtime plan will be used; "
                     "captured batches are %s",
                     n,
                     sorted({k[0] for k in self._flydsl_plans}),
@@ -1288,6 +1284,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.context_lens[:scheduled_bs],
                 scheduled_bs,
             )
+            # token -> request, -1 on the graph's pad tail: the mono kernels keep
+            # a pad row out of every cross-row decision (``row_live``)
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                pad_to=running_tokens,
+            )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=attn_metadata.context_lens[:scheduled_bs],
                 block_table=sparse_block_tables,
@@ -1529,6 +1531,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 seq_lens,
                 bs,
             )
+            # the buffer every replay's prepare_decode publishes into
+            attn_metadata.batch_id_per_q_token = var["batch_id_per_q_token"].gpu[
+                :scheduled_tokens
+            ]
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
                 seq_lens=seq_lens,
                 block_table=sparse_block_tables,

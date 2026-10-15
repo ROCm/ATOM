@@ -1310,3 +1310,53 @@ class TestWillOnlineRequant:
     def test_source_already_at_online_target_is_not_requantized(self):
         qcfg = self._m3_config()
         assert will_online_requant(qcfg, ATTENTION, QuantType.per_Token, FP8) is False
+
+
+class TestBlockscaleE8m0Scale:
+    """E8M0 128x128 block scales: the env var when set, else by arch and by the
+    checkpoint's declared ``scale_fmt``."""
+
+    @pytest.fixture
+    def resolve(self, monkeypatch):
+        import importlib
+
+        monkeypatch.setattr(
+            _m, "envs", importlib.import_module("atom.utils.envs"), raising=False
+        )
+        monkeypatch.delenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", raising=False)
+
+        def run(scale_fmt, gfx, env=None):
+            chip_info = types.ModuleType("aiter.jit.utils.chip_info")
+            chip_info.get_gfx = lambda: gfx
+            monkeypatch.setitem(sys.modules, "aiter.jit.utils.chip_info", chip_info)
+            if env is not None:
+                monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE", env)
+            quant = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+            if scale_fmt is not None:
+                quant["scale_fmt"] = scale_fmt
+            hf = FakeHFConfig(torch_dtype=BF16, quantization_config=quant)
+            return QuantizationConfig(hf).blockscale_e8m0_scale
+
+        return run
+
+    @pytest.mark.parametrize("gfx", ["gfx950", "gfx1250"])
+    def test_ue8m0_checkpoint_defaults_to_e8m0(self, resolve, gfx):
+        assert resolve("ue8m0", gfx) is True
+
+    def test_gfx942_defaults_to_fp32(self, resolve):
+        assert resolve("ue8m0", "gfx942") is False
+
+    def test_fp32_checkpoint_defaults_to_fp32(self, resolve):
+        # Its scales are not powers of two: E8M0 would round the weights.
+        assert resolve(None, "gfx950") is False
+
+    @pytest.mark.parametrize(
+        "scale_fmt,gfx,env,expected",
+        [
+            ("ue8m0", "gfx950", "0", False),
+            (None, "gfx950", "1", True),
+            ("ue8m0", "gfx942", "1", True),
+        ],
+    )
+    def test_env_overrides_default(self, resolve, scale_fmt, gfx, env, expected):
+        assert resolve(scale_fmt, gfx, env) is expected

@@ -25,14 +25,13 @@ import torch
 
 from atom.kv_transfer.disaggregation.types import SaveOperationId, SaveSourceGroupId
 from atom.kv_transfer.offload.atom_lmcache_staging import (
-    _env_flag,
-    _env_optional_int,
     _PipelineStage,
     _StagingBuffer,
     _ThreadTransferState,
     memory_object_as_uint8,
     run_staged_pipeline,
 )
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -46,7 +45,7 @@ logger = logging.getLogger("atom")
 # handoff a no-op of in-order execution and gives up an overlap that does not
 # exist. Correctness is unaffected -- one stream is strictly more ordered than
 # two, and the terminal synchronize is unchanged.
-_SINGLE_STREAM = _env_flag("OFFLOAD_SINGLE_STREAM")
+_SINGLE_STREAM = envs.OFFLOAD_SINGLE_STREAM
 
 # The default staging buffer is denominated in bytes, not in LMCache chunks --
 # see `_default_staging_buffer_chunks` for why. 48 MiB: on GLM-5.2, whose chunk
@@ -202,6 +201,7 @@ class BlockGPUConnector:
         chunk_size: int | None = None,
         virtual_block_size: int | None = None,
         source_safe_callback: Callable[[SaveSourceGroupId], None] | None = None,
+        max_staging_bytes: int | None = None,
     ) -> None:
         self.codec = codec
         self.physical_block_size = int(block_size)
@@ -260,15 +260,19 @@ class BlockGPUConnector:
         self._quarantined_staging_tensors: list[torch.Tensor] = []
         self._quarantined_block_id_owners: list[Any] = []
         self._quarantined_staging_lock = threading.Lock()
-        requested_buffer_chunks = _env_optional_int("OFFLOAD_GPU_STAGING_CHUNKS")
+        requested_buffer_chunks = envs.OFFLOAD_GPU_STAGING_CHUNKS
         if requested_buffer_chunks is None:
             requested_buffer_chunks = self._default_staging_buffer_chunks()
-        max_staging_bytes = _env_optional_int("OFFLOAD_GPU_STAGING_MAX_BYTES")
+        # A caller that must know the bound before the KV geometry is known
+        # (the Mooncake Store worker holds it back from the KV budget) passes
+        # it in place of OFFLOAD_GPU_STAGING_MAX_BYTES.
+        if max_staging_bytes is None:
+            max_staging_bytes = envs.OFFLOAD_GPU_STAGING_MAX_BYTES
         if max_staging_bytes is not None:
             if max_staging_bytes < self._gpu_staging_chunk_bytes:
                 raise ValueError(
-                    "OFFLOAD_GPU_STAGING_MAX_BYTES must be at least one "
-                    "LMCache chunk: "
+                    "A GPU staging buffer must hold at least one LMCache chunk; "
+                    "raise OFFLOAD_GPU_STAGING_MAX_BYTES: "
                     f"max_bytes={max_staging_bytes}, "
                     f"chunk_bytes={self._gpu_staging_chunk_bytes}"
                 )
@@ -280,8 +284,8 @@ class BlockGPUConnector:
         self._gpu_staging_buffer_bytes = (
             self._staging_buffer_chunks * self._gpu_staging_chunk_bytes
         )
-        self._release_gpu_staging_after_transfer = _env_flag(
-            "OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER"
+        self._release_gpu_staging_after_transfer = (
+            envs.OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER
         )
 
     def _default_staging_buffer_chunks(self) -> int:

@@ -365,6 +365,17 @@ indexer's verify path; Kimi-K3 + DSpark, dcp8 (gsm8k 0.98/200, nshot=5) covers
 dense MLA's `cprr` kernel running on a QREP-produced `q_out` — the combination
 the removed `speculative_config` gate used to block.
 
+**Sparse (DSA) prefill** can use QREP too, opt-in via `ATOM_DCP_PREFILL_QREP=1`.
+Past `index_topk` context (2048 for GLM-5.2) prefill runs the absorbed MLA
+kernel and, like decode, AllGathers Q over the DCP group; through pynccl that
+gather lands rank-major, so `all_gather(dim=1)` also copies the whole gathered q
+back to token-major. With the env set, each rank projects the group's heads
+itself and both disappear, at the cost of a group-wide q GEMM + `W_K` bmm per
+prefill token. Dense prefill (context ≤ `index_topk`) never gathers q and is
+unaffected. Numerics: prefill then uses `W_K_qrep`, which is quantized with one
+scale across the group's heads rather than per rank -- the same weight decode
+already uses.
+
 A layer falls back to AllGather automatically, instead of enabling QREP
 incorrectly, for either of two reasons: `q_proj` was never built with the QREP
 override (target models, MTP, eagle3, and DSpark are all wired today, so this

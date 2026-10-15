@@ -154,7 +154,6 @@ class CompilationConfig:
     use_cudagraph: bool = True
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
-    # cudagraph_capture_sizes: Optional[list[int]] = [1,2,4,8]
     cudagraph_capture_sizes: list[int] | None = None
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
@@ -410,6 +409,24 @@ class QuantizationConfig:
                 "--online_quant_config with an mxfp4 target, for example "
                 '\'{"global_quant_config": "mxfp4"}\'.'
             )
+
+    @property
+    def blockscale_e8m0_scale(self) -> bool:
+        """Whether 128x128 FP8 block scales (weight and activation) are E8M0.
+
+        ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE decides when set. Otherwise E8M0 on
+        every arch but gfx942, and only for a checkpoint whose scales are
+        declared ``scale_fmt: ue8m0`` (DeepSeek-V4): those are powers of two, so
+        E8M0 restates them exactly, while an FP32 scale loaded into an E8M0
+        parameter would be rounded, altering the weight.
+        """
+        if envs.is_set("ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE"):
+            return envs.ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE
+        if (self.hf_quant_config or {}).get("scale_fmt") != "ue8m0":
+            return False
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx() != "gfx942"
 
     # -- typed API (preferred) ----------------------------------------------
 
@@ -751,7 +768,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
 # Loaded as a bare PretrainedConfig; the ATOM model normalizes the aliases it
 # needs at construction time.
 _PLAIN_TEXT_CONFIG_MODEL_TYPES: frozenset[str] = frozenset(
-    {"kimi_linear", "glm5_next_text"}
+    {"kimi_linear", "glm5_next_text", "qwen4_exp_text"}
 )
 
 # multimodal models fully supported by plugin mode
@@ -952,6 +969,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None and text_config is not hf_config:
+        # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
+        # replaces the text config's own, then is checked like any other.
+        for attr_name in ("mlp_layer_types", "moe_layer_freq"):
+            attr_value = getattr(hf_config, attr_name, None)
+            if attr_value is not None:
+                setattr(text_config, attr_name, attr_value)
     _normalize_minimax_m3_mlp_layer_types(
         text_config if text_config is not None else hf_config
     )
@@ -1819,6 +1843,22 @@ def qrep_enabled_for_layer(
     )
 
 
+def qrep_for_step(
+    qrep_enabled: bool, use_seg_mla: bool, is_prefill: bool, prefill_qrep: bool
+) -> bool:
+    """Whether this forward produces the DCP group's query heads locally (QREP)
+    instead of gathering them.
+
+    Decode always does when the layer has QREP. Prefill reaches the QREP-aware
+    branch only as sparse (DSA) prefill -- dense prefill takes the MHA path and
+    never gathers q -- and joins only under ``ATOM_DCP_PREFILL_QREP``
+    (``prefill_qrep``). The seg path is excluded because its q_out is allocated
+    at the per-rank head count. Pure so the prefill clause can be pinned by a
+    test instead of living only as an inline expression.
+    """
+    return qrep_enabled and not use_seg_mla and (not is_prefill or prefill_qrep)
+
+
 def indexer_cp_unsupported_reason(
     arches,
     tp_size: int,
@@ -1848,7 +1888,7 @@ def indexer_cp_unsupported_reason(
     if not any("MiniMaxM3" in str(a) for a in arches):
         return "not a MiniMax-M3 model"
     if plugin_mode:
-        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3.py, so
+        # The vLLM/SGLang bridges run ATOM's own linear.py and minimax_m3/model.py, so
         # the flag would widen index_q underneath them -- and both reshape it
         # with a ``view`` on the width they assume, yielding 4x the rows with no
         # error. ``indexer_cp_enabled`` refuses them at runtime; this clears the
@@ -1915,6 +1955,28 @@ class Config:
     # `StateSlotPool.mark_speculative` for the measurement and
     # `BlockManager._record_checkpoint_demand` for the placement.
     state_checkpoint_demand: bool = True
+    # DeepSeek-V4.1 decoder SWA bounded replay
+    # (models/deepseek_v41/bounded_replay.py). On by default;
+    # --no-decoder-swa-bounded-replay turns it off. No effect on other models.
+    enable_decoder_swa_bounded_replay: bool = True
+    # The fewest rows the forward that finishes a prompt runs: one that resumes
+    # closer to the prompt's end starts that much earlier, recomputing rows
+    # the cache already holds (`BlockManager.replay_start`). Set by the model,
+    # not a flag: V4.1's decoder bounded replay reads the last `window` rows.
+    min_final_prefill_rows: int = 0
+    # The tokens before a replaying forward a backend reads (`Replay.history_ids`).
+    # Set by the model: V4.1's Engram n-gram lookback.
+    replay_history_tokens: int = 0
+    # How far below a prefix hit with no state checkpoint behind it a prefill
+    # starts to rebuild that state exactly (`BlockManager.replay_start`), 0 =
+    # such a hit is not taken. Set by the model, not a flag: DeepSeek-V4's
+    # window receptive field under ATOM_DSV4_STATE_REPLAY (`deepseek_v4_replay`).
+    state_replay_tokens: int = 0
+    # DeepSeek-V4.1 encoder SWA bounded replay: a prefix hit keeps no state
+    # checkpoint and rebuilds it by recomputing the window rows below the hit
+    # (`--encoder-swa-bounded-replay`). On by default;
+    # --no-encoder-swa-bounded-replay keeps checkpoints. No effect on other models.
+    enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
     max_model_len: int | None = None
@@ -1962,6 +2024,13 @@ class Config:
     # Requests in the sliding window behind the status line's prefix-cache hit
     # rate. Validated > 0 by EngineStats.
     cache_hit_rate_window: int = 1000
+    enable_dynamic_chunking: bool = False
+    # None reads ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR once the feature is on; see
+    # `_resolve_dynamic_chunking`.
+    dynamic_chunking_smooth_factor: float | None = None
+    # Floor for solved chunks. Every extra chunk re-pays the cached-prefix
+    # rebuild, so the floor is what bounds that amplification.
+    dynamic_chunking_min_chunk_size: int = 4096
     port: int = 8006
     torch_profiler_dir: str | None = field(
         default_factory=lambda: envs.ATOM_TORCH_PROFILER_DIR
@@ -2087,7 +2156,7 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
-            return [1, 2, 4, 8] + list(range(16, sizes[0] + 1, 16))
+            return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
     def __post_init__(self):
@@ -2371,6 +2440,24 @@ class Config:
                 import ast
 
                 self.kv_transfer_config = ast.literal_eval(self.kv_transfer_config)
+        if self.kv_transfer_config:
+            # The offload namespace hashes the model's cache geometry. A worker
+            # normalises `hf_config` while it builds the model (Kimi-K3 derives
+            # `head_dim`, `ModelRunner.get_num_blocks` fills a missing one) and
+            # the scheduler never does, so hashing the live config gives each a
+            # different namespace and every scheduler lookup misses. Snapshot it
+            # here, before the config is shipped to either process.
+            from atom.kv_transfer.offload.config import (
+                snapshot_kv_encoding,
+                snapshot_page_hf_geometry,
+            )
+
+            self.offload_page_hf_geometry = snapshot_page_hf_geometry(self.hf_config)
+            # Likewise how K and V are encoded (the RoPE settings above all):
+            # llama.py adds a key to the live `rope_parameters` while a worker
+            # builds the model.
+            self.offload_kv_encoding = snapshot_kv_encoding(self.hf_config)
+        self._resolve_dynamic_chunking()
 
         if self.speculative_config is not None:
             num_spec = self.speculative_config.num_speculative_tokens
@@ -2558,17 +2645,71 @@ class Config:
             # CSA2's index plane is paged by the same scorer GLM's is, so a
             # PAGE again has to hold a whole number of `MQA_LOGITS_PRESHUFFLE_ROWS`
             # tiles -- and its ratio-2 owners halve the PAGE before that count
-            # is taken, which makes the floor twice the tile. 256 rather than
-            # that floor, and for the reason DeepSeek-V4 takes it: the block
-            # table is `[max_num_seqs, max_model_len / block_size]` int32 held
-            # twice and copied to the device every forward, 8 MB here against
-            # 134 MB at the 16 this field defaults to. What it costs is prefix
-            # reuse shorter than a PAGE, which stops matching at all.
-            self.kv_cache_block_size = 256
+            # is taken, which makes the floor twice the tile. 128 rather than
+            # that floor: the block table is `[max_num_seqs, max_model_len /
+            # block_size]` int32 held twice and copied to the device every
+            # forward, 17 MB here against 134 MB at the 16 this field defaults
+            # to. Not the 256 DeepSeek-V4 takes: a PAGE is also the prefix
+            # cache's hash block, so it is the granularity of prefix reuse and
+            # of the rows encoder bounded replay recomputes below a hit: one
+            # PAGE, which must cover the window - 1 rows a row at the hit reads.
+            self.kv_cache_block_size = 128
+            if self.enable_decoder_swa_bounded_replay:
+                self.min_final_prefill_rows = self.hf_config.sliding_window
+            self.replay_history_tokens = self.hf_config.engram_max_ngram_size - 1
 
             from atom.models.deepseek_v41.config import validate_runtime_config
 
             validate_runtime_config(self)
+
+        if is_deepseek_v4:
+            from atom.model_ops.attentions.deepseek_v4_replay import (
+                state_replay_tokens,
+            )
+
+            self.state_replay_tokens = state_replay_tokens(self)
+
+    def _resolve_dynamic_chunking(self) -> None:
+        """Validate dynamic chunking, or turn it off where it cannot size a chunk.
+
+        Everything here, the env read included, runs only when the feature is
+        on: a stale ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR in a shared launch script
+        must not stop a server that never asked for dynamic chunking.
+        """
+        if not self.enable_dynamic_chunking:
+            return
+        if self.dynamic_chunking_smooth_factor is None:
+            try:
+                self.dynamic_chunking_smooth_factor = (
+                    envs.ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR must be a number: {exc}"
+                ) from None
+        if not 0.0 <= self.dynamic_chunking_smooth_factor <= 1.0:
+            raise ValueError(
+                "dynamic_chunking_smooth_factor must be in [0, 1], got "
+                f"{self.dynamic_chunking_smooth_factor}"
+            )
+        if self.dynamic_chunking_min_chunk_size <= 0:
+            raise ValueError("dynamic_chunking_min_chunk_size must be positive")
+        if self.pipeline_parallel_size <= 1:
+            reason = "pipeline_parallel_size is 1"
+        elif not self.enable_chunked_prefill:
+            reason = "chunked prefill is off"
+        elif self.enable_rapidserve:
+            reason = "the RapidServe prefill scheduler never chunks"
+        elif (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer":
+            reason = "a P/D decode instance does not run the prefills it would size"
+        else:
+            return
+        # Same degrade-to-fixed path as a failed profile or a rejected fit.
+        # Raising would make the flag a hard failure in a shared launch script.
+        logger.warning(
+            "Dynamic chunking disabled because %s; chunking stays fixed", reason
+        )
+        self.enable_dynamic_chunking = False
 
     def compute_hash(self) -> str:
         """
@@ -2598,9 +2739,8 @@ class Config:
         factors.append(vllm_factors)
         factors.append(self.tensor_parallel_size)
         # PCP changes the compiled graph: when pcp>1 the indexer runs through the
-        # opaque `indexer_with_output` op (whose identity output is fed as the MLA
-        # query) and the indexer takes the round-robin all-gather / separate-rope
-        # path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
+        # opaque `sparse_attn_indexer_pcp` op and takes the round-robin all-gather
+        # / separate-rope path. A pcp1 vs pcp2 run over the same model+source otherwise hashes
         # identically, so without this factor pcp2 loads pcp1's cached artifact
         # (no indexer op) and trips copy_misaligned_inputs / assert_size_stride at
         # runtime — the same stale-artifact hazard documented for the vocab-embed
@@ -2608,7 +2748,7 @@ class Config:
         factors.append(self.prefill_context_parallel_size)
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
-        # them under CP (minimax_m3.py, linear.py), so the traced graph and the
+        # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
         # captured buffer strides differ. Exactly the pcp hazard above -- two
         # runs of the same model and source otherwise hash identically, so
         # starting one mode after the other would load the opposite mode's
@@ -2622,6 +2762,10 @@ class Config:
         factors.append(bool(getattr(self.dcp_config, "indexer_dcp_only", False)))
         factors.append(self.enable_dp_attention)
         factors.append(self.index_cache_dtype)
+        # DeepSeek-V4.1 decoder SWA bounded replay compiles the backbone as two
+        # graphs (early + late layers) instead of one; both compile under the
+        # `backbone` tag, so the flag must key the artifacts.
+        factors.append(getattr(self, "enable_decoder_swa_bounded_replay", True))
         text_config = getattr(self.hf_config, "text_config", self.hf_config)
         factors.append(
             (
@@ -2654,6 +2798,15 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # The drafter graph bakes its draft width in as a constant (DSpark traces
+        # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
+        # would otherwise load the other width's artifact: draft 6 over a draft 3
+        # cache hands MoE half the rows it expects. Acceptance-length knobs only
+        # steer sampling and stay out.
+        spec = self.speculative_config
+        factors.append(
+            None if spec is None else (spec.method, spec.num_speculative_tokens)
+        )
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

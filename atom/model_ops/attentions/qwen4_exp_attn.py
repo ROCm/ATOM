@@ -323,6 +323,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         from atom.kv_transfer.disaggregation.types import (
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         arena = getattr(self, "qsa_arena", None)
@@ -355,7 +356,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             ple = getattr(runner, name, None)
             if ple is not None:
                 slots.append(region(ple, role))
-        return KVTransferTensors(block_regions=blocks, slot_regions=slots)
+        # Addresses only: no byte views, so LMCache MP refuses this layout.
+        return KVTransferTensors(
+            pages=[PageRegion(block) for block in blocks], slot_regions=slots
+        )
 
     def allocate_per_req_cache(self, entries: dict[str, int]) -> dict[str, object]:
         caches = super().allocate_per_req_cache(entries)

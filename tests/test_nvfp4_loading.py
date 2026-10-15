@@ -22,7 +22,7 @@ QKVParallelLinear = linear_mod.QKVParallelLinear
 FusedMoE = moe_mod.FusedMoE
 Nvfp4MoEMethod = moe_mod.Nvfp4MoEMethod
 
-minimax_m3 = importlib.import_module("atom.models.minimax_m3")
+minimax_m3 = importlib.import_module("atom.models.minimax_m3.model")
 _is_moe_layer = minimax_m3._is_moe_layer
 make_minimax_m3_expert_params_mapping = minimax_m3.make_minimax_m3_expert_params_mapping
 _normalize_minimax_m3_text_config = importlib.import_module(
