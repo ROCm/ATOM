@@ -45,7 +45,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
-    use_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -401,12 +401,18 @@ class KimiSparseMoeBlock(nn.Module):
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
-            # AITER RMSNorm+quant emits the activation layout consumed directly by
-            # the routed up-projection. FP4 Triton paths choose an M-dependent
-            # shuffled/non-shuffled scale layout, so keep those on their existing
-            # standalone quant path until the fused kernel supports both layouts.
             fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+                use_fp4_non_shuffle_triton_gemm()
+                or use_mxfp4_preshuffle_triton_gemm(up_proj_quant_dtype)
+            )
+            # RMSNorm's generic MXFP4 fusion always emits shuffled scales. Triton
+            # needs an M-dependent layout, so its routed path uses the existing
+            # layout-aware fused producer explicitly in forward.
+            self.fuse_routed_triton_mxfp4_quant = (
+                latent_moe_use_norm
+                and up_proj_quant_type == QuantType.per_1x32
+                and up_proj_quant_dtype == dtypes.fp4x2
+                and fp4_triton_active
             )
             self.fuse_routed_norm_quant = latent_moe_use_norm and (
                 (
@@ -457,6 +463,38 @@ class KimiSparseMoeBlock(nn.Module):
         self._defer_shared_add = self.shared_experts is not None and (
             self.use_latent_moe or self.tp_size == 1
         )
+
+    def _apply_routed_norm_and_up_proj(
+        self, routed_output: torch.Tensor
+    ) -> torch.Tensor:
+        if self.routed_expert_norm is not None:
+            if self.fuse_routed_triton_mxfp4_quant:
+                from atom.models.deepseek_v2 import (
+                    _fuse_rmsnorm_quant,
+                    _mxfp4_activation_quant_layout,
+                )
+
+                shuffle, scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                    routed_output.shape[0]
+                )
+                (routed_output, routed_output_scale), _, _, _ = _fuse_rmsnorm_quant(
+                    routed_output,
+                    self.routed_expert_norm.weight,
+                    self.routed_expert_norm.eps,
+                    dtype_quant=dtypes.fp4x2,
+                    shuffle=shuffle,
+                    scale_shuffle_padding=scale_shuffle_padding,
+                )
+                return self.routed_expert_up_proj(
+                    routed_output, x_scale=routed_output_scale
+                )
+            routed_output = self.routed_expert_norm(routed_output)
+        if isinstance(routed_output, tuple):
+            routed_output, routed_output_scale = routed_output
+            return self.routed_expert_up_proj(
+                routed_output, x_scale=routed_output_scale
+            )
+        return self.routed_expert_up_proj(routed_output)
 
     def forward(
         self, hidden_states: torch.Tensor
@@ -513,15 +551,7 @@ class KimiSparseMoeBlock(nn.Module):
             # routed_expert_norm/up_proj are replicated, so the result stays full.
             if self.tp_size > 1:
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
-            if self.routed_expert_norm is not None:
-                routed_output = self.routed_expert_norm(routed_output)
-            if isinstance(routed_output, tuple):
-                routed_output, routed_output_scale = routed_output
-                routed_output = self.routed_expert_up_proj(
-                    routed_output, x_scale=routed_output_scale
-                )
-            else:
-                routed_output = self.routed_expert_up_proj(routed_output)
+            routed_output = self._apply_routed_norm_and_up_proj(routed_output)
         return routed_output
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -640,16 +670,7 @@ class KimiSparseMoeBlock(nn.Module):
                 current.wait_stream(alt)
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
 
-            if self.routed_expert_norm is not None:
-                routed_output = self.routed_expert_norm(routed_output)
-            if isinstance(routed_output, tuple):
-                routed_output, routed_output_scale = routed_output
-                routed_output = self.routed_expert_up_proj(
-                    routed_output,
-                    x_scale=routed_output_scale,
-                )
-            else:
-                routed_output = self.routed_expert_up_proj(routed_output)
+            routed_output = self._apply_routed_norm_and_up_proj(routed_output)
 
             if self.tp_size == 1:
                 current.wait_stream(alt)

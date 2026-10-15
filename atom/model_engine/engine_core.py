@@ -822,6 +822,9 @@ class EngineCore:
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
                 num_valid = len(valid_seqs)
+                for seq in valid_seqs:
+                    # Unconsumed if the seq never reached a prefix probe.
+                    seq.prompt_hash_chain = None
                 if num_valid > 0:
                     obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
                     socket.send(obj)

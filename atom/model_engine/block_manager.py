@@ -3,13 +3,15 @@
 
 import array
 import logging
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import islice
 from math import inf, isinf
 from time import monotonic
 from weakref import WeakKeyDictionary
 
 import numpy as np
-import xxhash
 
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
@@ -23,6 +25,13 @@ from atom.distributed.kv_events import (
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
+from atom.model_engine.prefix_hash import (
+    block_hash,
+    chained_block_hashes,
+    full_prompt_blocks,
+    hash_block_size_for,
+    prompt_fingerprint,
+)
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
@@ -107,6 +116,43 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
+# Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
+# older than this many is re-walked.
+_RECENT_INDEX_CHANGES = 8192
+
+# Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
+# from MIN to MAX; bounds the hashing wasted past the first miss.
+_WALK_HASH_ROUND_MIN = 64
+_WALK_HASH_ROUND_MAX = 1024
+
+
+@dataclass(slots=True)
+class _PrefixWalk:
+    """`_walk_prefix`'s contiguous HBM hit (`ids[i]` holds `hashes[i]`): what
+    `_evaluate` reads, the delayer memoises and, on the fast walk, `allocate`
+    claims (`_take_admission_walk` revalidates the claimed ids)."""
+
+    num_tokens: int
+    cache_seed: int
+    index_version: int
+    hashes: list[int]
+    ids: list[int]
+
+
+@dataclass(slots=True)
+class _CachedWalk:
+    """A walk memoised for `can_allocate_memoized`. `watched`: every hash
+    whose index entry it read (the hit and the first miss, `boundary_hash`,
+    None if the hit reaches the last reusable block)."""
+
+    walk: _PrefixWalk
+    index_clears: int
+    index_changes_seen: int
+    watched: set[int]
+    boundary_hash: int | None
+    boundary_id: int
+
+
 class BlockManager:
     def __init__(
         self,
@@ -130,16 +176,36 @@ class BlockManager:
         # Prefix-cache hashing / reuse granularity: under DCP one block_table
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
-        self.hash_block_size = self.block_size * self.dcp_world_size
+        self.hash_block_size = hash_block_size_for(self.block_size, self.dcp_world_size)
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Content hashes only: pool hits and resource fit are always rechecked.
-        # Weak keys keep this scheduler-side cache out of request serialization.
-        self._prefill_probe_hashes: WeakKeyDictionary[
-            Sequence, tuple[int, list[int]]
-        ] = WeakKeyDictionary()
+        # Each seq's prompt-block hash chain, as `(cache_seed, chain)`
+        # (`_prompt_hashes`). Content hashes only: pool hits and resource fit
+        # are always rechecked. Weak keys keep this scheduler-side cache out of
+        # request serialization.
+        self._prompt_hash_chains: WeakKeyDictionary[Sequence, tuple[int, list[int]]] = (
+            WeakKeyDictionary()
+        )
+        # `_adopt_shipped_chain` outcomes; rejections should stay at 0.
+        self.shipped_chains_adopted: int = 0
+        self.shipped_chains_rejected: int = 0
         self.total_evicted_blocks: int = 0
+        # `can_allocate_memoized`'s memo, validated against the hashes
+        # evicted or remapped since (`_note_index_change`) and `clear_cache`.
+        self._cached_walks: WeakKeyDictionary[Sequence, _CachedWalk] = (
+            WeakKeyDictionary()
+        )
+        self._recent_index_changes: deque[int] = deque(maxlen=_RECENT_INDEX_CHANGES)
+        self._index_changes = 0
+        self._index_clears = 0
+        self.walk_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
+        # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
+        self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
+        # Each seq's last fast walk, for its `allocate` to claim.
+        self._admission_walks: WeakKeyDictionary[Sequence, _PrefixWalk] = (
+            WeakKeyDictionary()
+        )
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -154,6 +220,7 @@ class BlockManager:
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
+            on_remap=self._note_index_change,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -396,17 +463,7 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        # dtype pinned even though every caller now passes an `array("i")`:
-        # `np.array` infers int64 from a list and int32 from an array, so the
-        # digest used to depend on the caller's Python type. int64 is what
-        # lists gave, which leaves every hash recorded before that where it
-        # was -- and keeps a caller who does pass a list from silently
-        # computing a different one.
-        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
-        return h.intdigest()
+        return block_hash(token_ids, prefix)
 
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
@@ -452,6 +509,11 @@ class BlockManager:
                 totals[k] = totals.get(k, 0) + v
         return totals
 
+    def _note_index_change(self, h: int) -> None:
+        """`h` left the KV index or moved to another block id."""
+        self._index_changes += 1
+        self._recent_index_changes.append(h)
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
@@ -462,6 +524,7 @@ class BlockManager:
         can reach and spends live ones to make room for them.
         """
         self.total_evicted_blocks += 1
+        self._note_index_change(h)
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
@@ -680,6 +743,73 @@ class BlockManager:
         rewrites the blocks past it the load would have filled.
         """
         seq.replay_kv_load = False
+
+    def _prompt_hashes(self, seq: Sequence) -> list[int]:
+        """`seq`'s prompt-block hash chain, computed once per `cache_seed`;
+        starts from the frontend's when it checks out (`_adopt_shipped_chain`)."""
+        seed = seq.cache_seed
+        cached = self._prompt_hash_chains.get(seq)
+        if cached is None or cached[0] != seed:
+            cached = (seed, self._adopt_shipped_chain(seq))
+            self._prompt_hash_chains[seq] = cached
+        return cached[1]
+
+    def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
+        """The frontend's chain for `seq` (consumed), or `[]` to hash here.
+        Adopted only if it was minted for this block size and seed from these
+        prompt tokens (`prompt_fingerprint`), and its first, middle and last
+        links rehash equal here (the same hash function). Then trusted whole:
+        walks, `allocate` and `hash_blocks` read it."""
+        shipped = getattr(seq, "prompt_hash_chain", None)
+        if shipped is None:
+            return []
+        seq.prompt_hash_chain = None
+        hbs, seed = self.hash_block_size, seq.cache_seed
+        n = full_prompt_blocks(seq, hbs)
+        packed = shipped.hashes
+        if (shipped.hash_block_size, shipped.cache_seed, len(packed)) != (hbs, seed, n):
+            return self._reject_shipped_chain(
+                f"minted for hash block {shipped.hash_block_size}, seed "
+                f"{shipped.cache_seed}, {len(packed)} blocks; this engine wants "
+                f"{hbs}, {seed}, {n}"
+            )
+        if (shipped.num_prompt_tokens, shipped.fingerprint) != (
+            seq.num_prompt_tokens,
+            prompt_fingerprint(seq),
+        ):
+            return self._reject_shipped_chain("it was minted from other tokens")
+        chain = packed.tolist()
+
+        def link_holds(i: int) -> bool:
+            prev = chain[i - 1] if i else seed
+            return chain[i] == self.compute_hash(self._hash_block_tokens(seq, i), prev)
+
+        if n and not all(map(link_holds, {0, n // 2, n - 1})):
+            return self._reject_shipped_chain("its hashes differ from this engine's")
+        self.shipped_chains_adopted += 1
+        return chain
+
+    def _reject_shipped_chain(self, why: str) -> list[int]:
+        # Warn once: a frontend/engine mismatch repeats on every request.
+        if not self.shipped_chains_rejected:
+            logger.warning(
+                "Prefix cache: rehashing a prompt chain the frontend shipped, "
+                "%s. Prefix hits are unaffected; the scheduler thread pays "
+                "the hashing.",
+                why,
+            )
+        self.shipped_chains_rejected += 1
+        return []
+
+    def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
+        """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
+        from or appended to `chain` (`_prompt_hashes`, full prompt blocks)."""
+        if i < len(chain):
+            return chain[i]
+        h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
+        if i == len(chain) and i < full_prompt_blocks(seq, self.hash_block_size):
+            chain.append(h)
+        return h
 
     def _gated_hit(
         self,
@@ -904,10 +1034,13 @@ class BlockManager:
         boundary addressable. Resumes from the last APPENDED hash: on a miss the
         caller's loop variable holds a hash that is not in the chain.
         """
+        prompt = self._prompt_hashes(seq)
+        # `block_hashes` is a prefix of the prompt chain: continue it in one slice.
         chain = list(block_hashes)
+        chain += prompt[len(chain) : blocks]
         h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            h = self._block_hash(seq, prompt, i, h)
             chain.append(h)
         return chain
 
@@ -924,7 +1057,6 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
-        reuse_hashes: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
@@ -935,6 +1067,8 @@ class BlockManager:
         demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
+        `_admission_walk` then `_evaluate`; `can_allocate_memoized` evaluates a
+        memoised walk the same way.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -946,14 +1080,23 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
+        return self._evaluate(seq, self._admission_walk, record, block_hashes)
+
+    def _evaluate(
+        self,
+        seq: Sequence,
+        walk_of: Callable[[Sequence], _PrefixWalk],
+        record: bool,
+        block_hashes: list[int] | None,
+    ) -> int:
+        """`can_allocate` over the walk `walk_of(seq)` returns; everything but
+        the walk is asked afresh on every call."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
         # gating on one slot would admit a request the pool cannot give a
         # rollback set to.
-        if block_hashes is None:
-            block_hashes = []
-        else:
+        if block_hashes is not None:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
@@ -964,28 +1107,12 @@ class BlockManager:
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = seq.cache_seed
-        compressed_hit = 0
-        cached_hashes = None
-        if reuse_hashes:
-            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
-            if seed != h:
-                cached_hashes = []
-            self._prefill_probe_hashes[seq] = (h, cached_hashes)
-        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            if cached_hashes is not None and i < len(cached_hashes):
-                h = cached_hashes[i]
-            else:
-                h = self.compute_hash(token_ids, h)
-                if cached_hashes is not None and i < immutable_blocks:
-                    cached_hashes.append(h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        walk = walk_of(seq)
+        if block_hashes is None:
+            block_hashes = walk.hashes  # read, never extended, below
+        else:
+            block_hashes += walk.hashes
+        compressed_hit = len(walk.hashes)
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -1009,10 +1136,9 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = self._n_hash_blocks(seq)
-        for i in range(num_cached_blocks):
-            if self.kv.is_used(self.kv.lookup(block_hashes[i])):
-                num_new_blocks -= 1
+        num_new_blocks = self._n_hash_blocks(seq) - self.kv.count_used(
+            walk.ids, num_cached_blocks
+        )
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
@@ -1053,6 +1179,170 @@ class BlockManager:
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
+    def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
+        """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        prompt = self._prompt_hashes(seq)
+        if self.fast_prefix_walk:
+            hashes, ids = self._hit_walk(seq, prompt)
+        else:
+            hashes, ids, h = [], [], seq.cache_seed
+            for i in range(self._n_hash_blocks(seq) - 1):
+                h = self._block_hash(seq, prompt, i, h)
+                block_id = self.kv.lookup(h)
+                if block_id == -1 or self.kv.block(block_id).token_ids != (
+                    self._hash_block_tokens(seq, i)
+                ):
+                    break
+                hashes.append(h)
+                ids.append(block_id)
+        return _PrefixWalk(
+            seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
+        )
+
+    def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
+        """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
+        (`_take_admission_walk`)."""
+        walk = self._walk_prefix(seq)
+        if self.fast_prefix_walk:
+            self._admission_walks[seq] = walk
+        return walk
+
+    def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
+        """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
+
+        Resolves the chain with one `map`, hashing ahead in rounds past the
+        cached prompt chain. Tokens are compared on the last hit block only:
+        indexed contents cannot change (`publish` writes fresh blocks,
+        `allocate` unindexes first), so a mismatch is a 64-bit hash collision,
+        and then every block is compared as the per-block walk did. A collision
+        on an interior block alone goes undetected (vLLM compares none).
+        """
+        n = self._n_hash_blocks(seq) - 1
+        get = self.kv.index_get
+        hashes: list[int] = []
+        ids: list = []
+        hash_round = _WALK_HASH_ROUND_MIN
+        while len(hashes) < n:
+            k = len(hashes)
+            if k < len(prompt):
+                new = prompt[k:n]
+            else:
+                end = min(n, k + hash_round)
+                new = chained_block_hashes(
+                    seq.token_ids,
+                    self.hash_block_size,
+                    k,
+                    end,
+                    hashes[-1] if k else seq.cache_seed,
+                )
+                if k == len(prompt):
+                    # Prompt blocks only: those past it can still change.
+                    full = full_prompt_blocks(seq, self.hash_block_size)
+                    prompt += new[: max(0, full - k)]
+                hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
+            new_ids = list(map(get, new))
+            try:
+                miss = new_ids.index(None)
+            except ValueError:
+                hashes += new
+                ids += new_ids
+                continue
+            hashes += new[:miss]
+            ids += new_ids[:miss]
+            break
+        last = len(ids) - 1
+        if last >= 0 and self.kv.block(ids[last]).token_ids != (
+            self._hash_block_tokens(seq, last)
+        ):
+            for i, block_id in enumerate(ids):
+                if self.kv.block(block_id).token_ids != self._hash_block_tokens(seq, i):
+                    del hashes[i:], ids[i:]
+                    break
+        return hashes, ids
+
+    def _take_admission_walk(self, seq: Sequence, blocks: int) -> _PrefixWalk | None:
+        """`seq`'s last fast walk if its first `blocks` ids, all `allocate`
+        claims, still hold (consumed either way). Past its `index_version` they
+        hold while their hashes still resolve to the same ids."""
+        walk = self._admission_walks.pop(seq, None)
+        if (
+            walk is None
+            or walk.num_tokens != seq.num_tokens
+            or walk.cache_seed != seq.cache_seed
+        ):
+            return None
+        k = min(blocks, len(walk.ids))
+        if walk.index_version != self.kv.index_version and (
+            list(map(self.kv.index_get, walk.hashes[:k])) != walk.ids[:k]
+        ):
+            return None
+        return walk
+
+    def can_allocate_memoized(self, seq: Sequence) -> int:
+        """`can_allocate(seq, record=False)` for the delayer and the DP chunk
+        cost, with the walk memoised per seq. The same `_evaluate`, so state
+        room, the gates, the replay, checkpoint demand/end, the used hit blocks
+        and the fit are re-asked on every call, and the answer is the exact
+        probe's.
+
+        The walk is reused while nothing it read moved: no `watched` hash was
+        evicted or remapped to another block (`_note_index_change`; more than
+        `_RECENT_INDEX_CHANGES` since the last check re-walks), no
+        `clear_cache`, the first miss still resolves the same (a hit only grows
+        by a publish of that hash), and token count and seed are unchanged.
+        """
+        walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
+        return self._evaluate(seq, walk_of, False, None)
+
+    def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
+        memo = self._cached_walks.get(seq)
+        if memo is not None and self._walk_still_valid(seq, memo):
+            return memo.walk
+        walk = self._walk_prefix(seq)
+        hit = len(walk.hashes)
+        boundary_hash = None
+        boundary_id = -1
+        if hit < self._n_hash_blocks(seq) - 1:
+            # Read back from the prompt chain, where the walk left it.
+            prev = walk.hashes[-1] if hit else seq.cache_seed
+            boundary_hash = self._block_hash(seq, self._prompt_hashes(seq), hit, prev)
+            boundary_id = self.kv.lookup(boundary_hash)
+        watched = set(walk.hashes)
+        if boundary_hash is not None:
+            watched.add(boundary_hash)
+        self._cached_walks[seq] = _CachedWalk(
+            walk=walk,
+            index_clears=self._index_clears,
+            index_changes_seen=self._index_changes,
+            watched=watched,
+            boundary_hash=boundary_hash,
+            boundary_id=boundary_id,
+        )
+        return walk
+
+    def _walk_still_valid(self, seq: Sequence, memo: _CachedWalk) -> bool:
+        """Whether the KV index still answers `memo`'s walk the same way. Costs
+        the index changes since the last check, not the prompt length."""
+        if (
+            memo.walk.num_tokens != seq.num_tokens
+            or memo.walk.cache_seed != seq.cache_seed
+            or memo.index_clears != self._index_clears
+        ):
+            return False
+        new = self._index_changes - memo.index_changes_seen
+        if new:
+            if new > len(self._recent_index_changes):
+                return False
+            watched = memo.watched
+            for h in islice(reversed(self._recent_index_changes), new):
+                if h in watched:
+                    return False
+            memo.index_changes_seen = self._index_changes
+        return (
+            memo.boundary_hash is None
+            or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
+        )
+
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
     ) -> None:
@@ -1077,6 +1367,8 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
+        # Admitted: the delayer no longer probes this seq.
+        self._cached_walks.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
         # it. `claim_blocks` is what it may point its block table at: every
@@ -1096,9 +1388,20 @@ class BlockManager:
         )
         h = seq.cache_seed
         hit_hash = -1
-        for i in range(claim_blocks):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+        # Claim the probe's ids as one run; the loop walks only the rest (a
+        # joint tail past the HBM hit, or everything if the walk is stale).
+        claimed = 0
+        walk = self._take_admission_walk(seq, claim_blocks)
+        if walk is not None and (claimed := min(claim_blocks, len(walk.ids))):
+            ids = walk.ids[:claimed]
+            self.kv.claim_many(ids)
+            seq.block_table.extend(ids)
+            h = walk.hashes[claimed - 1]
+            if cached := min(claimed, num_cached_blocks):
+                hit_hash = walk.hashes[cached - 1]
+        prompt = self._prompt_hashes(seq)
+        for i in range(claimed, claim_blocks):
+            h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:
                 # Evicted between `can_allocate` and here. For the widened joint
@@ -1746,9 +2049,15 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
+        # Prompt blocks the seq's chain covers (`_prompt_hashes`) are named
+        # from it; only the rest are hashed here.
+        known = self._prompt_hash_chains.get(seq)
+        known = known[1] if known and known[0] == seq.cache_seed else ()
+        if 0 < start <= len(known) and known[start - 1] != h:
+            known = ()
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = known[i] if i < len(known) else self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
@@ -2842,6 +3151,7 @@ class BlockManager:
         future requests."""
         self.kv.clear_index()
         self._state_checkpoint_cache.clear_index()
+        self._index_clears += 1
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 

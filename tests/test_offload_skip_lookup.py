@@ -515,7 +515,7 @@ def test_admission_walks_the_prefix_once_when_the_detach_is_probed(monkeypatch):
     monkeypatch.setattr(sched_mod.envs, "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", True)
     walks = []
 
-    def can_allocate(seq, *, record, block_hashes, reuse_hashes):
+    def can_allocate(seq, *, record, block_hashes):
         walks.append(record)
         block_hashes.extend([11, 12])
         return 2
