@@ -4,6 +4,8 @@
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -113,6 +115,82 @@ class PreparationTests(unittest.TestCase):
                 self.assertFalse(
                     any("numa_exec.py" in str(cmd) for cmd, _ in self.calls)
                 )
+
+    def test_clean_file_cache_can_cover_reserve_but_not_pool(self):
+        info = self.state["numa"][0]
+        info.update(
+            MemFree=1056 * PREP.GIB,
+            **{"Active(file)": 72 * PREP.GIB, "Inactive(file)": 342 * PREP.GIB},
+        )
+        self.assertEqual(self.prepare(), 0)
+        self.assertTrue(any("numa_exec.py" in str(cmd) for cmd, _ in self.calls))
+        for changes in (
+            {"MemFree": 1000 * PREP.GIB},
+            {"Dirty": 330 * PREP.GIB, "Writeback": 10 * PREP.GIB},
+        ):
+            with self.subTest(changes=changes):
+                self.calls.clear()
+                with patch.dict(info, changes):
+                    self.assertEqual(self.prepare(), 2)
+                self.assertEqual(self.result["status"], "insufficient_numa_free_memory")
+                self.assertFalse(
+                    any("numa_exec.py" in str(cmd) for cmd, _ in self.calls)
+                )
+
+    def test_agentic_prefill_prepares_before_starting_services(self):
+        source = (SCRIPTS / "pd_server_atom.sh").read_text()
+        start = source.index("start_prefill() {")
+        setup = source[start : source.index("  start_mooncake_store\n", start)]
+        script = (
+            setup
+            + """
+  echo START_SERVICES
+}
+apply_role_env() { :; }
+reset_lmcache_disk() { :; }
+python3() { printf '%s\n' "$*"; return "$TEST_PREP_RC"; }
+start_prefill prefill-rank-0
+"""
+        )
+        for enabled, rc in (("true", 0), ("true", 2), ("false", 0)):
+            with self.subTest(enabled=enabled, rc=rc):
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script],
+                    env={
+                        **os.environ,
+                        "PREFILL_PORT": "8010",
+                        "HANDSHAKE_PORT": "6301",
+                        "PREFILL_DP_MASTER_PORT": "6200",
+                        "PREFILL_DP_BASE_PORT": "6210",
+                        "host_ip": "127.0.0.1",
+                        "SINGLE_NODE_PD": "1",
+                        "BENCHMARK_KIND": "aiperf_agentic",
+                        "LMCACHE_LOCAL_CPU": "True",
+                        "LMCACHE_MAX_LOCAL_CPU_SIZE": "256",
+                        "HIP_VISIBLE_DEVICES": "0,1,2,3",
+                        "ATOMESH_PREPARE_LMCACHE_HOST_MEMORY": enabled,
+                        "ATOMESH_SCRIPT_DIR": str(SCRIPTS),
+                        "MODEL_PATH": "/models/target model",
+                        "DRAFT_MODEL_PATH": "/models/draft model",
+                        "RUN_DIR": str(self.root),
+                        "TEST_PREP_RC": str(rc),
+                    },
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, rc, result.stderr)
+                if enabled == "true":
+                    self.assertIn("prepare_lmcache_host_memory.py", result.stdout)
+                    self.assertIn("--gpus 0,1,2,3 --per-gpu-gib 256", result.stdout)
+                    self.assertIn("--timeout 300 --step-timeout 90", result.stdout)
+                else:
+                    self.assertNotIn("prepare_lmcache_host_memory.py", result.stdout)
+                if rc == 0:
+                    self.assertTrue(result.stdout.endswith("START_SERVICES\n"))
+                else:
+                    self.assertNotIn("START_SERVICES", result.stdout)
 
     def test_deadline_prevents_starting_another_step(self):
         def run(*args):

@@ -91,7 +91,8 @@ reference and how to add a new metric.
 
 ## Collection lifecycle
 
-The workflow explicitly enables `ATOMESH_BUILD_MESH=true` for agentic cells.
+The workflow enables `ATOMESH_BUILD_MESH=true` for agentic cells unless the case
+sets `benchmark.mesh_source: image` to reuse a compatible image binary.
 Before launching the rank-0 service container, `../setup_mesh.sh` runs a separate
 build container using `../build_mesh.sh`. It builds the reviewed source with
 `ATOMESH_MESH_BUILD_PROFILE=release` (or an explicitly selected `ci` profile).

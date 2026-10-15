@@ -1856,15 +1856,15 @@ start_prefill() {
   reset_lmcache_disk
   if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
     local memory_local_cpu="${LMCACHE_LOCAL_CPU:-false}"
-    if [[ "${SINGLE_NODE_PD}" != "1" || "${BENCHMARK_KIND}" != "minimax_full_model_replay" || "${memory_local_cpu,,}" != "true" ]]; then
-      echo "ERROR: host-memory preparation requires the single-node LMCache replay" >&2
+    if [[ "${SINGLE_NODE_PD}" != "1" || "${memory_local_cpu,,}" != "true" ]]; then
+      echo "ERROR: host-memory preparation requires single-node PD with LMCache CPU storage" >&2
       return 2
     fi
     local -a memory_model_dirs=("${MODEL_PATH}")
     [[ -n "${DRAFT_MODEL_PATH}" ]] && memory_model_dirs+=("${DRAFT_MODEL_PATH}")
     python3 "${ATOMESH_SCRIPT_DIR}/prepare_lmcache_host_memory.py" \
       --gpus "${HIP_VISIBLE_DEVICES}" --per-gpu-gib "${LMCACHE_MAX_LOCAL_CPU_SIZE}" \
-      --attempts 3 --timeout 120 --step-timeout 35 --reserve-gib 128 \
+      --attempts 3 --timeout 300 --step-timeout 90 --reserve-gib 128 \
       --output "${RUN_DIR}/benchmark_results/lmcache-host-memory" \
       "${memory_model_dirs[@]}" || return $?
   fi

@@ -91,7 +91,8 @@ Mesh compilation for `minimax_full_model_replay`, avoiding Rust installation
 and the shared Cargo source cache that failed in run `38728945101`
 (`aws-lc-rs-1.18.2/Cargo.toml` missing). No cache deletion is needed.
 Recheck Mesh compatibility if the image or router source changes. Agentic
-benchmark cells still build their reviewed Mesh source.
+cells build their reviewed Mesh source unless they explicitly select
+`benchmark.mesh_source: image`, as the C32 case does.
 
 After all eight primers return, the client atomically creates `armed.json`.
 The prefill EngineCore continues receiving requests and draining idle connector
@@ -102,30 +103,8 @@ scheduler. Before dispatching any target GPU work it verifies request IDs,
 Unexpected requests, a 30-second admission timeout, or a shape mismatch fail the
 case; `gate-batch.json` records the observed shape. No dummy GPU barrier is added.
 
-The gated case also enables `benchmark.prepare_lmcache_host_memory`. Before
-starting either model service, it directly runs `sync` and writes `drop_caches=3`
-and `compact_memory=1` as the existing CI user, without sudo. If the direct
-operation is unavailable, it uses the existing `drop_page_cache.py`,
-`numa_exec.py`, and `compact_huge_pages.py` helpers. No container privileges are
-changed. The ordinary replay and other benchmark cases keep this preparation off.
-
-Preparation makes at most three serial attempts within a 120-second work budget,
-with at most 35 seconds per command and up to five additional seconds to reap a
-timed-out child. A child that cannot be reaped blocks model startup. The 20-minute
-Slurm allocation limit still includes this preparation. The current prefill GPU
-list and per-rank LMCache capacity determine each NUMA node's planned allocation;
-free memory and visible cgroup headroom must accommodate it plus 128 GiB reserve.
-Unknown cgroup capacity, insufficient memory, permission failures in the NUMA
-helper, or persistent partial THP coverage fail before model loading. Direct VM
-permission errors select the unprivileged helpers instead of repeating the same
-write. A successful preparation is not proof that later LMCache pinning is fast.
-
-Artifacts under `benchmark_results/lmcache-host-memory/` contain `summary.json`
-and each command's output, including before/after NUMA memory, buddyinfo, vmstat,
-cgroup limits and THP settings. File-cache eviction remains advisory; the existing
-helper's zero exit status alone is not used as proof of enough memory. The model
-and draft directories are both included. This phase does not release a live
-LMCache pool: old service processes must have exited before a new job starts.
+LMCache host-memory preparation is enabled on the original C32 AgentX benchmark,
+not on this diagnostic replay. See [the C32 setup](minimax_m3_c32_lmcache.md).
 
 `prepare_minimax_replay_debug.py` copies the read-only mounted `atom/` package
 into a fresh container-local `/tmp` directory and applies exact-anchor hooks

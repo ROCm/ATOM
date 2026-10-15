@@ -81,8 +81,19 @@ def capacity_error(state, planned, reserve_gib):
         info = state["numa"][node]
         if gib * GIB + reserve > info.get("MemTotal", 0):
             return "numa_capacity_exceeded"
-        # Do not deliberately force a TiB-scale allocation into direct reclaim.
-        if gib * GIB + reserve > info.get("MemFree", 0):
+        # The pool itself must fit in free memory before first-touch. The
+        # additional reserve may include clean file cache that can be reclaimed;
+        # requiring the reserve to be free too rejected a node with 1056 GiB
+        # free plus 414 GiB file cache for a 1024 GiB pool.
+        free = info.get("MemFree", 0)
+        clean_file_cache = max(
+            0,
+            info.get("Active(file)", 0)
+            + info.get("Inactive(file)", 0)
+            - info.get("Dirty", 0)
+            - info.get("Writeback", 0),
+        )
+        if gib * GIB > free or gib * GIB + reserve > free + clean_file_cache:
             return "insufficient_numa_free_memory"
     if not state["cgroup"]:
         return "cgroup_memory_unknown"
