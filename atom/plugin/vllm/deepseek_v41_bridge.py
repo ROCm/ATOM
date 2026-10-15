@@ -1580,9 +1580,21 @@ def _v41_live_step_inputs(
             max_reqs=builder.max_bs,
         )
         return snapshot, batch, batch.total_seqs_num, running_tokens, True
+    # The same three-source test the builder path uses, not the request-id one
+    # alone. Asking the ids by themselves is an inference about the batch, and
+    # `apply_vllm_dummy_run_patch` exists because four such inferences were
+    # each wrong: V2's dummy batches carry unique ids, so this read one as real
+    # traffic and handed it the STATE slots real requests hold.
+    from atom.plugin.vllm.vllm_runtime import in_dummy_run
+
+    synthetic = (
+        in_dummy_run()
+        or torch.cuda.is_current_stream_capturing()
+        or _v41_request_ids_are_synthetic(snapshot)
+    )
     slots = (
         v41_capture_state_slots(int(snapshot.num_reqs), vllm_config)
-        if _v41_request_ids_are_synthetic(snapshot)
+        if synthetic
         else _v41_request_state_slots(snapshot, vllm_config)
     )
     batch = _v41_scheduled_batch(snapshot, slots=slots)
