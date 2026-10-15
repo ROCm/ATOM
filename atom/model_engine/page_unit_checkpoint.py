@@ -1008,6 +1008,9 @@ class PagedStateCheckpointCoordinator:
         # *same* hash still collapses, which is what the hash in the key is
         # for -- that is one boundary reached twice, not two boundaries.
         self._pending: dict[tuple[int, int], tuple[Sequence, int]] = {}
+        # Boundaries whose forward is in the batch being built, held back from
+        # that batch's drain; see `checkpoint_when_scheduled`.
+        self._staged: dict[tuple[int, int], tuple[Sequence, int]] = {}
         self._store_ops: list[CheckpointStoreOp] = []
         # External loads write temporary PAGE images before a runner gathers
         # them into an Active Slot. Owners include a transfer generation, so a
@@ -1169,6 +1172,20 @@ class PagedStateCheckpointCoordinator:
             self._supersede(id(seq))
             self._pending[(id(seq), h)] = (seq, h)
 
+    def checkpoint_when_scheduled(self, seq: Sequence, h: int) -> None:
+        """File a boundary whose forward is in the batch being built.
+
+        That batch's own drain must not take it: its copy runs before the
+        forward that fills the slot. Staged here, it becomes pending once the
+        drain has passed, so the *next* batch carries the copy -- after the
+        boundary's forward and before anything later, on every stage, since
+        each runs its batches in order. With several forwards in flight this is
+        the only point the slot is known to be read at the right moment: by
+        retire, the chunk after the boundary has been issued and written it.
+        """
+        if self.applies(seq) and seq.state_slot >= 0:
+            self._staged[(id(seq), h)] = (seq, h)
+
     def _supersede(self, seq_id: int) -> None:
         """Drop this seq's earlier pending boundaries; the slot has moved on.
 
@@ -1188,8 +1205,9 @@ class PagedStateCheckpointCoordinator:
         that is about to go back on the free list, so all of them die with it.
         """
         seq_id = id(seq)
-        for key in [k for k in self._pending if k[0] == seq_id]:
-            del self._pending[key]
+        for filed in (self._pending, self._staged):
+            for key in [k for k in filed if k[0] == seq_id]:
+                del filed[key]
         self.store.cancel_queued_restore(seq.state_slot)
 
     def restore_queued_for(self, dst_slot: int) -> bool:
@@ -1225,6 +1243,7 @@ class PagedStateCheckpointCoordinator:
             self._take_scratch_stores(
                 self._max_ops_per_batch - len(self._store_ops) - len(restores)
             )
+        self._pending, self._staged = self._staged, {}
         stores, self._store_ops = self._store_ops, []
         return tuple(stores), restores
 
@@ -1362,9 +1381,12 @@ class PagedStateCheckpointCoordinator:
         # `_pending` is keyed by `(seq, hash)`, so one hash can be pending for
         # several sequences at once -- two turns of a conversation reaching the
         # same boundary. All of them lose it together.
-        stale = [key for key, (_, pending_h) in self._pending.items() if pending_h == h]
-        for key in stale:
-            del self._pending[key]
+        stale = 0
+        for filed in (self._pending, self._staged):
+            keys = [key for key, (_, filed_h) in filed.items() if filed_h == h]
+            for key in keys:
+                del filed[key]
+            stale += len(keys)
         removed = self.store.unindex(h)
         if stale or removed:
             self.checkpoints_orphaned += 1
@@ -1381,6 +1403,7 @@ class PagedStateCheckpointCoordinator:
         `checkpoints_kept`'s growth rate, and in the admin call itself.
         """
         self._pending.clear()
+        self._staged.clear()
         self.store.clear()
 
     def checkpoint_fates(self) -> dict[str, int]:
