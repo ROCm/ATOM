@@ -643,6 +643,10 @@ class AttentionMetaData:
     kv_indices: torch.Tensor | None = None
     qo_indptr: torch.Tensor | None = None
     kv_last_page_lens: torch.Tensor | None = None
+    # Physical page64 CSR for shuffled QH64 ASM; token CSR stays independent.
+    mla_page_indptr: torch.Tensor | None = None
+    mla_page_indices: torch.Tensor | None = None
+    mla_page_last_lens: torch.Tensor | None = None
     cu_seqlen_ks: torch.Tensor | None = None
     cu_seqlen_ke: torch.Tensor | None = None
     sparse_kv_indptr: torch.Tensor | None = None
@@ -715,6 +719,9 @@ class AttentionMetaData:
         kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        mla_page_indptr: torch.Tensor | None = None,
+        mla_page_indices: torch.Tensor | None = None,
+        mla_page_last_lens: torch.Tensor | None = None,
     ):
         self.has_cached = has_cached
         self.total_kv = total_kv
@@ -736,6 +743,9 @@ class AttentionMetaData:
         self.kv_indices = kv_indices
         self.qo_indptr = qo_indptr
         self.kv_last_page_lens = kv_last_page_lens
+        self.mla_page_indptr = mla_page_indptr
+        self.mla_page_indices = mla_page_indices
+        self.mla_page_last_lens = mla_page_last_lens
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr

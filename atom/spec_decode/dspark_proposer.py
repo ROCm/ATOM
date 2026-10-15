@@ -954,6 +954,16 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
 
+        builder = getattr(self.runner, "attn_metadata_builder", None)
+        if getattr(builder, "use_shuffled_asm_page_csr", False):
+            # QH64 supports truly empty padding rows. Rebuild page CSR once
+            # for this bidirectional block, independently of the token CSR.
+            lengths = torch.where(slots[:, 0] >= 0, ctx_lens, 0)
+            attn_metadata.__dict__.update(
+                builder.prepare_shuffled_page_metadata(lengths, block_tables)
+            )
+            return
+
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
 

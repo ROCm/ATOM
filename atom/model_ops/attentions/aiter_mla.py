@@ -15,6 +15,7 @@ from aiter import (
     get_mla_metadata_info_v1,
     get_mla_metadata_v1,
 )
+from aiter.mla import mla_decode_prepare_page_csr
 
 from atom.distributed.dcp_utils import (
     NONPS_MAX_Q_ROWS,
@@ -48,6 +49,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
+    shuffled_asm_page_csr_supported,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -427,6 +429,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self.use_shuffled_asm_page_csr = (
+            self.kv_shuffled
+            and not envs.ATOM_USE_TRITON_MLA
+            and not self.is_sparse
+            and self.dcp_world_size == 1
+            and shuffled_asm_page_csr_supported(
+                self.padded_num_attention_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                config.torch_dtype,
+                hf_config.kv_lora_rank,
+                hf_config.qk_rope_head_dim,
+                model_runner.block_size,
+            )
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
         # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
@@ -740,6 +757,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         self.model_runner.forward_vars.update(mla_metadata)
+        if self.use_shuffled_asm_page_csr:
+            self._allocate_shuffled_page_buffers()
         if self.is_sparse:
             self.model_runner.forward_vars["batch_id_per_q_token"].publication_group = (
                 "mla_tokens"
@@ -848,6 +867,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
+            if self.use_shuffled_asm_page_csr:
+                self._allocate_shuffled_page_buffers(p)
             host_i32 = dict(i32_kwargs, publication_group=f"{p}mla_metadata")
             host_i64 = dict(i64_kwargs, publication_group=f"{p}mla_metadata")
             var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
@@ -1093,6 +1114,38 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "reduce_partial_map": reduce_partial_map,
         }
 
+    def _allocate_shuffled_page_buffers(self, prefix=""):
+        # Device-written scheduling outputs, with stable addresses for graph
+        # replay and independent storage for TBO and the forward_vars PP ring.
+        # CpuGpuBuffer lets the ring clone these; the host halves are unused.
+        var = self.model_runner.forward_vars
+        sizes = {
+            "mla_page_indptr": self.max_bs + 1,
+            "mla_page_indices": self.max_bs * self.block_table_cols,
+            "mla_page_last_lens": self.max_bs,
+        }
+        for name, size in sizes.items():
+            var[prefix + name] = CpuGpuBuffer(
+                size, dtype=torch.int32, device=self.device, pin_memory=False
+            )
+
+    def prepare_shuffled_page_metadata(self, seq_lens, block_tables, prefix=""):
+        """Publish independent page CSR on the caller's preparation stream."""
+        if not self.use_shuffled_asm_page_csr:
+            return {}
+        var = self.model_runner.forward_vars
+        batch = seq_lens.numel()
+        indptr = var[prefix + "mla_page_indptr"].gpu[: batch + 1]
+        # Fixed capacity makes updates replayable without reading a GPU cumsum.
+        indices = var[prefix + "mla_page_indices"].gpu[: batch * block_tables.shape[1]]
+        last = var[prefix + "mla_page_last_lens"].gpu[:batch]
+        mla_decode_prepare_page_csr(seq_lens, block_tables, indptr, indices, last)
+        return {
+            "mla_page_indptr": indptr,
+            "mla_page_indices": indices,
+            "mla_page_last_lens": last,
+        }
+
     def prepare_mtp_decode(
         self,
         bs: int,
@@ -1246,6 +1299,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # The two branches above pass no counts and so take the row count.
             result = self.set_mla_persistent_worker_buffers(
                 bs, max_seqlen_q, only_update, num_reject_tokens
+            )
+        if self.use_shuffled_asm_page_csr:
+            # kv_indptr already includes rejection and this draft token. The
+            # context_lens mirror need not include the same rejection yet.
+            # Eagle refreshes slot_mapping AFTER this call; its current flat
+            # target-query view cannot identify the padded draft rows.
+            lengths = torch.where(
+                self.row_ids[:running_bs] < bs,
+                kv_indptr[1:] - kv_indptr[:-1],
+                0,
+            )
+            result.update(
+                self.prepare_shuffled_page_metadata(
+                    lengths, var["block_tables"].gpu[:running_bs]
+                )
             )
         return result
 
@@ -2809,6 +2877,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # A view: `publish_cu_seqlens_q` already uploaded it this step, and
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
+        ctx.update(
+            self.prepare_shuffled_page_metadata(
+                ctx["context_lens"], ctx["block_tables"]
+            )
+        )
 
         if is_sparse_mtp:
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
@@ -3028,6 +3101,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.block_ratio,
                 ub_max_seqlen_k,
             )
+            self.prepare_shuffled_page_metadata(
+                var[f"{p}context_lens"].gpu[:running_bs],
+                var[f"{p}block_tables"].gpu[:running_bs],
+                p,
+            )
 
             self._set_ubatch_mla_buffers(
                 running_bs,
@@ -3040,6 +3118,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self, running_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
     ):
         """Compute MLA work buffers for a per-ubatch forward_vars set."""
+        if self.kv_shuffled:
+            return
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 
@@ -3156,6 +3236,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
+        attn_matadata.__dict__.update(
+            self.prepare_shuffled_page_metadata(
+                attn_matadata.context_lens, attn_matadata.block_tables
+            )
+        )
         # Attach the round-robin CP global kv_indptr for the captured graph so
         # replay (which overwrites the buffer with real values) matches. Only
         # consumed by _forward_decode when dcp>1 and max_q_len>1.
@@ -3253,6 +3338,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         attn.dtype_q = self.dtype_q
+        if self.use_shuffled_asm_page_csr:
+            # _prepare_ubatch_decode publishes these each scheduling step.
+            attn.mla_page_indptr = var[p + "mla_page_indptr"].gpu[: running_bs + 1]
+            attn.mla_page_indices = var[p + "mla_page_indices"].gpu[
+                : running_bs * self.block_table_cols
+            ]
+            attn.mla_page_last_lens = var[p + "mla_page_last_lens"].gpu[:running_bs]
         # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
         # by _forward_decode when dcp>1 and max_q_len>1 (MTP).
         attn.g_kv_indptr = (
