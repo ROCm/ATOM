@@ -15,8 +15,8 @@ start_benchmark_bundle() {
   fi
   if [[ "$kind" == agentic ]]; then
     local -a harness_identity=()
-    mapfile -t harness_identity < <(PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "${AIPERF_VENV}/bin/python" -c \
-      'from atom.benchmarks.results.metadata import installed_package; h=installed_package("aiperf"); print(h["version"] or ""); print(h["sha"] or "")')
+    mapfile -t harness_identity < <(PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" "${AGENTX_VENV}/bin/python" -c \
+      'from atom.benchmarks.results.metadata import installed_package; h=installed_package("agentx-harness"); print(h["version"] or ""); print(h["sha"] or "")')
     export ATOM_HARNESS_VERSION="${harness_identity[0]:-}"
     export ATOM_HARNESS_SHA="${harness_identity[1]:-}"
   fi
