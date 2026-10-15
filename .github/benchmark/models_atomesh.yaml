@@ -1036,6 +1036,40 @@ models:
               <<: *kimi_k3_agentic_agg_pp8_decode_env
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
 
+        # The 1P1D C72 cell with its prefill node split into eight PP stages of
+        # one GPU instead of one TP8xDCP8 group. Decode, workload and the
+        # prefill's 192 GiB LMCache tier are unchanged; each stage pushes its
+        # own layers' MLA KV and KDA state straight to the decode ranks.
+        - <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-agentic-lmcache-1m-c72
+          topology: 1p1d_pp8_dcp8
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8
+          concurrency: [72]
+          prefill:
+            workers: 1
+            tp: 1
+            # The last --online_quant_config wins: unsharded, the KDA gate GEMM
+            # stays bf16 as in the aggregated PP8 cells, while the decode keeps
+            # the common config. No spaces, since the launcher word-splits this.
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 144
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "0"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+              # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+          run_eval: true
+          eval_concurrency: [72]
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
