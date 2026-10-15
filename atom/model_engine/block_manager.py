@@ -642,17 +642,44 @@ class BlockManager:
     def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
         """`hit` widened to `compressed_hit` when replaying is cheaper.
 
-        Resuming from the checkpoint at `hit` recomputes `compressed_hit - hit`
-        blocks; replaying recomputes `state_replay_tokens`. Records on `seq`
-        whether the hit it returns replays (`replay_start`).
+        Without a replay the forward resumes at the checkpoint `hit`, or at the
+        LMCache MP hit (`kv_prefix_tokens`) if that is further, which brings its
+        state image along. A replay resumes `state_replay_tokens` below the
+        furthest full-attention KV: the HBM `compressed_hit`, or LMCache's
+        KV-only reach (`kv_only_tokens`) when that is further, in which case
+        the connector loads the KV past the HBM hit first (`replay_kv_load`).
+        Records on `seq` whether the hit it returns replays (`replay_start`).
         """
         hbs = self.hash_block_size
-        seq.replays_hit = bool(
-            self.state_replay_tokens
-            and seq.has_per_req_cache
-            and (compressed_hit - hit) * hbs > self.state_replay_tokens
-        )
-        return compressed_hit if seq.replays_hit else hit
+        seq.replays_hit = seq.replay_kv_load = False
+        if not self.state_replay_tokens or not seq.has_per_req_cache:
+            return hit
+        # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
+        # LMCache figure counts unless it clears that above where it starts.
+        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        resume = hit * hbs
+        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if tier_hit - resume >= min_load:
+            resume = tier_hit
+        in_hbm = compressed_hit * hbs
+        end = in_hbm
+        tier_kv = int(seq.offload_joint.kv_only_tokens or 0)
+        if tier_kv - in_hbm >= min_load:
+            end = tier_kv
+        if end - resume <= self.state_replay_tokens:
+            return hit
+        seq.replays_hit = True
+        seq.replay_kv_load = end > in_hbm
+        return compressed_hit
+
+    def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
+        """A replay's KV-only load will not run: replay below the HBM hit.
+
+        The state slot is fresh (`allocate` restored no checkpoint), so the HBM
+        hit is no place to resume; the forward replays below it instead, and
+        rewrites the blocks past it the load would have filled.
+        """
+        seq.replay_kv_load = False
 
     def _gated_hit(
         self,
@@ -1062,6 +1089,7 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
+        requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
@@ -1115,6 +1143,9 @@ class BlockManager:
             # A replay starts from a fresh state slot, never a checkpoint: it
             # rebuilds the state below whatever the claim above reached.
             hit_hash = -1
+            if num_cached_blocks < requested_blocks:
+                # A KV-only load past the hit would start above a gap.
+                seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -2700,7 +2731,7 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         seq.replay = None
-        seq.replays_hit = False
+        seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.

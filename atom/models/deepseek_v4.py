@@ -206,19 +206,33 @@ def v4_attention_with_output(
 v4_attn_runner = CudagraphCaptureRunner()
 
 
-def _v4_attn_compress_fake(x: torch.Tensor, layer_name: str) -> None:
+def _v4_attn_compress_fake(
+    x: torch.Tensor,
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
+    layer_name: str,
+) -> None:
     return None
 
 
 @mark_spliting_op(is_custom=True, gen_fake=_v4_attn_compress_fake, mutates_args=[])
-def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
+def v4_attn_compress(
+    x: torch.Tensor,
+    idx_q_quant: torch.Tensor | None,
+    idx_weights: torch.Tensor | None,
+    idx_q_scale: torch.Tensor | None,
+    layer_name: str,
+) -> None:
     """The split point, and the ONE batch-shaped kernel: the compressor.
 
     Its grid is `plan_gpu.shape[0] = graph_bs * per_seq_bound`, which is why
     this graph keys on `(layer, num_tokens, bucket_bs, q_eff)` while a dense
-    piece keys on num_tokens alone. The indexer top-k is token-shaped on both
-    the FP8 and FP4 paths, so it sits in `_sparse_attention` with the rest of
-    that granularity.
+    piece keys on num_tokens alone. The gfx950 FP4 decode scorer is batch-shaped
+    too -- its row-group launch is planned from the sequence count and the
+    query span -- so it runs here as well, after the compressor has written the
+    index rows it reads (`_attn_compress`). Every other indexer top-k is
+    token-shaped and stays in `_sparse_attention`.
 
     It returns NOTHING, and does not need to: a split op's submodule is the one
     piece the backend leaves uncompiled (`backends.py`, `submod_names_to_compile`
@@ -249,6 +263,9 @@ def v4_attn_compress(x: torch.Tensor, layer_name: str) -> None:
         capture=self.attn_ffn_piecewise,
         forward_context=fc,
         x=x,
+        idx_q_quant=idx_q_quant,
+        idx_weights=idx_weights,
+        idx_q_scale=idx_q_scale,
     )
 
 
@@ -1735,6 +1752,29 @@ class Indexer(nn.Module):
             q_quant, weights, q_scale, self.prefix, self.index_topk
         )  # [total_tokens, index_topk] int32
 
+    def score_decode_topk_into(
+        self,
+        q_fp4: torch.Tensor,
+        weights: torch.Tensor,
+        q_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        """The gfx950 FP4 decode top-k, written straight into `out`.
+
+        For `DeepseekV4Attention._attn_compress`, which runs in a split op --
+        already eager or its own graph -- so it calls the scorer directly
+        rather than through the opaque `indexer_score_topk` op, and hands it
+        the fixed buffer the dense piece downstream reads, instead of copying
+        a fresh result into it."""
+        self._score_topk_decode_fp4_flydsl(
+            q_fp4,
+            q_scale,
+            get_forward_context().attn_metadata.block_tables,
+            weights,
+            self.index_topk,
+            out=out,
+        )
+
     def indexer_score_topk(
         self,
         q_quant: torch.Tensor,  # [total_tokens, n_heads, head_dim] — FP8, or packed FP4 (uint8) when the FP4 indexer is on
@@ -2301,6 +2341,7 @@ class Indexer(nn.Module):
         block_tables: torch.Tensor,  # [bs, max_blocks_per_seq] int32
         weights: torch.Tensor,  # [padded_tokens, n_heads] fp32
         topk: int,
+        out: torch.Tensor | None = None,  # [>= padded_tokens, topk] int32
     ) -> torch.Tensor:
         """RAGGED decode FP4 via `flydsl_pa_mqa_logits_fp4` with
         `query_start_loc`, which at 64-row pages runs the row-group kernel: a
@@ -2315,23 +2356,21 @@ class Indexer(nn.Module):
         out by), zero on the pad tail, so pad rows get top-k -1 (ignored
         downstream).
 
-        Native decode keeps the sequence capacity and query-span bound fixed
-        for each token bucket. The builder refreshes its complete boundary
-        buffer every forward, including empty slots, so a token-count graph
-        can replay another sequence layout with the same launch and addresses.
+        The launch is planned from the sequence count and `max_seqlen_q`, so it
+        must run where both are part of the graph key (see below).
         """
         device = q_fp4.device
         padded_tokens = q_fp4.size(0)
         attn_metadata = get_forward_context().attn_metadata
         local_ends = attn_metadata.csa_n_committed_per_token[:padded_tokens]
-        # Native decode publishes a token-bucket-sized view and a fixed query
-        # span, so the launch captured inside a dense piece remains valid when
-        # the sequence layout changes. Other callers keep their own metadata.
-        ragged = (attn_metadata.indexer_meta or {}).get("fp4_decode")
-        if ragged is None:
-            ragged = Fp4MqaRaggedMetadata(
-                attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
-            )
+        # The step's own sequences. The row-group launch is planned from their
+        # count and `max_seqlen_q`, so a captured one is only valid for steps
+        # with the same two: FULL keys its graph on `(running_bs, max_q_len)`
+        # and narrow PIECEWISE scores inside `_attn_compress`, whose graph keys
+        # on the same bucket. Never from a num_tokens-keyed dense piece.
+        ragged = Fp4MqaRaggedMetadata(
+            attn_metadata.cu_seqlens_q, attn_metadata.max_seqlen_q, block_tables
+        )
         # Fixed logits width → static `[padded, W]` shape (CG-capturable), same as
         # the rectangular decode path.
         max_seq_len = self._max_model_len_idx
@@ -2369,7 +2408,11 @@ class Indexer(nn.Module):
         )  # [padded_tokens, max_seq_len] fp32, seq-local
         # Seq-local output → indices returned directly. top_k writes every row
         # (real + empty pad rows → -1), so a bare torch.empty output is fine.
-        topk_out = torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+        topk_out = (
+            torch.empty((padded_tokens, topk), dtype=torch.int32, device=device)
+            if out is None
+            else out[:padded_tokens]
+        )
         # DECODE top-k: every row's window starts at 0, the `rowStart == 0`
         # this entry assumes. The prefill entry dispatches on
         # `topk_use_mulblocks(rows, stride0)` with `stride0 =
@@ -2826,7 +2869,9 @@ class DeepseekV4Attention(nn.Module):
 
         # Batch-shaped side effect. AF_PIECEWISE captures this op; plain
         # PIECEWISE runs it eager. The dense pieces around it are token-shaped.
-        torch.ops.aiter.v4_attn_compress(hidden, self.layer_name)
+        torch.ops.aiter.v4_attn_compress(
+            hidden, idx_q_quant, idx_weights, idx_q_scale, self.layer_name
+        )
 
         o = torch.ops.aiter.v4_sparse_attention(
             q_sa,
@@ -3090,6 +3135,9 @@ class DeepseekV4Attention(nn.Module):
         self,
         *,
         x: torch.Tensor | None = None,  # [num_tokens, dim] hidden state
+        idx_q_quant: torch.Tensor | None = None,  # narrow path: `forward_pre`'s
+        idx_weights: torch.Tensor | None = None,
+        idx_q_scale: torch.Tensor | None = None,
         compressor_already_launched: bool = False,
     ) -> None:
         """Batch-shaped compressor launch plus side-stream join.
@@ -3136,6 +3184,17 @@ class DeepseekV4Attention(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             if self.indexer is not None:
                 current_stream.wait_stream(self.indexer_stream)
+
+        # The gfx950 FP4 decode scorer, after the join: it reads the index rows
+        # the indexer's compressor just wrote. Its launch follows the sequence
+        # count and query span, which this core's graph key fixes and a dense
+        # piece's (token count alone) does not. `_sparse_attention` reads the
+        # result off the fixed buffer.
+        out = attn_md.fp4_decode_topk
+        if out is not None and idx_q_quant is not None and not self.skip_topk:
+            self.indexer.score_decode_topk_into(
+                idx_q_quant, idx_weights, idx_q_scale, out
+            )
 
     def _qk_norm_rope(
         self,
@@ -3245,7 +3304,8 @@ class DeepseekV4Attention(nn.Module):
 
         Every launch here is sized by the token count -- `csa_translate_pack`'s grid
         is `(T, ...)`, the paged kernels take `N = qo_indptr.numel()-1`, the FP4
-        row-group scorer uses fixed-capacity metadata per token bucket --
+        the FP8 / gfx1250 scorers are token-shaped (the gfx950 FP4 decode
+        scorer is not, and runs in `_attn_compress`) --
         and everything it reads is token-shaped or a whole persistent buffer. So it
         belongs in a dense piece, keyed on num_tokens, not in the core.
         """
@@ -3282,15 +3342,19 @@ class DeepseekV4Attention(nn.Module):
         # paged offsets in the active CSA buffer. Both are token-shaped and run
         # after the compressor split op in the narrow PIECEWISE order.
         if self.indexer is not None and not self.skip_topk:
-            topk_local = self.indexer.topk(
-                x,
-                qr,
-                positions,
-                qr_scale,
-                pre_q_quant=idx_q_quant,
-                pre_weights=idx_weights,
-                pre_q_scale=idx_q_scale,
-            )
+            if idx_q_quant is not None and attn_md.fp4_decode_topk is not None:
+                # Scored in `_attn_compress` (see there).
+                topk_local = attn_md.fp4_decode_topk[:num_tokens]
+            else:
+                topk_local = self.indexer.topk(
+                    x,
+                    qr,
+                    positions,
+                    qr_scale,
+                    pre_q_quant=idx_q_quant,
+                    pre_weights=idx_weights,
+                    pre_q_scale=idx_q_scale,
+                )
             self._fill_csa_paged_compress(attn_md, topk_local, positions, num_tokens)
 
         # ===== Sparse attention dispatch =====

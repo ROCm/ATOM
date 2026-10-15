@@ -340,7 +340,8 @@ def test_window_tail_capture_shapes_fill_only_missing_token_buckets():
     assert owner.extra_piecewise_capture_shapes([128], [6]) == []
 
 
-def test_tail_replays_when_early_stage_missed_its_bucket(monkeypatch):
+@pytest.mark.parametrize("dp_stages", [None, object()])
+def test_tail_replay_respects_its_bucket_and_dp_stage(monkeypatch, dp_stages):
     context = _context(monkeypatch, 768)
     owner = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
     torch.nn.Module.__init__(owner)
@@ -356,7 +357,13 @@ def test_tail_replays_when_early_stage_missed_its_bucket(monkeypatch):
     state = SinglePassHCState(torch.ones(1, 128, 2), None, None, None, None)
     owner._late_layers(state)  # startup capture of T=128
     context.cudagraph_runtime_mode, context.batch_descriptor = CUDAGraphMode.NONE, None
+    context.dp_stages = dp_stages
     owner._late_layers(state, allow_capture=False)
-    assert seen[-1] == (CUDAGraphMode.PIECEWISE, BatchDescriptor(128))
+    expected = (
+        (CUDAGraphMode.PIECEWISE, BatchDescriptor(128))
+        if dp_stages is None
+        else (CUDAGraphMode.NONE, None)
+    )
+    assert seen[-1] == expected
     assert context.cudagraph_runtime_mode == CUDAGraphMode.NONE
     assert context.batch_descriptor is None

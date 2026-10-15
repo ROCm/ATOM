@@ -234,6 +234,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
         os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
     ),
+    # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
+    # interpolates between the configured initial chunk size (0) and the fitted
+    # equal-latency size (1). Values around 0.6-0.85 are typically most stable.
+    # Read by Config only when dynamic chunking is on and no explicit factor
+    # was given.
+    "ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR": lambda: float(
+        os.getenv("ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR", "0.75")
+    ),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
     "ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE": lambda: (
@@ -305,18 +313,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
-    # gemm2-fused EP combine: the a8w4 grouped gemm2 epilogue P2P-writes its
-    # weighted per-(token,k) results straight into the peers' combine staging, so
-    # combine only barriers + sums. Requires the a8w4 (fp8 act + mxfp4 weight)
+    # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
+    # P2P-writes its weighted per-(token,k) results straight into the peers'
+    # combine staging, so combine only barriers + sums. Requires the mxfp4 weight
     # path; ignored unless ATOM_MORI_V2 is on.
     # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
-    # the fused dispatch/combine pair (its dispatch kernel is picked by aiter's
-    # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
-    # gather, i.e. the untouched upstream baseline.
-    "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # the fused dispatch/combine pair, 0 binds mori's v2 op-layer running plain
+    # gather, i.e. the untouched upstream baseline. Formerly ATOM_MORI_V2_FUSED.
+    "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
-    # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
+    # always combines in bf16. Ignored unless ATOM_MEGA_STAGE2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
+    # MegaMoE compact-plan stage 1 (aiter stage1_fused): routing/layout planning
+    # fused with a flydsl TDM dispatch that writes the grouped GEMM's per-expert
+    # rows directly. Needs ATOM_MEGA_STAGE2_FUSED and an fp8/fp4
+    # MEGA_DISPATCH_WIRE; a bf16 wire keeps the token-major path regardless of
+    # this flag.
+    "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
@@ -1076,6 +1089,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # answered before it waits for the answer instead.
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
+    ),
+    # Admit a prefill without waiting for its external-tier lookup when the HBM
+    # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
+    # could be loaded. The lookup is still sent to refresh the tier's LRU.
+    # On by default; set to 0 to always wait for the lookup.
+    "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT": lambda: _flag_env(
+        "OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT", "1"
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),

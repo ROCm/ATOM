@@ -106,6 +106,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
@@ -516,7 +517,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
 def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
     if use_fp4_non_shuffle_triton_gemm():
         return False, False
-    if use_triton_gemm():
+    if use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2):
         should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
         return should_shuffle, should_shuffle
     return True, True

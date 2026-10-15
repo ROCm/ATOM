@@ -194,8 +194,20 @@ def test_a_dspark_draft_counts_as_one_more_layer(monkeypatch):
         {"decode_context_parallel_size": 2},
         # Nothing to keep a hit with.
         {"enable_prefix_caching": False},
-        # An LMCache MP load would write the claimed blocks a replay reads.
-        {"kv_transfer_config": {"kv_connector": "lmcache_mp", "kv_role": "offload"}},
+        # A load that knows nothing of the replay would write the claimed
+        # blocks it reads; LMCache MP offload alone is the one that knows.
+        {"kv_transfer_config": {"kv_connector": "moriio", "kv_role": "kv_both"}},
+        {"kv_transfer_config": {"kv_connector": "lmcache_offload"}},
+        # P/D plus LMCache MP offload: the P/D leg's loads do not know either.
+        {
+            "kv_transfer_config": {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+                    {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                ],
+            }
+        },
     ],
 )
 def test_off_where_a_hit_cannot_be_replayed(monkeypatch, overrides):
@@ -478,3 +490,105 @@ def test_a_replay_reports_its_hit_from_where_its_forward_starts():
     # checkpoint: wanted (the hit) minus cached (where the forward starts).
     assert stats.total_cached_tokens - cached == 32 - REPLAY
     assert stats.total_wanted_tokens - wanted == 32
+
+
+# --- LMCache MP: a replay past the HBM hit, at the KV-only reach -----------
+_MP = {"kv_transfer_config": {"kv_connector": "lmcache_mp", "kv_role": "offload"}}
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        _MP["kv_transfer_config"],
+        # As the factory resolves it: an alias, and the connector's default role.
+        {"kv_connector": "LMCacheMPConnector"},
+    ],
+)
+def test_lmcache_mp_offload_alone_keeps_replay_on(monkeypatch, kv_transfer_config):
+    monkeypatch.setenv("ATOM_DSV4_STATE_REPLAY", "1")
+    config = _config(kv_transfer_config=kv_transfer_config)
+    assert state_replay_tokens(config) == REPLAY
+
+
+def _mp_seq(bm, reach_with_state, reach_kv_only, n=60):
+    """A 60-token prompt whose first 32 are in HBM with no checkpoint, and
+    whose LMCache lookup answered `reach_with_state` / `reach_kv_only`."""
+    _prefill_and_finish(bm, _seq(32))
+    seq = _seq(n)
+    seq.offload_joint.kv_prefix_tokens = reach_with_state
+    seq.offload_joint.kv_only_tokens = reach_kv_only
+    return seq
+
+
+def _mp_bm(monkeypatch, min_load=0):
+    monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", str(min_load))
+    return _bm()
+
+
+def test_a_kv_only_reach_past_hbm_loads_then_replays_below_it(monkeypatch):
+    bm = _mp_bm(monkeypatch)
+    seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
+    hit = bm.can_allocate(seq)
+    assert hit == 8  # the whole HBM prefix is claimed
+    assert seq.replays_hit and seq.replay_kv_load
+    assert bm.allocate(seq, hit)
+    # The load runs first, from the HBM hit.
+    assert seq.num_cached_tokens == 32 and seq.replay_kv_load
+    # Once it lands (`num_cached_tokens` at the reach) the forward replays.
+    seq.num_cached_tokens = 48
+    _resume(bm, seq, hit=True)
+    assert seq.replay == Replay(48, True, (), 48 - REPLAY)
+
+
+def test_a_kv_only_load_that_does_not_run_replays_below_the_hbm_hit(monkeypatch):
+    bm = _mp_bm(monkeypatch)
+    seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    bm.fall_back_to_hbm_replay(seq)
+    assert not seq.replay_kv_load and seq.replays_hit
+    _resume(bm, seq, hit=True)
+    assert seq.replay == Replay(32, True, (), 32 - REPLAY)
+
+
+def test_a_state_carrying_hit_close_to_the_kv_reach_is_loaded_as_is(monkeypatch):
+    """44 with its image beats replaying to 48: 48 - 7 < 44."""
+    bm = _mp_bm(monkeypatch)
+    seq = _mp_seq(bm, reach_with_state=44, reach_kv_only=48)
+    assert bm.can_allocate(seq) == 0
+    assert not seq.replays_hit and not seq.replay_kv_load
+
+
+def test_a_kv_reach_too_small_to_load_replays_from_hbm(monkeypatch):
+    """The connector skips loads under OFFLOAD_MIN_LOAD_TOKENS, so the decision
+    must not count on one."""
+    bm = _mp_bm(monkeypatch, min_load=100)
+    seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
+    assert bm.can_allocate(seq) == 8
+    assert seq.replays_hit and not seq.replay_kv_load
+    assert bm.replay_start(seq, 32, hit=True) == 32 - REPLAY
+
+
+def test_a_claim_short_of_the_hbm_hit_drops_the_kv_only_load(monkeypatch):
+    """A load past the hit would start above a gap: replay from the claim."""
+    bm = _mp_bm(monkeypatch)
+    seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
+    hit = bm.can_allocate(seq)
+    assert seq.replay_kv_load
+    lookup, calls = bm.kv.lookup, []
+
+    def evicting(h):
+        calls.append(h)
+        return -1 if len(calls) == 7 else lookup(h)  # block 6 is gone
+
+    monkeypatch.setattr(bm.kv, "lookup", evicting)
+    assert bm.allocate(seq, hit)
+    assert seq.num_cached_tokens == 24
+    assert seq.replays_hit and not seq.replay_kv_load
+
+
+def test_deallocate_forgets_the_kv_only_load(monkeypatch):
+    bm = _mp_bm(monkeypatch)
+    seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
+    assert bm.allocate(seq, bm.can_allocate(seq))
+    bm.deallocate(seq)
+    assert not seq.replay_kv_load and not seq.replays_hit

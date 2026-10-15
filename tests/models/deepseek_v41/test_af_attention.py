@@ -458,7 +458,7 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once(subset)
         if not hasattr(cache, "results"):
             cache.results = StableOutputs()
 
-        def result(name):
+        def result(name, count=count, hidden=hidden):
             return cache.results.empty(
                 (count, name), hidden.shape, dtype=hidden.dtype, device=hidden.device
             )

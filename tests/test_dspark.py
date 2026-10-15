@@ -638,11 +638,12 @@ def test_v4_core_inputs_come_from_the_signature():
             raise
         pytest.skip(f"requires aiter to import deepseek_v4: {e}")
 
-    # The core is the ONE batch-shaped kernel now: the compressor, whose grid is
-    # `graph_bs * per_seq_bound`. `x` is all it needs. The indexer top-k left
-    # with the FP4 default -- its varqlen path is token-shaped -- and everything
-    # else token-shaped was already in the dense pieces. Nine inputs to one.
-    assert core.input_names == ("x",)
+    # The core holds the batch-shaped kernels: the compressor, whose grid is
+    # `graph_bs * per_seq_bound`, and the gfx950 FP4 decode scorer, whose
+    # row-group launch is planned from the sequence count -- it takes the
+    # indexer projections the dense piece upstream made. Everything
+    # token-shaped stays in the dense pieces.
+    assert core.input_names == ("x", "idx_q_quant", "idx_weights", "idx_q_scale")
 
 
 def test_core_with_var_kwargs_is_rejected():
@@ -1978,7 +1979,7 @@ def test_every_op_fake_agrees_with_its_body():
             ),
             (
                 "v4_attn_compress",
-                [v4._v4_attn_compress_fake(x, "L")],
+                [v4._v4_attn_compress_fake(x, None, None, None, "L")],
                 [A._attn_compress(layer, piecewise=False, x=x)],
             ),
             (

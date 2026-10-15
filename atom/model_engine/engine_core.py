@@ -16,6 +16,10 @@ from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.async_proc import AsyncIOProcManager
+from atom.model_engine.dynamic_chunking import (
+    DYNAMIC_CHUNKING_POLL_STEPS,
+    ChunkSizePredictor,
+)
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -145,6 +149,32 @@ class EngineCore:
             assert ret, "Failed to allocate kv cache"
 
             config.num_kvcache_blocks = num_blocks
+            # Config has already turned the feature off wherever it cannot act,
+            # so every stage of a pipeline takes this branch or none does: the
+            # sweep's dummy forwards cross stages and must run in lockstep.
+            if config.enable_dynamic_chunking:
+                # Startup profiling only measures the chunk cost that carries no
+                # attention; the attention terms are calibrated from real
+                # prefills while serving, so no chunk is rebalanced until then.
+                profile = self.runner_mgr.call_func(
+                    "profile_dynamic_chunking", wait_out=True
+                )
+                if not profile or "linear_coeff" not in profile:
+                    config.enable_dynamic_chunking = False
+                    reason = (profile or {}).get("error", "")
+                    logger.warning(
+                        "%s: disabling dynamic chunking because startup profiling "
+                        "did not produce a chunk overhead baseline%s",
+                        self.label,
+                        f": {reason}" if reason else "",
+                    )
+                if (
+                    config.enable_dynamic_chunking
+                    and config.parallel_config.pipeline_parallel_rank != 0
+                ):
+                    # Downstream stages execute metadata from the PP head and
+                    # never make chunking decisions themselves.
+                    config.enable_dynamic_chunking = False
             if not config.enforce_eager and not config.disagg_is_decode:
                 cap_cost, bs, pool_bytes = self.runner_mgr.call_func(
                     "capture_cudagraph", wait_out=True
@@ -177,6 +207,9 @@ class EngineCore:
                 and envs.ATOM_PREFILL_DECODE_INTERVAL > 0
             ):
                 self._init_prefill_delayer(config)
+
+        self._dynamic_chunking_enabled = config.enable_dynamic_chunking
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
@@ -595,6 +628,49 @@ class EngineCore:
         reconcile = getattr(self.scheduler, "_reconcile_stalled_deferred_saves", None)
         if callable(reconcile):
             reconcile()
+
+    def _poll_dynamic_chunking_calibration(self) -> None:
+        """Install a freshly calibrated chunk latency model, if one is ready.
+
+        The workers time their own prefills, so this is one RPC round trip every
+        `DYNAMIC_CHUNKING_POLL_STEPS` steps and nothing on the forward path.
+
+        Called from the PP head's step loop rather than from here: dynamic
+        chunking needs more than one stage, and every such deployment runs
+        `PPEngineCoreProc`, whose head loop replaces `_process_engine_step`.
+        Every other stage had the feature turned off during startup because it
+        makes no chunking decisions.
+        """
+        if not self._dynamic_chunking_enabled:
+            return
+        self._dynamic_chunking_poll_countdown -= 1
+        if self._dynamic_chunking_poll_countdown > 0:
+            return
+        self._dynamic_chunking_poll_countdown = DYNAMIC_CHUNKING_POLL_STEPS
+        fit = self.runner_mgr.call_func("take_dynamic_chunking_fit", wait_out=True)
+        coefficients = fit.get("coefficients") if fit else None
+        if coefficients is None:
+            if fit and fit.get("gave_up"):
+                # The workers have stopped timing, so end the sweep too rather
+                # than size every other request for a model that never lands.
+                self._dynamic_chunking_enabled = False
+                self.scheduler.abandon_chunk_latency_calibration()
+            return
+        # The workers stop timing prefills once they have answered with a fit, so
+        # there is never a second one to collect - whether the scheduler takes
+        # this model or rejects it as not worth acting on.
+        self._dynamic_chunking_enabled = False
+        try:
+            predictor = ChunkSizePredictor.from_coefficients(coefficients)
+        except (TypeError, ValueError):
+            logger.exception(
+                "%s: rejecting dynamic chunking coefficients %r",
+                self.label,
+                coefficients,
+            )
+            self.scheduler.abandon_chunk_latency_calibration()
+            return
+        self.scheduler.install_chunk_latency_model(predictor)
 
     def _dispatch_idle_offload_work(self, dispatch_new: bool = True) -> None:
         if not self.kv_transfer_enabled:
