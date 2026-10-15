@@ -183,6 +183,8 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up = _upload(
         device,
         torch.int32,
+        buffers=step.piecewise_buffers,
+        namespace="tail_int",
         rows=rows,
         cu=np.concatenate(([0], ends)),
         batch_ids=batch_ids,
@@ -199,9 +201,19 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up |= _upload(
         device,
         step.positions.dtype,
+        buffers=step.piecewise_buffers,
+        namespace="tail_position",
         positions=positions,
         last_positions=positions[last],
     )
+
+    def keep(name, tensor):
+        return (
+            tensor
+            if step.piecewise_buffers is None
+            else step.piecewise_buffers.deliver(("tail", name), tensor)
+        )
+
     tail = BatchStep(
         tuple(
             RequestSpan(s.request_id, int(start), int(end - n), n, s.slot)
@@ -211,12 +223,17 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
         up["cu"],
         up["slots"],
         up["batch_ids"],
-        step.block_tables.index_select(0, up["requests"]),
+        keep("block_tables", step.block_tables.index_select(0, up["requests"])),
         scheduled=int(ends[-1]),
         max_q_len=int(lengths.max()),
-        visible=dict(
-            zip(step.visible, _gather_rows(up["rows"], *step.visible.values()))
-        ),
+        visible={
+            r: keep(("visible", r), value)
+            for r, value in zip(
+                step.visible, _gather_rows(up["rows"], *step.visible.values())
+            )
+        },
+        piecewise_buffers=step.piecewise_buffers,
+        piecewise_namespace="tail",
         request_positions=starts.astype(np.int32),
         swa_replay_start=up["floors"],
         swa_cached_until=up["cached_until"],
@@ -234,18 +251,16 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     )
 
 
-def _upload(device, dtype, **arrays):
+def _upload(device, dtype, *, buffers=None, namespace=None, **arrays):
     """``arrays`` on ``device`` as ``dtype``, in one copy."""
     names = list(arrays)
     host = np.concatenate([np.asarray(arrays[k]) for k in names]).astype(
         torch.empty(0, dtype=dtype).numpy().dtype
     )
-    return dict(
-        zip(
-            names,
-            upload_numpy(host, device).split([len(arrays[k]) for k in names]),
-        )
-    )
+    value = upload_numpy(host, device)
+    if buffers is not None:
+        value = buffers.deliver(namespace, value)
+    return dict(zip(names, value.split([len(arrays[k]) for k in names])))
 
 
 def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
@@ -259,6 +274,10 @@ def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
         ({s.candidate_source for s in specs} - {None} - own) & parent.candidates.keys()
     )
     rows, tail = plan.tail_rows, plan.tail
+    if tail.piecewise_buffers is not None:
+        for name in ("selected", "candidates"):
+            values = getattr(tail, name)
+            values.bind(tail.piecewise_buffers, (tail.piecewise_namespace, name))
     taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
     tail.selected.update(zip(owners, taken))
     taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
@@ -284,6 +303,8 @@ def rows_of(metadata, step, queries=None, rows=None):
     indexed.indptrs = fill_step_indptrs(
         indexed, metadata.cache.geometry, metadata.cache.indptr_buffers
     )
+    if getattr(step, "piecewise_buffers", None) is not None:
+        step.prepare_piecewise(metadata.cache, queries)
     outer = metadata.step, metadata.queries, metadata.image_mask
     metadata.step, metadata.queries = step, queries
     if rows is not None and outer[2] is not None:

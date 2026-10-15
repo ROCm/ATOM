@@ -13,6 +13,7 @@ from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
 from atom.model_ops.attentions.token_layout.prefill import prefill_positions
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_tables import block_table_state
+from atom.utils.piecewise_af import PiecewiseBuffers, PiecewiseState, ReplayCache
 
 
 class TileWorkspace(Protocol):
@@ -66,17 +67,22 @@ class BatchStep:
     # `indptrs` are filled into fixed addresses before any layer runs; the
     # rest are filled by the layer that gets there first and dropped by
     # `begin_forward`.
-    selected: dict[int, torch.Tensor] = field(default_factory=dict)
-    candidates: dict[int, torch.Tensor] = field(default_factory=dict)
-    tiles: dict[int, torch.Tensor] = field(default_factory=dict)
+    selected: dict[int, torch.Tensor] = field(
+        default_factory=lambda: ReplayCache(stable=True)
+    )
+    candidates: dict[int, torch.Tensor] = field(
+        default_factory=lambda: ReplayCache(stable=True)
+    )
+    tiles: dict[int, torch.Tensor] = field(default_factory=ReplayCache)
     # candidate source layer -> its `CandidateBlocks`, bound for every layer
     # its candidates bound
-    candidate_blocks: dict[int, object] = field(default_factory=dict)
+    candidate_blocks: dict[int, object] = field(default_factory=ReplayCache)
     # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
     # launch wrote for the whole run.
-    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
+    group_indices: dict[int, tuple[torch.Tensor, ...]] = field(
+        default_factory=ReplayCache
+    )
     # A split decode's window rows (`indices.build_window_rows`), every layer's.
-    window_rows: torch.Tensor | None = None
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the
@@ -141,8 +147,107 @@ class BatchStep:
     # and only they are written to the ring.
     swa_cached_until: torch.Tensor | None = None
 
-    # AF publication memo; reset even when a BatchStep is reused.
-    af_inputs: dict = field(default_factory=dict)
+    # Published once per forward/view. None for FULL/eager execution.
+    piecewise_state: PiecewiseState | None = None
+    piecewise_buffers: PiecewiseBuffers | None = None
+    piecewise_namespace: object = None
+
+    def __post_init__(self):
+        # Preserve aliases when dataclasses.replace creates a query view.
+        for name in (
+            "selected",
+            "candidates",
+            "tiles",
+            "candidate_blocks",
+            "group_indices",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, ReplayCache):
+                setattr(
+                    self,
+                    name,
+                    ReplayCache(value, stable=name in ("selected", "candidates")),
+                )
+
+    @property
+    def window_rows(self):
+        return self.group_indices.get("window")
+
+    @window_rows.setter
+    def window_rows(self, value):
+        if value is None:
+            self.group_indices.pop("window", None)
+        else:
+            self.group_indices["window"] = value
+
+    def prepare_piecewise(self, cache, queries=None):
+        """Publish the builder's view once, as V4 does for decode capture.
+
+        Ordinary metadata already has fixed storage. The only additional key
+        choices are host branches used by attention; dynamic cache dependencies
+        are discovered by the common runner when recording each core.
+        """
+        if not self.requests:
+            self.piecewise_state = None
+            return
+        if self.piecewise_buffers is None:
+            if not hasattr(cache, "piecewise_buffers"):
+                cache.piecewise_buffers = PiecewiseBuffers()
+            self.piecewise_buffers = cache.piecewise_buffers
+        if self.piecewise_namespace is None:
+            # Parent and TBO children have distinct builder-owned token maps.
+            self.piecewise_namespace = (
+                self.positions.data_ptr(),
+                self.batch_ids.data_ptr(),
+            )
+        page_size = getattr(getattr(cache, "geometry", None), "block_size", 1 << 60)
+        columns = (max(s.end for s in self.requests) + page_size - 1) // page_size
+        self.piecewise_state = PiecewiseState(
+            (
+                self.decode,
+                self.width,
+                self.max_q_len,
+                columns,
+                bool(self.request_cached_until.any()),
+                self.piecewise_namespace,
+            ),
+            (
+                cache.pool,
+                self.positions,
+                self.cu_seqlens_q,
+                self.slots,
+                self.batch_ids,
+                self.block_tables,
+                self.swa_replay_start,
+                self.swa_cached_until,
+                self.visible,
+                self.indptrs,
+                {
+                    r: (p.compress_plan_gpu, p.write_plan_gpu, p.key_rope_positions_gpu)
+                    for r, p in self.plans.items()
+                },
+                self.planned,
+                self.planned_host,
+                (
+                    None
+                    if queries is None
+                    else (
+                        queries.rows,
+                        queries.positions,
+                        queries.ptr_rows,
+                        queries.index.batch_ids,
+                        queries.index.indptrs,
+                    )
+                ),
+            ),
+            {
+                name: value
+                for name, value in vars(self).items()
+                if isinstance(value, ReplayCache)
+            },
+            storage=self.piecewise_buffers,
+            namespace=self.piecewise_namespace,
+        )
 
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
@@ -151,7 +256,7 @@ class BatchStep:
         the recorded pass is a kernel that pass skips -- absent from the graph,
         and read at capture-time values on every replay.
         """
-        self.af_inputs.clear()
+        self.piecewise_state = None
         self.selected.clear()
         self.candidates.clear()
         self.tiles.clear()

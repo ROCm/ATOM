@@ -45,6 +45,8 @@ __all__ = [
     "piecewise_core",
 ]
 
+_NO_CAPTURE_STATE = object()
+
 
 def decode_bucket_key(forward_context) -> tuple:
     """``(bucket_bs, q_eff)`` for a core captured per decode bucket.
@@ -153,29 +155,20 @@ def piecewise_core(
     copy_per_step: tuple[str, ...] = (),
     capture_prefill: bool = False,
     token_dim: int = 0,
-    metadata: dict | Callable[[Any, dict], Any] | None = None,
 ):
     """Give the decorated function its own cudagraph, keyed per layer and shape.
 
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
     By default only DECODE steps are captured. ``capture_prefill=True`` also
-    permits live prefill capture. A ``metadata={...}`` declaration uses the common
-    field-selection, reconstruction and publication schema. Advanced providers
-    may instead use ``metadata(layer, arguments)`` to return a
-    ``PiecewiseMetadata`` describing dynamic inputs, reconstruction and result
-    publication, or None to run eagerly. The decorator stages those inputs,
-    keys their structure/layouts and owns the warmup/record/replay lifecycle.
-    With no metadata hook, the lower-level API requires a complete
-    ``capture_key`` and pre-staged metadata. Warmup executes once on a side stream; its
-    result is returned after recording, preserving the core's state effects.
-    ``token_dim`` identifies the token axis of the tensor inputs. An optional
-    per-call ``prepare`` context manager supplies fresh non-tensor arguments
-    for each execution and records their Python-side effects after execution.
-    With a metadata hook, a per-method runner/output store is created lazily;
-    callers may supply a common ``PiecewiseAFRunner`` to share input storage or
-    fixed-capacity outputs. ``zero_copy_inputs`` optionally overrides the tensor
-    input policy per call. Changed direct-input addresses always get a new key.
+    permits live prefill capture. The builder supplies ``capture_state``, a
+    ``PiecewiseState`` over its already-published buffers and result caches.
+    The core receives the live metadata unchanged. No model reconstruction or
+    publication hook is needed. The lower-level ``capture_key`` / ``prepare``
+    interface remains available for callers managing their own lifecycle.
+    With live capture enabled, a runner/output store is created lazily when
+    not supplied. ``zero_copy_inputs`` overrides the tensor policy per call.
+    Changed direct-input addresses always select another graph.
     ``max_tokens`` is an OPTIONAL extra cap on the rows
     a captured graph covers -- a memory lever, off by default. It used to be 512
     and to be the only gate, which silently excluded every decode bucket above
@@ -220,17 +213,10 @@ def piecewise_core(
             f'("{copy_per_step}",). Without it this silently copies nothing.'
         )
     copied = frozenset(copy_per_step)
-    if metadata is not None and not capture_prefill:
-        raise ValueError("metadata requires capture_prefill=True")
-    if isinstance(metadata, dict):
-        from atom.utils.piecewise_metadata import PiecewiseMetadataSchema
-
-        metadata = PiecewiseMetadataSchema(**metadata)
 
     def decorate(fn: Callable) -> Callable:
         input_names, passthrough_names = _partition_inputs(fn)
         signature = inspect.signature(fn)
-        config_names = frozenset(passthrough_names)
         unknown = copied - set(input_names)
         if unknown:
             raise ValueError(
@@ -248,6 +234,7 @@ def piecewise_core(
             outputs=None,
             forward_context=None,
             capture_key=None,
+            capture_state=_NO_CAPTURE_STATE,
             prepare=None,
             zero_copy_inputs=None,
             **inputs,
@@ -257,16 +244,18 @@ def piecewise_core(
             if not piecewise:
                 return fn(layer, *args, **inputs)
 
-            if args or metadata is not None:
+            if args or capture_prefill:
                 bound = signature.bind(layer, *args, **inputs)
                 bound.apply_defaults()
                 inputs = dict(list(bound.arguments.items())[1:])
 
-            if metadata is not None:
+            if capture_prefill:
                 from atom.utils.piecewise_af import PiecewiseAFRunner
 
-                if prepare is not None or capture_key is not None:
-                    raise ValueError("metadata owns prepare and capture_key")
+                if capture_state is not _NO_CAPTURE_STATE and (
+                    prepare is not None or capture_key is not None
+                ):
+                    raise ValueError("capture_state owns the key and cache lifecycle")
                 if runner is None:
                     stores = layer.__dict__.setdefault("_piecewise_core_runners", {})
                     if fn not in stores:
@@ -298,7 +287,7 @@ def piecewise_core(
                 if getattr(outputs, "capacity", 0)
                 else (layer_name, num_tokens)
             )
-            if metadata is not None:
+            if capture_prefill:
                 out_key = (fn, out_key)
             # Config args are not graph inputs: bind them into the compute so they
             # are baked at capture, and hand the runner only the tensor inputs.
@@ -341,44 +330,40 @@ def piecewise_core(
                 )
                 and (max_tokens is None or num_tokens <= max_tokens)
             )
-            if eligible and metadata is not None:
-                spec = metadata(layer, inputs)
-                if spec is not None:
-                    direct = (
-                        zero_copy
-                        if zero_copy_inputs is None
-                        else frozenset(zero_copy_inputs)
+            if capture_state is None:
+                eligible = False
+            if eligible and capture_state is not _NO_CAPTURE_STATE:
+                direct = (
+                    zero_copy
+                    if zero_copy_inputs is None
+                    else frozenset(zero_copy_inputs)
+                )
+                if isinstance(zero_copy_inputs, str) or direct - set(input_names):
+                    raise ValueError(
+                        "zero_copy_inputs must name declared tensor inputs"
                     )
-                    if isinstance(zero_copy_inputs, str) or direct - set(input_names):
-                        raise ValueError(
-                            "zero_copy_inputs must name declared tensor inputs"
-                        )
-                    handled, result = runner.run(
-                        (
-                            fn,
-                            layer_name,
-                            num_tokens,
-                            tuple(key(forward_context)),
-                            tuple(
-                                (name, type(inputs[name]), inputs[name])
-                                for name in passthrough_names
-                                if isinstance(
-                                    inputs.get(name),
-                                    (str, int, float, bool, type(None)),
-                                )
-                            ),
+                handled, result = runner.run(
+                    (
+                        fn,
+                        layer_name,
+                        num_tokens,
+                        tuple(key(forward_context)),
+                        tuple(
+                            (name, type(inputs[name]), inputs[name])
+                            for name in passthrough_names
+                            if isinstance(
+                                inputs.get(name), (str, int, float, bool, type(None))
+                            )
                         ),
-                        tensor_inputs,
-                        spec,
-                        core,
-                        functools.partial(outputs.slot, out_key),
-                        zero_copy=direct,
-                        config_names=config_names,
-                    )
-                    if handled:
-                        return result
-            # The metadata engine already attempted capture or chose fallback.
-            if metadata is not None:
+                    ),
+                    tensor_inputs,
+                    capture_state,
+                    core,
+                    functools.partial(outputs.slot, out_key),
+                    zero_copy=direct,
+                )
+                if handled:
+                    return result
                 eligible = False
             # num_tokens is a KEY DIM, not an incidental one: the graph is
             # captured at exactly this flat row count.

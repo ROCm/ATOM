@@ -5,146 +5,96 @@
 `capture=True` also captures/replays the core when eligible. FULL/eager calls
 use `piecewise=False` and execute the original method directly.
 
-## Declarative live prefill metadata
+## Builder-owned metadata
 
-Use `capture_prefill=True` and a `metadata` dictionary. The decorator compiles
-it into the common `PiecewiseMetadataSchema`; models only declare their
-fields and rules. No per-model staging, reconstruction, publication method
-or graph runner subclass is needed.
+Live prefill uses the same ownership principle as V4's decode compressor:
+the attention builder publishes fixed-address buffers before the layers run,
+and graphs read those buffers directly. The model only decorates its core:
 
 ```python
-import torch
-from atom.utils.attn_ffn_piecewise import piecewise_core
+@piecewise_core(capture_prefill=True)
+def attention_forward(self, x: torch.Tensor, step: BatchStep):
+    return self.attention(x, step)
+```
 
-@piecewise_core(
-    capture_prefill=True,
-    metadata={
-        "when": "step.enabled",
-        "key": ("step.is_decode", lambda s: s["cache"].pool.data_ptr()),
-        "objects": {
-            "step": {
-                "inputs": ("positions", "lengths"),
-                "reset": {"indices": {}},
-            },
-        },
-        "arguments": ("step",),
-        "publish": {"step.indices": "update"},
-    },
+The builder supplies a `PiecewiseState` once per forward or subset view:
+
+```python
+step.piecewise_state = PiecewiseState(
+    key=(is_decode, query_width, kernel_variant),
+    buffers=(positions, lengths, block_tables, kv_pool),
+    caches={"indices": step.indices},
 )
-def attention_forward(self, x: torch.Tensor, step: BatchStep, cache: Cache):
-    return self.attention(x, step, cache)
 
 result = layer.attention_forward(
-    hidden, step, cache,
+    hidden, step,
     piecewise=True, capture=True, forward_context=forward_context,
+    capture_state=step.piecewise_state,
 )
 ```
 
-Selectors are dotted paths rooted at bound core arguments (including their
-defaults) or `layer`. Ordered `bindings` add reusable names. A callable taking
-that scope may express a model's host predicate or derived scalar, such as a
-KV pool address. Strings are field paths, never evaluated Python expressions.
-A path through `None` yields `None`; missing fields raise an error.
+`key` must include all host decisions that affect the captured kernels.
+`buffers` is an explicit tensor/scalar tree; addresses, shapes, strides,
+dtypes, devices and scalar values are keyed automatically. Include persistent
+resources such as the KV pool. The state retains these buffers for the graph's
+lifetime. Other changing non-tensor arguments must be represented in the key.
+Scalar core arguments are keyed automatically.
 
-| Declaration | Common behavior |
-|---|---|
-| `objects[name].source` | Live template path, defaulting to `name`; `None` creates no view. |
-| `inputs` | Names of fields to stage. Dict/list/tuple trees, tensor and scalar leaves are supported. |
-| `select` | Select dictionary fields with `{"keys": (selector, ...)}` or `{"suffix": selector}` and optional `when`. Missing requested keys fail; disabled selections are empty. |
-| `reset` | Fresh scalar/container values for derived fields on each warmup and recording, for example `{"indices": {}, "window": None}`. |
-| `bind` | Attach an earlier captured object by name, or use `{"object": name, "key": selector}` to attach a one-entry dictionary, empty if the object is `None`. |
-| `template` | Clone an earlier captured object, with inputs from this object's `source`; unchanged fields keep their aliases. |
-| `arguments` | Object names to pass as non-tensor keyword overrides to the core. |
-| `publish` | Field paths mapped to `update`, `replace`, `if_not_none`, or `{"keys": (selector, ...)}` for scoped dictionary writes. |
-| `when`, `key`, `memo`, `copy_each_call` | Eligibility, extra host decisions, optional per-forward copy memo and metadata paths refreshed on each call. |
+The core receives the live metadata unchanged. There is no schema, metadata
+reconstruction, per-layer refresh, or model-specific graph runner. The builder
+must publish contents before execution and preserve addresses for replay.
+Replaced allocations select another graph. Tensor parameters are direct inputs
+by default; `copy_per_step=("x",)` or per-call `zero_copy_inputs=()` allows
+temporary producer tensors by copying them to runner-owned storage.
 
-Objects are declared in dependency order. Dataclasses (including frozen
-ones), dictionaries and shallow-copyable attribute objects are supported.
-Undeclared fields stay on the template; all mutable derived fields that the
-core changes must be declared as `reset`, selected inputs or explicit aliases.
-Tensor inputs are read-only. Persistent device state such as a KV pool remains
-outside the staged input tree and its identity belongs in the key.
+## Per-forward results
 
-For a subset view sharing the main step's result dictionaries:
+Use the common `ReplayCache` for Python dictionaries populated by a core:
 
 ```python
-"objects": {
-    "step": {
-        "inputs": ("positions",),
-        "reset": {"selected": {}, "indices": {}},
-    },
-    "query_index": {
-        "source": "queries.index",
-        "template": "step",
-        "inputs": ("batch_ids",),
-    },
-    "queries": {
-        "inputs": ("rows",),
-        "bind": {"index": "query_index"},
-    },
-},
-"arguments": ("step", "queries"),
-"publish": {
-    "step.selected": {"keys": ("layer.layer_id",)},
-    "step.indices": "update",
-},
+step.indices = ReplayCache()
+step.selected = ReplayCache(stable=True)
 ```
 
-Warmup and recording get separate fresh dictionaries; each query index shares
-its dictionaries with its own captured step. Keyed publication skips absent
-outputs and preserves upstream entries in the current live request. Input
-layouts/scalars, object presence/types, attachment keys and publication keys
-are included in the graph key. Other host branches must be declared in `key`.
+The runner records cache reads and writes during warmup and CUDA recording.
+Both executions see the same entry state, so lazy index-building kernels are
+included in the graph. Only entries actually read before the core's own writes
+are dependencies. Replay validates those dependencies and publishes only the
+recorded writes into the current forward's caches. Upstream and unrelated
+entries are preserved. Shared subset views should share the actual cache
+objects; name each shared cache once in `PiecewiseState`.
 
-Reconstruction runs only on a cache miss, once for warmup and once for
-recording. Replay refreshes tensors and publishes recorded results without
-rebuilding metadata. Schema compilation happens at decoration, not per step.
+Values are immutable tensor/scalar trees. Update the mapping rather than
+mutating a nested container in place. Persistent mutable GPU state such as KV
+belongs in the builder's buffers. Normal eager execution uses ordinary mapping
+operations; no capture callbacks are needed. Clear caches at every forward,
+including when reusing the same metadata object.
 
-## Runner and advanced callback interface
+When downstream cores reuse a result, `stable=True` delivers tensor writes to
+the state's optional `PiecewiseBuffers` store. Eager producers, first capture
+and replay then publish the same address. Give independent or concurrently
+live views distinct storage namespaces. Use `PiecewiseBuffers` only for
+results/subsets without existing storage; do not copy the builder's existing
+metadata into it again. For subset inputs, prepare the stable storage when
+entering that view, before recording or replaying any of its layers.
 
-A callable metadata provider remains supported for unusual cases. It receives
-`(layer, bound_arguments)` and returns `PiecewiseMetadata` or `None`. Prefer the
-schema for standard field selection, cloning and updates. The low-level
-callback contract below describes what the common schema implements.
+The first live call warms once, records without replaying, and publishes the
+warmup result. Later calls replay once and publish recorded results. GPU state
+updates therefore occur exactly once per invocation. Startup capture, dummy
+runs and FULL runtime graphs cannot start a nested live capture. Explicit
+`capture_state=None` declines live capture. At the default limit of 32 graphs
+per runner, new keys fall back eagerly before allocating graph inputs; cached
+keys continue to replay.
 
-The decorator lazily owns a runner/output store per layer method. Supply a
-common `PiecewiseAFRunner` when sharing input storage across layers or using
-fixed-capacity `StableOutputs`. Shared stores are for serial execution;
-concurrent microbatches need separate stores. The existing graph-holder
-lifecycle releases recordings and captured Python state.
+The decorator lazily creates a `PiecewiseAFRunner` and output storage when
+none are supplied. Explicit instances support fixed-capacity `StableOutputs`.
+Graph-holder release drops recordings and retained resources; builder buffer
+stores participate in the same lifecycle.
 
-The interface has four parts:
+## Existing decode interface
 
-- `inputs`: explicit dict/list/tuple trees with tensors and Python scalar
-  leaves (`None`, bool, int, float, str). The engine keys tree structure,
-  scalar values, tensor shape/stride/dtype/device and direct input addresses.
-  Do not include arbitrary request objects or workspaces.
-- `key`: additional host decisions and persistent addresses outside that tree.
-  Non-tensor core arguments remain baked into a recording; scalar arguments
-  are keyed automatically, and the provider must key other changing config.
-- `rebuild`: creates non-tensor keyword arguments from staged inputs, with
-  fresh derived Python state separately for warmup and recording. It must
-  preserve any metadata aliases the core relies on. Inputs are read-only;
-  device writes belong in persistent state such as the KV pool.
-- `publish`: updates the current live metadata from the executed state. Copy
-  only this core's results, preserving upstream inputs. It is optional for
-  cores without Python-visible results and is never cached across requests.
-
-Tensor parameters of the core are inferred from annotations and directly read
-by default. `copy_per_step=("x",)` stages selected parameters instead, or pass
-`zero_copy_inputs=()` at the boundary to stage all of them for that call.
-Metadata tensors are always staged. An optional `memo` skips repeated copies
-across layers within one forward; its owner must clear it at every forward,
-even when reusing metadata and source allocations. `copy_each_call` names
-metadata leaf paths whose contents can change within a forward.
-
-The first live call warms once and records without replaying, then publishes
-the warmup result. Later calls refresh inputs, replay once and publish the
-recorded results. This preserves exactly-once device state updates. Startup
-capture, dummy runs and FULL runtime graphs cannot start a nested live capture.
-The default limit is 32 graphs per runner; new keys beyond it run eagerly
-without staging inputs, while existing keys continue to replay.
-
-Decode-only users retain the existing `key=decode_bucket_key` startup-capture
-API. The low-level `capture_key`/`prepare` route remains available, but cannot
-be combined with a metadata provider.
+V4 and other decode-only users retain `key=decode_bucket_key` and startup
+capture. They need no `PiecewiseState` when their core only writes persistent
+device state. The lower-level `capture_key`/`prepare` route remains available
+for callers managing their own lifecycle, and cannot be combined with
+`capture_state`.

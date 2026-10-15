@@ -121,45 +121,33 @@ bounds, with the same shapes included in graph memory budgeting. For the
 
 ## AF buffers and metadata
 
-[`@piecewise_core`](piecewise_core.md) owns live AF capture and replay through
-the common `PiecewiseMetadataSchema` interface. Models declare input fields,
-host keys, fresh caches and publication rules in a dictionary. The common
-schema reconstructs capture views and updates current-request results; the
-runner stages inputs, keys layouts/scalars/direct-read addresses, bounds the
-cache and chooses warmup or recorded state for publication.
+[`@piecewise_core`](piecewise_core.md) owns live AF capture and replay.
+V4.1 follows V4's builder-owned metadata policy: the fixed buffers published
+by the attention backend are read directly. `Block.attention_forward` only
+uses the decorator, without a metadata schema, adapter or graph subclass.
 
-V4.1 declares `PIECEWISE_ATTENTION_METADATA` in its existing `config.py` and
-passes it to the decorator on `Block.attention_forward`. There is no model
-reconstruction/publication method, graph runner subclass or capture-state
-class. The runtime calls the decorated method with the common
-`PiecewiseAFRunner`. Field selectors cover compression plans, upstream
-selections and subset queries. Keyed publication writes only this layer's
-top-k/candidate outputs; query-index templates share derived dictionaries
-with the captured main step. All of these operations are common schema
-features, with no V4.1 imports or field names in the implementation.
+The backend publishes a common `PiecewiseState` once per forward/view. Its
+key covers host kernel choices and the addresses/layouts of the existing
+metadata. The common `ReplayCache` handles dependencies and Python results
+for selections, candidates and derived index tables. No per-layer metadata
+copy, reconstruction, reset/bind declaration or publication callback is needed.
 
-AF follows V4's producer/consumer buffer policy. It directly reads a stable
-upstream dense-graph hidden tensor and writes the persistent output slot
-already bound by the downstream dense graph. The producer address is part
-of the key to prevent a changed input allocation from replaying stale data.
-With bounded replay, standalone layers 20 and 39 still stage hidden inputs.
-Basic PIECEWISE and AF fallback paths copy their eager outputs into these
-same downstream slots.
+Warmup and recording see the same cache entry state. Only the entries the
+core actually reads are dependencies, and replay updates only its writes.
+Query-index views retain their original shared dictionaries. Selected rows
+and candidates use builder-owned result slots so eager, newly captured and
+replayed producers supply the same downstream addresses.
 
-Request metadata is staged in shared fixed-address buffers. Matching inputs
-are reused across layers within one live BatchStep. The memo is reset by
-begin_forward, including when the step and source allocations are reused.
-Early/late metadata, subset-query layouts and incoming selected/candidate
-rows are supported. Graph holders retain and release the input storage.
+AF reads the upstream dense graph's stable hidden tensor and writes the
+persistent output slot bound by the downstream graph. Bounded replay's
+standalone layers 20 and 39 still stage temporary hidden inputs. Subset
+metadata is stabilized when its view is constructed, before its layers run.
+Parent and TBO child storage has distinct namespaces; existing indptr fills,
+publication fences and view-exit invalidation are preserved.
 
-Each recording starts with fresh Python memo dictionaries so warmup cannot
-omit index-building work from the recorded graph. Replay publishes selected
-rows, candidates and CSR/window results into the current step.
-
-The first eligible invocation of a shape warms the computation once, then
-records without replaying and returns the warmup result. Subsequent calls
-refresh shared inputs and replay once. This preserves exactly-once KV
-updates, including prefill's read-before-window-write ordering.
+The first eligible invocation warms once, records without replaying, and
+returns the warmup result. Later invocations replay once. This preserves
+exactly-once KV updates, including prefill's read-before-window-write order.
 
 ## Graph reuse limits
 
@@ -180,7 +168,6 @@ Run the regression suite in an ATOM ROCm environment:
 
 ```bash
 python -m pytest -q \
-  tests/test_piecewise_metadata.py \
   tests/test_piecewise_af.py \
   tests/test_hybrid_cudagraph.py \
   tests/test_forward_mode.py \

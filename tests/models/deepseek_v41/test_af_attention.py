@@ -12,7 +12,7 @@ pytest.importorskip("aiter")
 from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
 from atom.models.deepseek_v41.model import Block
-from atom.utils.piecewise_af import PiecewiseAFRunner
+from atom.utils.piecewise_af import PiecewiseAFRunner, PiecewiseBuffers
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 
@@ -29,6 +29,72 @@ def _forward(
     zero_copy_hidden=False,
 ):
     """Use the same decorated model entry as the runtime splitting op."""
+    if step.piecewise_state is None:
+        # Isolated cache helpers allocate fresh request tensors. Emulate the
+        # serving builder's fixed addresses once per view, before any layer.
+        from dataclasses import replace
+
+        if not hasattr(cache, "test_buffers"):
+            cache.test_buffers = PiecewiseBuffers()
+
+        def keep(name, value):
+            return value if value is None else cache.test_buffers.deliver(name, value)
+
+        for name in (
+            "positions",
+            "cu_seqlens_q",
+            "slots",
+            "batch_ids",
+            "block_tables",
+            "swa_replay_start",
+            "swa_cached_until",
+        ):
+            setattr(step, name, keep(name, getattr(step, name)))
+        for name in ("visible", "planned"):
+            setattr(
+                step,
+                name,
+                {k: keep((name, k), v) for k, v in getattr(step, name).items()},
+            )
+        step.plans = {
+            r: replace(
+                p,
+                **{
+                    n: keep((r, n), getattr(p, n))
+                    for n in (
+                        "compress_plan_gpu",
+                        "write_plan_gpu",
+                        "key_rope_positions_gpu",
+                    )
+                },
+            )
+            for r, p in step.plans.items()
+        }
+
+        def indptrs(scope, values):
+            return {
+                r: tuple(
+                    keep((scope, r, i), t) if isinstance(t, torch.Tensor) else t
+                    for i, t in enumerate(parts)
+                )
+                for r, parts in values.items()
+            }
+
+        step.indptrs = indptrs("main_ptrs", step.indptrs)
+        if queries is not None:
+            queries = replace(
+                queries,
+                index=replace(
+                    step,
+                    batch_ids=keep("query_ids", queries.index.batch_ids),
+                    indptrs=indptrs("query_ptrs", queries.index.indptrs),
+                ),
+                **{
+                    n: keep(("query", n), getattr(queries, n))
+                    for n in ("rows", "positions", "ptr_rows")
+                },
+            )
+        step.prepare_piecewise(cache, queries)
     metadata = SimpleNamespace(cache=cache, step=step, queries=queries, dummy=False)
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
@@ -48,6 +114,7 @@ def _forward(
         capture=True,
         forward_context=context,
         runner=graphs,
+        capture_state=step.piecewise_state,
         zero_copy_inputs=("normed",) if zero_copy_hidden else (),
     )
 

@@ -16,7 +16,7 @@ from atom.utils.backends import set_model_tag
 from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.piecewise_af import PiecewiseAFRunner, SharedGraphInputs
+from atom.utils.piecewise_af import PiecewiseAFRunner
 
 from .bounded_replay import (
     build_replay_plan,
@@ -109,6 +109,7 @@ def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tens
         runner=layer.attention_graphs,
         outputs=layer.piecewise_outputs,
         forward_context=context,
+        capture_state=getattr(metadata.step, "piecewise_state", None),
     )
 
 
@@ -132,6 +133,12 @@ def v41_piecewise_begin(hidden: torch.Tensor) -> None:
         return
     rows = metadata.engram_embeddings
     context = get_forward_context()
+    if (
+        context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
+        and not getattr(context, "in_hipgraph", False)
+        and metadata.cache is not None
+    ):
+        metadata.step.prepare_piecewise(metadata.cache)
     if getattr(rows, "stage", None) is not None and (
         not getattr(context, "in_hipgraph", False)
         or context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
@@ -290,16 +297,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self._late_input_buffers = (
             StableOutputs(capacity=buffer_tokens) if buffer_tokens else None
         )
-        attention_inputs = SharedGraphInputs() if self.piecewise else None
         for i, layer in enumerate(self.layers):
             layer.piecewise = self.piecewise
             if self.piecewise:
                 layer.piecewise_outputs = StableOutputs(
                     capacity=buffer_tokens, token_dim=1
                 )
-                layer.attention_graphs = PiecewiseAFRunner(
-                    layer.piecewise_outputs, attention_inputs
-                )
+                layer.attention_graphs = PiecewiseAFRunner(layer.piecewise_outputs)
             layer.af_piecewise = (
                 self.piecewise
                 and config.compilation_config.cudagraph_mode

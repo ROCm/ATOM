@@ -341,10 +341,18 @@ class PagedAttentionCache:
         zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
         if step.request_floors.any() and not step.decode:
-            step.swa_replay_start, step.swa_cached_until = upload_numpy(
-                np.stack((step.request_floors, step.request_cached_until)),
-                step.positions.device,
+            from atom.utils.piecewise_af import PiecewiseBuffers
+
+            if not hasattr(self, "piecewise_buffers"):
+                self.piecewise_buffers = PiecewiseBuffers()
+            layout = self.piecewise_buffers.deliver(
+                ("replay_layout", step.positions.data_ptr()),
+                upload_numpy(
+                    np.stack((step.request_floors, step.request_cached_until)),
+                    step.positions.device,
+                ),
             )
+            step.swa_replay_start, step.swa_cached_until = layout.unbind()
 
     def _replay_start_zeros(self, running_bs):
         """Every request's window from position 0: what a step that is not a

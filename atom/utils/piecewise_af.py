@@ -1,198 +1,268 @@
 # SPDX-License-Identifier: MIT
-"""Metadata interface and live capture engine for :func:`piecewise_core`."""
+"""Live piecewise graphs over builder-owned buffers and per-forward caches."""
 
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import MutableMapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 
 from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 from atom.utils.graph_holders import register_graph_holder
 
+_recording = ContextVar("piecewise_recording", default=None)
+_missing = object()
 
-@dataclass
-class PiecewiseMetadata:
-    """Describe dynamic metadata without implementing a graph runner.
 
-    ``inputs`` is an explicit dict/list/tuple tree of tensors and immutable
-    scalar leaves. Tensor layouts, tree structure and scalar values are keyed
-    automatically. ``key`` adds host branches and persistent addresses outside
-    that tree (such as the KV pool). Do not put arbitrary request objects or
-    workspaces in the tree; keep them in the model's reconstruction function.
+def buffer_key(value):
+    """Key explicit buffer trees by address/layout and host values, never data.
 
-    ``rebuild(staged_inputs)`` returns keyword overrides for the decorated core.
-    It runs separately for warmup and recording, with fresh tree containers, and
-    must create fresh derived Python state. Tensor inputs are read-only; device
-    side effects belong in persistent state such as the KV pool.
-
-    ``publish(overrides)`` copies only this core's Python results into the CURRENT
-    live metadata. The engine supplies warmup results on the first call and
-    recorded results on replay. It never retains this publication callback.
-
-    Optional ``memo`` shares immutable-per-forward inputs across serial layers;
-    its owner MUST clear it at each forward, including reused request objects.
-    ``copy_each_call`` lists paths whose contents may change within a forward.
-    Without a memo every tensor is refreshed on every call.
+    Builders call this once when publishing a view. Persistent tensors are read
+    directly, just as in startup decode capture. This does not walk arbitrary
+    model/request objects or rebuild metadata.
     """
-
-    key: tuple
-    inputs: dict
-    rebuild: Callable[[dict], dict]
-    publish: Callable[[dict], None] | None = None
-    memo: dict | None = None
-    copy_each_call: tuple[tuple, ...] = ()
-
-
-def _signature(tensor: torch.Tensor) -> tuple:
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, tensor.device)
-
-
-def _flatten(tree, leaves, path=()):
-    """Only traverse the declared tree; never inspect arbitrary model objects."""
-    if type(tree) is dict:
+    if isinstance(value, torch.Tensor):
         return (
-            dict,
-            tuple((k, _flatten(v, leaves, (*path, k))) for k, v in tree.items()),
+            value.data_ptr(),
+            tuple(value.shape),
+            tuple(value.stride()),
+            value.dtype,
+            value.device,
         )
-    if type(tree) in (tuple, list):
-        return (
-            type(tree),
-            tuple(_flatten(v, leaves, (*path, i)) for i, v in enumerate(tree)),
-        )
-    if not isinstance(tree, (torch.Tensor, str, int, float, bool, type(None))):
-        raise TypeError(
-            f"Piecewise metadata at {path!r} must be a tensor or scalar, "
-            f"got {type(tree).__name__}"
-        )
-    leaves[path] = tree
-    return None
+    if isinstance(value, dict):
+        return tuple((k, buffer_key(v)) for k, v in value.items())
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(buffer_key(v) for v in value))
+    if isinstance(value, (str, int, float, bool, type(None))) or value is _missing:
+        return (type(value), value)
+    raise TypeError(f"Unsupported piecewise buffer/key value: {type(value).__name__}")
 
 
-def _unflatten(structure, leaves, path=("metadata",)):
-    if structure is None:
-        return leaves[path]
-    kind, children = structure
-    if kind is dict:
-        return {k: _unflatten(v, leaves, (*path, k)) for k, v in children}
-    return kind(_unflatten(v, leaves, (*path, i)) for i, v in enumerate(children))
+class PiecewiseBuffers(StableOutputs):
+    """Builder-owned storage for views/results without an existing fixed buffer.
 
-
-class SharedGraphInputs(StableOutputs):
-    """Stable input addresses, optionally copied once per forward across layers."""
+    Use distinct namespaces for simultaneously live views (including TBO).
+    Existing builder buffers must be passed directly, without another copy.
+    """
 
     def __init__(self):
         super().__init__()
-        self._generation = object()
         register_graph_holder(self)
 
     def release_graphs(self):
         self._slots.clear()
-        self._generation = object()
         return 0
 
-    def prepare(self, inputs, *, memo=None, copy_each_call=(), zero_copy=()):
-        staged = {}
-        for name, source in inputs.items():
-            if not isinstance(source, torch.Tensor) or name in zero_copy:
-                staged[name] = source
-                continue
-            # Scope the memo to this store, including after a graph release.
-            key = (self._generation, name, _signature(source))
-            pointer = source.data_ptr()
-            memoize = memo is not None and name not in copy_each_call
-            cached = memo.get(key) if memoize else None
-            if cached is not None and cached[0] == pointer:
-                staged[name] = cached[1]
-                continue
-            buffer = self.slot(key, source).copy_(source)
-            if memoize:
-                memo[key] = (pointer, buffer)
-            staged[name] = buffer
-        return staged
+
+class ReplayCache(MutableMapping):
+    """A forward-local dictionary whose Python writes accompany graph replay.
+
+    Reads are dependencies; only reads before the core's own write are keyed.
+    Warmup and recording run against the SAME entry state. Writes are restored
+    afterwards and published from warmup on the first call, recording on replay.
+    Values are immutable scalar/tensor trees. Tensor contents must not be mutated
+    by Python between layers; persistent GPU state belongs in builder buffers.
+
+    ``stable=True`` delivers tensor results to builder-owned slots. This lets
+    eager, newly captured and replayed producers share downstream graph inputs.
+    """
+
+    def __init__(self, values=(), *, stable=False):
+        self._data = dict(values)
+        self.stable = stable
+        self._storage = None
+        self._name = None
+
+    def _read(self, key):
+        record = _recording.get()
+        if record is not None:
+            record.read(self, key)
+
+    def __getitem__(self, key):
+        self._read(key)
+        return self._data[key]
+
+    def __iter__(self):
+        self._read(_missing)
+        return iter(self._data)
+
+    def __len__(self):
+        self._read(_missing)
+        return len(self._data)
+
+    def bind(self, storage, namespace):
+        """Bind result slots before any producer (including an eager gather)."""
+        self._storage, self._name = storage, namespace
+
+    def __setitem__(self, key, value):
+        record = _recording.get()
+        if record is not None:
+            record.write(self, key)
+        if self.stable and self._storage is not None:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("Stable ReplayCache results must be tensors")
+            slot = self._storage.slot((self._name, key), value)
+            if slot.data_ptr() != value.data_ptr():
+                slot.copy_(value)
+            value = slot
+        self._data[key] = value
+
+    def __delitem__(self, key):
+        record = _recording.get()
+        if record is not None:
+            record.write(self, key)
+        del self._data[key]
+
+    def clear(self):
+        if _recording.get() is None:
+            self._data.clear()
+        else:
+            super().clear()
+
+
+class _Transaction:
+    def __init__(self, caches):
+        self.caches = caches
+        self.names = {id(cache): name for name, cache in caches.items()}
+        self.reads, self.before, self.writes, self.orders = {}, {}, {}, {}
+
+    def _path(self, cache, key):
+        if id(cache) not in self.names:
+            raise ValueError("Core accessed a ReplayCache outside its capture state")
+        return self.names[id(cache)], key
+
+    def read(self, cache, key):
+        path = self._path(cache, key)
+        if key is _missing:
+            self.reads[path] = self.orders.get(path[0], tuple(cache._data))
+        elif path not in self.before:
+            self.reads[path] = buffer_key(cache._data.get(key, _missing))
+
+    def write(self, cache, key):
+        path = self._path(cache, key)
+        if path[0] not in self.orders:
+            self.orders[path[0]] = tuple(cache._data)
+        if path not in self.before:
+            self.before[path] = cache._data.get(key, _missing)
+
+    def finish(self):
+        for (name, key), previous in self.before.items():
+            data = self.caches[name]._data
+            self.writes[name, key] = data.get(key, _missing)
+            if previous is _missing:
+                data.pop(key, None)
+            else:
+                data[key] = previous
+        for name, order in self.orders.items():
+            cache = self.caches[name]
+            cache._data = {key: cache._data[key] for key in order}
+
+
+class PiecewiseState:
+    """The builder's public contract: a complete key, buffers, and result caches.
+
+    Prepare once per forward/view, after publishing the buffers. ``key`` covers
+    host branches; buffer addresses/layouts are added automatically. Capture
+    binds the live objects unchanged. There are no reconstruction/publication
+    callbacks, field selectors or model-specific graph classes.
+    """
+
+    def __init__(self, key, buffers, caches=(), *, storage=None, namespace=()):
+        self.buffers = buffers  # Keep captured device allocations alive.
+        self.key = (key, buffer_key(buffers))
+        hash(self.key)
+        self.caches = dict(caches)
+        if len({id(v) for v in self.caches.values()}) != len(self.caches):
+            raise ValueError("Name each shared ReplayCache only once")
+        for name, cache in self.caches.items():
+            if not isinstance(cache, ReplayCache):
+                raise TypeError("PiecewiseState caches must be ReplayCache instances")
+            cache.bind(storage, (namespace, name))
+
+    @contextmanager
+    def record(self):
+        if _recording.get() is not None:
+            raise RuntimeError("Nested piecewise state recording is unsupported")
+        transaction = _Transaction(self.caches)
+        token = _recording.set(transaction)
+        try:
+            yield transaction
+        finally:
+            _recording.reset(token)
+            transaction.finish()
+
+    def matches(self, reads):
+        for (name, key), expected in reads.items():
+            data = self.caches[name]._data
+            actual = (
+                tuple(data) if key is _missing else buffer_key(data.get(key, _missing))
+            )
+            if actual != expected:
+                return False
+        return True
+
+    def publish(self, writes):
+        # These copies already ran on the GPU. Rebind Python results without
+        # launching another copy or overwriting unrelated inputs.
+        for (name, key), value in writes.items():
+            data = self.caches[name]._data
+            if value is _missing:
+                data.pop(key, None)
+            else:
+                data[key] = value
 
 
 class PiecewiseAFRunner(CudagraphCaptureRunner):
-    """Bound live recordings and manage metadata for the decorator.
-
-    No subclass is needed. An explicit instance is optional; supply one when
-    sharing input storage or using fixed-capacity output slots across layers.
-    A full cache falls back before staging new inputs; existing keys replay.
-    """
+    """Bound live recordings over stable builder metadata, with eager fallback."""
 
     max_entries = 32
 
-    def __init__(self, outputs=None, inputs=None, *, token_dim=0):
+    def __init__(self, outputs=None, *, token_dim=0):
         super().__init__()
         self.outputs = (
             outputs if outputs is not None else StableOutputs(token_dim=token_dim)
         )
-        self._owns_inputs = inputs is None
-        self.inputs = inputs if inputs is not None else SharedGraphInputs()
-        self._captures: dict[tuple, dict] = {}
+        self._captures = {}
 
     def release_graphs(self):
         self._captures.clear()
-        count = super().release_graphs()
-        if self._owns_inputs:
-            self.inputs.release_graphs()
-        return count
+        return super().release_graphs()
 
-    def run(self, key, tensors, metadata, core, out_slot, *, zero_copy, config_names):
-        """Return ``(handled, result)``; only cache misses execute Python math."""
-        sources = {("tensor", name): value for name, value in tensors.items()}
-        structure = _flatten(metadata.inputs, sources, ("metadata",))
-        direct = frozenset(("tensor", name) for name in zero_copy)
-        signature = tuple(
-            (
-                name,
-                (
-                    (_signature(value), value.data_ptr() if name in direct else None)
-                    if isinstance(value, torch.Tensor)
-                    else (type(value), value)
-                ),
-            )
-            for name, value in sources.items()
+    def run(self, key, tensors, state, core, out_slot, *, zero_copy):
+        direct = {name: value for name, value in tensors.items() if name in zero_copy}
+        layouts = tuple(
+            (name, tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+            for name, value in tensors.items()
+            if isinstance(value, torch.Tensor)
         )
-        key = (key, metadata.key, structure, signature)
-        hash(key)  # Reject an invalid host key before allocating or warming.
-        first_call = not self.has_graph(key)
-        if first_call and len(self._graphs) >= self.max_entries:
+        key = (key, state.key, layouts, buffer_key(direct))
+        entries = self._captures.get(key, ())
+        for graph_key, reads, writes in entries:
+            if state.matches(reads):
+                result = self.replay(graph_key, tensors)
+                state.publish(writes)
+                return True, result
+        if len(self._graphs) >= self.max_entries:
             return False, None
-        staged = self.inputs.prepare(
-            sources,
-            memo=metadata.memo,
-            copy_each_call=(
-                *(("tensor", name) for name in tensors),
-                *(("metadata", *path) for path in metadata.copy_each_call),
-            ),
-            zero_copy=direct,
+        graph_key = len(self._graphs)
+        executions = []
+
+        def compute(**values):
+            with state.record() as transaction:
+                result = core(**values)
+            executions.append(transaction)
+            return result
+
+        read_from, refresh = self.input_buffers(tensors, tuple(tensors), zero_copy)
+        result = self.capture_on_demand(
+            graph_key, read_from, refresh, compute, out_slot
         )
-        if first_call:
-            executions = []
-
-            def compute(**values):
-                overrides = metadata.rebuild(_unflatten(structure, staged))
-                if not isinstance(overrides, dict) or overrides.keys() - config_names:
-                    raise ValueError(
-                        "Piecewise metadata rebuild must return only declared "
-                        "non-tensor keyword arguments"
-                    )
-                result = core(**values, **overrides)
-                executions.append(overrides)
-                return result
-
-            result = self.capture_on_demand(
-                key,
-                {name: staged["tensor", name] for name in tensors},
-                {},
-                compute,
-                out_slot,
-            )
-            self._captures[key] = executions[-1]
-            published = executions[0]
-        else:
-            result = self.replay(key, {})  # All refreshes happened above.
-            published = self._captures[key]
-        if metadata.publish is not None:
-            metadata.publish(published)
+        warm, recorded = executions
+        self._graphs[graph_key]["state"] = state
+        # Retain non-tensor resources whose addresses were captured too.
+        self._graphs[graph_key]["core"] = core
+        self._captures.setdefault(key, []).append(
+            (graph_key, recorded.reads, recorded.writes)
+        )
+        state.publish(warm.writes)
         return True, result
