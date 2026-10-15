@@ -272,7 +272,6 @@ def test_ineligible_calls_do_not_prepare_or_publish(gate):
 
     def metadata(layer, arguments):
         seen.append("metadata")
-        return None
 
     @piecewise_core(capture_prefill=True, metadata=metadata, max_tokens=4)
     def core(layer, x: torch.Tensor):

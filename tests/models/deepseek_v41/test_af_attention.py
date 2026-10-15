@@ -11,8 +11,8 @@ pytest.importorskip("aiter")
 
 from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
-from atom.utils.piecewise_af import PiecewiseAFRunner
 from atom.models.deepseek_v41.model import Block
+from atom.utils.piecewise_af import PiecewiseAFRunner
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 
