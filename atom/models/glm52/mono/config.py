@@ -19,6 +19,7 @@ from atom.models.glm52.mono.kernels.geometry_config import (
     glm5_tp_config,
 )
 from atom.models.glm52.mono.kernels.layout import INDEX_SEG, index_cp_world
+from atom.models.utils import is_neox_rope_style
 from atom.mono.plan.shard import Shard
 from atom.mono.runtime.deployment import common_refusals, first_refusal
 from atom.plugin.prepare import is_plugin_mode
@@ -187,27 +188,18 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
     if hf_config.moe_intermediate_size != shard.inter * tp_size:
         return "expert width"
     # The kernel rotates adjacent pairs unconditionally (`kernel.py`: x0, x1 at
-    # `pr*2` and `pr*2 + 1`), i.e. interleaved / GPT-J, with no NeoX branch. A
-    # checkpoint that asks for NeoX would get a different position encoding
-    # with no error. Deliberately NOT an `expected` entry: that dict compares
-    # for equality, and a MISSING or null `rope_interleave` is legal here --
-    # production resolves it through `default_is_neox=False`, i.e. interleaved
-    # (`deepseek_v2._is_neox_rope_style`). Only an explicit falsy value selects
-    # NeoX, so the test is on the resolved layout, not on the field.
-    # local import: `config` is reached early and must stay cheap -- module
-    # scope here would pull all of `deepseek_v2`, and that module imports GLM's
-    # mono dispatch back from inside `GlmMoeDsaForCausalLM.__init__`
-    from atom.models.deepseek_v2 import _is_neox_rope_style
-
-    if _is_neox_rope_style(hf_config, "rope_interleave", default_is_neox=False):
+    # `pr*2` and `pr*2 + 1`), i.e. interleaved / GPT-J, with no NeoX branch, for
+    # both the MLA rope and the fused indexer's own, independent one. A
+    # checkpoint that asks for NeoX would get a different position encoding with
+    # no error. Deliberately NOT `expected` entries: that dict compares for
+    # equality, while what decides the layout is how production RESOLVES the
+    # flag, and the two defaults are opposites -- a missing or null
+    # `rope_interleave` is interleaved and fine, a missing or null
+    # `indexer_rope_interleave` is NeoX and unservable. Hence the shared
+    # resolver rather than a local reimplementation of either rule.
+    if is_neox_rope_style(hf_config, "rope_interleave", default_is_neox=False):
         return f"rope_interleave={getattr(hf_config, 'rope_interleave', None)!r}"
-    # The fused indexer has its own rope instance and its own flag, and the
-    # kernel rotates its keys in pairs too (`kernel.py`'s index-key stage).
-    # Note the default is the opposite one: production resolves a missing or
-    # null `indexer_rope_interleave` to NeoX, so here it is the ABSENT field
-    # that is unservable and `=true` that is fine. Same reason this resolves
-    # instead of comparing.
-    if _is_neox_rope_style(hf_config, "indexer_rope_interleave", default_is_neox=True):
+    if is_neox_rope_style(hf_config, "indexer_rope_interleave", default_is_neox=True):
         return (
             "indexer_rope_interleave="
             f"{getattr(hf_config, 'indexer_rope_interleave', None)!r}"
