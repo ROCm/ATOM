@@ -40,7 +40,16 @@ include-package-data = true
 atom = [
     "mesh/target/release/libmesh.so",
     "benchmarks/results/schemas/*.json",
+    "models/deepseek_v4/mono/LICENSE",
+    "models/deepseek_v4/mono/UPSTREAM.json",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# FlyDSL traces these closures immediately while building the device program;
+# they do not escape the constexpr loop that provides the captured variables.
+# Keep nested constexpr guards and Stream defaults in their source form because
+# they are part of the kernel build contract rather than deferred Python work.
+"atom/models/deepseek_v4/mono/kernels/*.py" = ["B008", "B023", "PLR0124", "SIM102"]
 
 [project.entry-points."vllm.platform_plugins"]
 # by default the entry-points will be installed anyway

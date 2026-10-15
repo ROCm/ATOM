@@ -99,6 +99,77 @@ def launcher_resources(launcher) -> list[dict]:
     ]
 
 
+def require_resident_grid(launcher, grid: int, threads: int) -> None:
+    """Check HIP occupancy for the actual binaries before a persistent launch.
+
+    Scratch admission is a separate check. A successful occupancy query alone
+    does not prove mailbox/protocol safety or admit another device topology.
+    """
+    import ctypes
+
+    import torch
+
+    hip = ctypes.CDLL("libamdhip64.so")
+    hip.hipModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+    hip.hipModuleGetFunction.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+    ]
+    hip.hipModuleUnload.argtypes = [ctypes.c_void_p]
+    for name in (
+        "hipModuleLoadData",
+        "hipModuleGetFunction",
+        "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+        "hipModuleUnload",
+    ):
+        getattr(hip, name).restype = ctypes.c_int
+
+    def checked(status):
+        if status:
+            raise RuntimeError(f"HIP persistent residency query failed: {status}")
+
+    artifacts = list(launcher._mem_cache.values())
+    if not artifacts:
+        raise RuntimeError("compile before checking persistent residency")
+    cus = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    for artifact in artifacts:
+        elf = _code_object(artifact._ir_text)
+        # The metadata's descriptor is '<kernel>.kd'; HIP takes the entry name.
+        symbol = _symbol(elf, demangle=False)
+        module, function, active = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_int()
+        checked(
+            hip.hipModuleLoadData(
+                ctypes.byref(module), ctypes.create_string_buffer(elf)
+            )
+        )
+        try:
+            checked(
+                hip.hipModuleGetFunction(
+                    ctypes.byref(function), module, symbol.encode()
+                )
+            )
+            checked(
+                hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+                    ctypes.byref(active), function, threads, 0
+                )
+            )
+            if grid > cus * active.value:
+                raise RuntimeError(
+                    f"persistent grid {grid} cannot fit {cus} CUs x {active.value} CTAs/CU"
+                )
+        finally:
+            checked(hip.hipModuleUnload(module))
+
+
 def _code_object(module_text: str) -> bytes:
     """The ``gpu.binary``'s ELF: the ``bin = "..."`` string, MLIR-escaped (\\XX a
     byte, \\\\ and \\" themselves)."""
@@ -147,7 +218,7 @@ def _note_uint(elf: bytes, key: bytes, optional: bool = False) -> int | None:
     return int.from_bytes(v[1 : 1 + width], "big")
 
 
-def _symbol(elf: bytes) -> str:
+def _symbol(elf: bytes, *, demangle: bool = True) -> str:
     """The kernel's name from its ``.symbol`` (a msgpack str, ``<name>.kd``)."""
     at = elf.find(_SYMBOL_KEY)
     if at < 0:
@@ -162,6 +233,8 @@ def _symbol(elf: bytes) -> str:
     else:
         raise RuntimeError(f"unexpected msgpack tag {v[0]:#x} for .symbol")
     name = v[:n].decode().removesuffix(".kd")
+    if not demangle:
+        return name
     m = _MANGLED.fullmatch(name)
     if m is None:
         return name
