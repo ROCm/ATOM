@@ -225,6 +225,49 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
+_DUMMY_RUN_COVERAGE_LOGGED = False
+
+
+def _install_shared_vllm_patches() -> None:
+    """The patches both registration hooks need, installed from either.
+
+    Both hooks run them because neither is guaranteed to: vLLM resolves the
+    platform class from inside its own ``import vllm``, so ``register_platform``
+    can be swallowed whole and its coverage line never printed -- which is how
+    the dummy-run marking once covered nothing while the synthetic batches went
+    on taking real STATE slots. Every one of these is idempotent, so installing
+    twice costs nothing.
+
+    Kept in one function because it was two pasted copies, which drifted: the
+    coverage line was logged from both, so a normal run reported it twice. It is
+    logged here only by the call that installs something.
+    """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+        apply_vllm_v4_profile_cache_patch,
+    )
+    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
+
+    apply_vllm_v4_block_reuse_patch()
+    # Unconditionally, not from whoever registers a proxy layer. It was
+    # installed from V4's registration, so V4.1 -- which registers its own
+    # layer -- never got it, and the flag its bind reads never left a default
+    # that did not exist until this week. That is the third V4 guard V4.1
+    # missed for being opt-in (markers, attributes, now an installer), so this
+    # one stops being opt-in: `_mark_v4_proxy_cache_mode` only touches layers
+    # carrying `_atom_v4_proxy_layer`, which makes it a no-op everywhere else.
+    apply_vllm_v4_profile_cache_patch()
+
+    # Which forwards are vLLM's own, for a model that keeps per-request state.
+    global _DUMMY_RUN_COVERAGE_LOGGED
+    covered = apply_vllm_dummy_run_patch()
+    if covered and not _DUMMY_RUN_COVERAGE_LOGGED:
+        _DUMMY_RUN_COVERAGE_LOGGED = True
+        logger.info(
+            "ATOM plugin: dummy-run marking covers %d runner class(es)", covered
+        )
+
+
 def register_platform() -> str | None:
 
     if disable_vllm_plugin:
@@ -255,26 +298,7 @@ def register_platform() -> str | None:
     # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
     # install the targeted scheduler-side queue-order compatibility patch before
     # any KVCacheManager is constructed.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-        apply_vllm_v4_profile_cache_patch,
-    )
-
-    apply_vllm_v4_block_reuse_patch()
-    # Unconditionally, not from whoever registers a proxy layer. It was
-    # installed from V4's registration, so V4.1 -- which registers its own
-    # layer -- never got it, and the flag its bind reads never left a default
-    # that did not exist until this week. That is the third V4 guard V4.1
-    # missed for being opt-in (markers, attributes, now an installer), so this
-    # one stops being opt-in: `_mark_v4_proxy_cache_mode` only touches layers
-    # carrying `_atom_v4_proxy_layer`, which makes it a no-op everywhere else.
-    apply_vllm_v4_profile_cache_patch()
-
-    # Which forwards are vLLM's own, for a model that keeps per-request state.
-    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
-
-    covered = apply_vllm_dummy_run_patch()
-    logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
+    _install_shared_vllm_patches()
 
     _register_kv_connectors()
 
@@ -404,31 +428,9 @@ def register_model() -> None:
 
     _set_plugin_mode()
     # The general-plugin hook runs in the EngineCore process that owns the
-    # scheduler/KVCacheManager; install this here as well as in the platform hook.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-    )
-
-    apply_vllm_v4_block_reuse_patch()
-    # Also here, and this is the site that matters: `register_platform` can be
-    # swallowed (see the note below on why this hook is the reliable one), and
-    # a profile-cache patch that did not install leaves V4.1's bind unable to
-    # tell the profile's placeholder pool from the serving one. Idempotent, so
-    # installing in both places costs nothing.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_profile_cache_patch,
-    )
-
-    apply_vllm_v4_profile_cache_patch()
-
-    # Also from here, and this is the site that matters: `register_platform`
-    # can be swallowed whole, and the first run proved it -- the coverage line
-    # this logs never appeared, so the marking covered nothing and the
-    # synthetic batches went on taking real STATE slots.
-    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
-
-    covered = apply_vllm_dummy_run_patch()
-    logger.info("ATOM plugin: dummy-run marking covers %d runner class(es)", covered)
+    # scheduler/KVCacheManager; install these here as well as in the platform
+    # hook, which vLLM does not always reach.
+    _install_shared_vllm_patches()
 
     # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
     # before EngineCore sizes the KV cache. This hook is the only one that is

@@ -491,11 +491,18 @@ def test_the_profile_cache_patch_installs_without_a_v4_model():
     import inspect
 
     register = importlib.import_module("atom.plugin.vllm.register")
+    # Followed one level into the shared installer rather than grepping
+    # `register_model` for the call: the two hooks' pasted copies were folded
+    # into `_install_shared_vllm_patches`, and a literal-string check reads
+    # that refactor as the regression it exists to catch.
     source = inspect.getsource(register.register_model)
-    assert "apply_vllm_v4_profile_cache_patch()" in source, (
-        "register_model must install the profile-cache patch; installing it "
-        "from a model's own registration is what skipped V4.1"
+    assert "_install_shared_vllm_patches()" in source, (
+        "register_model must install the shared patches; installing them from "
+        "a model's own registration is what skipped V4.1"
     )
+    assert "apply_vllm_v4_profile_cache_patch()" in inspect.getsource(
+        register._install_shared_vllm_patches
+    ), "the shared installer must still install the profile-cache patch"
     # `register_platform` installs it too, but it is not checked here: that
     # hook can be swallowed whole (see `deepseek_v41_state_reserve_patch`), so
     # it is the belt and this is the braces.

@@ -86,8 +86,10 @@ _DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
 # DeepSeek-V4.1 (CSA2) is likewise native ATOM, but its pool holds a per-request
 # STATE region alongside the paged history and it binds no per-layer cache --
 # so it gets its own bridge (`deepseek_v41_bridge`) rather than sharing V4's.
-# Text-only: vision, DSpark drafting and MTP are refused in
-# `atom.models.deepseek_v41.config.validate_runtime_config`.
+# Text-only: vision and MTP are refused in
+# `atom.models.deepseek_v41.config.validate_runtime_config`. DSpark drafting is
+# supported on this path -- vLLM drives it -- and every other speculative
+# method is refused by `_refuse_unsupported_v41_speculation`.
 _DEEPSEEK_V41_ARCH = "DeepseekV41ForCausalLM"
 _DEEPSEEK_V41_ARCHES: set[str] = {_DEEPSEEK_V41_ARCH}
 
@@ -492,8 +494,19 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # before the model below is built out of it. Asked of the
             # effective graph setting rather than the breakable flag, which
             # vLLM sets for V4.1 on ROCm whether or not anything is captured.
+            #
+            # The constraints run first, and have to: they are what forces the
+            # mode to NONE when capture is unavailable, and they are not
+            # guaranteed to have run yet -- their config-time site is
+            # `ATOMPlatform`, which vLLM may never activate. Reading the mode
+            # before that decision installed the broken-out forward on an
+            # eager run, which then paid for its extra buffer and copy per
+            # layer, and skewed every eager-against-graph comparison. It is
+            # idempotent; the site below keeps its call.
+            from atom.plugin.vllm.platform import enforce_deepseek_v41_constraints
             from atom.plugin.vllm.vllm_runtime import graphs_enabled
 
+            enforce_deepseek_v41_constraints(vllm_config)
             apply_v41_eager_break(graphs_enabled(vllm_config))
         if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
             self.atom_config, "enable_decoder_swa_bounded_replay", False

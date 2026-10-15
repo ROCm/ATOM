@@ -72,22 +72,38 @@ _V41_MODEL_TYPE = "deepseek_v41"
 _V41_TEXT_CONFIG_CACHE: dict[str, object] = {}
 
 
-def is_deepseek_v41_vllm_config(vllm_config) -> bool:
-    """Whether this vLLM config is serving a DeepSeek-V4.1 checkpoint.
+def is_deepseek_v41_model_config(model_config) -> bool:
+    """Whether this model config describes a DeepSeek-V4.1 checkpoint.
 
-    Read off the architectures list first (what the registry dispatched on) and
-    fall back to ``model_type``, because the AutoConfig shim registered in
-    ``atom.plugin.vllm.register`` is what supplies the architectures and a
-    config built by some other route may only carry the type.
+    The one rule, so that everything keyed on "is this V4.1" answers the same
+    way. It used to be asked in several places with different rules -- some
+    reading ``architectures``, some also accepting ``model_type`` -- and the
+    disagreement had a shape: a config carrying only the type got its STATE
+    tail reserved out of the pool by the patch that uses the generous rule,
+    and none of the refusals keyed on the strict one.
+
+    Architectures first, because that is what the registry dispatched on, then
+    ``model_type``: the AutoConfig shim in ``atom.plugin.vllm.register`` is
+    what supplies the architectures, and a config built by another route may
+    carry only the type. Both are read off the object itself or off its
+    ``hf_config``, since callers hold one or the other.
     """
-    model_config = getattr(vllm_config, "model_config", None)
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None:
+    if model_config is None:
         return False
-    architectures = getattr(hf_config, "architectures", None) or ()
-    if any(str(arch) in _V41_ARCHITECTURES for arch in architectures):
-        return True
-    return str(getattr(hf_config, "model_type", "")) == _V41_MODEL_TYPE
+    for source in (model_config, getattr(model_config, "hf_config", None)):
+        if source is None:
+            continue
+        architectures = getattr(source, "architectures", None) or ()
+        if any(str(arch) in _V41_ARCHITECTURES for arch in architectures):
+            return True
+        if str(getattr(source, "model_type", "")) == _V41_MODEL_TYPE:
+            return True
+    return False
+
+
+def is_deepseek_v41_vllm_config(vllm_config) -> bool:
+    """Whether this vLLM config is serving a DeepSeek-V4.1 checkpoint."""
+    return is_deepseek_v41_model_config(getattr(vllm_config, "model_config", None))
 
 
 def v41_text_config(vllm_config):
@@ -1317,6 +1333,21 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     So it is checked here, where the row can still be named, rather than left
     to surface as a cursor that is off by the gap between two requests.
     """
+    # KNOWN DEAD on the V2 path, which is the only one real V4.1 serving takes:
+    # this names the V1 runner's field, and V2's `InputBatch` carries
+    # `num_computed_tokens_np` instead, so this returns before comparing
+    # anything. Reading the V2 field is not the fix, and that is worth writing
+    # down because it looks like one: `snapshot_v41_batch` takes `num_computed`
+    # from `common_attn_metadata` precisely because the persistent batch is
+    # ordered independently of it, and
+    # `test_v2_snapshot_keeps_exact_lengths_and_persistent_indices` pins that
+    # with a poisoned `num_computed_tokens_np` the step is expected to ignore.
+    # Comparing the two would turn that documented independence into a crash.
+    #
+    # So what has to be settled first is whether a divergence is a bug at all
+    # on this path, now that every KV connector is refused here and the
+    # park-and-readmit case that motivated the independence cannot arise. Until
+    # it is, this stays inert rather than fatal on an unverified premise.
     batch_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
     if batch_computed is None:
         return
@@ -1452,15 +1483,6 @@ except ImportError:  # vLLM too old for breakable capture; the break is a no-op
 
     def eager_break_during_capture(fn):
         return fn
-
-
-def _v41_capture_active() -> bool:
-    """Whether a breakable cudagraph capture is recording this forward."""
-    try:
-        from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-    except ImportError:
-        return False
-    return bool(BreakableCUDAGraphCapture.is_active())
 
 
 def _v41_live_running_tokens(input_ids) -> int:
@@ -1882,9 +1904,11 @@ def atom_deepseek_v41_forward_context(
         # one that did fork is the MoE's `alt_stream`, which takes the same
         # gate.
         #
-        # So this reports the thing the consumer actually asks about. If a
-        # second consumer ever wants "a graph is recording", it should ask
-        # `_v41_capture_active()` directly rather than widen this.
+        # So this reports the thing the consumer actually asks about. A
+        # second consumer wanting "a graph is recording" should ask
+        # `BreakableCUDAGraphCapture.is_active()` for itself rather than
+        # widen this -- there used to be a `_v41_capture_active()` here for
+        # that, and in three months nothing called it.
         in_hipgraph=False,
     )
     try:

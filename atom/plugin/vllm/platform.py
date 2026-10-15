@@ -27,8 +27,13 @@ _DEEPSEEK_V41_ARCHES = ("DeepseekV41ForCausalLM",)
 
 
 def _is_deepseek_v41(model_config) -> bool:
-    arches = getattr(model_config, "architectures", None) or []
-    return any(str(a) in _DEEPSEEK_V41_ARCHES for a in arches)
+    # One rule, shared with everything else keyed on this. Reading only
+    # `architectures` here while the STATE reserve also accepted `model_type`
+    # meant a config carrying just the type had its tail reserved and none of
+    # the refusals below applied to it.
+    from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_model_config
+
+    return is_deepseek_v41_model_config(model_config)
 
 
 def _is_deepseek_v4(model_config) -> bool:
