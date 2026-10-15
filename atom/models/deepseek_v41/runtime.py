@@ -18,12 +18,12 @@ from .bounded_replay import (
     build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
-    dp_stage_tokens,
     late_layer_start,
     placeholder_rows_of,
-    plan_stage_tokens,
+    planned_stage_tokens,
     replayable,
     rows_of,
+    run_decoder_stages,
 )
 from .config import validate_tbo_parallelism
 from .model import Block
@@ -244,7 +244,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             "Decoder SWA bounded replay: a prefill finishing its prompt runs "
             "the decoder (layers %d..%d) on its last window rows only and layer "
             "%d's query on its last row; one that does not stops at layer %d's "
-            "compression",
+            "compression (under DP attention it joins a peer's decoder "
+            "collectives on one placeholder row)",
             self.decoder_start,
             self.last_layer,
             self.last_layer,
@@ -302,39 +303,39 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             step = forward.attn_metadata.step
             window = forward.attn_metadata.cache.geometry.window_size
             plan = step.replay = build_replay_plan(step, window)
-        dp_tokens = self._dp_stage_tokens(forward, plan, num_tokens)
+        self._check_stage_report(forward, plan, num_tokens)
         if plan is not None:
-            return self._replayed(state, num_tokens, plan, dp_tokens)
-        with forward.use_dp_stage("decoder"):
-            state = self._late_layers(self._layer(self.decoder_start, state))
-            with forward.use_dp_stage("last_layer"):
-                hidden = self._layer(self.last_layer, state).collapse()
+            return self._replayed(state, num_tokens, plan)
+        hidden = run_decoder_stages(
+            forward,
+            lambda: self._layer(self.decoder_start, state),
+            self._late_layers,
+            lambda late: self._layer(self.last_layer, late),
+        ).collapse()
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def _dp_stage_tokens(self, forward, plan, num_tokens):
-        """Under DP attention, the group's tokens past the decoder's KV source,
-        as the step's DP sync agreed them (`dp_stage_tokens`). None outside DP
-        or when no rank replays.
-
-        This rank reported its counts from the batch before the step's
-        metadata existed (`DeepseekV41MetadataBuilder.dp_stage_tokens`); the
-        plan built here must run exactly those, or its peers' collectives
-        would wait on rows it never sends."""
-        tokens = dp_stage_tokens(forward)
-        if tokens is None:
-            return None
-        stages = forward.dp_stages
-        expected = (stages["decoder"].local_tokens, stages["last_layer"].local_tokens)
-        actual = plan_stage_tokens(plan, num_tokens)
-        if actual != expected:
+    def _check_stage_report(self, forward, plan, num_tokens):
+        """Under DP attention, check this forward runs the token counts its
+        rank reported to the group (`decoder_stage_report`): a rank that ran
+        others would leave its peers waiting in a collective. The replay
+        decision itself is the reported one (`replayable`); this guards the
+        counts, computed from the batch on one side and the plan on the
+        other."""
+        stages = getattr(forward, "dp_stages", None)
+        if stages is None:
+            return
+        reported = tuple(
+            stages.stages[name].local_tokens for name in ("decoder", "last_layer")
+        )
+        planned = planned_stage_tokens(plan, num_tokens)
+        if planned != reported:
             raise RuntimeError(
-                f"this DP rank runs {actual} decoder/last-layer tokens but "
-                f"reported {expected} to its DP group"
+                f"this DP rank runs {planned} decoder/last-layer tokens but "
+                f"reported {reported} to its DP group"
             )
-        return tokens
 
-    def _replayed(self, state, num_tokens, plan, dp_tokens=None):
+    def _replayed(self, state, num_tokens, plan):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
         compresses every row; the requests that finish their prompts run the
         decoder on their tails, layer 39's query on their last row, which alone
@@ -342,9 +343,9 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         read (the LM head's), and a chunk that holds none has its logits
         discarded.
 
-        ``dp_tokens``: the group's tokens per stage (`DPStageTokens`) when DP
-        attention replays. Each stage's MoE collectives are sized by
-        `ForwardContext.use_dp_stage`, prepared with the forward context."""
+        Under DP attention each stage's MoE collectives are sized as the
+        group agreed (`run_decoder_stages`), and a rank with no tail joins
+        them on one placeholder row while a peer has decoder work."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
@@ -356,20 +357,23 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         if plan.tail is not None:
             carry_selections(step, plan, self.decoder_specs)
             normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
-            with (
-                rows_of(metadata, plan.tail, rows=plan.tail_rows),
-                forward.use_dp_stage("decoder"),
-            ):
-                output = layer.attention_forward(normed, None, None, rope)
-                tail = self._late_layers(layer.ffn_forward(output, *seam))
-                with (
-                    rows_of(metadata, plan.tail, plan.q39, plan.q39.rows),
-                    forward.use_dp_stage("last_layer"),
-                ):
-                    last = self._layer(self.last_layer, tail, plan.q39)
+
+            def last_layer(tail):
+                with rows_of(metadata, plan.tail, plan.q39, plan.q39.rows):
+                    return self._layer(self.last_layer, tail, plan.q39)
+
+            with rows_of(metadata, plan.tail, rows=plan.tail_rows):
+                last = run_decoder_stages(
+                    forward,
+                    lambda: layer.ffn_forward(
+                        layer.attention_forward(normed, None, None, rope), *seam
+                    ),
+                    self._late_layers,
+                    last_layer,
+                )
             self._move_aux_rows(plan.tail_rows)
             full[plan.last_rows] = last.collapse().squeeze(0)
-        elif dp_tokens is not None and dp_tokens.decoder_active:
+        elif forward.dp_stages is not None and forward.dp_stages.active:
             self._join_decoder_collectives(forward, layer, rope, normed, seam)
         self.end_forward(full, None)
         return full
@@ -380,20 +384,22 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         A rank whose prefill finishes no prompt runs none of the decoder, but
         while a peer has decoder work its MoE gathers count on this rank once
         per layer. It runs the decoder on its first row under a request-less
-        step (`placeholder_rows_of`): attention returns
-        zeros and writes no cache, so the rows only feed the collectives, and
-        their output is dropped."""
+        step (`placeholder_rows_of`): attention returns zeros and writes no
+        cache, so the row only feeds the collectives, and its output is
+        dropped. V4.1 rejects EPLB (`validate_runtime_config`), so the row's
+        routing reaches no expert-load statistics."""
         metadata = forward.attn_metadata
         rows = torch.zeros(1, dtype=torch.int32, device=normed.device)
         normed, *seam = gather_rows(rows, normed, *seam, dim=1)
-        with (
-            placeholder_rows_of(metadata, rows),
-            forward.use_dp_stage("decoder"),
-        ):
-            output = layer.attention_forward(normed, None, None, rope)
-            state = self._late_layers(layer.ffn_forward(output, *seam))
-            with forward.use_dp_stage("last_layer"):
-                self._layer(self.last_layer, state)
+        with placeholder_rows_of(metadata, rows):
+            run_decoder_stages(
+                forward,
+                lambda: layer.ffn_forward(
+                    layer.attention_forward(normed, None, None, rope), *seam
+                ),
+                self._late_layers,
+                lambda late: self._layer(self.last_layer, late),
+            )
 
     def _move_aux_rows(self, rows):
         """Decoder-layer aux captures wrote the tail's rows at the buffer's head;

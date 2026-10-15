@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 """Decoder SWA bounded replay (`models/deepseek_v41/bounded_replay.py`)."""
 
-import contextlib
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -294,9 +293,15 @@ def _forward(lengths, **overrides):
         ({"ctx.is_dummy_run": True}, False),
         ({"ctx.is_draft": True}, False),
         ({"fwd.ubatch_slices": [object()]}, False),
-        # DP attention replays when the step's sync carried a stage table ...
-        ({"fwd.dp_metadata": object(), "ctx.forward_mode": "table"}, True),
-        # ... and not when it did not (no rank replays, or TBO split the step)
+        # DP attention replays as its rank reported to the group ...
+        (
+            {
+                "fwd.dp_metadata": object(),
+                "fwd.dp_stages": SimpleNamespace(applies=True),
+            },
+            True,
+        ),
+        # ... and not when the step's sync carried no stage table
         ({"fwd.dp_metadata": object()}, False),
         ({"step.decode": True}, False),
         # image rows replay: the router reads its rows' slice of the mask
@@ -305,20 +310,6 @@ def _forward(lengths, **overrides):
     ],
 )
 def test_only_an_unpadded_prefill_replays(overrides, expected):
-    if overrides.get("ctx.forward_mode") == "table":
-        # the step's DP sync carried a stage table: the forward context holds
-        # its stages (`set_forward_context`)
-        rows = ((128,), (1,), (1,), (1,))
-        overrides = {
-            **overrides,
-            "ctx.forward_mode": SimpleNamespace(
-                sync=SimpleNamespace(stage_tokens_across_dp=rows)
-            ),
-            "fwd.dp_stages": {
-                "decoder": SimpleNamespace(tokens_across_dp=(128,)),
-                "last_layer": SimpleNamespace(tokens_across_dp=(1,)),
-            },
-        }
     forward = _forward([500], **overrides)
     assert replayable(forward, 500) == expected
 
@@ -414,106 +405,147 @@ def test_a_replayed_history_marks_image_positions_dead(image):
 # ── DP attention: the step's DP sync carries each stage's token counts ───
 
 
-def _stage_forward(sizes, rank, rows, monkeypatch=None):
+def _batch(lengths, finals, *, prefill=True, dummy=False):
+    total = sum(lengths)
+    return SimpleNamespace(
+        num_scheduled_tokens=np.asarray(lengths, np.int32),
+        is_final_chunk=finals,
+        total_tokens_num=total,
+        total_tokens_num_prefill=total if prefill else 0,
+        is_dummy_run=dummy,
+    )
+
+
+def _report(lengths, finals, **kw):
+    from atom.models.deepseek_v41.bounded_replay import decoder_stage_report
+
+    return decoder_stage_report(_batch(lengths, finals, **kw), 128)
+
+
+def _stage_forward(sizes, rank, rows, report):
     """A forward context of a DP step whose sync carried stage ``rows``
-    (None: no rank replays), built the way `set_forward_context` builds it."""
+    (None: no rank's report applies), built the way `set_forward_context`
+    builds it."""
     from atom.utils.forward_context import DPMetadata, ForwardContext, _dp_stages
 
     parallel = SimpleNamespace(data_parallel_size=len(sizes), data_parallel_rank=rank)
-    sync = None if rows is None else SimpleNamespace(stage_tokens_across_dp=rows)
+    sync = SimpleNamespace(dp_stage_rows=rows)
     context = SimpleNamespace(
         scheduled_tokens=sizes[rank],
         running_tokens_across_dp=tuple(sizes),
         running_tokens_are_unified=False,
-        forward_mode=SimpleNamespace(sync=sync),
     )
     return ForwardContext(
         context=context,
         dp_metadata=DPMetadata.make(
             parallel, sizes[rank], torch.tensor(sizes, dtype=torch.int32)
         ),
-        dp_stages=_dp_stages(parallel, sync),
+        dp_stages=_dp_stages(parallel, report, sync),
     )
 
 
 @pytest.mark.parametrize(
-    "replaying, lengths, finals, expected",
+    "kw, expected",
     [
         # a decoding (or dummy) rank runs all its rows through both stages
-        (False, [40], [True], (40, 40, 0, 1)),
+        ({"lengths": [40], "finals": None, "prefill": False}, (0, 1, 40, 40)),
+        ({"lengths": [6], "finals": None, "dummy": True}, (0, 1, 6, 6)),
         # two finishing prompts: tails capped at the window, one row each
-        (True, [500, 64], [True, True], (128 + 64, 2, 1, 1)),
+        ({"lengths": [500, 64], "finals": [True, True]}, (1, 1, 128 + 64, 2)),
+        # a zero-row scheduler entry is no request
+        ({"lengths": [500, 0, 64], "finals": [True, True, True]}, (1, 1, 192, 2)),
         # a non-final chunk: one placeholder row, no decoder work of its own
-        (True, [16384], [False], (1, 1, 1, 0)),
+        ({"lengths": [16384], "finals": [False]}, (1, 0, 1, 1)),
     ],
 )
-def test_a_rank_reports_its_stage_tokens_from_the_batch(
-    replaying, lengths, finals, expected
-):
-    from atom.models.deepseek_v41.bounded_replay import local_stage_tokens
-
-    got = local_stage_tokens(lengths, finals, 128, sum(lengths), replaying=replaying)
-    assert got == expected
+def test_a_rank_reports_its_stage_tokens_from_the_batch(kw, expected):
+    assert _report(**kw).wire() == expected
 
 
-@cuda
-def test_the_plan_runs_what_the_rank_reported():
+def _cpu_step(lengths, positions, finals):
+    """A `BatchStep` on the CPU, the fields `build_replay_plan` reads."""
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
+
+    spans, offset = [], 0
+    for i, (n, p) in enumerate(zip(lengths, positions)):
+        spans.append(RequestSpan(100 + i, p, offset, n, i))
+        offset += n
+    width = sum(lengths)
+    step = BatchStep(
+        tuple(spans),
+        torch.arange(width, dtype=torch.int64),
+        torch.tensor(np.cumsum([0, *lengths]), dtype=torch.int32),
+        torch.arange(len(lengths), dtype=torch.int32),
+        torch.repeat_interleave(
+            torch.arange(len(lengths), dtype=torch.int32), torch.tensor(lengths)
+        ),
+        torch.zeros(len(lengths), 4, dtype=torch.int32),
+        scheduled=width,
+    )
+    step.request_finals = np.asarray(finals)
+    return step
+
+
+@pytest.mark.parametrize(
+    "lengths, finals",
+    [
+        ([300, 200, 5], [True, False, True]),
+        ([300], [False]),
+        ([64, 64], [True, True]),
+    ],
+)
+def test_the_plan_runs_what_the_rank_reported(lengths, finals):
     """The counts a rank reports from its batch are the counts its replay plan
     runs, or its peers' collectives would wait on rows it never sends."""
-    from atom.models.deepseek_v41.bounded_replay import (
-        local_stage_tokens,
-        plan_stage_tokens,
-    )
+    from atom.models.deepseek_v41.bounded_replay import planned_stage_tokens
 
-    cache = _cache(pages=128)
-    lengths, finals = [300, 200, 5], [True, False, True]
-    step = _forward_step(cache, lengths, [0, 0, 64], finals)
+    step = _cpu_step(lengths, [0] * len(lengths), finals)
     plan = build_replay_plan(step, 128)
-    reported = local_stage_tokens(lengths, finals, 128, 505, replaying=True)
-    assert plan_stage_tokens(plan, 505) == reported[:2] == (133, 2)
-    idle = _forward_step(cache, [300], [0], [False])
-    assert plan_stage_tokens(build_replay_plan(idle, 128), 300) == (1, 1)
-    assert local_stage_tokens([300], [False], 128, 300, replaying=True)[:2] == (1, 1)
-    assert plan_stage_tokens(None, 40) == (40, 40)
+    reported = _report(lengths, finals).tokens
+    assert planned_stage_tokens(plan, sum(lengths)) == reported
+    assert planned_stage_tokens(None, 40) == _report([40], None, prefill=False).tokens
+
+
+def test_replay_follows_the_ranks_own_report():
+    """Under DP the forward acts on what its rank reported, not on a second
+    reading of the step: one decision for the report and the forward."""
+    from atom.models.deepseek_v41.bounded_replay import replayable
+
+    rows = ((1, 0), (1, 1), (128, 40), (1, 40))
+    replaying = _stage_forward([500, 40], 0, rows, _report([500], [True]))
+    decoding = _stage_forward([500, 40], 1, rows, _report([40], None, prefill=False))
+    assert replayable(replaying, 500)
+    assert not replayable(decoding, 40)
+    plain = _stage_forward([500, 40], 0, None, _report([500], [True]))
+    assert plain.dp_stages is None and not replayable(plain, 500)
 
 
 def test_the_group_table_comes_from_the_steps_dp_sync():
-    from atom.models.deepseek_v41.bounded_replay import DPStageTokens, dp_stage_tokens
-
-    # rank 0 replays a 128-row tail of one request; rank 1 decodes 40 rows
-    rows = ((128, 40), (1, 40), (1, 0), (1, 1))
-    forward = _stage_forward([500, 40], 0, rows)
-    assert dp_stage_tokens(forward) == DPStageTokens(
-        (128, 40), (1, 40), decoder_active=True
-    )
-
-
-def test_no_table_means_no_rank_replays():
-    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
-
-    assert dp_stage_tokens(_stage_forward([500, 40], 0, None)) is None
+    rows = ((1, 0), (1, 1), (128, 40), (1, 40))
+    stages = _stage_forward([500, 40], 0, rows, _report([500], [True])).dp_stages
+    assert stages.applies and stages.active
+    assert stages.stages["decoder"].tokens_across_dp == (128, 40)
+    assert stages.stages["last_layer"].tokens_across_dp == (1, 40)
+    assert stages.stages["decoder"].local_tokens == 128
 
 
 def test_a_group_with_no_decoder_work_skips_the_decoder():
     """Every rank is on a non-final chunk: nobody has a tail, so no rank runs
     placeholder rows through layers 20..39."""
-    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
-
-    rows = ((1, 1), (1, 1), (1, 1), (0, 0))
-    got = dp_stage_tokens(_stage_forward([16384, 16384], 0, rows))
-    assert got is not None and not got.decoder_active
+    rows = ((1, 1), (0, 0), (1, 1), (1, 1))
+    stages = _stage_forward(
+        [16384, 16384], 0, rows, _report([16384], [False])
+    ).dp_stages
+    assert stages is not None and not stages.active
 
 
 def test_a_placeholder_count_equal_to_the_ranks_own_still_replays():
     """A 1-row non-final prefill beside a decoding peer: the placeholder count
-    equals the rank's own, yet the table still drives the group, since the
-    replay decision is an explicit flag, not a changed count."""
-    from atom.models.deepseek_v41.bounded_replay import dp_stage_tokens
-
-    rows = ((1, 40), (1, 40), (1, 0), (0, 1))
-    got = dp_stage_tokens(_stage_forward([1, 40], 0, rows))
-    assert got is not None and got.decoder_active
-    assert got.decoder == (1, 40) and got.last_layer == (1, 40)
+    equals the rank's own, yet the rank replays, since the decision is an
+    explicit flag, not a changed count."""
+    rows = ((1, 0), (0, 1), (1, 40), (1, 40))
+    stages = _stage_forward([1, 40], 0, rows, _report([1], [False])).dp_stages
+    assert stages.applies and stages.active
 
 
 def test_a_placeholder_step_cuts_the_image_mask_to_its_rows():
@@ -541,8 +573,8 @@ def test_a_placeholder_step_cuts_the_image_mask_to_its_rows():
 def test_a_stage_sizes_the_moe_gather_and_restores_it():
     """`use_dp_stage` switches to the metadata prepared with the forward
     context, and back; outside a replaying step it changes nothing."""
-    rows = ((128, 40), (1, 40), (1, 0), (1, 1))
-    forward = _stage_forward([500, 40], 1, rows)
+    rows = ((1, 0), (1, 1), (128, 40), (1, 40))
+    forward = _stage_forward([500, 40], 1, rows, _report([40], None, prefill=False))
     outer = forward.dp_metadata
     with forward.use_dp_stage("decoder"):
         assert forward.dp_metadata.get_sizes_across_dp() == [128, 40]
@@ -553,76 +585,35 @@ def test_a_stage_sizes_the_moe_gather_and_restores_it():
         assert forward.dp_metadata.get_sizes_across_dp() == [128, 40]
     assert forward.dp_metadata is outer
     assert forward.context.running_tokens_across_dp == (500, 40)
-    plain = _stage_forward([500, 40], 1, None)
+    plain = _stage_forward([500, 40], 1, None, None)
     with plain.use_dp_stage("decoder"):
         assert plain.dp_metadata.get_sizes_across_dp() == [500, 40]
 
 
-# ── the runtime runs each stage under its own counts ─────────────────────
+def test_decoder_stages_run_each_layer_under_its_counts():
+    """The runner every decoder path goes through (tail, placeholder and full
+    rows): layers 20..38 under the decoder counts and layer 39 under the
+    last-layer counts, each once -- a skipped layer or a wrong table leaves a
+    peer waiting in a mismatched collective."""
+    from atom.models.deepseek_v41.bounded_replay import run_decoder_stages
 
-
-class _RecordingLayer:
-    """A decoder layer that records the DP counts its MoE would gather by."""
-
-    def __init__(self, log, index):
-        self.log, self.index = log, index
-
-    def __call__(self, state, *args, **kwargs):
-        from atom.utils.forward_context import get_forward_context
-
-        sizes = get_forward_context().dp_metadata.get_sizes_across_dp()
-        self.log.append((self.index, tuple(sizes)))
-        return state
-
-
-def _runtime_model(log, monkeypatch):
-    from atom.models.deepseek_v41 import runtime
-
-    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
-    torch.nn.Module.__init__(model)
-    model.decoder_start, model.last_layer = 20, 39
-    layers = [_RecordingLayer(log, i) for i in range(40)]
-    model.__dict__["layers"] = layers
-    model.__dict__["_rope"] = lambda i: None
-    model.__dict__["_layer"] = lambda i, state, queries=None: layers[i](state)
-
-    def late(state):
-        for i in range(21, 39):
-            state = layers[i](state)
-        return state
-
-    model.__dict__["_late_layers"] = late
-    return model
-
-
-def test_placeholder_rows_run_every_decoder_layer_under_its_stage(monkeypatch):
-    """A rank with no tail beside a peer with decoder work: its placeholder
-    rows must reach layers 20..38 under the decoder counts and layer 39 under
-    the last-layer counts, once each -- a skipped layer or a wrong table
-    leaves the peer waiting in a mismatched collective."""
-    pytest.importorskip("aiter")  # the runtime module imports aiter's guards
-    from atom.models.deepseek_v41 import runtime
-    from atom.utils import forward_context as fc
-
-    rows = ((1, 128), (1, 1), (1, 1), (0, 1))
-    forward = _stage_forward([16384, 500], 0, rows)
-    forward.attn_metadata = SimpleNamespace(
-        step=SimpleNamespace(requests=()), queries=None, image_mask=None
-    )
-    monkeypatch.setattr(fc, "_forward_context", forward)
+    rows = ((1, 0), (0, 1), (1, 128), (1, 1))
+    forward = _stage_forward([16384, 500], 0, rows, _report([16384], [False]))
     log = []
-    model = _runtime_model(log, monkeypatch)
 
-    layer20 = SimpleNamespace(
-        attention_forward=lambda normed, *a: normed,
-        ffn_forward=lambda output, *seam: model.layers[20](output),
-    )
-    monkeypatch.setattr(
-        runtime, "placeholder_rows_of", lambda metadata, rows: contextlib.nullcontext()
-    )
-    monkeypatch.setattr(runtime, "gather_rows", lambda rows, *t, dim=1: t)
-    normed = torch.zeros(1, 16384, 4)
-    model._join_decoder_collectives(forward, layer20, None, normed, [])
+    def layer(i):
+        def run(state=None):
+            log.append((i, tuple(forward.dp_metadata.get_sizes_across_dp())))
+            return state
+
+        return run
+
+    def middle(state):
+        for i in range(21, 39):
+            state = layer(i)(state)
+        return state
+
+    run_decoder_stages(forward, layer(20), middle, layer(39))
     assert [i for i, _ in log] == list(range(20, 40))
     assert all(sizes == (1, 128) for i, sizes in log if i < 39)
     assert log[-1] == (39, (1, 1))

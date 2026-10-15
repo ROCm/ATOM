@@ -8,7 +8,9 @@ decoder's global KV comes from the encoder's output: its one KV source, layer
 onward -- reuses that KV and its selections and owns nothing but a
 sliding-window ring. So, as the V4.1 report's SWA Bounded Replay prescribes,
 the forward that finishes a prompt runs the decoder over its last ``W`` rows
-alone (the tail; ``W`` is the window), and one that does not runs none of it:
+alone (the tail; ``W`` is the window), and one that does not runs none of it
+(under DP attention, while a peer has decoder work, it runs the decoder on one
+placeholder row to join the MoE collectives; see "DP attention" below):
 
 - the encoder, and layer 20's compression (global KV, index keys): every row;
 - layers 20-38: the tail;
@@ -22,6 +24,14 @@ holds (``BlockManager.replay_start``, ``Config.min_final_prefill_rows``): their
 global KV and the encoder's window rows stay as the cache has them, and the
 rows from where the forward resumed read those rows, exact; only what the rows
 feed the decoder is new.
+
+DP attention. The decoder's MoE collectives are sized by every DP rank's token
+count, which a tail changes. Each rank therefore decides from its batch
+(``replays_batch``) and reports its decoder and layer-39 counts in the step's
+one DP sync (``decoder_stage_report``); the group's tables come back with the
+forward context, and each stage runs under its own (``run_decoder_stages``). A
+rank with no tail joins on one placeholder row while any rank has decoder work;
+when none has, every rank skips the decoder. TBO-split steps compute every row.
 
 On by default (``--no-decoder-swa-bounded-replay`` turns it off). The runtime
 model compiles layers 0-19 and 21-38 as two graphs (``runtime._EarlyLayers`` /
@@ -82,11 +92,16 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do padded steps. Under DP attention a prefill replays only
-    when the step's DP sync carried the group's per-stage token counts
-    (`dp_stage_tokens`): DP's MoE collectives are sized by every rank's
-    count, which a rank-local tail changes.
+    row, and so do padded steps.
+
+    Under DP attention the decision is not made here: each rank decided from
+    its batch before the step (`replays_batch`) and told its group, and it
+    acts on that report (`ForwardContext.dp_stages.applies`), so what it
+    forwards is what its peers' collectives expect.
     """
+    if getattr(forward, "dp_metadata", None) is not None:
+        stages = getattr(forward, "dp_stages", None)
+        return stages is not None and stages.applies
     context, metadata = forward.context, forward.attn_metadata
     if (
         context is None
@@ -94,10 +109,6 @@ def replayable(forward, num_tokens: int) -> bool:
         or context.is_dummy_run
         or context.is_draft
         or forward.ubatch_slices is not None
-    ):
-        return False
-    if getattr(forward, "dp_metadata", None) is not None and (
-        dp_stage_tokens(forward) is None
     ):
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
@@ -115,53 +126,48 @@ def replayable(forward, num_tokens: int) -> bool:
     )
 
 
-@dataclass(frozen=True)
-class DPStageTokens:
-    """The DP group's plan for the layers past the decoder's KV source.
-
-    ``decoder`` and ``last_layer``: every rank's MoE token count, in DP order,
-    for layers 20..38 (layer 20's FFN onward) and for layer 39. A rank that
-    does not replay runs all its tokens through both.
-
-    ``decoder_active``: whether any rank has decoder work -- a tail of its
-    own, or all its rows because it does not replay. When none does, every
-    rank skips the decoder; otherwise a replaying rank without a tail joins
-    each collective on one placeholder row."""
-
-    decoder: tuple[int, ...]
-    last_layer: tuple[int, ...]
-    decoder_active: bool = True
+# The stages past the decoder's KV source whose MoE token counts a DP group
+# agrees on: layer 20's FFN through layer 38, and layer 39.
+DECODER_STAGES = ("decoder", "last_layer")
 
 
-def tail_lengths(lengths, window: int) -> np.ndarray:
-    """Each finishing request's replayed rows: its last ``window`` rows."""
-    return np.minimum(np.asarray(lengths), window)
+def replays_batch(batch) -> bool:
+    """Whether a DP rank replays this step, from its batch alone: a real,
+    all-prefill step. The one decision for both the report the rank sends
+    its group and the forward it runs (`replayable`); TBO-split steps are
+    taken out by the group sync itself."""
+    total = int(batch.total_tokens_num)
+    return not batch.is_dummy_run and 0 < int(batch.total_tokens_num_prefill) == total
 
 
-def local_stage_tokens(
-    lengths, finals, window: int, num_tokens: int, *, replaying: bool
-) -> tuple[int, int, int, int]:
-    """This rank's row for the step's DP sync: ``(decoder tokens, last-layer
-    tokens, replaying, decoder active)``.
+def decoder_stage_report(batch, window: int):
+    """This rank's `DPStageReport` for the step: its decoder and last-layer
+    token counts, whether it replays, and whether it has decoder work.
 
-    Computed from the batch before the step's metadata exists, and the same
-    counts `plan_stage_tokens` reads off the replay plan afterwards. A rank
-    that does not replay runs all its rows through both stages; one that
-    replays runs each finishing request's tail through the decoder and its
-    last row through layer 39, or one placeholder row when nothing finishes.
-    """
-    if not replaying:
-        return num_tokens, num_tokens, 0, 1
-    tails = tail_lengths(lengths, window)[np.asarray(finals, dtype=bool)]
-    if not len(tails):
-        # Nothing finishes: one placeholder row joins the peers' collectives
-        # (`DeepseekV41RuntimeModel._join_decoder_collectives`).
-        return 1, 1, 1, 0
-    return int(tails.sum()), len(tails), 1, 1
+    A rank that does not replay runs all its rows through both stages. One
+    that replays runs each finishing request's last ``window`` rows through
+    the decoder and its last row through layer 39 -- or, when nothing
+    finishes, one placeholder row while a peer has decoder work
+    (`run_decoder_stages`)."""
+    from atom.utils.forward_context import DPStageReport
+
+    total = int(batch.total_tokens_num)
+    if not replays_batch(batch):
+        return DPStageReport(DECODER_STAGES, (total, total), applies=False)
+    lengths = batch.num_scheduled_tokens
+    finals = batch.is_final_chunk
+    tails = [
+        min(int(n), window)
+        for i, n in enumerate(lengths)
+        if n and (finals is None or finals[i])
+    ]
+    if not tails:
+        return DPStageReport(DECODER_STAGES, (1, 1), applies=True, active=False)
+    return DPStageReport(DECODER_STAGES, (sum(tails), len(tails)), applies=True)
 
 
-def plan_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
-    """The decoder and last-layer tokens this rank's forward will run."""
+def planned_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
+    """The decoder and last-layer tokens the forward will run, from its plan."""
     if plan is None:
         return num_tokens, num_tokens
     if plan.tail is None:
@@ -169,23 +175,17 @@ def plan_stage_tokens(plan, num_tokens: int) -> tuple[int, int]:
     return plan.tail.scheduled, len(plan.tail.requests)
 
 
-def dp_stage_tokens(forward) -> DPStageTokens | None:
-    """The group's per-stage token counts, from the step's DP sync.
+def run_decoder_stages(forward, first, middle, last):
+    """Run the layers past the decoder's KV source, each under its DP stage.
 
-    `set_forward_context` builds the stages (`ForwardContext.dp_stages`) only
-    when the sync carried them -- some rank replays on a prefill step TBO did
-    not split -- so the decision is the group's. None otherwise.
-    """
-    stages = getattr(forward, "dp_stages", None)
-    if not stages:
-        return None
-    sync = forward.context.forward_mode.sync
-    decoder_active = any(sync.stage_tokens_across_dp[3])
-    return DPStageTokens(
-        stages["decoder"].tokens_across_dp,
-        stages["last_layer"].tokens_across_dp,
-        decoder_active=decoder_active,
-    )
+    ``first`` (layer 20 after its compression) and ``middle`` (21..38) run
+    under the ``decoder`` counts, ``last`` (layer 39) under ``last_layer``,
+    so every MoE collective is sized the way the group agreed. Outside a DP
+    replay the stages are absent and this is a plain call chain."""
+    with forward.use_dp_stage("decoder"):
+        state = middle(first())
+        with forward.use_dp_stage("last_layer"):
+            return last(state)
 
 
 @contextlib.contextmanager
@@ -250,7 +250,7 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     (their compression ran over ``step``). Laid out on the host and uploaded
     in one copy per dtype."""
     picks = [
-        (span, int(tail_lengths(span.length, window)), i)
+        (span, min(span.length, window), i)
         for i, span in enumerate(step.requests)
         if step.request_finals[i]
     ]

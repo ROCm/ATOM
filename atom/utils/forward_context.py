@@ -243,6 +243,8 @@ class ForwardMode:
     # What else the one per-step collective returned: per-rank token counts, the
     # DSpark shape max. Not shape. None on a single rank.
     sync: Any | None = None
+    # This rank's own `DPStageReport` for the step, if its model sends one.
+    dp_stage_report: Any | None = None
 
     @classmethod
     def decide(
@@ -260,7 +262,7 @@ class ForwardMode:
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
         graph_shapes: Collection[tuple[int, int]] | None = None,
-        local_stage_tokens: tuple[int, int, int, int] | None = None,
+        dp_stage_report: "DPStageReport | None" = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
@@ -297,9 +299,11 @@ class ForwardMode:
                 # other flavor keeps its own and the two extra wire rows are
                 # not sent.
                 max_seqlen_q=max_seqlen_q if is_block_drafter else None,
-                # A model's per-stage row counts (V4.1 decoder bounded
-                # replay), so the step still issues one collective.
-                stage_tokens=local_stage_tokens,
+                # A model's per-stage token counts (`DPStageReport`), so the
+                # step still issues one collective.
+                dp_stage_row=(
+                    None if dp_stage_report is None else dp_stage_report.wire()
+                ),
             )
             # The group's query length, taken BEFORE the rows are read off it:
             # a rank still on its local q settles on a different `running_tokens`
@@ -385,6 +389,7 @@ class ForwardMode:
             piecewise_captured=piecewise_captured,
             tbo_collective_active=tbo_collective_active,
             sync=sync,
+            dp_stage_report=dp_stage_report,
         )
 
     @staticmethod
@@ -813,28 +818,56 @@ class GDNAttentionMetadata:
 
 
 @dataclass(frozen=True)
+class DPStageReport:
+    """A rank's report for the step's DP sync, from a model some of whose MoE
+    layers run on other rows than the step (`AttentionMetadataBuilder.
+    dp_stage_report`).
+
+    ``names``/``tokens``: this rank's token count per stage, in an order the
+    model fixes (every rank sends the same layout). ``applies``: this rank
+    runs those stages on these counts this step; the group uses the stage
+    tables when any rank does. ``active``: a model-defined flag, OR-reduced.
+    """
+
+    names: tuple[str, ...]
+    tokens: tuple[int, ...]
+    applies: bool
+    active: bool = True
+
+    def wire(self) -> tuple[int, ...]:
+        return (int(self.applies), int(self.active), *self.tokens)
+
+
+@dataclass(frozen=True)
 class DPStage:
-    """One stage of a forward whose MoE layers run on fewer rows than the step
-    (`ForwardContext.use_dp_stage`): every rank's token count and the
-    `DPMetadata` the variable-length gather reads."""
+    """One stage's token counts across DP and the `DPMetadata` the MoE
+    variable-length gather reads while it runs (`ForwardContext.use_dp_stage`)."""
 
     tokens_across_dp: tuple[int, ...]
     local_tokens: int
     dp_metadata: DPMetadata
 
 
-# The stages `sync_dp_metadata`'s stage rows describe, in row order. Rows 2 and
-# 3 (replaying, decoder active) are flags, read by the model, not stages.
-DP_STAGE_NAMES = ("decoder", "last_layer")
+@dataclass(frozen=True)
+class DPStages:
+    """The step's stage tables, when its DP sync carried them.
+
+    ``applies``: this rank's own report -- the one decision it acts on, so
+    what it forwards is what it told the group. ``active``: OR over the
+    group's flags."""
+
+    applies: bool
+    active: bool
+    stages: dict[str, DPStage]
 
 
-def _dp_stages(parallel_config, sync) -> dict[str, DPStage]:
-    rows = None if sync is None else getattr(sync, "stage_tokens_across_dp", None)
-    if rows is None:
-        return {}
+def _dp_stages(parallel_config, report, sync) -> "DPStages | None":
+    rows = None if sync is None else getattr(sync, "dp_stage_rows", None)
+    if rows is None or report is None:
+        return None
     rank = parallel_config.data_parallel_rank
     stages = {}
-    for name, tokens in zip(DP_STAGE_NAMES, rows):
+    for name, tokens in zip(report.names, rows[2:]):
         tokens = tuple(int(n) for n in tokens)
         stages[name] = DPStage(
             tokens_across_dp=tokens,
@@ -845,7 +878,7 @@ def _dp_stages(parallel_config, sync) -> dict[str, DPStage]:
                 torch.tensor(tokens, dtype=torch.int32),
             ),
         )
-    return stages
+    return DPStages(applies=report.applies, active=any(rows[1]), stages=stages)
 
 
 @dataclass
@@ -910,11 +943,10 @@ class ForwardContext:
     # The DP pad-row work this forward already did (see `step_pad_rows`).
     pad_rows_done: set = field(default_factory=set)
 
-    # A prefill whose model runs some layers on fewer rows than the step
-    # (DeepSeek-V4.1 decoder bounded replay): one `DPStage` per such stage,
-    # built from the step's DP sync (`sync_dp_metadata` stage rows) when the
-    # forward context is set. Empty on every other step.
-    dp_stages: dict[str, "DPStage"] = field(default_factory=dict)
+    # Stage tables for a model some of whose MoE layers run on other rows
+    # than the step (`DPStageReport`), built from the step's DP sync when the
+    # forward context is set. None on every step that did not carry them.
+    dp_stages: DPStages | None = None
 
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
@@ -932,7 +964,11 @@ class ForwardContext:
         and restored on exit. A no-op when ``name`` is None or this step has
         no such stage, so a caller outside DP runs unchanged.
         """
-        stage = self.dp_stages.get(name) if name is not None else None
+        stage = (
+            None
+            if self.dp_stages is None or name is None
+            else self.dp_stages.stages.get(name)
+        )
         if stage is None:
             yield
             return
@@ -1185,11 +1221,12 @@ def set_forward_context(
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
         dp_stages=(
-            {}
-            if dp_metadata is None
+            None
+            if dp_metadata is None or context.forward_mode is None
             else _dp_stages(
                 atom_config.parallel_config,
-                getattr(context.forward_mode, "sync", None),
+                context.forward_mode.dp_stage_report,
+                context.forward_mode.sync,
             )
         ),
     )  # _forward_context.attn_metadata = attn_metadata

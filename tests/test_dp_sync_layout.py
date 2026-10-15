@@ -188,15 +188,15 @@ def test_stage_rows_ride_the_same_collective(monkeypatch):
         calls.append(1)
         out = local.clone()
         out[2] = 0  # the peer decodes
-        out[-4:] = torch.tensor([40, 40, 0, 1], dtype=torch.int32)
+        out[-4:] = torch.tensor([0, 1, 40, 40], dtype=torch.int32)
         return out
 
     sync = _sync(
         monkeypatch,
         peers=[peer],
-        **_base(is_prefill=True, stage_tokens=(128, 1, 1, 1)),
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 128, 1)),
     )
-    assert sync.stage_tokens_across_dp == ((128, 40), (1, 40), (1, 0), (1, 1))
+    assert sync.dp_stage_rows == ((1, 0), (1, 1), (128, 40), (1, 40))
     assert len(calls) == 1
 
 
@@ -204,23 +204,34 @@ def test_no_replaying_rank_carries_no_table(monkeypatch):
     sync = _sync(
         monkeypatch,
         peers=[_with(2, 1)],
-        **_base(is_prefill=True, stage_tokens=(500, 500, 0, 1)),
+        **_base(is_prefill=True, dp_stage_row=(0, 1, 500, 500)),
     )
-    assert sync.stage_tokens_across_dp is None
+    assert sync.dp_stage_rows is None
 
 
 def test_a_decode_only_group_carries_no_table(monkeypatch):
     sync = _sync(
-        monkeypatch, peers=[_with(0, 10)], **_base(stage_tokens=(10, 10, 1, 0))
+        monkeypatch, peers=[_with(0, 10)], **_base(dp_stage_row=(1, 0, 10, 10))
     )
-    assert sync.stage_tokens_across_dp is None
+    assert sync.dp_stage_rows is None
 
 
 def test_stage_rows_follow_the_dspark_row(monkeypatch):
     sync = _sync(
         monkeypatch,
         peers=[_with(2, 1)],
-        **_base(is_prefill=True, max_seqlen_q=6, stage_tokens=(128, 1, 1, 1)),
+        **_base(is_prefill=True, max_seqlen_q=6, dp_stage_row=(1, 1, 128, 1)),
     )
     assert sync.max_seqlen_q_across_dp == 6
-    assert sync.stage_tokens_across_dp[0] == (128, 128)
+    assert sync.dp_stage_rows[2] == (128, 128)
+
+
+def test_a_stage_row_is_as_long_as_the_model_makes_it(monkeypatch):
+    """The shared sync knows nothing of a model's stages: it carries whatever
+    row the model reports and only reads its leading applies flag."""
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 7, 6, 5)),
+    )
+    assert sync.dp_stage_rows == ((1, 1), (1, 1), (7, 7), (6, 6), (5, 5))

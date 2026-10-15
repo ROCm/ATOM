@@ -292,7 +292,9 @@ Every decoder layer's window starts at the tail (`swa_replay_start`): a tail
 row at position `i` reads `[max(s, i - W + 1), i]`, `s` the tail's first
 position. A forward that does not finish its prompt
 (`ScheduledBatch.is_final_chunk`) runs nothing past the encoder but layer 20's
-compression: no kernel of the decoder's attention or FFN. Layer 39's queries
+compression: no kernel of the decoder's attention or FFN -- except under DP
+attention, where, while another rank has decoder work, it runs the decoder on
+one placeholder row so every MoE collective has all ranks (see below). Layer 39's queries
 are fewer than its KV rows (`QueryRows`): the rows are gathered in one launch
 (`token_layout.gather_rows`), the index lists built over all KV rows with every
 other row's batch id -1, so the queries' lists come out adjacent, and attention
@@ -320,8 +322,21 @@ With `--no-decoder-swa-bounded-replay` the runtime model compiles its forward
 as one graph (`runtime._Backbone`), as before. Otherwise layers 0..19 and
 21..38 are two graphs (`_EarlyLayers`, `_LateLayers`, each with its own
 compile-cache key) and layers 20 and 39 run between and after them, where a
-replay cuts their rows. Decode, warmup, draft, TBO, DP attention and padded steps run every
-layer on every row. After a replay only each finishing request's last row of
+replay cuts their rows. Decode, warmup, draft, TBO-split and padded steps run
+every layer on every row.
+
+Under DP attention a prefill replays too. The decoder's MoE collectives are
+sized by every rank's token count, which a tail changes, so each rank decides
+from its batch (`bounded_replay.replays_batch`) and reports its decoder and
+layer-39 token counts in the step's one packed DP sync
+(`AttentionMetadataBuilder.dp_stage_report` -> `sync_dp_metadata`). The
+group's per-stage `DPMetadata` is built with the forward context
+(`ForwardContext.dp_stages`), and each stage runs under its own
+(`ForwardContext.use_dp_stage`, `bounded_replay.run_decoder_stages`). A rank
+that does not replay runs all its rows under the same tables; one with no tail
+joins on one placeholder row while any rank has decoder work, and when none
+has every rank skips the decoder. The forward checks it runs the counts its
+rank reported. After a replay only each finishing request's last row of
 the model output is defined; the LM head reads only those.
 
 Accuracy: this is not a full prefill. In every decoder layer the tail's rows
