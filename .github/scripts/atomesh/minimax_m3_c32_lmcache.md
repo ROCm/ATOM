@@ -48,11 +48,13 @@ recovery. The code does not claim to restore node state in those cases.
 The host then runs `prepare_lmcache_host_memory.py`: direct sync/drop_caches/
 compact_memory where allowed, otherwise file-cache eviction and NUMA-bound THP
 preparation. It permits three serial attempts within 300 seconds, at most 90
-seconds per command, plus up to five seconds to reap a timed-out child. The pool
-itself must fit in ordinary NUMA free memory; the extra reserve may include clean
-active/inactive file cache, excluding dirty/writeback pages. Visible cgroup
-capacity is also checked. This remains one node, prefill GPUs 0-3 at 256 GiB/rank,
-currently 1024 GiB on NUMA0.
+seconds per command, plus up to five seconds to reap a timed-out child. Before
+the bounded allocation, ordinary free memory plus clean active/inactive file
+cache must cover the pool and 128 GiB reserve; dirty/writeback pages are excluded.
+This lets the preparation reclaim cache itself. After preparation, the pool
+must fit in actual ordinary free memory; when the NUMA helper is used, it must
+also report full THP coverage. Visible cgroup capacity is checked. This remains
+one node, prefill GPUs 0-3 at 256 GiB/rank, currently 1024 GiB on NUMA0.
 
 Run `38738296856` failed before model startup: NUMA0 had 470.49 GiB ordinary free
 memory, 268.30 GiB file cache and 720 GiB idle HugeTLB reservation. The former
@@ -72,3 +74,8 @@ cache. The pinned image has Mesh source tree
 `55ad15ac25935554c211538e0611bbca26bc567c`, identical to this branch; the existing
 `/app/ATOM/atom/mesh/target/release/atomesh` binary serves the benchmark. Recheck
 compatibility if the image or Mesh source changes.
+
+Run `38745966243` selected g19 successfully, but the former free-only pool check
+rejected 769 GiB free plus 701 GiB clean cache before running NUMA preparation.
+The bounded reclaim path now handles that state and verifies recovered free
+memory afterward; g34's 470 GiB free plus 268 GiB cache still fails capacity checks.

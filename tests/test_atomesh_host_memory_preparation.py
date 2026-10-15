@@ -116,7 +116,7 @@ class PreparationTests(unittest.TestCase):
                     any("numa_exec.py" in str(cmd) for cmd, _ in self.calls)
                 )
 
-    def test_clean_file_cache_can_cover_reserve_but_not_pool(self):
+    def test_clean_file_cache_covers_reserve_but_dirty_pages_do_not(self):
         info = self.state["numa"][0]
         info.update(
             MemFree=1056 * PREP.GIB,
@@ -124,18 +124,41 @@ class PreparationTests(unittest.TestCase):
         )
         self.assertEqual(self.prepare(), 0)
         self.assertTrue(any("numa_exec.py" in str(cmd) for cmd, _ in self.calls))
-        for changes in (
-            {"MemFree": 1000 * PREP.GIB},
-            {"Dirty": 330 * PREP.GIB, "Writeback": 10 * PREP.GIB},
-        ):
-            with self.subTest(changes=changes):
-                self.calls.clear()
-                with patch.dict(info, changes):
-                    self.assertEqual(self.prepare(), 2)
-                self.assertEqual(self.result["status"], "insufficient_numa_free_memory")
-                self.assertFalse(
-                    any("numa_exec.py" in str(cmd) for cmd, _ in self.calls)
-                )
+        self.calls.clear()
+        info.update(Dirty=330 * PREP.GIB, Writeback=10 * PREP.GIB)
+        self.assertEqual(self.prepare(), 2)
+        self.assertEqual(self.result["status"], "insufficient_numa_reclaimable_memory")
+        self.assertFalse(any("numa_exec.py" in str(cmd) for cmd, _ in self.calls))
+
+    def test_reclaims_cache_before_accepting_node_from_run_38745966243(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=769 * PREP.GIB, **{"Inactive(file)": 701 * PREP.GIB})
+
+        def reclaim(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "numa_exec.py" in str(command):
+                info["MemFree"] = 1100 * PREP.GIB
+                info["Inactive(file)"] = 370 * PREP.GIB
+            return result
+
+        self.assertEqual(self.prepare(reclaim), 0)
+        self.assertEqual(len(self.result["attempts"]), 1)
+        self.assertEqual(self.result["method"], "file_cache_and_numa")
+
+    def test_full_thp_message_without_recovered_free_memory_is_not_ready(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=769 * PREP.GIB, **{"Inactive(file)": 701 * PREP.GIB})
+        self.assertEqual(self.prepare(), 2)
+        self.assertEqual(self.result["status"], "insufficient_numa_free_memory")
+        self.assertEqual(len(self.result["attempts"]), 3)
+        self.assertEqual(sum("numa_exec.py" in str(cmd) for cmd, _ in self.calls), 3)
+
+    def test_node_without_enough_reclaimable_memory_never_allocates(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=470 * PREP.GIB, **{"Inactive(file)": 268 * PREP.GIB})
+        self.assertEqual(self.prepare(), 2)
+        self.assertEqual(self.result["status"], "insufficient_numa_reclaimable_memory")
+        self.assertFalse(any("numa_exec.py" in str(cmd) for cmd, _ in self.calls))
 
     def test_agentic_prefill_requires_host_preparation(self):
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
