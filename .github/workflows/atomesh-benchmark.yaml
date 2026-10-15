@@ -256,7 +256,7 @@ on:
       aiter_ref:
         description: 'ROCm/aiter ref for suite=scatter_bounds (install_aiter_from_ref / setup.py develop)'
         required: false
-        default: 'd755e51200f6346287d79573e46b9cf804b955ca'
+        default: '5eb866a95d66a38d64eecf151ac4ef3567a07ac5'
         type: string
       scatter_install_mode:
         description: 'suite=scatter_bounds: aiter_ref reinstalls from GitHub; patch applies .github/patches/aiter_moe_scatter_reduce_bounds.patch'
