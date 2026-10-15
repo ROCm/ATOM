@@ -12,7 +12,7 @@ pytest.importorskip("aiter")
 from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
 from atom.models.deepseek_v41.model import Block
-from atom.utils.piecewise_af import PiecewiseAFRunner, PiecewiseBuffers
+from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 
@@ -29,13 +29,13 @@ def _forward(
     zero_copy_hidden=False,
 ):
     """Use the same decorated model entry as the runtime splitting op."""
-    if step.piecewise_state is None:
+    if not getattr(step, "_test_prepared", False):
         # Isolated cache helpers allocate fresh request tensors. Emulate the
         # serving builder's fixed addresses once per view, before any layer.
         from dataclasses import replace
 
         if not hasattr(cache, "test_buffers"):
-            cache.test_buffers = PiecewiseBuffers()
+            cache.test_buffers = StableOutputs()
 
         def keep(name, value):
             return value if value is None else cache.test_buffers.deliver(name, value)
@@ -94,8 +94,20 @@ def _forward(
                     for n in ("rows", "positions", "ptr_rows")
                 },
             )
-        step.prepare_piecewise(cache, queries)
-    metadata = SimpleNamespace(cache=cache, step=step, queries=queries, dummy=False)
+        if hasattr(cache, "prepare_attention"):
+            cache.candidate_count = getattr(
+                getattr(attention, "indexer", None), "topk_blocks", 0
+            )
+            cache.prepare_attention(step, [attention.spec])
+        step._test_prepared = True
+    if hasattr(cache, "prepare_attention"):
+        cache.prepare_attention(step, [attention.spec])
+        backend_key = cache.graph_layout(step, queries)
+    else:
+        backend_key = (step.width, step.cu_seqlens_q.numel(), step.max_q_len)
+    metadata = SimpleNamespace(
+        cache=cache, step=step, queries=queries, dummy=False, cudagraph_key=backend_key
+    )
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
         in_hipgraph=False,
@@ -114,7 +126,6 @@ def _forward(
         capture=True,
         forward_context=context,
         runner=graphs,
-        capture_state=step.piecewise_state,
         zero_copy_inputs=("normed",) if zero_copy_hidden else (),
     )
 
@@ -132,7 +143,7 @@ def test_refreshes_metadata_and_applies_state_effect_once_per_call():
             cache.pool.add_(1)
             return hidden + step.positions[None, :, None] + step.slots[0]
 
-    graphs = PiecewiseAFRunner(token_dim=1)
+    graphs = CudagraphCaptureRunner(token_dim=1)
     for i, (lengths, position, slot) in enumerate(
         [
             ([4], 0, 0),
@@ -200,7 +211,7 @@ def test_real_window_attention_matches_eager_outputs_and_kv_across_steps(subset)
     attn.wq_b = lambda x, x_scale=None: x.repeat(1, 1, 2)
     attn._project_out = lambda out, rope, pos: out.mean(dim=-2)
     rope = RotaryEmbedding(64, 128, base=10000).to("cuda")
-    graphs = PiecewiseAFRunner(token_dim=1)
+    graphs = CudagraphCaptureRunner(token_dim=1)
     layouts = [
         [(0, 0, 4)],
         [(0, 4, 4)],
@@ -329,7 +340,7 @@ def test_indexed_graph_matches_eager_compression_selection_and_reindex(
                 project=lambda x: (x.float(), -x.float()),
             )
         layers.append(attn)
-    graphs = [PiecewiseAFRunner(token_dim=1) for _ in layers]
+    graphs = [CudagraphCaptureRunner(token_dim=1) for _ in layers]
     layouts = [
         [(0, 0, 130)],
         [(0, 130, 6)],
@@ -410,16 +421,13 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once(subset)
                 assert queries.index.group_indices is step.group_indices
             cache.pool.add_(1)
             selected = hidden + step.candidates[0] + step.visible[2][None, :, None]
-            step.selected[2] = selected
-            step.candidates[2] = selected + 1
-            # Exercise the memo populated during warmup: it must be rebuilt
-            # during recording, then published without Python on replay.
-            if 2 not in step.group_indices:
-                step.group_indices[2] = (selected + 2,)
-            step.window_rows = selected + 3
+            step.selected[2].copy_(selected)
+            step.candidates[2].copy_(selected + 1)
+            step.group_indices[2][0].copy_(selected + 2)
+            step.window_rows.copy_(selected + 3)
             return selected + step.positions[None, :, None] + step.slots[0]
 
-    graph = PiecewiseAFRunner(token_dim=1)
+    graph = CudagraphCaptureRunner(token_dim=1)
     graph.max_entries = 2
     for i, count in enumerate([4, 4, 6, 4, 8, 6], 1):
         step = BatchStep(
@@ -447,6 +455,21 @@ def test_indexed_replay_publishes_current_outputs_and_updates_state_once(subset)
                 replace(step, batch_ids=step.batch_ids.clone()),
                 torch.arange(count + 1, device="cuda"),
             )
+        if not hasattr(cache, "results"):
+            cache.results = StableOutputs()
+
+        def result(name):
+            return cache.results.empty(
+                (count, name), hidden.shape, dtype=hidden.dtype, device=hidden.device
+            )
+
+        step.candidates[0] = cache.results.deliver(
+            (count, "source"), step.candidates[0]
+        )
+        step.selected[2] = result("selected")
+        step.candidates[2] = result("candidates")
+        step.group_indices[2] = (result("group"),)
+        step.window_rows = result("window")
         actual = _forward(graph, Core(), hidden, cache, step, None, queries)
         assert step.selected[0] is upstream
         selected = hidden + i * 3
@@ -496,7 +519,7 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
         with torch.cuda.graph(producer):
             hidden.copy_(source * 2)
     torch.cuda.current_stream().wait_stream(stream)
-    graphs = PiecewiseAFRunner(token_dim=1)
+    graphs = CudagraphCaptureRunner(token_dim=1)
     for i in range(1, 5):
         # Reuse the exact BatchStep AND device allocations with changed values.
         step.begin_forward()

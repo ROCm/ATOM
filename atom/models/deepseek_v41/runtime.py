@@ -12,11 +12,11 @@ from atom.model_ops.attentions.token_layout.gather import gather_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils import mark_spliting_op
+from atom.utils.attn_ffn_piecewise import configure_piecewise_core
 from atom.utils.backends import set_model_tag
 from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.utils.piecewise_af import PiecewiseAFRunner
 
 from .bounded_replay import (
     build_replay_plan,
@@ -103,13 +103,6 @@ def v41_piecewise_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tens
         metadata.step,
         rope,
         metadata.queries,
-        piecewise=context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE,
-        capture=layer.af_piecewise,
-        zero_copy_inputs=("normed",) if layer.af_zero_copy_hidden else (),
-        runner=layer.attention_graphs,
-        outputs=layer.piecewise_outputs,
-        forward_context=context,
-        capture_state=getattr(metadata.step, "piecewise_state", None),
     )
 
 
@@ -133,12 +126,6 @@ def v41_piecewise_begin(hidden: torch.Tensor) -> None:
         return
     rows = metadata.engram_embeddings
     context = get_forward_context()
-    if (
-        context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-        and not getattr(context, "in_hipgraph", False)
-        and metadata.cache is not None
-    ):
-        metadata.step.prepare_piecewise(metadata.cache)
     if getattr(rows, "stage", None) is not None and (
         not getattr(context, "in_hipgraph", False)
         or context.cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
@@ -303,12 +290,6 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 layer.piecewise_outputs = StableOutputs(
                     capacity=buffer_tokens, token_dim=1
                 )
-                layer.attention_graphs = PiecewiseAFRunner(layer.piecewise_outputs)
-            layer.af_piecewise = (
-                self.piecewise
-                and config.compilation_config.cudagraph_mode
-                in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
-            )
             atom_config.compilation_config.static_forward_context[layer.layer_name] = (
                 layer,
                 self._rope(i),
@@ -323,10 +304,17 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
                 logger.warning("Decoder SWA bounded replay is off: %s.", reason)
         if not self.replay:
             self.backbone = _Backbone(atom_config=config, owner=self)
-        for i, layer in enumerate(self.layers):
-            layer.af_zero_copy_hidden = not (
-                self.replay and i in (self.decoder_start, self.last_layer)
-            )
+        if self.piecewise:
+            for i, layer in enumerate(self.layers):
+                configure_piecewise_core(
+                    layer,
+                    outputs=layer.piecewise_outputs,
+                    copy_per_step=(
+                        ("normed",)
+                        if self.replay and i in (self.decoder_start, self.last_layer)
+                        else ()
+                    ),
+                )
 
     def _build_replay_stages(self, config):
         hf = config.hf_config

@@ -1,100 +1,84 @@
 # AF piecewise cores
 
-`@piecewise_core` places a core between compiled dense pieces. With
-`piecewise=True`, its output uses a stable address for the downstream graph.
-`capture=True` also captures/replays the core when eligible. FULL/eager calls
-use `piecewise=False` and execute the original method directly.
+`@piecewise_core` places a numerical region between compiled pieces. The common
+`CudagraphCaptureRunner` owns recording, replay, graph lifetime and the output
+address consumed by the next piece. An attention backend owns request metadata
+and cross-layer result buffers, through its normal preparation lifecycle.
 
-## Builder-owned metadata
-
-Live prefill uses the same ownership principle as V4's decode compressor:
-the attention builder publishes fixed-address buffers before the layers run,
-and graphs read those buffers directly. The model only decorates its core:
+## Model interface
 
 ```python
-@piecewise_core(capture_prefill=True)
-def attention_forward(self, x: torch.Tensor, step: BatchStep):
-    return self.attention(x, step)
+@piecewise_core(capture_prefill=True, token_dim=1)
+def attention_forward(self, hidden: torch.Tensor, cache: PagedAttentionCache,
+                      step: BatchStep, rope: RotaryEmbedding):
+    return self.attention(hidden, cache, step, rope)
+
+# The current forward context supplies runtime mode and backend layout.
+result = layer.attention_forward(hidden, cache, step, rope)
 ```
 
-The builder supplies a `PiecewiseState` once per forward or subset view:
+No graph runner or capture-state argument is required at the numerical call.
+The decorator lazily owns one common runner per region on the layer. FULL/eager
+runtime executes the original body. Plain PIECEWISE stabilizes the output while
+running the body eagerly. A backend layout enables live attention capture.
+
+Runtimes may configure boundaries once, using the shared interface:
 
 ```python
-step.piecewise_state = PiecewiseState(
-    key=(is_decode, query_width, kernel_variant),
-    buffers=(positions, lengths, block_tables, kv_pool),
-    caches={"indices": step.indices},
-)
-
-result = layer.attention_forward(
-    hidden, step,
-    piecewise=True, capture=True, forward_context=forward_context,
-    capture_state=step.piecewise_state,
-)
+configure_piecewise_core(layer, outputs=shared_output_buffers,
+                         copy_per_step=("hidden",))
 ```
 
-`key` must include all host decisions that affect the captured kernels.
-`buffers` is an explicit tensor/scalar tree; addresses, shapes, strides,
-dtypes, devices and scalar values are keyed automatically. Include persistent
-resources such as the KV pool. The state retains these buffers for the graph's
-lifetime. Other changing non-tensor arguments must be represented in the key.
-Scalar core arguments are keyed automatically.
+This is optional. It preserves an existing fixed-capacity output workspace or
+requests staging for a standalone eager producer. Declared tensor inputs are
+direct by default; `copy_per_step` on the decorator is the ordinary static policy.
+`ATOM_ATTN_FFN_ZC` remains the diagnostic override.
 
-The core receives the live metadata unchanged. There is no schema, metadata
-reconstruction, per-layer refresh, or model-specific graph runner. The builder
-must publish contents before execution and preserve addresses for replay.
-Replaced allocations select another graph. Tensor parameters are direct inputs
-by default; `copy_per_step=("x",)` or per-call `zero_copy_inputs=()` allows
-temporary producer tensors by copying them to runner-owned storage.
+## Backend contract
 
-## Per-forward results
+An opting-in builder implements `AttentionMetadataBuilder.cudagraph_key(metadata)`
+and publishes its result as `metadata.cudagraph_key` after normal preparation.
+The default `None` runs attention eagerly. The key describes launch layout and
+buffer allocation generation, including any host choice that changes kernel
+dispatch or grid. Request values such as PAGE IDs or positions are tensor data.
 
-Use the common `ReplayCache` for Python dictionaries populated by a core:
+The backend must:
 
-```python
-step.indices = ReplayCache()
-step.selected = ReplayCache(stable=True)
-```
+- Update request inputs at stable device addresses before replay.
+- Bind cross-layer outputs before execution, with explicit producer/consumer
+  order. Producers write those tensors in place, including on eager fallback.
+- Compute batch-only metadata once during normal preparation. GPU metadata that
+  depends on an earlier layer's output executes after that producer.
+- Give concurrent views separate storage and retain the normal stream fences.
+- Change the key when a recorded layout or buffer generation changes, or return
+  `None` for unsupported layouts.
 
-The runner records cache reads and writes during warmup and CUDA recording.
-Both executions see the same entry state, so lazy index-building kernels are
-included in the graph. Only entries actually read before the core's own writes
-are dependencies. Replay validates those dependencies and publishes only the
-recorded writes into the current forward's caches. Upstream and unrelated
-entries are preserved. Shared subset views should share the actual cache
-objects; name each shared cache once in `PiecewiseState`.
+Python wrappers may be recreated. Recorded GPU addresses and their lifetimes
+must stay valid. The common layer does not scan metadata objects, maintain field
+schemas, intercept dictionaries, or replay Python side effects. A backend may
+use ordinary dictionaries to name its stable tensor slots.
 
-Values are immutable tensor/scalar trees. Update the mapping rather than
-mutating a nested container in place. Persistent mutable GPU state such as KV
-belongs in the builder's buffers. Normal eager execution uses ordinary mapping
-operations; no capture callbacks are needed. Clear caches at every forward,
-including when reusing the same metadata object.
+## Boundary buffers and capture lifetime
 
-When downstream cores reuse a result, `stable=True` delivers tensor writes to
-the state's optional `PiecewiseBuffers` store. Eager producers, first capture
-and replay then publish the same address. Give independent or concurrently
-live views distinct storage namespaces. Use `PiecewiseBuffers` only for
-results/subsets without existing storage; do not copy the builder's existing
-metadata into it again. For subset inputs, prepare the stable storage when
-entering that view, before recording or replaying any of its layers.
+`StableOutputs.empty` binds a backend result before its producer runs. Existing
+`slot`/`deliver` methods preserve a split operation's output address across eager
+and graphed execution. Prefer an operator's `out=` interface; use an explicit
+copy when its implementation cannot write the destination directly.
 
-The first live call warms once, records without replaying, and publishes the
-warmup result. Later calls replay once and publish recorded results. GPU state
-updates therefore occur exactly once per invocation. Startup capture, dummy
-runs and FULL runtime graphs cannot start a nested live capture. Explicit
-`capture_state=None` declines live capture. At the default limit of 32 graphs
-per runner, new keys fall back eagerly before allocating graph inputs; cached
-keys continue to replay.
+On first use, live capture executes warmup once, records without executing GPU
+nodes, and returns the warmup result without an immediate replay. Later calls
+replay once. The region must not contain host mutations needed by later calls.
+Startup capture, dummy execution and FULL runtime cannot nest live capture.
 
-The decorator lazily creates a `PiecewiseAFRunner` and output storage when
-none are supplied. Explicit instances support fixed-capacity `StableOutputs`.
-Graph-holder release drops recordings and retained resources; builder buffer
-stores participate in the same lifecycle.
+The common runner keys tensor argument layouts and direct input addresses. It
+retains the captured callable and its backend resources until graph release.
+Each runner records at most 32 live graphs; new layouts then fall back eagerly,
+while existing layouts continue replaying. This limit is separate from the
+dispatcher token ladder. Compiled pieces keep independent pools per token bucket.
 
 ## Existing decode interface
 
-V4 and other decode-only users retain `key=decode_bucket_key` and startup
-capture. They need no `PiecewiseState` when their core only writes persistent
-device state. The lower-level `capture_key`/`prepare` route remains available
-for callers managing their own lifecycle, and cannot be combined with
-`capture_state`.
+V4 keeps `key=decode_bucket_key` and its explicit startup-capture interface.
+Existing `piecewise`, `capture`, `runner`, `outputs`, `forward_context` and the
+lower-level `capture_key`/`prepare` arguments remain supported. A backend does
+not need to adopt live-prefill metadata to keep its existing decode behavior.

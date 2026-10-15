@@ -467,6 +467,7 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry, builder.device, builder.block_size = geo, "cpu", 32
+    builder.config = SimpleNamespace(candidate_topk_blocks=0)
     builder.cache = None
     builder.score_workspace = None
     builder.model_runner = SimpleNamespace(

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from atom.config import CUDAGraphMode
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_loader.weight_utils import local_model_dir
@@ -66,6 +67,8 @@ class DeepseekV41Backend(AttentionBackend):
 
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
+    topology = ()
+    capture_attention = False
     capture_owns_cu_seqlens_q = True
     tbo_comm_stream_priority = -1
 
@@ -123,6 +126,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
         ]
+        self.topology = tuple(topology)
+        self.capture_attention = (
+            model_runner.config.compilation_config.cudagraph_mode
+            in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
+        )
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         self.geometry = V41PoolGeometry(
@@ -384,6 +392,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
+            topology=self.topology,
+            candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -588,6 +598,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                topology=self.topology,
+                candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
             )
             if batch.is_dummy_run
             else self.cache
@@ -729,8 +741,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         return metadata, step.positions
 
-    @staticmethod
     def _assemble_metadata(
+        self,
         cache,
         step,
         rows,
@@ -741,6 +753,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         image_mask=None,
         engram_embeddings=None,
     ):
+        cache.prepare_attention(step)
         metadata = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
             max_seqlen_q=step.max_q_len,
@@ -763,7 +776,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         metadata.engram_embeddings = (
             {} if engram_embeddings is None else engram_embeddings
         )
+        metadata.cudagraph_key = self.cudagraph_key(metadata)
         return metadata
+
+    def cudagraph_key(self, metadata):
+        if not self.capture_attention or metadata.dummy:
+            return None
+        return metadata.cache.graph_layout(metadata.step, metadata.queries)
 
     @staticmethod
     def _token_mask(batch, spans, tokens):

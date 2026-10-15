@@ -173,6 +173,15 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
 
+    def cudagraph_key(self, metadata):
+        """Layout/generation for an AF region, or None for eager attention.
+
+        Opting in promises that normal build() refreshed the captured inputs,
+        GPU producers write stable result buffers, and this key covers all host
+        decisions affecting the region. Python side effects are not replayed.
+        """
+        return None
+
     supports_piecewise_prefill = False
 
     def prepare_prefill_padded(self, batch, running_bs, running_tokens):

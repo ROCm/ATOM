@@ -341,6 +341,13 @@ class StableOutputs:
         self._slots: dict = {}
         self.capacity, self.token_dim = capacity, token_dim
 
+    def empty(self, key, shape, *, dtype, device):
+        """Allocate a backend result before its producer runs, without a copy."""
+        key = (key, tuple(shape), dtype, torch.device(device))
+        if key not in self._slots:
+            self._slots[key] = torch.empty(shape, dtype=dtype, device=device)
+        return self._slots[key]
+
     def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
         """Return a stable slot, optionally a view into fixed token capacity.
 
@@ -383,8 +390,19 @@ class CudagraphCaptureRunner:
     Holds its own graph pool, isolated from the dense-piece pool.
     """
 
-    def __init__(self, capture_error_mode: str = "thread_local"):
+    def __init__(
+        self,
+        capture_error_mode: str = "thread_local",
+        *,
+        outputs=None,
+        token_dim=0,
+        max_entries=32,
+    ):
         self._graphs: dict = {}
+        self.outputs = (
+            outputs if outputs is not None else StableOutputs(token_dim=token_dim)
+        )
+        self.max_entries = max_entries
         self._pool = None
         self._capture_error_mode = capture_error_mode
         # A runner is a module-level global of the model that uses it
@@ -487,6 +505,45 @@ class CudagraphCaptureRunner:
                 slot.copy_(warm)
         current.wait_stream(self.capture_stream)
         return slot
+
+    def run(self, key, tensors, compute_fn, output_slot, *, zero_copy):
+        """Capture a region over an explicitly prepared backend layout.
+
+        The backend owns non-argument buffers and their generation in ``key``.
+        Direct tensor arguments must retain their address; copied arguments may
+        change address but must retain layout. Python mutations are not replayed.
+        A new layout falls back once this runner's recording budget is exhausted.
+        """
+        layout = tuple(
+            (
+                name,
+                (
+                    None
+                    if value is None
+                    else (
+                        tuple(value.shape),
+                        tuple(value.stride()),
+                        value.dtype,
+                        value.device,
+                        value.data_ptr() if name in zero_copy else None,
+                    )
+                ),
+            )
+            for name, value in tensors.items()
+        )
+        key = (key, layout)
+        if self.has_graph(key):
+            return True, self.replay(key, tensors)
+        if len(self._graphs) >= self.max_entries:
+            return False, None
+        read_from, refresh = self.input_buffers(tensors, tuple(tensors), zero_copy)
+        result = self.capture_on_demand(
+            key, read_from, refresh, compute_fn, output_slot
+        )
+        # Retain the bound backend, metadata views and any resources captured by
+        # the callable until graph release, including allocations outside its pool.
+        self._graphs[key]["compute"] = compute_fn
+        return True, result
 
     def replay(self, key, named_args: dict) -> torch.Tensor | None:
         """Refresh the inputs this runner owns, replay, and return the output."""

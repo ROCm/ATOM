@@ -183,7 +183,7 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up = _upload(
         device,
         torch.int32,
-        buffers=step.piecewise_buffers,
+        buffers=step.result_buffers,
         namespace="tail_int",
         rows=rows,
         cu=np.concatenate(([0], ends)),
@@ -201,7 +201,7 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up |= _upload(
         device,
         step.positions.dtype,
-        buffers=step.piecewise_buffers,
+        buffers=step.result_buffers,
         namespace="tail_position",
         positions=positions,
         last_positions=positions[last],
@@ -210,8 +210,8 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     def keep(name, tensor):
         return (
             tensor
-            if step.piecewise_buffers is None
-            else step.piecewise_buffers.deliver(("tail", name), tensor)
+            if step.result_buffers is None
+            else step.result_buffers.deliver(("tail", name), tensor)
         )
 
     tail = BatchStep(
@@ -232,8 +232,8 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
                 step.visible, _gather_rows(up["rows"], *step.visible.values())
             )
         },
-        piecewise_buffers=step.piecewise_buffers,
-        piecewise_namespace="tail",
+        result_buffers=step.result_buffers,
+        buffer_namespace="tail",
         request_positions=starts.astype(np.int32),
         swa_replay_start=up["floors"],
         swa_cached_until=up["cached_until"],
@@ -274,14 +274,25 @@ def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
         ({s.candidate_source for s in specs} - {None} - own) & parent.candidates.keys()
     )
     rows, tail = plan.tail_rows, plan.tail
-    if tail.piecewise_buffers is not None:
-        for name in ("selected", "candidates"):
-            values = getattr(tail, name)
-            values.bind(tail.piecewise_buffers, (tail.piecewise_namespace, name))
+    tail.layer_specs = tuple(specs)
     taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
-    tail.selected.update(zip(owners, taken))
+    for owner, value in zip(owners, taken):
+        tail.selected[owner] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "selected", owner), value
+            )
+        )
     taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
-    tail.candidates.update(zip(sources, taken))
+    for source, value in zip(sources, taken):
+        tail.candidates[source] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "candidates", source), value
+            )
+        )
 
 
 @contextlib.contextmanager
@@ -303,9 +314,15 @@ def rows_of(metadata, step, queries=None, rows=None):
     indexed.indptrs = fill_step_indptrs(
         indexed, metadata.cache.geometry, metadata.cache.indptr_buffers
     )
-    if getattr(step, "piecewise_buffers", None) is not None:
-        step.prepare_piecewise(metadata.cache, queries)
+    if getattr(step, "result_buffers", None) is not None:
+        # Bind the tail's normal backend workspace after its row mapping and
+        # carried results are ready. A query-only boundary remains eager.
+        metadata.cache.prepare_attention(step)
     outer = metadata.step, metadata.queries, metadata.image_mask
+    outer_key = getattr(metadata, "cudagraph_key", None)
+    metadata.cudagraph_key = (
+        metadata.cache.graph_layout(step, queries) if outer_key is not None else None
+    )
     metadata.step, metadata.queries = step, queries
     if rows is not None and outer[2] is not None:
         # [1, tokens]: an MoE router routes image rows by it
@@ -314,5 +331,6 @@ def rows_of(metadata, step, queries=None, rows=None):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
+        metadata.cudagraph_key = outer_key
         outer[0].indptrs = {}
         outer[0].tiles.clear()

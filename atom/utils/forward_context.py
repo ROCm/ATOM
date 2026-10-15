@@ -627,6 +627,10 @@ class Context:
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
 
+    # Published by an opting-in backend after ordinary metadata preparation.
+    # None leaves AF attention eager while preserving its output boundary.
+    cudagraph_key: tuple | None = None
+
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
@@ -723,7 +727,9 @@ class AttentionMetaData:
         kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        cudagraph_key: tuple | None = None,
     ):
+        self.cudagraph_key = cudagraph_key
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.kpool_total_pools = kpool_total_pools

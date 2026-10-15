@@ -74,16 +74,17 @@ the sum of token sizes; it does not reclaim the boundary-buffer savings for KV.
 
 Attention, Engram and begin/end-forward are explicit splitting operations.
 Dense pieces are keyed by total token count. In AF mode, each attention
-boundary owns a separate graph cache; ordinary, FULL/REINDEX and subset-query
-attention paths are supported.
+boundary owns a separate graph cache for ordinary and FULL/REINDEX attention.
+Partial-query boundaries execute eagerly with the same output-address contract.
 
-An attention graph includes QKV/norm, query gathering when required, RoPE,
+An attention graph includes QKV/norm, RoPE,
 CSR construction, sparse attention, ordered window writes and output
 projection/TP reduction. FULL/REINDEX paths also include their compression,
 index writes, scoring and top-k. Bounded replay's layer-20 precompression
 and row selection remain outside these attention calls.
 
-Begin/end-forward maintain the live BatchStep dictionaries on every call.
+The backend prepares fixed result bindings once per execution view.
+Begin/end-forward retain those bindings and reset standalone eager caches.
 Engram staging starts and joins before dense capture to close its stream
 boundary. FULL and eager retain their existing Engram scheduling. Image
 prefills execute the stage's Python body so a text graph cannot freeze an
@@ -121,33 +122,32 @@ bounds, with the same shapes included in graph memory budgeting. For the
 
 ## AF buffers and metadata
 
-[`@piecewise_core`](piecewise_core.md) owns live AF capture and replay.
-V4.1 follows V4's builder-owned metadata policy: the fixed buffers published
-by the attention backend are read directly. `Block.attention_forward` only
-uses the decorator, without a metadata schema, adapter or graph subclass.
+[`@piecewise_core`](piecewise_core.md) owns live AF dispatch through the existing
+common capture runner. `Block.attention_forward` is a normal numerical method
+with a decorator. Runtime calls pass no capture state or graph runner.
 
-The backend publishes a common `PiecewiseState` once per forward/view. Its
-key covers host kernel choices and the addresses/layouts of the existing
-metadata. The common `ReplayCache` handles dependencies and Python results
-for selections, candidates and derived index tables. No per-layer metadata
-copy, reconstruction, reset/bind declaration or publication callback is needed.
+Normal backend preparation binds selection/candidate slots and decode group
+outputs for the current execution view. Scoring publishes into these fixed
+slots. Candidate translation executes at the first REINDEX consumer, after its
+upstream candidate producer; grouped decode indices execute at the group's
+first layer. Batch-only tile/window metadata is prepared once before the walk.
+There is no Python dictionary transaction or metadata reconstruction.
 
-Warmup and recording see the same cache entry state. Only the entries the
-core actually reads are dependencies, and replay updates only its writes.
-Query-index views retain their original shared dictionaries. Selected rows
-and candidates use builder-owned result slots so eager, newly captured and
-replayed producers supply the same downstream addresses.
+The backend publishes a launch-layout key on `AttentionMetaData`. Compression
+capacities, packed score bands and workspace view offsets distinguish layouts;
+request contents are updated through existing builder buffers. Independent TBO
+views have distinct namespaces and retain existing publication/stream fences.
+Bounded tails carry encoder results into stable slots and use the decoder's
+producer schedule. Partial-query layer 39 remains eager in this first version.
 
-AF reads the upstream dense graph's stable hidden tensor and writes the
-persistent output slot bound by the downstream graph. Bounded replay's
-standalone layers 20 and 39 still stage temporary hidden inputs. Subset
-metadata is stabilized when its view is constructed, before its layers run.
-Parent and TBO child storage has distinct namespaces; existing indptr fills,
-publication fences and view-exit invalidation are preserved.
+AF reads stable inputs directly and writes the persistent output consumed by
+the next compiled piece. Runtime initialization uses the common configuration
+interface for output capacity and the two standalone bounded-decoder input
+boundaries. Eager producer fallbacks write the same cross-layer result slots.
 
-The first eligible invocation warms once, records without replaying, and
-returns the warmup result. Later invocations replay once. This preserves
-exactly-once KV updates, including prefill's read-before-window-write order.
+The first eligible invocation warms once, records without replaying, and returns
+the warmup result. Later invocations replay once. GPU state writes therefore run
+once per invocation; ordinary Python side effects are not part of the contract.
 
 ## Graph reuse limits
 

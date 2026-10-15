@@ -462,7 +462,6 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
         af_piecewise=True,
         af_zero_copy_hidden=True,
         piecewise_outputs=outputs,
-        attention_graphs=runtime.PiecewiseAFRunner(outputs),
     )
     context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.NONE,
@@ -475,10 +474,14 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
             cache=cache,
             queries=None,
             dummy=False,
+            cudagraph_key=(4,),
             engram_embeddings={},
             image_mask=None,
         ),
     )
+    from atom.utils import forward_context
+
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
     monkeypatch.setattr(runtime, "get_forward_context", lambda: context)
     monkeypatch.setattr(cuda_graph, "get_forward_context", lambda: context)
     config = SimpleNamespace(compilation_config=SimpleNamespace())
@@ -521,7 +524,8 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
         with torch.cuda.graph(full):
             destination.copy_(compiled(hidden))
     torch.cuda.current_stream().wait_stream(stream)
-    assert not layer.attention_graphs._graphs
+    runner = next(iter(layer._piecewise_core_runners.values()))
+    assert not runner._graphs
     context.in_hipgraph = False
     cache.pool.zero_()
     for i, use_full in enumerate([True, False, True, False], 1):
@@ -536,8 +540,8 @@ def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
             actual = compiled(hidden)
         torch.testing.assert_close(actual, torch.full_like(hidden, 12 * i + 3))
         assert cache.pool.item() == i
-    assert len(layer.attention_graphs._graphs) == 1
-    layer.attention_graphs.release_graphs()
+    assert len(runner._graphs) == 1
+    runner.release_graphs()
     for piece in pieces:
         piece.release_graphs()
 

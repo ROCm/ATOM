@@ -109,7 +109,14 @@ def _lift_kernel(
 
 
 def candidate_block_table(
-    candidates, block_tables, batch_ids, units_per_page, visible, *, rows_per_block
+    candidates,
+    block_tables,
+    batch_ids,
+    units_per_page,
+    visible,
+    *,
+    rows_per_block,
+    out=None
 ):
     """`(table, context)` for scoring only the blocks `candidates` kept.
 
@@ -117,12 +124,27 @@ def candidate_block_table(
     its request's PAGE table (`batch_ids` the token's request, -1 a padding
     token), a PAGE `units_per_page` blocks. `table` is `[tokens, topk_blocks]`
     physical block ids and `context` how far into `topk_blocks *
-    rows_per_block` columns each row may read. Both are fresh allocations, so
-    a caller inside a graph capture gets the address the replay will read.
+    rows_per_block` columns each row may read. ``out`` lets the backend bind
+    both results before execution; otherwise they are allocated here.
     """
     tokens, topk_blocks = candidates.shape
-    table = torch.empty_like(candidates)
-    context = torch.empty(tokens, dtype=torch.int32, device=candidates.device)
+    table = torch.empty_like(candidates) if out is None else out[0]
+    context = (
+        torch.empty(tokens, dtype=torch.int32, device=candidates.device)
+        if out is None
+        else out[1]
+    )
+    if out is not None and (
+        table.shape != candidates.shape
+        or table.stride() != candidates.stride()
+        or table.dtype != candidates.dtype
+        or table.device != candidates.device
+        or context.shape != (tokens,)
+        or context.dtype != torch.int32
+        or context.device != candidates.device
+        or not context.is_contiguous()
+    ):
+        raise ValueError("Candidate result buffers do not match their producer layout")
     if tokens:
         _candidate_table_kernel[(tokens,)](
             candidates,
@@ -158,13 +180,13 @@ class CandidateBlocks(NamedTuple):
 
 
 def bind_candidates(
-    ids, block_tables, batch_ids, units_per_page, visible, *, rows_per_block
+    ids, block_tables, batch_ids, units_per_page, visible, *, rows_per_block, out=None
 ):
     """`CandidateBlocks` for `ids` over their requests' PAGE tables
     (`candidate_block_table`), for every layer they bound."""
     table, context = candidate_block_table(
         ids, block_tables, batch_ids, units_per_page, visible,
-        rows_per_block=rows_per_block,
+        rows_per_block=rows_per_block, out=out,
     )  # fmt: skip
     return CandidateBlocks(ids, table, context, rows_per_block)
 

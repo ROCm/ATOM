@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Builder-owned buffers and Python result lifetimes, independent of V4.1."""
+"""AF regions over backend-owned buffers, without Python state replay."""
 
 from types import SimpleNamespace
 
@@ -8,83 +8,55 @@ import torch
 
 from atom.config import CUDAGraphMode
 from atom.utils.attn_ffn_piecewise import piecewise_core
-from atom.utils.piecewise_af import (
-    PiecewiseAFRunner,
-    PiecewiseBuffers,
-    PiecewiseState,
-    ReplayCache,
-)
+from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
 
 
-def _context(**kwargs):
+def _context(key=(), mode=CUDAGraphMode.PIECEWISE):
     return SimpleNamespace(
         in_hipgraph=False,
         context=SimpleNamespace(is_dummy_run=False),
-        attn_metadata=SimpleNamespace(dummy=False),
-        cudagraph_runtime_mode=kwargs.get("mode", CUDAGraphMode.PIECEWISE),
+        attn_metadata=SimpleNamespace(dummy=False, cudagraph_key=key),
+        cudagraph_runtime_mode=mode,
     )
 
 
-def test_cache_transaction_rolls_back_and_publishes_only_its_writes():
-    upstream = torch.ones(3)
-    cache = ReplayCache({0: upstream, "remove": 4})
-    state = PiecewiseState((), (), {"results": cache})
-    with state.record() as tx:
-        assert cache.get(0) is upstream
-        assert "new" not in cache
-        cache["new"] = upstream + 1
-        del cache["remove"]
-        assert "new" in cache
-    assert cache[0] is upstream and "new" not in cache and cache["remove"] == 4
-    assert state.matches(tx.reads)
-    state.publish(tx.writes)
-    assert cache[0] is upstream and "remove" not in cache
-    torch.testing.assert_close(cache["new"], upstream + 1)
-    assert not state.matches(tx.reads)
-
-
-def test_exception_restores_caches_and_recording_context():
-    cache = ReplayCache()
-    state = PiecewiseState((), (), {"cache": cache})
-    with pytest.raises(RuntimeError, match="failed"), state.record():
-        cache[0] = 1
-        raise RuntimeError("failed")
-    assert not cache
-    with state.record():
-        cache[1] = 2
-    assert not cache
-    with pytest.raises(ValueError, match="outside"), state.record():
-        ReplayCache()[0] = 1
+def test_backend_result_slots_are_explicit_and_isolated_by_view():
+    storage = StableOutputs()
+    main = storage.empty(("main", "selected"), (4, 8), dtype=torch.int32, device="cpu")
+    child = storage.empty(("ub0", "selected"), (4, 8), dtype=torch.int32, device="cpu")
+    main.fill_(7)
+    child.fill_(9)
+    assert (
+        storage.empty(("main", "selected"), (4, 8), dtype=torch.int32, device="cpu")
+        is main
+    )
+    assert main.data_ptr() != child.data_ptr()
+    assert torch.all(main == 7)
 
 
 @cuda
 @pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("void", [False, True])
-def test_replay_uses_published_buffers_and_applies_effect_once(direct, void):
+def test_replay_refreshes_buffers_and_applies_gpu_effect_exactly_once(direct, void):
     @piecewise_core(capture_prefill=True)
     def core(layer, x: torch.Tensor, md: object):
         layer.calls += 1
         layer.kv.add_(1)
-        if "derived" not in md.cache:
-            md.cache["derived"] = x + md.positions
-        md.cache["output"] = md.cache["derived"] + 2
-        return None if void else md.cache["output"]
+        md.output.copy_(x + md.positions + 2)
+        return None if void else md.output
 
     layer = SimpleNamespace(calls=0, kv=torch.zeros(1, device="cuda"))
     positions = torch.zeros(4, device="cuda")
     hidden = torch.zeros_like(positions)
-    runner = PiecewiseAFRunner()
-    outputs = PiecewiseBuffers()
+    output = torch.empty_like(hidden)
+    runner = CudagraphCaptureRunner()
     for i in range(1, 5):
         positions.fill_(i)
         hidden.fill_(i * 2)
-        cache = ReplayCache(stable=True)
-        state = PiecewiseState(
-            (), (positions, layer.kv), {"cache": cache}, storage=outputs
-        )
-        md = SimpleNamespace(positions=positions, cache=cache)
+        # Python wrappers may change; captured storage is owned by the backend.
+        md = SimpleNamespace(positions=positions, output=output)
         result = core(
             layer,
             hidden,
@@ -92,101 +64,122 @@ def test_replay_uses_published_buffers_and_applies_effect_once(direct, void):
             piecewise=True,
             capture=True,
             runner=runner,
-            capture_state=state,
             forward_context=_context(),
             zero_copy_inputs=("x",) if direct else (),
         )
-        torch.testing.assert_close(cache["output"], hidden + positions + 2)
+        torch.testing.assert_close(output, hidden + positions + 2)
         if void:
             assert result is None
         else:
-            torch.testing.assert_close(result, hidden + positions + 2)
+            torch.testing.assert_close(result, output)
         assert layer.kv.item() == i
-    assert layer.calls == 2  # Warmup + record; replay executes no Python core.
+    assert layer.calls == 2
     assert runner.release_graphs() == 1
-    assert not runner._captures
 
 
 @cuda
-def test_cache_dependencies_changed_addresses_and_full_cache_fallback():
+def test_layout_generation_and_budget_fallback():
     @piecewise_core(capture_prefill=True)
-    def core(layer, x: torch.Tensor, cache: object):
+    def core(layer, x: torch.Tensor, source: object):
         layer.calls += 1
-        return x + cache["source"]
+        return x + source
 
     layer = SimpleNamespace(calls=0)
-    runner = PiecewiseAFRunner()
-    runner.max_entries = 2
+    runner = CudagraphCaptureRunner(max_entries=2)
     x = torch.ones(4, device="cuda")
     sources = [torch.full_like(x, i) for i in range(3)]
     for i in (0, 1, 0, 2, 1):
-        cache = ReplayCache(
-            {"source": sources[i], "irrelevant": torch.empty(i + 1, device="cuda")}
-        )
-        state = PiecewiseState((), (), {"cache": cache})
         result = core(
             layer,
             x,
-            cache,
+            sources[i],
             piecewise=True,
             capture=True,
             runner=runner,
-            capture_state=state,
-            forward_context=_context(),
+            forward_context=_context(key=(i,)),
         )
         torch.testing.assert_close(result, x + sources[i])
-    assert (
-        layer.calls == 5
-    )  # Two recordings + one fallback, unrelated writes don't key.
+    assert layer.calls == 5
     assert runner.release_graphs() == 2
 
 
 @cuda
-def test_cross_layer_stable_results_survive_producer_capture_and_fallback():
+def test_eager_producer_then_graph_consumer_reads_current_result():
     @piecewise_core(capture_prefill=True)
-    def produce(layer, x: torch.Tensor, cache: object):
-        cache[0] = x + 3
-        return cache[0]
+    def produce(layer, x: torch.Tensor, results: object):
+        results[0].copy_(x + 3)
+        return results[0]
 
     @piecewise_core(capture_prefill=True)
-    def consume(layer, x: torch.Tensor, cache: object):
+    def consume(layer, x: torch.Tensor, results: object):
         layer.calls += 1
-        return x + cache[0]
+        return x + results[0]
 
-    storage = PiecewiseBuffers()
-    producer, consumer = PiecewiseAFRunner(), PiecewiseAFRunner()
-    producer.max_entries = 1
+    producer, consumer = CudagraphCaptureRunner(max_entries=1), CudagraphCaptureRunner()
+    slot = torch.empty(4, device="cuda")
     layer = SimpleNamespace(calls=0)
     for i in range(5):
         x = torch.full((4,), float(i), device="cuda")
-        cache = ReplayCache(stable=True)
-        state = PiecewiseState((), (), {"cache": cache}, storage=storage)
-        opts = {
-            "piecewise": True,
-            "capture": True,
-            "capture_state": state,
-            "forward_context": _context(),
-        }
-        produce(layer, x, cache, runner=producer, **opts)
-        actual = consume(layer, x, cache, runner=consumer, zero_copy_inputs=(), **opts)
+        results = {0: slot}
+        produce(
+            layer,
+            x,
+            results,
+            piecewise=True,
+            capture=True,
+            runner=producer,
+            forward_context=_context(key=(i,)),
+            zero_copy_inputs=(),
+        )
+        actual = consume(
+            layer,
+            x,
+            results,
+            piecewise=True,
+            capture=True,
+            runner=consumer,
+            forward_context=_context(),
+            zero_copy_inputs=(),
+        )
         torch.testing.assert_close(actual, x * 2 + 3)
     assert layer.calls == 2
     assert producer.release_graphs() == consumer.release_graphs() == 1
 
 
 @cuda
-@pytest.mark.parametrize("gate", ["dummy", "startup", "full", "disabled", "cap"])
+def test_context_only_model_interface(monkeypatch):
+    from atom.utils import forward_context
+
+    @piecewise_core(capture_prefill=True, copy_per_step=("x",))
+    def core(layer, x: torch.Tensor):
+        return x + 1
+
+    fc = _context()
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: fc)
+    layer = SimpleNamespace()
+    for i in range(3):
+        x = torch.full((4,), float(i), device="cuda")
+        torch.testing.assert_close(core(layer, x), x + 1)
+    runner = next(iter(layer._piecewise_core_runners.values()))
+    assert runner.release_graphs() == 1
+
+
+@cuda
+@pytest.mark.parametrize(
+    "gate", ["dummy", "startup", "full", "disabled", "cap", "unsupported"]
+)
 def test_live_capture_guards(gate):
     @piecewise_core(capture_prefill=True, max_tokens=3 if gate == "cap" else None)
     def core(layer, x: torch.Tensor):
         return x + 1
 
     context = _context(
-        mode=CUDAGraphMode.FULL if gate == "full" else CUDAGraphMode.PIECEWISE
+        key=None if gate == "unsupported" else (),
+        mode=CUDAGraphMode.FULL if gate == "full" else CUDAGraphMode.PIECEWISE,
     )
     context.in_hipgraph = gate == "startup"
     context.attn_metadata.dummy = gate == "dummy"
-    runner = PiecewiseAFRunner()
+    runner = CudagraphCaptureRunner()
     x = torch.ones(4, device="cuda")
     out = core(
         SimpleNamespace(),
@@ -195,7 +188,29 @@ def test_live_capture_guards(gate):
         capture=gate != "disabled",
         runner=runner,
         forward_context=context,
-        capture_state=PiecewiseState((), ()),
     )
     torch.testing.assert_close(out, x + 1)
     assert not runner._graphs
+
+
+def test_context_interface_preserves_configured_output_capacity(monkeypatch):
+    from atom.utils import forward_context
+    from atom.utils.attn_ffn_piecewise import configure_piecewise_core
+
+    @piecewise_core(capture_prefill=True, token_dim=1)
+    def core(layer, x: torch.Tensor):
+        return x * 2
+
+    fc = _context(key=None)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: fc)
+    layer = SimpleNamespace()
+    outputs = StableOutputs(capacity=8, token_dim=1)
+    configure_piecewise_core(layer, outputs=outputs, copy_per_step=("x",))
+    addresses = []
+    for tokens in (3, 8, 3):
+        x = torch.arange(tokens * 2).reshape(1, tokens, 2)
+        result = core(layer, x)
+        torch.testing.assert_close(result, x * 2)
+        addresses.append(result.data_ptr())
+    assert len(set(addresses)) == 1
+    assert not next(iter(layer._piecewise_core_runners.values()))._graphs

@@ -1,37 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Capture one op's body into its OWN cudagraph, between the dense pieces.
+"""Capture numerical regions between compiled pieces through one decorator.
 
-Under ``--cudagraph-mode AF_PIECEWISE`` the attention core gets a cudagraph of
-its own, so small-batch decode replays through it instead of running eager
-between the graphed dense pieces. A cudagraph bakes the ADDRESS of everything it
-reads, so both sides of that boundary need one that does not move:
+The common runner owns recording, replay and stable boundary outputs. Tensor
+arguments are captured directly by default; ``copy_per_step`` requests staging
+when their producer changes addresses. Backends prepare metadata and cross-layer
+results through their normal lifecycle, with explicit in-place GPU producers.
 
-  * inputs -- the runner clones each one at capture and refreshes the clone at
-    replay, so the producer upstream can allocate however it likes;
-  * the output -- the dense piece downstream was captured reading one address
-    per (layer, rows), so an eagerly computed result is delivered into it.
-
-Both are the runner's business, not the model's. A model opts in by decorating
-the method that IS its core -- no separate wrapper, the decorated function is the
-core itself::
-
-    @piecewise_core(key=decode_bucket_key)
-    def _attn_compress(self, *, x):
-        ...the body that needs its own graph...
-
-and writes nothing else -- no staging buffers, no per-input policy, no dummy
-forward to measure shapes. The inputs and their order come off the function's
-own signature (the leading ``self``/layer is skipped). A caller on the FULL /
-eager path just passes ``piecewise=False`` and the body runs directly.
-
-What this deliberately does NOT do is let the producer write the graph's input
-buffer directly. That saves the clone's copy, but only by making every producer
-in the chain aware of the capture -- which is what the previous design did, and
-is what made this feature reach into the model layer. ``copy_per_step`` buys
-that back for whichever inputs cannot be captured on -- name one and the runner
-clones and refreshes it. V4 currently names none.
+V4 retains its decode startup-capture interface. Live prefill regions opt in with
+``capture_prefill=True`` and use the current forward context's backend layout.
+See ``docs/piecewise_core.md`` for the metadata and buffer lifetime contract.
 """
 
 import functools
@@ -41,11 +20,22 @@ from collections.abc import Callable
 from typing import Any, get_args
 
 __all__ = [
+    "configure_piecewise_core",
     "decode_bucket_key",
     "piecewise_core",
 ]
 
-_NO_CAPTURE_STATE = object()
+
+def configure_piecewise_core(layer, *, outputs=None, copy_per_step=None):
+    """Configure a layer's region boundaries once during runner initialization.
+
+    Optional: the decorator otherwise owns its output store and uses its declared
+    input policy. Runtime layouts with standalone eager producers can request
+    staging here without adding graph arguments to the model's numerical calls.
+    """
+    if isinstance(copy_per_step, str):
+        raise TypeError("copy_per_step must be a tuple of tensor argument names")
+    layer.__dict__["_piecewise_core_options"] = (outputs, copy_per_step)
 
 
 def decode_bucket_key(forward_context) -> tuple:
@@ -161,14 +151,13 @@ def piecewise_core(
     ``key`` adds whatever else changes the graph's shape beyond the layer and the
     token count -- for a decode core that is the bucket, `decode_bucket_key`.
     By default only DECODE steps are captured. ``capture_prefill=True`` also
-    permits live prefill capture. The builder supplies ``capture_state``, a
-    ``PiecewiseState`` over its already-published buffers and result caches.
-    The core receives the live metadata unchanged. No model reconstruction or
-    publication hook is needed. The lower-level ``capture_key`` / ``prepare``
-    interface remains available for callers managing their own lifecycle.
-    With live capture enabled, a runner/output store is created lazily when
-    not supplied. ``zero_copy_inputs`` overrides the tensor policy per call.
-    Changed direct-input addresses always select another graph.
+    permits live prefill capture over the current backend's ``cudagraph_key``.
+    The backend prepares request inputs and persistent result workspaces in its
+    normal build lifecycle. GPU producers write these buffers in place; Python
+    side effects are not replayed. No metadata schema or transaction is inferred.
+    Omitting ``piecewise`` uses the current forward context. The runner and its
+    boundary output store are created lazily on the owning layer.
+    The explicit decode API remains available for startup capture callers.
     ``max_tokens`` is an OPTIONAL extra cap on the rows
     a captured graph covers -- a memory lever, off by default. It used to be 512
     and to be the only gate, which silently excluded every decode bucket above
@@ -228,17 +217,30 @@ def piecewise_core(
         def wrapper(
             layer,
             *args,
-            piecewise=False,
-            capture=False,
+            piecewise=None,
+            capture=None,
             runner=None,
             outputs=None,
             forward_context=None,
             capture_key=None,
-            capture_state=_NO_CAPTURE_STATE,
             prepare=None,
             zero_copy_inputs=None,
             **inputs,
         ):
+            if piecewise is None:
+                if not capture_prefill:
+                    piecewise = False
+                else:
+                    from atom.utils.forward_context import get_forward_context
+
+                    if forward_context is None:
+                        forward_context = get_forward_context()
+                    mode = getattr(forward_context, "cudagraph_runtime_mode", None)
+                    piecewise = getattr(mode, "name", None) == "PIECEWISE"
+            metadata = getattr(forward_context, "attn_metadata", None)
+            backend_key = getattr(metadata, "cudagraph_key", None)
+            if capture is None:
+                capture = backend_key is not None
             # FULL / eager: the body runs directly, so a caller on that path only
             # states `piecewise=False` and none of the capture collaborators.
             if not piecewise:
@@ -250,16 +252,29 @@ def piecewise_core(
                 inputs = dict(list(bound.arguments.items())[1:])
 
             if capture_prefill:
-                from atom.utils.piecewise_af import PiecewiseAFRunner
+                from atom.utils.cuda_graph import CudagraphCaptureRunner
 
-                if capture_state is not _NO_CAPTURE_STATE and (
-                    prepare is not None or capture_key is not None
-                ):
-                    raise ValueError("capture_state owns the key and cache lifecycle")
+                configured_outputs, configured_copies = layer.__dict__.get(
+                    "_piecewise_core_options", (None, None)
+                )
+                if outputs is None:
+                    outputs = configured_outputs
+                if zero_copy_inputs is None and configured_copies is not None:
+                    unknown = set(configured_copies) - set(input_names)
+                    if unknown:
+                        raise ValueError(
+                            f"copy_per_step names unknown tensor inputs: {sorted(unknown)}"
+                        )
+                    zero_copy_inputs = _resolve_zero_copy(
+                        input_names, frozenset(configured_copies)
+                    )
+
                 if runner is None:
                     stores = layer.__dict__.setdefault("_piecewise_core_runners", {})
                     if fn not in stores:
-                        stores[fn] = PiecewiseAFRunner(outputs, token_dim=token_dim)
+                        stores[fn] = CudagraphCaptureRunner(
+                            outputs=outputs, token_dim=token_dim
+                        )
                     runner = stores[fn]
                 if outputs is None:
                     outputs = runner.outputs
@@ -330,40 +345,41 @@ def piecewise_core(
                 )
                 and (max_tokens is None or num_tokens <= max_tokens)
             )
-            if capture_state is None:
-                eligible = False
-            if eligible and capture_state is not _NO_CAPTURE_STATE:
-                direct = (
-                    zero_copy
-                    if zero_copy_inputs is None
-                    else frozenset(zero_copy_inputs)
-                )
-                if isinstance(zero_copy_inputs, str) or direct - set(input_names):
-                    raise ValueError(
-                        "zero_copy_inputs must name declared tensor inputs"
+            if capture_prefill and capture_key is None:
+                eligible = eligible and backend_key is not None
+                if eligible:
+                    direct = (
+                        zero_copy
+                        if zero_copy_inputs is None
+                        else frozenset(zero_copy_inputs)
                     )
-                handled, result = runner.run(
-                    (
-                        fn,
-                        layer_name,
-                        num_tokens,
-                        tuple(key(forward_context)),
-                        tuple(
-                            (name, type(inputs[name]), inputs[name])
-                            for name in passthrough_names
-                            if isinstance(
-                                inputs.get(name), (str, int, float, bool, type(None))
-                            )
+                    if isinstance(zero_copy_inputs, str) or direct - set(input_names):
+                        raise ValueError(
+                            "zero_copy_inputs must name declared tensor inputs"
+                        )
+                    handled, result = runner.run(
+                        (
+                            fn,
+                            layer_name,
+                            num_tokens,
+                            backend_key,
+                            tuple(key(forward_context)),
+                            tuple(
+                                (name, type(inputs[name]), inputs[name])
+                                for name in passthrough_names
+                                if isinstance(
+                                    inputs.get(name),
+                                    (str, int, float, bool, type(None)),
+                                )
+                            ),
                         ),
-                    ),
-                    tensor_inputs,
-                    capture_state,
-                    core,
-                    functools.partial(outputs.slot, out_key),
-                    zero_copy=direct,
-                )
-                if handled:
-                    return result
+                        tensor_inputs,
+                        core,
+                        functools.partial(outputs.slot, out_key),
+                        zero_copy=direct,
+                    )
+                    if handled:
+                        return result
                 eligible = False
             # num_tokens is a KEY DIM, not an incidental one: the graph is
             # captured at exactly this flat row count.

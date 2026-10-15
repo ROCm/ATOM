@@ -22,6 +22,9 @@ def _context(monkeypatch, tokens=8):
         batch_descriptor=BatchDescriptor(tokens),
         attn_metadata=SimpleNamespace(image_mask=None),
     )
+    from atom.utils import forward_context
+
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
     monkeypatch.setattr(runtime, "get_forward_context", lambda: context)
     monkeypatch.setattr(cuda_graph, "get_forward_context", lambda: context)
     return context
@@ -110,7 +113,6 @@ def test_split_graph_replays_with_live_batch_state_and_engram(monkeypatch):
         attn=attention,
         engram=Engram(),
         piecewise_outputs=outputs,
-        attention_graphs=runtime.PiecewiseAFRunner(outputs),
         af_piecewise=False,
         af_zero_copy_hidden=True,
     )

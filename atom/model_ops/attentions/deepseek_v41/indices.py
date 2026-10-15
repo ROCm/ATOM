@@ -343,16 +343,20 @@ def fill_step_indptrs(step, geometry, buffers):
     return built
 
 
-def build_window_rows(step, geometry, window, eptr):
+def build_window_rows(step, geometry, window, eptr, *, out=None):
     """A split decode's window rows (`_window_rows`), one list for every layer.
 
     `window`: any layer's -- the rings differ only in their start, which these
     rows leave to the reader's view.
     """
-    rows = torch.empty(
-        step.width * geometry.window_size,
-        dtype=torch.int32,
-        device=step.positions.device,
+    rows = (
+        out
+        if out is not None
+        else torch.empty(
+            step.width * geometry.window_size,
+            dtype=torch.int32,
+            device=step.positions.device,
+        )
     )
     if step.width:
         _window_rows[(step.width,)](
@@ -368,7 +372,9 @@ def build_window_rows(step, geometry, window, eptr):
     return rows
 
 
-def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stride=0):
+def build_indices(
+    selected, step, geometry, window, owner, ratio, layers=1, stride=0, *, out=None
+):
     """`layers` consecutive layers' indices, starting at `window`'s.
 
     Only a decode groups: its `extend` is empty, so the run needs no second
@@ -389,15 +395,27 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
         # dereferences.
         raise ValueError(f"Scorer width {topk} is not the {reserved} reserved")
     plane = step.width * (topk + geometry.window_size * history)
-    prefix = torch.empty(
-        layers * plane,
-        dtype=torch.int64 if geometry.packed else torch.int32,
-        device=step.positions.device,
+    prefix = (
+        out[0].reshape(-1)
+        if out is not None
+        else torch.empty(
+            layers * plane,
+            dtype=torch.int64 if geometry.packed else torch.int32,
+            device=step.positions.device,
+        )
     )
-    extend = torch.empty(
-        0 if step.decode else step.width * min(step.max_q_len, geometry.window_size),
-        dtype=torch.int32,
-        device=step.positions.device,
+    extend = (
+        out[2]
+        if out is not None
+        else torch.empty(
+            (
+                0
+                if step.decode
+                else step.width * min(step.max_q_len, geometry.window_size)
+            ),
+            dtype=torch.int32,
+            device=step.positions.device,
+        )
     )
     if step.width and plane:
         _indices[(step.width, layers)](
