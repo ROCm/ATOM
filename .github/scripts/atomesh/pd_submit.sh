@@ -373,6 +373,10 @@ if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_c48_previous_jobs.py" \
     --controller "${SPUR_CONTROLLER_ADDR}" \
     --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-previous-jobs.json"
+  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" check-previous \
+    --controller "${SPUR_CONTROLLER_ADDR}" \
+    --previous-manifest "${REPO_ROOT}/.github/benchmark/c48-model-gap/previous-spur-jobs.json" \
+    --output "${RESULT_DIR}/${ATOMESH_CELL_ID}-previous-inactive.json"
 fi
 # Recorded before sbatch so the job summary can point at the logs even when the
 # Slurm job never starts or dies before copying anything back.
@@ -414,6 +418,24 @@ stream_spur_shared_logs_once() {
 
 check_spur_workload_failure() {
   local job_id="$1"
+  local queue_state="${2:-}" startup_rc=0
+  if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
+    python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_spur_allocation.py" watch \
+      --job-id "${job_id}" --controller "${SPUR_CONTROLLER_ADDR}" \
+      --state "${queue_state}" --run-dir "${LOG_ROOT}/slurm_job-${job_id}" \
+      --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
+      --timeout-seconds "${ATOMESH_C48_WORKER_START_TIMEOUT_SECONDS:-600}" || startup_rc=$?
+    if [[ "${startup_rc}" -eq 124 ]]; then
+      # Worker entry is written before GPU checks or container creation. Only
+      # this allocation is cancelled; no worker result is fabricated.
+      SPUR_WORKLOAD_CHECK_RC=124
+      scancel_slurm_job "confirmed allocation has no worker entry after startup deadline"
+      SLURM_EXTRA_STATUS_CHECKER=""
+      return 0
+    elif [[ "${startup_rc}" -ne 0 ]]; then
+      echo "WARNING: startup observation failed rc=${startup_rc}; retaining the allocation" >&2
+    fi
+  fi
   # A failed worker is conclusive even if Spur still reports RUNNING.
   if python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" check-failed \
     --run-dir "${LOG_ROOT}/slurm_job-${job_id}" --job-id "${job_id}" \

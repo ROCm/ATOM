@@ -474,6 +474,11 @@ class SlurmMonitoringTest(unittest.TestCase):
         srun = self.bin / "srun"
         srun.write_text('#!/bin/sh\nprintf "fixture srun failed\\n" >&2\nexit 7\n')
         srun.chmod(0o755)
+        scontrol = self.bin / "scontrol"
+        scontrol.write_text(
+            '#!/bin/sh\nprintf "JobId=831 JobState=RUNNING Restarts=0 NumNodes=2\\n"\n'
+        )
+        scontrol.chmod(0o755)
         result = subprocess.run(
             ["bash", str(HELPERS.parent / "atomesh/pd_slurm_job.sh")],
             env={
@@ -481,6 +486,7 @@ class SlurmMonitoringTest(unittest.TestCase):
                 "ATOMESH_ENV_ATOMESH_C48_CASE": "V-Q",
                 "SPUR_JOB_ID": "831", "NUM_NODES": "2", "BACKEND": "vllm",
                 "LOG_ROOT": str(self.root), "HOSTNAME": "fixture-host",
+                "SPUR_CONTROLLER_ADDR": "http://fixture",
             },
             capture_output=True, text=True, timeout=10,
         )
