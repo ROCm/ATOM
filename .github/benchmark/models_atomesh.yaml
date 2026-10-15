@@ -1476,7 +1476,7 @@ models:
             float32 --block-size 128 --attention-backend ROCM_AITER_MLA --attention-config '{"mla_prefill_backend":"ROCM_AITER_FA","use_prefill_query_quantization":true}'
             --speculative-config '{"model":"/models/Inferact-Kimi-K3-DSpark","method":"dspark","num_speculative_tokens":4,"attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"synthetic","synthetic_acceptance_length":3.36}'
             --kv-transfer-config '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"connectors":[{"kv_connector":"MoRIIOConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail","kv_connector_extra_config":{"backend":"rdma","read_mode":true}},{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":1799000000000,"lazy_offload":false}}]}}'
-            --max-num-seqs 96 --max-num-batched-tokens 8192 --compilation-config '{"mode":3,"cudagraph_mode":"NONE","max_cudagraph_capture_size":0,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}'
+            --max-num-seqs 2 --max-num-batched-tokens 8192 --compilation-config '{"mode":3,"cudagraph_mode":"NONE","max_cudagraph_capture_size":0,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}'
         decode:
           workers: 1
           tp: 8
