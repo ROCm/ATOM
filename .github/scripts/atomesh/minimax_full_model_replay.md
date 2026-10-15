@@ -82,6 +82,10 @@ The follow-up case is
 Use the same dispatch command above with this case name. It retains the same
 model configuration and 20-minute allocation limit. The original case remains
 available as the control.
+For this diagnostic case, a fallback Rust toolchain used to build Mesh is
+installed into a fresh build-local Rustup home; Cargo crates and build outputs
+stay cached. This avoids reusing a node cache with an interrupted toolchain
+installation. Toolchain setup still counts toward the 20-minute limit.
 
 After all eight primers return, the client atomically creates `armed.json`.
 The prefill EngineCore continues receiving requests and draining idle connector

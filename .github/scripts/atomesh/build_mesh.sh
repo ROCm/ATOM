@@ -28,12 +28,18 @@ exec 9> "${target_dir}/.build.lock"
 flock 9
 # Some CI images install Rust below /root, inaccessible to Spur's service UID.
 # Keep a pinned fallback toolchain in the writable build cache for those jobs.
-if ! cargo --version >/dev/null 2>&1; then
+if ! cargo --version >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
   export CARGO_HOME="${target_dir}/cargo-home"
   export RUSTUP_HOME="${target_dir}/rustup-home"
+  if [[ "${ATOMESH_M3_REPLAY_GATE:-false}" == "true" ]]; then
+    # The reduced replay must not inherit an interrupted toolchain install.
+    # Keep compiled crates cached, but isolate this job's fallback toolchain.
+    export RUSTUP_HOME="${build_dir}/rustup-home"
+    echo "[build] Replay fallback toolchain=${RUSTUP_HOME}" >&2
+  fi
   export PATH="${CARGO_HOME}/bin:${PATH}"
   export RUSTUP_TOOLCHAIN="${ATOMESH_MESH_RUST_TOOLCHAIN:-1.94.0}"
-  if ! cargo --version >/dev/null 2>&1; then
+  if ! cargo --version >/dev/null 2>&1 || ! rustc --version >/dev/null 2>&1; then
     rust_arch="$(uname -m)"
     case "${rust_arch}" in
       x86_64|aarch64) ;;
@@ -47,6 +53,8 @@ if ! cargo --version >/dev/null 2>&1; then
       --default-toolchain "${RUSTUP_TOOLCHAIN}" >&2
   fi
 fi
+cargo --version >&2
+rustc --version >&2
 lock_args=()
 if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
