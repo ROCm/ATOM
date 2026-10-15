@@ -4,9 +4,8 @@
 
 from __future__ import annotations
 
-from typing import Self
-
 import torch
+from typing_extensions import Self
 
 from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
 from atom.mono.runtime.hip_ipc import (

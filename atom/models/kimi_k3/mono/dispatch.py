@@ -24,7 +24,6 @@ from torch import nn
 
 from atom.models.kimi_k3.mono.config import config_refusal
 from atom.models.kimi_k3.mono.plan import kda_metadata, step_shape
-from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
 
@@ -37,12 +36,24 @@ class MonoDecodeModel(nn.Module):
     def __init__(self, model: nn.Module) -> None:
         super().__init__()
         self.model = model
-        # created on its first eligible step outside a graph capture
+
+        # Created on its first eligible step outside a graph capture
         # (``LazyRunner``: the allocation and the peer handshake cannot be
-        # captured), then each width prepared on its first step
-        self._mono = LazyRunner(
-            lambda: K3MonoDecodeRunner(model), "Kimi-K3 mono decode"
-        )
+        # captured), then each width prepared on its first step. The import
+        # sits in the factory rather than at module scope for the same
+        # reason: resolving this installer must not pull ``runner`` -- and
+        # through it K1/K2 and FlyDSL, 97 modules -- before
+        # ``config_refusal`` can turn mono down. FlyDSL is not a declared
+        # dependency, so a deployment without it would otherwise fail at
+        # import even with ``ATOM_MONO_ENABLE=0``.
+        # ``glm52/mono/kernels/__init__`` keeps its GPU wrappers lazy for
+        # the same reason.
+        def _build_runner():
+            from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
+
+            return K3MonoDecodeRunner(model)
+
+        self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()
 
     def _qlen(self, input_ids, intermediate_tensors, inputs_embeds) -> int | None:
