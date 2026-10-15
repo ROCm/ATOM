@@ -1123,6 +1123,20 @@ models:
               ATOM_PD_MLA_STAGING_CHUNK_PAGES: "0"
           run_eval: false
 
+        # The DSpark3 cell with the drafter's stage cut to the last nine layers.
+        # Its four target MLA layers plus the drafter's five cap the block
+        # count every stage shares at 81K; three plus five, and three layers
+        # fewer of weights, lift it to about 147K. Boundaries land on AttnRes
+        # blocks as in the aggregated PART12 cell.
+        - <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part12
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-PART12
+          env:
+            common: *kimi_k3_1p1d_pp8_dspark3_common_env
+            prefill:
+              <<: *kimi_k3_1p1d_pp8_dspark3_prefill_env
+              VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
