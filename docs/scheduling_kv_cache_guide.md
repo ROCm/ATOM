@@ -450,9 +450,10 @@ already in use, and the fit. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.
 
 The delayer and the DP chunk-cost estimate call `can_allocate_memoized`. It
-reuses a seq's walk until a block the walk read is evicted, moved or published,
-and runs the same evaluation on every call, so it returns what `can_allocate`
-would.
+reuses a seq's walk until a hash the walk read is evicted or remapped, or the
+hash at its first miss is published (`ATOM_PREFILL_DELAYER_PROBE_MEMO` lists
+every trigger), and runs the same evaluation on every call, so it returns what
+`can_allocate` would. `allocate` revalidates only the ids it claims.
 
 `can_append` checks whether the next decode extension needs additional blocks,
 including speculative tokens and the active cache layout.

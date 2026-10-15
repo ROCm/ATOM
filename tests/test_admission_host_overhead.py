@@ -196,10 +196,27 @@ def test_the_walk_is_handed_to_its_own_allocate():
     bm = published(range(40))
     a, b = (Sequence(list(range(40)) + [900 + k], BLOCK) for k in range(2))
     assert exact(bm, a) == bm.can_allocate_memoized(a) == 10
-    assert bm.can_allocate_memoized(b) == exact(bm, b) == 10
+    assert bm.can_allocate_memoized(b) == 10 and b not in bm._admission_walks
+    assert exact(bm, b) == 10
     assert bm.can_allocate_memoized(a) == 10
     bm.kv.lookup = lambda h: pytest.fail("walked again")
     assert bm.allocate(a, 10) and a.num_cached_tokens == 40
+
+
+def test_allocate_checks_only_the_ids_it_claims(monkeypatch):
+    """An eviction past the claim keeps the walk; one inside it does not."""
+    for victim, kept in ((8, True), (3, False)):
+        bm = published(range(40))
+        seq = Sequence(list(range(40)) + [900, 901], BLOCK)
+        assert bm.can_allocate(seq, record=False) == 10
+        want = list(map(bm.kv.lookup, bm._prompt_hashes(seq)))
+        bm.kv.allocate(want[victim])  # unindexes it
+        if kept:
+            monkeypatch.setattr(bm.kv, "lookup", lambda h: pytest.fail("walked"))
+        assert bm.allocate(seq, 5)
+        claimed = 5 if kept else victim
+        assert list(seq.block_table[:claimed]) == want[:claimed]
+        assert seq.num_cached_tokens == claimed * BLOCK
 
 
 @pytest.mark.parametrize("block,fast_hit,slow_hit", [(9, 9, 9), (4, 10, 4)])
@@ -230,6 +247,28 @@ def test_the_memo_follows_a_change_to_what_its_walk_read(change):
     assert bm.can_allocate_memoized(head) == 10
     change(bm, head)
     assert bm.can_allocate_memoized(head) == exact(bm, head) != 10
+
+
+@pytest.mark.parametrize("watched", [0, 1])
+def test_the_memo_follows_only_remaps_of_what_its_walk_read(watched):
+    bm = published(range(500, 540), published(range(40)))
+    head = Sequence(list(range(56)) + [900], BLOCK)
+    assert bm.can_allocate_memoized(head) == 10
+    moved = chained_block_hashes(
+        list(range(0 if watched else 500, 540)), BLOCK, 0, 4, -1
+    )
+    victim = bm.kv.block(bm.kv.lookup(moved[3]))
+    fresh = bm._fresh_block()
+    bm.kv.publish(fresh, moved[3], victim.token_ids)  # remapped, nothing evicted
+    assert bm.total_evicted_blocks == 0
+    walks = []
+    walk = bm._walk_prefix
+    bm._walk_prefix = lambda s: walks.append(s) or walk(s)
+    assert bm.can_allocate_memoized(head) == exact(bm, head) == 10
+    assert len(walks) == 1 + watched
+    assert bm._cached_walks[head].walk.ids == list(
+        map(bm.kv.lookup, bm._prompt_hashes(head)[:10])
+    )
 
 
 def test_the_memo_recounts_hit_blocks_another_seq_claimed():

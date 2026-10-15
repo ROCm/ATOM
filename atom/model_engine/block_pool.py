@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
+from itertools import islice
 
 from atom.model_engine.kv_block import Block
 
@@ -72,6 +73,7 @@ class BlockPool:
         max_blocks: int | None = None,
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
+        on_remap: Callable[[int], None] | None = None,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -91,15 +93,14 @@ class BlockPool:
             raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
         self.num_blocks: int = num_blocks
         self._on_evict = on_evict
+        # Called with a hash whose index entry moved to another block id
+        # (republished elsewhere, `_adopt`): ids resolved before then are stale.
+        self._on_remap = on_remap
         self.blocks: list[Block] = [Block(i) for i in range(self.max_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
         # Bumped on every change to a hash -> id mapping: ids resolved at
         # version v are still current while it is v.
         self.index_version: int = 0
-        # Bumped when an indexed hash moves to another block id (republished
-        # elsewhere, `_adopt`): ids resolved before then can go stale with no
-        # eviction.
-        self.index_remaps: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
@@ -188,9 +189,10 @@ class BlockPool:
         of a whole chain with `map`. Read it per walk, not once per pool."""
         return self._hash_to_block_id.get
 
-    def count_used(self, block_ids) -> int:
-        """How many of `block_ids` (distinct) some live sequence holds."""
-        return len(self._used.intersection(block_ids))
+    def count_used(self, block_ids: list[int], n: int) -> int:
+        """How many of the first `n` of `block_ids` (distinct) some live
+        sequence holds. Allocates nothing."""
+        return sum(map(self._used.__contains__, islice(block_ids, n)))
 
     def claim_many(self, block_ids) -> None:
         """`claim` each of `block_ids`, in order, with the lookups hoisted."""
@@ -214,8 +216,9 @@ class BlockPool:
         block.update(h, token_ids)
         prev = self._hash_to_block_id.get(h, block_id)
         self._hash_to_block_id[h] = block_id
-        self.index_remaps += prev != block_id
         self.index_version += 1
+        if prev != block_id and self._on_remap is not None:
+            self._on_remap(h)
 
     def clear_index(self) -> None:
         """Drop every content-hash entry, keeping blocks live sequences hold.
@@ -500,7 +503,8 @@ class BlockPool:
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
             self.index_version += 1
-            self.index_remaps += 1
+            if self._on_remap is not None:
+                self._on_remap(src.hash)
         self._used.discard(source)
         self._used.add(destination)
         src.ref_count, src.hash, src.token_ids = 0, -1, array.array("i")
