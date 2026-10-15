@@ -14,10 +14,12 @@ from aiter import (
     rmsnorm2d_fwd_with_add,
 )
 from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
@@ -969,6 +971,11 @@ def fused_allreduce_gemma_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
     if get_tensor_model_parallel_world_size() > 1:
+        if get_gfx() == "gfx1250":
+            return norm(
+                tensor_model_parallel_all_reduce(hidden_states.contiguous()),
+                residual,
+            )
         return tensor_model_parallel_fused_allreduce_rmsnorm(
             hidden_states.contiguous(),
             residual,
@@ -986,6 +993,19 @@ def fused_allreduce_gemma_rms_norm_quant(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant."""
     if get_tensor_model_parallel_world_size() > 1:
+        if get_gfx() == "gfx1250":
+            normed, residual_out = norm(
+                tensor_model_parallel_all_reduce(hidden_states.contiguous()),
+                residual,
+            )
+            from aiter import get_hip_quant
+            from aiter.utility.dtypes import fp8
+
+            out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
+                normed,
+                quant_dtype=fp8,
+            )
+            return out_fp8, scale_out, residual_out
         out_fp8, residual_out, scale_out = (
             tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                 hidden_states.contiguous(),
