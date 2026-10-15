@@ -109,11 +109,11 @@ def test_off_with_a_single_dp_rank(monkeypatch, seq_factory):
     assert delayer.reported == [0.0]
 
 
-def test_estimate_keeps_the_head_walk(monkeypatch, seq_factory):
-    """The estimate probes the waiting head on every tick with prefill work.
-    Its prompt-block hashes and its prefix walk are kept between ticks
-    (`can_allocate_memoized`), so a repeat probe walks and hashes nothing and
-    costs the same."""
+def test_per_tick_probes_keep_the_head_walk(monkeypatch, seq_factory):
+    """The estimate and the delayer's head check probe the waiting head on
+    every tick with prefill work. Its prompt-block hashes and its prefix walk
+    are kept between ticks (`can_allocate_memoized`), so a repeat probe walks
+    and hashes nothing and costs the same."""
     sched = _sched(monkeypatch, prefix_caching=True)
     prefix = list(range(100, 132))
     _cached_prefix(sched, seq_factory, prefix)
@@ -136,6 +136,7 @@ def test_estimate_keeps_the_head_walk(monkeypatch, seq_factory):
     assert hashed and len(walks) == 1
     first_probe = len(hashed)
     assert sched._estimate_prefill_chunk_cost() == cost
+    assert sched._can_admit_head_prefill() and sched._can_admit_head_prefill()
     assert len(hashed) == first_probe and len(walks) == 1
 
 

@@ -219,6 +219,66 @@ def test_allocate_checks_only_the_ids_it_claims(monkeypatch):
         assert seq.num_cached_tokens == claimed * BLOCK
 
 
+class CountingIndex(dict):
+    lookups = 0
+
+    def get(self, *a):
+        self.lookups += 1
+        return super().get(*a)
+
+
+@pytest.mark.parametrize("hit", [0, 1, 8, 40])
+def test_a_walk_looks_up_near_its_hit_not_the_whole_chain(hit):
+    """The first block alone, then rounds of 16, 64, ...: a cold 400-block
+    prompt costs one lookup."""
+    tokens = list(range(BLOCK * 400 + 1))
+    bm = BlockManager(prefix_config(num_kvcache_blocks=1024))
+    if hit:
+        published(tokens[: hit * BLOCK], bm)
+    bm.kv._hash_to_block_id = index = CountingIndex(bm.kv._hash_to_block_id)
+    assert bm.can_allocate(shipped_seq(tokens), record=False) == hit
+    assert index.lookups <= max(1, 4 * hit + 16)
+
+
+def test_publish_revokes_the_hash_a_block_held():
+    """Indexed content never changes: a new hash on an indexed block drops
+    its old one, as an eviction does, for the memo and `allocate` too."""
+    bm = published(range(40))
+    seq = Sequence(list(range(40)) + [900], BLOCK)
+    assert bm.can_allocate_memoized(seq) == exact(bm, seq) == 10
+    old = bm._prompt_hashes(seq)[3]
+    block_id = bm.kv.lookup(old)
+    bm.kv.publish(block_id, 12345, array.array("i", [7] * BLOCK))
+    assert bm.kv.lookup(old) == -1 and bm.total_evicted_blocks == 1
+    assert bm.can_allocate_memoized(seq) == 3
+    assert bm.allocate(seq, 10) and seq.num_cached_tokens == 3 * BLOCK
+
+
+def test_only_a_moved_or_dropped_hash_bumps_the_index_version():
+    """`allocate` skips revalidation while it holds: not bumped by a
+    republish in place or a new hash."""
+    bm = published(range(40))
+    kv, version = bm.kv, bm.kv.index_version
+    h = chained_block_hashes(list(range(8)), BLOCK, 0, 2, -1)[1]
+    block = kv.block(kv.lookup(h))
+    kv.publish(block.block_id, block.hash, block.token_ids)
+    published(range(100, 140), bm)
+    assert kv.index_version == version
+    kv.publish(bm._fresh_block(), block.hash, block.token_ids)  # remapped
+    assert kv.index_version == version + 1
+
+
+def test_chain_to_continues_only_a_prefix_of_the_prompt_chain():
+    bm = BlockManager(prefix_config())
+    seq = Sequence(PROMPT, BLOCK)
+    want = reference_chain(PROMPT, BLOCK, -1, 10)
+    assert bm._chain_to(seq, [], 10) == want == bm._prompt_hashes(seq)
+    assert bm._chain_to(seq, want[:4], 10) == want
+    other = reference_chain(PROMPT, BLOCK, 7, 10)  # another seed's chain
+    assert bm._chain_to(seq, other[:4], 10) == other
+    assert bm._prompt_hashes(seq) == want
+
+
 @pytest.mark.parametrize("block,fast_hit,slow_hit", [(9, 9, 9), (4, 10, 4)])
 def test_hash_collision(block, fast_hit, slow_hit):
     """Only the last hit block's tokens are compared (the documented trade-off)."""

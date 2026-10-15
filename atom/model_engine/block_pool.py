@@ -98,8 +98,8 @@ class BlockPool:
         self._on_remap = on_remap
         self.blocks: list[Block] = [Block(i) for i in range(self.max_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
-        # Bumped on every change to a hash -> id mapping: ids resolved at
-        # version v are still current while it is v.
+        # Bumped when a hash leaves the index or moves to another id (not when
+        # one is added): ids resolved at version v still hold while it is v.
         self.index_version: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
@@ -212,14 +212,26 @@ class BlockPool:
                 used.add(block_id)
 
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
-        """Index `block_id` under the content hash of the tokens it now holds."""
+        """Index `block_id` under the content hash of the tokens it now holds.
+        A different hash it was indexed under goes, as on eviction: indexed
+        content never changes."""
         block = self.blocks[block_id]
+        index = self._hash_to_block_id
+        old = block.hash
+        if old not in (-1, h) and index.get(old) == block_id:
+            del index[old]
+            self.index_version += 1
+            if self._on_evict is not None:
+                self._on_evict(old)
         block.update(h, token_ids)
-        prev = self._hash_to_block_id.get(h, block_id)
-        self._hash_to_block_id[h] = block_id
-        self.index_version += 1
-        if prev != block_id and self._on_remap is not None:
-            self._on_remap(h)
+        prev = index.get(h)
+        if prev == block_id:
+            return
+        index[h] = block_id
+        if prev is not None:
+            self.index_version += 1
+            if self._on_remap is not None:
+                self._on_remap(h)
 
     def clear_index(self) -> None:
         """Drop every content-hash entry, keeping blocks live sequences hold.

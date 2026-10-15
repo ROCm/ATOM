@@ -1252,9 +1252,9 @@ class Scheduler:
                 # with (`replays_hit`), which decide how it resumes.
                 return True
             # KV-pressured requests definitely cannot prefill. A fit probe, not
-            # an admission -- `record=False` so it does not move the joint-
-            # boundary funnel counters for a seq it may never schedule.
-            return self.block_manager.can_allocate(seq, record=False) >= 0
+            # an admission: it records nothing, and runs every tick, so the
+            # walk is memoised across ticks.
+            return self.block_manager.can_allocate_memoized(seq) >= 0
         return False
 
     def _kv_usage(self) -> float:
