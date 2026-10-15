@@ -25,8 +25,11 @@ closes each one:
 * **TP sharding** -- ``SUPPORTED_TP``; ``Dims`` refuses any size that does not
   divide every width.
 * **weight layouts** -- ``weights.py`` checks each tensor it binds.
-* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32
-  (``ATOM_GDN_SSM_DTYPE``); both are checked again per layer in ``weights.py``.
+* **KV dtype** -- the conv state must be bf16 and the recurrent state fp32.
+  ``ATOM_GDN_SSM_DTYPE`` is checked here, but that is the *request*; the pools
+  that were actually allocated are checked in ``runner._conv_state`` and
+  ``runner._recurrent_state`` -- at build for the first mono layer, and again
+  where each step packs them.
 """
 
 from dataclasses import dataclass

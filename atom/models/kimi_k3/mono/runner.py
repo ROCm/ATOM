@@ -141,7 +141,27 @@ class K3MonoDecodeRunner:
         """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
         verify window the KDA state pool was allocated for."""
         state = self._conv_state(plan.layer_id)
+        self._recurrent_state(plan.layer_id)
         return state.size(-1)
+
+    def _recurrent_state(self, layer_id: int) -> torch.Tensor:
+        """The layer's KDA recurrent state, checked.
+
+        `config_refusal` checks `ATOM_GDN_SSM_DTYPE`, which is the *request*;
+        this is the pool that was actually allocated. The recurrence reads and
+        writes it in place as fp32 (see `_allocate`), so a narrower pool is
+        reinterpreted rather than converted -- wrong numbers, no error. The
+        conv state next door has been checked all along; this one was not,
+        although the module docstring claimed both were.
+        """
+        cache = get_forward_context().kv_cache_data[f"layer_{layer_id}"]
+        state = cache.v_cache
+        if state.dtype != torch.float32:
+            raise MonoUnsupported(
+                f"layer {layer_id}: recurrent state {state.dtype}, the "
+                "recurrence reads it in place as float32"
+            )
+        return state
 
     def _conv_state(self, layer_id: int) -> torch.Tensor:
         """The layer's conv state, with the channel dim first (the pool is
@@ -339,7 +359,7 @@ class K3MonoDecodeRunner:
                 f"layer {plan.layer_id}: conv window {state.size(-1)} != the "
                 f"built {key.state_len}"
             )
-        cache = get_forward_context().kv_cache_data[f"layer_{plan.layer_id}"]
+        rstate = self._recurrent_state(plan.layer_id)
         core = prefix.new_empty(prefix.size(0), self.dims.proj)
         p = torch.Tensor.data_ptr
         args = k1.ABI.pack({
@@ -351,7 +371,7 @@ class K3MonoDecodeRunner:
             "cs_seq": state.stride(0), "cs_dim": state.stride(1),
             "cs_tok": state.stride(2), "a_log": p(w.a_log),
             "dt_bias": p(w.dt_bias), "on_w": p(w.on_w),
-            "rstate": p(cache.v_cache), "rs_seq": cache.v_cache.stride(0),
+            "rstate": p(rstate), "rs_seq": rstate.stride(0),
             "st_idx": p(metadata.spec_state_indices_tensor),
             "st_stride": metadata.spec_state_indices_tensor.stride(0),
             "num_acc": p(metadata.num_accepted_tokens), "core_out": p(core),
