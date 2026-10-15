@@ -692,9 +692,6 @@ class BlockManager:
         hbs = self.hash_block_size
         return (len(seq) + hbs - 1) // hbs
 
-    def _n_prompt_blocks(self, seq: Sequence) -> int:
-        return full_prompt_blocks(seq, self.hash_block_size)
-
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
@@ -762,7 +759,7 @@ class BlockManager:
             return []
         seq.prompt_hash_chain = None
         hbs, seed = self.hash_block_size, seq.cache_seed
-        n = self._n_prompt_blocks(seq)
+        n = full_prompt_blocks(seq, hbs)
         packed = shipped.hashes
         if (shipped.hash_block_size, shipped.cache_seed, len(packed)) != (hbs, seed, n):
             return self._reject_shipped_chain(
@@ -804,7 +801,7 @@ class BlockManager:
         if i < len(chain):
             return chain[i]
         h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
-        if i == len(chain) and i < self._n_prompt_blocks(seq):
+        if i == len(chain) and i < full_prompt_blocks(seq, self.hash_block_size):
             chain.append(h)
         return h
 
@@ -1230,7 +1227,8 @@ class BlockManager:
                 )
                 if k == len(prompt):
                     # Prompt blocks only: those past it can still change.
-                    prompt += new[: max(0, self._n_prompt_blocks(seq) - k)]
+                    full = full_prompt_blocks(seq, self.hash_block_size)
+                    prompt += new[: max(0, full - k)]
                 hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
             new_ids = list(map(get, new))
             try:
