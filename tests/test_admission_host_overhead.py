@@ -13,9 +13,14 @@ from types import SimpleNamespace
 import pytest
 from conftest import MockConfig
 from test_dsv4_state_replay import _bm, _mp_bm, _mp_seq
-from test_state_checkpoint import PAGED_COPY_RUNTIME, ckpt_config, stateful_seq
-from test_state_checkpoint import make_block_manager, publish_at_boundary
-from test_state_checkpoint import publisher_has_read_its_source
+from test_state_checkpoint import (
+    PAGED_COPY_RUNTIME,
+    ckpt_config,
+    make_block_manager,
+    publish_at_boundary,
+    publisher_has_read_its_source,
+    stateful_seq,
+)
 
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash_chain
