@@ -21,16 +21,23 @@ Use hybrid mode for AF piecewise prefill and whole-forward FULL decode:
 ```
 
 In this mode, the capture ladder is measured in **tokens**. Omitting
-`--cudagraph-capture-sizes` defaults to 83 token sizes through 1024:
-`[1, 2, 4] + range(8, 256, 8) + range(256, 1025, 16)`.
-The Python configuration uses the same default. A single
+`--cudagraph-capture-sizes` defaults to 91 prefill token sizes through 2048:
+`[1, 2, 4] + range(8, 256, 8) + range(256, 1025, 16) + range(1152, 2049, 128)`.
+FULL decode and its derived draft batch sizes retain the original 83-size
+ladder through 1024. The Python configuration uses the same defaults. A single
 `CompilationConfig.cuda_graph_sizes` value expands to `[1, 2, 4]`, multiples
 of 8 below 256, then multiples of 16 through that maximum. An explicit
 `--cudagraph-capture-sizes '[1, 2, 4, 8, 16, 32, 64, 128, 256, 448, 512, 704, 768, 1024]'`
-uses exactly those token candidates, overriding the default. In particular,
+uses those token candidates for both phases, overriding the defaults. Internal
+full-window tail buckets can still supplement the prefill list. In particular,
 `'[1024]'` selects just that candidate rather than expanding the ladder.
 Existing FULL, PIECEWISE and AF_PIECEWISE options retain their default
 batch-size lists and units.
+
+`CompilationConfig.cudagraph_prefill_capture_sizes` can supply an independent
+prefill list without changing FULL/draft decode. `Config.prefill_capture_sizes`
+drives prefill capture, its memory estimate and boundary-buffer capacity;
+`Config.capture_sizes` continues to drive decode.
 
 Prefill captures the token ladder independently of request count. FULL decode
 rounds each candidate up to a multiple of Q, derives BS=T/Q, deduplicates and
@@ -39,7 +46,7 @@ scheduler capacity. The dense small-BS coverage keeps decode and mono draft
 from padding BS=5 to 6 or BS=9 to 10, regardless of prefill bucket spacing.
 Padding selects the BS
 ladder for the DP-agreed Q. With DSpark 5, Q=6: a 600-token prefill uses the
-608 bucket in the default 1024 ladder; BS=100 decode uses FULL at BS=102,
+608 bucket in the default ladder; BS=100 decode uses FULL at BS=102,
 612 tokens. Out-of-range decode runs eagerly, not through AF piecewise.
 
 Hybrid mode permits mono target decode and mono DSpark draft whenever their
@@ -114,6 +121,20 @@ bounds, with the same shapes included in graph memory budgeting. For the
 
 ## AF buffers and metadata
 
+`atom.utils.piecewise_af` supplies the model-independent live AF machinery:
+`SharedGraphInputs` stages named tensors, and `PiecewiseAFRunner.bind_capture`
+adds tensor layouts/direct-read addresses to the model's key, bounds the cache,
+and retains the state used by `@piecewise_core(capture_prefill=True)`.
+The binding exposes staged inputs, decorator arguments, capture state and
+whether this is the first call. Models provide a state factory whose `bind()`
+context manager creates fresh Python arguments for warmup and recording, then
+publish model-specific results after the decorated call.
+
+`models/deepseek_v41/af_attention.py` is the V4.1 adapter: it describes BatchStep,
+compression plans, incoming selections and subset queries, and publishes top-k,
+candidate and index results. The common module has no V4.1 imports or metadata
+field names. Other models can reuse it with their own keys and state objects.
+
 AF follows V4's producer/consumer buffer policy. It directly reads a stable
 upstream dense-graph hidden tensor and writes the persistent output slot
 already bound by the downstream dense graph. The producer address is part
@@ -156,6 +177,7 @@ Run the regression suite in an ATOM ROCm environment:
 
 ```bash
 python -m pytest -q \
+  tests/test_piecewise_af.py \
   tests/test_hybrid_cudagraph.py \
   tests/test_forward_mode.py \
   tests/models/deepseek_v41/test_piecewise.py \

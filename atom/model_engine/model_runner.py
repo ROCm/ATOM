@@ -3818,7 +3818,7 @@ class ModelRunner:
     def _piecewise_prefill_tokens(self):
         tokens = [
             t
-            for t in self.config.capture_sizes
+            for t in self.config.prefill_capture_sizes
             if 0 < t <= self.config.max_num_batched_tokens
         ]
         extra = self._extra_piecewise_capture_shapes(tokens, [1])

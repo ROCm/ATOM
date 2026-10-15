@@ -16,8 +16,9 @@ from atom.utils.backends import set_model_tag
 from atom.utils.cuda_graph import BatchDescriptor, StableOutputs
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.piecewise_af import SharedGraphInputs
 
-from .af_attention import AttentionGraphs, SharedAttentionInputs
+from .af_attention import AttentionGraphs
 from .bounded_replay import (
     build_replay_plan,
     carry_selections,
@@ -275,7 +276,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         )
         self._late_piecewise_inputs = {}
         buffer_tokens = (
-            min(max(config.capture_sizes), config.max_num_batched_tokens)
+            min(max(config.prefill_capture_sizes), config.max_num_batched_tokens)
             if self.piecewise
             and config.compilation_config.cudagraph_mode
             == CUDAGraphMode.FULL_AND_PIECEWISE
@@ -284,7 +285,7 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self._late_input_buffers = (
             StableOutputs(capacity=buffer_tokens) if buffer_tokens else None
         )
-        attention_inputs = SharedAttentionInputs() if self.piecewise else None
+        attention_inputs = SharedGraphInputs() if self.piecewise else None
         for i, layer in enumerate(self.layers):
             layer.piecewise = self.piecewise
             if self.piecewise:

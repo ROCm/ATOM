@@ -328,7 +328,8 @@ class EngineArgs:
             default=EngineArgs.cudagraph_capture_sizes,
             help=(
                 "Explicit cudagraph capture sizes. FULL_AND_PIECEWISE defaults "
-                "to 83 token buckets through 1024; other modes keep the "
+                "to 91 prefill buckets through 2048 and a 1024-token FULL decode "
+                "ladder; other modes keep the "
                 "batch-size ladder through 512. Example: [1,2,4,8,16]"
             ),
         )

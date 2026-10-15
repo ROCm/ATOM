@@ -161,6 +161,14 @@ class CompilationConfig:
     each decode query length to derive FULL (batch size, query length) graphs.
     """
 
+    cudagraph_prefill_capture_sizes: list[int] | None = None
+    """Optional independent prefill token ladder for FULL_AND_PIECEWISE.
+
+    With no capture-size overrides, prefill uses 91 sizes through 2048 while
+    FULL decode keeps the original 1024-token ladder. Explicit capture sizes
+    apply to both phases unless this prefill list is also supplied.
+    """
+
     cuda_graph_sizes: list[int] = field(default_factory=list)
     """Fallback ladder when cudagraph_capture_sizes is not provided.
 
@@ -275,6 +283,17 @@ class CompilationConfig:
         if self.level not in {0, 1, 2, 3}:
             raise ValueError("level must in 0-3")
         if not self.cuda_graph_sizes:
+            if (
+                self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+                and not self.cudagraph_capture_sizes
+                and self.cudagraph_prefill_capture_sizes is None
+            ):
+                self.cudagraph_prefill_capture_sizes = (
+                    [1, 2, 4]
+                    + list(range(8, 256, 8))
+                    + list(range(256, 1025, 16))
+                    + list(range(1152, 2049, 128))
+                )
             self.cuda_graph_sizes = [
                 1024 if self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE else 512
             ]
@@ -296,6 +315,7 @@ class CompilationConfig:
         factors.append(self.use_cudagraph)
         factors.append(self.local_cache_dir)
         factors.append(self.cudagraph_capture_sizes)
+        factors.append(self.cudagraph_prefill_capture_sizes)
         factors.append(self.cuda_graph_sizes)
 
         return hashlib.sha256(str(factors).encode()).hexdigest()
@@ -2169,6 +2189,17 @@ class Config:
                 ]
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    @property
+    def prefill_capture_sizes(self) -> list[int]:
+        """Prefill tokens, independent of the hybrid FULL/draft decode ladder."""
+        compilation = self.compilation_config
+        if (
+            compilation.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+            and compilation.cudagraph_prefill_capture_sizes is not None
+        ):
+            return list(compilation.cudagraph_prefill_capture_sizes)
+        return self.capture_sizes
 
     def __post_init__(self):
         self.moe_all2all_backend = (

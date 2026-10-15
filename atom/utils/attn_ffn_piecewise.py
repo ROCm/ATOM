@@ -165,6 +165,8 @@ def piecewise_core(
     ``token_dim`` identifies the token axis of the tensor inputs. An optional
     per-call ``prepare`` context manager supplies fresh non-tensor arguments
     for each execution and records their Python-side effects after execution.
+    ``PiecewiseAFRunner`` in ``atom.utils.piecewise_af`` provides reusable live
+    input staging and capture-state caching for model metadata adapters.
     ``max_tokens`` is an OPTIONAL extra cap on the rows
     a captured graph covers -- a memory lever, off by default. It used to be 512
     and to be the only gate, which silently excluded every decode bucket above

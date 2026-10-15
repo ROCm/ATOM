@@ -14,9 +14,14 @@ from atom.utils.forward_context import ForwardMode
 
 
 def _runner(mode):
+    class RunnerConfig(SimpleNamespace):
+        @property
+        def prefill_capture_sizes(self):
+            return getattr(self, "prefill_sizes", self.capture_sizes)
+
     runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
     runner.enforce_eager = False
-    runner.config = SimpleNamespace(
+    runner.config = RunnerConfig(
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(cudagraph_mode=mode),
         max_num_seqs=256,
@@ -176,12 +181,31 @@ def test_hybrid_default_ladder_and_internal_tail_shapes():
         )
     )
     assert len(Config.capture_sizes.fget(config)) == 83
+    assert len(Config.prefill_capture_sizes.fget(config)) == 91
     runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
     runner.config.capture_sizes = [6, 192, 768]
     runner._extra_piecewise_capture_shapes = lambda sizes, qs: [(128, 1), (256, 1)]
     pw, full = runner._cudagraph_capture_plan([6])
     assert pw[2] == [768, 256, 192, 128, 6]
     assert full[2] == [128] + list(range(32, 0, -1))
+
+
+@pytest.mark.parametrize("max_tokens", [1536, 2048, 16384])
+def test_default_2k_prefill_preserves_full_and_draft_decode_ladder(max_tokens):
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+    )
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.max_num_batched_tokens = max_tokens
+    runner.config.capture_sizes = Config.capture_sizes.fget(config)
+    baseline = runner._cudagraph_capture_plan([1, 2, 4, 6])
+    runner.config.prefill_sizes = Config.prefill_capture_sizes.fget(config)
+    extended = runner._cudagraph_capture_plan([1, 2, 4, 6])
+    assert extended[1:] == baseline[1:]  # Draft uses the union of these BS lists.
+    expected = list(range(1152, min(max_tokens, 2048) + 1, 128))
+    assert extended[0][2] == expected[::-1] + baseline[0][2]
 
 
 @pytest.mark.parametrize("max_seqs,max_tokens", [(256, 16384), (7, 16384), (256, 48)])
@@ -283,6 +307,8 @@ def test_hybrid_cli_explicit_capture_sizes_override_default(sizes):
         compilation_config=args._get_engine_kwargs()["compilation_config"]
     )
     assert Config.capture_sizes.fget(config) == sizes
+    config.capture_sizes = sizes
+    assert Config.prefill_capture_sizes.fget(config) == sizes
 
 
 def test_python_hybrid_capture_ceiling_override_is_preserved():
@@ -292,6 +318,20 @@ def test_python_hybrid_capture_ceiling_override_is_preserved():
         )
     )
     assert Config.capture_sizes.fget(config) == [1, 2, 4] + list(range(8, 257, 8))
+    config.capture_sizes = Config.capture_sizes.fget(config)
+    assert Config.prefill_capture_sizes.fget(config) == config.capture_sizes
+
+
+def test_independent_prefill_override_does_not_change_decode():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_capture_sizes=[8, 128, 512],
+            cudagraph_prefill_capture_sizes=[128, 512, 1024, 2048],
+        )
+    )
+    assert Config.capture_sizes.fget(config) == [8, 128, 512]
+    assert Config.prefill_capture_sizes.fget(config) == [128, 512, 1024, 2048]
 
 
 @pytest.mark.parametrize("query,expected_bs", [(2, 100), (6, 102), (4, 100)])

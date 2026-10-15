@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Stage V4.1 attention metadata and publish the state produced by graph replay."""
+"""Adapt V4.1 attention metadata to the shared piecewise AF runner."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import torch
 
 from atom.config import CUDAGraphMode
 from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep
-from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
-from atom.utils.graph_holders import register_graph_holder
+from atom.utils.cuda_graph import StableOutputs
+from atom.utils.piecewise_af import PiecewiseAFRunner, SharedGraphInputs
 
 if TYPE_CHECKING:
     from .attention import Attention
@@ -33,48 +33,6 @@ _PLAN_TENSORS = (
     "write_plan_gpu",
     "key_rope_positions_gpu",
 )
-
-
-def _signature(tensor: torch.Tensor) -> tuple:
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-
-
-class SharedAttentionInputs(StableOutputs):
-    """Fixed metadata addresses shared by layers, refreshed once per live step.
-
-    Graph holders release this storage with the attention graphs. Memoization
-    belongs to BatchStep and is reset by begin_forward, including reused steps.
-    Hidden states are deliberately never memoized: each layer has new values.
-    """
-
-    def __init__(self):
-        super().__init__()
-        register_graph_holder(self)
-
-    def release_graphs(self):
-        self._slots.clear()
-        return 0
-
-    def prepare(self, inputs: dict, step: BatchStep, *, zero_copy_hidden: bool) -> dict:
-        staged = {}
-        for name, source in inputs.items():
-            if not isinstance(source, torch.Tensor):
-                staged[name] = source
-                continue
-            hidden = name == "hidden"
-            if hidden and zero_copy_hidden:
-                staged[name] = source
-                continue
-            key = (name, _signature(source), source.device)
-            memo = (key, source.data_ptr())
-            if not hidden and memo in step.af_inputs:
-                staged[name] = step.af_inputs[memo]
-                continue
-            buffer = self.slot(key, source).copy_(source)
-            if not hidden:
-                step.af_inputs[memo] = buffer
-            staged[name] = buffer
-        return staged
 
 
 @dataclass
@@ -134,23 +92,13 @@ class AttentionCapture:
         self.warmup = None
 
 
-class AttentionGraphs(CudagraphCaptureRunner):
-    # Bound request-shaped live captures per layer; additional shapes stay eager.
-    max_entries = 32
+class AttentionGraphs(PiecewiseAFRunner):
+    """V4.1 host branches, staged BatchStep construction and result publication."""
 
-    def __init__(
-        self,
-        outputs: StableOutputs | None = None,
-        inputs: SharedAttentionInputs | None = None,
-    ):
-        super().__init__()
-        self.outputs = outputs if outputs is not None else StableOutputs(token_dim=1)
-        self.inputs = inputs if inputs is not None else SharedAttentionInputs()
-        self._captures: dict[tuple, AttentionCapture] = {}
-
-    def release_graphs(self):
-        self._captures.clear()
-        return super().release_graphs()
+    def __init__(self, outputs=None, inputs: SharedGraphInputs | None = None):
+        super().__init__(
+            outputs if outputs is not None else StableOutputs(token_dim=1), inputs
+        )
 
     @staticmethod
     def eligible(metadata, context):
@@ -259,100 +207,88 @@ class AttentionGraphs(CudagraphCaptureRunner):
             return
 
         sources = self._inputs(attention, hidden, step, queries)
-        signature = tuple(
-            (name, _signature(value) if isinstance(value, torch.Tensor) else value)
-            for name, value in sources.items()
-        )
         key = (
             step.decode,
             step.width,
             step.max_q_len,
             bool(step.request_cached_until.any()),
             cache.pool.data_ptr(),
-            signature,
-            # Directly captured producer addresses MUST match, even for an
-            # eager/compiled producer unexpectedly reached at the same shape.
-            hidden.data_ptr() if zero_copy_hidden else None,
         )
-        if not self.has_graph(key) and len(self._graphs) >= self.max_entries:
+        with self.bind_capture(
+            key,
+            sources,
+            lambda inputs: self._capture_state(attention, step, queries, inputs),
+            memo=step.af_inputs,
+            copy_each_call=("hidden",),
+            zero_copy=("hidden",) if zero_copy_hidden else (),
+        ) as binding:
+            if binding is None:
+                yield arguments
+                return
+            arguments.update(normed=binding.inputs["hidden"], **binding.arguments)
             yield arguments
-            return
-        inputs = self.inputs.prepare(sources, step, zero_copy_hidden=zero_copy_hidden)
-        first_call = not self.has_graph(key)
-        if first_call:
-            ratio = attention.spec.ratio
-            groups = {
-                name: {}
-                for name in (
-                    "visible",
-                    "selected",
-                    "candidates",
-                    "planned",
-                    "planned_host",
-                )
-            }
-            for name, value in inputs.items():
-                if isinstance(name, tuple) and name[0] in groups:
-                    groups[name[0]][name[1]] = value
-            staged_step = replace(
-                step,
-                **{name: inputs[name] for name in _STEP_TENSORS},
-                **groups,
-                indptrs={
-                    ratio: tuple(
-                        inputs["indptrs", ratio, i]
-                        for i in range(len(step.indptrs[ratio]))
-                    )
-                },
-                plans=(
-                    {}
-                    if step.plans.get(ratio) is None
-                    else {
-                        ratio: replace(
-                            step.plans[ratio],
-                            **{
-                                name: inputs["plan", ratio, name]
-                                for name in _PLAN_TENSORS
-                            },
-                        )
-                    }
-                ),
-                tiles={},
-                candidate_blocks={},
-                group_indices={},
-                window_rows=None,
-                af_inputs={},
+            binding.state.publish(
+                step, attention.spec.layer_id, first_call=binding.first_call
             )
-            query = None
-            if queries is not None:
-                query = replace(
-                    queries,
-                    **{
-                        name: inputs["queries", name]
-                        for name in ("rows", "positions", "ptr_rows")
-                    },
-                    index=replace(
-                        staged_step,
-                        batch_ids=inputs["query_batch_ids"],
-                        indptrs={
-                            ratio: tuple(
-                                inputs["query_indptrs", ratio, i]
-                                for i in range(len(queries.index.indptrs[ratio]))
-                            )
-                        },
-                    ),
-                )
-            state = AttentionCapture(staged_step, query)
-        else:
-            state = self._captures[key]
 
-        arguments.update(
-            normed=inputs["hidden"],
-            capture=True,
-            capture_key=key,
-            prepare=state.bind,
+    @staticmethod
+    def _capture_state(attention, step, queries, inputs):
+        ratio = attention.spec.ratio
+        groups = {
+            name: {}
+            for name in (
+                "visible",
+                "selected",
+                "candidates",
+                "planned",
+                "planned_host",
+            )
+        }
+        for name, value in inputs.items():
+            if isinstance(name, tuple) and name[0] in groups:
+                groups[name[0]][name[1]] = value
+        staged_step = replace(
+            step,
+            **{name: inputs[name] for name in _STEP_TENSORS},
+            **groups,
+            indptrs={
+                ratio: tuple(
+                    inputs["indptrs", ratio, i] for i in range(len(step.indptrs[ratio]))
+                )
+            },
+            plans=(
+                {}
+                if step.plans.get(ratio) is None
+                else {
+                    ratio: replace(
+                        step.plans[ratio],
+                        **{name: inputs["plan", ratio, name] for name in _PLAN_TENSORS},
+                    )
+                }
+            ),
+            tiles={},
+            candidate_blocks={},
+            group_indices={},
+            window_rows=None,
+            af_inputs={},
         )
-        yield arguments
-        if first_call:
-            self._captures[key] = state
-        state.publish(step, attention.spec.layer_id, first_call=first_call)
+        query = None
+        if queries is not None:
+            query = replace(
+                queries,
+                **{
+                    name: inputs["queries", name]
+                    for name in ("rows", "positions", "ptr_rows")
+                },
+                index=replace(
+                    staged_step,
+                    batch_ids=inputs["query_batch_ids"],
+                    indptrs={
+                        ratio: tuple(
+                            inputs["query_indptrs", ratio, i]
+                            for i in range(len(queries.index.indptrs[ratio]))
+                        )
+                    },
+                ),
+            )
+        return AttentionCapture(staged_step, query)
