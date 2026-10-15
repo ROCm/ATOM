@@ -567,3 +567,80 @@ def test_direct_producer_input_and_consumer_output_with_reused_step():
     assert cache.pool.item() == 5
     assert len(graphs._graphs) == 2
     graphs.release_graphs()
+
+
+@cuda
+@pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_backend_shared_results_are_bounded_by_capacity(decode, packed):
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+    from tests.attentions.deepseek_v41.helpers import (
+        PagedRequest,
+        begin_step,
+        metadata_buffers,
+    )
+
+    geo = V41PoolGeometry(
+        3,
+        ((0, 2),),
+        128,
+        8,
+        512,
+        128,
+        layer_ratios=(0, 2),
+        index_topk=4,
+        index_block_rows=8,
+        index_fp4=True,
+        packed=packed,
+    )
+    specs = (
+        LayerAttentionSpec(0, 2, AttentionMode.FULL, 0, 0, 0),
+        LayerAttentionSpec(1, 2, AttentionMode.REINDEX, 0, 1, 0, 1, 2),
+        LayerAttentionSpec(2, 2, AttentionMode.REUSE, 0, 1, 0, 1, 2),
+    )
+    cache = PagedAttentionCache(
+        geo, 4, 16, "cuda", max_tokens=16, topology=specs, candidate_count=2
+    )
+    buffers = metadata_buffers(16, 16, 4, "cuda", geo)
+    footprints = []
+    pointers = []
+    for width in (16, 1, 3, 5, 9, 2, 15, 4):
+        requests = (
+            [PagedRequest(i, 64, i, 1, i, (0, 1)) for i in range(width)]
+            if decode
+            else [PagedRequest(0, 64, 0, width, 0, (0, 1))]
+        )
+        step = begin_step(
+            cache,
+            requests,
+            buffers=buffers,
+            running_bs=len(requests),
+            running_tokens=width,
+            is_prefill=not decode,
+        )
+        cache.prepare_attention(step)
+        blocks = step.candidate_blocks[0]
+        assert blocks.table.shape == (width, 2)
+        assert blocks.context.shape == (width,)
+        pointers.append(
+            (
+                step.selected[0].data_ptr(),
+                blocks.table.data_ptr(),
+                blocks.context.data_ptr(),
+            )
+        )
+        if decode:
+            assert all(
+                values[0].is_contiguous() for values in step.group_indices.values()
+            )
+            assert step.group_indices[1][0].shape[0] == (2 if packed else 1)
+        footprints.append(
+            sum(
+                t.untyped_storage().nbytes()
+                for t in cache.result_buffers._slots.values()
+            )
+        )
+    assert len(set(pointers)) == 1
+    assert len(set(footprints)) == 1

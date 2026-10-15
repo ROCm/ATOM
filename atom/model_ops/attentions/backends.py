@@ -183,7 +183,14 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return
 
+    # A backend opting in supplies both padded live metadata and token-only
+    # startup metadata. Others keep eager prefill and their FULL decode graphs
+    # in hybrid mode; ordinary PIECEWISE/AF_PIECEWISE capture is unchanged.
     supports_piecewise_prefill = False
+
+    def build_for_piecewise_capture(self, num_tokens):
+        """Build token-only startup metadata for hybrid prefill capture."""
+        raise NotImplementedError("This backend does not support token-only prefill")
 
     def prepare_prefill_padded(self, batch, running_bs, running_tokens):
         """Opt-in token padding; existing backends keep their prefill layout."""

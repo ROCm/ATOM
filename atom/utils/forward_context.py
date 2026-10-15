@@ -341,7 +341,7 @@ class ForwardMode:
         # built and never mutated), so the insertion point IS the smallest size
         # that holds the batch, and running off the end IS "no recording can".
         # Select after the DP reduction: all ranks must use the agreed Q.
-        if capture_sizes_by_q is not None and not is_prefill:
+        if capture_sizes_by_q is not None and unified and not is_prefill:
             capture_sizes = capture_sizes_by_q.get(max_seqlen_q, ())
         rung = int(np.searchsorted(capture_sizes, unified_bs))
         on_ladder = rung < len(capture_sizes)

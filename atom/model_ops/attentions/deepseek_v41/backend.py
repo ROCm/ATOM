@@ -776,7 +776,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         image_mask=None,
         engram_embeddings=None,
     ):
-        cache.prepare_attention(step)
+        # Plain piecewise runs attention eagerly; FULL records its normal
+        # allocations. Only AF needs result slots shared by separate regions.
+        if self.capture_attention and not dummy:
+            cache.prepare_attention(step)
         metadata = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
             max_seqlen_q=step.max_q_len,
@@ -854,7 +857,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def prepare_prefill_padded(self, batch, running_bs, running_tokens):
         # The request spans stay exact; begin_step marks the padded rows with
         # batch_id=-1 and extends per-token metadata to the chosen graph bucket.
-        return self._prepare(batch, running_bs, running_tokens, query_prefix_ready=True)
+        return self._prepare(
+            batch, running_bs, running_tokens, query_prefix_ready=True, is_prefill=True
+        )
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(

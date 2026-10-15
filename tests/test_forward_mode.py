@@ -547,3 +547,46 @@ def test_dp_prefill_does_not_take_single_rank_token_padding(monkeypatch):
         captured_tokens=[768],
     )
     assert not mode.piecewise_captured and mode.running_tokens == 600
+
+
+@pytest.mark.parametrize("q", [2, 6])
+def test_hybrid_mixed_dp_uses_union_ladder_on_both_ranks(monkeypatch, q):
+    union = np.asarray([1, 100, 102], dtype=np.int32)
+    ladders = {
+        2: np.asarray([1, 100], dtype=np.int32),
+        6: np.asarray([1, 102], dtype=np.int32),
+    }
+    modes = []
+    for prefill in (False, True):
+        _fake_sync(
+            monkeypatch,
+            peer_tokens=700 if not prefill else 100 * q,
+            peer_bs=2 if not prefill else 100,
+            peer_prefill=not prefill,
+        )
+        modes.append(
+            _decide(
+                _batch(
+                    seqs=2 if prefill else 100,
+                    tokens=700 if prefill else 100 * q,
+                    prefill_tokens=700 if prefill else 0,
+                    q=q,
+                ),
+                dp_size=2,
+                is_block_drafter=True,
+                capture_sizes=union,
+                capture_sizes_by_q=ladders,
+            )
+        )
+    assert [mode.running_bs for mode in modes] == [100, 100]
+    assert all(not mode.use_cudagraph for mode in modes)
+    _fake_sync(monkeypatch, peer_tokens=100 * q, peer_bs=100)
+    decoding = _decide(
+        _batch(seqs=100, q=q),
+        dp_size=2,
+        is_block_drafter=True,
+        capture_sizes=union,
+        capture_sizes_by_q=ladders,
+    )
+    assert decoding.running_bs == (100 if q == 2 else 102)
+    assert decoding.use_cudagraph

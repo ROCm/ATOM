@@ -60,7 +60,16 @@ use ordinary dictionaries to name its stable tensor slots.
 
 ## Boundary buffers and capture lifetime
 
-`StableOutputs.empty` binds a backend result before its producer runs. Existing
+`StableOutputs.empty(..., capacity=elements)` binds a fixed-capacity result
+before its producer runs. It returns a contiguous active prefix, reshaped to
+the requested dimensions. Different active widths reuse the same allocation;
+grouped planes remain contiguous. Choose capacity from the execution view
+budget, not the current prompt length. Separate namespaces isolate concurrent
+views. Fixed metadata inputs need no additional AF copy, and tensors local
+to a region need no output slot.
+
+Only AF regions need prebound cross-layer results; ordinary eager, FULL and
+plain PIECEWISE keep lazy attention results. Existing
 `slot`/`deliver` methods preserve a split operation's output address across eager
 and graphed execution. Prefer an operator's `out=` interface; use an explicit
 copy when its implementation cannot write the destination directly.
@@ -82,3 +91,12 @@ V4 keeps `key=decode_bucket_key` and its explicit startup-capture interface.
 Existing `piecewise`, `capture`, `runner`, `outputs`, `forward_context` and the
 lower-level `capture_key`/`prepare` arguments remain supported. A backend does
 not need to adopt live-prefill metadata to keep its existing decode behavior.
+
+## Token-only hybrid capture
+
+`supports_piecewise_prefill` opts into both padded live prefill and
+`build_for_piecewise_capture(num_tokens)`. Unsupported backends run eager
+prefill in FULL_AND_PIECEWISE while keeping the same token-derived FULL/draft
+decode ladders. Their ordinary PIECEWISE and AF_PIECEWISE startup paths remain
+unchanged. A mixed prefill/decode DP group uses the union BS ladder on every
+rank; the per-Q ladder applies only when all ranks are decoding.

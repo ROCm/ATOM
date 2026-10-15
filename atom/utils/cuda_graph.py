@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import math
 import os
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -341,12 +342,24 @@ class StableOutputs:
         self._slots: dict = {}
         self.capacity, self.token_dim = capacity, token_dim
 
-    def empty(self, key, shape, *, dtype, device):
-        """Allocate a backend result before its producer runs, without a copy."""
-        key = (key, tuple(shape), dtype, torch.device(device))
+    def empty(self, key, shape, *, dtype, device, capacity=None):
+        """Return contiguous result storage, optionally a fixed-capacity prefix.
+
+        ``capacity`` is the number of elements reserved for this role, fixed by
+        its owner. Flatten before taking the prefix, then reshape: grouped
+        planes must stay contiguous even when their active row width changes.
+        Active shapes never create additional slots within that capacity.
+        """
+        shape = tuple(shape)
+        count = math.prod(shape)
+        if capacity is not None and count > capacity:
+            raise ValueError(f"Buffer needs {count} elements, capacity {capacity}")
+        storage_shape = shape if capacity is None else (capacity,)
+        key = (key, storage_shape, dtype, torch.device(device))
         if key not in self._slots:
-            self._slots[key] = torch.empty(shape, dtype=dtype, device=device)
-        return self._slots[key]
+            self._slots[key] = torch.empty(storage_shape, dtype=dtype, device=device)
+        buf = self._slots[key]
+        return buf if capacity is None else buf[:count].view(shape)
 
     def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
         """Return a stable slot, optionally a view into fixed token capacity.

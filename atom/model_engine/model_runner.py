@@ -4050,9 +4050,13 @@ class ModelRunner:
                 self.config.max_num_batched_tokens,
                 max(q_buckets),
             )
-            plan = [
-                (CUDAGraphMode.PIECEWISE, 1, self._piecewise_prefill_tokens()[::-1])
-            ]
+            # Token-only prefill needs backend support. The hybrid FULL
+            # decode ladder still uses tokens -> BS even when prefill is eager.
+            plan = []
+            if self.attn_metadata_builder.supports_piecewise_prefill:
+                plan.append(
+                    (CUDAGraphMode.PIECEWISE, 1, self._piecewise_prefill_tokens()[::-1])
+                )
             for q in q_buckets:
                 sizes = {(t + q - 1) // q for t in tokens if t > 0}
                 # Small decode batches must remain exact, including every
@@ -4096,13 +4100,17 @@ class ModelRunner:
         warmup_exchange(self.device)
 
         _piecewise = self._piecewise_cg_active(prefill=True)
-        enable_piecewise_prefill = _piecewise and not self._piecewise_cg_active()
+        # This selects hybrid ladder units, independently of whether the
+        # backend can record the optional token-only prefill part of the plan.
+        hybrid_capture = _piecewise and not self._piecewise_cg_active()
         # AF_PIECEWISE: also capture the attn core (ragged combos below)
         cudagraph_mode = getattr(self.config.compilation_config, "cudagraph_mode", None)
         attn_ffn_piecewise = (
             cudagraph_mode is not None and cudagraph_mode.is_attn_ffn_piecewise()
         )
-        if _piecewise:
+        if _piecewise and (
+            not hybrid_capture or self.attn_metadata_builder.supports_piecewise_prefill
+        ):
             logger.info(
                 "PIECEWISE cudagraph: capturing token-bucket pieces; "
                 "decode mode is %s.",
@@ -4115,7 +4123,7 @@ class ModelRunner:
         self.capture_sizes = self.config.capture_sizes
         full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
-        if enable_piecewise_prefill:
+        if hybrid_capture:
             capture_plan = self._cudagraph_capture_plan(q_buckets)
             self.capture_sizes_by_q = {
                 q: np.asarray(sizes[::-1], dtype=np.int32)
@@ -4128,7 +4136,12 @@ class ModelRunner:
             )
             logger.info(
                 "FULL_AND_PIECEWISE token buckets: %s; FULL BS by Q: %s",
-                capture_plan[0][2][::-1],
+                [
+                    size
+                    for mode, _, sizes in capture_plan
+                    if mode == CUDAGraphMode.PIECEWISE
+                    for size in reversed(sizes)
+                ],
                 {q: sizes.tolist() for q, sizes in self.capture_sizes_by_q.items()},
             )
         self.capture_sizes.sort(reverse=True)
@@ -4286,7 +4299,7 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        if not enable_piecewise_prefill:
+        if not hybrid_capture:
             capture_plan = self._cudagraph_capture_plan(q_buckets)
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
@@ -4309,7 +4322,7 @@ class ModelRunner:
                     self._capture_trace_tag = (
                         f"{capture_mode.name.lower()}_bs_{bs}_q_{max_q_len}"
                     )
-                    if piecewise_capture and enable_piecewise_prefill:
+                    if piecewise_capture and hybrid_capture:
                         # This backend builds token-only metadata, with no live
                         # requests or speculative state to constrain prefill Q.
                         self.h2d_owner.begin()

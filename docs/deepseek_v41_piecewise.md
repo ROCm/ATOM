@@ -44,8 +44,9 @@ rounds each candidate up to a multiple of Q, derives BS=T/Q, deduplicates and
 also includes every BS from 1 through 32, and filters by the token ceiling and
 scheduler capacity. The dense small-BS coverage keeps decode and mono draft
 from padding BS=5 to 6 or BS=9 to 10, regardless of prefill bucket spacing.
-Padding selects the BS
-ladder for the DP-agreed Q. With DSpark 5, Q=6: a 600-token prefill uses the
+When every DP rank is decoding, padding selects the BS
+ladder for the DP-agreed Q. A mixed prefill/decode group uses the union BS
+ladder on every rank, including for its draft passes. With DSpark 5, Q=6: a 600-token prefill uses the
 608 bucket in the default ladder; BS=100 decode uses FULL at BS=102,
 612 tokens. Out-of-range decode runs eagerly, not through AF piecewise.
 
@@ -83,7 +84,12 @@ projection/TP reduction. FULL/REINDEX paths also include their compression,
 index writes, scoring and top-k. Bounded replay's layer-20 precompression
 and row selection remain outside these attention calls.
 
-The backend prepares fixed result bindings once per execution view.
+For AF, the backend prepares fixed result bindings once per execution view.
+Selection, candidate tables/context, grouped indices and window rows reuse
+capacity-backed storage across active lengths; grouped planes are contiguous.
+Pure FULL/eager and plain PIECEWISE use lazy attention results without these
+AF bindings. Fixed request metadata is updated by the normal builder in all
+modes, and graph-local temporaries need no binding.
 Begin/end-forward retain those bindings and reset standalone eager caches.
 Engram staging starts and joins before dense capture to close its stream
 boundary. FULL and eager retain their existing Engram scheduling. Image

@@ -606,10 +606,11 @@ class PagedAttentionCache:
     def prepare_attention(self, step, specs=None):
         """Bind the backend's producer/consumer workspace for one execution view.
 
-        This is ordinary metadata preparation, used in eager, FULL and AF modes.
-        Results have fixed slots before any producer runs. Only batch-dependent
-        tables are computed here; candidate translation and grouped indices stay
-        after their selection producer in the layer walk.
+        Only results shared between AF regions need these slots. Fixed request
+        inputs are already refreshed by the normal builder; local temporaries
+        belong to each graph. Candidate translation and grouped indices stay
+        after their selection producer in the layer walk. Plain piecewise and
+        FULL/eager keep the ordinary lazy result path.
         """
         specs = (step.layer_specs or self.topology) if specs is None else tuple(specs)
         if not specs or not step.requests:
@@ -627,10 +628,11 @@ class PagedAttentionCache:
         def result(kind, owner, columns):
             return self.result_buffers.empty(
                 (ns, kind, owner),
-                (1, capacity, columns),
+                (1, step.width, columns),
+                capacity=capacity * columns,
                 dtype=torch.int32,
                 device=device,
-            )[:, : step.width]
+            )
 
         # Include external owners: bounded decoder views carry their values from
         # the encoder into these same slots before their first consumer runs.
@@ -659,12 +661,14 @@ class PagedAttentionCache:
             table = self.result_buffers.empty(
                 (ns, "candidate_table", source),
                 ids.shape,
+                capacity=capacity * ids.shape[-1],
                 dtype=torch.int32,
                 device=device,
             )
             context = self.result_buffers.empty(
                 (ns, "candidate_context", source),
                 (step.width,),
+                capacity=capacity,
                 dtype=torch.int32,
                 device=device,
             )
@@ -686,10 +690,12 @@ class PagedAttentionCache:
                     continue
                 layers = 1 if split else spec.index_group_size
                 topk = self.geometry.batch_topk(spec.ratio)
-                plane = step.width * (topk + self.geometry.window_size * (not split))
+                columns = topk + self.geometry.window_size * (not split)
+                plane = step.width * columns
                 prefix = self.result_buffers.empty(
                     (ns, "indices", first),
                     (layers, plane),
+                    capacity=layers * capacity * columns,
                     dtype=torch.int64 if self.geometry.packed else torch.int32,
                     device=device,
                 )
@@ -702,6 +708,7 @@ class PagedAttentionCache:
                 rows = self.result_buffers.empty(
                     (ns, "window"),
                     (step.width * self.geometry.window_size,),
+                    capacity=capacity * self.geometry.window_size,
                     dtype=torch.int32,
                     device=device,
                 )

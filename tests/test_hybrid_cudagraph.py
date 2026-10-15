@@ -21,6 +21,7 @@ def _runner(mode):
 
     runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
     runner.enforce_eager = False
+    runner.attn_metadata_builder = SimpleNamespace(supports_piecewise_prefill=True)
     runner.config = RunnerConfig(
         prefill_context_parallel_size=1,
         compilation_config=SimpleNamespace(cudagraph_mode=mode),
@@ -584,3 +585,62 @@ def test_stable_output_role_keeps_different_shapes_separate():
     assert large.shape == (1, 8, 2)
     assert small.data_ptr() != large.data_ptr()
     torch.testing.assert_close(small, torch.ones_like(small))
+
+
+@pytest.mark.parametrize("backend", ["base", "v4", "mha", "mla"])
+def test_unsupported_token_prefill_keeps_hybrid_full_decode_ladder(backend):
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    builders = {
+        "base": AttentionMetadataBuilder,
+        "v4": DeepseekV4AttentionMetadataBuilder,
+        "mha": AiterAttentionMetadataBuilder,
+        "mla": AiterMLAMetadataBuilder,
+    }
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = [6, 192, 608, 768]
+    supported = runner._cudagraph_capture_plan([2, 6])
+    runner.attn_metadata_builder = builders[backend]
+    fallback = runner._cudagraph_capture_plan([2, 6])
+    assert fallback == [entry for entry in supported if entry[0] == CUDAGraphMode.FULL]
+    assert 102 in fallback[1][2]
+    runner.capture_sizes = [8, 2, 1]
+    runner.config.compilation_config.cudagraph_mode = CUDAGraphMode.AF_PIECEWISE
+    assert runner._cudagraph_capture_plan([6]) == [
+        (CUDAGraphMode.PIECEWISE, 6, [8, 2, 1])
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+def test_capacity_results_keep_contiguous_planes_across_graph_shapes():
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs()
+    recorded = {}
+    source = torch.zeros(48, device="cuda")
+    for width in (8, 3, 5):
+        shape = (2, width * 3)
+        view = outputs.empty(
+            "indices", shape, capacity=48, dtype=torch.float32, device="cuda"
+        )
+        assert view.is_contiguous()
+        result = torch.empty_like(view)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            view.copy_(source[: view.numel()].view(shape))
+            result.copy_(view + 1)
+        recorded[width] = graph, view, result
+    assert len({view.data_ptr() for _, view, _ in recorded.values()}) == 1
+    for i, width in enumerate((3, 8, 5, 3, 8), 1):
+        source.copy_(torch.arange(48, device="cuda") + i * 100)
+        graph, view, result = recorded[width]
+        graph.replay()
+        torch.testing.assert_close(result, source[: view.numel()].view_as(view) + 1)
+    assert len(outputs._slots) == 1
+    with pytest.raises(ValueError, match="capacity"):
+        outputs.empty("indices", (49,), capacity=48, dtype=torch.float32, device="cuda")
