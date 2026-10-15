@@ -137,7 +137,7 @@ class PreparationTests(unittest.TestCase):
                     any("numa_exec.py" in str(cmd) for cmd, _ in self.calls)
                 )
 
-    def test_agentic_prefill_prepares_before_starting_services(self):
+    def test_agentic_prefill_requires_host_preparation(self):
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
         start = source.index("start_prefill() {")
         setup = source[start : source.index("  start_mooncake_store\n", start)]
@@ -148,12 +148,16 @@ class PreparationTests(unittest.TestCase):
 }
 apply_role_env() { :; }
 reset_lmcache_disk() { :; }
-python3() { printf '%s\n' "$*"; return "$TEST_PREP_RC"; }
+python3() { echo UNEXPECTED_CONTAINER_PREPARATION; return 99; }
 start_prefill prefill-rank-0
 """
         )
-        for enabled, rc in (("true", 0), ("true", 2), ("false", 0)):
-            with self.subTest(enabled=enabled, rc=rc):
+        for enabled, prepared, rc in (
+            ("true", "true", 0),
+            ("true", "false", 2),
+            ("false", "false", 0),
+        ):
+            with self.subTest(enabled=enabled, prepared=prepared):
                 result = subprocess.run(
                     ["bash", "-euo", "pipefail", "-c", script],
                     env={
@@ -163,17 +167,8 @@ start_prefill prefill-rank-0
                         "PREFILL_DP_MASTER_PORT": "6200",
                         "PREFILL_DP_BASE_PORT": "6210",
                         "host_ip": "127.0.0.1",
-                        "SINGLE_NODE_PD": "1",
-                        "BENCHMARK_KIND": "aiperf_agentic",
-                        "LMCACHE_LOCAL_CPU": "True",
-                        "LMCACHE_MAX_LOCAL_CPU_SIZE": "256",
-                        "HIP_VISIBLE_DEVICES": "0,1,2,3",
                         "ATOMESH_PREPARE_LMCACHE_HOST_MEMORY": enabled,
-                        "ATOMESH_SCRIPT_DIR": str(SCRIPTS),
-                        "MODEL_PATH": "/models/target model",
-                        "DRAFT_MODEL_PATH": "/models/draft model",
-                        "RUN_DIR": str(self.root),
-                        "TEST_PREP_RC": str(rc),
+                        "ATOMESH_LMCACHE_HOST_PREPARED": prepared,
                     },
                     text=True,
                     capture_output=True,
@@ -181,16 +176,8 @@ start_prefill prefill-rank-0
                     check=False,
                 )
                 self.assertEqual(result.returncode, rc, result.stderr)
-                if enabled == "true":
-                    self.assertIn("prepare_lmcache_host_memory.py", result.stdout)
-                    self.assertIn("--gpus 0,1,2,3 --per-gpu-gib 256", result.stdout)
-                    self.assertIn("--timeout 300 --step-timeout 90", result.stdout)
-                else:
-                    self.assertNotIn("prepare_lmcache_host_memory.py", result.stdout)
-                if rc == 0:
-                    self.assertTrue(result.stdout.endswith("START_SERVICES\n"))
-                else:
-                    self.assertNotIn("START_SERVICES", result.stdout)
+                self.assertNotIn("UNEXPECTED_CONTAINER_PREPARATION", result.stdout)
+                self.assertEqual("START_SERVICES" in result.stdout, rc == 0)
 
     def test_deadline_prevents_starting_another_step(self):
         def run(*args):

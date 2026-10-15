@@ -1854,19 +1854,10 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
-  if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
-    local memory_local_cpu="${LMCACHE_LOCAL_CPU:-false}"
-    if [[ "${SINGLE_NODE_PD}" != "1" || "${memory_local_cpu,,}" != "true" ]]; then
-      echo "ERROR: host-memory preparation requires single-node PD with LMCache CPU storage" >&2
-      return 2
-    fi
-    local -a memory_model_dirs=("${MODEL_PATH}")
-    [[ -n "${DRAFT_MODEL_PATH}" ]] && memory_model_dirs+=("${DRAFT_MODEL_PATH}")
-    python3 "${ATOMESH_SCRIPT_DIR}/prepare_lmcache_host_memory.py" \
-      --gpus "${HIP_VISIBLE_DEVICES}" --per-gpu-gib "${LMCACHE_MAX_LOCAL_CPU_SIZE}" \
-      --attempts 3 --timeout 300 --step-timeout 90 --reserve-gib 128 \
-      --output "${RUN_DIR}/benchmark_results/lmcache-host-memory" \
-      "${memory_model_dirs[@]}" || return $?
+  if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" \
+    && "${ATOMESH_LMCACHE_HOST_PREPARED:-false}" != "true" ]]; then
+    echo "ERROR: LMCache memory must be prepared on the allocated host before container startup" >&2
+    return 2
   fi
   start_mooncake_store
   # On the env command line, not exported: decode starts from this same shell.

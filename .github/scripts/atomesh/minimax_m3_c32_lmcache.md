@@ -17,36 +17,50 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
   -f run_model_benchmark=true -f publish_dashboard=false
 ```
 
-Only this C32 case enables `benchmark.prepare_lmcache_host_memory`. In
-`start_prefill`, after applying the prefill environment and before launching
-either model service, the helper directly tries `sync`, `drop_caches=3` and
-`compact_memory=1` as the existing CI user. It uses no sudo and changes no
-container privileges. If the VM controls are unavailable, it runs the existing
-file-cache eviction and NUMA-bound huge-page preparation helpers.
+Only this C32 case enables `benchmark.prepare_lmcache_host_memory`. The Spur
+worker executes preparation on the **allocated host**, after the existing
+container cleanup and before launching the service container. It uses the CI
+user directly, with no sudo or extra container privileges. The server only
+accepts the launch after `ATOMESH_LMCACHE_HOST_PREPARED=true` is set by a
+successful host preparation.
 
-Preparation permits three serial attempts within 300 seconds, at most 90 seconds
-per command, plus up to five seconds to reap a timed-out child. A child that cannot
-be reaped blocks model startup. The longer step allowance accommodates preparing
-1 TiB before the services start. Pool size comes from the prefill GPU list and
-LMCache capacity: GPUs 0-3, 256 GiB/rank, currently 1024 GiB on NUMA0.
+`lmcache_hugetlb.py` first checks the prefill NUMA nodes. Where ordinary free
+memory is below the LMCache pool plus 128 GiB reserve, it can temporarily shrink
+the node's unused 2 MiB HugeTLB pool, only by the calculated shortfall. It requires
+the node's pool to be entirely free, no surplus pages and no global 2 MiB page
+reservations. Used or reserved pools are not modified. Pool size and the increase
+in ordinary free memory are checked after writing. Permission failures fail
+before model startup; they cannot be fixed by retries inside a read-only container.
 
-The pool itself must fit in NUMA free memory; the additional 128 GiB reserve may
-include clean active/inactive file cache, excluding dirty/writeback pages. NUMA
-total capacity and visible cgroup headroom are checked as well. Unknown cgroup
-capacity, persistent insufficient memory, permission errors in the NUMA helper,
-or incomplete preparation fail before starting services. File-cache eviction is
-advisory. Successful preparation does not establish subsequent pinning latency
-and does not release a live LMCache pool; its owning processes must exit first.
+The original counts are journaled before each write. After model containers have
+stopped, normal completion, failures and catchable cancellation attempt to restore
+the counts. Writes have a 60-second deadline plus up to five seconds to reap the
+child. Failed or incomplete restoration fails the job and preserves the journal
+for node recovery. A writer that might still be alive blocks automatic recovery.
+SIGKILL/node loss can prevent cleanup; recorded counts may require administrator
+recovery. The code does not claim to restore node state in those cases.
 
-Run `38736095232` stopped at the former free-memory check: NUMA0 had about
-1056 GiB free and 414 GiB file cache, but the helper required all 1152 GiB to be
-free. The direct VM write was read-only, three file-cache passes did not change
-this state, and no NUMA compaction or model startup occurred. The updated reserve
-check permits compaction in that state without requiring the pool itself to
-reclaim file cache.
+The host then runs `prepare_lmcache_host_memory.py`: direct sync/drop_caches/
+compact_memory where allowed, otherwise file-cache eviction and NUMA-bound THP
+preparation. It permits three serial attempts within 300 seconds, at most 90
+seconds per command, plus up to five seconds to reap a timed-out child. The pool
+itself must fit in ordinary NUMA free memory; the extra reserve may include clean
+active/inactive file cache, excluding dirty/writeback pages. Visible cgroup
+capacity is also checked. This remains one node, prefill GPUs 0-3 at 256 GiB/rank,
+currently 1024 GiB on NUMA0.
 
-Artifacts under `benchmark_results/lmcache-host-memory/` retain `summary.json`,
-command logs and before/after NUMA, cgroup, buddyinfo, vmstat and THP snapshots.
+Run `38738296856` failed before model startup: NUMA0 had 470.49 GiB ordinary free
+memory, 268.30 GiB file cache and 720 GiB idle HugeTLB reservation. The former
+container-side script could not write the read-only VM controls and did not
+release HugeTLB pages. Three file-cache passes took 1.94 seconds and no THP
+compaction ran. `drop_caches` and THP compaction do not shrink HugeTLB pools.
+
+Artifacts under `benchmark_results/lmcache-host-memory/` retain the preparation
+`summary.json`, command logs and before/after NUMA, cgroup, buddyinfo, vmstat and
+THP snapshots. `host/hugetlb.json` records original counts, targets, observed
+results and restoration status, with per-node release/restore logs. File-cache
+eviction is advisory; successful preparation still does not prove subsequent
+pinning latency. Existing live LMCache arenas must be released by their owners.
 
 This case sets `benchmark.mesh_source: image` to avoid the damaged shared Cargo
 cache. The pinned image has Mesh source tree
