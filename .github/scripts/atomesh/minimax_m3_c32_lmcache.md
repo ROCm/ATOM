@@ -19,9 +19,7 @@ gh workflow run atomesh-benchmark.yaml --repo ROCm/ATOM \
 Slurm account and single-node placement use their defaults (`auto`). The C32
 case excludes `pit2-p03-g34` and `pit2-p03-g12`: runs `38741996691` and
 `38793498618` confirmed that UID 300152 cannot
-write the node's HugeTLB controls. It also excludes `pit2-p03-g01` after run
-`38805249199` exhausted bounded THP preparation despite sufficient ordinary
-free RAM (details below). The scheduler selects among the remaining
+write the node's HugeTLB controls. The scheduler selects among the remaining
 nodes. This exclusion does not imply other nodes have sufficient memory or
 administrator permissions; host preparation still validates the selected node.
 
@@ -176,3 +174,22 @@ The case excludes this demonstrated preparation failure for subsequent runs;
 it does not increase the budget or accept partial THP coverage. No model
 service started, so this run provides no runtime validation of the stack
 sampler or the earlier NCCL stall.
+
+Run 38809378429 failed preparation on g35. Model-directory advice recovered
+450 GiB, but 700 GiB of file cache remained; repeated advice made essentially
+no further progress. THP attempts reached only 636/685 GiB before their
+90-second deadlines. No model services started.
+
+The bounded preparation now uses temporary base pages when clean file cache
+exceeds the reserve and the pool does not fit either ordinary free RAM or the
+free blocks of at least 2 MiB. The scratch size is at most ordinary free plus
+clean file cache minus 128 GiB, also capped by total NUMA memory and every
+visible cgroup's remaining capacity minus the reserve. Dirty/writeback memory
+is excluded. A NUMA-bound child uses MADV_NOHUGEPAGE and MADV_POPULATE_WRITE on
+disjoint ranges with up to eight threads, so cache reclaim is not coupled to
+THP compaction on each initial fault. It checks actual RSS and frees the entire
+mapping before the existing THP helper starts. No pinning or VM setting changes
+are involved. Failure or timeout prevents model startup; the existing 90-second
+step and 300-second total bounds still apply. The previous g01 exclusion is
+removed so this path can handle that documented fragmentation case as well.
+This is a CI preparation change; runtime improvement still requires validation.

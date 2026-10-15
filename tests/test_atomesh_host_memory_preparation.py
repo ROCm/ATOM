@@ -233,7 +233,9 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.prepare(), 2)
         self.assertEqual(self.result["status"], "insufficient_numa_free_memory")
         self.assertEqual(len(self.result["attempts"]), 3)
-        self.assertEqual(sum("numa_exec.py" in str(cmd) for cmd, _ in self.calls), 3)
+        self.assertEqual(
+            sum("compact_huge_pages.py" in str(cmd) for cmd, _ in self.calls), 3
+        )
 
     def test_node_without_enough_reclaimable_memory_never_allocates(self):
         info = self.state["numa"][0]
@@ -241,6 +243,81 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.prepare(), 2)
         self.assertEqual(self.result["status"], "insufficient_numa_reclaimable_memory")
         self.assertFalse(any("numa_exec.py" in str(cmd) for cmd, _ in self.calls))
+
+    def test_base_page_plan_keeps_numa_and_cgroup_reserve(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
+        self.assertEqual(PREP.base_page_reclaim_gib(self.state, 0, 1024, 128), 1345)
+        self.state["cgroup"] = [{"limit": 1400 * PREP.GIB, "current": 100 * PREP.GIB}]
+        self.assertEqual(PREP.base_page_reclaim_gib(self.state, 0, 1024, 128), 1172)
+        info["Dirty"] = 725 * PREP.GIB
+        self.assertEqual(PREP.base_page_reclaim_gib(self.state, 0, 1024, 128), 0)
+
+    def test_fragmented_free_memory_also_needs_base_page_reclaim(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=1156 * PREP.GIB, **{"Inactive(file)": 311 * PREP.GIB})
+        self.state["buddyinfo"] = "Node 0, zone Normal 0 0 0 0 0 0 0 0 0 0 200000\n"
+        self.assertEqual(PREP.base_page_reclaim_gib(self.state, 0, 1024, 128), 1339)
+        self.state["buddyinfo"] = "Node 0, zone Normal 0 0 0 0 0 0 0 0 0 0 300000\n"
+        self.assertEqual(PREP.base_page_reclaim_gib(self.state, 0, 1024, 128), 0)
+
+    def test_base_page_reclaim_finishes_before_thp(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
+        reclaimed = False
+
+        def run(command, seconds, output):
+            nonlocal reclaimed
+            result = self.run_step(command, seconds, output)
+            if "reclaim_file_cache.py" in str(command):
+                reclaimed = True
+                info["MemFree"] = 1350 * PREP.GIB
+                info["Inactive(file)"] = 123 * PREP.GIB
+            if "compact_huge_pages.py" in str(command):
+                self.assertTrue(reclaimed)
+            return result
+
+        self.assertEqual(self.prepare(run), 0)
+        self.assertTrue(reclaimed)
+        self.assertIn("after_base_reclaim", self.result["attempts"][0])
+        self.assertTrue(
+            all(timeout <= self.args.step_timeout for _, timeout in self.calls)
+        )
+
+    def test_failed_base_page_reclaim_never_starts_thp(self):
+        info = self.state["numa"][0]
+        info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
+
+        def run(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "reclaim_file_cache.py" in str(command):
+                result.update(returncode=-9, timed_out=True)
+            return result
+
+        self.assertEqual(self.prepare(run), 2)
+        self.assertEqual(self.result["status"], "base_page_reclaim_failed")
+        self.assertEqual(len(self.result["attempts"]), 3)
+        self.assertFalse(
+            any("compact_huge_pages.py" in str(cmd) for cmd, _ in self.calls)
+        )
+
+    def test_small_base_page_allocation_is_resident_then_released(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS / "reclaim_file_cache.py"), "0.0078125"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [
+            json.loads(line.split(" ", 1)[1]) for line in result.stdout.splitlines()
+        ]
+        populated = next(row for row in rows if row["event"] == "populated")
+        self.assertEqual(populated["populated_gib"], 0.0078125)
+        self.assertGreaterEqual(populated["rss_gib"], 0.0078125)
+        self.assertEqual(populated["anon_huge_gib"], 0)
+        self.assertEqual(rows[-1]["event"], "released")
 
     def test_agentic_prefill_requires_host_preparation(self):
         source = (SCRIPTS / "pd_server_atom.sh").read_text()

@@ -105,6 +105,44 @@ def capacity_error(state, planned, reserve_gib, *, require_free=False):
     return None
 
 
+def base_page_reclaim_gib(state, node, planned_gib, reserve_gib):
+    """Scratch capacity, retaining the reserve in both NUMA and cgroup budgets."""
+    info = state["numa"][node]
+    free = info.get("MemFree", 0)
+    clean = max(
+        0,
+        info.get("Active(file)", 0)
+        + info.get("Inactive(file)", 0)
+        - info.get("Dirty", 0)
+        - info.get("Writeback", 0),
+    )
+    reserve = reserve_gib * GIB
+    if clean <= reserve:
+        return 0
+    # Ordinary free memory can still be scattered among cached file pages.
+    # Count free blocks of order >= 9 (2 MiB on these Linux hosts).
+    large_free = 0
+    found = False
+    for line in state.get("buddyinfo", "").splitlines():
+        fields = line.split()
+        if len(fields) > 4 and fields[:2] == ["Node", f"{node},"]:
+            found = True
+            large_free += sum(
+                int(count) * (os.sysconf("SC_PAGE_SIZE") << order)
+                for order, count in enumerate(fields[4:])
+                if order >= 9
+            )
+    if free >= planned_gib * GIB and (not found or large_free >= planned_gib * GIB):
+        return 0
+    available = min(free + clean, info.get("MemTotal", 0)) - reserve
+    if not state["cgroup"]:
+        return 0  # The caller rejects unknown cgroup capacity before allocation.
+    for row in state["cgroup"]:
+        if row["limit"] is not None:
+            available = min(available, row["limit"] - row["current"] - reserve)
+    return max(0, int(available // GIB))
+
+
 def child_state(pid, elapsed):
     row = {"pid": pid, "elapsed_seconds": round(elapsed, 3)}
     for line in read_optional(f"/proc/{pid}/status").splitlines():
@@ -212,6 +250,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             raise ValueError("a non-empty positive LMCache memory plan is required")
         result["planned_gib"] = planned
         direct_available = True
+        reclaimed_nodes = set()
         for attempt in range(1, args.attempts + 1):
             if clock() >= deadline:
                 result["status"] = "preparation_deadline"
@@ -326,6 +365,35 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             if used_numa_helper:
                 complete = True
                 for node, gib in sorted(planned.items()):
+                    current = take_snapshot(planned)
+                    problem = capacity_error(current, planned, args.reserve_gib)
+                    if problem:
+                        result["status"] = problem
+                        return 2
+                    scratch_gib = base_page_reclaim_gib(
+                        current, node, gib, args.reserve_gib
+                    )
+                    if scratch_gib and node not in reclaimed_nodes:
+                        row.setdefault("before_base_reclaim", {})[node] = current
+                        reclaimed = step(
+                            f"base-pages-{node}",
+                            [
+                                sys.executable,
+                                str(HERE / "numa_exec.py"),
+                                str(node),
+                                sys.executable,
+                                str(HERE / "reclaim_file_cache.py"),
+                                str(scratch_gib),
+                            ],
+                        )
+                        row.setdefault("after_base_reclaim", {})[node] = take_snapshot(
+                            planned
+                        )
+                        if reclaimed["timed_out"] or reclaimed["returncode"]:
+                            complete = False
+                            row["status"] = "base_page_reclaim_failed"
+                            break  # Retry only after run_step has reaped the child.
+                        reclaimed_nodes.add(node)
                     compact = step(
                         f"numa-{node}",
                         [
@@ -359,7 +427,11 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                             return 2
                         break
             row["after"] = take_snapshot(planned)
-            row["status"] = "prepared" if complete else "numa_preparation_incomplete"
+            row["status"] = (
+                "prepared"
+                if complete
+                else row.get("status", "numa_preparation_incomplete")
+            )
             result["status"] = row["status"]
             if complete:
                 problem = capacity_error(
