@@ -1,222 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792093037104,
+  "lastUpdate": 1792105024259,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "zhangxinyuanliuhengyu",
-            "username": "zhangxinyuanliuhengyu",
-            "email": "xinyuazh@amd.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "13a2fc427d02cf8778d9f0542e7988ee52669eff",
-          "message": "[atom+sgl]fix(sglang): align DeepSeek-V4 bridge with geometry/dest_rows API (#1996)\n\n* fix(sglang): align DeepSeek-V4 bridge with geometry/dest_rows API\n\nPort the vLLM DeepSeek-V4 metadata contract into the SGLang plugin after\n#1771 changed write_v4_paged_decode_indices to use geometry/dest_rows\ninstead of cache_size/swa_pages.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): fix Black/Ruff issues in DSV4 bridge\n\nApply Black formatting for pool_geometry and visible_np, and resolve\nundefined model reference in eager metadata builder.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* refactor(sglang): slim DSV4 bridge geometry API fix\n\nMinimal plugin-only update: switch kernel calls to geometry/dest_rows,\nattach required decode metadata, and keep existing graph buffer layout.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* style(sglang): apply Black formatting in DSV4 bridge\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): bind swa_plane views for DSV4 graph capture\n\nAlign SGLang proxy cache binding with the vLLM bridge contract so decode\nfused SWA writes and fp8 verify-graph swa_write target the real unified KV\nplanes instead of the warmup placeholder buffer.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): attach envelope_rows to DSV4 metadata\n\n_resolve_v4_pool_geometry already bound pool_geometry but omitted the\nenvelope_rows scalar that _fill_csa_paged_compress reads during decode.\nAlso route eager decode HCA indices through write_v4_decode_hca_compress_tail\ninstead of the legacy swa_pages CPU scatter.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): gate decode index buffers by pool geometry\n\nMTP draft workers may have geometry without CSA (ratio 4). Passing CSA/HCA\nbuffers unconditionally made write_v4_paged_decode_indices treat those classes\nas active and index served[4], crashing graph capture with KeyError: 4.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* style(sglang): apply Black formatting in DSV4 bridge\n\nWrap long kv_indptr assignments so Pre Checkin Black passes.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): keep V4 metadata builder for DeepSeek-V4 NextN draft\n\nMTP draft uses DeepseekV4ForCausalLMNextN with model_type remapped to deepseek_v3, so adapter lookup fell through to generic AttentionMetaData and CUDA graph capture crashed on missing state_slot_in.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): use per-layer DSV4 proxy geometry for dest_rows\n\nSGLang's proxy pool is independent per-layer planes, not ATOM's interleaved UnifiedPoolGeometry. Wrong row math was collapsing GSM8K on MI355 TP8. MI308 catalog keeps FP8 weights with BF16 KV because gfx942 has no DSV4 FP8 KV decode kernels.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* style(sglang): apply Black formatting to DSV4 bridge geometry\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): fill csa_n_committed_per_token after main rename\n\nNative DSV4 decode reads AttentionMetaData.csa_n_committed_per_token; the SGLang bridge still set the old n_committed_per_token name.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): rename leftover batch_id_per_token_cpu after main merge\n\nKeep DSV4 SGLang metadata aligned with #2147 batch_id_per_q_token.\n\n* fix(sglang): address DSV4 graph pad, split state slots, and per-stage geometry classes\n\nPad CSA visibility to t_pad, keep distinct CUDAGraph state_slot_in/out buffers, and derive dest_rows classes from stage_ratios so absent compress classes fail closed.\n\n* fix(v4): gate paged-prefill CSA/HCA on served geometry classes\n\nMTP draft pools are dense-only; write_v4_paged_prefill_indices used to\nassert CSA+HCA and crash Pro MTP3 draft-extend. Mirror the existing\nHAS_DENSE path so absent classes leave their buffers untouched.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* fix(sglang): keep dense-only MTP draft off shared CSA/HCA prefill writer\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: zhangxinyuanliuhengyu <190174499+zhangxinyuanliuhengyu@users.noreply.github.com>\nCo-authored-by: Cursor <cursoragent@cursor.com>",
-          "timestamp": "2026-09-11T08:33:24Z",
-          "url": "https://github.com/ROCm/ATOM/commit/13a2fc427d02cf8778d9f0542e7988ee52669eff"
-        },
-        "date": 1789151201412,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DEP RCCL accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark accuracy (GSM8K)",
-            "value": 0.9545,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark MTP acceptance (%)",
-            "value": 42.88,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark avg toks/fwd (tok/fwd)",
-            "value": 4,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 accuracy (GSM8K)",
-            "value": 0.9507,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB pure rearrangement (num_redundant_experts=0, no extra memory), rebalance_interval=200. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9560/0.9568 (2026-07-20), 4 rebalances during the eval, 0 crashes. Guards the num_redundant>0 startup-OOM/migration-deadlock fixes (redundant=0 doesn't hit them, but shares the rebalance/migration code path). | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r64 biased accuracy (GSM8K)",
-            "value": 0.9568,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.955 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB biased placement (64 redundant physical experts = top-8 hottest fully replicated to all 8 GPUs), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot flexible/strict = 0.9553/0.9560 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9583 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro EPLB r64 naive accuracy (GSM8K)",
-            "value": 0.9538,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.956 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: EP+DPA, EPLB naive placement (64 redundant physical experts spread thinly via balanced_packing), rebalance_interval=200. Exercises fill_redundant init + runtime rebalance/migration end-to-end, guarding the num_redundant>0 startup-OOM/migration-deadlock fixes. g64 8xMI355X measured GSM8K 5-shot = 0.956 (2026-07-20), 4 rebalances including migration during the eval, 0 crashes. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP MTP acceptance (%)",
-            "value": 66.03,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
-            "value": 2.98,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Kimi-K3 accuracy (GSM8K)",
-            "value": 0.9522,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 | BaselineNote: Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9507 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9136,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6338 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::MiMo-V2-Flash accuracy (GSM8K)",
-            "value": 0.7953,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot. First stable run base=0.8082 (run 26410931088, commit 24e4367b). Baseline 0.79 sits ~1.5pp below to absorb run-to-run noise (stderr ±0.011); threshold 0.778 leaves ~1.1σ headroom. tp pinned to 4 to match the MTP entry. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7885 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
-          },
-          {
-            "name": "ATOM::MiMo-V2-Flash MTP accuracy (GSM8K)",
-            "value": 0.8006,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot MTP1=0.7983 (run 26410931088). Baseline 0.79; threshold 0.778 (~1.1σ). tp MUST=4, num-speculative-tokens MUST=1: ATOM builds only MTP layer 0 (vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); more spec → layers 1/2 KV unpopulated, accept craters. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7892 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
-          },
-          {
-            "name": "ATOM::MiMo-V2-Flash MTP MTP acceptance (%)",
-            "value": 93.55,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.778 | Baseline: 0.79 | BaselineModel: XiaomiMiMo/MiMo-V2-Flash | BaselineNote: CI GSM8K 3-shot MTP1=0.7983 (run 26410931088). Baseline 0.79; threshold 0.778 (~1.1σ). tp MUST=4, num-speculative-tokens MUST=1: ATOM builds only MTP layer 0 (vLLM _MIMO_V2_FLASH_NUM_MTP_LAYERS=1); more spec → layers 1/2 KV unpopulated, accept craters. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7892 | fewshot: 3 | Model: /models/XiaomiMiMo/MiMo-V2-Flash"
-          },
-          {
-            "name": "ATOM::MiMo-V2-Flash MTP avg toks/fwd (tok/fwd)",
-            "value": 1.94,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7 accuracy (GSM8K)",
-            "value": 0.8923,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.8872 | Baseline: 0.9022 | BaselineModel: MiniMaxAI/MiniMax-M2.7 | BaselineNote: ATOM CI measured: 0.9022 (gsm8k 3-shot flexible-extract). Threshold = baseline - 0.015. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9257 | fewshot: 3 | Model: /models/MiniMaxAI/MiniMax-M2.7"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.93 | Baseline: 0.9363 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 Eagle3 accuracy (GSM8K)",
-            "value": 0.9416,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.93 | Baseline: 0.9469 | BaselineModel: amd/MiniMax-M3-MXFP4 + Inferact/MiniMax-M3-EAGLE3 | BaselineNote: FP4 M3 + EAGLE3 draft (tp8), lossless vs greedy target. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 Eagle3 MTP acceptance (%)",
-            "value": 73.14,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.93 | Baseline: 0.9469 | BaselineModel: amd/MiniMax-M3-MXFP4 + Inferact/MiniMax-M3-EAGLE3 | BaselineNote: FP4 M3 + EAGLE3 draft (tp8), lossless vs greedy target. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9424 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 Eagle3 avg toks/fwd (tok/fwd)",
-            "value": 3.19,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8999,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8825 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-MXFP4 accuracy (GSM8K)",
-            "value": 0.8923,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8779 | fewshot: 3 | Model: /models/amd/Qwen3-235B-A22B-Instruct-2507-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.6854,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.793 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::Qwen3.5-35B-A3B TP2 accuracy (GSM8K)",
-            "value": 0.8673,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.83 | Baseline: 0.85 | BaselineModel: Qwen/Qwen3.5-35B-A3B | BaselineNote: Mean of first 4 valid CI runs (0.8226 / 0.8529 / 0.8620 / 0.8628). Threshold 0.83 from sglang nightly retained. | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8491 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
-            "value": 0.8613,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8453 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
-            "value": 84.12,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8453 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.52,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.8302,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.812 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
-            "value": 83.52,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.812 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.51,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.8992,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1956 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.8969,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620916079 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609111448 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1539 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -258595,6 +258381,82 @@ window.BENCHMARK_DATA = {
             "value": 379.4471,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38777311150 | docker_image=rocm/atom-dev:nightly_202610131249 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4-MCSTORE | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9506%2C%22cache_hit_tokens%22%3A1224329120%2C%22cache_total_tokens%22%3A1287988415%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A11119%2C%22concurrency%22%3A112%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4_mcstore%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3629.9455%2C%22e2el_ms%22%3A28377.2292%2C%22e2el_p90%22%3A56554.6785%2C%22e2el_p99%22%3A205129.9684%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610131249%22%2C%22input_tput%22%3A354823.0593%2C%22input_tput_per_gpu%22%3A44352.8824%2C%22interactivity%22%3A11.9631%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A11114%2C%22interactivity_p90_itl%22%3A39.2211%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A21.7444%2C%22itl_p90%22%3A25.4965%2C%22median_e2el_ms%22%3A16932.6221%2C%22median_itl_ms%22%3A22.4509%2C%22median_tpot_ms%22%3A22.4509%2C%22median_ttft_ms%22%3A4965.1098%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A3035.5771%2C%22output_tput_per_gpu%22%3A379.4471%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.8293%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc112-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38777311150%22%2C%22scenario%22%3A%22agentx%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A357858.6364%2C%22tpot_ms%22%3A21.7444%2C%22tpot_p90%22%3A25.4965%2C%22tpot_p99%22%3A30.6396%2C%22tput_per_gpu%22%3A44732.3296%2C%22ttft_ms%22%3A6793.1369%2C%22ttft_p90%22%3A13203.8958%2C%22ttft_p99%22%3A34998.848%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "yifehuan-amd",
+            "username": "yifehuan",
+            "email": "Yifeng.Huang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "67c54da4e0cb55954a69382f20c1f747604f29d3",
+          "message": "[ATOM] Enable DPA comm-fused MoE reduce-scatter with compact ragged gathers (#2429)\n\n* feat(comm-fused-moe): enable DPA reduce-scatter\n\nIntegrate DPA comm-fused reduce-scatter with model dispatch and tests. Pad gathered inputs inside each rank shard so bucket slack cannot cross reduce-scatter rank boundaries.\n\n* feat(comm-fused-moe): gather compact DPA inputs\n\nUse grouped all-gatherv for compact ragged inputs and enable the Direct path when the DPA input-gather phase proves prior partial reuse is synchronized. Reuse Aiter runtime bucket selection and expose explicit backend capability contracts.\n\n* fix(comm-fused-moe): use row-aware Stage2 callback\n\n* fix(comm-fused-moe): harden runtime integration\n\n* fix(comm-fused-moe): gate unsupported gfx950 hardware\n\n* fix(v41): align comm-fused Stage2 callbacks\n\n* fix(comm-fused-moe): defer device gating to aiter",
+          "timestamp": "2026-10-15T15:53:46Z",
+          "url": "https://github.com/ROCm/ATOM/commit/67c54da4e0cb55954a69382f20c1f747604f29d3"
+        },
+        "date": 1792105023408,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=1 perf point",
+            "value": 10.4791,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A10%2C%22concurrency%22%3A1%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A110.971%2C%22e2el_ms%22%3A11096.7603%2C%22e2el_p90%22%3A11855.518%2C%22e2el_p99%22%3A12036.3928%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A666.5978%2C%22input_tput_per_gpu%22%3A83.3247%2C%22interactivity%22%3A87.6324%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A11.41%2C%22itl_p90%22%3A11.5328%2C%22median_e2el_ms%22%3A10830.2077%2C%22median_itl_ms%22%3A11.4078%2C%22median_tpot_ms%22%3A11.4113%2C%22median_ttft_ms%22%3A495.791%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A10%2C%22osl%22%3A1024%2C%22output_tput%22%3A83.8327%2C%22output_tput_per_gpu%22%3A10.4791%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.0901%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc1-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098024000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A750.4305%2C%22tpot_ms%22%3A11.4099%2C%22tpot_p90%22%3A11.4191%2C%22tpot_p99%22%3A11.4201%2C%22tput_per_gpu%22%3A93.8038%2C%22ttft_ms%22%3A493.4708%2C%22ttft_p90%22%3A511.2478%2C%22ttft_p99%22%3A518.7002%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=128 perf point",
+            "value": 362.7929,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A1280%2C%22concurrency%22%3A128%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A405.788%2C%22e2el_ms%22%3A39134.7358%2C%22e2el_p90%22%3A41987.6105%2C%22e2el_p99%22%3A62114.2765%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A23300.249%2C%22input_tput_per_gpu%22%3A2912.5311%2C%22interactivity%22%3A33.5316%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A29.3755%2C%22itl_p90%22%3A30.6421%2C%22median_e2el_ms%22%3A38546.1344%2C%22median_itl_ms%22%3A29.8011%2C%22median_tpot_ms%22%3A29.8226%2C%22median_ttft_ms%22%3A11121.2877%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A1280%2C%22osl%22%3A1024%2C%22output_tput%22%3A2902.3432%2C%22output_tput_per_gpu%22%3A362.7929%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A3.1544%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc128-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792099747000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A26202.5922%2C%22tpot_ms%22%3A29.3671%2C%22tpot_p90%22%3A29.9743%2C%22tpot_p99%22%3A30.0581%2C%22tput_per_gpu%22%3A3275.324%2C%22ttft_ms%22%3A12145.8381%2C%22ttft_p90%22%3A13198.619%2C%22ttft_p99%22%3A34614.7825%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=16 perf point",
+            "value": 118.2413,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A160%2C%22concurrency%22%3A16%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A154.7957%2C%22e2el_ms%22%3A14911.6611%2C%22e2el_p90%22%3A16395.4977%2C%22e2el_p99%22%3A19138.4211%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A7590.8561%2C%22input_tput_per_gpu%22%3A948.857%2C%22interactivity%22%3A64.7058%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A15.3345%2C%22itl_p90%22%3A15.7997%2C%22median_e2el_ms%22%3A14787.2013%2C%22median_itl_ms%22%3A15.4211%2C%22median_tpot_ms%22%3A15.4546%2C%22median_ttft_ms%22%3A549.8046%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A160%2C%22osl%22%3A1024%2C%22output_tput%22%3A945.9306%2C%22output_tput_per_gpu%22%3A118.2413%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.0336%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc16-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098666000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A8536.7867%2C%22tpot_ms%22%3A15.3342%2C%22tpot_p90%22%3A15.5291%2C%22tpot_p99%22%3A15.5843%2C%22tput_per_gpu%22%3A1067.0983%2C%22ttft_ms%22%3A893.4569%2C%22ttft_p90%22%3A1285.7734%2C%22ttft_p99%22%3A4774.9601%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=2 perf point",
+            "value": 21.8636,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A20%2C%22concurrency%22%3A2%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A106.9416%2C%22e2el_ms%22%3A10653.0135%2C%22e2el_p90%22%3A11406.2141%2C%22e2el_p99%22%3A11498.5705%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A1383.7834%2C%22input_tput_per_gpu%22%3A172.9729%2C%22interactivity%22%3A92.0856%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A10.8493%2C%22itl_p90%22%3A11.0015%2C%22median_e2el_ms%22%3A10717.8101%2C%22median_itl_ms%22%3A10.8397%2C%22median_tpot_ms%22%3A10.8595%2C%22median_ttft_ms%22%3A500.0002%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A20%2C%22osl%22%3A1024%2C%22output_tput%22%3A174.9086%2C%22output_tput_per_gpu%22%3A21.8636%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.187%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc2-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098158000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A1558.6919%2C%22tpot_ms%22%3A10.8492%2C%22tpot_p90%22%3A10.8716%2C%22tpot_p99%22%3A10.8923%2C%22tput_per_gpu%22%3A194.8365%2C%22ttft_ms%22%3A517.0702%2C%22ttft_p90%22%3A546.7007%2C%22ttft_p99%22%3A759.2222%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=256 perf point",
+            "value": 374.304,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A2560%2C%22concurrency%22%3A256%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A788.2811%2C%22e2el_ms%22%3A75594.6025%2C%22e2el_p90%22%3A79582.1881%2C%22e2el_p99%22%3A96873.7924%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A23947.7071%2C%22input_tput_per_gpu%22%3A2993.4634%2C%22interactivity%22%3A33.3313%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A29.7559%2C%22itl_p90%22%3A30.9815%2C%22median_e2el_ms%22%3A76697.8863%2C%22median_itl_ms%22%3A29.9726%2C%22median_tpot_ms%22%3A30.0018%2C%22median_ttft_ms%22%3A49111.0045%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A2560%2C%22osl%22%3A1024%2C%22output_tput%22%3A2994.432%2C%22output_tput_per_gpu%22%3A374.304%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A3.2476%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc256-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792100724000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A26942.1391%2C%22tpot_ms%22%3A29.7421%2C%22tpot_p90%22%3A30.1519%2C%22tpot_p99%22%3A30.2696%2C%22tput_per_gpu%22%3A3367.7674%2C%22ttft_ms%22%3A48201.2738%2C%22ttft_p90%22%3A50211.3337%2C%22ttft_p99%22%3A68992.3934%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=32 perf point",
+            "value": 188.7259,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A320%2C%22concurrency%22%3A32%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A196.1462%2C%22e2el_ms%22%3A18946.955%2C%22e2el_p90%22%3A20641.211%2C%22e2el_p99%22%3A27289.3855%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A11991.3702%2C%22input_tput_per_gpu%22%3A1498.9213%2C%22interactivity%22%3A51.9001%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A19.1343%2C%22itl_p90%22%3A19.9516%2C%22median_e2el_ms%22%3A18703.3579%2C%22median_itl_ms%22%3A19.3301%2C%22median_tpot_ms%22%3A19.2678%2C%22median_ttft_ms%22%3A741.308%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A320%2C%22osl%22%3A1024%2C%22output_tput%22%3A1509.8073%2C%22output_tput_per_gpu%22%3A188.7259%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.6314%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc32-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098912000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A13501.1775%2C%22tpot_ms%22%3A19.1365%2C%22tpot_p90%22%3A19.6545%2C%22tpot_p99%22%3A19.7119%2C%22tput_per_gpu%22%3A1687.6472%2C%22ttft_ms%22%3A1258.3387%2C%22ttft_p90%22%3A1891.3961%2C%22ttft_p99%22%3A9306.9012%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=4 perf point",
+            "value": 39.6944,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A40%2C%22concurrency%22%3A4%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A115.901%2C%22e2el_ms%22%3A11214.1726%2C%22e2el_p90%22%3A12138.8631%2C%22e2el_p99%22%3A12951.0638%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A2537.0782%2C%22input_tput_per_gpu%22%3A317.1348%2C%22interactivity%22%3A86.453%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A11.5671%2C%22itl_p90%22%3A12.113%2C%22median_e2el_ms%22%3A11337.1995%2C%22median_itl_ms%22%3A11.5237%2C%22median_tpot_ms%22%3A11.567%2C%22median_ttft_ms%22%3A514.5821%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A40%2C%22osl%22%3A1024%2C%22output_tput%22%3A317.5554%2C%22output_tput_per_gpu%22%3A39.6944%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.3451%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc4-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098305000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A2854.6336%2C%22tpot_ms%22%3A11.5668%2C%22tpot_p90%22%3A11.6035%2C%22tpot_p99%22%3A11.7185%2C%22tput_per_gpu%22%3A356.8292%2C%22ttft_ms%22%3A582.5994%2C%22ttft_p90%22%3A805.1423%2C%22ttft_p99%22%3A1307.738%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=64 perf point",
+            "value": 289.8258,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A640%2C%22concurrency%22%3A64%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A254.4317%2C%22e2el_ms%22%3A24581.1027%2C%22e2el_p90%22%3A26449.8476%2C%22e2el_p99%22%3A40627.0878%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A18580.795%2C%22input_tput_per_gpu%22%3A2322.5994%2C%22interactivity%22%3A40.2921%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A24.4985%2C%22itl_p90%22%3A25.5939%2C%22median_e2el_ms%22%3A24029.3972%2C%22median_itl_ms%22%3A24.7919%2C%22median_tpot_ms%22%3A24.8188%2C%22median_ttft_ms%22%3A1118.7705%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A640%2C%22osl%22%3A1024%2C%22output_tput%22%3A2318.6062%2C%22output_tput_per_gpu%22%3A289.8258%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.5154%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc64-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792099236000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A20899.4012%2C%22tpot_ms%22%3A24.505%2C%22tpot_p90%22%3A25.1132%2C%22tpot_p99%22%3A25.2706%2C%22tput_per_gpu%22%3A2612.4251%2C%22ttft_ms%22%3A2024.2947%2C%22ttft_p90%22%3A2233.7065%2C%22ttft_p99%22%3A17774.0621%7D"
+          },
+          {
+            "name": "Atomesh::GLM-5.2-MXFP4 mi350x_atomesh-vllm_mxfp4_1p1d_tp4 8192/1024 c=8 perf point",
+            "value": 72.2819,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38768847498 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP4 | random_range_ratio=0.8 | perf_point=%7B%22backend%22%3A%22atomesh-vllm%22%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI350X%20%28atomesh-vllm%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A80%2C%22concurrency%22%3A8%2C%22config_label%22%3A%22mi350x_atomesh-vllm_mxfp4_1p1d_tp4%22%2C%22date%22%3A%222026-10-15%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A128.0905%2C%22e2el_ms%22%3A12530.8548%2C%22e2el_p90%22%3A13617.7916%2C%22e2el_p99%22%3A14919.6211%2C%22hardware%22%3A%22mi350x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A4565.5926%2C%22input_tput_per_gpu%22%3A570.6991%2C%22interactivity%22%3A77.9899%2C%22interactivity_method%22%3A%22median_tpot%22%2C%22isl%22%3A8192%2C%22itl_ms%22%3A12.8049%2C%22itl_p90%22%3A13.2353%2C%22median_e2el_ms%22%3A12633.7887%2C%22median_itl_ms%22%3A12.779%2C%22median_tpot_ms%22%3A12.8222%2C%22median_ttft_ms%22%3A519.1113%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22num_prompts%22%3A80%2C%22osl%22%3A1024%2C%22output_tput%22%3A578.2553%2C%22output_tput_per_gpu%22%3A72.2819%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.6246%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl8192-osl1024-conc8-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38768847498%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22timestamp%22%3A1792098467000%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A5143.8478%2C%22tpot_ms%22%3A12.8036%2C%22tpot_p90%22%3A12.9031%2C%22tpot_p99%22%3A12.9915%2C%22tput_per_gpu%22%3A642.981%2C%22ttft_ms%22%3A688.0774%2C%22ttft_p90%22%3A936.4019%2C%22ttft_p99%22%3A2564.8082%7D"
           }
         ]
       }
