@@ -141,6 +141,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP decode rank owns into a GPU staging slot and send whole destination
     # pages instead of one RDMA descriptor per token. 0 = per-token path.
     "ATOM_PD_MLA_STAGING": lambda: _flag_env("ATOM_PD_MLA_STAGING", "1"),
+    # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
+    # does not serve): pages per producer slot that repacks MLA KV for a DCP
+    # consumer below a page of interleave; 0 writes each token run in place.
+    "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
+        "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 128
+    ),
     # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
     # GPU landing pool, first come, first served (see mla_landing.py). A stage
     # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
