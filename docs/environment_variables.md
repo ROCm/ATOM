@@ -75,7 +75,6 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK** | float\|"" | "" (None) | If set, a prefillable rank below this KV usage force-releases (GPU starving). |
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
-| **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across hold ticks (delayer probe and DP chunk-cost estimate). It walks again when a hash the walk read is evicted or remapped to another block, the hash at its first miss is published, `clear_cache` runs, more than 8192 evictions and remaps happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-probes every tick. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
@@ -325,17 +324,18 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 
 ## Prefix cache lookup
 
-Both default on and move work off the scheduler thread.
-`ATOM_FRONTEND_PREFIX_HASH=0` gives the same hits. `ATOM_PREFIX_FAST_WALK=0`
-does not always: the fast walk compares tokens only on the last hit block, so a
+All three default on and move work off the scheduler thread.
+`ATOM_FRONTEND_PREFIX_HASH=0` and `ATOM_PREFIX_WALK_MEMO=0` give the same hits.
+`ATOM_PREFIX_FAST_WALK=0` does not always: the fast walk compares tokens only on the last hit block, so a
 64-bit xxhash chained-hash collision on an interior block reuses another
 prompt's KV with no error (wrong output). `0` compares every hit block's tokens
 and catches it; set it when chasing a corruption that does not reproduce.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens. The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks after prefill, so prefill hashes no prompt block on the scheduler thread (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens; the LMCache/offload and PD-transfer publish paths still hash their blocks). Any mismatch falls back to engine-side hashing. Read in the API server process. |
-| **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's whole chain up in one pass, compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
+| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens, beside the request in the ADD message (never inside a pickled `Sequence`; with `DisaggCoreManager` only the decode engine, which allocates, gets it). The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks after prefill, so prefill hashes no prompt block on the scheduler thread (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens; the LMCache/offload and PD-transfer publish paths still hash their blocks). Any mismatch falls back to engine-side hashing. Read in the API server process. |
+| **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
+| **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
 
 ## State checkpoints
 
