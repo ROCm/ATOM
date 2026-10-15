@@ -1128,7 +1128,8 @@ models:
         # count every stage shares at 81K; three plus five, and three layers
         # fewer of weights, lift it to about 147K. Boundaries land on AttnRes
         # blocks as in the aggregated PART12 cell.
-        - <<: *kimi_k3_1p1d_pp8_dspark3
+        - &kimi_k3_1p1d_pp8_dspark3_part12
+          <<: *kimi_k3_1p1d_pp8_dspark3
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part12
           display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-PART12
           env:
@@ -1136,6 +1137,17 @@ models:
             prefill:
               <<: *kimi_k3_1p1d_pp8_dspark3_prefill_env
               VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+
+        # The PART12 cell at the DCP8TP8-DSpark3 sweep's other concurrencies.
+        - <<: *kimi_k3_1p1d_pp8_dspark3_part12
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c88-part12
+          concurrency: [88]
+          run_eval: false
+
+        - <<: *kimi_k3_1p1d_pp8_dspark3_part12
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c56-part12
+          concurrency: [56]
+          run_eval: false
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
