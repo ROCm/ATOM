@@ -494,10 +494,20 @@ def _cpu_step(lengths, positions, finals):
         ([64, 64], [True, True]),
     ],
 )
-def test_the_plan_runs_what_the_rank_reported(lengths, finals):
+def test_the_plan_runs_what_the_rank_reported(lengths, finals, monkeypatch):
     """The counts a rank reports from its batch are the counts its replay plan
     runs, or its peers' collectives would wait on rows it never sends."""
+    from atom.models.deepseek_v41 import bounded_replay
     from atom.models.deepseek_v41.bounded_replay import planned_stage_tokens
+
+    # The Triton row gather, in torch: this runs where Triton is absent.
+    monkeypatch.setattr(
+        bounded_replay,
+        "_gather_rows",
+        lambda rows, *tensors, dim=0: tuple(
+            t.index_select(dim, rows.long()) for t in tensors
+        ),
+    )
 
     step = _cpu_step(lengths, [0] * len(lengths), finals)
     plan = build_replay_plan(step, 128)
