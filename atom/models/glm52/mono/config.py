@@ -201,6 +201,17 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
 
     if _is_neox_rope_style(hf_config, "rope_interleave", default_is_neox=False):
         return f"rope_interleave={getattr(hf_config, 'rope_interleave', None)!r}"
+    # The fused indexer has its own rope instance and its own flag, and the
+    # kernel rotates its keys in pairs too (`kernel.py`'s index-key stage).
+    # Note the default is the opposite one: production resolves a missing or
+    # null `indexer_rope_interleave` to NeoX, so here it is the ABSENT field
+    # that is unservable and `=true` that is fine. Same reason this resolves
+    # instead of comparing.
+    if _is_neox_rope_style(hf_config, "indexer_rope_interleave", default_is_neox=True):
+        return (
+            "indexer_rope_interleave="
+            f"{getattr(hf_config, 'indexer_rope_interleave', None)!r}"
+        )
     return None
 
 

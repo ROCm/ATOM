@@ -74,6 +74,9 @@ def _served_tp4_fp8_config(*, speculative_config, compilation_config=None):
         norm_topk_prob=True,
         rms_norm_eps=EPS,
         moe_intermediate_size=cfg.inter * 8,
+        # GLM-5.x sets this; it overrides a default that would be NeoX, which
+        # the fused indexer kernel cannot serve (`deepseek_v2.py`).
+        indexer_rope_interleave=True,
     )
     return SimpleNamespace(
         hf_config=hf_config,
@@ -223,7 +226,7 @@ _MISSING = object()
         (0, True),
     ],
 )
-def test_neox_rope_is_refused_but_the_interleaved_default_is_not(
+def test_neox_mla_rope_is_refused_but_the_interleaved_default_is_not(
     rope_interleave, refused
 ):
     """The kernel rotates adjacent pairs with no NeoX branch, so a NeoX
@@ -243,5 +246,39 @@ def test_neox_rope_is_refused_but_the_interleaved_default_is_not(
     # geometry checks above the gate pass, so the gate is actually reached.
     if refused:
         assert why == f"rope_interleave={rope_interleave!r}"
+    else:
+        assert why is None
+
+
+@pytest.mark.parametrize(
+    ("indexer_rope_interleave", "refused"),
+    [
+        (_MISSING, True),  # no field at all -> production resolves to NeoX
+        (None, True),  # explicit null -> same default
+        (False, True),
+        (0, True),
+        (True, False),  # what GLM-5.x actually sets
+        (1, False),
+    ],
+)
+def test_neox_indexer_rope_is_refused_and_its_default_is_the_refused_one(
+    indexer_rope_interleave, refused
+):
+    """The indexer carries a second, independent rope whose default is the
+    opposite of MLA's: a missing `indexer_rope_interleave` means NeoX, and the
+    fused kernel rotates index keys in pairs. Decode would then score keys
+    that prefill wrote under a different layout and pick wrong sparse indices.
+    """
+    cfg = _served_tp4_fp8_config(
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4)
+    ).hf_config
+    if indexer_rope_interleave is _MISSING:
+        del cfg.indexer_rope_interleave
+    else:
+        cfg.indexer_rope_interleave = indexer_rope_interleave
+    why = model_geometry_refusal(cfg, GLM5_CONFIG, 8)
+    seen = None if indexer_rope_interleave is _MISSING else indexer_rope_interleave
+    if refused:
+        assert why == f"indexer_rope_interleave={seen!r}"
     else:
         assert why is None
