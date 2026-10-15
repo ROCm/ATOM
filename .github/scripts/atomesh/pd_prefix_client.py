@@ -14,4 +14,6 @@ from aiperf.timing import phase_orchestrator
 if "/prefix-read-fixed/client/" not in phase_orchestrator.__file__:
     raise RuntimeError("unpatched AIPerf phase orchestrator")
 
-runpy.run_module("aiperf", run_name="__main__")
+# Spawned AIPerf children re-import this file as __mp_main__.
+if __name__ == "__main__":
+    runpy.run_module("aiperf", run_name="__main__")

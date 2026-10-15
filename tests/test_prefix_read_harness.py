@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -268,3 +269,30 @@ def test_unsharded_model_without_index(tmp_path):
     result = helper.check_model(tmp_path)
     assert result["index_sha256"] is None
     assert result["shards"] == [{"path": "model.safetensors", "bytes": 7}]
+
+
+def test_client_spawned_children_do_not_rerun_aiperf(tmp_path):
+    client = tmp_path / "prefix-read-fixed/client"
+    (client / "aiperf/timing").mkdir(parents=True)
+    (client / "sitecustomize.py").write_text("ACTIVE = True\n")
+    (client / "aiperf/__init__.py").write_text("")
+    (client / "aiperf/timing/__init__.py").write_text("")
+    (client / "aiperf/timing/phase_orchestrator.py").write_text("")
+    # The weka trace loader reconstructs traces in a spawn-context pool.
+    (client / "aiperf/__main__.py").write_text(
+        "import multiprocessing\n"
+        "from concurrent.futures import ProcessPoolExecutor\n"
+        "print('aiperf-main', flush=True)\n"
+        "ctx = multiprocessing.get_context('spawn')\n"
+        "with ProcessPoolExecutor(1, mp_context=ctx) as pool:\n"
+        "    print(list(pool.map(abs, [-1])), flush=True)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(SCRIPTS / "pd_prefix_client.py")],
+        env={"PYTHONPATH": str(client)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["aiperf-main", "[1]"]
