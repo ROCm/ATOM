@@ -1077,7 +1077,8 @@ models:
         # others relay its aux hidden states forward. The prefill runs eager:
         # PP cudagraphs do not carry speculative decoding, and a P/D producer
         # never decodes.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_1p1d_pp8_dspark3
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72
           topology: 1p1d_pp8_dcp8
           display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3
@@ -1098,10 +1099,10 @@ models:
               num_speculative_tokens: 3
               spec_decode_acceptance_length: 3.00
           env:
-            common:
+            common: &kimi_k3_1p1d_pp8_dspark3_common_env
               ATOM_ENABLE_REPLAYSSM: "1"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-            prefill:
+            prefill: &kimi_k3_1p1d_pp8_dspark3_prefill_env
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "96"
@@ -1109,6 +1110,18 @@ models:
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
           run_eval: true
           eval_concurrency: [72]
+
+        # The cell above writing each token run of MLA KV to the DCP8 decode
+        # in place instead of through the producer's staging pages, for A/B.
+        - <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-nostage
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-NOSTAGE
+          env:
+            common: *kimi_k3_1p1d_pp8_dspark3_common_env
+            prefill:
+              <<: *kimi_k3_1p1d_pp8_dspark3_prefill_env
+              ATOM_PD_MLA_STAGING_CHUNK_PAGES: "0"
+          run_eval: false
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
