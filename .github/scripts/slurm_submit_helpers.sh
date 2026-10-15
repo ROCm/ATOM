@@ -528,7 +528,7 @@ monitor_slurm_job() {
       "${SLURM_EXTRA_LOG_STREAMER}" "${job_id}"
     fi
     if [[ -n "${SLURM_EXTRA_STATUS_CHECKER:-}" ]]; then
-      "${SLURM_EXTRA_STATUS_CHECKER}" "${job_id}"
+      "${SLURM_EXTRA_STATUS_CHECKER}" "${job_id}" "${state}"
     fi
 
     if slurm_state_is_terminal "${state}"; then
