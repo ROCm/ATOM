@@ -134,11 +134,15 @@ def check_capacity(
 def check_model(root: Path) -> dict:
     config = root / "config.json"
     index = root / "model.safetensors.index.json"
-    mapping = json.loads(index.read_text())["weight_map"]
-    if not mapping:
-        raise RuntimeError(f"empty model shard index: {root}")
+    if index.is_file():
+        names = set(json.loads(index.read_text())["weight_map"].values())
+    else:
+        # Unsharded checkpoints (e.g. the DSpark draft) have no index.
+        names = {path.name for path in root.glob("*.safetensors")}
+    if not names:
+        raise RuntimeError(f"no safetensors weights: {root}")
     shards = []
-    for name in sorted(set(mapping.values())):
+    for name in sorted(names):
         path = root / name
         if Path(name).is_absolute() or ".." in Path(name).parts:
             raise RuntimeError(f"unsafe model shard name: {name}")
@@ -152,7 +156,7 @@ def check_model(root: Path) -> dict:
     return {
         "path": str(root),
         "config_sha256": digest(config),
-        "index_sha256": digest(index),
+        "index_sha256": digest(index) if index.is_file() else None,
         "shards": shards,
         "weight_contents_hashed": False,
     }

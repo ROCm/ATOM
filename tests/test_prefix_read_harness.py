@@ -255,3 +255,16 @@ def test_missing_model_shards_fail(tmp_path):
         helper.check_model(tmp_path)
     (tmp_path / "missing.safetensors").write_bytes(b"fixture")
     assert helper.check_model(tmp_path)["weight_contents_hashed"] is False
+
+
+def test_unsharded_model_without_index(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    with pytest.raises(RuntimeError, match="no safetensors"):
+        helper.check_model(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="empty"):
+        helper.check_model(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"fixture")
+    result = helper.check_model(tmp_path)
+    assert result["index_sha256"] is None
+    assert result["shards"] == [{"path": "model.safetensors", "bytes": 7}]
