@@ -285,6 +285,21 @@ def config_refusal(atom_config) -> str | None:
             "routed scaling factor != 1",
         ),
         (getattr(hf, "num_expert_group", 1) == 1, "expert groups"),
+        # The route stage bakes the router in, it does not read these fields:
+        # it scores with sigmoid and renormalizes the pre-bias sigmoids by an
+        # IEEE ``1 / sum`` (``kernels/stages/moe.py``), while the production
+        # path hands both to ``FusedMoE`` from the config (``model.py``).
+        # Today's shipped ``moonshotai/Kimi-K3`` is exactly sigmoid +
+        # renormalize, so these are LATENT refusals -- nothing is miscomputed
+        # right now. They are here because a checkpoint that flipped either
+        # field would be served by the wrong router with no error at all: a
+        # softmax checkpoint scored as sigmoid, or unnormalized weights
+        # normalized, is a silently different model, not a crash.
+        (
+            (act := getattr(hf, "moe_router_activation_func", None)) == "sigmoid",
+            f"router activation {act!r}",
+        ),
+        (getattr(hf, "moe_renormalize", None) is True, "router does not renormalize"),
         (
             float(getattr(hf, "activation_situ_beta", 0.0) or 0.0) == SITU_BETA,
             "SiTU beta",
