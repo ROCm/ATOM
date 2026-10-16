@@ -812,7 +812,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
-        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PLAN_MAX_BATCH,
+            flydsl_plan_shape,
+        )
 
         n = int(context_lens.shape[0])
         if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
@@ -827,9 +830,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ):
             return None
 
-        # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
-        # default. Setting it from the static split count clamps every request
-        # alike and removes the planner's mechanism -- this tree did that once.
+        # `max_partitions` is never the static split count: that clamps every
+        # request alike and removes the planner's mechanism -- this tree did
+        # that once. It takes plan_pa_decode's own default, except at head_dim
+        # 256, where `flydsl_plan_shape` caps it at 64 with a 256-workgroup
+        # budget to keep aiter's reducer off its slow serial path; remove that
+        # once aiter #5949 is in the image. The shape is fixed per builder (its
+        # KV pools are), so the key needs no part of it; the op's runtime plans
+        # take the same shape from the call's own head size.
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
@@ -854,7 +862,14 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 )
             return None
         if plan is None:
-            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
+            # One head size across this builder's pools, or aiter's defaults.
+            head_dims = {geometry.head_dim for geometry in self.kv_pools}
+            plan = plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                **flydsl_plan_shape(head_dims.pop() if len(head_dims) == 1 else None),
+            )
             self._flydsl_plans[key] = plan
             logger.info(
                 "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
