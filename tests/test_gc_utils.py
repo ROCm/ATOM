@@ -61,16 +61,15 @@ def _leave_gc_as_found():
 def test_freezing_takes_the_live_heap_out_of_the_collectors_reach():
     live = [object() for _ in range(64)]
     gc.collect()
-    before = gc.get_freeze_count()
+    assert gc.is_tracked(live)
 
     freeze_gc_heap("test")
 
-    assert gc.get_freeze_count() > before, "nothing was frozen"
-    # Control: what the frozen set is for. `gc.get_objects()` reports only what
-    # a collection would still walk, so the drop is the cost that goes away.
-    assert len(gc.get_objects()) < len(live), (
-        "the live heap is still visible to the collector, so freezing bought " "nothing"
-    )
+    # Inspect the held object: process-wide counts also include unrelated
+    # objects allocated or released while the freeze helper logs its result.
+    assert all(
+        obj is not live for obj in gc.get_objects()
+    ), "the live heap is still visible to the collector, so freezing bought nothing"
 
 
 def test_new_objects_are_still_collected_after_a_freeze():
@@ -136,17 +135,25 @@ def test_unfreezing_makes_the_startup_heap_reclaimable_again():
     assert gc.collect() > 0, "unfreezing did not hand the object back"
 
 
-def test_freezing_twice_is_additive_and_harmless():
+@pytest.mark.parametrize("retiring_count", [0, 64])
+def test_freezing_twice_is_additive_and_harmless(retiring_count):
     """The disaggregated decode path freezes a second time, once its block pool
     exists -- it is built later in `DecodeEngineCore.__init__`, after the base
     freeze has already run."""
+    live = [object() for _ in range(64)]
+    retiring = [[] for _ in range(retiring_count)]
     freeze_gc_heap("first")
-    first = gc.get_freeze_count()
     later = [object() for _ in range(64)]
+    assert gc.is_tracked(live) and gc.is_tracked(later)
+    # Freezing excludes cyclic collection, not reference-counted destruction.
+    # Releasing frozen objects can offset newly frozen ones in the global count.
+    del retiring
     freeze_gc_heap("second")
 
-    assert gc.get_freeze_count() > first, "the second freeze caught nothing"
-    assert len(later) == 64  # and did not disturb what it froze
+    visible = {id(obj) for obj in gc.get_objects()}
+    assert id(live) not in visible, "the first heap is no longer frozen"
+    assert id(later) not in visible, "the second freeze left new objects visible"
+    assert len(live) == len(later) == 64  # and did not disturb what it froze
 
 
 def test_the_frozen_count_cannot_be_mirrored_so_nothing_scrape_side_reads_it():
