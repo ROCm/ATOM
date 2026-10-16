@@ -72,6 +72,7 @@ from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_l
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import DenseLayer, SparseMoeLayer
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.runtime.aux_taps import bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
@@ -146,9 +147,9 @@ class MonoDecodeRunner:
     shard, then all agree (``consensus.bind_agreed``) before the peer handshake, so a rank that
     refuses turns mono off on every rank instead of leaving the others waiting."""
 
-    def __init__(self, causal_lm) -> None:
+    def __init__(self, causal_lm, drafter=None, require_aux: bool = False) -> None:
         group = get_tp_group().cpu_group
-        bind_agreed(lambda: self._bind(causal_lm), group)
+        bind_agreed(lambda: self._bind(causal_lm, drafter, require_aux), group)
         self._allocate(group)
         # per decode batch size (every graph captures its own) a sparse layer
         # kernel of each kind the layers use (``self.k4[n][lw.index_topk]``) and,
@@ -176,7 +177,7 @@ class MonoDecodeRunner:
             (launch, _KERNEL_ABI.get(kind, K4_ABI)) for kind, launch in kernels.items()
         ]
 
-    def _bind(self, causal_lm) -> None:
+    def _bind(self, causal_lm, drafter, require_aux: bool) -> None:
         """This rank's checks and weight views; raises ``MonoUnsupported``."""
         model = causal_lm.model
         config = causal_lm.config
@@ -185,6 +186,9 @@ class MonoDecodeRunner:
             raise MonoUnsupported(f"TP {npes}")
         layers = model.layers
         self.dense_mono = dense_prefix_mono(layers)
+        if require_aux and drafter is None:
+            raise MonoUnsupported("no DSpark drafter")
+        self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
         self.model = model
         self.npes = npes
         self.rank = get_tensor_model_parallel_rank()
@@ -354,6 +358,7 @@ class MonoDecodeRunner:
         rows = token_rows(fwd, res.shape[0])
         for i, lw in enumerate(self.sparse):
             res = self.run_sparse_layer(i, lw, fwd, positions, res, rows)
+            self._write_aux(lw.layer_id - 1, self.h[: res.shape[0]])
             if lw.layer_id in aux_layers:
                 aux.append(self.h[: res.shape[0]].clone())
         hidden = self.finish_step(res)
@@ -501,10 +506,18 @@ class MonoDecodeRunner:
         """The final norm (the mailboxes are cleared at the next step's start:
         ``StepMailboxes.begin_step``)."""
         ar = self.ars[len(self.sparse) % 2]
-        hidden, _ = self.model.norm(ar[: res.shape[0]], res)
+        hidden, residual = self.model.norm(ar[: res.shape[0]], res)
+        self._write_aux(self.sparse[-1].layer_id, residual)
         if self.debug and not torch.cuda.is_current_stream_capturing():
             self.raise_on_given_up_waits(res.shape[0])
         return hidden
+
+    def _write_aux(self, layer_id: int, value: torch.Tensor) -> None:
+        if self.aux is None or layer_id not in self.aux.layer_ids:
+            return
+        self.aux.buffers[self.aux.layer_ids.index(layer_id)][: value.shape[0]].copy_(
+            value
+        )
 
     def raise_on_given_up_waits(self, n: int) -> None:
         """A debug build's step: raise with every mailbox wait that gave up (its
