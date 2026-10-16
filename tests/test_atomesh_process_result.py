@@ -267,49 +267,49 @@ class DashboardCliTest(unittest.TestCase):
 
     def test_cli_keeps_measured_zero_and_skips_all_unmeasured_point(self):
         for output_tput, expected_entries in ((0, 1), ("NaN", 0)):
-            with self.subTest(output_tput=output_tput):
-                with tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    path = write_cell(root, "agg", False)
-                    payload = json.loads(path.read_text(encoding="utf-8"))
-                    payload.update(
-                        total_token_throughput=0 if expected_entries else "NaN",
-                        input_throughput=0 if expected_entries else "Infinity",
-                        output_throughput=output_tput,
-                        median_tpot_ms="-Infinity",
-                        mean_ttft_ms=0,
-                    )
-                    path.write_text(
-                        json.dumps(payload, allow_nan=False), encoding="utf-8"
-                    )
-                    entries, points, summary = self.run_cli(root)
-                    self.assertEqual(len(entries), expected_entries)
-                    if expected_entries:
-                        self.assertEqual(entries[0]["value"], 0.0)
-                        self.assertEqual(points["agg"]["output_tput"], 0.0)
-                        self.assertEqual(points["agg"]["ttft_ms"], 0.0)
-                        for key in (
-                            "tput_per_gpu",
-                            "input_tput_per_gpu",
-                            "output_tput_per_gpu",
-                        ):
-                            self.assertEqual(points["agg"][key], 0.0)
-                        headers, _, row = [
-                            line.split("|")[1:-1]
-                            for line in summary.splitlines()
-                            if line.startswith("|")
-                        ]
-                        cells = dict(zip(map(str.strip, headers), map(str.strip, row)))
-                        for column in (
-                            "Total tok/s/GPU",
-                            "Input tok/s/GPU",
-                            "Output tok/s/GPU",
-                        ):
-                            self.assertEqual(float(cells[column]), 0.0)
-                    else:
-                        self.assertEqual(points, {})
-                    self.assertNotIn("nan", summary.lower())
-                    self.assertNotIn("infinity", summary.lower())
+            with (
+                self.subTest(output_tput=output_tput),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                root = Path(tmp)
+                path = write_cell(root, "agg", False)
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload.update(
+                    total_token_throughput=0 if expected_entries else "NaN",
+                    input_throughput=0 if expected_entries else "Infinity",
+                    output_throughput=output_tput,
+                    median_tpot_ms="-Infinity",
+                    mean_ttft_ms=0,
+                )
+                path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+                entries, points, summary = self.run_cli(root)
+                self.assertEqual(len(entries), expected_entries)
+                if expected_entries:
+                    self.assertEqual(entries[0]["value"], 0.0)
+                    self.assertEqual(points["agg"]["output_tput"], 0.0)
+                    self.assertEqual(points["agg"]["ttft_ms"], 0.0)
+                    for key in (
+                        "tput_per_gpu",
+                        "input_tput_per_gpu",
+                        "output_tput_per_gpu",
+                    ):
+                        self.assertEqual(points["agg"][key], 0.0)
+                    headers, _, row = [
+                        line.split("|")[1:-1]
+                        for line in summary.splitlines()
+                        if line.startswith("|")
+                    ]
+                    cells = dict(zip(map(str.strip, headers), map(str.strip, row)))
+                    for column in (
+                        "Total tok/s/GPU",
+                        "Input tok/s/GPU",
+                        "Output tok/s/GPU",
+                    ):
+                        self.assertEqual(float(cells[column]), 0.0)
+                else:
+                    self.assertEqual(points, {})
+                self.assertNotIn("nan", summary.lower())
+                self.assertNotIn("infinity", summary.lower())
 
 
 if __name__ == "__main__":
