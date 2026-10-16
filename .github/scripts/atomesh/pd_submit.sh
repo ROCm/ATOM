@@ -407,6 +407,19 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
+spur_workload_never_started() {
+  local job_id="$1" job_line state
+  job_line="$(query_slurm_job "${job_id}")" || return 1
+  IFS='|' read -r _ state _ <<< "${job_line}"
+  if [[ "${state}" != "RUNNING" ]]; then
+    SPUR_RUNNING_SINCE=""
+    return 1
+  fi
+  compgen -G "${LOG_ROOT}/slurm_job-${job_id}/rank-workload-*.json" >/dev/null && return 1
+  SPUR_RUNNING_SINCE="${SPUR_RUNNING_SINCE:-${SECONDS}}"
+  (( SECONDS - SPUR_RUNNING_SINCE >= ${ATOMESH_WORKLOAD_START_TIMEOUT_SECONDS:-1200} ))
+}
+
 check_spur_workload_failure() {
   local job_id="$1"
   # A failed worker is conclusive even if Spur still reports RUNNING.
@@ -414,7 +427,12 @@ check_spur_workload_failure() {
     --run-dir "${LOG_ROOT}/slurm_job-${job_id}" --job-id "${job_id}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
     --scheduler-error-path "${SLURM_JOB_ERROR}"; then
-    return 0
+    if ! spur_workload_never_started "${job_id}"; then
+      return 0
+    fi
+    # A controller restart can leave a RUNNING allocation whose workers never start.
+    echo "ERROR: Slurm job ${job_id} RUNNING without any worker status; cancelling" >&2
+    SPUR_WORKLOAD_CHECK_RC=124
   else
     SPUR_WORKLOAD_CHECK_RC=$?
   fi
@@ -431,7 +449,14 @@ check_spur_workload_failure() {
   done
   # Preserve the failed result even when the peer cleanup succeeds.
   scancel_slurm_job "workload failed"
-  SLURM_EXTRA_STATUS_CHECKER=""
+  # A cancel sent while the controller is unreachable is lost; resend on the next poll.
+  local queue_rc=0
+  slurm_job_in_queue "${job_id}" || queue_rc=$?
+  if [[ "${queue_rc}" -eq 1 ]]; then
+    SLURM_EXTRA_STATUS_CHECKER=""
+  else
+    SCANCEL_SENT=0
+  fi
 }
 
 # Every Spur worker writes container output to shared storage, regardless of
