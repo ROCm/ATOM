@@ -26,9 +26,8 @@ class SpurDispatchTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         self.script = scripts / JOB_SCRIPT.name
         shutil.copyfile(JOB_SCRIPT, self.script)
-        shutil.copyfile(
-            JOB_SCRIPT.with_name("pd_job_result.py"), scripts / "pd_job_result.py"
-        )
+        for helper in ("pd_job_result.py", "cap_log.py"):
+            shutil.copyfile(JOB_SCRIPT.with_name(helper), scripts / helper)
         (scripts / "setup_mesh.sh").write_text("echo /fake/atomesh\n")
         self.bin_dir = self.root / "bin"
         self.bin_dir.mkdir()
@@ -283,6 +282,21 @@ class SpurDispatchTest(unittest.TestCase):
         self.assertEqual((self.run_dir / "rank-rc-0").read_text(), "7\n")
         status = json.loads((self.run_dir / "rank-workload-0.json").read_text())
         self.assertEqual(status["status"], "running")
+
+    def test_runaway_container_log_is_capped_and_container_killed(self):
+        limit = 1024 * 1024
+        result = self.run_job(
+            "--spur-worker",
+            CONTAINER_LOG_BYTES=str(8 * limit),
+            ATOMESH_CONTAINER_LOG_MAX_BYTES=str(limit),
+        )
+        content = (self.run_dir / "rank-0/container.log").read_bytes()
+        self.assertTrue(content.startswith(b"container stdout start\n"))
+        self.assertIn(b"container log reached 1048576 bytes", content)
+        self.assertLess(len(content), limit + 1024)
+        self.assertNotIn(b"container stderr end", content)
+        self.assertIn("log exceeded 1048576 bytes", result.stderr)
+        self.assertIn(["kill", "atomesh-test-cell-42-0"], self.docker_calls(0))
 
     def test_log_summary_failure_does_not_replace_container_exit_code(self):
         self.write_tool("tail", "raise SystemExit(23)")
