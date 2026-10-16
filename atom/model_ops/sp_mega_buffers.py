@@ -22,11 +22,10 @@ def _copy_tail_kernel(
     value = tl.load(source + offsets, offsets < elements, 0)
     tl.store(out + offsets, value, offsets < elements)
     if HAS_SCALE:  # noqa: SIM102 - discard the absent scale pointer at compile time
-        # The first CTA can copy all scales (at most 2048 rows per tile).
-        if pid == 0:
-            r = tl.arange(0, BLOCK)
-            scale = tl.load(source_scale + r, r < rows, 0)
-            tl.store(out_scale + r, scale, r < rows)
+        # rows <= elements: the data offsets also cover every scale row.
+        if pid * BLOCK < rows:
+            scale = tl.load(source_scale + offsets, offsets < rows, 0)
+            tl.store(out_scale + offsets, scale, offsets < rows)
 
 
 def copy_tail(source, source_scale, out, out_scale):

@@ -10,7 +10,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.mark.parametrize("fp8", [False, True])
-@pytest.mark.parametrize("rows", [1, 65, 512, 1024])
+@pytest.mark.parametrize("rows", [1, 65, 512, 1024, 8192])
 def test_tail_copy_owns_rank_slice_and_replays_changed_input(fp8, rows):
     from atom.model_ops.sp_mega_buffers import copy_tail
 
