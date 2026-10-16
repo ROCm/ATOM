@@ -1,48 +1,87 @@
 name: ATOM Agentic Benchmark
-run-name: TP4 C1 · current image · baseline 38855733134 · ${{ github.actor }}
-
-on:
-  workflow_dispatch:
-
+run-name: TP4 C1 decode · Triton ablation + repeat · ${{ github.actor }}
+'on':
+  workflow_dispatch: null
 permissions:
   contents: read
-
 concurrency:
   group: tp4-c1-image-ab
   cancel-in-progress: false
-
 jobs:
   compare:
-    name: TP4 C1 · 1015 · same runner and frozen baseline client
-    runs-on: [self-hosted, pit2-p03-g08]
-    timeout-minutes: 300
+    name: Decode attribution · 1012 / 1015 / Triton rollback / repeat
+    runs-on:
+    - self-hosted
+    - pit2-p03-g08
+    timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v6
-        with:
-          path: tp4-c1-study
-          persist-credentials: false
-      - name: Recreate baseline AgentX client from its exact dependency lock
-        id: prepare
-        timeout-minutes: 40
-        env:
-          HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
-          TP4_C1_BASELINE_RUN_ID: '38855733134'
-        run: python3 tp4-c1-study/.github/scripts/image_ab.py prepare current
-      - name: Current image · TP4 C1 · 3600 seconds
-        timeout-minutes: 130
-        run: python3 tp4-c1-study/.github/scripts/image_ab.py run current
-      - name: Upload current image evidence and experiment identity
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: tp4-c1-current-and-plan-${{ github.run_attempt }}
-          path: |
-            tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/current/
-            tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.json
-            tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.log
-            tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.lock
-          if-no-files-found: warn
-          retention-days: 15
-      - name: Stop only this experiment's containers
-        if: always()
-        run: python3 tp4-c1-study/.github/scripts/image_ab.py cleanup
+    - uses: actions/checkout@v6
+      with:
+        path: tp4-c1-study
+        persist-credentials: false
+    - name: Prepare immutable images, frozen client and identical token inputs
+      timeout-minutes: 40
+      env:
+        HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py prepare
+    - name: official37 · TP4 C1 FULL · focused decode and GPU profile
+      timeout-minutes: 85
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py run official37
+    - name: Upload official37 evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: tp4-c1-decode-official37-${{ github.run_attempt }}
+        path: tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/official37/
+        if-no-files-found: warn
+        retention-days: 15
+    - name: current38 · TP4 C1 FULL · focused decode and GPU profile
+      timeout-minutes: 85
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py run current38
+    - name: Upload current38 evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: tp4-c1-decode-current38-${{ github.run_attempt }}
+        path: tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/current38/
+        if-no-files-found: warn
+        retention-days: 15
+    - name: current37 · TP4 C1 FULL · focused decode and GPU profile
+      timeout-minutes: 85
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py run current37
+    - name: Upload current37 evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: tp4-c1-decode-current37-${{ github.run_attempt }}
+        path: tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/current37/
+        if-no-files-found: warn
+        retention-days: 15
+    - name: current38_repeat · TP4 C1 FULL · focused decode and GPU profile
+      timeout-minutes: 85
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py run current38_repeat
+    - name: Upload current38_repeat evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: tp4-c1-decode-current38_repeat-${{ github.run_attempt }}
+        path: tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/current38_repeat/
+        if-no-files-found: warn
+        retention-days: 15
+    - name: Upload shared experiment identity
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: tp4-c1-decode-plan-${{ github.run_attempt }}
+        path: 'tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.json
+
+          tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.log
+
+          tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/*.lock
+
+          tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/prompts/manifest.json'
+        if-no-files-found: warn
+        retention-days: 15
+    - name: Stop only this experiment's containers
+      if: always()
+      run: python3 tp4-c1-study/.github/scripts/decode_ablation.py cleanup

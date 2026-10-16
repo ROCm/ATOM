@@ -1,3 +1,7 @@
+> The one-hour image comparison below is complete. The workflow on this
+> experimental branch now runs the follow-up [focused decode attribution](decode_ablation.md).
+> `image_ab.py` remains the shared image/client configuration and historical replay tool.
+
 # TP4 C1 image comparison
 
 This branch is a temporary investigation workflow, not the regular agentic suite.
