@@ -1226,6 +1226,130 @@ models:
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 512
 
+        # A PP8xTP1 prefill in front of InferenceX's AgentX server
+        # (kimik3-fp4-mi355x-atom-agentic-mtp, SemiAnalysisAI/InferenceX#4085).
+        # The decode runs that recipe: TP8 with seven DSpark drafts at CONC 1/4,
+        # TP8xDCP8 with four drafts and ReplaySSM from CONC 16, the drafter's
+        # linears unquantized, max_num_seqs 2 * CONC, a 128 GiB per-rank CPU
+        # tier through CONC 48 and 192 GiB plus comm-group reuse from CONC 56.
+        # CONC 32 and 88 are not in the recipe and take the neighbouring band.
+        # The recipe's PrefillDelayer settings pace prefill against decode on
+        # one server, which neither P/D server does, so these cells leave them
+        # unset as the TP8 1P1D cells above do.
+        #
+        # The prefill is eight one-GPU stages. Only the last holds the drafter,
+        # so its stage is cut to nine layers, on AttnRes block boundaries, to
+        # even out the KV block count every stage shares. It runs eager, since a
+        # P/D producer never decodes, and compiles every M-bucketed prefill GEMM
+        # at startup. Its own --online_quant_config, the last on the command
+        # line and so the one that wins, also keeps the unsharded KDA gate GEMM
+        # in bf16; it has no spaces because the launcher word-splits extra_args.
+        - &kimi_k3_1p1d_pp8_tp8
+          <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c1
+          topology: 1p1d_pp8_tp8
+          display_topology: 1P1D-PP8-TP1-TP8-DSPARK7
+          concurrency: [1]
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --enforce-eager
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}
+          server:
+            common_args: &kimi_k3_pp8_dspark7_args
+              <<: *kimi_k3_agentic_dspark7_args
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}'
+          env:
+            common: &kimi_k3_pp8_env
+              AITER_LOG_LEVEL: WARNING
+              ATOM_ENABLE_REPLAYSSM: "0"
+            prefill: &kimi_k3_pp8_prefill_env
+              # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
+              HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
+              VLLM_PP_LAYER_PARTITION: "12,12,12,12,12,12,12,9"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
+
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c4
+          concurrency: [4]
+
+        - &kimi_k3_1p1d_pp8_dcp8
+          <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c16
+          topology: 1p1d_pp8_dcp8
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK4
+          concurrency: [16]
+          server:
+            common_args: &kimi_k3_pp8_dspark4_args
+              <<: *kimi_k3_pp8_dspark7_args
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.36
+          decode:
+            workers: 1
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+          env:
+            common: &kimi_k3_pp8_replay_env
+              <<: *kimi_k3_pp8_env
+              ATOM_ENABLE_REPLAYSSM: "1"
+            prefill: &kimi_k3_pp8_lmcache128_prefill_env
+              <<: [*kimi_k3_agentic_lmcache128_env, *kimi_k3_pp8_prefill_env]
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 64
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          concurrency: [48]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 96
+
+        - &kimi_k3_1p1d_pp8_dcp8_c56
+          <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 112
+          env:
+            common:
+              <<: *kimi_k3_pp8_replay_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_pp8_lmcache128_prefill_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 144
+          run_eval: true
+          eval_concurrency: [72]
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
