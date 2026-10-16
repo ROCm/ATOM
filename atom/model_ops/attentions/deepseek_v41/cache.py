@@ -433,7 +433,6 @@ class PagedAttentionCache:
             extra_write=self.geometry.speculative_tokens if tentative else 0,
         )
 
-
     def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
         """Give a checkpoint-image restore a chance before the contract judges.
 
@@ -480,9 +479,7 @@ class PagedAttentionCache:
             return cursors
         # Re-read, so the contract judges what the restore produced rather
         # than what it replaced.
-        return (
-            torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
-        )
+        return torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
 
     def _report_stale_state(self, cursors, starts, requests, fresh):
         """Raise on the first request whose state is not where it is wanted.
@@ -569,9 +566,7 @@ class PagedAttentionCache:
             cursors = (
                 torch.index_select(self.cursor, 0, step.slots[:count]).cpu().numpy()
             )
-            cursors = self._restore_stale_rows(
-                cursors, wanted, ids, fresh, step, count
-            )
+            cursors = self._restore_stale_rows(cursors, wanted, ids, fresh, step, count)
             self._report_stale_state(cursors, wanted, ids, fresh)
         else:
             # Issued before the reset below, so a recycled slot is captured as

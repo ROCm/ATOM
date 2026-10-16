@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+
 from atom.plugin.vllm import v41_shutdown as patch
 
 

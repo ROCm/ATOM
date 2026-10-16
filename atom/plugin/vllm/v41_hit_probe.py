@@ -36,7 +36,7 @@ def install() -> bool:
             MambaManager,
             SingleTypeKVCacheManager,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - a probe must never take the engine down
         logger.warning("V4.1 hit probe: vLLM internals not where expected")
         return False
 
@@ -60,7 +60,7 @@ def install() -> bool:
             return blocks, hit
 
         wrapped._atom_probed = True
-        setattr(cls, "find_longest_cache_hit", classmethod(wrapped))
+        cls.find_longest_cache_hit = classmethod(wrapped)
 
     orig = HybridKVCacheCoordinator.find_longest_cache_hit
     if not getattr(orig, "_atom_probed", False):
@@ -69,12 +69,12 @@ def install() -> bool:
             out = _orig(self, *a, **kw)
             _CALLS[0] += 1
             if _CALLS[0] <= 40:
-                groups = [
-                    type(g.spec).__name__ for g in self.attention_groups
-                ]
+                groups = [type(g.spec).__name__ for g in self.attention_groups]
                 logger.info(
                     "V4.1 hit probe: coordinator #%d groups=%s -> combined=%s",
-                    _CALLS[0], groups, out[1],
+                    _CALLS[0],
+                    groups,
+                    out[1],
                 )
             return out
 

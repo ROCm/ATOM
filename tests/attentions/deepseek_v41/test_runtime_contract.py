@@ -583,6 +583,8 @@ def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
         assert (
             out.shape[:-2].numel() == tokens
         ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
+
+
 @pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
 @pytest.mark.parametrize("tbo", [False, True])
 @pytest.mark.parametrize("ep", [False, True])

@@ -14,8 +14,6 @@ engine boot, which is what was paying for this.
 import ast
 import pathlib
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MARKERS = ("<<<<<<< ", "=======\n>>>>>>> ", ">>>>>>> ")
 
@@ -43,7 +41,7 @@ def test_no_file_carries_a_merge_marker():
         if path.name == pathlib.Path(__file__).name:
             continue
         for n, line in enumerate(path.read_text().splitlines(), 1):
-            if line.startswith("<<<<<<< ") or line.startswith(">>>>>>> "):
+            if line.startswith(("<<<<<<< ", ">>>>>>> ")):
                 marked.append(f"{path.relative_to(ROOT)}:{n}")
                 break
     assert not marked, "unfinished merges:\n  " + "\n  ".join(marked)
@@ -63,7 +61,6 @@ def test_calls_to_v41_bridge_helpers_match_their_signatures():
     importing drags in vLLM and torch, and the point is to be cheap enough
     that nobody skips it.
     """
-    import inspect
 
     WATCHED = {
         "_check_row_alignment",

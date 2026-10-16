@@ -29,7 +29,8 @@ BLOCK, WINDOW, MAXB = 256, 128, 8192
 
 def post(payload, timeout=600):
     req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/v1/completions", json.dumps(payload).encode(),
+        f"http://127.0.0.1:{PORT}/v1/completions",
+        json.dumps(payload).encode(),
         {"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as h:
@@ -37,20 +38,31 @@ def post(payload, timeout=600):
 
 
 def completion(prompt):
-    return post({"model": MODEL, "prompt": prompt, "max_tokens": 1,
-                 "temperature": 0.0, "seed": 0})
+    return post(
+        {
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "seed": 0,
+        }
+    )
 
 
 def hits():
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/metrics", timeout=10) as h:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/metrics", timeout=10
+        ) as h:
             t = h.read().decode()
-    except Exception:
+    except Exception:  # noqa: BLE001 - a probe reports failures, it does not raise
         return None
     out = {}
     for line in t.splitlines():
-        for k in ("vllm:prefix_cache_hits_total",
-                  "vllm:external_prefix_cache_hits_total"):
+        for k in (
+            "vllm:prefix_cache_hits_total",
+            "vllm:external_prefix_cache_hits_total",
+        ):
             if line.startswith(k):
                 out[k] = float(line.rsplit(" ", 1)[1])
     return out
@@ -81,7 +93,9 @@ for name, n in targets:
     text = prompt_of(n)
     if text is None:
         rec["status"] = "MISSIZED"
-        rows.append(rec); print(f"{name:16s} {rec['status']}"); continue
+        rows.append(rec)
+        print(f"{name:16s} {rec['status']}")
+        continue
     try:
         r1 = completion(text)
         rec["prompt_tokens"] = r1["usage"]["prompt_tokens"]
@@ -98,9 +112,11 @@ for name, n in targets:
             rec["status"] = "NOT REACHED: the second send took no hit"
         else:
             rec["status"] = "survived"
-        print(f"{name:16s} tokens={rec['prompt_tokens']:6d} cached={got_hits} "
-              f"tail={tail}  {rec['status']}")
-    except Exception as exc:
+        print(
+            f"{name:16s} tokens={rec['prompt_tokens']:6d} cached={got_hits} "
+            f"tail={tail}  {rec['status']}"
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe records faults as data
         rec["status"] = f"FAULT {type(exc).__name__}: {exc}"
         print(f"{name:16s} {rec['status']}")
         rows.append(rec)
@@ -110,5 +126,7 @@ for name, n in targets:
 json.dump(rows, open(OUT, "w"))
 reached = [r for r in rows if r.get("status") == "survived"]
 print(f"\n{len(reached)}/{len(rows)} shapes actually took a hit on the second send")
-print("1-token tails reached:",
-      ", ".join(r["shape"] for r in reached if r.get("uncached_tail") == 1) or "NONE")
+print(
+    "1-token tails reached:",
+    ", ".join(r["shape"] for r in reached if r.get("uncached_tail") == 1) or "NONE",
+)

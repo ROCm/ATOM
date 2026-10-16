@@ -5,8 +5,9 @@
 
 from __future__ import annotations
 
-import os
 import logging
+from typing import ClassVar
+import os
 import time
 
 from atom.kv_transfer.disaggregation.base import KVConnectorSchedulerBase
@@ -176,14 +177,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """The prompt extent this layout can safely ask the tier to resume."""
         return list(seq.token_ids[: seq.num_prompt_tokens])
 
-
     #: Which exit of `_get_num_new_matched_tokens` a lookup took, counted
     #: per reason. A lookup that returns nothing has half a dozen ways to do
     #: it and they are not interchangeable: "the tier had nothing" and "we
     #: never asked" lead to opposite fixes, and the aggregate hit rate shows
     #: the same 0.0% for both. Logged on a count schedule rather than an
     #: interval so a short workload cannot print only its start-up state.
-    _LOOKUP_EXITS: dict = {}
+    _LOOKUP_EXITS: ClassVar[dict] = {}
 
     def _lookup_exit(self, seq, reason: str, value: int) -> tuple[int, bool]:
         self._LOOKUP_EXITS[reason] = self._LOOKUP_EXITS.get(reason, 0) + 1
@@ -200,7 +200,10 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             return value, False
         logger.info(
             "ATOM offload lookup #%d: %s (prompt=%s) -> %s; totals %s",
-            total, reason, getattr(seq, "num_prompt_tokens", "?"), value,
+            total,
+            reason,
+            getattr(seq, "num_prompt_tokens", "?"),
+            value,
             ", ".join(f"{k}={v}" for k, v in sorted(self._LOOKUP_EXITS.items())),
         )
         # Always the declining shape. The hit path calls this to be counted
@@ -561,9 +564,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             # that holds nothing both end at `hit=0`, and only the raw value
             # tells them apart.
             logger.info(
-                "ATOM offload lookup raw: seq=%s prompt=%s raw_hit=%d "
-                "floored=%d",
-                seq.id, num_prompt, raw_hit, hit,
+                "ATOM offload lookup raw: seq=%s prompt=%s raw_hit=%d " "floored=%d",
+                seq.id,
+                num_prompt,
+                raw_hit,
+                hit,
             )
         if self._hit_cap_hook is not None:
             # After `_loadable_hit`, so the hook caps the hit that will
@@ -596,7 +601,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.info(
                 "ATOM offload lookup detail: seq=%s prompt=%s hit=%d "
                 "frontier=%d need=%d",
-                seq.id, seq.num_prompt_tokens, hit, frontier, need,
+                seq.id,
+                seq.num_prompt_tokens,
+                hit,
+                frontier,
+                need,
             )
         if need <= 0:
             self._clear_pending_load(sid)
@@ -804,7 +813,7 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
     #: Saves dropped because the per-request state leg had nothing to offer
     #: at the boundary. Per request id, so one request failing repeatedly is
     #: visibly different from many failing once.
-    _SAVE_DROPPED: dict = {}
+    _SAVE_DROPPED: ClassVar[dict] = {}
 
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
@@ -841,14 +850,20 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                     self._SAVE_DROPPED.get(str(seq.id), 0) + 1
                 )
                 n = sum(self._SAVE_DROPPED.values())
-                if n <= 8 or n % 32 == 0 or os.environ.get(
-                    "ATOM_OFFLOAD_LOOKUP_PROBE"
-                ) in ("1", "true", "True"):
+                if (
+                    n <= 8
+                    or n % 32 == 0
+                    or os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE")
+                    in ("1", "true", "True")
+                ):
                     logger.info(
                         "ATOM offload save dropped #%d: seq=%s prompt=%s "
                         "aligned=%d end=%d (no recurrent state)",
-                        n, seq.id, getattr(seq, "num_prompt_tokens", "?"),
-                        int(aligned), int(end),
+                        n,
+                        seq.id,
+                        getattr(seq, "num_prompt_tokens", "?"),
+                        int(aligned),
+                        int(end),
                     )
                 return None
         if os.environ.get("ATOM_OFFLOAD_LOOKUP_PROBE") in ("1", "true", "True"):
@@ -859,8 +874,12 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.info(
                 "ATOM offload save built: seq=%s prompt=%s saved=%d "
                 "aligned=%d last_prefill=%s blocks=%d",
-                seq.id, getattr(seq, "num_prompt_tokens", "?"), int(saved),
-                int(aligned), bool(is_last_prefill), len(block_ids or ()),
+                seq.id,
+                getattr(seq, "num_prompt_tokens", "?"),
+                int(saved),
+                int(aligned),
+                bool(is_last_prefill),
+                len(block_ids or ()),
             )
         return LMCacheReqMeta(
             req_id=seq.id,
@@ -1110,10 +1129,13 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 logger.info(
                     "ATOM offload save frontier: seq=%s prompt=%s computed=%s "
                     "finished_cached=%s aligned=%d saved=%d emit=%s",
-                    seq.id, getattr(seq, "num_prompt_tokens", "?"),
+                    seq.id,
+                    getattr(seq, "num_prompt_tokens", "?"),
                     getattr(seq, "num_cached_tokens", "?"),
                     getattr(seq, "_offload_finished_cached_tokens", "unset"),
-                    int(aligned), int(saved), aligned > saved,
+                    int(aligned),
+                    int(saved),
+                    aligned > saved,
                 )
             if aligned <= saved:
                 continue
@@ -1713,7 +1735,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
                 logger.warning(
                     "ATOM offload: completion for %s does not match the "
                     "active load (%s); dropping it. Total %d",
-                    req_id, active[1] if active else None,
+                    req_id,
+                    active[1] if active else None,
                     self._dropped_load_completions,
                 )
                 return False
@@ -1723,7 +1746,8 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             logger.warning(
                 "ATOM offload: plain-id completion for %s while a load "
                 "operation is active; dropping it. Total %d",
-                sid, self._dropped_load_completions,
+                sid,
+                self._dropped_load_completions,
             )
             return False
         self._finish_load_statistics(req_id, succeeded=True)

@@ -64,6 +64,7 @@ logger = logging.getLogger("atom")
 # throughput work in the recipe's Measured section is read from.
 _STEP_PROBE_ON = __import__("os").environ.get("ATOM_MP_STEP_PROBE") == "1"
 
+
 # Kill switch for the step-event pool: ATOM_MP_EVENT_POOL=0 exports a freshly
 # created interprocess event every step instead of re-recording a pooled one.
 # Opt-in, because the reason it was on by default has been measured false.

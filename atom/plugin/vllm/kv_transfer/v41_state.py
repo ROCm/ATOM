@@ -80,27 +80,6 @@ _IMAGE_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_IMAGE_LOCAL_HITS") in (
 )
 
 
-def _images_can_serve() -> bool:
-    """True when the state-image mechanism is wired and may back a local hit.
-
-    Imported lazily and guarded: this module is used on configurations where
-    the image module's vLLM imports are unavailable, and a local hit refused
-    for that reason is the old, safe behaviour.
-    """
-    try:
-        from vllm.config import get_current_vllm_config_or_none
-
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import register_v41_state_checkpoint_adapter
-        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
-
-        config = get_current_vllm_config_or_none()
-        return bool(
-            config is not None and state_checkpoints_on(register_v41_state_checkpoint_adapter(), config)
-        )
-    except Exception:
-        return False
-
-
 # How many intervals `cap_hit` walks back before giving up. The same bound K3
 # uses: a hit far past every stored boundary is a cold tier, and descending
 # further costs a lookup per step for a prefix that will be recomputed anyway.
@@ -404,6 +383,7 @@ class V41BoundaryPlanner:
         world_size: int,
         can_store: bool = True,
         can_load: bool = True,
+        state_checkpoints_can_serve: bool = False,
     ) -> None:
         self.hash_block_size = int(hash_block_size)
         # Two different things that used to be one.
@@ -429,6 +409,12 @@ class V41BoundaryPlanner:
         self.chunk_size = int(chunk_size)
         self.state_interval = int(state_interval)
         self._world_size = max(1, int(world_size))
+        # Decided by the caller, which holds the VllmConfig. Asking vLLM for
+        # its *current* config from here returns None -- the scheduler calls
+        # `cap_local_hit` outside any `set_current_vllm_config` scope -- so a
+        # check made here was false on every request and this gate never
+        # opened (measured: local_cap_image=0 with ATOM_V41_IMAGE_LOCAL_HITS=1).
+        self._state_checkpoints_can_serve = bool(state_checkpoints_can_serve)
         self._index = StateOffloadIndex(can_store=can_store, can_load=can_load)
         self._next_op_id = 0
         self._pending_stores: dict[int, _PendingStore] = {}
@@ -692,7 +678,7 @@ class V41BoundaryPlanner:
         self._local_caps.pop(req_id, None)
         if hit <= 0:
             return hit
-        if _images_can_serve() and _IMAGE_LOCAL_HITS_ENABLED:
+        if self._state_checkpoints_can_serve and _IMAGE_LOCAL_HITS_ENABLED:
             # Left alone. vLLM has already reduced this hit to a boundary
             # the state group can serve: its coordinator takes the minimum
             # across groups, and the image group only offers boundaries it

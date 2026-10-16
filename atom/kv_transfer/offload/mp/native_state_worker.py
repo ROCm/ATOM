@@ -23,9 +23,9 @@ from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
     _published_tp_replication_factor,
-    storage_kv_transfer_config,
     _tp_replication_factor,
     _validate_mp_config,
+    storage_kv_transfer_config,
 )
 from atom.kv_transfer.offload.mp.native_state_layout import (
     build_native_state_mp_layout,

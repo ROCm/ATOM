@@ -55,6 +55,7 @@ def _compress_plan_buffer_names(ratio):
         "key_rope": f"v41_key_rope_positions_{ratio}",
     }
 
+
 def _staging_advances(staged) -> bool:
     """Whether this step's Engram staging will advance the cursor itself.
 

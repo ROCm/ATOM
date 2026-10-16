@@ -276,7 +276,11 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
             #
             # ATOM_V41_PROMPT_ANCHOR_CLIP=0 turns it off, for bisecting a
             # prefill-shape problem against the old behaviour.
-            if os.environ.get("ATOM_V41_PROMPT_ANCHOR_CLIP") not in ("0", "false", "False"):
+            if os.environ.get("ATOM_V41_PROMPT_ANCHOR_CLIP") not in (
+                "0",
+                "false",
+                "False",
+            ):
                 anchor = (total // block) * block
                 if start < anchor < end:
                     return anchor - start

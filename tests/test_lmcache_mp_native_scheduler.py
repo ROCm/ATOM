@@ -891,6 +891,8 @@ def test_reconcile_hands_the_live_set_to_the_recurrent_retire_hook(monkeypatch):
     scheduler._active_load_operations["r2"] = (object(), "op-load")
     scheduler.reconcile_recurrent_rides()
     assert seen[-1] == {"op-save", "op-load"}
+
+
 # --- Bounded replay over a KV-only load ------------------------------------
 
 

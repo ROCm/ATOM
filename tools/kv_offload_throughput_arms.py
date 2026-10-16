@@ -67,7 +67,10 @@ def post(doc_id, tail, timeout=900):
         {
             "model": MODEL,
             "messages": [
-                {"role": "user", "content": document(doc_id) + f"\nQuery {tail}: reply."}
+                {
+                    "role": "user",
+                    "content": document(doc_id) + f"\nQuery {tail}: reply.",
+                }
             ],
             "temperature": 0.0,
             "max_tokens": OUT_TOKENS,
@@ -76,20 +79,27 @@ def post(doc_id, tail, timeout=900):
         }
     ).encode()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/v1/chat/completions", body,
+        f"http://127.0.0.1:{PORT}/v1/chat/completions",
+        body,
         {"Content-Type": "application/json"},
     )
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as h:
         d = json.load(h)
-    return time.time() - t0, d["usage"]["prompt_tokens"], d["usage"]["completion_tokens"]
+    return (
+        time.time() - t0,
+        d["usage"]["prompt_tokens"],
+        d["usage"]["completion_tokens"],
+    )
 
 
 def metrics():
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/metrics", timeout=10) as h:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/metrics", timeout=10
+        ) as h:
             text = h.read().decode()
-    except Exception:
+    except Exception:  # noqa: BLE001 - one arm's failure is data, not a crash
         return {}
     keep = (
         "vllm:external_prefix_cache_queries_total",
@@ -151,7 +161,7 @@ def worker():
             cursor[0] += 1
         try:
             dt, p, c = post(doc_id, tail)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             with lock:
                 errs.append(type(exc).__name__)
             continue

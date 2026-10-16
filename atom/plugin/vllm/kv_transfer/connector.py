@@ -82,9 +82,13 @@ _SAVE_RECONCILE_INTERVAL_S = 5.0
 
 def _v41_image_group_ids(kv_cache_config) -> set:
     """Group ids whose layers are ALL DeepSeek-V4.1 state images."""
-    from atom.plugin.vllm.deepseek_v41_state_checkpoint import register_v41_state_checkpoint_adapter
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_v41_state_checkpoint_adapter,
+    )
 
-    is_state_checkpoint_layer = register_v41_state_checkpoint_adapter().is_state_checkpoint_layer
+    is_state_checkpoint_layer = (
+        register_v41_state_checkpoint_adapter().is_state_checkpoint_layer
+    )
 
     out = set()
     for gid, group in enumerate(
@@ -109,9 +113,13 @@ def _without_v41_image_groups(groups, kv_cache_config):
     `AttributeError: 'KdaStore' object has no attribute 'req_id'` on the
     first request, every rank, with the engine down.
     """
-    from atom.plugin.vllm.deepseek_v41_state_checkpoint import register_v41_state_checkpoint_adapter
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_v41_state_checkpoint_adapter,
+    )
 
-    is_state_checkpoint_layer = register_v41_state_checkpoint_adapter().is_state_checkpoint_layer
+    is_state_checkpoint_layer = (
+        register_v41_state_checkpoint_adapter().is_state_checkpoint_layer
+    )
 
     cfg_groups = list(getattr(kv_cache_config, "kv_cache_groups", None) or ())
     kept = []
@@ -275,6 +283,35 @@ def _refuse_v41_speculation_with_offload(vllm_config) -> None:
         "Set ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1 for validation, or disable "
         "speculative decoding."
     )
+
+
+def _v41_state_checkpoints_can_serve(vllm_config) -> bool:
+    """Whether a V4.1 state checkpoint may back a LOCAL prefix hit.
+
+    Takes the config rather than reading vLLM's current one. The scheduler
+    calls `cap_local_hit` outside any `set_current_vllm_config` scope, so
+    `get_current_vllm_config_or_none()` is None there and the check it fed was
+    false on every request -- the gate `ATOM_V41_IMAGE_LOCAL_HITS` opens never
+    actually opened. Here the caller already holds the config.
+
+    Guarded: this module is used on configurations where the checkpoint
+    module's vLLM imports are unavailable, and a local hit refused for that
+    reason is the old, safe behaviour.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
+        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
+
+        return bool(
+            vllm_config is not None
+            and state_checkpoints_on(
+                register_v41_state_checkpoint_adapter(), vllm_config
+            )
+        )
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
@@ -809,7 +846,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # group decides which column vLLM hashes. A boundary the planner
         # accepts on a different grid is a store nothing can look up, and the
         # symptom is a silent zero hit rate rather than an error.
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import register_v41_state_checkpoint_adapter
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
 
         image_block = int(register_v41_state_checkpoint_adapter().block_size)
         if image_block and image_block != grid:
@@ -827,6 +866,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),
             world_size=self._world_size,
+            state_checkpoints_can_serve=_v41_state_checkpoints_can_serve(vllm_config),
         )
         self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
         logger.info(
@@ -2018,7 +2058,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             if self._v41_planner is not None:
                 self._v41_planner.end_lookup()
         parked = need > 0 and self._scheduler.should_park_for_load_after_alloc(seq)
-        if self._v41_planner is not None and not parked:
+        if self._v41_planner is not None and not parked:  # noqa: SIM102
             # `cap_local_hit` shortened vLLM's own hit by one block on the
             # promise that the tier would supply that block and the state
             # behind it. The tier did not, and the request cannot be parked
@@ -2076,7 +2116,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 int(num_external_tokens),
                 int(self._config.kv_cache_block_size),
             )
-        if self._v41_planner is not None and num_total_computed > 0:
+        if self._v41_planner is not None and num_total_computed > 0:  # noqa: SIM102
             # The attention blocks the dense load is filling: if the state
             # half misses, they are what has to be invalidated, or vLLM caches
             # a prefix whose window ring never existed.

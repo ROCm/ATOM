@@ -21,9 +21,7 @@ def _check(ids, starts, cursors, fresh=None):
     arr = np.asarray([[c, 0] for c in cursors], dtype=np.int64)
     if fresh is None:
         fresh = np.zeros(len(ids), dtype=bool)
-    _Cache()._report_stale_state(
-        arr, np.asarray(starts, dtype=np.int64), ids, fresh
-    )
+    _Cache()._report_stale_state(arr, np.asarray(starts, dtype=np.int64), ids, fresh)
 
 
 def test_a_real_request_with_a_stale_cursor_still_raises():

@@ -100,8 +100,10 @@ if len(ratios) < 3:
     sys.exit(1)
 signs = {r > 1 for r in ratios}
 if len(signs) > 1:
-    print("NOT MEASURABLE: the pair ratios disagree in sign:",
-          ", ".join(f"{r:.4f}" for r in ratios))
+    print(
+        "NOT MEASURABLE: the pair ratios disagree in sign:",
+        ", ".join(f"{r:.4f}" for r in ratios),
+    )
     print("The remedy the design names is more pairs, not appending a fourth")
     print("to a set of three that disagreed.")
     sys.exit(1)

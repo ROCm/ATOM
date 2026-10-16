@@ -4,6 +4,9 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
 from atom.kv_transfer.disaggregation.types import KVConnectorOutput as AtomOutput
 from atom.plugin.vllm.kv_transfer.connector import (
     AtomLMCacheOffloadConnector,
@@ -11,8 +14,6 @@ from atom.plugin.vllm.kv_transfer.connector import (
 )
 from atom.plugin.vllm.kv_transfer.kda_state import _KdaLoadResult
 from atom.plugin.vllm.kv_transfer.mp_worker_adapter import MPOffloadWorkerAdapter
-from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 
 class Page:

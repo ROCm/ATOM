@@ -50,12 +50,15 @@ from atom.plugin.vllm.paged_state_checkpoint import (
     PagedStateCheckpointAdapter,
     PagedStateCheckpointBackend,
     PagedStateCheckpointLayer,
-    state_checkpoint_copy_funcs,
     install,
     register_state_checkpoint_adapter,
     register_state_checkpoint_layers,
+    state_checkpoint_copy_funcs,
 )
-from atom.plugin.vllm.paged_state_checkpoint_scheduler import StateCheckpointPlacement, SchedulerStateCheckpoints
+from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
+    SchedulerStateCheckpoints,
+    StateCheckpointPlacement,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +82,8 @@ def _proxy_alignment() -> int:
 
 def deepseek_v41_state_checkpoint_layer_names(k: int) -> list[str]:
     return [
-        f"model.layers.{1 + i}.{ATOM_DEEPSEEK_V41_STATE_CHECKPOINT_LAYER_SUFFIX}" for i in range(k)
+        f"model.layers.{1 + i}.{ATOM_DEEPSEEK_V41_STATE_CHECKPOINT_LAYER_SUFFIX}"
+        for i in range(k)
     ]
 
 
@@ -157,7 +161,9 @@ class V41StateCheckpointSizing:
 #: `carve_bytes` needs the geometry the sizing was read off, and the dataclass
 #: is frozen, so it is attached rather than being a field: a field would make
 #: it part of equality and of the log line, and it is neither.
-def _with_geometry(sizing: V41StateCheckpointSizing, geometry) -> V41StateCheckpointSizing:
+def _with_geometry(
+    sizing: V41StateCheckpointSizing, geometry
+) -> V41StateCheckpointSizing:
     object.__setattr__(sizing, "_geometry", geometry)
     return sizing
 
@@ -253,7 +259,9 @@ class AtomDeepseekV41StateCheckpointLayer(PagedStateCheckpointLayer):
 
 def register_deepseek_v41_state_checkpoint_layers(vllm_config) -> list[str]:
     return register_state_checkpoint_layers(
-        register_v41_state_checkpoint_adapter(), vllm_config, AtomDeepseekV41StateCheckpointLayer
+        register_v41_state_checkpoint_adapter(),
+        vllm_config,
+        AtomDeepseekV41StateCheckpointLayer,
     )
 
 
@@ -563,7 +571,10 @@ def install_v41_runner_state_events() -> int:
             )
             PSI._decode_plan.clear()
             PSI._decode_plan.update(
-                getattr(scheduler_output, "atom_state_checkpoint_decode_candidates", None) or {}
+                getattr(
+                    scheduler_output, "atom_state_checkpoint_decode_candidates", None
+                )
+                or {}
             )
             copies = getattr(scheduler_output, "kv_cache_block_copies", None)
             if copies and PSI._config_has_proxy(getattr(self, "kv_cache_config", None)):

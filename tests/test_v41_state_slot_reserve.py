@@ -13,6 +13,7 @@ it, so it is pinned here.
 from copy import deepcopy
 
 import pytest
+
 from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
 
 

@@ -30,7 +30,7 @@ def test_the_anchor_lands_on_the_page_grid_not_the_hash_grid():
     class _Req:
         num_prompt_tokens = 1345
 
-    assert p._prompt_anchor(_Req()) == 1280          # was 1344 on the 32 grid
+    assert p._prompt_anchor(_Req()) == 1280  # was 1344 on the 32 grid
 
 
 def test_a_hash_is_indexed_in_vllms_unit():
@@ -85,8 +85,8 @@ def test_the_prefill_clip_aligns_to_the_grid_not_the_hash_unit():
     from atom.plugin.vllm import scheduler as sched
 
     src = inspect.getsource(sched.apply_vllm_v41_prefill_alignment_patch)
-    assert "boundary_grid" in src, (
-        "the prefill clip must align to the grid a boundary sits on"
-    )
+    assert (
+        "boundary_grid" in src
+    ), "the prefill clip must align to the grid a boundary sits on"
     # And the fallback keeps single-group runs working unchanged.
     assert "planner.hash_block_size" in src

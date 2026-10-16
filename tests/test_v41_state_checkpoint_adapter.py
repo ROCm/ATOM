@@ -157,7 +157,9 @@ def config(**overrides):
 
 
 def test_the_shipped_configuration_is_accepted():
-    adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(config())
+    adapter_mod.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported(
+        config()
+    )
 
 
 @pytest.mark.parametrize(

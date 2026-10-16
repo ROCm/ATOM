@@ -24,7 +24,6 @@ import pytest
 pytest.importorskip("vllm")
 
 import torch
-from atom.plugin.vllm.v41_speculative import patch_v41_speculative_scheduling
 from vllm.config.speculative import SpeculativeConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
@@ -33,6 +32,8 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
+
+from atom.plugin.vllm.v41_speculative import patch_v41_speculative_scheduling
 
 _LIVE_SCHEDULE = inspect.unwrap(Scheduler.schedule)
 _V41 = "DeepseekV41ForCausalLM"

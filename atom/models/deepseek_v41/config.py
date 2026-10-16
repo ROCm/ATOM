@@ -380,13 +380,17 @@ def _v41_state_checkpoints_own_state(config) -> bool:
     try:
         from vllm.config import get_current_vllm_config_or_none
 
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import register_v41_state_checkpoint_adapter
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
         from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
 
         vllm_config = get_current_vllm_config_or_none()
         return bool(
             vllm_config is not None
-            and state_checkpoints_on(register_v41_state_checkpoint_adapter(), vllm_config)
+            and state_checkpoints_on(
+                register_v41_state_checkpoint_adapter(), vllm_config
+            )
         )
     except Exception:  # noqa: BLE001 - absence means images are off
         return False
@@ -398,7 +402,6 @@ def validate_runtime_config(config):
 
     unsupported = []
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
-    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
     plugin = config.plugin_config
     # The vLLM plugin path is text-only and runs the backbone alone: vLLM owns

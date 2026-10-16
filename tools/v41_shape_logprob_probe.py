@@ -41,7 +41,8 @@ BLOCK, WINDOW, MAXB = 256, 128, 8192
 
 def post(path, payload, timeout=600):
     req = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}{path}", json.dumps(payload).encode(),
+        f"http://127.0.0.1:{PORT}{path}",
+        json.dumps(payload).encode(),
         {"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as h:
@@ -49,10 +50,17 @@ def post(path, payload, timeout=600):
 
 
 def completion(prompt):
-    return post("/v1/completions", {
-        "model": MODEL, "prompt": prompt, "max_tokens": 1,
-        "temperature": 0.0, "prompt_logprobs": 0, "seed": 0,
-    })
+    return post(
+        "/v1/completions",
+        {
+            "model": MODEL,
+            "prompt": prompt,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "prompt_logprobs": 0,
+            "seed": 0,
+        },
+    )
 
 
 def logprobs_of(resp):
@@ -89,12 +97,16 @@ def deviation(a, b):
     pairs = [(x, y) for x, y in zip(a, b) if x is not None and y is not None]
     if not pairs:
         return None
-    return max(abs(x - y) for x, y in pairs), sum(abs(x - y) for x, y in pairs) / len(pairs)
+    return max(abs(x - y) for x, y in pairs), sum(abs(x - y) for x, y in pairs) / len(
+        pairs
+    )
 
 
 targets = [("one_token", 1), ("two_token", 2)]
 targets += [(f"block_m1_{m}", BLOCK * m + 1) for m in (1, 2, 4, 8)]
-targets += [(f"win_m1_{m}", WINDOW * m + 1) for m in (1, 3, 5) if (WINDOW * m + 1) % BLOCK != 1]
+targets += [
+    (f"win_m1_{m}", WINDOW * m + 1) for m in (1, 3, 5) if (WINDOW * m + 1) % BLOCK != 1
+]
 targets += [("maxb_k1", MAXB + 1)]
 targets += [(f"tiny_{n}", n) for n in (8, 64, 128)]
 targets += [("block_aligned", BLOCK * 8), ("win_aligned", WINDOW * 9)]
@@ -123,7 +135,9 @@ for name, n in targets:
         rec["self_deviation"] = deviation(a, b)
         rec["status"] = "ok"
         sd = rec["self_deviation"]
-        print(f"{ARM} {name:16s} tokens={got:6d}  self_max={sd[0]:.3e} self_mean={sd[1]:.3e}")
+        print(
+            f"{ARM} {name:16s} tokens={got:6d}  self_max={sd[0]:.3e} self_mean={sd[1]:.3e}"
+        )
     except Exception as exc:
         rec["status"] = f"ERROR {type(exc).__name__}: {exc}"
         print(f"{ARM} {name:16s} {rec['status']}")
