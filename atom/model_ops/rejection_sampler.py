@@ -462,13 +462,19 @@ def rejection_sample(
         # path would simply never run. The two are not combinable: relaxed
         # acceptance is deliberately not distribution-preserving, while the
         # ratio rule's entire claim is that it is.
-        if RELAXED_TOP_N > 1:
-            raise NotImplementedError(
-                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-                "mutually exclusive: relaxed top-N acceptance is approximate by "
-                "construction and the probability-ratio rule is exact, so there "
-                "is no defensible way to apply both. Turn one off."
-            )
+        #
+        # An assert, not a raise: the pair is refused at construction by
+        # `DSparkProposer._init_lossless_sampling`, so reaching here means that
+        # gate was bypassed. Re-checking on the verify path cost a per-step
+        # branch in every TP worker for a condition that cannot change after
+        # startup -- both flags are read at import -- and it only fired on a
+        # sampled unfiltered batch, so an all-greedy batch silently ran relaxed
+        # instead of being refused.
+        assert RELAXED_TOP_N <= 1, (
+            "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
+            "mutually exclusive; this should have been refused at proposer "
+            "construction"
+        )
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
