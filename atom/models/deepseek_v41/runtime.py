@@ -40,23 +40,7 @@ def _fake_layer_output(hidden, layer_name):
 # orders the stream fork/join with the model's tensor work.
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
 def v41_begin_forward(hidden: torch.Tensor) -> None:
-    """Read live request state on every execution.
-
-    Everything here is per step and host-decided -- the cursor advance, the
-    Engram snapshot, the staging fork -- so it cannot be left to a forward
-    that a graph might record once and replay. Under the vLLM plugin it does
-    not run here at all: the metadata builder stages the step before the
-    forward, outside any capture, and the guard below returns on a step that
-    was. What is left is native ATOM, and the plugin's own window before its
-    proxy pool is bound.
-
-    This carried `@eager_break_during_capture` while the work still ran in the
-    forward. That only ever covered one frontend's PIECEWISE mode -- a FULL
-    graph skips the break outright, which is why the cursor's position column
-    kept replaying the warmup's value -- and it is redundant now that the work
-    has moved out. The decorator, and the vLLM import behind it, are gone from
-    this file with it.
-    """
+    """Read live request state on every execution, including graph capture."""
     context = get_forward_context()
     metadata = context.attn_metadata
     metadata.step.begin_forward()
@@ -326,31 +310,8 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     def forward(self, input_ids, positions, inputs_embeds=None):
         """Tensor-only serving entry; guarded ops read the live forward context."""
-        # The plugin path has no ATOM drafter to install the aux hooks
-        # `set_aux_hidden_state_rows` serves, so a speculator there asks the
-        # model for the pair instead -- vLLM unpacks `hidden_states,
-        # aux_hidden_states = model_output`. The two mechanisms capture the
-        # same quantity: `DSparkDeepseekV41.target_aux_capture_spec` taps a
-        # block's INPUT and returns `settle().residual.mean(dim=-2)`, which
-        # is what the layer loop in `model.py` collects.
-        if self.aux_hidden_state_layers and self.replay:
-            # A replay runs the late layers on a tail of the rows, and only
-            # the hook path knows how to move those captures back to their
-            # forward rows (`_late_on_tail`). Refuse rather than return a
-            # tensor whose untapped rows hold whatever was there before.
-            raise NotImplementedError(
-                "DeepSeek-V4.1 aux hidden states and decoder SWA bounded "
-                "replay cannot run together; pass "
-                "--no-decoder-swa-bounded-replay to speculate on the plugin"
-            )
         if not self.replay:
-            hidden = self.backbone(input_ids, positions, inputs_embeds)
-            if not self.aux_hidden_state_layers:
-                return hidden
-            # The drafter's rows, beside the backbone's. Only here: the guard
-            # above refuses aux states together with bounded replay, so the
-            # replay path below never has to carry them.
-            return hidden, [aux.squeeze(0) for aux in self.get_aux_hidden_states()]
+            return self.backbone(input_ids, positions, inputs_embeds)
         state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
         forward, num_tokens = get_forward_context(), input_ids.numel()
         plan = None

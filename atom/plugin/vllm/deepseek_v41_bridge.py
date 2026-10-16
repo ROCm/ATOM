@@ -1244,6 +1244,17 @@ def bind_deepseek_v41_proxy_cache(
         workspace=builder.score_workspace,
         backing=raw,
     )
+    from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
+
+    if not hasattr(model, "_atom_v41_slot_allocator"):
+        # The STATE slots this pool's requests draw from. Attached to the
+        # model because that is the one object every reader of it can reach:
+        # the metadata builder stages against it each step, and the offload
+        # connector reserves one for a tier load before the request is ever
+        # scheduled.
+        model._atom_v41_slot_allocator = StateSlotAllocator(
+            v41_scheduler_state_slots(vllm_config)
+        )
     model._atom_v41_proxy_cache_ptr = ptr
     logger.info(
         "ATOM DeepSeek-V4.1: bound proxy pool -- %d PAGEs x %d B + %d STATE slots "
@@ -1338,7 +1349,19 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     So it is checked here, where the row can still be named, rather than left
     to surface as a cursor that is off by the gap between two requests.
     """
-    # KNOWN DEAD on the V2 path, which is the only one real V4.1 serving takes:
+    if getattr(input_batch, "atom_row_order_unverifiable", False):
+        # The V2 runner keeps no second count ordered independently of the
+        # step: `_V2InputBatchView` answers `num_computed_tokens_cpu` from the
+        # batch's own `num_computed_tokens_np`, which disagrees with
+        # `seq_lens - query_lens` on batches whose row order is fine. A check
+        # fed a number that is not independent either fires on nothing (noise)
+        # or proves nothing (tautology), so it is skipped here and named,
+        # rather than left looking like it ran. Without this the first decode
+        # dies with "the persistent batch and this step's attention metadata
+        # disagree at row 0" -- which is the crash the note below predicts.
+        return
+    # Was KNOWN DEAD on the V2 path while nothing supplied the V1 field, and
+    # the note is kept because the reasoning still governs the branch above:
     # this names the V1 runner's field, and V2's `InputBatch` carries
     # `num_computed_tokens_np` instead, so this returns before comparing
     # anything. Reading the V2 field is not the fix, and that is worth writing
@@ -2063,7 +2086,7 @@ def _v41_install_restore_hook(adapter, worker) -> None:
     `cache.py` has carried the call site all along (`_restore_stale_rows`,
     between the slot being assigned and its cursor being judged -- the only
     place a restore is neither undone by the reset nor unchecked by the
-    contract), but nothing ever called `install_image_restore_hook`, so every
+    contract), but nothing ever called `install_state_checkpoint_restore_hook`, so every
     cross-request hit died in `_report_stale_state` with `needs state at N,
     found <whatever the slot's last tenant left>`.
 
@@ -2074,7 +2097,7 @@ def _v41_install_restore_hook(adapter, worker) -> None:
     else's state.
     """
     from atom.model_ops.attentions.deepseek_v41.cache import (
-        install_image_restore_hook,
+        install_state_checkpoint_restore_hook,
     )
     from atom.plugin.vllm.paged_state_checkpoint import (
         execute_state_checkpoint_restores,
@@ -2135,7 +2158,7 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         )
         return len(slots)
 
-    install_image_restore_hook(restore)
+    install_state_checkpoint_restore_hook(restore)
     logger.info(
         "ATOM DeepSeek-V4.1: checkpoint image restores wired into prepare_state"
     )

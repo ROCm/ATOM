@@ -25,7 +25,7 @@ pin holds. V4.1's state sits in the request's own slot and is overwritten by
 every forward. It therefore has to be *snapshotted* before the forward that
 would overwrite it, into staging this module owns, and the store reads the
 snapshot. `advance_cursor` states the same pairing from the runtime side: the
-image a checkpoint takes is "the ring and the cursor of the step before this
+checkpoint a checkpoint takes is "the ring and the cursor of the step before this
 one, which is the pair that agrees".
 
 **A boundary is offered once or never.** K3 can ask its block pool whether the
@@ -69,12 +69,12 @@ _LOCAL_PREFIX_HITS_ENABLED = os.environ.get("ATOM_V41_LOCAL_PREFIX_HITS") in (
 )
 
 
-#: Whether an image may back a LOCAL prefix hit. Separate from whether
-#: images are wired, so the two halves can be measured apart: storing and
-#: restoring images is testable without opening the gate that lets vLLM
-#: serve a hit which -- if no image happens to sit at that exact position --
+#: Whether a checkpoint may back a LOCAL prefix hit. Separate from whether
+#: checkpoints are wired, so the two halves can be measured apart: storing and
+#: restoring checkpoints is testable without opening the gate that lets vLLM
+#: serve a hit which -- if no checkpoint happens to sit at that exact position --
 #: is a dead engine rather than a slow one.
-_IMAGE_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_IMAGE_LOCAL_HITS") in (
+_CHECKPOINT_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_CHECKPOINT_LOCAL_HITS") in (
     "1",
     "true",
     "True",
@@ -86,7 +86,7 @@ _IMAGE_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_IMAGE_LOCAL_HITS") in (
 # further costs a lookup per step for a prefix that will be recomputed anyway.
 _MAX_CAP_DESCENT = 64
 
-# Default tokens between STATE checkpoints. The image is fixed-size while PAGE
+# Default tokens between STATE checkpoints. The checkpoint is fixed-size while PAGE
 # bytes scale with history, so this is the whole cost knob: the tax is
 # `state_bytes / (interval * page_bytes_per_token)`. For the shipped BF16
 # geometry (5,276,672 B against 2,890 B/token) 8192 puts it near 22%, and the
@@ -267,7 +267,7 @@ class V41StateWorkerLeg:
         The copy runs on the caller's current stream, which is the compute
         stream inside ``start_load_kv`` -- before this step's forward is
         enqueued and after the previous one wrote the slot. That is the pairing
-        the runtime itself states: the image a checkpoint takes is the ring and
+        the runtime itself states: the checkpoint a checkpoint takes is the ring and
         the cursor of the step before this one, which is the pair that agrees.
         """
         refused: dict[str, list[int]] = {}
@@ -311,14 +311,14 @@ class V41StateWorkerLeg:
                 continue
             committed = next(cursors)
             if committed != int(store.boundary):
-                # The one failure nothing downstream can detect: an image keyed
+                # The one failure nothing downstream can detect: a checkpoint keyed
                 # to a position it is not at would be accepted by `cap_hit` and
                 # then refused by the forward it was restored into.
                 refuse("cursor_mismatch", store.op_id)
                 logger.warning(
                     "V4.1 state offload: %s is scheduled at %d but its slot's "
                     "cursor reads %d; dropping the store rather than keying an "
-                    "image to a position it is not at",
+                    "checkpoint to a position it is not at",
                     store.req_id,
                     store.boundary,
                     committed,
@@ -367,7 +367,7 @@ class V41BoundaryPlanner(PageRideMixin):
     """Scheduler half: picks the boundaries, and caps hits to them.
 
     Everything this decides is about keeping one invariant: a request that vLLM
-    is told has `n` computed tokens must have a STATE image whose cursor reads
+    is told has `n` computed tokens must have a STATE checkpoint whose cursor reads
     exactly `n`. The two ways to break it are restoring a prefix past the last
     stored boundary (`cap_hit` prevents) and storing a snapshot that was not
     taken at the boundary it is keyed by (`cursor_mismatch` catches).
@@ -413,11 +413,11 @@ class V41BoundaryPlanner(PageRideMixin):
         self.state_interval = int(state_interval)
         # Under `mp` the checkpoint groups are registered as engine groups of
         # their own, so a PAGE transfer names one block in each and carries
-        # the image with the KV it continues. This planner then decides only
+        # the checkpoint with the KV it continues. This planner then decides only
         # *which* boundary each transfer rides with: there is no second tier
         # to drive, no blob to stage and no store or load job to queue.
         self.rides_page = bool(rides_page)
-        # The groups holding the image, in the order the worker registered
+        # The groups holding the checkpoint, in the order the worker registered
         # them -- that order is the key space, so it is taken from the caller
         # rather than rebuilt here.
         self.ride_group_ids = tuple(int(g) for g in checkpoint_group_ids)
@@ -426,7 +426,7 @@ class V41BoundaryPlanner(PageRideMixin):
         self.ride_boundary_grid = self.boundary_grid
         if self.rides_page and not self.ride_group_ids:
             raise ValueError(
-                "DeepSeek-V4.1 state offload: the image cannot ride the PAGE "
+                "DeepSeek-V4.1 state offload: the checkpoint cannot ride the PAGE "
                 "object with no checkpoint group to name it; a transfer would "
                 "carry KV whose state is someone else's"
             )
@@ -435,7 +435,7 @@ class V41BoundaryPlanner(PageRideMixin):
         # its *current* config from here returns None -- the scheduler calls
         # `cap_local_hit` outside any `set_current_vllm_config` scope -- so a
         # check made here was false on every request and this gate never
-        # opened (measured: local_cap_image=0 with ATOM_V41_IMAGE_LOCAL_HITS=1).
+        # opened (measured: local_cap_checkpoint=0 with ATOM_V41_CHECKPOINT_LOCAL_HITS=1).
         self._state_checkpoints_can_serve = bool(state_checkpoints_can_serve)
         self._index = StateOffloadIndex(can_store=can_store, can_load=can_load)
         self._next_op_id = 0
@@ -501,9 +501,9 @@ class V41BoundaryPlanner(PageRideMixin):
             # measures what prefix caching costs on a model whose state the
             # block pool does not carry.
             "local_cap_declined": 0,
-            #: Local hits passed through whole because a checkpoint image
-            #: can restore the state at the hit. Zero while images are off.
-            "local_cap_image": 0,
+            #: Local hits passed through whole because a checkpoint
+            #: can restore the state at the hit. Zero while checkpoints are off.
+            "local_cap_checkpoint": 0,
             "local_cap_kept": 0,
             "local_cap_withdrawn": 0,
             "admission_refused": 0,
@@ -595,11 +595,11 @@ class V41BoundaryPlanner(PageRideMixin):
             return 0
         block_hashes = getattr(request, "block_hashes", None) or ()
         if self.rides_page:
-            # No index to probe: the KV and the image that continues it are
+            # No index to probe: the KV and the checkpoint that continues it are
             # one object, so whatever the dense lookup reported present is
-            # present with its image. What still has to hold is the *shape*
+            # present with its checkpoint. What still has to hold is the *shape*
             # -- a hit must end on a whole PAGE edge for there to be a stored
-            # image at all -- and that is what this truncation is.
+            # checkpoint at all -- and that is what this truncation is.
             boundary = (hit // self.boundary_grid) * self.boundary_grid
             if boundary <= 0:
                 self._counters["cap_declined"] += 1
@@ -714,10 +714,10 @@ class V41BoundaryPlanner(PageRideMixin):
         self._local_caps.pop(req_id, None)
         if hit <= 0:
             return hit
-        if self._state_checkpoints_can_serve and _IMAGE_LOCAL_HITS_ENABLED:
+        if self._state_checkpoints_can_serve and _CHECKPOINT_LOCAL_HITS_ENABLED:
             # Left alone. vLLM has already reduced this hit to a boundary
             # the state group can serve: its coordinator takes the minimum
-            # across groups, and the image group only offers boundaries it
+            # across groups, and the checkpoint group only offers boundaries it
             # has a cached checkpoint block for (measured: the group
             # answered 1280 for a 1345-token prompt whose checkpoint is at
             # 1280).
@@ -727,7 +727,7 @@ class V41BoundaryPlanner(PageRideMixin):
             # is a rule about a raw prefix length; applied to an
             # already-snapped hit it returns one block lower, which is a
             # position nothing wrote -- `needs state at 1024, found 3`.
-            self._counters["local_cap_image"] += 1
+            self._counters["local_cap_checkpoint"] += 1
             return hit
         if not _LOCAL_PREFIX_HITS_ENABLED:
             # Off, and the reason is structural rather than a race that is
@@ -840,7 +840,7 @@ class V41BoundaryPlanner(PageRideMixin):
         """
         accepted: list[V41Store] = []
         if self.rides_page:
-            # Nothing to drive: the PAGE save commits the image with the KV,
+            # Nothing to drive: the PAGE save commits the checkpoint with the KV,
             # and its source blocks are resolved at build time by
             # `source_blocks_for`, from the same hash-keyed pool lookup.
             return accepted
@@ -933,7 +933,7 @@ class V41BoundaryPlanner(PageRideMixin):
     def absorb_reports(self, stored, failed) -> None:
         """Fold the worker's per-rank store reports into the index.
 
-        A boundary is claimed only when every rank stored it: an image that
+        A boundary is claimed only when every rank stored it: a checkpoint that
         exists on three of four ranks is one `cap_hit` would accept and one
         rank would then fail to load, leaving that rank's prefix restored over
         the state of whatever ran there before.
@@ -965,7 +965,7 @@ class V41BoundaryPlanner(PageRideMixin):
     ) -> tuple[int, ...]:
         """This boundary's destination block in each checkpoint group, or ``()``.
 
-        All or nothing: an image scattered into some of its groups leaves the
+        All or nothing: a checkpoint scattered into some of its groups leaves the
         rest holding the previous occupant's state, which is the half restore
         this module exists to prevent. One unresolved group fails the load.
         """
@@ -1060,7 +1060,7 @@ class V41BoundaryPlanner(PageRideMixin):
         """
         self._counters["admission_refused"] += 1
         if self.rides_page:
-            # There is no state leg to refuse through: the image travels
+            # There is no state leg to refuse through: the checkpoint travels
             # inside the PAGE object, so the decline that matters was already
             # made by the scheduler, which does not emit a transfer whose
             # `take_ride_state` came back None. Queueing a job here instead

@@ -1003,7 +1003,7 @@ _IMAGE_RESTORE_HOOK = None
 _RESTORE_FAILURES: list = []
 
 
-def install_image_restore_hook(hook) -> None:
+def install_state_checkpoint_restore_hook(hook) -> None:
     global _IMAGE_RESTORE_HOOK
     _IMAGE_RESTORE_HOOK = hook
 

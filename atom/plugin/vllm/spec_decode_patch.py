@@ -169,7 +169,7 @@ def _split_v41_proxy_layers(kv_cache_spec):
 
 
 def _is_v41_image_layer(name: str) -> bool:
-    """Whether a layer is one PAGE unit of a V4.1 checkpoint image.
+    """Whether a layer is one PAGE unit of a V4.1 checkpoint.
 
     Asks the adapter rather than matching a string here, so the suffix has one
     owner. False when the mechanism is not importable, which is every build
@@ -207,12 +207,14 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
 
     proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
     # Checkpoint layers are neither the proxy nor the draft: each is one PAGE
-    # unit of a STATE image and `paged_state_checkpoint` requires them as k
+    # unit of a STATE checkpoint and `paged_state_checkpoint` requires them as k
     # SINGLE-layer MambaSpec groups. Lumping them in with the draft is what
     # vLLM rejects as "All layers in the same KV cache group must be the
     # same" -- measured, engine down at startup with checkpoints on.
-    images = {name: spec for name, spec in rest.items() if _is_v41_image_layer(name)}
-    rest = {name: spec for name, spec in rest.items() if name not in images}
+    checkpoints = {
+        name: spec for name, spec in rest.items() if _is_v41_image_layer(name)
+    }
+    rest = {name: spec for name, spec in rest.items() if name not in checkpoints}
     proxy_specs = list(proxy.values())
     groups = [
         KVCacheGroupSpec(
@@ -222,7 +224,7 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
     ]
     groups += [
         KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
-        for name, spec in images.items()
+        for name, spec in checkpoints.items()
     ]
     if rest:
         draft_specs = list(rest.values())
@@ -239,7 +241,7 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
         len(groups),
         groups[0].kv_cache_spec.page_size_bytes,
         groups[0].kv_cache_spec.block_size,
-        len(images),
+        len(checkpoints),
         1 if rest else 0,
     )
     return groups
@@ -391,7 +393,7 @@ def _groups_are_heterogeneous_mla_mha(kv_cache_groups) -> bool:
 def _v41_overlay_split(kv_cache_groups):
     """Split the layers into the overlaid pool and the per-layer slices.
 
-    V4.1's proxy and its checkpoint-image layers are one pool: they have the
+    V4.1's proxy and its checkpoint-checkpoint layers are one pool: they have the
     same page and the block manager hands each group its own block ids, so a
     block index costs ONE page across all of them and every one of them starts
     at byte 0 (this is what vLLM's own allocator does, and what
@@ -399,7 +401,7 @@ def _v41_overlay_split(kv_cache_groups):
     separate pool -- its page is not a multiple of the proxy's -- so each gets
     its own slice.
 
-    Returns ``(overlay_names, overlay_page, slice_pairs)``. With no image
+    Returns ``(overlay_names, overlay_page, slice_pairs)``. With no checkpoint
     layers the overlay is the proxy alone, which is the previous behaviour
     (one page, one slice) layer for layer.
     """
@@ -423,7 +425,7 @@ def _v41_overlay_split(kv_cache_groups):
                 slice_pairs.append((layer_name, layer_spec))
     if len(overlay_pages) > 1:
         raise RuntimeError(
-            "DeepSeek-V4.1 proxy and checkpoint-image layers must share one "
+            "DeepSeek-V4.1 proxy and checkpoint-checkpoint layers must share one "
             f"page to be overlaid on one pool; got {sorted(overlay_pages)}"
         )
     return overlay_names, (overlay_pages.pop() if overlay_pages else 0), slice_pairs
@@ -522,7 +524,7 @@ def _heterogeneous_max_memory_usage_bytes(vllm_config, kv_cache_groups):
     from vllm.utils.math_utils import cdiv
 
     max_model_len = vllm_config.model_config.max_model_len
-    # Same split as the builder and the divisor: the proxy and its image
+    # Same split as the builder and the divisor: the proxy and its checkpoint
     # layers are one overlaid pool and cost one page per block between them,
     # so counting them per layer would overstate the requirement k+1 times.
     overlay_names, overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)

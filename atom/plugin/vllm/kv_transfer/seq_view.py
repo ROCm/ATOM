@@ -30,7 +30,7 @@ class SeqView:
         # raises ``AttributeError`` on that assignment, out of the save path,
         # the first time a finished request is parked. A clock that is not
         # restarted abandons the copy while the worker is still reading the
-        # blocks: a truncated image under a valid prefix hash.
+        # blocks: a truncated snapshot under a valid prefix hash.
         "_deferred_save_at",
         "_load_operation",
         "_num_cached_tokens",

@@ -103,11 +103,13 @@ def _v41_checkpoint_group_ids(kv_cache_config) -> tuple[int, ...]:
     read back in another, so both halves derive it the same way rather than
     passing it between them.
     """
-    return tuple(sorted(int(gid) for gid in _v41_image_group_ids(kv_cache_config)))
+    return tuple(
+        sorted(int(gid) for gid in _v41_checkpoint_group_id_set(kv_cache_config))
+    )
 
 
-def _v41_image_group_ids(kv_cache_config) -> set:
-    """Group ids whose layers are ALL DeepSeek-V4.1 state images."""
+def _v41_checkpoint_group_id_set(kv_cache_config) -> set:
+    """Group ids whose layers are ALL DeepSeek-V4.1 state checkpoints."""
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
         register_v41_state_checkpoint_adapter,
     )
@@ -126,10 +128,10 @@ def _v41_image_group_ids(kv_cache_config) -> set:
     return out
 
 
-def _without_v41_image_groups(groups, kv_cache_config):
-    """Drop DeepSeek-V4.1's checkpoint-image group from the recurrent leg.
+def _without_v41_checkpoint_groups(groups, kv_cache_config):
+    """Drop DeepSeek-V4.1's checkpoint-checkpoint group from the recurrent leg.
 
-    The image layers are declared as a `MambaSpec` so vLLM allocates and
+    The checkpoint layers are declared as a `MambaSpec` so vLLM allocates and
     prefix-caches blocks for them, which makes `find_mamba_groups` pick them
     up -- but they are ATOM's own state checkpoints, written and read inside
     the worker, not a recurrent cache to hand to the tier.
@@ -156,7 +158,7 @@ def _without_v41_image_groups(groups, kv_cache_config):
         if names and all(is_state_checkpoint_layer(n) for n in names):
             logger.info(
                 "ATOM LMCache offload: kv cache group %s is DeepSeek-V4.1's "
-                "state-image group (%d layers); not offloading it",
+                "state-checkpoint group (%d layers); not offloading it",
                 group_id,
                 len(names),
             )
@@ -317,7 +319,7 @@ def _v41_state_checkpoints_can_serve(vllm_config) -> bool:
     Takes the config rather than reading vLLM's current one. The scheduler
     calls `cap_local_hit` outside any `set_current_vllm_config` scope, so
     `get_current_vllm_config_or_none()` is None there and the check it fed was
-    false on every request -- the gate `ATOM_V41_IMAGE_LOCAL_HITS` opens never
+    false on every request -- the gate `ATOM_V41_CHECKPOINT_LOCAL_HITS` opens never
     actually opened. Here the caller already holds the config.
 
     Guarded: this module is used on configurations where the checkpoint
@@ -418,7 +420,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # Resolved once here so both halves agree on which group is which. A
         # model with no mamba group leaves every field below inert and takes
         # exactly the code path it takes today.
-        self._mamba_groups = _without_v41_image_groups(
+        self._mamba_groups = _without_v41_checkpoint_groups(
             find_mamba_groups(getattr(kv_cache_config, "kv_cache_groups", None) or ()),
             kv_cache_config,
         )
@@ -829,15 +831,15 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "nothing to register"
             )
         mamba_ids = {group_id for group_id, _ in self._mamba_groups}
-        # V4.1's state-image group is neither: it is dropped from the
+        # V4.1's state-checkpoint group is neither: it is dropped from the
         # recurrent leg above, and counting it here as an attention group
         # made this refuse to start with `found [0, 1]`. It is ATOM's own
         # state and the connector never touches it in either direction.
-        image_ids = _v41_image_group_ids(kv_cache_config)
+        checkpoint_unit_ids = _v41_checkpoint_group_id_set(kv_cache_config)
         others = [
             gid
             for gid in range(len(groups))
-            if gid not in mamba_ids and gid not in image_ids
+            if gid not in mamba_ids and gid not in checkpoint_unit_ids
         ]
         if len(others) == 1:
             self._attn_block_size = int(
@@ -882,8 +884,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # becomes the smallest group's, so with a draft group the two part
         # company and a boundary chosen on the hash grid is not a PAGE edge.
         grid = int(getattr(self, "_attn_block_size", 0) or 0) or int(hash_block_size)
-        # When images are registered the two mechanisms have to agree on one
-        # grid: the planner decides where a boundary may sit, and the image
+        # When checkpoints are registered the two mechanisms have to agree on one
+        # grid: the planner decides where a boundary may sit, and the checkpoint
         # group decides which column vLLM hashes. A boundary the planner
         # accepts on a different grid is a store nothing can look up, and the
         # symptom is a silent zero hit rate rather than an error.
@@ -891,11 +893,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             register_v41_state_checkpoint_adapter,
         )
 
-        image_block = int(register_v41_state_checkpoint_adapter().block_size)
-        if image_block and image_block != grid:
+        checkpoint_block = int(register_v41_state_checkpoint_adapter().block_size)
+        if checkpoint_block and checkpoint_block != grid:
             raise ValueError(
                 f"ATOM LMCache offload: V4.1 boundary grid {grid} does not match the "
-                f"state image block {image_block}. A boundary claimed on one grid is "
+                f"state checkpoint block {checkpoint_block}. A boundary claimed on one grid is "
                 "hashed on the other, so nothing stored would ever be found."
             )
         rides_page = self._state_rides_mp
@@ -935,10 +937,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def _refuse_v41_ride_without_dense_checkpoints(self, grid: int) -> None:
         """A ride needs a state checkpoint at EVERY chunk boundary.
 
-        One save spans many chunks and carries exactly one image -- the
+        One save spans many chunks and carries exactly one checkpoint -- the
         boundary it ends on -- with the earlier chunks' recurrent ids nulled.
         If a later lookup can report a hit at one of those earlier chunk
-        boundaries, the PAGE bytes come back with no image behind them, and
+        boundaries, the PAGE bytes come back with no checkpoint behind them, and
         `cap_hit` under a ride has no index left to catch it with: it trusts
         that whatever the lookup reported present is present with its state.
         That trust is only earned when every chunk boundary is a checkpoint,
@@ -952,9 +954,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         blocks held in the proxy pool; the cost of not refusing is a wrong
         answer nothing reports.
         """
-        from atom.plugin.vllm.deepseek_v41_state_checkpoint import V41ImagePlacement
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            V41CheckpointPlacement,
+        )
 
-        placement = V41ImagePlacement.from_env()
+        placement = V41CheckpointPlacement.from_env()
         interval = int(placement.interval)
         chunk = int(self._scheduler.chunk_size)
         if interval == chunk:
@@ -962,7 +966,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         raise ValueError(
             "ATOM offload connector: DeepSeek-V4.1 state cannot ride the PAGE "
             f"object with a checkpoint interval of {interval} tokens against "
-            f"an LMCache chunk of {chunk}. A save carries one image, at the "
+            f"an LMCache chunk of {chunk}. A save carries one checkpoint, at the "
             "boundary it ends on, so every chunk boundary must be a "
             "checkpoint. Bring the two together from either side -- "
             f"ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS={chunk}, or an LMCache "
@@ -975,7 +979,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
     def _v41_state_for_transfer(self, seq, end: int, operation=None):
-        """Which state image the transfer ending at *end* carries.
+        """Which state checkpoint the transfer ending at *end* carries.
 
         The scheduler holds a ``SeqView``, which has no block hashes; the
         planner needs vLLM's own request object for them, and this connector
@@ -1307,7 +1311,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         One recurrent engine group per checkpoint group, every one of them
         aliasing the *same* PAGE planes that were just registered. That is
         not a duplicate registration but the whole mechanism: a V4.1 state
-        image is `k` consecutive PAGE units, the checkpoint groups are the
+        checkpoint is `k` consecutive PAGE units, the checkpoint groups are the
         `k` columns vLLM hashes and allocates blocks in, and a block id in
         column `j` is a page id in the one pool. So each group needs its own
         engine block-id list -- which is what a separate engine group buys --
@@ -1319,7 +1323,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         The STATE region is deliberately absent. It is addressed by request
         slot, so it has no block id to name; what the tier carries is the
-        checkpoint image already copied into PAGE units by
+        checkpoint already copied into PAGE units by
         `execute_paged_state_copies`, which is the only form of this state
         that a later request can be restored from.
         """
@@ -1465,7 +1469,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """Stand up the worker half of V4.1's STATE leg.
 
         Built like the recurrent tier beside it and for the same reason: the
-        image is one whole entry, so it needs staging sized to that rather
+        checkpoint is one whole entry, so it needs staging sized to that rather
         than the KV path's chunk-sized buffer, which would fail every transfer
         at `ensure_buffer`.
         """
@@ -1538,7 +1542,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         views = self._build_kda_views(per_group, groups)
         tensors_by_group = views.groups
 
-        # Sized to one whole state image. The KV staging buffer is sized in
+        # Sized to one whole state checkpoint. The KV staging buffer is sized in
         # LMCache chunks and is routinely an order of magnitude smaller, so
         # sharing it would fail every transfer at `ensure_buffer`.
         if self._offload_backend == "mp":
@@ -1655,7 +1659,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # which vLLM calls before the forward; `_flush_kda_stores` runs
             # from `wait_for_save`, after it. By then `advance_cursor` has
             # moved the slot's cursor to the END of this step's tokens, so the
-            # image no longer reads the frontier it would be keyed by -- which
+            # checkpoint no longer reads the frontier it would be keyed by -- which
             # is precisely what the cursor guard refuses. K3 can flush late
             # because its source is a block vLLM copied aside; V4.1's source is
             # the live slot, and the live slot has a tense.
@@ -2026,7 +2030,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         truncates `num_computed_tokens` to the first bad block and recomputes
         from there, where a request-level failure discards the whole external
         prefix. More than one group -- a hybrid model, or V4.1 once its state
-        images become their own groups -- has no choice.
+        checkpoints become their own groups -- has no choice.
         """
         # `getattr` on self, not just on the config: the base class sets
         # `_kv_cache_config` in `__init__`, so a connector without it is one
@@ -2299,6 +2303,18 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 group_blocks=groups,
             ):
                 self._v41_planner.refuse_admission(request, attention_blocks)
+                if self._state_rides_mp:
+                    # Under a ride there is no state leg to fail the request
+                    # through: the checkpoint travels inside the PAGE object,
+                    # so `refuse_admission` queues nothing. The admission has
+                    # already happened, though, and a request left parked on a
+                    # prefix whose state nobody restored runs on whatever the
+                    # slot held -- measured as `needs state at 1280, found
+                    # -4643142014259413360`. Withdrawing the promise here is
+                    # the ride's equivalent: `get_finished` releases the park
+                    # and truncates to what HBM really holds, and the prefix
+                    # is recomputed.
+                    self._abandoned_loads.add(str(request.request_id))
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """Snapshot this step's transfers.
@@ -2426,6 +2442,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
             kda_loads = list(kda_loads) + self._v41_planner.take_loads()
             self._v41_planner.log_stats()
+            # After this step's stores, deliberately: a ride pinned for a save
+            # built here must see its own operation in the scheduler's live
+            # set. `_collect_kda_stores` does the same for the recurrent leg,
+            # but it returns early when there is no KDA planner -- which is
+            # every V4.1 run -- so the call has to exist on this branch too.
+            # Without it nothing ever gives a ride's blocks back: measured at
+            # `ride_pinned=97, ride_unpinned=0`, eight blocks each out of a
+            # 950-block pool, and the engine sat at `Running: 0, Waiting: 32`
+            # with the KV cache 94.9% full.
+            self._scheduler.reconcile_recurrent_rides()
 
         return AtomOffloadMetadata(
             inner,

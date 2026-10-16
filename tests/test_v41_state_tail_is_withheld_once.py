@@ -7,9 +7,9 @@ before handing the rest out. Both running deducts it twice, and the symptom is
 a pool quietly smaller than it was priced at -- no error, just fewer blocks
 than the recipe says and a preemption rate nobody can explain.
 
-So the reserve patch defers when images are on. These tests pin that it
+So the reserve patch defers when checkpoints are on. These tests pin that it
 defers only then, because deferring unconditionally would leave the tail
-unreserved on every run that has images off -- the opposite failure, and a
+unreserved on every run that has checkpoints off -- the opposite failure, and a
 louder one (the carve runs off the end of the tensor).
 """
 
@@ -29,7 +29,7 @@ def blocks(monkeypatch):
     return 37
 
 
-def images(monkeypatch, on: bool):
+def checkpoints(monkeypatch, on: bool):
     import atom.plugin.vllm.paged_state_checkpoint as mech
 
     monkeypatch.setattr(
@@ -39,18 +39,18 @@ def images(monkeypatch, on: bool):
 
 
 def test_the_patch_owns_the_tail_when_images_are_off(monkeypatch, blocks):
-    images(monkeypatch, False)
+    checkpoints(monkeypatch, False)
     assert reserve_mod.deepseek_v41_state_reserve_blocks(SimpleNamespace()) == blocks
 
 
 def test_the_patch_defers_when_images_are_on(monkeypatch, blocks):
-    images(monkeypatch, True)
+    checkpoints(monkeypatch, True)
     assert reserve_mod.deepseek_v41_state_reserve_blocks(SimpleNamespace()) == 0
 
 
 def test_an_unimportable_mechanism_means_the_patch_still_owns_it(monkeypatch, blocks):
     """This module runs before ATOM's attention stack on some configs. The
-    mechanism being absent is 'images are off', not 'skip the reservation'."""
+    mechanism being absent is 'checkpoints are off', not 'skip the reservation'."""
 
     def boom(cfg):
         raise ImportError("not available here")
@@ -62,7 +62,7 @@ def test_an_unimportable_mechanism_means_the_patch_still_owns_it(monkeypatch, bl
 
 
 def test_the_deferral_is_decided_where_both_are_visible():
-    """Not in the image path and not in the bridge: in the one function that
+    """Not in the checkpoint path and not in the bridge: in the one function that
     can see both answers, so the choice cannot be made twice."""
     import inspect
 
@@ -71,7 +71,7 @@ def test_the_deferral_is_decided_where_both_are_visible():
 
 
 def test_register_installs_both_and_the_image_path_after_the_patch():
-    """Order matters for readability, not correctness -- but the image install
+    """Order matters for readability, not correctness -- but the checkpoint install
     must be present at all, or the adapter never exists in EngineCore and the
     pool is sized without it."""
     import inspect

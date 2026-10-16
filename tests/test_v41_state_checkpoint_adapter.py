@@ -71,7 +71,7 @@ def test_the_spec_matches_the_geometry_state_copies_will_check_it_against():
 
 
 def test_an_image_is_several_whole_page_units():
-    """`k` is what sizes the image layer list, so it must be the ceiling the
+    """`k` is what sizes the checkpoint layer list, so it must be the ceiling the
     spec computes and not a separate rounding."""
     s = sizing()
     assert s.k == -(-s.image_bytes // s.page_unit_bytes)
@@ -80,7 +80,7 @@ def test_an_image_is_several_whole_page_units():
 
 
 def test_the_image_is_a_strict_part_of_a_slot():
-    """The compressor rings are `in_checkpoint=False`, so the image is smaller
+    """The compressor rings are `in_checkpoint=False`, so the checkpoint is smaller
     than the slot. Equal would mean that exclusion stopped applying."""
     s = sizing()
     assert 0 < s.image_bytes < s.slot_bytes

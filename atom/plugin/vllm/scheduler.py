@@ -181,7 +181,7 @@ class _HybridKVLoadFailureMixin:
 def apply_vllm_v41_prefill_alignment_patch() -> None:
     """End V4.1 prefill chunks on a state boundary. Idempotent, no-op elsewhere.
 
-    A STATE image exists only where the frontier *lands*, and vLLM spends one
+    A STATE checkpoint exists only where the frontier *lands*, and vLLM spends one
     token budget across the whole step: a prefill sharing a batch with six
     decodes is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
     arbitrary offset and steps over the interval grid for the rest of the
@@ -325,12 +325,12 @@ def _log_cap_decision(num_local, planner, capped=None) -> None:
     )
 
 
-def _image_only_cap(num_local: int, block_size: int) -> int:
-    """Leave vLLM's answer alone when the state images are wired.
+def _checkpoint_only_cap(num_local: int, block_size: int) -> int:
+    """Leave vLLM's answer alone when the state checkpoints are wired.
 
     vLLM has ALREADY reduced the hit to a position the state group can
     serve. Its coordinator reconciles every group to a common length by
-    taking the minimum, and the image group -- a `MambaSpec`, so
+    taking the minimum, and the checkpoint group -- a `MambaSpec`, so
     `MambaManager` -- only ever offers a boundary it has a cached
     checkpoint block for. Measured directly:
 
@@ -396,12 +396,14 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
             capped = int(planner.cap_local_hit(request, int(num_local)))
         else:
             # No connector, so no planner -- but capping a local hit to the
-            # checkpoint position is a property of the state images, not of
-            # the tier. Without this the images could never be shown to
+            # checkpoint position is a property of the state checkpoints, not of
+            # the tier. Without this the checkpoints could never be shown to
             # carry anything: every arm that had them also had a tier, and
             # the tier reached the boundary first (measured: 11 state loads
-            # completed, 0 images restored).
-            capped = _image_only_cap(int(num_local), int(self.cache_config.block_size))
+            # completed, 0 checkpoints restored).
+            capped = _checkpoint_only_cap(
+                int(num_local), int(self.cache_config.block_size)
+            )
         _log_cap_decision(num_local, planner, capped)
         if capped >= num_local:
             return blocks, num_local, boundary, divergent

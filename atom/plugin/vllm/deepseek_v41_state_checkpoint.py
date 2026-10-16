@@ -35,7 +35,7 @@ What V4.1 decides differently from V4, and why:
     (`attentions/deepseek_v41/speculative.py:4-6`). The bytes a speculative
     step leaves are already the right bytes for the accepted prefix; only
     the position they are filed under has to wait for `commit_tentative`.
-  * **No fp8 requirement.** V4's images are validated only over its fp8
+  * **No fp8 requirement.** V4's checkpoints are validated only over its fp8
     2buff plane layout and its bf16 path does not run. V4.1's target pool is
     BF16 and that is the configuration it ships in.
 """
@@ -61,9 +61,9 @@ from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
 
 logger = logging.getLogger(__name__)
 
-#: Suffix of the image layer names. Positional: unit *i* of the image is
+#: Suffix of the checkpoint layer names. Positional: unit *i* of the checkpoint is
 #: layer *i*, so the order is the key space and renumbering makes every
-#: stored image unreadable.
+#: stored checkpoint unreadable.
 ATOM_DEEPSEEK_V41_STATE_CHECKPOINT_LAYER_SUFFIX = "atom_deepseek_v41_state_checkpoint"
 
 
@@ -197,7 +197,7 @@ def v41_state_checkpoint_sizing(vllm_config) -> V41StateCheckpointSizing:
 class _PluginV41StateCopier:
     """`StateCopies` behind the names `paged_state_checkpoint` calls.
 
-    No method borrowing: the image blocks alias the proxy arena at the same
+    No method borrowing: the checkpoint blocks alias the proxy arena at the same
     block stride, which is what makes native's own addressing correct here.
     The wrapper exists only because the mechanism asks for `checkpoint_spec`
     as an attribute and `execute_paged_state_copies` as a method, while
@@ -224,7 +224,7 @@ class _PluginV41StateCopier:
 
 
 def build_v41_state_checkpoint_copier(vllm_config, max_batch: int = 64):
-    """The copier for this worker's bound pool, or None when images are off."""
+    """The copier for this worker's bound pool, or None when checkpoints are off."""
     from atom.plugin.vllm.deepseek_v41_bridge import ensure_v41_proxy_bound
 
     cache, _slots = ensure_v41_proxy_bound(vllm_config)
@@ -233,7 +233,7 @@ def build_v41_state_checkpoint_copier(vllm_config, max_batch: int = 64):
 
 
 # ---------------------------------------------------------------------------
-# Image layers, placement
+# Checkpoint layers, placement
 # ---------------------------------------------------------------------------
 
 
@@ -248,7 +248,7 @@ class AtomDeepseekV41StateCheckpointBackend(PagedStateCheckpointBackend):
 
 
 class AtomDeepseekV41StateCheckpointLayer(PagedStateCheckpointLayer):
-    """One PAGE unit of a V4.1 checkpoint image, as vLLM sees it."""
+    """One PAGE unit of a V4.1 checkpoint, as vLLM sees it."""
 
     def __init__(self, prefix: str, part: int, page_bytes: int, adapter=None):
         super().__init__(
@@ -275,13 +275,15 @@ def _native_checkpoint_defaults() -> tuple[int, bool]:
 
 
 @dataclass(frozen=True)
-class V41ImagePlacement(StateCheckpointPlacement):
+class V41CheckpointPlacement(StateCheckpointPlacement):
     """Native placement at V4.1's 256-token block."""
 
     block: int = 256
 
     @classmethod
-    def from_env(cls, defaults=None, block: int | None = None) -> V41ImagePlacement:
+    def from_env(
+        cls, defaults=None, block: int | None = None
+    ) -> V41CheckpointPlacement:
         return super().from_env(
             defaults or _native_checkpoint_defaults(), block or _block_size()
         )
@@ -296,12 +298,12 @@ V41SchedulerStateCheckpoints = SchedulerStateCheckpoints
 
 
 def v41_drafter_in_target_slot(vllm_config) -> bool:
-    """Whether a prefix hit may resume the configured drafter from an image.
+    """Whether a prefix hit may resume the configured drafter from a checkpoint.
 
     True for DSpark, and this is the one place V4.1 departs from #2502's V4
     adapter, so the argument is written out rather than assumed:
 
-    A V4.1 image carries the window ring and the Engram cursor; the two
+    A V4.1 checkpoint carries the window ring and the Engram cursor; the two
     compressor rings are `in_checkpoint=False` because a checkpoint sits on a
     PAGE boundary, a multiple of every ratio, so a resumer reads none of them
     (`v41_pool_geometry.py:318-319`). DSpark adds no state outside that --
@@ -313,7 +315,7 @@ def v41_drafter_in_target_slot(vllm_config) -> bool:
     alone.
 
     The consequence for the store, handled where the store is: a speculative
-    step's own ends are the DRAFTED ends, so the image must be filed under
+    step's own ends are the DRAFTED ends, so the checkpoint must be filed under
     the committed position instead, which exists only after
     `commit_tentative`.
 
@@ -379,7 +381,7 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
         mode = getattr(cache, "mamba_cache_mode", "align")
         if mode != "align":
             bad.append(
-                f"mamba_cache_mode={mode!r}: the image groups are MambaSpecs and "
+                f"mamba_cache_mode={mode!r}: the checkpoint groups are MambaSpecs and "
                 "only 'align' writes their state at chunk ends (pass "
                 "--mamba-cache-mode align)"
             )
@@ -387,9 +389,9 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
         unit = getattr(cache, "prefix_match_unit", None)
         if unit is not None and int(unit) != block:
             bad.append(
-                f"prefix_match_unit={unit} against an image block of {block}: a "
+                f"prefix_match_unit={unit} against a checkpoint block of {block}: a "
                 "finer unit lets MambaManager serve a hit at a sub-block "
-                "position, which is not a V4.1 PAGE edge and has no image"
+                "position, which is not a V4.1 PAGE edge and has no checkpoint"
             )
 
         retention = getattr(cache, "prefix_cache_retention_interval", 0) or 0
@@ -409,7 +411,7 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
 
         if bad:
             raise ValueError(
-                "DeepSeek-V4.1 checkpoint images cannot be served under this "
+                "DeepSeek-V4.1 checkpoints cannot be served under this "
                 "configuration:\n  - " + "\n  - ".join(bad)
             )
 
@@ -436,7 +438,7 @@ def current_state_checkpoint_worker(adapter=None):
 
 
 def apply_vllm_v41_prefix_install() -> None:
-    """Register the V4.1 adapter and install every image hook. Idempotent.
+    """Register the V4.1 adapter and install every checkpoint hook. Idempotent.
 
     Called from `register_model`, which runs in EngineCore and in every
     worker. `ATOMPlatform.check_and_update_config` is not a reliable site:
@@ -446,7 +448,7 @@ def apply_vllm_v41_prefix_install() -> None:
     installed = install()
     if any(installed):
         logger.info(
-            "ATOM DeepSeek-V4.1: installed checkpoint image hooks "
+            "ATOM DeepSeek-V4.1: installed checkpoint hooks "
             "(get_kv_cache_configs=%s, kv zeroing=%s, runner events=%s, "
             "placement scheduler=%s)",
             *installed,
@@ -458,21 +460,21 @@ def apply_vllm_v41_prefix_install() -> None:
 
 
 def install_v41_group_check_scope() -> bool:
-    """Scope the vendored group check to the pool the images actually live in.
+    """Scope the vendored group check to the pool the checkpoints actually live in.
 
     `check_state_checkpoint_groups` walks EVERY group in the config and requires the
     family's block size and page of each. That holds for the proxy and the
-    image layers -- they are one overlaid pool -- but a DSpark draft group is
+    checkpoint layers -- they are one overlaid pool -- but a DSpark draft group is
     a second, separate pool by design (`_build_v41_proxy_draft_groups`), with
-    its own block size and page, and no image is ever stored in it. Left
+    its own block size and page, and no checkpoint is ever stored in it. Left
     unscoped the check refuses the one combination the adapter advertises as
-    supported (`state_checkpoint_drafters`), so images and speculative decoding could
+    supported (`state_checkpoint_drafters`), so checkpoints and speculative decoding could
     never run together.
 
     Done by wrapping the module attribute, so the vendored file stays
     byte-identical; the check itself is unchanged and still runs over the
-    proxy and all k image groups. Upstream fix: have `check_state_checkpoint_groups`
-    skip groups that hold neither the proxy nor an image layer.
+    proxy and all k checkpoint groups. Upstream fix: have `check_state_checkpoint_groups`
+    skip groups that hold neither the proxy nor a checkpoint layer.
     """
     import functools
     from types import SimpleNamespace
@@ -503,7 +505,7 @@ def install_v41_group_check_scope() -> bool:
             num_blocks=cfg.num_blocks,
         )
         logger.info(
-            "ATOM DeepSeek-V4.1: image group check scoped to %d of %d groups "
+            "ATOM DeepSeek-V4.1: checkpoint group check scoped to %d of %d groups "
             "(%d belong to another pool, e.g. the DSpark draft)",
             len(ours),
             len(groups),
@@ -517,12 +519,12 @@ def install_v41_group_check_scope() -> bool:
 
 
 def install_v41_runner_state_events() -> int:
-    """Carry the scheduler's per-step image plan into whichever runner runs.
+    """Carry the scheduler's per-step checkpoint plan into whichever runner runs.
 
     Third site with the same gap as `install_v41_store_sites` and
     `install_v41_state_checkpoint_group_ids`: the vendored `_apply_runner_patches` wraps
     `_update_states` on the V1 `GPUModelRunner` only, so on V4.1's V2 runner
-    `_store_plan` stayed empty -- the scheduler planned an image at the
+    `_store_plan` stayed empty -- the scheduler planned a checkpoint at the
     anchor, the worker was never told, and the next request's hit landed on a
     boundary nothing had written (`needs state at N, found 1`).
 
@@ -584,24 +586,24 @@ def install_v41_runner_state_events() -> int:
         patched += 1
     if patched:
         logger.info(
-            "ATOM DeepSeek-V4.1: image step events on %d model runner class(es)",
+            "ATOM DeepSeek-V4.1: checkpoint step events on %d model runner class(es)",
             patched,
         )
     return patched
 
 
 def install_v41_state_checkpoint_group_ids() -> int:
-    """Record each image layer's KV cache group id on whichever runner runs.
+    """Record each checkpoint layer's KV cache group id on whichever runner runs.
 
     Same gap as `install_v41_store_sites`, on a different site and with a
     worse failure: the vendored installer wraps
     `vllm.v1.worker.gpu_model_runner.GPUModelRunner.initialize_kv_cache` to
     write `_atom_state_checkpoint_group_id`, but DeepSeek-V4.1 runs on the V2 runner, so
-    the write never happened and the hook still reported success -- the image
-    worker then refused to start, with the pool already sized for images.
+    the write never happened and the hook still reported success -- the checkpoint
+    worker then refused to start, with the pool already sized for checkpoints.
 
     Written BEFORE the original runs, not after as the vendored hook does:
-    V4.1 binds its proxy pool (and stands up the image worker) inside
+    V4.1 binds its proxy pool (and stands up the checkpoint worker) inside
     `initialize_kv_cache`, so a write afterwards is already too late. The id
     comes from this worker's own `kv_cache_config` argument, which is what the
     vendored hook reads too, so both writes agree.
@@ -614,7 +616,7 @@ def install_v41_state_checkpoint_group_ids() -> int:
     patched = 0
     for cls in gpu_model_runner_classes():
         original = getattr(cls, "initialize_kv_cache", None)
-        if original is None or getattr(original, "_atom_v41_image_gids", False):
+        if original is None or getattr(original, "_atom_v41_checkpoint_gids", False):
             continue
 
         @functools.wraps(original)
@@ -627,12 +629,12 @@ def install_v41_state_checkpoint_group_ids() -> int:
                         layer._atom_state_checkpoint_group_id = gid
             return _orig(self, kv_cache_config, *args, **kwargs)
 
-        initialize_kv_cache._atom_v41_image_gids = True
+        initialize_kv_cache._atom_v41_checkpoint_gids = True
         cls.initialize_kv_cache = initialize_kv_cache
         patched += 1
     if patched:
         logger.info(
-            "ATOM DeepSeek-V4.1: image group ids recorded on %d model runner "
+            "ATOM DeepSeek-V4.1: checkpoint group ids recorded on %d model runner "
             "class(es)",
             patched,
         )
@@ -651,7 +653,7 @@ def install_v41_store_sites() -> int:
     The V2 runner has no `_model_forward` at all: its forward is inlined in
     `execute_model`. A `getattr(cls, "_model_forward", None)` guard therefore
     skipped the only runner V4.1 uses, silently -- the scheduler planned an
-    image at the anchor, nothing ever wrote it, and the next request's hit on
+    checkpoint at the anchor, nothing ever wrote it, and the next request's hit on
     that boundary died with `needs state at N, found 1`. So wrap
     `execute_model` there instead: it returns after the step's last forward,
     on the same stream and outside any capture, which is what the store site
@@ -691,7 +693,7 @@ def install_v41_store_sites() -> int:
             # the slot IS final here, and deferring instead carries the store
             # across the NEXT step's forward.
             #
-            # Measured with DSpark on, before this: every image held the state
+            # Measured with DSpark on, before this: every checkpoint held the state
             # of the following boundary -- planned 2560 stored at cursor 3072,
             # planned 3072 at 3584, planned 3584 at 3630 -- and a later hit on
             # one of those boundaries got back a state one checkpoint ahead.

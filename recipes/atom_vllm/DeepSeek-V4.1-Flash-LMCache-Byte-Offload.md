@@ -27,8 +27,8 @@ export AITER_LOG_LEVEL=WARNING VLLM_WORKER_MULTIPROC_METHOD=spawn
 export PYTHONHASHSEED=0
 export ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1 VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export ATOM_V41_ALLOW_SPECULATIVE_OFFLOAD=1
-export ATOM_V41_STATE_IMAGES=0 ATOM_V41_LOCAL_PREFIX_HITS=0
-export ATOM_V41_IMAGE_LOCAL_HITS=0
+export ATOM_V41_STATE_CHECKPOINTS=0 ATOM_V41_LOCAL_PREFIX_HITS=0
+export ATOM_V41_CHECKPOINT_LOCAL_HITS=0
 export LMCACHE_LOCAL_CPU=True LMCACHE_MAX_LOCAL_CPU_SIZE=16
 export LMCACHE_CHUNK_SIZE=256 LMCACHE_CACHE_POLICY=ATOM_SLRU
 export OFFLOAD_MIN_LOAD_TOKENS=256
@@ -60,7 +60,7 @@ For OFF, stop ON and its MP server, then start the same model command without
 `--kv-transfer-config`, replacing `--enable-prefix-caching` with
 `--no-enable-prefix-caching`. Keep graphs, DSpark and all other model parameters
 unchanged. This compares CPU PAGE+STATE reuse against **no prefix reuse**, not
-CPU offload against existing local-HBM prefix reuse. The three image/local-hit
+CPU offload against existing local-HBM prefix reuse. The three checkpoint/local-hit
 flags above must remain zero for this tested configuration.
 
 ## Test method

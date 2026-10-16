@@ -12,7 +12,7 @@ movement is `KdaStateTier`/`StateByteCodec`, which this leg reuses unchanged.
   it is still in the slot, which is only at the step whose frontier *is* that
   boundary. Everything else is a boundary that no longer exists.
 * The cursor guard is what stands between a scheduling change and a wrongly
-  keyed image.
+  keyed checkpoint.
 
 No GPU, no vLLM: the views object is faked down to the three methods the
 planner calls.
@@ -403,7 +403,7 @@ def test_a_request_with_no_slot_is_refused_by_the_worker():
 def test_a_cursor_that_disagrees_with_the_schedule_is_refused():
     """The hard contract, checked against the bytes rather than the schedule.
 
-    Keying an image to a position it is not at is the one failure nothing
+    Keying a checkpoint to a position it is not at is the one failure nothing
     downstream catches: `cap_hit` would accept the boundary and the forward it
     was restored into would then refuse the request.
     """

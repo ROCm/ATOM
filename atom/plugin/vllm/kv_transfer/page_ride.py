@@ -106,7 +106,7 @@ class PageRideMixin:
         by indexing a block table: a block that was superseded, freed, nulled
         or relocated is no longer registered under that hash, so a stale row
         cannot be mistaken for a live boundary. All groups or none -- a state
-        stored for some of them is an image that cannot be restored.
+        stored for some of them is a checkpoint that cannot be restored.
         """
         pool = self._pool
         self._last_ride_gate = "no_pool"
