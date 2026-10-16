@@ -131,9 +131,25 @@ def _mxfp4_to_bf16(module, name: str, shape: tuple[int, ...]) -> torch.Tensor:
     )
     groups = cols // MX_GROUP
     packed = w.data.view(torch.uint8)
+    # Both AITER layouts are applied under one condition and must be undone
+    # under the same one. `LinearBase.process_weights_after_loading` shuffles
+    # the weight when `weight_is_stored_preshuffled` holds -- for per_1x32
+    # fp4x2 that is `not use_fp4_non_shuffle_triton_gemm()` -- and e8m0-shuffles
+    # the scale on that same predicate (`linear.py`). So the weight's
+    # `is_shuffled` is an exact proxy for the scale's state, and under
+    # ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 neither is permuted: inverse-
+    # permuting the row-major scale plane there is silent, because the routed
+    # expert planes are tile-aligned and no shape check fires.
     if getattr(w, "is_shuffled", False):
         packed = unshuffle_weight(packed)
-    plane = unshuffle_scale(scale.data, rows, groups)
+        plane = unshuffle_scale(scale.data, rows, groups)
+    else:
+        _need(
+            scale.data.numel() == rows * groups,
+            f"{name}: unshuffled scale has {scale.data.numel()} elements, "
+            f"expected {rows * groups}",
+        )
+        plane = scale.data.reshape(rows, groups)
     return dequant_fp4_e2m1(
         packed.view(torch.int8), plane.view(torch.float8_e8m0fnu), MX_GROUP, BF16
     )
