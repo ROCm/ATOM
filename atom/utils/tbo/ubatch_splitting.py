@@ -98,9 +98,11 @@ def maybe_create_ubatch_slices(
     # each slice has to record where its own prefill ends. Dispatch before the
     # prefill/decode paths below, which would only see the prefill rows.
     if num_prefill_tokens is not None:
-        assert (
-            num_scheduled_tokens is not None
-        ), "mixed split needs per-row token counts for the whole batch"
+        if num_scheduled_tokens is None or num_prefill_seqs is None:
+            raise RuntimeError(
+                "mixed split needs per-row token counts and the prefill row "
+                "count for the whole batch"
+            )
         return split_mixed_token_midpoint(
             num_reqs,
             num_prefill_seqs,

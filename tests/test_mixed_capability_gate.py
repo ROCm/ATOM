@@ -134,6 +134,7 @@ class _FakeConfig:
         cudagraph_mode=None,
         chunked_prefill=True,
         dcp=1,
+        pcp=1,
         enable_tbo=False,
         kv_transfer_config=None,
     ):
@@ -146,6 +147,7 @@ class _FakeConfig:
         self.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
         self.enable_chunked_prefill = chunked_prefill
         self.decode_context_parallel_size = dcp
+        self.prefill_context_parallel_size = pcp
         self.enable_tbo = enable_tbo
         self.kv_transfer_config = kv_transfer_config or {}
 
@@ -250,6 +252,15 @@ def test_validator_refuses_mrope(hf_factory):
     hf.rope_parameters = {"mrope_section": [16, 24, 24]}
     with pytest.raises(ValueError, match="M-RoPE"):
         _FakeConfig(hf=hf)._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("v4", [False, True])
+def test_validator_refuses_pcp(v4):
+    """PCP's round-robin query split covers the whole batch on every family."""
+    _bind()
+    hf = _v4_hf() if v4 else None
+    with pytest.raises(ValueError, match="prefill context parallel"):
+        _FakeConfig(hf=hf, pcp=2)._validate_mixed_prefill_decode()
 
 
 def test_validator_refuses_dcp_on_dense_mla_only():

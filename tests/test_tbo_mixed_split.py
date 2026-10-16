@@ -187,6 +187,26 @@ def test_maybe_create_ubatch_slices_dispatches_to_mixed():
     assert slices[-1].token_slice.stop == total
 
 
+@pytest.mark.parametrize("missing", ["num_scheduled_tokens", "num_prefill_seqs"])
+def test_maybe_create_ubatch_slices_mixed_refuses_missing_counts(missing):
+    """A mixed call without the row counts must fail loudly, not split on None."""
+    from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices
+
+    toks = np.asarray([605] * 27 + [1], dtype=np.int64)
+    kwargs = dict(
+        num_reqs=28,
+        num_tokens=int(toks.sum()),
+        is_prefill=True,
+        num_scheduled_tokens=toks,
+        force=True,
+        num_prefill_seqs=27,
+        num_prefill_tokens=27 * 605,
+    )
+    kwargs[missing] = None
+    with pytest.raises(RuntimeError, match="mixed split needs"):
+        maybe_create_ubatch_slices(**kwargs)
+
+
 def test_maybe_create_ubatch_slices_leaves_prefill_path_alone():
     """Without the mixed args the factory must behave exactly as before."""
     from atom.utils.tbo.ubatch_splitting import maybe_create_ubatch_slices

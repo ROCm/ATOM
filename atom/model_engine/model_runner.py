@@ -235,15 +235,6 @@ class tokenIDProcessor:
             device=device,
             publication_group="input_ids",
         )
-        # Index staging for the mixed prefill+decode deferred path, which reads
-        # last step's sampled ids with a `torch.gather` over `prev_token_ids`
-        # and needs somewhere to upload the row indices. The pure-decode path
-        # moved to the fused `fill_deferred_decode_ids` kernel (`decode_cu` /
-        # `decode_src` below) and dropped this buffer; the mixed path still
-        # gathers, so it keeps its own.
-        self.deferred_prev_idx = CpuGpuBuffer(
-            max_num_batched_tokens, dtype=torch.int64, device=device
-        )
         # One per request, not per token: where each request's anchor comes
         # from. Sized by tokens -- a batch can never hold more requests. The
         # matching prefix sum is `forward_vars["cu_seqlens_q"]`.
