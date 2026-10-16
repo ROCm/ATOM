@@ -92,6 +92,7 @@ from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
+from atom.model_ops.deepseek_v41.score_workspace import logits_rows
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
@@ -1562,6 +1563,23 @@ def _prefill_mqa_logits_fp4(
     return logits
 
 
+def _decode_band_rows(
+    ws: torch.Tensor | None, rows: int, width: int, next_n: int
+) -> int:
+    """Rows per decode chunk, in whole requests."""
+    band = logits_rows(rows, width)
+    if ws is not None and ws.numel() >= width * next_n:
+        band = min(band, ws.numel() // width)
+    return min(rows, max(next_n, band // next_n * next_n))
+
+
+def _indexer_logits(ws: torch.Tensor | None, rows: int, width: int) -> torch.Tensor:
+    """`[rows, width]` view of the workspace, or a new tensor if it is too small."""
+    if ws is not None and ws.numel() >= rows * width:
+        return ws[: rows * width].view(rows, width)
+    return torch.empty(rows, width, dtype=torch.float32, device="cuda")
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -1588,6 +1606,7 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
+    indexer_logits_ws: torch.Tensor | None = None,
 ) -> None:
     # Room for the DCP prefill all-gather to land in place. It produces
     # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
@@ -1993,12 +2012,13 @@ def sparse_attn_indexer(
             return
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
         # global one.
-        logits = torch.empty(
-            [num_rows, max_model_len], dtype=torch.float32, device="cuda"
-        )
+        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
         if indexer_fp4:
             from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
+            logits = torch.empty(
+                [num_rows, max_model_len], dtype=torch.float32, device="cuda"
+            )
             flydsl_pa_mqa_logits_fp4(
                 padded_q_decode_tokens,
                 q_fp4_scale[:num_decode_tokens],
@@ -2020,29 +2040,45 @@ def sparse_attn_indexer(
                     max_seq_len=max_model_len,
                 ),
             )
-        else:
-            deepgemm_fp8_paged_mqa_logits(
-                padded_q_decode_tokens,
-                kv_cache,
-                weights[:num_padded_tokens],
+            top_k_per_row_decode(
                 logits,
+                next_n,
                 decode_metadata.context_lens,
-                attn_metadata.block_tables,
-                max_model_len,
-                KVBlockSize=runner_block_size,
-                Preshuffle=True,
+                topk_indices_decode,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                stable=stable_topk,
             )
-        topk_indices_decode = topk_indices[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.context_lens,
-            topk_indices_decode,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-            stable=stable_topk,
-        )
+        else:
+            # Score in chunks of whole requests (as V4.1).
+            band = _decode_band_rows(indexer_logits_ws, num_rows, max_model_len, next_n)
+            logits = _indexer_logits(indexer_logits_ws, band, max_model_len)
+            for r0 in range(0, num_rows, band):
+                r1 = min(r0 + band, num_rows)
+                b0, b1 = r0 // next_n, r1 // next_n
+                scores = logits[: r1 - r0]
+                deepgemm_fp8_paged_mqa_logits(
+                    padded_q_decode_tokens[b0:b1],
+                    kv_cache,
+                    weights[r0:r1],
+                    scores,
+                    decode_metadata.context_lens[b0:b1],
+                    attn_metadata.block_tables[b0:b1],
+                    max_model_len,
+                    KVBlockSize=runner_block_size,
+                    Preshuffle=True,
+                )
+                top_k_per_row_decode(
+                    scores,
+                    next_n,
+                    decode_metadata.context_lens[b0:b1],
+                    topk_indices_decode[r0:r1],
+                    r1 - r0,
+                    scores.stride(0),
+                    scores.stride(1),
+                    stable=stable_topk,
+                )
         if attn_metadata.max_seqlen_q > 1:
             triton_gather_kv_indices_sparse(
                 attn_metadata.sparse_kv_indptr,
@@ -2073,6 +2109,7 @@ direct_register_custom_op(
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
+        "indexer_logits_ws",
     ],
     fake_impl=lambda *_args, **_kwargs: None,
 )
@@ -2372,6 +2409,8 @@ class Indexer(nn.Module):
             0, dtype=torch.int32, device="cuda"
         )
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
+        # Set by the MLA metadata builder (aiter_mla.py).
+        self.indexer_logits_ws = torch.empty(0, dtype=torch.float32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
         # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
@@ -2510,6 +2549,7 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style,
             not unfused_qk_rope,
             self.stable_topk,
+            self.indexer_logits_ws,
         )
 
 
