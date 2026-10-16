@@ -129,6 +129,7 @@ cannot affect a server that does not use the feature.
 | **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
 | **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |

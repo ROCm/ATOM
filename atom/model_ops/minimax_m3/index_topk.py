@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton kernels for MiniMax M3 lightning-indexer block scoring + top-k.
+"""MiniMax M3 lightning-indexer block scoring + top-k.
 
 Index queries score each 128-token block of index keys (max over the block),
 then the top-k blocks (plus forced init/local blocks) are selected per query
 token. The KV page size is forced to equal the sparse block size (128), so one
 sparse block maps to exactly one page.
 
-The two phases score differently -- prefill over whole query tiles, decode over
-one request's rows at a time -- and then share a selector.
+The two phases score differently and then share a Triton selector. Decode
+scores on the matrix cores through aiter's flydsl kernel (`decode_index_score`),
+which is the only decode scorer -- there is no Triton fallback behind it.
+Prefill runs the same flydsl family (`prefill_index_score`). The Triton
+query-tile kernel (`_index_block_score_kernel`) stays as the reference the
+tests hold it against, reachable by naming it, not by configuration.
 
 Index-K cache layout: ``(num_blocks, 128, idx_head_dim)``. The indexer is MQA:
 index_q carries num_idx_heads heads, index_k one, shared by all of them.
@@ -27,19 +31,88 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
-    # direction as the Triton one below, same selection on every shape tried.
-    # It narrows in one pass where Triton folds tl.topk over
-    # ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as the row widens
-    # -- 7us against 36us at a 1M context. `_aiter_selector_wins` says where.
-    from aiter.ops.flydsl.topk_per_row_small_k import (
+
+# aiter's MFMA block-score kernel: max-over-128-tokens block scoring on the
+# matrix cores, with a packed work map so a ragged batch does not pay for its
+# holes. This is the ONLY decode scorer -- the Triton one it replaced is gone --
+# so a missing kernel is fatal to M3 decode and this must not degrade silently.
+#
+# Resolved on FIRST USE rather than at import, though, because an ImportError
+# here is not contained to M3: `sparse_attn` imports this module at module
+# scope, `atom/plugin/vllm/attention/backend.py` imports `sparse_attn` for
+# `SPARSE_BLOCK_SIZE`, and that module carries the MLA prefill backends. A hard
+# import would take all of them down on an aiter that merely predates the
+# kernel. Deferring keeps the blast radius at "M3 decode raises, with a message
+# that names what to install".
+@functools.cache
+def _flydsl(name):
+    """One aiter decode-scorer symbol, or a RuntimeError naming the dependency."""
+    from aiter.ops import flydsl
+
+    try:
+        return getattr(flydsl, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"MiniMax-M3 decode needs aiter.ops.flydsl.{name}, which this aiter "
+            f"does not carry. The decode index scorer has no Triton fallback, so "
+            f"this is not recoverable at runtime -- install an aiter that "
+            f"includes the FlyDSL M3 index-score kernels (ROCm/aiter#5626)."
+        ) from exc
+
+
+@functools.cache
+def _topk_small_k():
+    """aiter's chunk-narrowing per-row selector: ``(select, supported)``.
+
+    Same forced-block pins and tie direction as the Triton one below, same
+    selection on every shape tried. It narrows in one pass where Triton folds
+    `tl.topk` over ceil(max_block / BLOCK_SIZE_K) tiles, so it pulls ahead as
+    the row widens -- 7us against 36us at a 1M context. `_aiter_selector_wins`
+    says where.
+
+    Resolved on use rather than at module scope, for the reason `_flydsl` is:
+    the only CI job that runs `tests/` installs no aiter, so a module-scope
+    import would turn this file's whole test module into a collection error.
+
+    NOT guarded by `try/except ImportError`. It was, and the module moved
+    underneath it (`flydsl/` -> `flydsl/topk/`), which that guard turns into
+    "every row takes the 36us path, forever, silently" instead of an error.
+    There is no aiter that carries the M3 score kernels this file requires but
+    not this selector -- it is older and sits on aiter main -- so an absent
+    module means a moved path, and the right answer to a moved path is to say
+    so.
+    """
+    from aiter.ops.flydsl.topk.topk_per_row_small_k import (
         topk_per_row_small_k,
         topk_per_row_small_k_supported,
     )
-except ImportError:  # pragma: no cover - aiter is optional at import time
-    topk_per_row_small_k = None
-    topk_per_row_small_k_supported = None
+
+    return topk_per_row_small_k, topk_per_row_small_k_supported
+
+
+# aiter's MFMA prefill block-score kernel, by module path because
+# `aiter.ops.flydsl` does not re-export it yet. Guarded for the reason
+# `_flydsl` is deferred, which `test_the_symbols_are_not_imported_at_module_scope`
+# pins: `sparse_attn` imports this module and the vLLM backend imports that, so
+# a hard import here takes the MLA prefill backends down with it.
+try:
+    from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+        score_prefill_flydsl,
+    )
+except ImportError:  # pragma: no cover - depends on the installed aiter
+    score_prefill_flydsl = None
+
+# Shared by all four allocators and by `decode_index_score`, so they cannot
+# drift into naming different flags for the same refusal.
+# Both ROCm flavours: gfx942 is e4m3fnuz, gfx950 is e4m3fn, and the allocator
+# hands back whichever `aiter.dtypes.fp8` is on this part.
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+INDEX_CACHE_MUST_BE_FP8 = (
+    "MiniMax-M3's index cache must be fp8: the FlyDSL scorers are the only "
+    "index scorers and they serve fp8 only (ROCm/aiter#5626). Pass "
+    "--index-cache-dtype fp8."
+)
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
@@ -56,20 +129,10 @@ SPARSE_BLOCK_SIZE = 128
 SCORE_BLOCK_SIZE_Q = 128
 # Workgroups per compute unit the block-axis split aims for (_score_chunk_blocks).
 SCORE_CHUNK_CTAS_PER_CU = 8
-# Stages, both score kernels. 2 -- triton's default -- was the worst of 1/2/3
-# nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1 wins the
-# short-context rows, which is not where a step spends its time.
+# Stages, the prefill score kernel. 2 -- triton's default -- was the worst of
+# 1/2/3 nearly everywhere. Between 1 and 3, 3 wins on fp8 and ties on bf16; 1
+# wins the short-context rows, which is not where a step spends its time.
 SCORE_NUM_STAGES = 3
-DECODE_SCORE_NUM_STAGES = 3
-# Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
-# floors the blocks a chunk walks -- the query tile is loaded once outside the
-# block loop, so at one block per chunk that fixed cost is the whole cost.
-# TARGET_GRID caps total workgroups, which MIN_BLOCKS alone cannot: it ignores
-# batch, so the grid grows without limit (275 us at batch 128 vs 202 capped).
-# Both are fits, not derivations -- the best (batch x chunks) runs 8k-44k over
-# batch 16-128, and 1<<14 stays within 5% of the per-batch optimum there.
-DECODE_SCORE_TARGET_GRID = 1 << 14
-DECODE_SCORE_MIN_BLOCKS = 3
 # Physical 16-pages per logical 128-block for the page-16 SHUFFLE ASM/gluon cache.
 # Used by the fused block-table emission in the topk kernels.
 #
@@ -284,6 +347,119 @@ def n_valid_column_per_row_for_forward(owner, phase, row_starts, row_prefix, **k
             pass  # slotted metadata: correct, just rebuilt per layer
     if phase not in cache:
         cache[phase] = build_n_valid_column_per_row(row_starts, row_prefix, **kw)
+    return cache[phase]
+
+
+def build_index_score_work_map(
+    seq_lens, *, max_block, max_query_len, num_idx_heads, out=None,
+    cp_world=1, cp_rank=0,
+):  # fmt: skip
+    """``[grid, 2]`` int32: the flydsl score kernel's packed dispatch order.
+
+    None only when the batch is empty, which has no work to dispatch.
+
+    Build this ONCE PER DECODE STEP. It is ~15 tiny device ops -- almost all
+    launch floor -- and costs ~120us whatever the shape, against a score kernel
+    of 17-250us, so a per-layer rebuild costs far more than the kernel wins.
+    The lengths do not change between layers, so once is right as well as
+    necessary. :func:`decode_index_score` will build one for itself when none
+    arrives, which is correct and slow; every production caller hoists.
+
+    ``out`` is a persistent buffer to fill, sliced inside; same reason as
+    :func:`build_n_valid_column_per_row` -- a captured decode replays against
+    the pointer baked in at capture.
+
+    ``cp_world``/``cp_rank`` describe an indexer-CP shard: this rank owns the
+    round-robin blocks ``b % world == rank``, and ``max_block`` is then this
+    rank's LOCAL bound ``ceil(global_blocks / cp_world)``, not the global one.
+    The same pair must reach the map builder and the score call, which
+    re-derive the same per-request local block count from it.
+    """
+    if seq_lens.shape[0] <= 0:
+        return None
+    return _flydsl("minimax_m3_index_score_work_map")(
+        seq_lens,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+        out=out,
+    )
+
+
+def index_score_work_map_size(
+    batch, max_block, max_query_len, num_idx_heads, cp_world=1, cp_rank=0,
+):  # fmt: skip
+    """Rows :func:`build_index_score_work_map` will write, for sizing a buffer.
+
+    0 for an empty batch, so a caller can skip the allocation.
+    """
+    if batch <= 0:
+        return 0
+    return _flydsl("minimax_m3_index_score_work_map_size")(
+        batch,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+    )
+
+
+def index_score_work_map_capacity(
+    max_batch, max_block, max_query_len, num_idx_heads, cp_world=1, cp_rank=0,
+):  # fmt: skip
+    """Rows a PERSISTENT buffer needs to serve every batch up to ``max_batch``.
+
+    NOT :func:`index_score_work_map_size` at ``max_batch``. aiter documents the
+    exact grid as non-monotonic in the bounds and says a caller sizing a
+    persistent ``[rows, 2]`` buffer for a cudagraph must use this instead --
+    and it really is non-monotonic: at ``max_block=256`` a batch of 8 needs 256
+    rows while a batch of 7 needs 455, so a buffer sized at the larger batch is
+    rejected by the smaller one with "work_map: expected packed [at least 455,
+    2] int32".
+
+    The exact size stays the right thing for VALIDATING a map that was handed
+    in, which is what `decode_index_score` does with it. Only allocation moves.
+
+    0 for an empty batch, so a caller can skip the allocation.
+    """
+    if max_batch <= 0:
+        return 0
+    return _flydsl("minimax_m3_index_score_work_map_capacity")(
+        max_batch,
+        max_block,
+        max_query_len,
+        num_idx_heads,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+    )
+
+
+def index_score_work_map_for_forward(owner, phase, seq_lens, **kw):
+    """:func:`build_index_score_work_map`, hoisted to once per forward.
+
+    Same contract and the same reason as
+    :func:`n_valid_column_per_row_for_forward`, for the same callers: the vLLM
+    and SGLang plugins, whose metadata is framework code with no field to
+    publish into. Native ATOM reads
+    `MiniMaxM3SparseMetadata.index_score_work_map` instead.
+
+    `owner` MUST live exactly one forward. The hoist matters more here than it
+    does for the column counts: the map costs ~120us of launch floor, so
+    rebuilding it per sparse layer would cost more than the score kernel it
+    feeds saves.
+    """
+    cache = getattr(owner, "_index_score_work_map", None)
+    if cache is None:
+        cache = {}
+        try:
+            owner._index_score_work_map = cache
+        except AttributeError:
+            pass  # slotted metadata: correct, just rebuilt per layer
+    if phase not in cache:
+        cache[phase] = build_index_score_work_map(seq_lens, **kw)
     return cache[phase]
 
 
@@ -617,38 +793,6 @@ def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, de
     return triton.cdiv(max_block, chunks)
 
 
-def _decode_score_chunks(batch: int, max_block: int) -> int:
-    """Chunks one decode score row is split across.
-
-    A count, not a size: the grid is (request, chunk), so this IS the second
-    grid dim and it must stay shape-constant for a cuda graph to replay it.
-    Enough chunks that a long context is not serialized inside a handful of
-    CTAs, floored so no chunk shrinks to a single block -- DECODE_SCORE_MIN_BLOCKS
-    is what bounds the split, and TARGET_GRID still caps the largest batches.
-
-    The round trip through the size is not redundant. The caller turns this
-    count back into a size with the same cdiv, and a count that does not divide
-    the blocks overshoots: 800 blocks over 64 chunks is 13 blocks each, and
-    13 * 64 covers 832, so the last two chunks start past the end and launch
-    only to return. Deriving the count from the size it implies keeps every
-    chunk non-empty, and both are still pure functions of launch-time bounds,
-    so a cuda graph replays the grid it captured.
-    """
-    target = max(1, DECODE_SCORE_TARGET_GRID // max(1, batch))
-    if max_block <= 0:
-        # A grid dim still has to be positive. Capping `chunks` is not enough:
-        # the round trip below divides by its own inner `cdiv`, zero here, and
-        # the raise lands outside any launch -- one rank down while the others
-        # wait in the collective that follows.
-        return 1
-    chunks = min(1 << (target.bit_length() - 1), max_block)
-    # Floor the blocks one chunk walks. The query tile is loaded once outside
-    # the block loop, so at one block per chunk that fixed cost is the whole
-    # cost -- every measured regression was a chunk down to a single block.
-    chunks = min(chunks, max(1, triton.cdiv(max_block, DECODE_SCORE_MIN_BLOCKS)))
-    return triton.cdiv(max_block, triton.cdiv(max_block, chunks))
-
-
 def _require_packable(max_block: int) -> None:
     """The packed key spends its low 16 bits on the 1-based block id.
 
@@ -721,11 +865,18 @@ def _select_with_aiter(
     """Run the selection through aiter, or return False if it cannot serve.
 
     Declines rather than raises: k past the wave width, or a survivor buffer
-    past the LDS budget, are shapes the Triton selector still handles. `score`
-    and `topk_idx` are contiguous, so the flattening is a view.
+    past the LDS budget, are shapes the Triton selector still handles.
+
+    The flattening is a view, which is why `score` has to be contiguous -- the
+    flydsl score kernel writes the feature-contiguous layout `alloc_score`
+    picks, and `.view(rows, max_block)` on that is not a reshape but an error.
+    At the widths where that layout is chosen this selector already declines on
+    its LDS budget, so the guard costs nothing today; it is here so the two
+    changes stay independent.
     """
-    if topk_per_row_small_k is None:
+    if not score.is_contiguous():
         return False
+    select, supported = _topk_small_k()
     heads, total_q, max_block = score.shape
     rows = heads * total_q
     flat_score = score.view(rows, max_block)
@@ -736,12 +887,12 @@ def _select_with_aiter(
     key = (rows, max_block, topk, n_valid_column_per_row.shape[0], score.device)
     served = _AITER_SERVES.get(key)
     if served is None:
-        served = _AITER_SERVES[key] = topk_per_row_small_k_supported(
+        served = _AITER_SERVES[key] = supported(
             flat_score, n_valid_column_per_row, flat_idx, topk
         )
     if not served:
         return False
-    topk_per_row_small_k(
+    select(
         flat_score, n_valid_column_per_row, flat_idx, topk, init_blocks, local_blocks
     )
     return True
@@ -973,117 +1124,120 @@ def _topk_index_packed_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Decode index-score kernel, tiled over (query row x index head).
-#
-# One program owns a (request, block chunk) and scores every (row, head) of
-# that request against each block it loads: the columns become the N dim of a
-# tl.dot, so a 128-token index-K block is read once per request. What this
-# replaced scored one (row, head) at a time and re-read each block
-# heads * query_rows times -- 8x at tp2 under MTP-4, which is why that
-# configuration cost 5x what tp4 plain decode does on identical unique traffic.
-#
-# The block scores land in HBM instead of being consumed in-register, which
-# costs a separate selection pass. That buffer is ~1.3 MB at the 100k/conc-50
-# serving point against 1.3 GB of index K, so it is not the trade it looks like.
-# ---------------------------------------------------------------------------
-@triton.heuristics(
-    {
-        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        # tl.dot wants a real N; a request with one row and one head would
-        # otherwise ask for a 1-wide matmul.
-        "BLOCK_SIZE_N": lambda args: max(
-            16, triton.next_power_of_2(args["NUM_IDX_HEADS"] * args["MAX_Q"])
-        ),
-    }
-)
-@triton.jit
-def _decode_index_score_tiled_kernel(
-    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
-    score_ptr,  # out: [num_idx_heads, total_q, max_block]
-    block_table_ptr,  # [num_reqs, max_blocks]
-    seq_lens,  # [batch]
-    head_dim,
-    sm_scale,
-    chunk_blocks,  # blocks this program's chunk owns
-    stride_q_n,
-    stride_q_h,
-    stride_q_d,
-    stride_ik_blk,
-    stride_ik_pos,
-    stride_ik_d,
-    stride_s_h,
-    stride_s_b,
-    stride_s_k,
-    stride_bt_b,
-    NUM_IDX_HEADS: tl.constexpr,
-    MAX_Q: tl.constexpr,  # query tokens per request (num_spec + 1; 1 == plain decode)
-    BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    BLOCK_SIZE_D: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-):
-    pid_b = tl.program_id(0)
-    pid_chunk = tl.program_id(1)
-
-    seq_len = tl.load(seq_lens + pid_b)
-    # The request's last query row is the one that sees the most blocks.
-    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
-    chunk_start = pid_chunk * chunk_blocks
-    chunk_end = tl.minimum(chunk_start + chunk_blocks, num_blocks)
-    if chunk_start >= chunk_end:
-        return
-
-    off_n = tl.arange(0, BLOCK_SIZE_N)
-    tok = off_n // NUM_IDX_HEADS
-    head = off_n - tok * NUM_IDX_HEADS
-    n_valid = off_n < NUM_IDX_HEADS * MAX_Q
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    off_k = tl.arange(0, BLOCK_SIZE_K)
-    row = pid_b * MAX_Q + tok
-
-    # [D, N]: one column per (query row, index head) of this request.
-    q = tl.load(
-        q_ptr
-        + row[None, :] * stride_q_n
-        + head[None, :] * stride_q_h
-        + off_d[:, None] * stride_q_d,
-        mask=d_mask[:, None] & n_valid[None, :],
-        other=0.0,
-    )
-    # Row `tok` sits at absolute position seq_len - MAX_Q + tok, so its causal
-    # cutoff is one past that. Every column has its own.
-    causal_len = seq_len - MAX_Q + tok + 1
-    bt_row = block_table_ptr + pid_b * stride_bt_b
-    sm_scale_log2e = sm_scale * 1.4426950409
-
-    for blk in tl.range(chunk_start, chunk_end):
-        page = tl.load(bt_row + blk).to(tl.int64)
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d[None, :] * stride_ik_d,
-            mask=d_mask[None, :],
-            other=0.0,
-        )
-        # Keep the query at its own precision and lift the key to meet it, the
-        # way the gemv path did -- prefill instead rounds the query down to the
-        # cache dtype, and the two phases are meant to keep scoring differently.
-        qk = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * sm_scale_log2e
-        pos = blk * BLOCK_SIZE_K + off_k
-        qk = tl.where(pos[:, None] < causal_len[None, :], qk, float("-inf"))
-        score = tl.max(qk, axis=0)
-        tl.store(
-            score_ptr + head * stride_s_h + row * stride_s_b + blk * stride_s_k,
-            score,
-            mask=n_valid,
-        )
-
-
-# ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+def prefill_index_score(
+    idx_q,  # [total_q, num_idx_heads, head_dim]
+    index_kv_cache,  # [num_blocks, 128, head_dim]
+    block_table,
+    cu_seqlens_q,
+    seq_lens,
+    prefix_lens,
+    max_query_len,
+    max_seq_len,
+    sm_scale,
+    backend: str | None = None,
+):
+    """The prefill block scores, ``[num_idx_heads, total_q, max_block]`` fp32.
+
+    The ragged counterpart of :func:`decode_index_score`, and the one place the
+    two prefill scorers are chosen between. Both
+    produce the same layout -- aiter's `alloc_score` is deliberately the one the
+    Triton kernel wrote -- so everything downstream is blind to the choice.
+
+    Neither scorer owes an answer past a query row's causal window, and the two
+    do not even agree about how far past it they write: each fills out to its
+    own query TILE's window, and the tile widths differ. That is safe because
+    `n_valid_column_per_row` bounds the selector at `ceil(causal_len / 128)` per
+    row. It also means the columns beyond it are uninitialised, not merely
+    stale, so the score tensor cannot be read raw.
+
+    Unlike decode there is no indexer-CP variant: prefill stays TP and is handed
+    a single index head (see `_sparse_prefill`), so there is no shard to remap.
+    """
+    # flydsl, unless a caller names the Triton scorer. There is no env knob and
+    # no dtype routing: bf16 is refused before it reaches either scorer, so the
+    # choice only exists for the tests that hold the two side by side.
+    if backend not in (None, "flydsl", "triton"):
+        raise ValueError(f"backend must be 'flydsl' or 'triton', got {backend!r}")
+    resolved = backend or "flydsl"
+
+    total_q, num_idx_heads, head_dim = idx_q.shape
+    batch = cu_seqlens_q.shape[0] - 1
+    max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+
+    if resolved == "flydsl":
+        if score_prefill_flydsl is None:
+            # The import above is guarded so a missing kernel cannot take the
+            # MLA prefill backends down at import; it was never a fallback.
+            # Triton is the tests' reference, not a production route, so say
+            # what to install rather than calling None.
+            raise RuntimeError(
+                "MiniMax-M3 prefill needs aiter.ops.flydsl.kernels."
+                "minimax_m3_index_score_prefill, which this aiter does not "
+                "carry. The prefill index scorer has no Triton fallback in "
+                "production, so this is not recoverable at runtime -- install "
+                "an aiter that includes the FlyDSL M3 index-score kernels "
+                "(ROCm/aiter#5626)."
+            )
+        # sm_scale passes through as-is: the kernel folds `log2(e)` in itself,
+        # exactly as the Triton one does. The fp8 MFMA needs no switch here --
+        # `fp8_mfma` resolves itself from the cache dtype.
+        return score_prefill_flydsl(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            cu_seqlens_q,
+            seq_lens,
+            prefix_lens,
+            max_query_len,
+            max_seq_len,
+            sm_scale,
+        )
+
+    score = torch.empty(
+        (num_idx_heads, total_q, max_block),
+        dtype=torch.float32,
+        device=idx_q.device,
+    )
+    q_tiles = triton.cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
+    chunk_blocks = _score_chunk_blocks(
+        max_block, q_tiles, batch, num_idx_heads, idx_q.device
+    )
+    grid_score = (
+        q_tiles,
+        batch * num_idx_heads,
+        triton.cdiv(max_block, chunk_blocks),
+    )
+    _index_block_score_kernel[grid_score](
+        idx_q,
+        index_kv_cache,
+        score,
+        block_table,
+        cu_seqlens_q,
+        seq_lens,
+        prefix_lens,
+        num_idx_heads,
+        head_dim,
+        sm_scale,
+        chunk_blocks,
+        idx_q.stride(0),
+        idx_q.stride(1),
+        idx_q.stride(2),
+        index_kv_cache.stride(0),
+        index_kv_cache.stride(1),
+        index_kv_cache.stride(2),
+        score.stride(0),
+        score.stride(1),
+        score.stride(2),
+        block_table.stride(0),
+        BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
+        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        num_stages=SCORE_NUM_STAGES,
+    )
+    return score
+
+
 @torch.no_grad()
 def minimax_m3_index_topk(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
@@ -1128,7 +1282,7 @@ def minimax_m3_index_topk(
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
     """
-    total_q, num_idx_heads, head_dim = idx_q.shape
+    total_q, num_idx_heads, _ = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
@@ -1136,45 +1290,16 @@ def minimax_m3_index_topk(
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
     _require_packable(max_block)
 
-    score = torch.empty(
-        (num_idx_heads, total_q, max_block),
-        dtype=torch.float32,
-        device=idx_q.device,
-    )
-    q_tiles = triton.cdiv(max_query_len, SCORE_BLOCK_SIZE_Q)
-    chunk_blocks = _score_chunk_blocks(
-        max_block, q_tiles, batch, num_idx_heads, idx_q.device
-    )
-    grid_score = (
-        q_tiles,
-        batch * num_idx_heads,
-        triton.cdiv(max_block, chunk_blocks),
-    )
-    _index_block_score_kernel[grid_score](
+    score = prefill_index_score(
         idx_q,
         index_kv_cache,
-        score,
         block_table,
         cu_seqlens_q,
         seq_lens,
         prefix_lens,
-        num_idx_heads,
-        head_dim,
+        max_query_len,
+        max_seq_len,
         sm_scale,
-        chunk_blocks,
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        block_table.stride(0),
-        BLOCK_SIZE_Q=SCORE_BLOCK_SIZE_Q,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_stages=SCORE_NUM_STAGES,
     )
 
     topk_idx = torch.empty(
@@ -1206,6 +1331,128 @@ def minimax_m3_index_topk(
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
 
+def decode_index_score(
+    idx_q,
+    index_kv_cache,
+    block_table,
+    seq_lens,
+    max_block,
+    max_query_len,
+    num_idx_heads,
+    sm_scale,
+    work_map=None,
+    cp_world=1,
+    cp_rank=0,
+    out=None,
+):
+    """The decode block scores, `[num_idx_heads, total_q, max_block]` fp32.
+
+    The only decode scorer there is. It raises rather than declining -- the
+    Triton kernel that used to sit behind it is gone -- so a shape outside the
+    envelope (head dim != 128, a cache that is neither bf16 nor fp8-e4m3, a
+    strided last axis) fails loudly in `minimax_m3_index_score_flydsl`'s own
+    asserts instead of quietly running something else.
+
+    ``work_map`` is the packed dispatch order. Pass one. Omitting it is correct
+    and slow: this builds its own, ~120us of launch floor against a score kernel
+    of 17-250us, which is fine once per step and ruinous once per sparse layer.
+    Every production caller hoists it into per-step metadata; the convenience is
+    here for tests and one-off callers, and the docstring is the only thing
+    stopping it becoming the default.
+
+    `max_block` is the caller's capture-stable bound, NOT
+    `ceil(max_seq_len / 128)` for this step: see the caller for why. That is not
+    free, and not for the reason it looks like. The dead chunks themselves do
+    retire cheaply -- the map packs them to the end of the dispatch order -- but
+    `resolve_config` estimates the machine's CTA supply from `batch * max_block`,
+    so an inflated bound inflates that estimate and it picks the deepest page
+    loop, which its own docstring measures at up to +71% on a short batch.
+    Against a batch-bounded score: b32 q1 s8k fp8 11.9 -> 19.3us, b16 q8 s32k
+    bf16 31.2 -> 42.8us, while b32 q1 s128k -- the one case whose bound does not
+    move -- is unchanged. Over the whole selection op the win survives at 13/14
+    rather than 14/14, the loss being that same short fp8 case at 0.77x.
+
+    The depth cannot simply be pinned to what the batch wants: it divides the
+    work chunk, so it sets the map's row count, which IS the grid, which is
+    baked at capture. Decoupling the two -- a runtime page-loop count, so the
+    grid stays fixed while the depth tracks the step -- is a kernel change and
+    the real fix.
+
+    Under indexer CP (``cp_world > 1``) this scores only the blocks
+    ``b % cp_world == cp_rank``, `max_block` is the LOCAL bound, and the result
+    is the compacted shard `local_candidate_keys` reads. One thing matters
+    downstream: it writes only the blocks a request actually has, leaving dead
+    slots untouched. That is safe because `_pack_score_key` sends every masked
+    lane to key 0, below any real candidate -- but it means the score tensor
+    cannot be read raw.
+
+    The score comes back in the transposed layout `alloc_score` picks. Both
+    selectors take the three score strides as arguments, so this is invisible
+    downstream -- except to `_select_with_aiter`, which needs a view and checks
+    contiguity for exactly this reason.
+    """
+    if index_kv_cache.dtype not in _FP8_DTYPES:
+        raise ValueError(f"{INDEX_CACHE_MUST_BE_FP8} Got {index_kv_cache.dtype}.")
+    batch = seq_lens.shape[0]
+    if work_map is None:
+        work_map = build_index_score_work_map(
+            seq_lens, max_block=max_block, max_query_len=max_query_len,
+            num_idx_heads=num_idx_heads, cp_world=cp_world, cp_rank=cp_rank,
+        )  # fmt: skip
+    else:
+        # The map's row count IS the grid, so a map built against a different
+        # max_block is not a shorter map -- it is the kernel walking the
+        # right-sized grid through rows that mean something else. Silent wrong
+        # scores, so this has to refuse.
+        #
+        # ValueError and not an assert, for the reason `_require_packable`
+        # gives: the bound traces back to launch flags and a captured buffer,
+        # and `python -O` must not be able to turn a stale map into wrong
+        # scores that nothing reports.
+        rows = index_score_work_map_size(
+            batch, max_block, max_query_len, num_idx_heads, cp_world, cp_rank,
+        )  # fmt: skip
+        if work_map.shape[0] != rows:
+            raise ValueError(
+                f"index_score_work_map has {work_map.shape[0]} rows, this call "
+                f"needs {rows} (max_block={max_block}) -- the two were built "
+                f"against different bounds"
+            )
+
+    # `out` is for a consumer that needs a LAYOUT, not one that wants to reuse
+    # a buffer. Past `total_q * num_idx_heads >= 16` the allocator hands back
+    # `[max_block, total_q, H]` permuted into `[H, total_q, max_block]` --
+    # feature-contiguous, which coalesces the scorer's store but leaves the
+    # result non-contiguous, and aiter says so: "it loses eligibility for the
+    # aiter selector ... a caller with a small max_block should check rather
+    # than assume". `indexer_context_scores` is such a caller. Both layouts
+    # produce bit-identical scores, so this costs the store's coalescing and
+    # nothing else.
+    score = out
+    if score is None:
+        score = _flydsl("minimax_m3_index_score_alloc")(
+            batch, max_query_len, num_idx_heads, max_block, idx_q.device
+        )
+    # sm_scale passes through as-is: the kernel applies `sm_scale * log2(e)`
+    # itself, validated against an independent torch oracle in aiter's
+    # op_tests/test_flydsl_minimax_m3_index_score.py.
+    _flydsl("minimax_m3_index_score_flydsl")(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        max_query_len,
+        num_idx_heads,
+        sm_scale,
+        max_block,
+        out=score,
+        work_map=work_map,
+        cp_world=cp_world,
+        cp_rank=cp_rank,
+    )
+    return score
+
+
 @torch.no_grad()
 def minimax_m3_index_topk_decode(
     idx_q: torch.Tensor,  # [total_q == batch*max_query_len, num_idx_heads, head_dim]
@@ -1222,6 +1469,8 @@ def minimax_m3_index_topk_decode(
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_score_work_map: torch.Tensor | None = None,
+    index_score_max_block: int = 0,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -1248,8 +1497,23 @@ def minimax_m3_index_topk_decode(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+
+    ``index_score_work_map`` is its scoring-side counterpart --
+    ``MiniMaxM3SparseMetadata.index_score_work_map``, also built once per
+    forward. Omitted, :func:`decode_index_score` builds its own, which is
+    correct but costs ~120us of launch floor; see there.
+
+    ``index_score_max_block`` is the bound that map was built against, and when
+    it is larger than this step's ``ceil(max_seq_len / 128)`` the score is
+    computed and stored that wide. It has to be, because a map's row count IS
+    the grid: under a cudagraph the grid is baked at capture while the map is
+    refilled each step outside it, so both have to follow a bound that does not
+    move -- ``ceil(max_model_len / 128)``, not the batch's longest request. The
+    extra columns cost almost nothing (the packed map retires dead chunks at
+    ~0.2us per thousand) and neither selector reads past its own row bound.
     """
-    total_q, num_idx_heads, head_dim = idx_q.shape
+    # The head dim is the kernel's business now -- it asserts 128 itself.
+    total_q, num_idx_heads, _ = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
@@ -1271,35 +1535,18 @@ def minimax_m3_index_topk_decode(
         total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
     )
 
-    score = torch.empty(
-        (num_idx_heads, total_q, max_block),
-        dtype=torch.float32,
-        device=idx_q.device,
-    )
-    num_score_chunks = _decode_score_chunks(batch, max_block)
-    _decode_index_score_tiled_kernel[(batch, num_score_chunks)](
+    score_max_block = max(max_block, index_score_max_block)
+    _require_packable(score_max_block)
+    score = decode_index_score(
         idx_q,
         index_kv_cache,
-        score,
         block_table,
         seq_lens,
-        head_dim,
+        score_max_block,
+        max_query_len,
+        num_idx_heads,
         sm_scale,
-        triton.cdiv(max_block, num_score_chunks),
-        idx_q.stride(0),
-        idx_q.stride(1),
-        idx_q.stride(2),
-        index_kv_cache.stride(0),
-        index_kv_cache.stride(1),
-        index_kv_cache.stride(2),
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        block_table.stride(0),
-        NUM_IDX_HEADS=num_idx_heads,
-        MAX_Q=max_query_len,
-        BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        num_stages=DECODE_SCORE_NUM_STAGES,
+        index_score_work_map,
     )
 
     _launch_select(
