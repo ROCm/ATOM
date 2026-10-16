@@ -10,10 +10,10 @@ published region, so the unit is the published sum.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from atom.kv_transfer.disaggregation.page_region import page_region
-from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
 from atom.model_ops.attentions.mha_kv_pool import MhaKvPool
 from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
     mha_page_unit_bases,
@@ -25,9 +25,18 @@ from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
 )
 
 
+def _builder_cls():
+    # gdn_attn imports aiter at module load; CI's CPU runner has none, so only
+    # the tests that need the builder skip there.
+    pytest.importorskip("aiter", reason="needs the AITER GPU kernel library")
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+
+    return GDNAttentionMetadataBuilder
+
+
 def _uses_paged_checkpoints(config):
     builder = SimpleNamespace(model_runner=SimpleNamespace(config=config))
-    return GDNAttentionMetadataBuilder._uses_paged_checkpoints(builder)
+    return _builder_cls()._uses_paged_checkpoints(builder)
 
 
 def _config(model_type, *, pp=1, rapidserve=False, wrapped=False):
@@ -55,6 +64,7 @@ def _layout(monkeypatch, **kwargs):
         "num_spec": 0,
     }
     params.update(kwargs)
+    builder_cls = _builder_cls()
     monkeypatch.setattr(
         "atom.model_ops.attentions.gdn_attn.get_tp_group",
         lambda: SimpleNamespace(world_size=params["tp"]),
@@ -66,7 +76,7 @@ def _layout(monkeypatch, **kwargs):
         _state_shape_for_runner=lambda: (params["shape_k"], params["shape_v"]),
         _state_dtypes=lambda: (params["dtype_k"], params["dtype_v"]),
     )
-    return GDNAttentionMetadataBuilder.state_transfer(builder).paged_layout_id
+    return builder_cls.state_transfer(builder).paged_layout_id
 
 
 class TestWhoCopies:
