@@ -34,7 +34,7 @@ logger = logging.getLogger("atom")
 class MonoDecodeModel(nn.Module):
     """The loaded K3 model, with its supported steps routed to mono."""
 
-    def __init__(self, model: nn.Module) -> None:
+    def __init__(self, model: nn.Module, drafter=None) -> None:
         super().__init__()
         self.model = model
 
@@ -61,7 +61,7 @@ class MonoDecodeModel(nn.Module):
             except ImportError as error:
                 raise MonoUnsupported(f"mono kernels unavailable: {error}") from error
 
-            return K3MonoDecodeRunner(model)
+            return K3MonoDecodeRunner(model, drafter)
 
         self._mono = LazyRunner(_build_runner, "Kimi-K3 mono decode")
         self._declines: set[str] = set()
@@ -125,4 +125,4 @@ def install_mono_decode(
         logger.info("Kimi-K3 mono decode off: %s", why)
         return model
     logger.info("Kimi-K3 mono decode armed (TP%d)", atom_config.tensor_parallel_size)
-    return MonoDecodeModel(model)
+    return MonoDecodeModel(model, drafter)

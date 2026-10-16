@@ -98,13 +98,17 @@ def _width(key: int) -> tuple[int, int]:
 def _keep_hooked_layers(plans, inner):
     """Plans with mono turned off for any layer carrying a forward hook.
 
-    A mono layer's ``nn.Module`` never runs, so a hook on it never fires. The
-    drafter's aux capture is installed exactly that way (``Drafter.
-    arm_aux_capture`` hooks ``layers[lid]``) and is armed before this runner is
-    built, so a tapped layer that took the kernels would leave the drafter
-    reading a buffer from an earlier step -- wrong, and silently so. Hand those
-    layers back to their own modules instead of refusing the whole model, and
-    say which.
+    A hook on ``layers[lid]`` never fires on a mono step, and handing the layer
+    back does NOT change that: ``_fallback`` reruns the layer's forward from
+    its submodules rather than calling the module. So this buys nothing for the
+    drafter's aux capture, which ``K3MonoDecodeRunner._write_aux`` now fills
+    directly instead.
+
+    It is kept for the hooks mono does not know about -- ``RLHFModelRunner.
+    _register_hidden_state_hooks`` installs one per captured layer -- where
+    running the production module at least keeps the rest of that layer honest
+    and costs only this layer's speed. Refusing the whole model would be the
+    alternative; say which layers instead.
     """
     hooked = {
         i

@@ -56,6 +56,7 @@ from atom.models.kimi_k3.mono.plan import (
     width_key,
 )
 from atom.models.kimi_k3.mono.weights import bind_model
+from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import (
     DIAG_BYTES,
@@ -104,9 +105,9 @@ class K3MonoDecodeRunner:
 
     max_rows = MAX_ROWS
 
-    def __init__(self, model) -> None:
+    def __init__(self, model, drafter=None) -> None:
         group = get_tp_group().cpu_group
-        bind_agreed(lambda: self._bind(model), group)
+        bind_agreed(lambda: self._bind(model, drafter), group)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             k2.peer_bytes(self.max_rows),
@@ -121,7 +122,7 @@ class K3MonoDecodeRunner:
         )
 
     # ------------------------------------------------------------------ bind
-    def _bind(self, model) -> None:
+    def _bind(self, model, drafter=None) -> None:
         self.model = model
         self.rank = get_tensor_model_parallel_rank()
         self.tp = get_tensor_model_parallel_world_size()
@@ -132,6 +133,13 @@ class K3MonoDecodeRunner:
             bind_model(self.inner, self.dims, self.rank), self.inner
         )
         self.num_blocks = num_blocks(len(self.inner.layers))
+        # K3 mono requires DSpark (`config_refusal`), so in an armed deployment
+        # there is always a drafter and always taps to keep current.
+        self.aux = (
+            AuxTaps((), ())
+            if drafter is None
+            else bind_aux_taps(drafter, self.inner.config.hidden_size)
+        )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
         self.state_len = self._state_len(first)
@@ -312,12 +320,36 @@ class K3MonoDecodeRunner:
                     f"layer {plan.layer_id} returned rows {sorted(widths)} for "
                     f"an {rows}-row step"
                 )
-            return out
-        delta = add if add2 is None else (add2 if add is None else add + add2)
-        core = self._k1(build, plan, prefix, delta, blocks, metadata)
-        # K2 updates ``prefix`` in place: on a block-write layer it restarts it
-        # at the all-reduced o_proj output, which K1 has already banked
-        return prefix, self._k2(build, plan, core, prefix, blocks), None
+        else:
+            delta = add if add2 is None else (add2 if add is None else add + add2)
+            core = self._k1(build, plan, prefix, delta, blocks, metadata)
+            # K2 updates ``prefix`` in place: on a block-write layer it restarts
+            # it at the all-reduced o_proj output, which K1 has already banked
+            out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+        self._write_aux(plan.layer_id, out)
+        return out
+
+    def _write_aux(self, layer_id: int, out: tuple) -> None:
+        """This layer's aux hidden state, for a DSpark drafter tapping it.
+
+        The drafter hooks ``layers[layer_id]`` (``Drafter.arm_aux_capture``),
+        and NEITHER branch above calls that module -- ``_fallback`` reruns the
+        layer's forward from its submodules -- so the hook cannot fire on a
+        mono step and the drafter would keep reading whatever the last
+        production step left in the buffer. K3 mono requires DSpark, so that is
+        every armed deployment drafting from stale features.
+
+        The reconstruction is the layer's own ``aux_hidden_state``, called on
+        this step's return rather than reimplemented, so the two cannot drift
+        apart -- which is exactly what that method's docstring asks of a caller.
+        ``out`` is ``(prefix, add, add2)``; the layer's own return carries the
+        block residual in a fourth slot that the reconstruction ignores, and
+        mono keeps that in ``blocks``.
+        """
+        if layer_id not in self.aux.layer_ids:
+            return
+        layer = self.inner.layers[layer_id]
+        self.aux.write(layer_id, layer.aux_hidden_state((*out, None)))
 
     def _fallback(self, plan, positions, prefix, blocks, add, add2):
         """``KimiDecoderLayer.forward`` with ``maybe_close_block``'s ``cat``

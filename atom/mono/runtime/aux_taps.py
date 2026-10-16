@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Fixed-address buffers the mono kernels hand to the rest of the step."""
+"""The drafter's aux hidden-state buffers, for the models whose mono path
+has to fill them itself.
+
+Shared because the staleness is: a drafter taps the target's residual stream
+with forward hooks on decoder layers, and a mono step does not call those
+layers through ``nn.Module.__call__``, so the hooks never fire and the drafter
+drafts from whatever the last non-mono step left behind. Every mono model that
+runs under a drafter has to write these buffers itself -- V4.1 from its
+kernels, K3 from its runner's per-layer seam."""
 
 from dataclasses import dataclass
 
@@ -11,16 +19,33 @@ from atom.mono.runtime.consensus import MonoUnsupported
 
 @dataclass(frozen=True)
 class AuxTaps:
-    """The DSpark drafter's aux hidden-state buffers.
+    """The DSpark drafter's aux hidden-state buffers, one per tapped layer.
 
-    The drafter fills them from forward pre-hooks on target layers ``layer_ids``
-    (each the mean over the hc copies of the settled residual entering the
-    layer). A mono layer does not go through ``nn.Module.__call__``, so the hooks
-    do not fire and the kernels write these buffers themselves.
+    On a production step the drafter's own hooks fill them from target layers
+    ``layer_ids``; what each one holds is that target's business (V4.1 the mean
+    over the hc copies, K3 the settled ``prefix_sum`` its layer reconstructs).
+    A mono step bypasses those modules, so it owes the same tensor here.
+
+    A ``-1`` entry taps the embedding rather than a decoder layer. That module
+    IS still called on a mono step, so its hook fires and ``write`` simply
+    never matches it.
     """
 
     layer_ids: tuple[int, ...]
     buffers: tuple[torch.Tensor, ...]
+
+    def write(self, layer_id: int, tap: torch.Tensor | None) -> None:
+        """Record ``tap`` as layer ``layer_id``'s aux hidden state, if it is
+        tapped at all.
+
+        ``tap`` is ``None`` where the layer has nothing settled to report; the
+        drafter's own hook treats that the same way, by leaving the buffer as
+        it was. Rows start at 0 like the hook's (its only offset is the TBO
+        one, and every mono path refuses TBO), and the write is in place so a
+        captured graph keeps replaying into the same buffer."""
+        if tap is None or layer_id not in self.layer_ids:
+            return
+        self.buffers[self.layer_ids.index(layer_id)][: tap.shape[0]].copy_(tap)
 
 
 def bind_aux_taps(drafter, hidden_size: int) -> AuxTaps:
