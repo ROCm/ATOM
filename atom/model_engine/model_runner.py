@@ -4336,6 +4336,13 @@ class ModelRunner:
             # signature -- which of them takes a `max_q_len` is the runner's to
             # know, and it is the same probe the loop above ran.
             if hasattr(self, "drafter"):
+
+                def end_draft_trace(tag):
+                    torch.cuda.synchronize()
+                    self._capture_trace_tag = tag
+                    prof.step()
+                    self._capture_trace_tag = None
+
                 self.drafter.warmup_draft_graphs(
                     (
                         partial(build_capture, max_q_len=full_q_len)
@@ -4343,6 +4350,7 @@ class ModelRunner:
                         else build_capture
                     ),
                     capture_ctx.stream,
+                    end_draft_trace if prof is not None else None,
                 )
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
