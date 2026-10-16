@@ -1440,7 +1440,9 @@ models:
           runner:
             # These nodes reserve idle HugeTLB that the CI UID cannot release:
             # 38741996691 (g34), 38793498618 (g12, 720 GiB on prefill NUMA0).
-            exclude_nodes: [pit2-p03-g34, pit2-p03-g12]
+            # g53 also retains ~300 GiB anon outside job8641; three THP
+            # attempts stopped at912 GiB (38827608848), before model startup.
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53]
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
