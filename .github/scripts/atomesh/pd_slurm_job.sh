@@ -187,6 +187,32 @@ pre_cleanup_local() {
   set -e
 }
 
+# Spur often ignores --exclusive. If another job already holds VRAM, model
+# load fails with opaque HIP OOM ("0 bytes free"). Fail fast with a clear
+# message so the cell is not attributed to the model or LMCache sizing.
+assert_gpus_idle() {
+  local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
+  local used line gpu_idx
+  if command -v amd-smi >/dev/null 2>&1; then
+    while read -r line; do
+      [[ "${line}" =~ ^[[:space:]]*[0-9]+ ]] || continue
+      gpu_idx="$(awk '{print $1}' <<<"${line}")"
+      used="$(awk '{print $3}' <<<"${line}")"
+      used="${used%MB}"
+      [[ "${used}" =~ ^[0-9]+$ ]] || continue
+      if (( used > max_used_mb )); then
+        echo "ERROR: $(hostname) GPU ${gpu_idx} already uses ${used} MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
+        amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
+        docker ps --format '  {{.Names}}\t{{.Status}}' 2>/dev/null | head -20 >&2 || true
+        return 1
+      fi
+    done < <(amd-smi monitor -v 2>/dev/null | tail -n +2)
+  elif command -v rocm-smi >/dev/null 2>&1; then
+    rocm-smi --showmemuse 2>/dev/null | head -40 || true
+  fi
+  return 0
+}
+
 # The image ships every tuned FlyDSL kernel AOT-compiled under
 # /app/aiter-test/aiter/jit/flydsl_cache, but as root-only (0600) files the
 # --user container cannot read. Without them each new prefill M bucket compiles
@@ -474,6 +500,7 @@ run_spur_job() {
   echo "run_dir=${RUN_DIR}"
 
   pre_cleanup_local
+  assert_gpus_idle || return 1
   write_env_file "${env_file}"
   if [[ "${node_rank}" -eq 0 ]]; then
     cat > "${RUN_DIR}/cell-metadata.json" <<EOF

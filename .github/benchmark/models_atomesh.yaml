@@ -190,12 +190,13 @@ models:
       decode: {}
     env_by_runner:
       # Spur MI350X hosts have 1007 GiB per NUMA node and GPUs 0-3 all sit on
-      # NUMA0, so four prefill ranks pin their LMCache tier there. At the
-      # suites' 256 GiB/rank (~1037 GiB actual) plus ~100 GiB of MoE staging
-      # buffers, the last rank is OOM-killed during init.
+      # NUMA0. Measured MoE staging is ~80-96 GiB/rank (~360 GiB for cpp4), so
+      # suites' 256 and the earlier 210 GiB/rank LMCache caps still overflow
+      # NUMA0 (4*212 + 360 > 1007). Cap at 160 GiB/rank (~647 GiB LMCache +
+      # staging fits with headroom).
       atomesh-cicd-mi350:
         prefill:
-          LMCACHE_MAX_LOCAL_CPU_SIZE: "210"
+          LMCACHE_MAX_LOCAL_CPU_SIZE: "160"
     service:
       prefill:
         cudagraph_mode: FULL
