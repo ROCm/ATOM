@@ -2108,7 +2108,9 @@ class ModelRunner:
                 )
         offsets, total = plan_regions(sizes)
         if buf is None:
-            buf = torch.zeros(total, dtype=torch.uint8, device=self.device)
+            from atom.utils.ipc_memory import allocate_shared_kv_buffer
+
+            buf = allocate_shared_kv_buffer(total, self.device)
         elif buf.numel() < total:
             raise ValueError(
                 f"the imported paged pool holds {buf.numel()} B but this side's "

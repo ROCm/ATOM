@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -91,6 +92,13 @@ def run_grouped_prefill(
     if cu_q[-1] != q.shape[0] or cu_k[-1] != meta.total_kv:
         raise ValueError("CPU prefill lengths disagree with draft attention geometry")
     groups = lengths.groups(max_tokens)
+    logging.getLogger("atom").info(
+        "[draft-prefill-workspace] total_kv=%d groups=%d budget_bytes=%d max_group_kv=%d",
+        meta.total_kv,
+        len(groups),
+        max_workspace_bytes,
+        max(cu_k[end] - cu_k[start] for start, end in groups),
+    )
 
     import torch
 
