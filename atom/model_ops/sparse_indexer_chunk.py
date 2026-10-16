@@ -12,6 +12,8 @@ so a burst of long-context requests can push one allocation to tens of GiB
 owns the one rule they all need to agree on.
 """
 
+from atom.utils import envs
+
 # A buffer resource descriptor addresses at most 2^31 bytes, so aiter's
 # fp8_mqa_logits drops to plain global load/store once the logits tensor reaches
 # 2 GiB. On gfx950 that USE_BUFFER_STORE=False specialization of the gluon kernel
@@ -55,6 +57,53 @@ def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) ->
     if max_rows >= _ROW_TILE:
         return (max_rows // _ROW_TILE) * _ROW_TILE
     return 1 << (max(1, max_rows).bit_length() - 1)
+
+
+def plane_rows(width):
+    """Query rows a `width`-column logits plane may hold at once.
+
+    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
+    elements wraps to a negative address. `width` follows the model-length cap
+    and not the live context, so only a long-context configuration can get
+    there; wherever a batch already fits, this leaves it in one piece.
+    """
+    return max(1, (2**31 - 1) // width)
+
+
+def logits_rows(rows, width):
+    """One logits band's rows, shared by allocation and execution."""
+    return min(
+        plane_rows(width),
+        sparse_indexer_row_chunk(
+            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
+        ),
+    )
+
+
+def decode_band_rows(rows, width, next_n, capacity=None):
+    """Rows per decode band: `logits_rows` rounded down to whole requests of
+    `next_n` rows, never below one request, and within `capacity` rows when
+    given. A band that split a request would mis-slice its query and lengths."""
+    band = logits_rows(rows, width)
+    if capacity is not None:
+        if capacity < next_n:
+            raise ValueError(
+                f"logits workspace holds {capacity} rows, less than one "
+                f"request's {next_n}"
+            )
+        band = min(band, capacity)
+    return min(rows, max(next_n, band // next_n * next_n))
+
+
+def flat_view(flat, rows, width):
+    """`[rows, width]` view of the front of a flat buffer; fails rather than
+    growing past it."""
+    if rows * width > flat.numel():
+        raise ValueError(
+            f"a [{rows}, {width}] scorer temporary exceeds its workspace of "
+            f"{flat.numel()} elements"
+        )
+    return flat[: rows * width].view(rows, width)
 
 
 def dcp_qsplit_rows(
