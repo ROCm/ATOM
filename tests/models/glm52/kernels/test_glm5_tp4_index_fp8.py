@@ -280,6 +280,7 @@ def _build_index_writer(tokens: int, page: int = PAGE):
 def test_flydsl_writer_matches_oracle_bytes():
     """The kernel's own expressions, on the GPU, against the oracle's bytes."""
 
+    pytest.importorskip("aiter", reason="the writer pulls buffer_ops out of the AITER runtime")
     pytest.importorskip("flydsl")
     tokens = 128
     k, slots, blocks = _sample(tokens, seed=21)

@@ -260,7 +260,9 @@ def test_runner_passes_the_switch_through_to_the_kernel():
     """
     import inspect
 
-    # the kernel module compiles through FlyDSL at import
+    # the kernel module compiles through FlyDSL at import, and the runner
+    # imports the AITER runtime unconditionally
+    pytest.importorskip("aiter")
     pytest.importorskip("flydsl", reason="the mono kernel is FlyDSL source")
 
     from atom.models.glm52.mono.kernels.op import Glm5MonoKernel
