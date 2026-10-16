@@ -11,6 +11,7 @@ from atom.model_engine.collective_rpc import (
     COLLECTIVE_RPC_CMD,
     DISCARD_WEIGHT_SYNC_CMD,
     FINISH_WEIGHT_SYNC_CMD,
+    WEIGHT_WRITING_RPC_METHODS,
     RpcPayload,
     checked_timeout,
 )
@@ -38,6 +39,10 @@ def completes_weight_sync(cmd: str, args: dict) -> bool:
 # broadcast_utility_command_sync always does.
 _DIRECT_UPDATE_TIMEOUT_S = 300.0
 _FAILED_SYNC_CLEANUP_TIMEOUT_S = 1.0
+# Asking the runners whether a failed weight stream left one fenced. They have
+# all just answered the stream, so a rank that does not answer this either is
+# taken as fenced.
+_FENCE_STATUS_TIMEOUT_S = 10.0
 
 
 def _remaining_timeout(args: dict, default: float) -> float:
@@ -117,6 +122,10 @@ class EngineUtilityHandler:
         self.scheduler = scheduler
         self._weight_sync_fenced = False
         self._weight_sync_in_progress = False
+        # From a sync's first update until its FINISH commits it or a discard
+        # ends it. A failed update ends _weight_sync_in_progress but not this:
+        # the sync is not over until its sender discards it.
+        self._weight_sync_open = False
         # Why the current sync can no longer complete. Its later updates and
         # its FINISH are refused while this is set.
         self._weight_sync_failure: str | None = None
@@ -155,6 +164,7 @@ class EngineUtilityHandler:
                     if args.get("sync_id") != self._sync_id:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
+                    self._weight_sync_open = True
                 reply = self._execute_utility_command(cmd, args)
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
@@ -201,6 +211,7 @@ class EngineUtilityHandler:
                 elif cmd == DISCARD_WEIGHT_SYNC_CMD:
                     self._weight_sync_fenced = True
                     self._weight_sync_in_progress = False
+                    self._weight_sync_open = False
                     self._awaiting_finish = None
                     self._weight_sync_failure = self._weight_sync_failure or str(
                         args.get("error") or args.get("failed_cmd") or "aborted"
@@ -211,6 +222,12 @@ class EngineUtilityHandler:
                         f"{self.label}: global weight sync aborted; serving stays "
                         f"fenced until a complete sync succeeds"
                     )
+                elif (
+                    cmd == COLLECTIVE_RPC_CMD
+                    and isinstance(reply, dict)
+                    and reply.get("method") in WEIGHT_WRITING_RPC_METHODS
+                ):
+                    self._settle_weight_stream(reply, engine)
                 elif cmd == FINISH_WEIGHT_SYNC_CMD:
                     if isinstance(reply, dict) and reply.get("error"):
                         logger.error(
@@ -220,6 +237,7 @@ class EngineUtilityHandler:
                     else:
                         self._weight_sync_fenced = False
                         self._weight_sync_in_progress = False
+                        self._weight_sync_open = False
                         self._weight_sync_failure = None
                         self._awaiting_finish = None
                         engine._rl_weights_inconsistent = False
@@ -298,24 +316,32 @@ class EngineUtilityHandler:
             or not isinstance(request_id, str)
             or not request_id
         ):
-            self.output_queue.put_nowait(
-                (
-                    "UTILITY_RESPONSE",
-                    {
-                        "cmd": COLLECTIVE_RPC_CMD,
-                        "request_id": request_id,
-                        "error": "collective_rpc needs a method name and a request "
-                        "id, both non-empty strings",
-                    },
-                )
-            )
-            return
+            response = {
+                "cmd": COLLECTIVE_RPC_CMD,
+                "request_id": request_id,
+                "error": "collective_rpc needs a method name and a request "
+                "id, both non-empty strings",
+            }
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
+            return response
 
         try:
+            kwargs = dict(args.get("kwargs") or {})
+            if method in WEIGHT_WRITING_RPC_METHODS and self._weight_sync_open:
+                # Taken between that sync's buckets, or before its FINISH, the
+                # stream committed and the sync's later buckets went on over
+                # it; taken after a failed bucket, it committed and the sync's
+                # discard then fenced the engine over it. The runners refuse
+                # it, draining it first: refused here, it would leave the
+                # trainer in its first broadcast.
+                kwargs["engine_refusal"] = (
+                    f"weight sync {self._sync_id!r} of the direct, SHM or IPC "
+                    f"paths is open until its FINISH or discard"
+                )
             payload = RpcPayload(
                 request_id=request_id,
                 args=tuple(args.get("args", ())),
-                kwargs=dict(args.get("kwargs") or {}),
+                kwargs=kwargs,
                 barrier=bool(args.get("barrier", False)),
             )
             replies = self.runner_mgr.collective_rpc(
@@ -324,46 +350,102 @@ class EngineUtilityHandler:
         except Exception as exc:  # noqa: BLE001 - reported, never raised at the loop
             # Raising here would kill the EngineCore busy loop and take the
             # engine down with it; the caller gets the reason instead.
-            self.output_queue.put_nowait(
-                (
-                    "UTILITY_RESPONSE",
-                    {
-                        "cmd": COLLECTIVE_RPC_CMD,
-                        "request_id": request_id,
-                        "method": method,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
-            )
-            return
+            response = {
+                "cmd": COLLECTIVE_RPC_CMD,
+                "request_id": request_id,
+                "method": method,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
+            return response
 
         failures = [r for r in replies if not r.ok]
         logger.info(
             f"{self.label}: collective_rpc {method} ranks={len(replies)} "
             f"failed={len(failures)}"
         )
-        self.output_queue.put_nowait(
-            (
-                "UTILITY_RESPONSE",
+        response = {
+            "cmd": COLLECTIVE_RPC_CMD,
+            "request_id": request_id,
+            "method": method,
+            # Includes PCP: this is the number of worker processes
+            # behind this EngineCore, not logical tensor parallelism.
+            "worker_world_size": self.runner_mgr.proc_num,
+            # Kept for wire compatibility; prefer worker_world_size.
+            "tp_world_size": self.runner_mgr.proc_num,
+            "results": [
                 {
-                    "cmd": COLLECTIVE_RPC_CMD,
-                    "request_id": request_id,
-                    "method": method,
-                    # Includes PCP: this is the number of worker processes
-                    # behind this EngineCore, not logical tensor parallelism.
-                    "worker_world_size": self.runner_mgr.proc_num,
-                    # Kept for wire compatibility; prefer worker_world_size.
-                    "tp_world_size": self.runner_mgr.proc_num,
-                    "results": [
-                        {
-                            "tp_rank": r.tp_rank,
-                            "value": r.value,
-                            "error": r.error,
-                        }
-                        for r in replies
-                    ],
-                },
+                    "tp_rank": r.tp_rank,
+                    "value": r.value,
+                    "error": r.error,
+                }
+                for r in replies
+            ],
+        }
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", response))
+        return response
+
+    def _settle_weight_stream(self, reply: dict, engine) -> None:
+        """Bring the serving fence into line with a weight stream's outcome.
+
+        The stream runs as a collective RPC, not through the weight-update
+        commands that own this fence, so its outcome reached the runners
+        alone. After a failed stream the engine went on scheduling, and its
+        next forward met a fenced runner and took the worker down; after a
+        committed one, a fence a failed sync had left stayed up.
+
+        Committed on every rank, the stream rewrote every parameter there, so
+        the fence comes down as a FINISH takes it down -- unless a sync of the
+        other paths is open, whose FINISH decides, or a runner still reports
+        its own fence up: a commit can leave one fenced, by a fence that was
+        put off while its reload was open. Failed anywhere, it goes up if any
+        runner was left fenced; a stream every rank refused wrote nothing, and
+        leaves the engine as it was.
+        """
+        method = reply.get("method")
+        results = reply.get("results") or []
+        committed = (
+            not reply.get("error")
+            and bool(results)
+            and not any(r.get("error") for r in results)
+        )
+        if committed and self._weight_sync_open:
+            return
+        if not self._a_runner_is_fenced():
+            if committed:
+                self._weight_sync_fenced = False
+                self._weight_sync_failure = None
+                engine._rl_weights_inconsistent = False
+                engine._weight_sync_fenced = False
+                logger.info(f"{self.label}: {method} committed on every rank; serving")
+            return
+        outcome = "committed, but" if committed else "failed and"
+        self._weight_sync_fenced = True
+        self._weight_sync_failure = (
+            self._weight_sync_failure or f"{method} {outcome} left a runner fenced"
+        )
+        engine._rl_weights_inconsistent = True
+        engine._weight_sync_fenced = True
+        logger.error(
+            f"{self.label}: {method} {outcome} left a runner fenced; serving "
+            f"stays fenced until a complete sync succeeds"
+        )
+
+    def _a_runner_is_fenced(self) -> bool:
+        """Whether any runner reports its reload fence up. A rank that does
+        not answer is taken as fenced."""
+        try:
+            replies = self.runner_mgr.collective_rpc(
+                "get_weight_update_status",
+                RpcPayload(request_id=uuid.uuid4().hex),
+                timeout=_FENCE_STATUS_TIMEOUT_S,
             )
+        except Exception:  # answered as fenced, never raised at the loop
+            logger.exception(f"{self.label}: the runners' fence status is unknown")
+            return True
+        return any(
+            not r.ok or not isinstance(r.value, dict) or not r.value.get("healthy")
+            for r in replies
         )
 
     def _begin_weight_sync(self, sync_id: str | None) -> None:
@@ -372,12 +454,13 @@ class EngineUtilityHandler:
         Its id is all that marks a sync's first update. Without one, the rest
         of a failed sync's buckets passed for a new sync and committed.
         """
-        abandoned = self._weight_sync_in_progress
+        abandoned = self._weight_sync_open
         self._sync_id = sync_id
         self._weight_sync_failure = None
         if abandoned:
-            # The previous sync stopped between buckets and was never aborted;
-            # its packed shards and IPC mapping must not carry into this one.
+            # The previous sync stopped between buckets, or failed, and was
+            # never discarded; its packed shards and IPC mapping must not
+            # carry into this one.
             reply = self._discard_failed_update_on_every_rank(
                 "abandoned weight sync", _FAILED_SYNC_CLEANUP_TIMEOUT_S
             )
