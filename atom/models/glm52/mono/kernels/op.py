@@ -240,17 +240,19 @@ class Glm5MonoKernel:
         if native_fp4_mfma and not self.atom_experts:
             raise ValueError("native FP4 MFMA requires ATOM MXFP4 expert storage")
         self.native_fp4_mfma = native_fp4_mfma
-        self.packed = dict(
-            prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
-        )
         if with_indexer:
             required = ("w_index_k", "s_index_k", "w_index_w", "w_index_q", "s_index_q", "g_index_k", "b_index_k")
             missing = [name for name in required if name not in t]
             if missing:
                 raise ValueError(f"with_indexer=True requires weights: {', '.join(missing)}")
-            self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
-            self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
-            self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
+        # `layout` and `stage_tasks` are hoisted above every allocation so that
+        # all of them can sit in ONE attempt below. Both are pure -- they return
+        # byte offsets and task counts, and `kernels/layout.py` does not import
+        # torch at all -- so running them earlier moves no device work and can
+        # fail on no rank. The argument validation above stays outside the
+        # attempt too: it is a misuse of this constructor, identical on every
+        # rank, and must keep raising `ValueError` loudly rather than becoming
+        # a `MonoUnsupported` that silently turns mono off.
         self.scr_layout, self.sym_layout = layout(
             samples,
             W.heads,
@@ -265,14 +267,6 @@ class Glm5MonoKernel:
             native_fp4_mfma=native_fp4_mfma,
         )
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.identity_block_tables = (
-            torch.arange(self.index_block_table_stride, dtype=torch.int32, device=dev).unsqueeze(0)
-            if with_indexer
-            and self.kv_cache_layout is KvCacheLayout.ATOM
-            and samples == self.index_request_width
-            and self.index_block_table_stride == index_max_seq // index_page_size
-            else None
-        )
         self.stages = stage_tasks(
             samples,
             W.heads,
@@ -286,49 +280,86 @@ class Glm5MonoKernel:
             split_head_merge=W.heads // MONO_WAVES > 1,
         )
         n_tasks = sum(n for _, n in self.stages)
-        if with_indexer:
-            index_tensors = dict(t, **self.packed)
-            self.index_params = torch.tensor(
-                [
-                    index_tensors[name].data_ptr()
-                    for name in (
-                        "w_index_k",
-                        "s_index_k",
-                        "w_index_w",
-                        "w_index_q",
-                        "s_index_q",
-                        "g_index_k",
-                        "b_index_k",
-                    )
-                ]
-                + [0],
-                dtype=torch.int64,
-                device=dev,
-            )
-        else:
-            self.index_params = None
         self._owns_runtime = runtime is None
-        if runtime is None:
-            # `scratch` and `step` are rank-local, but `SymmetricPeerBuffer`'s
-            # constructor is COLLECTIVE (it all-gathers IPC handles). Allocating
-            # them straight through would let one rank fail here -- an OOM is the
-            # realistic case -- and unwind into the runner's next collective while
-            # its peers sit inside the peer-buffer all-gather. That is a collective
-            # ORDER mismatch, which hangs, instead of the uniform fallback every
-            # other refusal in this path gives.
-            #
-            # So agree first, in exactly the shape SymmetricPeerBuffer uses for its
-            # own allocation: every rank attempts, every rank reports, and the whole
-            # group raises together -- a rank that succeeded locally still raises, so
-            # nobody is left holding a buffer the others do not have.
-            local_error = None
-            try:
+        # EVERY rank-local GPU allocation this constructor makes, in one
+        # attempt whose verdict is agreed before the first collective.
+        #
+        # `SymmetricPeerBuffer`'s constructor is COLLECTIVE (it all-gathers IPC
+        # handles), and so is the report below. Allocating straight through
+        # would let one rank fail here -- an OOM is the realistic case -- and
+        # unwind into the runner's `tp_uniform_local_validation` while its
+        # peers sit inside one of those two. That is a collective ORDER
+        # mismatch, which hangs, instead of the uniform fallback every other
+        # refusal in this path gives.
+        #
+        # So agree first, in exactly the shape SymmetricPeerBuffer uses for its
+        # own allocation: every rank attempts, every rank reports, and the whole
+        # group raises together -- a rank that succeeded locally still raises, so
+        # nobody is left holding a buffer the others do not have.
+        #
+        # `scratch` and `step` were already inside this attempt. The weight
+        # packing, the identity block tables and the index params were not:
+        # they ran earlier, straight through, so an OOM in any of them was
+        # exactly the hang this block exists to prevent -- just moved a few
+        # statements up. They allocate on the same device out of the same
+        # pool, and `pack_fp8` of the indexer weights is far the largest of
+        # them, so if any allocation here is going to fail it is one of these.
+        self.packed = {}
+        self.identity_block_tables = None
+        self.index_params = None
+        self.scratch = None
+        self.step = None
+        local_error = None
+        try:
+            self.packed = dict(
+                prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
+            )
+            if with_indexer:
+                self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
+                self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
+                self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
+                index_tensors = dict(t, **self.packed)
+                self.index_params = torch.tensor(
+                    [
+                        index_tensors[name].data_ptr()
+                        for name in (
+                            "w_index_k",
+                            "s_index_k",
+                            "w_index_w",
+                            "w_index_q",
+                            "s_index_q",
+                            "g_index_k",
+                            "b_index_k",
+                        )
+                    ]
+                    + [0],
+                    dtype=torch.int64,
+                    device=dev,
+                )
+                if (
+                    self.kv_cache_layout is KvCacheLayout.ATOM
+                    and samples == self.index_request_width
+                    and self.index_block_table_stride == index_max_seq // index_page_size
+                ):
+                    self.identity_block_tables = torch.arange(
+                        self.index_block_table_stride, dtype=torch.int32, device=dev
+                    ).unsqueeze(0)
+            if runtime is None:
                 self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
                 self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-            except Exception as error:
-                self.scratch = None
-                self.step = None
-                local_error = f"{type(error).__name__}: {error}"
+        except Exception as error:
+            self.packed = {}
+            self.identity_block_tables = self.index_params = self.scratch = self.step = None
+            if runtime is not None:
+                # Nothing collective is pending on THIS path. A shared runtime
+                # means no peer-buffer constructor and no report below, so a
+                # peer cannot be inside either; every rank's next collective is
+                # the runner's own `tp_uniform_local_validation`, which it
+                # reaches whether this raised or returned. Raising plainly also
+                # keeps the original exception type for that helper to report.
+                raise
+            local_error = f"{type(error).__name__}: {error}"
+        if runtime is None:
             if npes > 1:
                 import torch.distributed as dist
 
@@ -338,8 +369,8 @@ class Glm5MonoKernel:
                 reports = [local_error]
             failed = [(peer, why) for peer, why in enumerate(reports) if why is not None]
             if failed:
-                self.scratch = None
-                self.step = None
+                self.packed = {}
+                self.identity_block_tables = self.index_params = self.scratch = self.step = None
                 # MonoUnsupported, not RuntimeError: `_build` routes on
                 # MonoUnsupported, so a RuntimeError here skipped the uniform
                 # fallback this whole consensus exists to give and took the
@@ -347,7 +378,7 @@ class Glm5MonoKernel:
                 # the verdict is already agreed -- every rank sees the same
                 # `failed` list and raises together.
                 raise MonoUnsupported(
-                    "mono scratch/step allocation failed: "
+                    "mono rank-local allocation failed: "
                     + "; ".join(f"rank {peer}: {why}" for peer, why in failed)
                 )
             self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
