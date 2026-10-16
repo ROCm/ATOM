@@ -47,7 +47,9 @@ MoE. The MLA layers keep the production paged path.
 
 `ATOM_MONO_ENABLE` defaults to `1`, so a qualifying deployment gets mono
 without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
-`ATOM_ENABLE_REPLAYSSM=0`. Only the last of those is not already a default:
+`ATOM_ENABLE_REPLAYSSM=0`. The launch above supplies TP8 and FP8 KV and takes
+DCP1 and the FULL cudagraph by default; **DSpark and `ATOM_ENABLE_REPLAYSSM`
+it does not**, and without both mono stays off:
 
 - FULL cudagraph **is** the CLI default (`cudagraph_mode: str = "FULL"`,
   `atom/model_engine/arg_utils.py:145`, passed through at :768), so a launch
@@ -57,6 +59,10 @@ without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
   mono refuses PIECEWISE, logging `Kimi-K3 mono decode off: piecewise
   cudagraph`. The examples below still pass the flag explicitly, because it
   costs nothing and makes the requirement visible in the command.
+- **DSpark is not in the launch above.** Mono replaces the KDA layers of a
+  speculative *verify* step, so a server with no drafter has no such step to
+  replace and says `Kimi-K3 mono decode off: no speculative decoding`. The
+  draft model is a separate checkpoint and a local directory, not a repo id.
 - `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
   resumes a request from a per-token snapshot slot that ReplaySSM does not
   keep live.
@@ -72,7 +78,19 @@ without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
 
 ```bash
 export ATOM_ENABLE_REPLAYSSM=0
+export DRAFT_MODEL_PATH=/path/to/Kimi-K3-DSpark   # a directory, not a repo id
 ```
+
+Add these to the launch command:
+
+```
+  --method dspark \
+  --draft-model "${DRAFT_MODEL_PATH}" \
+  --num-speculative-tokens 7 \
+```
+
+Seven is what the row cap wants: a step is served only at 8 rows or fewer, and
+bs=1 with seven speculative tokens is exactly 8 (see below).
 
 Add these to the launch's `exclude_layer` list:
 
