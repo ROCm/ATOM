@@ -1040,7 +1040,8 @@ models:
         # one GPU instead of one TP8xDCP8 group. Decode, workload and the
         # prefill's 192 GiB LMCache tier are unchanged; each stage pushes its
         # own layers' MLA KV and KDA state straight to the decode ranks.
-        - <<: *kimi_k3_agentic_no_dspark
+        - &kimi_k3_1p1d_pp8
+          <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-agentic-lmcache-1m-c72
           topology: 1p1d_pp8_dcp8
           display_topology: 1P1D-PP8-DCP8-TP1-TP8
@@ -1246,6 +1247,30 @@ models:
 
         - <<: *kimi_k3_1p1d_pp8_dspark3
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-stage
+          eval_only: true
+
+        # The PP8 cell without drafts, rerun to size run-to-run noise.
+        - <<: *kimi_k3_1p1d_pp8
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-gsm8k-c72-nospec
+          eval_only: true
+
+        # The same DSpark3 server on a TP8xDCP8 prefill: the reference the PP8
+        # prefill replaces.
+        - <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-gsm8k-c72
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DCP8-DSPARK3
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          env:
+            common: *kimi_k3_1p1d_pp8_dspark3_common_env
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "96"
+              ATOM_WARMUP_GEMM_M_BUCKETS: "1"
           eval_only: true
 
     accuracy:

@@ -135,7 +135,9 @@ on:
           Kimi-K3 (accuracy suite, GSM8K only):
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-part12,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-base,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-stage
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-stage,
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-gsm8k-c72-nospec,
+            kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-gsm8k-c72
 
           Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
