@@ -97,6 +97,24 @@ def test_real_device_agrees_with_aiter(monkeypatch):
     assert sparse_attn._gluon_one_pass_max_rows(0) == expected
 
 
+def test_gfx1250_fp8_sparse_path_declines_missing_asm(monkeypatch):
+    monkeypatch.setattr(sparse_attn, "get_gfx", lambda: "gfx1250")
+    q = torch.empty((65, 16, 128), dtype=torch.bfloat16, device="meta")
+    k_cache = torch.empty((32, 1, 8, 16, 16), dtype=torch.uint8, device="meta")
+    v_cache = torch.empty((32, 1, 1, 128, 16), dtype=torch.uint8, device="meta")
+    scale = torch.empty((32, 1, 16), dtype=torch.float32, device="meta")
+    assert not sparse_attn._sparse_pa_ran_on_asm(
+        q,
+        k_cache,
+        v_cache,
+        torch.empty((65, 128), dtype=torch.int32, device="meta"),
+        torch.empty((65,), dtype=torch.int32, device="meta"),
+        scale,
+        scale,
+        torch.empty_like(q),
+    )
+
+
 def test_gfx1250_sparse_fallback_uses_unified_attention(monkeypatch):
     import importlib
 
@@ -138,22 +156,46 @@ def test_gfx1250_sparse_fallback_uses_unified_attention(monkeypatch):
     assert kwargs["shuffled_kv_cache"] is True
 
 
-def test_gfx1250_sparse_fallback_rejects_per_token_fp8_scales():
+def test_gfx1250_sparse_fallback_uses_per_token_fp8_decode(monkeypatch):
+    import importlib
+
+    seen = {}
+
+    def fake_decode(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+    module = importlib.import_module("aiter.ops.triton.attention.pa_decode_shuffle")
+    monkeypatch.setattr(module, "paged_attention_decode_shuffle_swa", fake_decode)
+
     q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
     k_cache = torch.empty((32, 1, 16, 16, 8), dtype=torch.bfloat16, device="meta")
     v_cache = torch.empty((32, 1, 2, 128, 8), dtype=torch.bfloat16, device="meta")
     sparse_bt = torch.empty((4, 128), dtype=torch.int32, device="meta")
     sparse_ctx = torch.empty((4,), dtype=torch.int32, device="meta")
+    k_scale = torch.empty((32, 1, 16), dtype=torch.float32, device="meta")
+    v_scale = torch.empty_like(k_scale)
 
-    with pytest.raises(NotImplementedError, match="per-token fp8 KV scales"):
-        sparse_attn._sparse_unified_per_row(
-            q,
-            k_cache,
-            v_cache,
-            sparse_bt,
-            sparse_ctx,
-            128**-0.5,
-            torch.empty_like(q),
-            torch.empty((32, 16), dtype=torch.float32, device="meta"),
-            torch.empty((32, 16), dtype=torch.float32, device="meta"),
-        )
+    output = torch.empty_like(q)
+    sparse_attn._sparse_unified_per_row(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        128**-0.5,
+        output,
+        k_scale,
+        v_scale,
+    )
+
+    args = seen["args"]
+    assert args[0] is output
+    assert args[1] is q
+    assert args[2] is k_cache
+    assert args[3] is v_cache
+    assert args[4] is sparse_bt
+    assert args[5] is sparse_ctx
+    assert args[7] is k_scale
+    assert args[8] is v_scale
+    assert seen["kwargs"]["sliding_window"] == -1

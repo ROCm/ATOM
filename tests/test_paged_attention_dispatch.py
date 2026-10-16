@@ -407,6 +407,35 @@ class TestDecodeRouting:
         )
 
 
+def test_gfx1250_per_token_shuffled_decode_contract(monkeypatch):
+    from atom.model_ops import attention_mha as mha
+
+    monkeypatch.setattr(mha, "get_gfx", lambda: "gfx1250")
+    layer = SimpleNamespace(
+        use_flash_layout=False,
+        sinks=None,
+        alibi_slopes=None,
+        logits_soft_cap=None,
+    )
+    query = _torch.empty((4, 16, 128), dtype=_torch.bfloat16, device="meta")
+    key_cache = _torch.empty((32, 1, 8, 128, 16), dtype=_FP8, device="meta")
+    value_cache = _torch.empty((32, 1, 8, 128, 16), dtype=_FP8, device="meta")
+    k_scale = _torch.empty((32, 1, 128), dtype=_torch.float32, device="meta")
+    v_scale = _torch.empty_like(k_scale)
+    metadata = SimpleNamespace(
+        max_seqlen_q=1,
+        context_lens=_torch.empty((4,), dtype=_torch.int32, device="meta"),
+    )
+
+    assert mha.PagedAttentionImpl._can_use_per_token_shuffled_decode(
+        layer, query, key_cache, value_cache, k_scale, v_scale, metadata
+    )
+    metadata.max_seqlen_q = 2
+    assert not mha.PagedAttentionImpl._can_use_per_token_shuffled_decode(
+        layer, query, key_cache, value_cache, k_scale, v_scale, metadata
+    )
+
+
 class _FakePlan:
     """Just the fields the op and the scratch helper read off a real plan."""
 
