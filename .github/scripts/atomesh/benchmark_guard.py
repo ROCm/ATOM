@@ -22,7 +22,11 @@ PROGRESS = re.compile(
     r"Scheduled prefill batch:|Engine Core: output send|"
     r"\[OFFLOAD-SAVE-PROF\]"
 )
-COUNTERS = re.compile(r"returned=(\d+)/\d+.*sent=(\d+).*in_flight=(\d+)")
+COUNTERS = re.compile(r"returned=([\d,]+)/[\d,]+.*sent=([\d,]+).*in_flight=([\d,]+)")
+PHASE = re.compile(r"Phase \S+ \([^)]+\) (started|sending complete|complete)\b")
+DRAIN_COUNTERS = re.compile(
+    r"sent=([\d,]+), completed=([\d,]+), (?:cancelled=[\d,]+, )?in_flight=([\d,]+)"
+)
 
 
 class Guard:
@@ -35,6 +39,7 @@ class Guard:
         self.last_progress = time.monotonic()
         self.returned = None
         self.in_flight = 0
+        self.phase_active = True
 
     def lines(self, path):
         try:
@@ -66,13 +71,37 @@ class Guard:
                 if PROGRESS.search(line):
                     self.last_progress = now
         for line in self.lines(self.client):
+            phase = PHASE.search(line)
+            if phase:
+                event = phase.group(1)
+                if event == "started":
+                    self.phase_active = True
+                    self.returned, self.in_flight = None, 0
+                    self.last_progress = now
+                elif event == "complete":
+                    # Exporting records/metrics needs no inference progress.
+                    # A subsequent phase start re-arms the inactivity check.
+                    self.phase_active = False
+                    self.in_flight = 0
+            if not self.phase_active:
+                continue
             match = COUNTERS.search(line)
-            if match:
-                returned, _sent, in_flight = map(int, match.groups())
+            drain = DRAIN_COUNTERS.search(line)
+            if match or drain:
+                values = [
+                    int(value.replace(",", "")) for value in (match or drain).groups()
+                ]
+                returned, _sent, in_flight = (
+                    values if match else (values[1], values[0], values[2])
+                )
                 if self.returned != returned:
                     self.last_progress = now
                 self.returned, self.in_flight = returned, in_flight
-        if self.in_flight and now - self.last_progress >= self.timeout:
+        if (
+            self.phase_active
+            and self.in_flight
+            and now - self.last_progress >= self.timeout
+        ):
             return {
                 "reason": "inference_stalled",
                 "seconds": now - self.last_progress,

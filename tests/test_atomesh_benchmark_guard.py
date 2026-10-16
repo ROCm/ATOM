@@ -61,6 +61,55 @@ class BenchmarkGuardTests(unittest.TestCase):
         self.assertIsNone(self.guard.check(now=2000))
         self.assertIsNone(self.guard.check(now=4000))
 
+    def test_completed_phase_does_not_kill_slow_result_export(self):
+        self.append(
+            self.client,
+            "Phase warmup progress | returned=335/354 | sent=345 | in_flight=10\n",
+        )
+        self.guard.check(now=0)
+        self.append(
+            self.client,
+            "Phase warmup (warmup) complete | completed=354, cancelled=0, errors=0\n",
+        )
+        self.append(
+            self.client,
+            "Phase profiling (profiling) started | target: 3600.0s duration\n",
+        )
+        self.guard.check(now=10)
+        self.append(
+            self.client,
+            "Phase profiling (profiling) sending complete | sent=3,842, completed=3,825, in_flight=17\n",
+        )
+        self.guard.check(now=3610)
+        self.assertEqual(self.guard.in_flight, 17)
+        self.append(
+            self.client,
+            "Phase profiling (profiling) complete | completed=3,838, cancelled=4, errors=0\n",
+        )
+        self.append(self.client, "Waiting for result domains: server_metrics\n")
+        self.assertIsNone(self.guard.check(now=3940))
+        self.assertIsNone(self.guard.check(now=10000))
+        self.assertFalse(self.guard.phase_active)
+        self.append(self.server, "Watchdog caught collective operation timeout\n")
+        self.assertEqual(self.guard.check(now=10001)["reason"], "fatal_worker_error")
+
+    def test_next_phase_rearms_and_sending_complete_still_watches_requests(self):
+        self.append(self.client, "Phase warmup (warmup) complete | completed=354\n")
+        self.assertIsNone(self.guard.check(now=1000))
+        self.append(
+            self.client,
+            "Phase profiling (profiling) started | target: 3600.0s duration\n",
+        )
+        self.append(
+            self.client,
+            "Phase profiling (profiling) sending complete | sent=1,042, completed=1,040, in_flight=2\n",
+        )
+        self.assertIsNone(self.guard.check(now=2000))
+        failure = self.guard.check(now=2901)
+        self.assertEqual(failure["reason"], "inference_stalled")
+        self.assertEqual(failure["returned"], 1040)
+        self.assertEqual(failure["in_flight"], 2)
+
     def test_fatal_error_across_read_boundary_is_detected(self):
         self.append(self.server, "[rank1] Watchdog caught collective")
         self.assertIsNone(self.guard.check(now=1))
