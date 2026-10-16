@@ -2605,13 +2605,13 @@ class TestOffloadResumeAdmission:
     GENERATED = tuple(range(100, 112))  # owes 20 positions in total
 
     def _sched(self, **overrides):
-        cfg = dict(
-            max_num_seqs=4,
-            max_num_batched_tokens=64,
-            num_kvcache_blocks=100,
-            kv_cache_block_size=4,
-            max_model_len=256,
-        )
+        cfg = {
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 64,
+            "num_kvcache_blocks": 100,
+            "kv_cache_block_size": 4,
+            "max_model_len": 256,
+        }
         cfg.update(overrides)
         sched = Scheduler(MockConfig(**cfg))
         sched.kv_connector = SimpleNamespace(
