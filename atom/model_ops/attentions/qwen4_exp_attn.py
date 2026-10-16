@@ -96,9 +96,6 @@ class Qwen4ExpPLEMetadata:
     has_initial_state: torch.Tensor  # [reqs] bool
     conv_state: torch.Tensor  # [slots, channels, state_len] short-conv pool
     num_accepted_tokens: torch.Tensor | None = None
-    # RTP target verification stores each candidate's state in a distinct
-    # physical block. The ordinary PLE output slot is the final candidate.
-    rtp_spec_state_indices: torch.Tensor | None = None
 
 
 class Qwen4ExpBackend(GDNAttentionBackend):

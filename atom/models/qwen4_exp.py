@@ -776,43 +776,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def _apply_ple(self, hidden_states, input_ids):
         ple_metadata = get_forward_context().attn_metadata.ple_metadata
         if ple_metadata is not None:
-            spec_slots = ple_metadata.rtp_spec_state_indices
-            if spec_slots is not None:
-                # RTP's target verifier reserves a state block for each
-                # candidate. Compute the full-window output first, then write
-                # shorter-prefix states in descending order. The first write
-                # may alias the input block, so it must happen last.
-                from dataclasses import replace
-
-                batch_size, query_len = spec_slots.shape
-                if query_len not in (2, 3, 4):
-                    raise ValueError("Qwen4Exp RTP MTP requires 2-4 verify tokens")
-                contribution = self.ple.forward_with_state(
-                    hidden_states, input_ids, ple_metadata
-                )
-                hidden_by_request = hidden_states.reshape(batch_size, query_len, -1)
-                ids_by_request = input_ids.reshape(batch_size, query_len)
-                for prefix_len in range(query_len - 1, 0, -1):
-                    prefix_metadata = replace(
-                        ple_metadata,
-                        query_start_loc=torch.arange(
-                            0,
-                            (batch_size + 1) * prefix_len,
-                            prefix_len,
-                            device=hidden_states.device,
-                            dtype=torch.int32,
-                        ),
-                        state_indices_out=spec_slots[:, prefix_len - 1],
-                        rtp_spec_state_indices=None,
-                    )
-                    self.ple.forward_with_state(
-                        hidden_by_request[:, :prefix_len]
-                        .reshape(batch_size * prefix_len, -1)
-                        .contiguous(),
-                        ids_by_request[:, :prefix_len].reshape(-1).contiguous(),
-                        prefix_metadata,
-                    )
-                return hidden_states + contribution
             return hidden_states + self.ple.forward_with_state(
                 hidden_states, input_ids, ple_metadata
             )

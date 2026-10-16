@@ -12,16 +12,18 @@ from rtp_llm.model_factory_register import _model_factory
 from rtp_llm.ops import DataType, HybridAttentionType
 
 from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata
-from atom.models.qwen4_exp import (
-    Qwen4ExpDecoderLayer,
-    qwen4_exp_packed_modules_mapping,
-)
+from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
+from atom.plugin.rtpllm.models import qwen4_exp_mtp_hooks
 from atom.plugin.rtpllm.models.qwen3_5 import _ATOMQwen35MoeRuntime
 from atom.plugin.rtpllm.models.qwen4_exp import (
     ATOMQwen4Exp,
     ATOMQwen4ExpMTP,
     _ATOMQwen4ExpMTPRuntime,
     _ATOMQwen4ExpRuntime,
+)
+from atom.plugin.rtpllm.models.qwen4_exp_mtp_hooks import (
+    _rtp_apply_ple,
+    _rtp_spec_conv1d_update,
 )
 from atom.plugin.rtpllm.utils import qwen4_exp_context
 from atom.plugin.rtpllm.utils.forward_context import (
@@ -38,15 +40,12 @@ from atom.plugin.rtpllm.utils.qwen4_exp_context import (
 def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
     monkeypatch, draft_steps
 ):
-    from atom.models import qwen4_exp as qwen4_exp_module
-
     width = draft_steps + 1
     write_slots = torch.tensor(
         [list(range(10, 10 + width)), list(range(20, 20 + width))],
         dtype=torch.int32,
     )
     metadata = Qwen4ExpPLEMetadata(
-        rtp_spec_state_indices=write_slots,
         state_indices_out=write_slots[:, -1],
         query_start_loc=torch.arange(0, 2 * width + 1, width, dtype=torch.int32),
         ngram_state=torch.empty(0),
@@ -54,8 +53,9 @@ def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
         has_initial_state=torch.ones(2, dtype=torch.bool),
         conv_state=torch.empty(0),
     )
+    metadata.rtp_spec_state_indices = write_slots
     monkeypatch.setattr(
-        qwen4_exp_module,
+        qwen4_exp_mtp_hooks,
         "get_forward_context",
         lambda: SimpleNamespace(attn_metadata=SimpleNamespace(ple_metadata=metadata)),
     )
@@ -74,7 +74,7 @@ def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
     layer = SimpleNamespace(ple=SimpleNamespace(forward_with_state=forward_with_state))
     ids = torch.arange(2 * width)
     hidden = torch.zeros(2 * width, 3)
-    result = Qwen4ExpDecoderLayer._apply_ple(layer, hidden, ids)
+    result = _rtp_apply_ple(layer, hidden, ids)
 
     assert torch.equal(result, torch.ones_like(hidden))
     assert [len(call[0]) // 2 for call in calls] == list(range(width, 0, -1))
@@ -84,6 +84,50 @@ def test_qwen4_exp_ple_writes_every_verify_prefix_in_reverse_order(
         )
         assert starts == [0, prefix_len, 2 * prefix_len]
         assert slots == [10 + prefix_len - 1, 20 + prefix_len - 1]
+
+
+def test_qwen4_exp_mtp_spec_conv_uses_rtp_block_map(monkeypatch):
+    from rtp_llm.models_py.triton_kernels.causal_conv1d import causal_conv1d
+
+    mixed = torch.arange(2 * 3 * 8).reshape(6, 8)
+    block_map = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+    lengths = torch.tensor([4, 5], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        rtp_target_verify_block_map=block_map,
+        rtp_target_verify_sequence_lengths=lengths,
+        rtp_seq_size_per_block=64,
+        num_spec_decodes=2,
+        spec_state_indices_tensor=torch.empty((2, 3), dtype=torch.int32),
+    )
+    gdn = SimpleNamespace(
+        num_k_heads=1,
+        head_k_dim=2,
+        num_v_heads=1,
+        head_v_dim=4,
+        tp_size=1,
+        conv1d=SimpleNamespace(bias=None),
+        activation="silu",
+    )
+    seen = {}
+
+    def fake_update(inputs, states, weights, **kwargs):
+        seen.update(inputs=inputs, states=states, weights=weights, **kwargs)
+        return inputs
+
+    monkeypatch.setattr(causal_conv1d, "causal_conv1d_update", fake_update)
+    states = torch.empty(1)
+    weights = torch.empty(1)
+    q, k, v = _rtp_spec_conv1d_update(
+        gdn, mixed, states, weights, metadata, None, False
+    )
+
+    assert seen["inputs"].shape == (2, 8, 3)
+    assert seen["inputs"].is_contiguous()
+    assert seen["block_map"] is block_map
+    assert seen["sequence_lengths"] is lengths
+    assert seen["seq_size_per_block"] == 64
+    assert seen["states"] is states and seen["weights"] is weights
+    assert torch.equal(torch.cat((q, k, v), dim=-1), mixed)
 
 
 def test_qwen4_exp_ngram_mapping_is_shared_across_plugin_paths():
