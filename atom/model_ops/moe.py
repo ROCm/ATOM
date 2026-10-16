@@ -740,17 +740,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 for slot in range(num_mori_ops)
             ]
 
-            # Off the op, not re-derived: the mapping is aiter's.
-            kernel_name = mori_ops[0].config.kernel_type.name
-            logger.info(
-                "[MORI] EP all2all kernel=%s internode=%s low_latency=%s "
-                "tbo_ubatch_ops=%d",
-                kernel_name,
-                all2all_manager.internode,
-                low_latency,
-                len(mori_ops) if tbo_is_enabled else 0,
-            )
-
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
                 max_tokens_per_rank=moe.max_num_tokens,
