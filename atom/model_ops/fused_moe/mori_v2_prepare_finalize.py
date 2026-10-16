@@ -28,7 +28,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from aiter import ActivationType, QuantType, dtypes
-from aiter.dist.parallel_state import get_dp_group
 from aiter.ops.flydsl.moe_common import GateMode
 
 import atom.model_ops.fused_moe.modular_kernel as mk
@@ -646,28 +645,16 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
     this layer's weights and returns its output instead of walking
     prepare -> fused_moe -> finalize.
 
-    The dispatch arena is padded to a huge static token_num
-    (ws * max_num_inp_token_per_rank) while the received tokens occupy only the
-    first ``total_recv`` rows, so the static ``sum(running_tokens_across_dp)``
-    bound (same as the base policy) goes down as ``recv_token_bound``: the
-    grid-bound aiter kernels then launch a grid sized to what the group
-    actually sent instead of the full arena.
+    Both MORI-dispatch expert paths leave the arena unsliced and consume its
+    exact device-side live-row count. Compact dispatch has a different static
+    row-layout contract and retains the original host bound.
     """
 
     def _recv_bound(self, arena_rows: int) -> int | None:
-        """Recv-row bound for this step, or None when it does not shrink.
+        """Compact-dispatch token-row bound, or None when it does not shrink.
 
-        Correctness / capture-safety:
-          * The counts are python ints, fixed per captured graph, so the bound is
-            static across capture/replay and no GPU->CPU sync is needed (unlike
-            reading the device ``total_recv``).
-          * mori dispatch deduplicates per destination rank, so each source
-            rank contributes at most its own token count -- never that times
-            topk. ``total_recv <= sum(running_tokens_across_dp)``; the bound
-            therefore never drops a valid row, and the aiter kernels'
-            device-side ``num_valid_routes`` guard still skips the exact
-            within-buffer tail [total_recv, bound).
-            Why the sum and not ``running_tokens * dp``: see the base method.
+        The counts are python ints fixed per captured graph, so the bound stays
+        static across capture/replay without reading a device counter.
         """
         context = get_forward_context().context
         if context is None:
@@ -728,30 +715,6 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             assert not kwargs.get(
                 "apply_router_weight_on_input", False
             ), "mori does not support apply_router_weight_on_input=True now."
-            arena_rows = (
-                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
-            )
-            bound = self._recv_bound(arena_rows)
-            # The "Direction-3" shrink, reproduced from the base-class walk: the
-            # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
-            # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.
-            # Guarded by the same uniform-decode test, via `bound`: None there
-            # means a mixed/prefill batch, which keeps the full arena.
-            #
-            # Guarded on the unified-decode test below, NOT on `bound is not
-            # None`: _recv_bound also returns None when the bound would not
-            # actually shrink the arena, and the base walk still applies M_eff in
-            # that case. Keying off `bound` would silently skip the trim there.
-            # Same test and same quantity the base walk uses. Inlined rather
-            # than imported: the flag it mirrors is a local in moe.apply().
-            m_eff = None
-            _ctx = get_forward_context().context
-            if (
-                _ctx is not None
-                and not _ctx.is_prefill
-                and getattr(_ctx, "running_tokens_are_unified", True)
-            ):
-                m_eff = _ctx.running_tokens * get_dp_group().world_size
             return triton_mega_moe(
                 mega,
                 hidden_states,
@@ -768,8 +731,8 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
                 w1_bias=triton_experts.get("w1_bias"),
                 w2_bias=triton_experts.get("w2_bias"),
                 swiglu_limit=triton_experts.get("swiglu_limit", 10.0),
-                recv_token_bound=bound,
-                m_eff=m_eff,
+                recv_token_bound=None,
+                m_eff=None,
             )
 
         assert not kwargs.get(
@@ -777,6 +740,12 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
         ), "mori does not support apply_router_weight_on_input=True now."
         self._assert_recipe_matches(mega, kwargs)
 
+        compact_dispatch, _ = _mega_kinds(mega)
+        recv_token_bound = None
+        if compact_dispatch:
+            recv_token_bound = self._recv_bound(
+                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
+            )
         ids = topk_ids.to(torch.int32).contiguous()
         out = mega(
             hidden_states.contiguous(),
@@ -790,9 +759,9 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             bias2=kwargs.get("bias2"),
             a1_scale=kwargs.get("a1_scale"),
             a2_scale=kwargs.get("a2_scale"),
-            recv_token_bound=self._recv_bound(
-                self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank,
-            ),
+            # MORI consumes the exact device-side count. Compact keeps its
+            # original static token-row bound.
+            recv_token_bound=recv_token_bound,
             combine_wire=self.prepare_finalize.combine_wire_for_step(),
         )
         return out
