@@ -303,7 +303,10 @@ class LLMEngine:
         # fresh batch gets deterministic DP assignment and no leaked counts.
         self.core_mgr.reset_dp_router()
 
-        self.add_request(prompts, sampling_params, request_ids=request_ids)
+        # Backpressure admission is offline-only. The flag covers this add,
+        # not the collect loop; refills of the pool do not consult it.
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=request_ids)
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()
@@ -323,11 +326,12 @@ class LLMEngine:
     ) -> list[dict]:
         """Generate completions for multimodal inputs (token IDs + vision data)."""
         self.core_mgr.reset_dp_router()
-        self.add_request(
-            token_ids_list,
-            sampling_params,
-            multimodal_data_list=multimodal_data_list,
-        )
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(
+                token_ids_list,
+                sampling_params,
+                multimodal_data_list=multimodal_data_list,
+            )
         outputs = {}
         while not self.is_finished() and (
             self.core_mgr.is_alive() or self.core_mgr.is_rest()

@@ -201,7 +201,8 @@ class AsyncLLMEngine(LLMEngine):
         ]
 
         self.core_mgr.reset_dp_router()
-        self.add_request(prompts, sampling_params, request_ids=data_ids)
+        with self.core_mgr.offline_backpressure_batch():
+            self.add_request(prompts, sampling_params, request_ids=data_ids)
 
         outputs = {}
         while not self.is_finished() and (
