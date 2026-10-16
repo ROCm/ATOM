@@ -2605,16 +2605,15 @@ class TestOffloadResumeAdmission:
     GENERATED = tuple(range(100, 112))  # owes 20 positions in total
 
     def _sched(self, **overrides):
-        sched = Scheduler(
-            MockConfig(
-                max_num_seqs=4,
-                max_num_batched_tokens=64,
-                num_kvcache_blocks=100,
-                kv_cache_block_size=4,
-                max_model_len=256,
-                **overrides,
-            )
+        cfg = dict(
+            max_num_seqs=4,
+            max_num_batched_tokens=64,
+            num_kvcache_blocks=100,
+            kv_cache_block_size=4,
+            max_model_len=256,
         )
+        cfg.update(overrides)
+        sched = Scheduler(MockConfig(**cfg))
         sched.kv_connector = SimpleNamespace(
             is_offload=True,
             build_connector_meta=lambda: None,
@@ -2711,6 +2710,29 @@ class TestOffloadResumeAdmission:
         _, scheduled = sched.schedule()
 
         assert behind.id in scheduled, "starved behind the offload resume"
+
+    def test_a_resume_leaves_the_decode_reserve(self, seq_factory):
+        """With mixed batching on, a resume spends only `prefill_budget`, like
+        a first admission: sized against the whole batch budget it took every
+        token and pushed the running decode out of the step."""
+        sched = self._sched(
+            enable_mixed_prefill_decode=True,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=16,
+        )
+        d = seq_factory([1, 2, 3, 4])
+        sched.add(d)
+        sched.schedule()
+        d.num_cached_tokens = d.num_prompt_tokens
+        d.append_token(5)
+        # Owes 16 positions: exactly the batch budget.
+        seq = self._parked(sched, seq_factory, cached=4)
+
+        batch, scheduled = sched.schedule()
+
+        assert seq.id in scheduled and d.id in scheduled
+        assert batch.is_mixed
+        assert int(batch.num_scheduled_tokens[0]) == 15
 
 
 # ── get_next_batch_info ────────────────────────────────────────────────────

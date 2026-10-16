@@ -280,3 +280,16 @@ def test_the_precondition_check_is_not_an_assert():
         f"{len(asserts)} assert(s) in _MixedDecodeView.__init__; each guards a "
         "silent row-misalignment path and vanishes under -O"
     )
+
+
+def test_unsliced_guard_covers_tensors():
+    """A per-row field held as a torch.Tensor must trip the guard too.
+
+    The guard decides by length; limiting it to list/tuple/ndarray let a tensor
+    field through unsliced. A 0-d value is a scalar and must be skipped, since
+    `len()` raises on it.
+    """
+    src = _view_source()
+    guard = re.search(r"isinstance\(val, \(([^)]*)\)\)", src)
+    assert guard and "torch.Tensor" in guard.group(1)
+    assert 'getattr(val, "ndim", 1) > 0' in src

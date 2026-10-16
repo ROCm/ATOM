@@ -16,6 +16,7 @@ which never executes these builders.
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,41 @@ _BUILDERS = [
     "atom/model_ops/attentions/aiter_mla.py",
 ]
 _BACKENDS = "atom/model_ops/attentions/backends.py"
+
+
+# The runner's `cu_seqlens_q` host view, as a write target: `var["cu_seqlens_q"].np`
+# or `.cpu`. Only the exact key -- `sparse_cu_seqlens_q` is a different buffer.
+_HOST_CU = re.compile(r"""\[(['"])cu_seqlens_q\1\]\.(np|cpu)$""")
+
+
+def _host_cu_seqlens_writes(fn: ast.AST) -> list[str]:
+    """Every statement in `fn` that writes the runner's `cu_seqlens_q` host copy.
+
+    Reads such as `var["cu_seqlens_q"].np[1:] - var["cu_seqlens_q"].np[:-1]`
+    are not writes; only a store into the view (`... .np[i] = x`, `+=`) or an
+    in-place call on it (`.np[...].fill(...)`, `.cpu.copy_(...)`) is.
+    """
+    found = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+            if _HOST_CU.search(ast.unparse(node.value)):
+                found.append(ast.unparse(node))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr not in ("copy_", "fill_", "fill", "copyto"):
+                continue
+            recv = node.func.value
+            if isinstance(recv, ast.Subscript):
+                recv = recv.value
+            if _HOST_CU.search(ast.unparse(recv)):
+                found.append(ast.unparse(node))
+    return found
+
+
+def _function_node(rel: str, name: str) -> ast.FunctionDef:
+    for node in ast.walk(ast.parse((_ROOT / rel).read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    pytest.fail(f"{rel} has no {name}")
 
 
 def _function_body(rel: str, name: str) -> str:
@@ -41,9 +77,10 @@ def _function_body(rel: str, name: str) -> str:
 def test_prepare_mixed_does_not_republish_cu_seqlens_q(rel):
     """`publish_cu_seqlens_q` already published the decode spans this epoch."""
     body = _function_body(rel, "prepare_mixed")
-    assert 'cu_seqlens_q"].np[' not in body or "!=" in body, (
-        f"{rel}: prepare_mixed writes cu_seqlens_q on the host; the decode "
-        "segment's spans are publish_cu_seqlens_q's to write"
+    writes = _host_cu_seqlens_writes(_function_node(rel, "prepare_mixed"))
+    assert not writes, (
+        f"{rel}: prepare_mixed writes cu_seqlens_q on the host ({writes}); the "
+        "decode segment's spans are publish_cu_seqlens_q's to write"
     )
     assert 'cu_seqlens_q"].copy_to_gpu(' not in body, (
         f"{rel}: prepare_mixed re-uploads cu_seqlens_q, a second publish of it "
@@ -63,6 +100,23 @@ def test_prefill_bank_is_entered_through_the_shared_helper(rel):
         f"{rel}: prepare_mixed swaps forward_vars by hand, leaving the "
         "runner's publication groups bound to the live buffers"
     )
+
+
+@pytest.mark.parametrize(
+    "src, n_writes",
+    [
+        ('var["cu_seqlens_q"].np[1:] = 0', 1),
+        ("var['cu_seqlens_q'].np[: bs + 1] += off", 1),
+        ('var["cu_seqlens_q"].np[:bs].fill(0)', 1),
+        ('var["cu_seqlens_q"].cpu.copy_(t)', 1),
+        ('n = var["cu_seqlens_q"].np[1:] - var["cu_seqlens_q"].np[:-1]', 0),
+        ('if var["cu_seqlens_q"].np[bs] != total: raise ValueError', 0),
+        ('var["sparse_cu_seqlens_q"].np[:] = 0', 0),
+    ],
+)
+def test_host_write_detector(src, n_writes):
+    """The check above must see a write and ignore reads and other buffers."""
+    assert len(_host_cu_seqlens_writes(ast.parse(src))) == n_writes
 
 
 def test_publish_gives_a_mixed_batch_decode_local_spans():

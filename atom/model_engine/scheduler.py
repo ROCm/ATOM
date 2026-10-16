@@ -2267,7 +2267,10 @@ class Scheduler:
                     seq, seq.num_cached_tokens, hit=replayed
                 )
                 num_new_tokens = seq.num_tokens - start
-                budget_remaining = self._prefill_room(num_batched_tokens, start)
+                # Within the decode-first reservation, like the admission below.
+                budget_remaining = self._prefill_room(
+                    num_batched_tokens, start, prefill_budget
+                )
                 chunk = self._prefill_chunk_for_budget(
                     num_new_tokens,
                     budget_remaining,
