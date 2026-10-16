@@ -18,7 +18,8 @@ Registers three backends with the shared KV connector factory:
 * ``mooncake_store`` -- a Mooncake Store reached directly, no LMCache involved:
   start its master and owners and set ``ATOM_KV_OFFLOAD=mooncake_store`` with
   ``ATOM_KV_OFFLOAD_EXTRA_CONFIG`` naming them (``mooncake_store.master`` and
-  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Dense layout only.
+  ``mooncake_store.metadata``, or ``mooncake_store.pools``). Dense KV, and
+  Kimi-K3's KV with its KDA state images.
 """
 
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
@@ -54,12 +55,14 @@ KVConnectorFactory.register(
 
 KVConnectorFactory.register(
     "mooncake_store",
-    worker_module="atom.kv_transfer.offload.mooncake_store.worker",
-    worker_class="MooncakeStoreOffloadConnector",
-    scheduler_module="atom.kv_transfer.offload.mooncake_store.scheduler",
-    scheduler_class="MooncakeStoreOffloadScheduler",
+    # Each picks the dense or the Kimi-K3 class by the model's layout.
+    worker_module="atom.kv_transfer.offload.mooncake_store.connector",
+    worker_class="MooncakeStoreConnector",
+    scheduler_module="atom.kv_transfer.offload.mooncake_store.connector",
+    scheduler_class="MooncakeStoreConnectorScheduler",
     requires_pd_staging=False,
     offload=True,
-    # The dense codec builds from `KVCacheTensor`s; the region map is unread.
+    # The dense codec builds from `KVCacheTensor`s, and K3's state images come
+    # from the attention backend (`state_backend`): the region map is unread.
     reads_block_regions=False,
 )
