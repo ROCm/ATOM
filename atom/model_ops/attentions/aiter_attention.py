@@ -1220,14 +1220,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.block_size,
                 scratch=self.token_axis_scratch,
             )
-        else:
-            # One token per sequence reduces the gather to its last row, and
-            # `last_block_num_tokens` names the offset without a position.
+        elif not batch.is_dummy_run:
+            # One token per sequence reduces the gather to its last position's
+            # block. Indexed by position, not `block_table[-1]`: under MTP the
+            # table also holds the draft round's lookahead blocks past the last
+            # token (`draft_kv_lookahead`). A dummy run's synthetic lengths can
+            # point past its rows, and it writes nowhere anyway.
+            bsz = self.model_runner.block_size
             slots = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
+                block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                for block_table, n in zip(block_tables, context_lens.tolist())
             ]
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]

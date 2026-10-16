@@ -122,6 +122,26 @@ class JointBoundaryDecision:
 # older than this many is re-walked.
 _RECENT_INDEX_CHANGES = 8192
 
+
+def draft_kv_lookahead(num_speculative_tokens: int) -> int:
+    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+
+    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
+    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    mid-steps after it bumps `context_lens` and writes one token at
+    `context_lens - 1`. So a forward whose target context ends at `C` writes
+    draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
+    (prefill: `C` is the chunk end; decode: `C = len(seq) - num_rejected`, the
+    placeholders the scheduler appended assume full acceptance). The draft
+    therefore needs `k - 1` positions past `len(seq)`.
+
+    A position past the row's allocated blocks reads its block id from the
+    zeroed tail of the block table, so the write lands in physical block 0 --
+    another request's KV, or the units of a PAGE state checkpoint.
+    """
+    return max(0, int(num_speculative_tokens or 0) - 1)
+
+
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
 # from MIN to MAX; bounds the hashing wasted past the first miss.
 _WALK_HASH_ROUND_MIN = 64
@@ -183,6 +203,10 @@ class BlockManager:
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = hash_block_size_for(self.block_size, self.dcp_world_size)
+        # `draft_kv_lookahead`: positions past `len(seq)` a forward's draft
+        # round writes. Set by the scheduler, which knows whether this engine
+        # drafts; admission charges for it and `may_append` allocates it.
+        self.draft_lookahead = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -561,7 +585,10 @@ class BlockManager:
         pass. `allocate` protects the one checkpoint it is about to pin and
         sees the pins taken before it; `may_append` runs only in a pass that
         scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
-        first), so every pin was already released at the top of that pass.
+        first), so every pin was already released at the top of that pass --
+        except for the draft lookahead an admission allocates right after its
+        `allocate`, which `can_allocate` charged in the same units check
+        (`draft_lookahead_blocks`), against the same protected checkpoint.
         Under contention the reachable outcome is a refused admission, not
         this.
 
@@ -679,6 +706,18 @@ class BlockManager:
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
+    def draft_lookahead_blocks(self, seq_len: int) -> int:
+        """Blocks past `num_pool_blocks(seq_len)` that `draft_lookahead` adds.
+
+        What admission charges on top of the prompt, so the block `may_append`
+        takes for a forward ending at `seq_len` was paid for in the same pass.
+        """
+        if not self.draft_lookahead:
+            return 0
+        return self.num_pool_blocks(
+            seq_len + self.draft_lookahead
+        ) - self.num_pool_blocks(seq_len)
+
     @property
     def max_pool_tokens(self) -> int:
         """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
@@ -705,7 +744,7 @@ class BlockManager:
         lo = 0
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self.num_pool_blocks(mid) <= capacity:
+            if self.num_pool_blocks(mid) + self.draft_lookahead_blocks(mid) <= capacity:
                 lo = mid
             else:
                 hi = mid - 1
@@ -1126,7 +1165,9 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(self.num_pool_blocks(len(seq))):
+            if not self._has_page_units(
+                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+            ):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -1161,8 +1202,12 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = self._n_hash_blocks(seq) - self.kv.count_used(
-            walk.ids, num_cached_blocks
+        # Plus the draft round's lookahead past the prompt, which the scheduler
+        # allocates right after `allocate` (`may_append(..., lookahead=)`).
+        num_new_blocks = (
+            self._n_hash_blocks(seq)
+            - self.kv.count_used(walk.ids, num_cached_blocks)
+            + self.draft_lookahead_blocks(len(seq))
         )
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
@@ -3188,31 +3233,62 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
-    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+    def can_append(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> bool:
+        """Whether the pool can back what `may_append` takes for this step.
+
+        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
+        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
+        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
+        passed so the check states what it covers.
+        """
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
-        needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
+        reach = seq_len + max(num_new_tokens, lookahead)
+        needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         return self._has_page_units(new_blocks_needed)
 
-    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
-        # Note: in disaggregated (P/D) mode the scheduler skips this call on
-        # the first decode step after remote prefill, because blocks were
-        # already allocated during the KV transfer phase.
+    def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
+        """Allocate every block this step's KV writes land in.
+
+        The target writes up to `len(seq) - 1`; the draft round writes
+        `lookahead` positions past that (`draft_kv_lookahead`). Checking that
+        the pool has room (`can_append`) is not the same as allocating it: a
+        position past the last allocated block reads block id 0 from the zeroed
+        block-table tail, and the write lands in whoever owns physical block 0.
+        """
+        # Note: in disaggregated (P/D) mode the scheduler skips the
+        # `num_new_tokens` half on the first decode step after remote prefill,
+        # because those blocks were already allocated during the KV transfer.
         block_table = seq.block_table
         seq_len = len(seq)
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
         ebs = self._effective_block_size()
+        needed_blocks = 0
         if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
             needed_blocks = (seq_len + ebs - 1) // ebs
-            while len(block_table) < needed_blocks:
-                # Decode-generated blocks: token not finalized yet (depends on
-                # sampling / speculative verification), so we cannot compute a
-                # correct hash here.  Just allocate the block without hashing.
-                block_table.append(self._fresh_block())
+        if lookahead:
+            needed_blocks = max(needed_blocks, (seq_len + lookahead + ebs - 1) // ebs)
+        while len(block_table) < needed_blocks:
+            # Decode-generated blocks: token not finalized yet (depends on
+            # sampling / speculative verification), so we cannot compute a
+            # correct hash here.  Just allocate the block without hashing.
+            block_table.append(self._fresh_block())
+
+    def draft_writes_allocated(self, seq: Sequence) -> bool:
+        """Whether `seq`'s blocks reach the end of this forward's draft round.
+
+        `len(seq) + draft_lookahead` positions, the bound `draft_kv_lookahead`
+        derives. The scheduler checks it on every sequence it schedules.
+        """
+        ebs = self._effective_block_size()
+        reach = len(seq) + self.draft_lookahead
+        return len(seq.block_table) * ebs >= reach
 
     # ---------------- KV event API ---------------- #
 
