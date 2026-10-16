@@ -1437,13 +1437,16 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
+        # Register every logical P request, including those behind a capacity
+        # blocked head. Workers must not expire their D metadata as orphaned.
+        admission_ready = getattr(self.kv_connector, "admission_ready", None)
+        if callable(admission_ready) and self._unschedulable_reason(seq) is None:
+            admission_ready(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
-            self.metrics.enqueue(seq)
-            self._warn_if_unschedulable(seq)
-        self.waiting.extend(seqs)
+            self.add(seq)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1544,6 +1547,14 @@ class Scheduler:
         callback = getattr(self.kv_connector, "send_finished", None)
         if callable(callback):
             callback(req_id)
+
+    def _connector_abort_send(self, seq: Sequence) -> None:
+        """Let the send owner decide whether cancellation can retire its claim."""
+        callback = getattr(self.kv_connector, "abort_send", None)
+        if callable(callback):
+            callback(seq)
+        else:
+            self._connector_send_finished(seq.id)
 
     def _connector_source_blocks_released(self, seq: Sequence) -> None:
         """Tell the connector its source blocks are back in the pool.
@@ -2062,6 +2073,13 @@ class Scheduler:
             if len(self.running) >= self.max_num_seqs:
                 self.waiting.appendleft(seq)
                 break
+
+            admission_ready = getattr(self.kv_connector, "admission_ready", None)
+            if callable(admission_ready) and not admission_ready(seq):
+                # D may reserve a later request first. Unready P requests own no
+                # source blocks and must not block those that already have D space.
+                skipped_waiting_requests.append(seq)
+                continue
 
             remote_ready_for_decode = self._resolve_waiting_remote_kv(
                 seq, skipped_waiting_requests
@@ -2770,6 +2788,17 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
+            if (seq.kv_transfer_params or {}).get("chunked_transfer"):
+                # All TP/PP writers have drained. Discard the failed receive
+                # allocation and remote generation state before local prefill.
+                logger.info(
+                    "Chunked P/D receive failed for %s; falling back to local prefill",
+                    seq.id,
+                )
+                self.block_manager.deallocate(seq)
+                seq.num_cached_tokens = 0
+                for key in ("first_token_id", "draft_token_ids", "chunked_transfer"):
+                    seq.kv_transfer_params.pop(key, None)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
             # The state never arrived, so the boundary is not this request's
             # history. Disown it exactly as `BlockManager.allocate` does at
@@ -2846,13 +2875,13 @@ class Scheduler:
     def _abort_failed_remote_receive(self, req_id) -> None:
         """End a request whose P/D KV receive failed, as aborted.
 
-        A decode does not prefill a P/D request itself: it is sized and
+        Legacy decode does not prefill a P/D request itself: it is sized and
         compiled for decode, and the request's block table is still the one
         the transfer was writing, which re-admission cannot allocate over. The
         connector reports a failure only once no producer write can still land
         in those blocks (``ATOM_PD_FAILED_WRITE_HOLD_S``), so they are freed at
-        once. Offload load failures (``failed_loading``) still resume their
-        prefill on this node.
+        once. Chunked receives fall back to local prefill after the same write
+        hold; offload load failures (``failed_loading``) also resume local prefill.
         """
         seq = next(
             (
@@ -2870,6 +2899,11 @@ class Scheduler:
                 req_id,
             )
             return
+        if (seq.kv_transfer_params or {}).get("chunked_transfer"):
+            # Admission ordering avoids capacity cycles, but transfers can still
+            # fail. Preserve local recovery after the connector's write hold.
+            self.failed_recving_kv_req_ids.append(seq.id)
+            return
         logger.error("KV receive failed for request %s; aborting it", req_id)
         self.waiting.remove(seq)
         seq.status = SequenceStatus.ABORTED
@@ -2886,9 +2920,7 @@ class Scheduler:
         callback = getattr(self.kv_connector, "request_finished", None)
         if callable(callback):
             callback(seq)
-        # As in `_reject_aborted_waiting`: an abort never sends, so the
-        # scheduler retires the send claim rather than waiting for a report.
-        self._connector_send_finished(seq.id)
+        self._connector_abort_send(seq)
         self._maybe_release_deferred(seq)
 
     def _finish_aborted_load_cleanup(self, req_id) -> bool:
@@ -4365,8 +4397,7 @@ class Scheduler:
             if callable(callback):
                 callback(seq)
             if reason == "aborted":
-                # No peer will report a send for a cancelled request.
-                self._connector_send_finished(seq.id)
+                self._connector_abort_send(seq)
         seq.num_tokens = num_tokens
         seq.multimodal_data = None
         seq.status = SequenceStatus.FINISHED
@@ -4604,6 +4635,9 @@ class Scheduler:
         is_producer = self._connector_flag("is_producer")
         is_offload = self._connector_flag("is_offload")
 
+        process_pd = getattr(self.kv_connector, "process_pd_completions", None)
+        if callable(process_pd):
+            kv_connector_output = process_pd(kv_connector_output)
         process_completions = getattr(self.kv_connector, "process_completions", None)
         if callable(process_completions):
             kv_connector_output = process_completions(kv_connector_output)

@@ -16,13 +16,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from atom.kv_transfer.disaggregation.chunked_prefill import PrefillHandoff
+
 # ---------------------------------------------------------------------------
 # Type aliases
 # ---------------------------------------------------------------------------
 
 EngineId = str
 ReqId = str | int
-TransferId = int
+TransferId = str | int
 
 
 def kv_config_has_producer(kv_config: object) -> bool:
@@ -397,6 +399,9 @@ class KVConnectorOutput:
     failed_loading: set[LoadCompletionId] = field(default_factory=set)
     expected_finished_count: int = 0
     connector_completions: set[ConnectorCompletion] = field(default_factory=set)
+    # Final P/D metadata travels with successful receive completion. The TP
+    # aggregator validates agreement and discards it on any worker failure.
+    received_handoffs: dict[ReqId, PrefillHandoff] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         """Return True if no transfers finished on this worker."""
@@ -408,6 +413,7 @@ class KVConnectorOutput:
             and not self.finished_loading
             and not self.failed_loading
             and not self.connector_completions
+            and not self.received_handoffs
         )
 
     def __repr__(self) -> str:
@@ -441,7 +447,7 @@ class ReqMeta:
     remote_dp_rank: int = 0
     remote_pp_size: int = 1
     remote_tp_size: int = 0
-    transfer_id: int = 0
+    transfer_id: TransferId = 0
     local_slot_index: int = -1
     # Producer's final committed state slot. This is distinct from
     # `local_slot_index`, which is the consumer destination slot. Prefix
@@ -459,6 +465,11 @@ class ReqMeta:
     # region loop like block ids do. Empty for backends with no SWA state.
     local_swa_block_ids: list[int] = field(default_factory=list)
     remote_swa_block_ids: list[int] = field(default_factory=list)
+    chunked_transfer: bool = False
+    num_prompt_tokens: int = 0
+    prefill_handoff: dict | None = None
+    prefill_aborted: bool = False
+    prompt_digest: str | None = None
 
 
 @dataclass
@@ -503,6 +514,7 @@ class ConnectorMetadata:
         "reqs_to_send",
         "reqs_in_batch",
         "reqs_not_processed",
+        "chunked_admissions",
     )
 
     def __init__(self) -> None:
@@ -511,7 +523,10 @@ class ConnectorMetadata:
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
-        self.request_id_to_transfer_id: dict[ReqId, int] = {}
+        self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # Register P logical requests before allocating source blocks. Workers
+        # report D readiness through the existing TP/PP completion channel.
+        self.chunked_admissions: dict[ReqId, TransferId] = {}
 
     def has_work(self) -> bool:
         """Whether the worker has anything to do with this snapshot."""
@@ -548,6 +563,11 @@ class ConnectorMetadata:
             remote_slot_index=kv_transfer_params.get("remote_slot_index", -1),
             num_computed_blocks=kv_transfer_params.get("num_computed_blocks", 0),
             src_block_skip_factor=kv_transfer_params.get("src_block_skip_factor", 1),
+            chunked_transfer=kv_transfer_params.get("chunked_transfer", False),
+            num_prompt_tokens=kv_transfer_params.get("num_prompt_tokens", 0),
+            prefill_handoff=kv_transfer_params.get("prefill_handoff"),
+            prefill_aborted=kv_transfer_params.get("prefill_aborted", False),
+            prompt_digest=kv_transfer_params.get("prompt_digest"),
         )
 
     def add_new_req_to_save(
