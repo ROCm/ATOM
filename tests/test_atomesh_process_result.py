@@ -142,6 +142,12 @@ class AggregatedResourcesTest(unittest.TestCase):
 class NonFiniteBenchmarkMetricsTest(unittest.TestCase):
     """Missing/unmeasured benchmark metrics must not become chart numbers."""
 
+    def test_per_gpu_zero_is_measured_but_missing_operand_is_not(self):
+        self.assertEqual(process_result.divide_by_total_gpu(0, 8), 0.0)
+        self.assertIsNone(process_result.divide_by_total_gpu(None, 8))
+        self.assertIsNone(process_result.divide_by_total_gpu(0, None))
+        self.assertIsNone(process_result.divide_by_total_gpu(0, 0))
+
     def test_nonfinite_number_is_missing_and_valid_fallback_survives(self):
         for invalid in (float("nan"), float("inf"), -float("inf"), "NaN", "Infinity"):
             with self.subTest(invalid=str(invalid)):
@@ -268,8 +274,8 @@ class DashboardCliTest(unittest.TestCase):
                     path = write_cell(root, "agg", False)
                     payload = json.loads(path.read_text(encoding="utf-8"))
                     payload.update(
-                        total_token_throughput="NaN",
-                        input_throughput="Infinity",
+                        total_token_throughput=0 if expected_entries else "NaN",
+                        input_throughput=0 if expected_entries else "Infinity",
                         output_throughput=output_tput,
                         median_tpot_ms="-Infinity",
                         mean_ttft_ms=0,
@@ -283,6 +289,24 @@ class DashboardCliTest(unittest.TestCase):
                         self.assertEqual(entries[0]["value"], 0.0)
                         self.assertEqual(points["agg"]["output_tput"], 0.0)
                         self.assertEqual(points["agg"]["ttft_ms"], 0.0)
+                        for key in (
+                            "tput_per_gpu",
+                            "input_tput_per_gpu",
+                            "output_tput_per_gpu",
+                        ):
+                            self.assertEqual(points["agg"][key], 0.0)
+                        headers, _, row = [
+                            line.split("|")[1:-1]
+                            for line in summary.splitlines()
+                            if line.startswith("|")
+                        ]
+                        cells = dict(zip(map(str.strip, headers), map(str.strip, row)))
+                        for column in (
+                            "Total tok/s/GPU",
+                            "Input tok/s/GPU",
+                            "Output tok/s/GPU",
+                        ):
+                            self.assertEqual(cells[column], "0.00")
                     else:
                         self.assertEqual(points, {})
                     self.assertNotIn("nan", summary.lower())
