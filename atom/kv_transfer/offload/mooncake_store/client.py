@@ -144,12 +144,16 @@ def _new_distributed_store() -> Any:
     return MooncakeDistributedStore()
 
 
-def _new_replicate_config(group_ids: list[str]) -> Any:
-    """A default ``ReplicateConfig`` (one replica) that groups each key."""
+def _new_replicate_config(group_ids: list[str] | None, *, hard_pin: bool) -> Any:
+    """A default ``ReplicateConfig`` (one replica), grouping each key if asked
+    and hard-pinning it if asked."""
     from mooncake.store import ReplicateConfig
 
     config = ReplicateConfig()
-    config.group_ids = list(group_ids)
+    if group_ids is not None:
+        config.group_ids = list(group_ids)
+    if hard_pin:
+        config.with_hard_pin = True
     return config
 
 
@@ -261,11 +265,13 @@ class MooncakeStoreClient:
         sizes: list[int],
         *,
         group_ids: list[str] | None = None,
+        hard_pin: bool = False,
     ) -> list[int]:
         """Store each buffer under its key; per key 0 or a negative code.
 
         ``group_ids`` puts each key in that Mooncake group, which the master
         evicts whole. A key that already exists keeps the group it was put in.
+        ``hard_pin`` keeps each key out of eviction: only a remove takes it.
 
         Raises:
             CallRefused: Before ``batch_put_from`` was called (duplicate keys,
@@ -275,12 +281,12 @@ class MooncakeStoreClient:
         """
         self._check_unique(keys)
         args: list[Any] = [list(keys), [int(p) for p in ptrs], [int(s) for s in sizes]]
-        if group_ids is not None:
+        if group_ids is not None or hard_pin:
             try:
-                args.append(_new_replicate_config(group_ids))
+                args.append(_new_replicate_config(group_ids, hard_pin=hard_pin))
             except Exception as exc:
                 raise CallRefused(
-                    f"Mooncake Store could not group a put's keys: {exc!r}"
+                    f"Mooncake Store could not configure a put's keys: {exc!r}"
                 ) from exc
         codes = [int(code) for code in self._store.batch_put_from(*args)]
         self._check_length("batch_put_from", codes, keys)

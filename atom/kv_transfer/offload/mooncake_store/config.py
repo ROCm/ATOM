@@ -21,6 +21,9 @@ from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.mooncake_store.nic import parse_device_list
 
 KEY_PREFIX = "mooncake_store."
+# The offload layouts the Store moves: dense KV, and Kimi-K3's dense MLA KV
+# with its KDA state images.
+STORE_LAYOUTS = ("dense", "kimi_k3")
 _MIB = 1 << 20
 _PROTOCOLS = ("rdma", "tcp")
 
@@ -52,6 +55,9 @@ class MooncakeStoreOffloadConfig:
     chunk_tokens: int
     load_pool_mib: int
     save_pool_mib: int
+    # Kimi-K3 only: the registered HBM the KDA state images go through, half
+    # for stores and half for loads, each half at least one image.
+    state_pool_mib: int
     save_abandon_timeout_s: float
 
     @property
@@ -61,6 +67,10 @@ class MooncakeStoreOffloadConfig:
     @property
     def save_pool_bytes(self) -> int:
         return self.save_pool_mib * _MIB
+
+    @property
+    def state_pool_bytes(self) -> int:
+        return self.state_pool_mib * _MIB
 
     def store_masters(self) -> list[StorePool]:
         """Every distinct ``(master, metadata)`` a lookup must ask."""
@@ -173,6 +183,11 @@ def parse_mooncake_store_config(
         save_pool_mib=offcfg._strict_integer(
             "mooncake_store.save_pool_mib", values.get("save_pool_mib", 256), minimum=1
         ),
+        state_pool_mib=offcfg._strict_integer(
+            "mooncake_store.state_pool_mib",
+            values.get("state_pool_mib", 256),
+            minimum=2,
+        ),
         save_abandon_timeout_s=_positive_seconds(
             "mooncake_store.save_abandon_timeout_s",
             values.get("save_abandon_timeout_s", 300.0),
@@ -181,36 +196,36 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Refuse what phase 1 does not move: non-dense layouts, DCP, odd chunks.
+    """Refuse what the Store does not move: other layouts, chunks off the grid.
 
     The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. A hybrid, M3 or Kimi-K3 layout needs PAGE regions or a state
-    tier this connector does not carry, and a DCP rank's pages cover a virtual
-    block that the chunk keys do not name.
+    block bytes, and for Kimi-K3 also one per (rank, KDA state image). A
+    hybrid or M3 layout needs PAGE regions this connector does not carry.
+    Under DCP each scheduler block is a virtual block of ``block_size * dcp``
+    tokens, every rank holding its own share of it, so a chunk is a whole
+    number of virtual blocks.
 
     Raises:
-        ValueError: The model is not on the dense layout, DCP > 1, or the
-            chunk is not a whole number of KV blocks.
+        ValueError: The model is on another layout, or the chunk is not a
+            whole number of (virtual) KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense":
+    if layout not in STORE_LAYOUTS:
         raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
-            f"model resolves to {layout!r}"
-        )
-    dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
-    if dcp > 1:
-        raise ValueError(
-            "the Mooncake Store offload does not support decode context "
-            f"parallelism (decode_context_parallel_size={dcp})"
+            "the Mooncake Store offload moves the "
+            f"{' and '.join(repr(name) for name in STORE_LAYOUTS)} KV layouts; "
+            f"this model resolves to {layout!r}"
         )
     block_size = offcfg._strict_integer(
         "KV cache block size", config.kv_cache_block_size, minimum=1
     )
-    if cfg.chunk_tokens % block_size:
+    dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)
+    virtual_block = block_size * dcp
+    if cfg.chunk_tokens % virtual_block:
         raise ValueError(
             f"mooncake_store.chunk_tokens={cfg.chunk_tokens} must be a multiple "
             f"of the KV cache block size {block_size}"
+            + (f" times decode_context_parallel_size={dcp}" if dcp > 1 else "")
         )
 
 

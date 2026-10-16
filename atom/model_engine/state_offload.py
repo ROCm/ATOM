@@ -397,7 +397,9 @@ def state_tier_cpu_bytes() -> int:
 
 
 def state_tier_chunk_tokens(config) -> int:
-    """The LMCache chunk size in tokens for the joint KV leg, or 0.
+    """The offload chunk size in tokens for the joint KV leg, or 0.
+
+    LMCache's chunk size, or under `mooncake_store` its `chunk_tokens`.
 
     Decided from config for the same reason `state_tier_capability` is: this
     runs in the engine process at `BlockManager.__init__`, and the scheduler
@@ -426,6 +428,12 @@ def state_tier_chunk_tokens(config) -> int:
             sub, _why = _offload_subconfig(kvcfg)
             if sub is not None:
                 kvcfg = sub
+        if isinstance(kvcfg, dict) and kvcfg.get("kv_connector") == "mooncake_store":
+            from atom.kv_transfer.offload.mooncake_store.config import (
+                parse_mooncake_store_config,
+            )
+
+            return int(parse_mooncake_store_config(kvcfg).chunk_tokens)
         return int(build_lmcache_config(kvcfg).chunk_size)
     except Exception:
         # Blind on purpose: this runs at model load, the import reaches a
@@ -442,4 +450,4 @@ def state_tier_chunk_tokens(config) -> int:
 
 #: The connector backends whose worker half can build a `StateOffloadTier`.
 #: `multi` qualifies when it lists exactly one.
-_STATE_TIER_BACKENDS = frozenset({"lmcache_offload"})
+_STATE_TIER_BACKENDS = frozenset({"lmcache_offload", "mooncake_store"})

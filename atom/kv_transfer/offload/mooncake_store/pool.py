@@ -30,7 +30,7 @@ logger = logging.getLogger("atom")
 REGIONS = ("save", "load")
 # A slot starts on a page; the pool's base on a huge page, so splitting the
 # registration into MC_MAX_MR_SIZE pieces never cuts one.
-_SLOT_ALIGN = 4096
+SLOT_ALIGN = 4096
 _BASE_ALIGN = 2 << 20
 # A region's usable slots make at least this many windows, however few threads
 # share it: when one transfer never settles and its slots are quarantined, the
@@ -105,7 +105,7 @@ class TransferSlotPool:
         self.chunk_bytes = int(chunk_bytes)
         if self.chunk_bytes <= 0:
             raise ValueError("transfer pool chunk size must be positive")
-        self.slot_stride = _round_up(self.chunk_bytes, _SLOT_ALIGN)
+        self.slot_stride = _round_up(self.chunk_bytes, SLOT_ALIGN)
         capacity = {
             "save": int(save_bytes) // self.slot_stride,
             "load": int(load_bytes) // self.slot_stride,

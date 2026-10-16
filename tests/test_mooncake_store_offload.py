@@ -142,6 +142,10 @@ class FakeStore:
         self.groups: dict[str, str] = {}
         # Each put's group ids; None for a put without a ReplicateConfig.
         self.put_group_ids: list[list[str] | None] = []
+        # Keys put hard-pinned.
+        self.hard_pinned: set[str] = set()
+        # Per key, the code its next removes return instead of removing it.
+        self.remove_codes: dict[str, int] = {}
         self.setup_args: tuple | None = None
         self.registered: dict[int, int] = {}
         self.calls: list[tuple] = []
@@ -198,8 +202,11 @@ class FakeStore:
 
     def batch_put_from(self, keys, ptrs, sizes, config=None):
         self.calls.append(("put", list(keys)))
-        group_ids = None if config is None else list(config.group_ids)
+        group_ids = getattr(config, "group_ids", None)
+        group_ids = None if group_ids is None else list(group_ids)
         self.put_group_ids.append(group_ids)
+        if getattr(config, "with_hard_pin", False):
+            self.hard_pinned.update(keys)
         self._maybe_raise("put")
         if group_ids is not None and len(group_ids) != len(keys):
             return [store_client.INVALID_PARAMS] * len(keys)
@@ -284,6 +291,9 @@ class FakeStore:
 
     def remove(self, key, force=False):
         self.calls.append(("remove", key, force))
+        code = self.remove_codes.get(key)
+        if code is not None and not force:
+            return code
         return 0 if self.objects.pop(key, None) is not None else -704
 
     def close(self):
@@ -400,7 +410,10 @@ def cluster(monkeypatch):
     monkeypatch.setattr(
         store_client,
         "_new_replicate_config",
-        lambda group_ids: SimpleNamespace(group_ids=list(group_ids)),
+        lambda group_ids, hard_pin=False: SimpleNamespace(
+            group_ids=None if group_ids is None else list(group_ids),
+            with_hard_pin=hard_pin,
+        ),
     )
     monkeypatch.setattr(
         store_client,
@@ -715,24 +728,30 @@ def test_config_refuses_pools_without_rdma():
         parse_mooncake_store_config(_extra(master=None, metadata=None, pools=pools))
 
 
-def test_engine_compatibility_refuses_what_phase_one_does_not_move():
+def test_engine_compatibility_refuses_other_layouts_and_chunks_off_the_grid():
     cfg = parse_mooncake_store_config(_extra())
     check_engine_compatibility(cfg, _config())
     hybrid = _config()
     hybrid.hf_config.compress_ratios = [4, 128]
-    with pytest.raises(ValueError, match="only the dense KV layout"):
+    with pytest.raises(ValueError, match="moves the 'dense' and 'kimi_k3' KV"):
         check_engine_compatibility(cfg, hybrid)
-    with pytest.raises(ValueError, match="decode context parallelism"):
-        check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
     odd = parse_mooncake_store_config(_extra(chunk_tokens=6))
-    with pytest.raises(ValueError, match="multiple of the KV cache block size 4"):
+    with pytest.raises(ValueError, match="multiple of the KV cache block size 4$"):
         check_engine_compatibility(odd, _config())
+    # Under DCP a chunk is whole virtual blocks: block x DCP tokens.
+    check_engine_compatibility(cfg, _config(decode_context_parallel_size=2))
+    with pytest.raises(
+        ValueError, match="block size 4 times decode_context_parallel_size=4"
+    ):
+        check_engine_compatibility(cfg, _config(decode_context_parallel_size=4))
+    wide = parse_mooncake_store_config(_extra(chunk_tokens=4 * CHUNK))
+    check_engine_compatibility(wide, _config(decode_context_parallel_size=4))
 
 
 @pytest.mark.parametrize("role_side", ["scheduler", "worker"])
-def test_both_sides_refuse_dcp(cluster, role_side):
-    config = _config(decode_context_parallel_size=2)
-    with pytest.raises(ValueError, match="decode context parallelism"):
+def test_both_sides_refuse_a_chunk_off_the_dcp_grid(cluster, role_side):
+    config = _config(decode_context_parallel_size=4)
+    with pytest.raises(ValueError, match="times decode_context_parallel_size=4"):
         KVConnectorFactory.create_connector(config, role=role_side)
 
 
@@ -2254,7 +2273,7 @@ def test_a_put_refused_before_mooncake_has_it_fails_only_its_save(
     worker._do_save_req(stored)
     worker.get_finished()
 
-    def no_group_ids(group_ids):
+    def no_group_ids(group_ids, hard_pin=False):
         raise AttributeError("ReplicateConfig has no attribute 'group_ids'")
 
     # A binding that cannot group keys refuses the put before posting it.

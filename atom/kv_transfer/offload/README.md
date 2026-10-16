@@ -552,6 +552,7 @@ settings. The same keys work in `kv_connector_extra_config` of
 | `mooncake_store.chunk_tokens` | 256 | Tokens per Store object; a multiple of the KV block size. |
 | `mooncake_store.load_pool_mib` | 1024 | Load region per worker, MiB. |
 | `mooncake_store.save_pool_mib` | 256 | Save region per worker, MiB. |
+| `mooncake_store.state_pool_mib` | 256 | Kimi-K3 only: registered HBM for the KDA state images, half for stores and half for loads, each half at least one image. |
 | `mooncake_store.save_abandon_timeout_s` | 300 | Seconds before the engine reclaims an unreported save's source; must be > 0. |
 | `max_pending_saves` | unbounded | Optional cap on saves in flight across requests (one per request at most either way). |
 
@@ -630,10 +631,42 @@ this worker config.
   first, and its prefix grows only when its head window lands. At c112, 13 of
   a run's 22 uneven lookups came before the master's first eviction.
 
+### Kimi-K3: the KDA state images
+
+A Kimi-K3 model (offload layout `kimi_k3`) gets `KimiK3MooncakeStoreConnector`
+and `KimiK3MooncakeStoreScheduler` (`mooncake_store/kimi_k3.py`), picked by the
+`mooncake_store` registration from the model as `lmcache_offload` picks its
+codec. The KV leg is the dense one above. The state leg is K3's state tier
+(`hybrid/kimi_k3`) with `StoreStateCodec` in place of LMCache's:
+
+- One Store object per (rank, checkpoint image),
+  `{namespace}/state/w{rank}of{world}/{digest}`, where the digest is a blake2b
+  of ATOM's prefix hash and the checkpoint layout id. A store packs the image
+  straight into a slot of the worker's state pool (`state_pool_mib`, registered
+  HBM like the KV pool) and puts it from there; a load gets it into a slot and
+  unpacks it into the request's Active Slot.
+- The engine's `StateOffloadIndex` stays the one source of what is resumable,
+  capped at `OFFLOAD_STATE_CPU_SIZE / image` entries as under LMCache. The
+  codec keeps the same budget as an LRU: images are put hard-pinned, so the
+  master's eviction, which makes room for KV, never takes one behind the
+  index, and the codec removes the oldest itself. A removal the Store refuses
+  (a read lease) is retried before each later store and forced after 120 s.
+- A state store checks a source read deadline, like a KV save: one still
+  queued `save_abandon_timeout_s - min(60 s, timeout / 5)` after the worker
+  received it reads nothing, since the engine may have reclaimed its PAGE
+  units, and a put of a key the Store holds moves nothing.
+- Under DCP every scheduler block is a virtual block of `block_size x dcp`
+  tokens, each rank holding its share; `chunk_tokens` must be a multiple of it
+  (1024 for TP8+DCP8 at block 128). The joint KV+state boundary follows
+  `chunk_tokens` (`state_tier_chunk_tokens`).
+- Early block release stays off, as on K3's LMCache path. The worker logs
+  `[OFFLOAD-STATE-STORE-STATS]` (images held, stores, loads, removals) at most
+  once a minute.
+
 ### Not supported in phase 1
 
-- Layouts other than dense (DSV4 PAGE+SLOT, MiniMax-M3, Kimi-K3 state tier) and
-  DCP > 1 on the offload side: refused at startup.
+- Layouts other than dense and Kimi-K3 (DSV4 PAGE+SLOT, MiniMax-M3, the GDN
+  `qwen` state tier): refused at startup.
 - Decode-side offload, and reading the Store from decode workers: decode DRAM
   joins as Store owners only.
 - A second offload connector beside it in one `multi`.
