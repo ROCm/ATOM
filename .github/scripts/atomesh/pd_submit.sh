@@ -562,7 +562,17 @@ if [[ -d "${LOG_ROOT}" ]]; then
   # LOG_ROOT as their own artifact, so they stay out of the results copy that
   # every summarize job downloads.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    # Results land on the runner's root disk; a flooding rank log once filled
+    # it. Oversized logs stay on the shared volume and are only referenced.
+    oversized_excludes=()
+    while IFS= read -r -d '' oversized; do
+      echo "WARNING: not copying oversized log ${LOG_ROOT}/${oversized#./}" >&2
+      echo "${LOG_ROOT}/${oversized#./}" >> "${RESULT_DIR}/${ATOMESH_CELL_ID}/oversized-logs.txt"
+      oversized_excludes+=("--exclude=${oversized}")
+    done < <(cd "${LOG_ROOT}" && find . -type f -name '*.log' \
+      -size +"${ATOMESH_RESULT_LOG_MAX_MB:-1024}"M -print0 2>/dev/null)
     tar \
+      "${oversized_excludes[@]}" \
       --exclude='.cache' \
       --exclude='./.cache' \
       --exclude='.aiter' \
