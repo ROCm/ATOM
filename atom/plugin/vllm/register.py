@@ -314,6 +314,30 @@ def register_model() -> None:
 
     apply_vllm_v4_block_reuse_patch()
 
+    # vLLM auto-enables the breakable cudagraph for V4 while building
+    # VllmConfig, which happens after this hook in every process.
+    from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
+        apply_vllm_v4_breakable_cudagraph_opt_out,
+        apply_vllm_v4_prefill_not_uniform_patch,
+    )
+
+    apply_vllm_v4_breakable_cudagraph_opt_out()
+    # V1 dispatches the FULL decode graph on shape alone; for ATOM's V4 a step
+    # with a still-prefilling row is not a uniform decode.
+    apply_vllm_v4_prefill_not_uniform_patch()
+
+    # DeepSeek-V4: real per-block pricing with a withheld slot tail, and prefix
+    # hits restored from vLLM-managed state checkpoints. Lives here rather than in
+    # ATOMPlatform because this hook is always reached, in EngineCore and in
+    # every worker: vLLM resolves the platform class from inside its own
+    # ``import vllm``, so ``register_platform`` can fail on a partially
+    # initialized ``vllm`` package and be swallowed. A no-op for every other model.
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        apply_vllm_v4_prefix_install,
+    )
+
+    apply_vllm_v4_prefix_install()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()

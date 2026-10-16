@@ -204,7 +204,11 @@ class DeepseekV41TextConfig(PretrainedConfig):
                 "moe_intermediate_size must be divisible by tensor parallel size"
             )
 
-    def validate_request(self, *, num_draft_tokens, multimodal_data):
+    def validate_request(
+        self, *, num_draft_tokens, multimodal_data, enable_dp_attention=False
+    ):
+        if enable_dp_attention and multimodal_data:
+            raise ValueError("DeepSeek-V4.1 DP attention supports text requests only")
         if num_draft_tokens and multimodal_data:
             raise ValueError(
                 "DeepSeek-V4.1 DSpark currently supports text requests only"
@@ -363,9 +367,13 @@ def validate_runtime_config(config):
         (
             "data parallel",
             config.parallel_config.data_parallel_size != 1
-            or config.enable_dp_attention,
+            and not config.enable_dp_attention,
         ),
-        ("TBO", config.enable_tbo or config.enable_tbo_decode),
+        ("decode TBO", config.enable_tbo_decode),
+        (
+            "prefill TBO without DP attention",
+            config.enable_tbo and not config.enable_dp_attention,
+        ),
         (
             # `lmcache_mp` is the one transport admitted: it checkpoints STATE
             # through the backend's PAGE-backed copies. P/D and in-process
@@ -389,6 +397,13 @@ def validate_runtime_config(config):
             "a KV cache other than bf16 or fp4",
             config.kv_cache_dtype not in ("bf16", "fp4"),
         ),
+        (
+            # A hit rebuilds the window a row at it reads from the one PAGE
+            # below it (`BlockManager.replay_start`).
+            "encoder SWA bounded replay with a PAGE shorter than the window - 1",
+            config.enable_encoder_swa_bounded_replay
+            and config.kv_cache_block_size < config.hf_config.sliding_window - 1,
+        ),
     ):
         if enabled:
             unsupported.append(name)
@@ -399,3 +414,15 @@ def validate_runtime_config(config):
     if config.kv_cache_block_size % 2:
         raise ValueError("DeepSeek-V4.1 PAGE token count must be even")
     validate_speculative_config(config)
+
+
+def validate_tbo_parallelism(config):
+    """Check the final topology after the engine applies legacy DP settings."""
+    if config.enable_tbo and (
+        not config.enable_dp_attention
+        or config.tensor_parallel_size * config.parallel_config.data_parallel_size <= 1
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 runtime does not support prefill TBO without "
+            "multi-rank DP attention"
+        )

@@ -177,3 +177,30 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
+
+
+def test_kv_budget_refuses_free_memory_below_the_connector_reserve():
+    """The KV connector allocates its buffers after the KV cache is sized.
+
+    With less free HBM than they need, planning would give the KV cache
+    nothing and the connector would allocate from memory that is not there;
+    startup must stop before planning, with the reason.
+    """
+    method = _method("get_num_blocks")
+    plan = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "plan_pools"
+    )
+    refusals = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "free_for_kv" in ast.unparse(node.test)
+        and "connector_bytes" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(refusals) == 1
+    assert refusals[0].lineno < plan.lineno

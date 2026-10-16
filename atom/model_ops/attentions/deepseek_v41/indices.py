@@ -9,6 +9,19 @@ from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 
 @triton.jit
+def _window_split(positions, cu, cached_until, batch, pos, mask):
+    """Where a prefill row's window turns from its ring to this forward's own
+    KV: the forward's first position for the request, or for a row at or past
+    `cached_until` -- above it only where a forward recomputes rows below a
+    point its ring already holds -- that point."""
+    first = tl.load(
+        positions + tl.load(cu + batch, mask=mask, other=0), mask=mask, other=0
+    )
+    cached = tl.maximum(first, tl.load(cached_until + batch, mask=mask, other=0))
+    return tl.where(pos >= cached, cached, first).to(tl.int32)
+
+
+@triton.jit
 def _indptr_scan(
     batches,
     positions,
@@ -17,6 +30,7 @@ def _indptr_scan(
     eptr,
     tokens,
     replay_start,
+    cached_until,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIO: tl.constexpr,
@@ -56,19 +70,18 @@ def _indptr_scan(
         bid = tl.load(batches + idx, mask=in_range, other=-1)
         live = in_range & (bid >= 0)
         pos = tl.load(positions + idx, mask=live, other=0).to(tl.int32)
-        start = tl.load(cu + bid, mask=live, other=0)
         first = tl.maximum(pos - WINDOW + 1, 0)
         if not DECODE:
             # A request's window starts no lower than its replay start: 0
-            # except on a bounded-replay tail, a prefill whose late layers
+            # except on a bounded-replay tail, a prefill whose decoder layers
             # wrote no window row below it (`BatchStep.swa_replay_start`).
             first = tl.maximum(first, tl.load(replay_start + bid, mask=live, other=0))
-        # Decode sees its own token; a prefill chunk sees only what its first
-        # token already had, the rest arriving as the extend segment.
+        # Decode sees its own token; a prefill row sees only what its window
+        # split already had, the rest arriving as the extend segment.
         history_end = (
             pos + 1
             if DECODE
-            else tl.load(positions + start, mask=live, other=0).to(tl.int32)
+            else _window_split(positions, cu, cached_until, bid, pos, live)
         )
         history = tl.where(live, tl.maximum(history_end - first, 0), 0)
         count = tl.zeros_like(history) if SPLIT else history
@@ -79,7 +92,7 @@ def _indptr_scan(
         prefix_total += tl.sum(count)
         if EXTEND or SPLIT:
             if EXTEND:
-                reach = tl.where(live, tl.minimum(idx - start + 1, WINDOW), 0)
+                reach = tl.where(live, tl.minimum(pos - history_end + 1, WINDOW), 0)
             else:
                 reach = history
             tl.store(
@@ -97,6 +110,7 @@ def _indptr_scan_all(
     extends,
     tokens,
     replay_start,
+    cached_until,
     DECODE: tl.constexpr,
     WINDOW: tl.constexpr,
     RATIOS: tl.constexpr,
@@ -116,6 +130,7 @@ def _indptr_scan_all(
                 extends[i],
                 tokens,
                 replay_start,
+                cached_until,
                 DECODE,
                 WINDOW,
                 RATIOS[i] or 1,
@@ -144,6 +159,7 @@ def _indices(
     layer_stride,
     plane,
     replay_start,
+    cached_until,
     DECODE: tl.constexpr,
     ROWS_PER_PAGE: tl.constexpr,
     PAGE_ROWS: tl.constexpr,
@@ -172,13 +188,16 @@ def _indices(
     # row owns no slot to address and was given no room to write into.
     if batch < 0:
         return
-    start = tl.load(cu + batch)
     pos = tl.load(positions + t)
     first = tl.maximum(0, pos - WINDOW + 1)
     if not DECODE:
         # see `_indptr_scan`: only a prefill can be a bounded-replay tail
         first = tl.maximum(first, tl.load(replay_start + batch))
-    history_end = pos + 1 if DECODE else tl.load(positions + start)
+    history_end = (
+        pos + 1
+        if DECODE
+        else _window_split(positions, cu, cached_until, batch, pos, True)
+    )
     window_count = tl.maximum(0, history_end - first)
     pbegin, pend = tl.load(pptr + t), tl.load(pptr + t + 1)
     i = tl.arange(0, BLOCK)
@@ -214,7 +233,7 @@ def _indices(
             row = (row << 1) | 1
         tl.store(prefix + pend - window_count + i, row, i < window_count)
     if not DECODE:
-        count = tl.minimum(t - start + 1, WINDOW)
+        count = tl.minimum(pos - history_end + 1, WINDOW)
         begin = tl.load(eptr + t)
         tl.store(extend + begin + i, t - count + 1 + i, i < count)
 
@@ -279,6 +298,12 @@ def _replay_start(step):
     return replay_start
 
 
+def _cached_until(step):
+    """`step.swa_cached_until`, the replay start's zeros where it has none."""
+    cached = getattr(step, "swa_cached_until", None)
+    return _replay_start(step) if cached is None else cached
+
+
 def fill_step_indptrs(step, geometry, buffers):
     """`{ratio: (prefix indptr, extend indptr, reserved top-k)}` for this step.
 
@@ -307,6 +332,7 @@ def fill_step_indptrs(step, geometry, buffers):
             tuple(built[ratio][1] for ratio in ratios),
             step.width,
             _replay_start(step),
+            _cached_until(step),
             DECODE=step.decode,
             WINDOW=geometry.window_size,
             RATIOS=ratios,
@@ -391,6 +417,7 @@ def build_indices(selected, step, geometry, window, owner, ratio, layers=1, stri
             stride,
             plane,
             _replay_start(step),
+            _cached_until(step),
             DECODE=step.decode,
             ROWS_PER_PAGE=geometry.block_size // (ratio or 1),
             PAGE_ROWS=geometry.page_bytes

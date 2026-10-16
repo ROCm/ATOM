@@ -135,6 +135,11 @@ class NativeStateTransfer:
     boundary_tokens: int
     prefix_hash: int
     destination_slot: int | None = None
+    # PAGE only, no image: a load whose window state is rebuilt by a bounded
+    # replay (`Sequence.replay_kv_load`), or a save beside that replay, which
+    # stores no image (`stores_state_images`). `unit_ids` is empty and nothing
+    # is restored; a load's retrieve runs under the request's KV-only lookup.
+    kv_only: bool = False
 
 
 @dataclass
@@ -161,6 +166,16 @@ class LMCacheReqMeta:
     # Appended for positional compatibility with existing metadata producers.
     load_operation: LoadOperationId | None = None
     native_state: NativeStateTransfer | None = None
+    # 16-byte prefix-chained digests of chunks [0, n), concatenated, for
+    # transports that key objects by hash; they ship these instead of
+    # `token_ids`.
+    chunk_hashes: bytes | None = None
+    # When the scheduler dispatched this save, on its CLOCK_MONOTONIC
+    # (`time.monotonic()`), and which clock that is (its host's boot ID), for
+    # workers that must stop reading the save's source before the scheduler may
+    # reclaim it.
+    dispatched_at: float | None = None
+    dispatch_clock: str | None = None
 
 
 class LMCacheOffloadMetadata(ConnectorMetadata):

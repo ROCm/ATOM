@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
+from itertools import islice
 
 from atom.model_engine.kv_block import Block
 
@@ -72,6 +73,7 @@ class BlockPool:
         max_blocks: int | None = None,
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
+        on_remap: Callable[[int], None] | None = None,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -91,8 +93,14 @@ class BlockPool:
             raise ValueError(f"{num_blocks} blocks outside 0..{self.max_blocks}")
         self.num_blocks: int = num_blocks
         self._on_evict = on_evict
+        # Called with a hash whose index entry moved to another block id
+        # (republished elsewhere, `_adopt`): ids resolved before then are stale.
+        self._on_remap = on_remap
         self.blocks: list[Block] = [Block(i) for i in range(self.max_blocks)]
         self._hash_to_block_id: dict[int, int] = {}
+        # Bumped on every change to a hash -> id mapping: ids resolved at
+        # version v are still current while it is v.
+        self.index_version: int = 0
         # Both containers may hold ids that were re-claimed straight off the
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
@@ -175,11 +183,43 @@ class BlockPool:
         """Block id indexed under content hash `h`, or -1."""
         return self._hash_to_block_id.get(h, -1)
 
+    @property
+    def index_get(self):
+        """The index's own `dict.get`: block id or None, for C-speed lookups
+        of a whole chain with `map`. Read it per walk, not once per pool."""
+        return self._hash_to_block_id.get
+
+    def count_used(self, block_ids: list[int], n: int) -> int:
+        """How many of the first `n` of `block_ids` (distinct) some live
+        sequence holds. No slice; the set it builds holds only the used ids,
+        and a waiting head's hit blocks are mostly free."""
+        return len(self._used.intersection(islice(block_ids, n)))
+
+    def claim_many(self, block_ids) -> None:
+        """`claim` each of `block_ids`, in order, with the lookups hoisted."""
+        blocks, used, take = self.blocks, self._used, self._take_named
+        slru = self.cache_policy == "slru"
+        for block_id in block_ids:
+            block = blocks[block_id]
+            if slru and block.hash != -1:
+                self._reused.add(block_id)
+            if block_id in used:
+                block.ref_count += 1
+            else:
+                assert block.ref_count == 0
+                block.ref_count = 1
+                take(block_id)
+                used.add(block_id)
+
     def publish(self, block_id: int, h: int, token_ids: array.array) -> None:
         """Index `block_id` under the content hash of the tokens it now holds."""
         block = self.blocks[block_id]
         block.update(h, token_ids)
+        prev = self._hash_to_block_id.get(h, block_id)
         self._hash_to_block_id[h] = block_id
+        self.index_version += 1
+        if prev != block_id and self._on_remap is not None:
+            self._on_remap(h)
 
     def clear_index(self) -> None:
         """Drop every content-hash entry, keeping blocks live sequences hold.
@@ -188,6 +228,7 @@ class BlockPool:
         longer reachable by hash, so no future request can claim them.
         """
         self._hash_to_block_id.clear()
+        self.index_version += 1
         for block in self.blocks:
             if block.ref_count == 0:
                 block.hash = -1
@@ -215,6 +256,7 @@ class BlockPool:
         dropped = False
         if block.hash != -1 and self._hash_to_block_id.get(block.hash) == block_id:
             del self._hash_to_block_id[block.hash]
+            self.index_version += 1
             dropped = True
             if self._on_evict is not None:
                 self._on_evict(block.hash)
@@ -461,6 +503,9 @@ class BlockPool:
         dst.ref_count, dst.hash, dst.token_ids = src.ref_count, src.hash, src.token_ids
         if src.hash != -1 and self._hash_to_block_id.get(src.hash) == source:
             self._hash_to_block_id[src.hash] = destination
+            self.index_version += 1
+            if self._on_remap is not None:
+                self._on_remap(src.hash)
         self._used.discard(source)
         self._used.add(destination)
         src.ref_count, src.hash, src.token_ids = 0, -1, array.array("i")

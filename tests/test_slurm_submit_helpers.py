@@ -356,7 +356,9 @@ class SlurmMonitoringTest(unittest.TestCase):
         self.assertTrue(self.calls("scancel"))
 
     def test_workflow_wrapper_preserves_unknown_but_cleans_real_failure(self):
-        workflow = (HELPERS.parents[1] / "workflows/atomesh-benchmark.yaml").read_text()
+        workflow = (
+            HELPERS.parents[1] / "workflows/atomesh-benchmark-tmpl.yaml"
+        ).read_text()
         start = workflow.index("          cleanup_slurm_from_wrapper() {")
         end = workflow.index("          trap cleanup_slurm_from_wrapper EXIT", start)
         cleanup = textwrap.dedent(workflow[start:end])
