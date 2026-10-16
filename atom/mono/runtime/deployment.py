@@ -115,6 +115,59 @@ def common_refusals(
     return checks
 
 
+def device_cu_count() -> int | None:
+    """This device's CUs, or None where there is no device (a contract check
+    builds compile-only and never binds one)."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+def is_gfx950() -> bool:
+    """True on gfx950, and on no device at all -- the same convention
+    ``device_cu_count`` follows there, and for the same reason."""
+    import torch
+
+    if not torch.cuda.is_available():
+        return True
+    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
+    return arch.startswith("gfx950")
+
+
+def persistent_kernel_refusals(atom_config, blocks: int) -> list[tuple[bool, str]]:
+    """``(holds, why not)`` of what a persistent mono kernel needs from the
+    machine it lands on: ``blocks`` CTAs all resident, and nothing else taking
+    CUs while they spin.
+
+    GLM-5.2's and K3's kernels are both ``blocks``-CTA resident and both wait
+    on each other ACROSS CTAs, so a CTA that is never scheduled is a CTA its
+    peers wait on for ever. That makes these hang conditions rather than slow
+    ones, which is why each is a refusal by name and not a warning.
+
+    ``blocks`` is the caller's own CTA count -- ``glm52/mono/kernels/geometry``
+    and ``mono/plan/execution`` both say 256 today, but they are separate
+    constants and each model passes the one its kernels actually launch with.
+
+    Deliberately NOT folded into ``common_refusals``: DeepSeek-V4.1 and
+    MiniMax-M3 also call that, and arming a refusal for a model whose residency
+    has not been checked would turn a working deployment off on reasoning
+    alone. A model opts in by calling this.
+    """
+    cus = device_cu_count()
+    return [
+        (cus in (None, blocks), f"{cus} CUs, the kernels need {blocks}"),
+        # a connector's copy kernels run on another stream and can hold CUs,
+        # which wedges a kernel that waits on every one of them. The field is a
+        # dict that defaults to empty, so this is a truthiness test, as every
+        # other reader of it in ATOM does: `is None` refuses every deployment.
+        (not getattr(atom_config, "kv_transfer_config", None), "KV connector"),
+    ]
+
+
 def first_refusal(checks) -> str | None:
     """The reason of the first check that does not hold, or None."""
     return next((why for ok, why in checks if not ok), None)

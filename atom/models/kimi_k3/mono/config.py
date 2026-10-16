@@ -36,7 +36,12 @@ from dataclasses import dataclass
 
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import Shard, ShardError
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    is_gfx950,
+    persistent_kernel_refusals,
+)
 from atom.utils import envs
 
 # ---------------------------------------------------------------- model widths
@@ -213,21 +218,31 @@ def config_refusal(atom_config) -> str | None:
     # run under PIECEWISE -- every measurement to date used FULL -- and arming
     # an untested path is worse than requiring one documented flag. Drop it
     # when there is a PIECEWISE run to point at, not before.
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
+    checks += (
+        common_refusals(atom_config, Dims, SUPPORTED_TP)
         # the kernels are one CTA a CU with every CTA resident: a spin wait on
         # another CTA only makes progress while that CTA runs
-        (
-            _cu_count() in (None, BLOCKS),
-            f"{_cu_count()} CUs, the kernels need {BLOCKS}",
-        ),
-        # a connector's copy kernels run on another stream and can hold CUs,
-        # which wedges a kernel that waits on every one of them. The field is a
-        # dict that defaults to empty, so this is a truthiness test, as every
-        # other reader of it in ATOM does: `is None` refuses every deployment.
-        (
-            not getattr(atom_config, "kv_transfer_config", None),
-            "KV connector",
-        ),
+        + persistent_kernel_refusals(atom_config, BLOCKS)
+    ) + [
+        # ...and the arch gate GLM-5.2 states and K3 did not.
+        #
+        # The hard dependency is a CONSTANT, not a device query:
+        # ``kernels/attention/kda.py`` hardcodes ``LDS_LIMIT = 163840``, which
+        # is gfx950's LDS budget a workgroup. Every build therefore sizes its
+        # x staging against gfx950 whatever it lands on. ``slab_plan`` picks
+        # the fewest slabs whose widest fits that budget, so at ``MAX_ROWS``
+        # 8 it takes one slab -- ``8 * (7 * KGROUP + LDS_PAD) * 2 + LDS_FIXED``
+        # = 123,008 B -- which gfx942's 65,536 B cannot hold. On gfx942 that is
+        # a compile- or launch-time failure, not a graceful narrowing, because
+        # nothing recomputed the plan against the smaller budget.
+        #
+        # So "gfx950 only" is a property of that hardcoded constant and not of
+        # the algorithm: make ``LDS_LIMIT`` a device query and ``slab_plan``
+        # returns 3 slabs at 8 rows, which fits gfx942 -- and bit-identically,
+        # for the reason its own docstring gives (the groups are walked in the
+        # same increasing order, so no wave's accumulation order moves).
+        # That one line is what a gfx942 port would have to change.
+        (is_gfx950(), "not gfx950"),
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted
         (
@@ -321,15 +336,3 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
-
-
-def _cu_count() -> int | None:
-    """This device's CUs, or None where there is no device (a contract check
-    builds compile-only and never binds one)."""
-    import torch
-
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count

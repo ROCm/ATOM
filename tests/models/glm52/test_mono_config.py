@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from atom.config import CUDAGraphMode
+from atom.models.glm52.mono import config as glm_config
 from atom.models.glm52.mono.config import (
     AGENTX_BATCHES,
     QUERY_LENGTHS,
@@ -15,13 +16,16 @@ from atom.models.glm52.mono.config import (
     model_geometry_refusal,
     native_config,
 )
+from atom.models.glm52.mono.kernels.geometry import BLOCKS
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
     GLM5_CONFIG,
     glm5_kernel_samples,
     glm5_tp_config,
 )
+from atom.mono.plan.execution import BLOCKS as EXECUTION_BLOCKS
 from atom.mono.plan.shard import ShardError, shard_refusal
+from atom.mono.runtime import deployment
 
 
 def test_tp4_is_the_supported_shard():
@@ -323,3 +327,78 @@ def test_a_grouped_router_is_refused_but_an_all_groups_one_is_not(
     else:
         # `is None`, so the checks above the gate are known to pass
         assert why is None
+
+
+# --------------------------------------------------------------------------
+# The persistent-kernel preconditions. GLM stated the arch half (`is_gfx950`)
+# and not the residency half, which K3 stated and GLM needs for the same
+# reason: `kernels/geometry.BLOCKS` is 256 here too, every CTA is resident,
+# and the kernel spins across CTAs, so a CTA that is never scheduled is one
+# its peers wait on for ever.
+
+
+@pytest.fixture
+def on_a_whole_gfx950(monkeypatch):
+    """Pin the machine, so these report on the deployment and not the box.
+
+    `device_cu_count` is patched where it is DEFINED, because
+    `persistent_kernel_refusals` calls it from inside `deployment`;
+    `is_gfx950` is imported into `glm_config`, so it is patched there.
+    """
+    monkeypatch.setattr(deployment, "device_cu_count", lambda: BLOCKS)
+    monkeypatch.setattr(glm_config, "is_gfx950", lambda: True)
+
+
+def test_the_served_deployment_passes_on_a_whole_gfx950(on_a_whole_gfx950):
+    # The anchor for the two refusals below: they must be latent on the
+    # deployment GLM-5.2 actually serves.
+    assert config_refusal(_served_tp4_fp8_mtp4_config()) is None
+
+
+def test_glm_uses_the_same_cta_count_its_kernels_launch():
+    # The refusal is only as good as the constant it compares against. GLM's
+    # kernels carry their own BLOCKS rather than sharing the mono framework's,
+    # so the check must read GLM's -- and the two agreeing today is a fact to
+    # pin, not one to rely on silently.
+    assert BLOCKS == 256 and BLOCKS == EXECUTION_BLOCKS
+
+
+@pytest.mark.parametrize("cus", [BLOCKS - 1, BLOCKS // 2, BLOCKS * 2])
+def test_a_gfx950_without_every_cu_is_refused_by_name(
+    on_a_whole_gfx950, monkeypatch, cus
+):
+    # CPX, or masked CUs. The kernel does not run slower on a partitioned
+    # device, it hangs: a 256-CTA grid cannot be fully resident, and the CTAs
+    # that did launch spin on peers that never do.
+    monkeypatch.setattr(deployment, "device_cu_count", lambda: cus)
+    assert config_refusal(_served_tp4_fp8_mtp4_config()) == (
+        f"{cus} CUs, the kernels need {BLOCKS}"
+    )
+
+
+def test_a_kv_connector_is_refused_by_name(on_a_whole_gfx950):
+    # An LMCache connector's copy kernels run on another stream and can hold
+    # CUs, which wedges a kernel waiting on every one of them.
+    atom_config = _served_tp4_fp8_mtp4_config()
+    atom_config.kv_transfer_config = {"kv_connector": "LMCacheConnectorV1"}
+    assert config_refusal(atom_config) == "KV connector"
+
+
+def test_an_absent_kv_transfer_config_is_not_a_connector(on_a_whole_gfx950):
+    # The field defaults to an empty dict and is absent entirely on the
+    # configs ATOM builds in several places, so the check is a truthiness
+    # test. `is None` would refuse every deployment, including this one.
+    atom_config = _served_tp4_fp8_mtp4_config()
+    assert not hasattr(atom_config, "kv_transfer_config")
+    assert config_refusal(atom_config) is None
+    atom_config.kv_transfer_config = {}
+    assert config_refusal(atom_config) is None
+
+
+def test_no_device_at_all_still_serves(monkeypatch):
+    # A contract check builds compile-only and never binds a device. Both
+    # queries must read that as "not a refusal", or every such check would
+    # report a machine it never looked at.
+    monkeypatch.setattr(deployment, "device_cu_count", lambda: None)
+    monkeypatch.setattr(glm_config, "is_gfx950", lambda: True)
+    assert config_refusal(_served_tp4_fp8_mtp4_config()) is None

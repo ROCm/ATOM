@@ -93,7 +93,12 @@ def servable(monkeypatch):
     `config_refusal` is reporting on the checkpoint and nothing else."""
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
-    monkeypatch.setattr(k3_config, "_cu_count", lambda: BLOCKS)
+    # `device_cu_count` is called from inside `persistent_kernel_refusals`, so
+    # it is patched where it is DEFINED; `is_gfx950` is imported into
+    # `k3_config`, so it is patched there. Both pin the machine, so what these
+    # tests report on is the deployment and not the box they run on.
+    monkeypatch.setattr(deployment, "device_cu_count", lambda: BLOCKS)
+    monkeypatch.setattr(k3_config, "is_gfx950", lambda: True)
     monkeypatch.setattr(k3_config.envs, "ATOM_MONO_ENABLE", True)
     monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", "fp32")
     monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", False)
@@ -116,3 +121,58 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
     servable, override, reason
 ):
     assert reason in config_refusal(_atom_config(**override))
+
+
+# --------------------------------------------------------------------------
+# The persistent-kernel preconditions, which K3 and GLM-5.2 must state the
+# same way: both kernels are BLOCKS-CTA resident and spin across CTAs, and
+# both size their LDS against a hardcoded gfx950 budget. K3 stated the
+# residency half (CU count, KV connector) and not the arch half.
+
+
+def test_a_non_gfx950_is_refused_by_name(servable, monkeypatch):
+    # `kernels/attention/kda.py` hardcodes `LDS_LIMIT = 163840` -- gfx950's
+    # budget -- rather than querying the device, so `slab_plan` sizes every
+    # build against gfx950 whatever it lands on. At MAX_ROWS=8 it takes one
+    # slab of 123,008 B, which gfx942's 65,536 B cannot hold; admitting the
+    # arch here buys a compile- or launch-time failure instead of a refusal.
+    monkeypatch.setattr(k3_config, "is_gfx950", lambda: False)
+    assert config_refusal(_atom_config()) == "not gfx950"
+
+
+def test_the_gfx950_dependency_is_the_constant_and_not_the_algorithm():
+    # The claim the refusal's comment makes, checked rather than asserted in
+    # prose: `slab_plan`'s search is over slab COUNTS, so a smaller budget is
+    # not unservable -- it just needs more slabs. Recomputed here against
+    # kda.py's own constants, because importing kda.py needs FlyDSL.
+    per_wave, kgroup, lds_pad, lds_fixed = 7, 1024, 8, 8192
+
+    def fewest_slabs(rows, budget):
+        for nslab in range(1, per_wave + 1):
+            widest = -(-per_wave // nslab)
+            if rows * (widest * kgroup + lds_pad) * 2 + lds_fixed <= budget:
+                return nslab
+        return None
+
+    # what the hardcoded LDS_LIMIT makes every build assume
+    assert 8 * (per_wave * kgroup + lds_pad) * 2 + lds_fixed == 123008
+    assert fewest_slabs(8, 163840) == 1  # gfx950: the whole row at once
+    # gfx942 cannot take that plan -- but it is not out of reach, it is three
+    # slabs away. Making LDS_LIMIT a device query is the whole port.
+    assert fewest_slabs(8, 65536) == 3
+
+
+def test_a_kv_connector_is_still_refused_by_name(servable):
+    # Moved into `persistent_kernel_refusals`; it must not have been lost on
+    # the way. A connector's copy kernels can hold CUs the spin waits on.
+    config = _atom_config()
+    config.kv_transfer_config = {"kv_connector": "LMCacheConnectorV1"}
+    assert config_refusal(config) == "KV connector"
+
+
+def test_a_partitioned_device_is_still_refused_by_name(servable, monkeypatch):
+    monkeypatch.setattr(deployment, "device_cu_count", lambda: BLOCKS // 2)
+    assert (
+        config_refusal(_atom_config())
+        == f"{BLOCKS // 2} CUs, the kernels need {BLOCKS}"
+    )
