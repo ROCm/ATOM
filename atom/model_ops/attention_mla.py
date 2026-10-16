@@ -219,7 +219,7 @@ logger = logging.getLogger("atom")
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
 
-def shuffled_asm_page_csr_supported(
+def shuffled_asm_supported(
     num_heads,
     dtype_q,
     dtype_kv,
@@ -229,7 +229,7 @@ def shuffled_asm_page_csr_supported(
     block_size,
     num_kv_heads=1,
 ):
-    """Capabilities of shuffled ASM using page CSR and padded Q storage.
+    """Capabilities of shuffled ASM using token CSR and padded Q storage.
 
     Extend this predicate as more kernel shapes implement that contract;
     the existing dense-metadata ASM path is selected independently.
@@ -766,10 +766,10 @@ class MLAAttention(nn.Module):
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
         self.dcp_world_size = get_dcp_world_size()
-        self.use_shuffled_asm_page_csr = (
+        self.use_shuffled_asm = (
             self.kv_shuffled
             and not self.use_triton_mla
-            and shuffled_asm_page_csr_supported(
+            and shuffled_asm_supported(
                 self.padded_num_heads,
                 dtypes.d_dtypes.get(kv_cache_dtype),
                 dtypes.d_dtypes.get(kv_cache_dtype),
@@ -780,7 +780,7 @@ class MLAAttention(nn.Module):
                 self.num_kv_heads,
             )
         )
-        if self.use_shuffled_asm_page_csr:
+        if self.use_shuffled_asm:
             # The shuffled writer consumes a device pointer as well as the
             # decode. Reuse one scale tensor on both sides, including capture.
             self._k_scale = self._k_scale_device
@@ -791,7 +791,7 @@ class MLAAttention(nn.Module):
                 is_sparse_mla=self.is_sparse_mla,
                 dcp_world_size=self.dcp_world_size,
                 mla_page_size=envs.ATOM_MLA_PAGE_SIZE,
-                shuffled_asm_supports_speculative=self.use_shuffled_asm_page_csr,
+                shuffled_asm_supports_speculative=self.use_shuffled_asm,
             )
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import CPTritonContext
@@ -2651,23 +2651,35 @@ class MLAAttention(nn.Module):
                     shuffled_kv_cache=True,
                 )
             else:
-                # Metadata format is fixed at initialization; Aiter dispatches
-                # and validates the kernel. Keep page CSR separate from the
-                # scheduler/drafter's existing token-level CSR.
-                use_page_csr = self.use_shuffled_asm_page_csr
+                # Reuse the scheduler/drafter's token CSR directly. Aiter
+                # dispatches and validates the selected metadata contract.
+                use_token_csr = self.use_shuffled_asm
+                kv_indices = attn_metadata.kv_indices if use_token_csr else None
+                if kv_indices is not None:
+                    # The shared workspace covers max_bs. Bound this view to
+                    # the current batch's page-table capacity so automatic
+                    # split selection keeps the former page-CSR upper bound,
+                    # including capture before real lengths are published.
+                    capacity = (
+                        (attn_metadata.cu_seqlens_q.numel() - 1)
+                        * attn_metadata.block_tables.shape[1]
+                        * kv_buffer.shape[2]
+                    )
+                    kv_indices = kv_indices[:capacity]
                 _, lse_or_scratch = mla_decode_fwd(
                     q,
                     kv_buffer,
                     o,
                     attn_metadata.cu_seqlens_q,
-                    attn_metadata.mla_page_indptr if use_page_csr else None,
-                    attn_metadata.mla_page_indices if use_page_csr else None,
-                    attn_metadata.mla_page_last_lens if use_page_csr else None,
+                    attn_metadata.kv_indptr if use_token_csr else None,
+                    kv_indices,
+                    attn_metadata.kv_last_page_lens if use_token_csr else None,
                     int(attn_metadata.max_seqlen_q),
                     page_size=kv_buffer.shape[2],
                     kv_layout="kv_shuffled",
-                    seq_lens=None if use_page_csr else attn_metadata.context_lens[:B],
-                    page_table=None if use_page_csr else attn_metadata.block_tables[:B],
+                    kv_csr_layout="token" if use_token_csr else "page",
+                    seq_lens=None if use_token_csr else attn_metadata.context_lens[:B],
+                    page_table=None if use_token_csr else attn_metadata.block_tables[:B],
                     sm_scale=self.scale,
                     causal=causal,
                     q_scale=self._q_scale if q.element_size() == 1 else None,
@@ -3130,7 +3142,7 @@ class MLAAttention(nn.Module):
             else:
                 write_slot_mapping = attn_metadata.slot_mapping
 
-            if self.use_shuffled_asm_page_csr:
+            if self.use_shuffled_asm:
                 # The writer honors runtime strides. Keep its logical width
                 # at 576 while each FP8 head occupies a 768-byte row.
                 q_storage = (torch.zeros if self.head_pad else torch.empty)(
@@ -3182,7 +3194,7 @@ class MLAAttention(nn.Module):
             # reached through the kernel's runtime q_out strides.
             q_out_write = (
                 q_out[:, : self.num_heads]
-                if self._fused_q_head_pad or self.use_shuffled_asm_page_csr
+                if self._fused_q_head_pad or self.use_shuffled_asm
                 else q_out
             )
             if kv_cache.numel() > 0:
@@ -3277,7 +3289,7 @@ class MLAAttention(nn.Module):
                         kv_cache,
                         attn_metadata,
                         q_prepadded=self._fused_q_head_pad
-                        or self.use_shuffled_asm_page_csr,
+                        or self.use_shuffled_asm,
                     )
             elif self.dcp_world_size > 1:
                 output = self._dcp_decode(q_out, kv_cache, attn_metadata, use_qrep)
@@ -3287,7 +3299,7 @@ class MLAAttention(nn.Module):
                     kv_cache,
                     attn_metadata,
                     q_prepadded=self._fused_q_head_pad
-                    or self.use_shuffled_asm_page_csr,
+                    or self.use_shuffled_asm,
                 )
 
         return output

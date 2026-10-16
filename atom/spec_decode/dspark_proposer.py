@@ -955,13 +955,9 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
 
         builder = getattr(self.runner, "attn_metadata_builder", None)
-        if getattr(builder, "use_shuffled_asm_page_csr", False):
-            # QH64 supports truly empty padding rows. Rebuild page CSR once
-            # for this bidirectional block, independently of the token CSR.
-            lengths = torch.where(slots[:, 0] >= 0, ctx_lens, 0)
-            attn_metadata.__dict__.update(
-                builder.prepare_shuffled_page_metadata(lengths, block_tables)
-            )
+        if getattr(builder, "use_shuffled_asm", False):
+            # Shuffled ASM consumes the token CSR already built above,
+            # including safe synthetic padding rows that read physical page 0.
             return
 
         # Build persistent (ps=1) MLA-decode metadata
