@@ -450,6 +450,10 @@ else
   if [[ -n "${NODE_LIST}" ]]; then
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
+  elif [[ "${USES_SPUR_CONTROLLER}" == "1" && -n "${ATOMESH_SLURM_EXCLUDE-pit2-p03-g03}" ]]; then
+    # Sweep-only: g03's spurd never relaunches the batch step after Spur
+    # requeues a job, leaving it RUNNING with empty output (8705/8713/8720).
+    SBATCH_CMD+=(--exclude "${ATOMESH_SLURM_EXCLUDE-pit2-p03-g03}")
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
