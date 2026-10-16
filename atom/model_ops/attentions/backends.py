@@ -1201,8 +1201,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
     def prepare_mixed(self, batch: ScheduledBatch, bs: int):
         raise NotImplementedError(
             f"{type(self).__name__} does not support mixed prefill+decode "
-            "batches yet. Only the dense-MLA backend (AiterMLAMetadataBuilder) "
-            "implements split dispatch. Disable --enable-mixed-prefill-decode."
+            "batches: this metadata builder has no prepare_mixed. Disable "
+            "--enable-mixed-prefill-decode."
         )
 
 

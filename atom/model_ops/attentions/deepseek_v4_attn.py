@@ -624,7 +624,9 @@ class _MixedDecodeView:
         val = getattr(self._batch, name)
         if (
             self._np
-            and isinstance(val, (list, tuple, np.ndarray))
+            and isinstance(val, (list, tuple, np.ndarray, torch.Tensor))
+            # A 0-d array or tensor is a scalar: `len()` raises on it.
+            and getattr(val, "ndim", 1) > 0
             and len(val) == self._batch.total_seqs_num
         ):
             raise MixedViewUnslicedField(
