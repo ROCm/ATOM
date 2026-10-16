@@ -1105,6 +1105,23 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_hc_dspark3_reuse_env
 
+        # 1P2D: the DSpark3 C48 cell with a second TP8+DCP8 decode node (three
+        # nodes), so each decode carries about half the sessions while the one
+        # prefill is not yet the limit. The router picks a decode at random, as
+        # in the 1P1D cells. `decode` is restated whole: `<<` merges one level.
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p2d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK3
+          nodes: "${ATOMESH_2P1D_NODES}"
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+
         # Non-disaggregated counterpart to the no-draft C72 cell: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
