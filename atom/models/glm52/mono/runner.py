@@ -16,6 +16,7 @@ while its peers stay refused leaves them spinning on the GPU forever.
 from __future__ import annotations
 
 import logging
+import weakref
 
 import torch
 from aiter.dist.parallel_state import (
@@ -51,6 +52,22 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+
+# ---------------------------------------------------------------------------
+def _close_ops(ops: dict, fused_ops: dict) -> None:
+    """Close every built op and drop it.
+
+    Module level, and taking the two dicts rather than the runner, because this
+    is also a ``weakref.finalize`` callback: one that referenced the runner
+    would keep it alive for ever and so never fire. The dicts are the same
+    objects ``_build`` mutates, so a build added after the finalizer was
+    installed is still closed.
+    """
+    for owned in (*ops.values(), *fused_ops.values()):
+        owned.close()
+    ops.clear()
+    fused_ops.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +422,21 @@ class Glm52MonoRunner:
         self._indexer_cp = (
             self._fused_indexer_on and indexer_cp_refusal(atom_config) is None
         )
+        # Release the peer mappings when the runner is dropped -- the same
+        # guarantee ``owned_peer_buffer`` gives the K3 and V4.1 runners, which
+        # GLM cannot use directly because its ``SymmetricPeerBuffer``s are
+        # owned by the per-layer ops rather than by the runner.
+        #
+        # Without this nothing releases them on a normal teardown: ``close()``
+        # has no caller anywhere in ATOM, so only ``_build``'s rollback paths
+        # ever close an op. A runner that is simply dropped -- a model reload --
+        # leaves this rank's remote IPC mappings open.
+        #
+        # ``atexit`` off for ``owned_peer_buffer``'s reason: at interpreter exit
+        # the HIP runtime may already be gone, and closing then is worse than
+        # not closing at all.
+        self._finalizer = weakref.finalize(self, _close_ops, self._ops, self._fused_ops)
+        self._finalizer.atexit = False
 
     @property
     def rank(self) -> int:
@@ -912,12 +944,7 @@ class Glm52MonoRunner:
         )
 
     def close(self) -> None:
-        for owned in self._ops.values():
-            owned.close()
-        for owned in self._fused_ops.values():
-            owned.close()
-        self._ops.clear()
-        self._fused_ops.clear()
+        _close_ops(self._ops, self._fused_ops)
         self._weights.clear()
         self._prepared.clear()
         self._fused_weights.clear()
