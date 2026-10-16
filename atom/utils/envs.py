@@ -182,7 +182,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Per-rank cap on in-flight load-balanced requests. 0 sprays the whole
     # offline batch up front. >0 holds the rest and refills a rank only as it
     # finishes, so ranks finish prefilling together and the tail stays
-    # all-decode (CUDA-graph replay). While set, dispatch balances on in-flight
+    # all-decode (CUDA-graph replay). Only offline batch admission
+    # (LLMEngine.generate / generate_multimodal) uses it; online API requests
+    # keep immediate dispatch. While set, that path balances on in-flight
     # request count and ignores dp_load_balance; CoreManager warns when that
     # strategy is not least_requests. A non-integer or negative value warns
     # and reads as 0. Keep it >= max_num_seqs; a smaller cap truncates every
