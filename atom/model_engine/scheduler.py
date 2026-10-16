@@ -23,6 +23,7 @@ import enum
 import itertools
 import logging
 import math
+import os
 import struct
 import threading
 import time
@@ -56,6 +57,7 @@ from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
     SequenceType,
+    new_block_table,
     new_token_ids,
     resumes_offload_prefill,
 )
@@ -626,6 +628,15 @@ class Scheduler:
         self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        # SGLang DP phase lockstep (sgl-project/sglang#37273). When any rank
+        # prefills, a rank with no prefill work runs an idle prefill instead
+        # of decode. Mixing the two clears ForwardMode.unified and
+        # eager-decodes the whole group. Default off.
+        self.dp_phase_lockstep = os.environ.get("ATOM_DP_PHASE_LOCKSTEP", "0") == "1"
+        self._phase_lockstep_seq: Sequence | None = None
+        self._phase_lockstep_idles = 0
+        if self.dp_phase_lockstep:
+            logger.info("DP phase lockstep enabled")
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
         # batch budget; the ranks then aim at one cost target, a costlier rank
@@ -1930,6 +1941,56 @@ class Scheduler:
                 bm.num_state_slots,
             )
 
+    def _phase_lockstep_idle_needed(self, delayer_allows: bool) -> bool:
+        """True when some rank can prefill and this rank must not decode.
+
+        Prefill token graphs already do this via ``dummy_prefill``. The flag
+        only covers the case where those graphs are off. ``last_n_prefillable``
+        is "could prefill", not "did admit"; a failed admission still idles.
+        ``last_fire_aligned`` is the #2600 one-sequence cap, not this gate.
+        """
+        if not self.dp_phase_lockstep or not delayer_allows or self.prefill_token_graphs:
+            return False
+        delayer = self.prefill_delayer
+        if delayer is None or delayer.dp_size <= 1:
+            return False
+        return delayer.last_n_prefillable > 0
+
+    def _phase_lockstep_idle_batch(
+        self,
+    ) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+        """One dummy prefill token so this rank joins the prefill collective.
+
+        ``is_dummy_run`` skips the KV write. ``is_final_chunk=[False]`` makes
+        the runner treat it as a middle chunk and skip sampling. The sequence
+        stays out of ``running``.
+        """
+        seq = self._phase_lockstep_seq
+        if seq is None:
+            seq = Sequence([0], self.block_manager.block_size, id=-1)
+            seq.status = SequenceStatus.RUNNING
+            seq.type = SequenceType.PREFILL
+            seq.block_table = new_block_table([0])
+            self._phase_lockstep_seq = seq
+        self._phase_lockstep_idles += 1
+        if self._phase_lockstep_idles == 1 or self._phase_lockstep_idles % 1000 == 0:
+            logger.info(
+                "DP phase lockstep idle prefill: count=%d",
+                self._phase_lockstep_idles,
+            )
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[1],
+            total_tokens_num=1,
+            total_tokens_num_prefill=1,
+            total_seqs_num=1,
+            total_seqs_num_prefill=1,
+            is_dummy_run=True,
+            num_cached_tokens=[0],
+            is_final_chunk=[False],
+        )
+        return batch, {seq.id: seq}
+
     def take_rejected(self) -> list[Sequence]:
         """Pop and return any seqs the prefill scheduler dropped because
         `_unschedulable_reason` flagged them (oversized prompt, exhausted
@@ -2069,6 +2130,8 @@ class Scheduler:
 
         # Rejections may still need an empty batch to dispatch connector cleanup.
         if not self.running and not self.waiting and not self._rejected:
+            if self._phase_lockstep_idle_needed(delayer_allows):
+                return self._phase_lockstep_idle_batch()
             return None
 
         # One fresh/partial prefill per rank only on a full-group align.
@@ -2725,10 +2788,14 @@ class Scheduler:
             return (prefill_batch, scheduled_seqs)
 
         if self.dummy_prefill:
-            # The group's prefill step, with no prefill of this rank's own: it
-            # keeps its peers company on a dummy prefill rather than decode, so
-            # every rank's forward replays its token graph (`ForwardMode.decide`).
+            # Token graphs already join this rank to the group's prefill.
             return None
+
+        # Token graphs are off. Idling here is the only way this rank does not
+        # decode beside a peer prefill. It does not put anyone back on a graph
+        # for this step: the prefilling peer has already left unified.
+        if self._phase_lockstep_idle_needed(delayer_allows):
+            return self._phase_lockstep_idle_batch()
 
         # --- Decode scheduling ---
         num_seqs_decode = 0

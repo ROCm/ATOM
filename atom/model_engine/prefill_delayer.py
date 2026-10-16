@@ -175,6 +175,7 @@ class PrefillDelayer:
         "_stat_log_every",
         "cpu_group",
         "dp_size",
+        "last_n_prefillable",
         "kv_high_watermark",
         "last_fire_aligned",
         "max_num_batched_tokens",
@@ -319,6 +320,7 @@ class PrefillDelayer:
         self._first = True
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
+        self.last_n_prefillable = 0
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -494,6 +496,7 @@ class PrefillDelayer:
                 )
                 self._reset()
                 self.rank_prefill_costs = []
+                self.last_n_prefillable = 0
                 return PrefillDecision(allow=True, prefillable_ranks=0)
 
         # One readback for all slots (a single .tolist() beats per-slot .item()
@@ -518,6 +521,7 @@ class PrefillDelayer:
             queue_hot_n,
             prefill_ran_n,
         ) = reduced[:_FIXED_SLOTS]
+        self.last_n_prefillable = int(n_prefillable)
         if self._cost_gate:
             self._time_step(step_s, prefill_ran_n > 0)
             self._prev_running_dec = g_running_dec
