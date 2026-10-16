@@ -88,8 +88,7 @@ def common_refusals(
         (not (is_vllm() or is_sglang()), "plugin mode"),
         (
             not _takes_weight_updates(atom_config),
-            "rollout weight updates (mono caches weight copies a sync "
-            "would not reach)",
+            "rollout weight updates (mono caches copies a sync cannot reach)",
         ),
         # `model_runner.py` wraps the model -- and the drafter, which K3 mono
         # needs -- in `torch.compile(fullgraph=True)` at this level and only
