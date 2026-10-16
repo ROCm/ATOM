@@ -352,6 +352,17 @@ class LLMEngine:
     def print_mtp_statistics(self):
         self.core_mgr.send_utility_command("get_mtp_stats")
 
+    def get_mono_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Read every worker's host counters outside the measured workload."""
+        replies = self.core_mgr.collective_rpc("get_mono_statistics", timeout=timeout)
+        return {
+            "version": 1,
+            "ranks": [
+                {"rank": reply.tp_rank, "stats": reply.value, "error": reply.error}
+                for reply in replies
+            ],
+        }
+
     def get_mtp_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated speculative decoding statistics across DP ranks."""
         responses = self.core_mgr.broadcast_utility_command_sync(

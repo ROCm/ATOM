@@ -137,6 +137,20 @@ cannot affect a server that does not use the feature.
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
 
+### DeepSeek-V4 validation clients
+
+These settings control execution-evidence checks in the benchmark/evaluation
+client, not server admission. Select the server backend with `--mono-decode`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_V4_MONO_PROFILE** | string | empty | Enable TP8 measured-execution evidence for `ordinary` or `mtp3_target`. Empty leaves other model benchmarks unchanged. |
+| **ATOM_V4_MONO_POLICY** | string | auto | Expected server policy (`auto`, `force`, or `off`); a mismatch or missing rank fails verification. |
+
+`python -m atom.benchmarks.mono_stats verify --min-hit-rate 0.95` additionally
+enforces the controlled fixed-width coverage target. Mixed full-network runs
+report coverage without applying that fixed-width threshold.
+
 ### MiniMax-M3
 
 | Variable | Type | Default | Description |
@@ -310,7 +324,7 @@ from `GPU_MAX_HW_QUEUES`, not from where the forks sit.
 
 ## V4 attention backend (Migration)
 
-Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`
+Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4/model.py`
 and the new batched `V4AttentionBackend` (`atom/model_ops/v4_attention_backend.py`).
 The new backend removes ~256 GPU→CPU `.item()` syncs per forward and is required
 to enable CUDAGraph capture for V4. Legacy stays available during PR-A migration

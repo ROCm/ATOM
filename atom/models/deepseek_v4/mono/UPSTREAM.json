@@ -1,0 +1,177 @@
+{
+  "repository": "https://github.com/ROCm/FlyDSL",
+  "pull": 1234,
+  "head": "5ac3807214289651a3834f8a77593f1a744484a7",
+  "license": {
+    "spdx": "Apache-2.0",
+    "copyright": "Copyright 2025 FlyDSL Project Contributors",
+    "text": "atom/models/deepseek_v4/mono/LICENSE"
+  },
+  "changes": "initial namespace/dependency extraction from fixed PR head; host weight/state separation; ATOM IPC/compile runtime integration; exact-row target runner; lossless post-load V4 binder; real BF16 cache/metadata adapter; ordinary token entry and S1 engine lifecycle hooks; device dependency cache key expanded; deterministic radix winner compaction replaces atomic output-slot allocation without changing radix membership; BF16 KV NoPE round-trip is a compile-profile option and disabled for real BF16 cache; real non-fused shared Expert has an explicit BF16/block128 E8M0 profile, including independent pre-routed-quantization input and BF16 gate/activation boundaries; real routed down preserves each full-K route until weighted BF16 conversion, then BF16 routed sum/shared add; Opus routed UG retains FP32 prequant activation; real main/index compressor projections have a BF16 full-K epilogue before gate/ring publication; real attention uses FP8/block128 E8M0 inputs and BF16 projection outputs, fused FP32 q-norm requantization, FP32 sparse split partials and inverse-RoPE publication; real mHC normalization uses FP32 collapsed sqrsum with a BF16 numerator and HC4 pair-tree contraction, and gfx950 hidden7168 M1 reproduces the ordinary 256-thread/four-wave raw sqrsum reduction tree; main/index compressor pooling/norm/RoPE retain FP32 until cache/quant write, and real index query has no extra BF16 RoPE seam; existing observer plane records actual CSA BF16 weights-projection operands for fixed-input attribution; real CSA indexer Hadamard disabled to match ATOM; ONE layer grid and peer protocol retained; current real-model replay binaries are NOT the initial byte-exact performance-port binaries; standalone layer wrapper split from the serving runner into layer.py; production admission moved to ATOM-owned dispatch.py; ATOM-owned serving lifecycle and production cache binding extracted to session.py/cache.py; device layout/task plan restored to kernels/plan.py; full device/config/format source digest keys both layer and epoch-advance binaries",
+  "files": [
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/layer.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/build.py",
+      "upstream_sha256": "13891194424bdb0c57c1eb90f360da9be1c7b45a131c7eeda57e2fde72f5d2dd",
+      "port_sha256": "66d7d4665a2d7401e78569f904d12b69d71123dded838e47408c19f20f5cc83d",
+      "current_sha256": "347e675063be8759121be4a104ca583b0dcd34693fc2791b862531c15cfa718f"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/attn_pre.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/qkv.py",
+      "upstream_sha256": "e55a029d87b778ac6ed23417c23fb559c653e4267e266e1733f95883d7ded9a2",
+      "port_sha256": "2a68cd42742b8cecfcf223f1db15f3684e5479075e6c49fb9d28c496453c324f",
+      "current_sha256": "06b5d6696e20eac018ebd35562a0d9b09464297e5a7ded5cb479657798314eba"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/attention.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/attention.py",
+      "upstream_sha256": "31ccd2a35a17afbde7dcc89ef3b243dc770c3f4bda937ea899114f8d099b5b08",
+      "port_sha256": "f3dc9e8895506d0def3128d5257051568cb15819eb59fbf273e30f7a09c970a7",
+      "current_sha256": "dd27d87d88e9b95f5eec5fe3e05aecb0f01fb5a83db2be00abf176c92452a6a2"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/indexer.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/indexer.py",
+      "upstream_sha256": "247bf1bc1a83d12e10094e0ad85551f48ab3b72bbe545875e390fa2557382692",
+      "port_sha256": "5455ea474e03347a9d95dfbc8a76f1181bb9849b7c5e4c57680c6992a6918881",
+      "current_sha256": "505ea1db857e8624de383072cb2a27e8dfe90ba5e892b8c10dca592548d144d2"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/mhc.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/hc.py",
+      "upstream_sha256": "6343d4c862f7377ba90bac4a99989bbfa2708a1e8ce86e02ea23d4c7617f25fb",
+      "port_sha256": "3281be36ddae3eae98794b0c9fd07d59cd941dd08cf5353bbfc01309ff848224",
+      "current_sha256": "aa122e00ab8d31d485187aab227095d0708b54ff1297b568de9b7726beeca05b"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/moe.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/ffn.py",
+      "upstream_sha256": "3870a5642f04c0c60789471302dbe9ecc6531cdefe1ac6db4b2b7295cc3093f6",
+      "port_sha256": "54b8391374d1362323c0c5eeca73a44121bf2e75b4cab855d571f44d17af20d5",
+      "current_sha256": "cb82058405a9d2050c4529037ae3561c466de7ab5254b04e0f1754ff81d52ff4"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/common.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/common.py",
+      "upstream_sha256": "e81a1e6214bbd3b07393ae6bc9c77fb65e7eeec54a02285af98f1a5f71d59390",
+      "port_sha256": "6c0c899322f39056bfb8a8eccefaf77dfdff12a57325be0373f7e3dac6ad0279",
+      "current_sha256": "ad48a44bb939066ed17012738d57c6b333770e5735c16307b0757fd8865132bf"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/kernels/plan.py",
+      "upstream": "kernels/monokernel/dsv4/kernel/plan.py",
+      "upstream_sha256": "bb1cd29ee016ceaad612a4fb9e030d2bf263d51a72f29300146317ef7dc5f8bc",
+      "port_sha256": "39fe6cbefbf208a7fa5529fc3349455d33764d3d00863b4aa01ba06e51dd9162",
+      "current_sha256": "5eebe8370f1fa0f8ae885ee2dad009efb8c8d63c5042bd324ac2100c50e9cbaf"
+    },
+    {
+      "destination": "atom/mono/device/flydsl_primitives.py",
+      "upstream": "kernels/monokernel/ops.py",
+      "upstream_sha256": "8c8dd3598836c94ba7d5c00fdf814c144b9bd0afae3c570de1fae022c19ab678",
+      "port_sha256": "77802fc650ac3017d715f34ee6258cb62a99b887e4145d03a34f3c936e467b70",
+      "current_sha256": "6821d75ba52e74a6ead45c05d44f03cca5f3c225e14bbeab86469616adfe2711"
+    },
+    {
+      "destination": "atom/mono/device/flydsl_helpers.py",
+      "upstream": "kernels/monokernel/helpers.py",
+      "upstream_sha256": "7af220948234184d541729b7e8623fba6eeb4b771481547e015855a06d47ccc2",
+      "port_sha256": "756031671a9bc0662097938b2a17aa92a8c3cab3545753452ca7e0ec9b60f961",
+      "current_sha256": "ead4bed9ecb9e0a0bec935ba5d804d68cf8de00be98d586d35de6efb8bb0b118"
+    },
+    {
+      "destination": "atom/mono/device/buffer_ops.py",
+      "upstream": "kernels/common/buffer_ops.py",
+      "upstream_sha256": "c07958436a20e2297ab846b59103890028ee65abc3408ec61d1b747c90ff116e",
+      "port_sha256": "0831f40ba1c6f9d628c427f8dd1baf901c47e2ff0e11b72eb31a9fef32e600c3",
+      "current_sha256": "c53eb9ea88f0c35aba4c2fb38f83113760b210a8cde87b483cff9d6223ae8796"
+    },
+    {
+      "destination": "atom/mono/device/dpp_utils.py",
+      "upstream": "kernels/common/dpp_utils.py",
+      "upstream_sha256": "bdf6ff24f03dcd3d8db9034c52bb669087e157b9d05cd40a4e6868beb1a750c6",
+      "port_sha256": "4a51e95297e7599038fb5080ad2d1d1914a73fdc0923d92a3cccf876cff955d1",
+      "current_sha256": "c6756c4b16c2217f075acd6bc341818a9c22ad78a2c1f6691303bcf4d4c99f68"
+    },
+    {
+      "destination": "atom/mono/plan/formats.py",
+      "upstream": "kernels/monokernel/formats.py",
+      "upstream_sha256": "f7bb02b8c21be5c56ed81850009df66e6f5d2c519a0b833eee4caab01f773687",
+      "port_sha256": "70b7c9e84c5e7dc109e4d4304ed05fd758209bd4253ddd79dbba36db6d5f939d",
+      "current_sha256": "fd2186b213145725dd80e1fed42e8f038b792cc0501cb251a2ad380312a99dad"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/config.py",
+      "upstream": "kernels/monokernel/dsv4/config.py",
+      "upstream_sha256": "74c24c7b490322a9ea9a64d37dac33dfd780ca89620e9e7b2b42dee96eb3de92",
+      "port_sha256": "17ba76827db584f8e47f009896996dd4947e2985b5b10df40e440ce0414bb9e0",
+      "current_sha256": "7c01b00f6716a51e8b88354105d29ec6b5daf9f4fa10d8a3654be783d24bb570",
+      "extracted_sources": [
+        {
+          "upstream": "kernels/monokernel/config.py",
+          "upstream_sha256": "75f93b62a207533472625d64040cfd6e1fc9a14b13ddb40ee45f5ace95a4c448"
+        },
+        {
+          "upstream": "kernels/monokernel/dsv4/reference.py",
+          "upstream_sha256": "73d2f93c80c13e59483ee872dab7868fcb5d4e66bf15751116133cf5c0ec0a1c"
+        },
+        {
+          "upstream": "kernels/monokernel/dsv4/op.py",
+          "upstream_sha256": "fae0500c7951e0f44ed5c7acf13f17eb82a048da3ab07d99640f408dadce3058"
+        }
+      ]
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/weights.py",
+      "upstream": "kernels/monokernel/dsv4/packing.py",
+      "upstream_sha256": "298173ecde7f60c148e57653a8bfd13c3da86360b157068634bbc7b2a00c11b1",
+      "port_sha256": "94fed835d9cbe2e3075470b6e690cca625cbd8cfd500ec9c7b80be6f5a22f23b",
+      "current_sha256": "5edb2d022d8a53be8b10452faa2f497a7f9989d81bce8069c0836475a4cd5421",
+      "extracted_sources": [
+        {
+          "upstream": "kernels/monokernel/packing.py",
+          "upstream_sha256": "b6c017ff46859dc5385042e90584b6b1f7a7b2e48adf0e79fe7e687114967092"
+        },
+        {
+          "upstream": "kernels/monokernel/dsv4/reference.py",
+          "upstream_sha256": "73d2f93c80c13e59483ee872dab7868fcb5d4e66bf15751116133cf5c0ec0a1c"
+        }
+      ]
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/state.py",
+      "upstream": "kernels/monokernel/dsv4/op.py",
+      "upstream_sha256": "fae0500c7951e0f44ed5c7acf13f17eb82a048da3ab07d99640f408dadce3058",
+      "port_sha256": "5598aee89f474ebe6f576b16496903c809f50c193d47c3f315244b3008fd3e29",
+      "current_sha256": "703cabc862e9236579a90daab101469104ecd89eb92d3dfb35ed20ca6e6bb915"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/layer.py",
+      "upstream": "kernels/monokernel/dsv4/op.py",
+      "upstream_sha256": "fae0500c7951e0f44ed5c7acf13f17eb82a048da3ab07d99640f408dadce3058",
+      "port_sha256": "d6771f8fbc29211a6d67af923d6b9c3432662318034dd148eabf378da5f81a9b",
+      "current_sha256": "b59022a0e986b86511e48536b97ce480d68e69c1f60ea73b560ecf657abb4f92"
+    },
+    {
+      "destination": "atom/models/deepseek_v4/mono/runner.py",
+      "upstream": "kernels/monokernel/dsv4/op.py",
+      "upstream_sha256": "fae0500c7951e0f44ed5c7acf13f17eb82a048da3ab07d99640f408dadce3058",
+      "port_sha256": "59ff294f282a8cebd792475973ddfc7f404f0b7a116ef5baf88c5c85d127ca17",
+      "current_sha256": "042317f2d2bdacaa915572042de9f51286a9b2433da3b7e5290e6098da61f760"
+    }
+  ],
+  "hashes": "port_sha256 is the initial extracted snapshot; current_sha256 is the current integrated file",
+  "atom_runtime_adapters": [
+    "atom/mono/runtime/peer_memory.py",
+    "atom/mono/runtime/compile.py",
+    "atom/models/deepseek_v4/model.py",
+    "atom/model_engine/model_runner.py",
+    "atom/utils/envs.py",
+    "atom/rollout/memory_manager.py",
+    "atom/rollout/weight_updater.py",
+    "atom/models/deepseek_v4/mono/session.py",
+    "atom/models/deepseek_v4/mono/cache.py",
+    "atom/models/deepseek_v4/mono/contract.py",
+    "atom/models/deepseek_v4/mono/sources.py"
+  ]
+}

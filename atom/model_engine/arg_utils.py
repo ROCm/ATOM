@@ -157,6 +157,7 @@ class EngineArgs:
     cudagraph_capture_sizes: str = "[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"
     level: int = 3
     cudagraph_mode: str = "FULL"
+    mono_decode: str = "auto"
     load_dummy: str | None = None
     enable_expert_parallel: bool = False
     fake_eplb: bool = False
@@ -346,6 +347,19 @@ class EngineArgs:
             "attention eager (requires --level 3). AF_PIECEWISE = PIECEWISE where "
             "the attention core is also captured into its own cudagraph with "
             "zero-copy buffers (DeepSeek-V4 DSpark).",
+        )
+        parser.add_argument(
+            "--mono-decode",
+            type=str,
+            default="auto",
+            choices=["auto", "off", "force"],
+            help=(
+                "Model-level Mono decode policy (currently DeepSeek-V4). 'auto' "
+                "(default) installs the backend for supported deployments and "
+                "routes eligible decode steps to it; unsupported deployments or "
+                "steps keep the native path. 'off' disables Mono. 'force' fails "
+                "startup or a live decode step instead of falling back to native."
+            ),
         )
         parser.add_argument(
             "--load_dummy",

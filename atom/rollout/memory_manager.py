@@ -241,6 +241,15 @@ class MemoryManagerMixin:
         if hasattr(self, "tokenID_processor"):
             self.tokenID_processor.clean()
 
+        mono = getattr(getattr(self, "model", None), "_v4_mono", None)
+        if mono is not None and not sleep_keeps_memory_resident(self):
+            release_cudagraphs(self)
+            mono.close()  # retire peer/cache views before discarding their storage
+            if "weights" in tags:
+                mono.weights_ready = (
+                    False  # resume allocates placeholders, not loaded weights
+                )
+
         if "weights" in tags:
             self._release_weights()
 
@@ -264,6 +273,21 @@ class MemoryManagerMixin:
 
         if "kv_cache" in tags:
             self._resume_kv_cache()
+
+        mono = getattr(getattr(self, "model", None), "_v4_mono", None)
+        if (
+            mono is not None
+            and mono.runner is None
+            and not mono.disabled
+            and mono.weights_ready
+        ):
+            mono.prepare(cache_rebound=True)
+
+        if mono is not None and not mono.weights_ready:
+            logger.info(
+                "V4 Mono/graph preparation deferred until actual weight sync completes"
+            )
+            return True
 
         self._recapture_cudagraphs_if_needed()
 

@@ -82,6 +82,44 @@ def test_build_args_smoke_over_real_catalog():
         assert args.startswith("--kv_cache_dtype "), (m["display"], args)
 
 
+def test_v4_mono_variants_keep_index_profiles_and_controls_separate():
+    import json
+    import shlex
+
+    cells = [
+        cell
+        for cell in catalog.build_cells(CATALOG)
+        if cell["prefix"] == "deepseek-v4-pro" and "-mono-" in cell["suffix"]
+    ]
+    assert len(cells) == 16  # two policies x four profiles/widths x two scenarios
+    for cell in cells:
+        argv = shlex.split(cell["server_args"])
+        mtp = "-mono-mtp3-" in cell["suffix"]
+        assert "--no-enable_prefix_caching" in argv
+        assert json.loads(argv[argv.index("--hf-overrides") + 1]) == {
+            "use_index_cache": not mtp,
+            "index_topk_freq": 1 if mtp else 4,
+        }
+        assert cell["conc"] in ((1,) if mtp else (1, 4, 8))
+        assert "ATOM_V4_MONO_PROFILE=" in cell["env_vars"]
+        if mtp:
+            assert "--use-chat-template" in cell["bench_args"]
+        policy = cell["suffix"].rsplit("-", 1)[1]
+        assert argv[argv.index("--mono-decode") + 1] == policy
+        opposite = policy == "off" and "auto" or "off"
+        partner = next(
+            other
+            for other in cells
+            if other["suffix"] == cell["suffix"].removesuffix(policy) + opposite
+            and (other["conc"], other["isl"], other["osl"])
+            == (cell["conc"], cell["isl"], cell["osl"])
+        )
+        normalized = lambda value: value.replace(
+            "--mono-decode auto", "--mono-decode off"
+        )
+        assert normalized(partner["server_args"]) == normalized(cell["server_args"])
+
+
 def test_load_variants_shape():
     # Content-agnostic: assert the catalog produces at least one variant and
     # every variant carries the required fields. Deliberately does NOT pin the

@@ -29,9 +29,10 @@ atom/
 │   ├── attention_mla.py       # MLA attention (DeepSeek)
 │   ├── attention_mha.py       # Standard MHA attention
 │   └── paged_attention.py     # Paged attention backend
-├── models/                    # Model implementations (one file per family;
-│                              # `*_mtp.py` for MTP / speculative variants —
-│                              # run `ls atom/models/` for the current set)
+├── models/                    # Model implementations (one module or package per
+│                              # family; packages keep subordinate backends such as
+│                              # `deepseek_v4/model.py` + `deepseek_v4/mono/` together;
+│                              # `*_mtp.py` is used for MTP/speculative variants)
 ├── spec_decode/
 │   └── eagle.py               # MTP proposer (speculative decoding)
 ├── plugin/                    # vLLM/SGLang plugin adapters
@@ -89,7 +90,8 @@ MoE pattern: FusedMoE + shared_experts both use `reduce_results=False`, parent d
 
 ### Adding a Model (file co-change pattern)
 
-1. `atom/models/new_model.py` — Model implementation
+1. `atom/models/new_model.py` — Model implementation, or
+   `atom/models/new_model/model.py` when the family owns subordinate packages
 2. `atom/model_engine/model_runner.py` — Register in `support_model_arch_dict`
 3. `atom/config.py` — Add to `_CONFIG_REGISTRY` if config schema differs
 4. `.github/benchmark/models_accuracy.json` — CI accuracy test entry

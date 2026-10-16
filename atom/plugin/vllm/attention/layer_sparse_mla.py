@@ -35,7 +35,7 @@ from atom.utils.custom_register import direct_register_custom_op
 logger = logging.getLogger("atom")
 
 # Byte budget (MB) for the dense fp8_mqa_logits prefill logits buffer. Mirrors
-# native ATOM (atom/models/deepseek_v4.py, issue #1376): the indexer logits
+# native ATOM (atom/models/deepseek_v4/model.py, issue #1376): the indexer logits
 # matrix is [rows, total_seq_lens] fp32 and total_seq_lens (the sum of all
 # co-scheduled prefill contexts) is unbounded by max_num_batched_tokens, so a
 # burst of long-context requests can push a single allocation to tens of GiB

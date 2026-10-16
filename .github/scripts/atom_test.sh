@@ -175,6 +175,12 @@ if [ "$TYPE" == "accuracy" ]; then
   OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
   CLIENT_COMMAND="${CLIENT_COMMAND:-}"
+  MONO_PROFILE="${ATOM_V4_MONO_PROFILE:-}"
+  if [[ -n "$MONO_PROFILE" ]]; then
+    python3 -m atom.benchmarks.mono_stats snapshot \
+      --base-url "http://localhost:${ATOM_SERVER_PORT}" \
+      --output "${OUTPUT_PATH}/mono-before.json"
+  fi
   if [[ "${CLIENT_COMMAND}" == "null" ]]; then
     CLIENT_COMMAND=""
   fi
@@ -187,6 +193,7 @@ if [ "$TYPE" == "accuracy" ]; then
       CLIENT_COMMAND="${CLIENT_COMMAND}" \
       MODEL_PATH_VALUE="${MODEL_PATH}" \
       OUTPUT_PATH_VALUE="${OUTPUT_PATH}" \
+      SERVER_PORT_VALUE="${ATOM_SERVER_PORT}" \
       python3 - <<'PY'
 import os
 import shlex
@@ -198,6 +205,8 @@ replacements = {
     "$MODEL_PATH": os.environ["MODEL_PATH_VALUE"],
     "${OUTPUT_PATH}": os.environ["OUTPUT_PATH_VALUE"],
     "$OUTPUT_PATH": os.environ["OUTPUT_PATH_VALUE"],
+    "${ATOM_SERVER_PORT}": os.environ["SERVER_PORT_VALUE"],
+    "$ATOM_SERVER_PORT": os.environ["SERVER_PORT_VALUE"],
 }
 for src, dst in replacements.items():
     client_command = client_command.replace(src, dst)
@@ -257,8 +266,10 @@ PY
   #   - DP-attention SHM coordination warnings (`shared memory broadcast
   #     block found in 60.0 seconds` is CPU-idle waiting, not a hang)
   # Real GPU hangs / faults still surface within ACCURACY_TIMEOUT_MINUTES.
-  bash scripts/wait_infer_drain.sh 8000 "$ACCURACY_TIMEOUT_MINUTES" 10 "$ATOM_CLIENT_LOG" 18
+  set +e
+  bash scripts/wait_infer_drain.sh "$ATOM_SERVER_PORT" "$ACCURACY_TIMEOUT_MINUTES" 10 "$ATOM_CLIENT_LOG" 18
   DRAIN_RC=$?
+  set -e
   if [ "$DRAIN_RC" -ne 0 ]; then
     echo "wait_infer_drain.sh exit=$DRAIN_RC — killing client pgid $CLIENT_PID"
     # `kill -- -PGID` signals the whole group (set -m made CLIENT_PID == pgid).
@@ -273,20 +284,20 @@ PY
     exit "$DRAIN_RC"
   fi
   # Drain clean: client should be near-done. Reap exit status.
-  wait "$CLIENT_PID" || true
+  wait "$CLIENT_PID"
 
   RESULT_FILENAME=$(
     python3 - <<PY
 from pathlib import Path
 
-candidate_roots = [Path("${OUTPUT_PATH}"), Path("accuracy_test_results")]
+candidate_roots = [Path("${OUTPUT_PATH}")]
 json_candidates = []
 for root in candidate_roots:
     if root.is_file() and root.suffix == ".json":
         json_candidates.append(root)
     elif root.is_dir():
         for path in root.rglob("*.json"):
-            if path.is_file():
+            if path.is_file() and not path.name.startswith("mono-"):
                 json_candidates.append(path)
 
 if not json_candidates:
@@ -297,13 +308,21 @@ else:
 PY
   )
   if [[ -z "${RESULT_FILENAME}" || ! -f "${RESULT_FILENAME}" ]]; then
-    echo "ERROR: No results JSON file found under ${OUTPUT_PATH} or accuracy_test_results"
+    echo "ERROR: No current results JSON file found under ${OUTPUT_PATH}"
     exit 2
   fi
 
   if [[ "${RESULT_FILENAME}" != "${FLAT_RESULT_FILE}" ]]; then
     cp -f "${RESULT_FILENAME}" "${FLAT_RESULT_FILE}"
     RESULT_FILENAME="${FLAT_RESULT_FILE}"
+  fi
+
+  if [[ -n "$MONO_PROFILE" ]]; then
+    python3 -m atom.benchmarks.mono_stats verify \
+      --base-url "http://localhost:${ATOM_SERVER_PORT}" \
+      --before "${OUTPUT_PATH}/mono-before.json" \
+      --output "${OUTPUT_PATH}/mono-after.json" \
+      --result "$RESULT_FILENAME" --min-samples 1319
   fi
 
   if [ -n "${ATOM_DOCKER_IMAGE:-}" ] || [ -n "${GPU_NAME:-}" ] || [ -n "${GPU_VRAM_GB:-}" ] || [ -n "${ROCM_VERSION:-}" ]; then

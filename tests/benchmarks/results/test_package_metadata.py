@@ -13,6 +13,26 @@ from atom.benchmarks.results import metadata
 from atom.benchmarks.results.bundle import rebuild_bundle, verify_bundle
 from atom.benchmarks.results.io import read_json, write_json
 
+
+def test_build_environment_loads_without_installed_atom(tmp_path):
+    # setup.py's isolated build loads envs by path before ATOM is installed.
+    source = Path(__file__).resolve().parents[3] / "atom/utils/envs.py"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import runpy, sys; envs = runpy.run_path(sys.argv[1]); assert 'ATOM_V4_MONO_PROFILE' in envs['environment_variables']",
+            str(source),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 FIXTURES = Path(__file__).parent / "fixtures"
 VERSION = "0.1.1.dev1+ga75ba53de"
 DIGEST = "26ea7ce84b0b9e6e22235da060b91a5b59d121a228b5b4a58fed88d5ba867a8a"

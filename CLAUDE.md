@@ -44,7 +44,9 @@ diffusion_server.py → DiffusionEngine → DiffusionCoreManager → DiffusionEn
 Key entry points:
 - Server: `atom/entrypoints/openai_server.py`
 - Engine: `atom/model_engine/llm_engine.py` → `engine_core.py` → `scheduler.py` → `model_runner.py`
-- Models: `atom/models/` — registered in `model_runner.py:support_model_arch_dict`
+- Models: `atom/models/` — registered in `model_runner.py:support_model_arch_dict`;
+  a family may be a single module or a package when it owns subordinate
+  backends (for example `deepseek_v4/model.py` plus `deepseek_v4/mono/`)
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
@@ -68,7 +70,7 @@ Key entry points:
   mailbox and its `publish`, the TP group's peer bases and all-reduce sum
   (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
   / math primitives), a model's
-  kernels in `atom/models/<model>/mono/` (MiniMax-M3; DeepSeek-V4.1, wrapped
+  kernels in `atom/models/<model>/mono/` (MiniMax-M3; DeepSeek-V4 and V4.1, wrapped
   after load through `model_runner.mono_decode_installers`; its per-step cell
   decisions live in `deepseek_v41/mono/{index,attention,moe}_plan.py`, each
   called by both the kernel and its CPU I3 test)

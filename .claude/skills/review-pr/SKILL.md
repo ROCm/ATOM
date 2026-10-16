@@ -167,7 +167,7 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 | **2** | `atom/model_ops/linear.py` | 49 | All linear layers (every model) | Wrong GEMM dispatch, wrong quant |
 | **2** | `atom/model_ops/attention_mha.py` | 46 | All MHA models | Wrong attention output |
 | **2** | `atom/model_ops/layernorm.py` | 32 | Norm + quant fusion path | Wrong scale, wrong dtype |
-| **2** | `atom/models/deepseek_v4.py` | 34 | DSv4 / Kimi-K2.5 specific | Wrong sparse MLA, SWA layout break |
+| **2** | `atom/models/deepseek_v4/model.py` | 34 | DSv4 / Kimi-K2.5 specific | Wrong sparse MLA, SWA layout break |
 
 
 **Tier-1 special rule**: When `model_runner.py` or `config.py` is touched, ask: does the change
@@ -348,7 +348,7 @@ Real example (aiter#4043): old: "trailing pad must read back as zero for the asm
 **D5 — Verbatim duplication across backbone files** ⚠️
 The same fix is copy-pasted into 2+ Tier 1/2 backbone files with trivial name substitution (different variable names, identical algorithm and comments). AI code signature: changes look symmetric but each file's invariants may differ and were not independently verified.
 Trigger: nearly identical `+` blocks appearing in two backbone files in the same PR diff; same formula / same comment structure / same magic constants, only variable names differ.
-Real example (ATOM#1493): chunked indexer loop copy-pasted verbatim between `deepseek_v2.py` (num_rows, total_kv) and `deepseek_v4.py` (total_tokens, total_committed) — same `(budget_rows // 128) * 128` formula and same `bit_length() - 1` fallback, same block of comments.
+Real example (ATOM#1493): chunked indexer loop copy-pasted verbatim between `deepseek_v2.py` (num_rows, total_kv) and `deepseek_v4/model.py` (total_tokens, total_committed) — same `(budget_rows // 128) * 128` formula and same `bit_length() - 1` fallback, same block of comments.
 → `⚠️ D5: identical algorithm in [file_a] and [file_b] — was correctness verified independently in each context, or copy-pasted?`
 
 **D6 — Fake / meta function dtype or shape mismatch** 🔴
@@ -565,7 +565,7 @@ Do NOT use rule codes (P1, D2, A1…) in output — they are internal labels onl
 Examples of good findings:
 - `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
 - `⚠️ PR claims 1.3–1.5x speedup but the benchmark starts after shuffle_weight() completes — users pay that cost on every cold start. **Author must** re-run with shuffle_weight included in the timing window and confirm the speedup holds.`
-- `⚠️ Chunked indexer logic is copy-pasted verbatim into deepseek_v2.py and deepseek_v4.py with only variable names changed — if v4's variable semantics differ, the formula silently produces wrong KV offsets for all v4 callers. **Author must** confirm correctness was verified independently under v4's variable layout.`
+- `⚠️ Chunked indexer logic is copy-pasted verbatim into deepseek_v2.py and deepseek_v4/model.py with only variable names changed — if v4's variable semantics differ, the formula silently produces wrong KV offsets for all v4 callers. **Author must** confirm correctness was verified independently under v4's variable layout.`
 - `📝 No corresponding ATOM consumer PR mentioned. **Reviewer should ask** who will pass emit_bf16=True to activate this path.`
 
 Examples of bad findings (too vague, missing action verb):

@@ -27,9 +27,7 @@ def build_entries(
             continue
 
         # Artifact name format: "accuracy-ModelName"
-        model_name = artifact_dir.name
-        if model_name.startswith("accuracy-"):
-            model_name = model_name[len("accuracy-") :]
+        model_name = artifact_dir.name.removeprefix("accuracy-")
 
         # Find the latest JSON result file
         json_files = sorted(artifact_dir.glob("*.json"), reverse=True)
@@ -75,6 +73,10 @@ def build_entries(
             extra_parts.append(f"BaselineNote: {baseline_note}")
 
         ci_metadata = data.get("atom_ci_metadata", {})
+        mono = ci_metadata.get("mono_execution")
+        if mono:
+            extra_parts.append(f"Mono: {mono['profile']} / {mono['policy']}")
+            extra_parts.append(f"Decode coverage: {mono['mono_hit_rate']:.2%}")
         docker_image = ci_metadata.get("docker_image")
         if docker_image:
             extra_parts.append(f"Docker: {docker_image}")

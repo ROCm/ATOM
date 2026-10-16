@@ -112,6 +112,12 @@ def build_entries(
             extra += f" | ROCm: {rocm_ver}"
         if image_tag:
             extra += f" | Docker: {image_tag}"
+        mono = payload.get("atom_ci_metadata", {}).get("mono_execution")
+        if mono:
+            extra += (
+                f" | Mono: {mono['profile']} / {mono['policy']}"
+                f" | Decode coverage: {mono['mono_hit_rate']:.2%}"
+            )
         extra = extra or None
 
         append_metric(

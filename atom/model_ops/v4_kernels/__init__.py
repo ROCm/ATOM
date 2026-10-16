@@ -4,7 +4,7 @@
 """V4 attention backend Triton kernels.
 
 These kernels replace the per-seq Python state-write logic in
-`atom/models/deepseek_v4.py` (PR-A: kill .item() / unlock CUDAGraph). All
+`atom/models/deepseek_v4/model.py` (PR-A: kill .item() / unlock CUDAGraph). All
 take batched tensors (positions, slot_per_token, cu_seqlens_q) — nothing is
 derived from device data via `.item()`.
 """

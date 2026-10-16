@@ -431,6 +431,12 @@ class BlockManager:
         # `reclaim_stale_state_store_pins`.
         self._orphan_load_slots: dict[object, list[tuple[int, float]]] = {}
         self._orphan_load_slots_reclaimed: int = 0
+        # Physical Active Slots are reused across request lifetimes. Drain each
+        # new assignment into the next batch so model-side owners can advance
+        # their slot generation before publishing metadata for that request.
+        # This is lifecycle metadata, separate from the device state movement
+        # below: a restored/adopted slot still has a new request owner.
+        self._pending_state_slot_resets: list[int] = []
         # `kv_offload_enabled` is the whole switch: without a connector to
         # carry a transfer there is nothing beneath the pool, and a hash whose
         # KV left HBM could not be resumed from anyway.
@@ -477,11 +483,14 @@ class BlockManager:
 
     def take_state_maintenance_ops(self) -> StateMaintenanceOps:
         """Drain state maintenance for the batch being built."""
+        slot_resets = tuple(dict.fromkeys(self._pending_state_slot_resets))
+        self._pending_state_slot_resets.clear()
         relocations = self.state.take_relocations()
         stores = restores = ()
         if self.paged_state_checkpoints is not None:
             stores, restores = self.paged_state_checkpoints.take_checkpoint_ops()
         return StateMaintenanceOps(
+            slot_resets=slot_resets,
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
@@ -1538,6 +1547,8 @@ class BlockManager:
             # partial reset, not a full `reset_joint`.
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
+        if seq.has_per_req_cache:
+            self._pending_state_slot_resets.extend(seq.state_slots)
         return True
 
     def replay_start(self, seq: Sequence, start: int, *, hit: bool) -> int:

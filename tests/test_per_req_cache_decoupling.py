@@ -288,6 +288,24 @@ class TestSchedulerPerReqCacheIntegration:
         assert batch.total_seqs_num_prefill == 1
         assert seq.state_slot >= 0
         assert len(batch.state_slots) == 1
+        assert batch.state_maintenance_ops.slot_resets == (seq.state_slot,)
+
+    def test_reused_state_slot_is_published_as_a_new_generation(self):
+        """A recycled physical slot is announced again for its new owner."""
+        bm = BlockManager(
+            per_req_cache_config(num_kvcache_blocks=100, pool_entries={"state": 1})
+        )
+        first = stateful_seq([1, 2, 3, 4])
+        assert bm.allocate(first, bm.can_allocate(first))
+        slot = first.state_slot
+        assert bm.take_state_maintenance_ops().slot_resets == (slot,)
+        assert bm.take_state_maintenance_ops().empty
+
+        bm.deallocate(first)
+        second = stateful_seq([5, 6, 7, 8])
+        assert bm.allocate(second, bm.can_allocate(second))
+        assert second.state_slot == slot
+        assert bm.take_state_maintenance_ops().slot_resets == (slot,)
 
     def test_preempt_releases_slot(self):
         """Preempted stateful sequence releases its per-req cache slot."""

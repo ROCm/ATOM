@@ -197,6 +197,7 @@ DEFAULT_STATE_RUNTIME = StateRuntime()
 class StateMaintenanceOps:
     """State movement drained once before a model batch."""
 
+    slot_resets: tuple[int, ...] = ()
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
@@ -204,5 +205,8 @@ class StateMaintenanceOps:
     @property
     def empty(self) -> bool:
         return not (
-            self.relocations or self.checkpoint_stores or self.checkpoint_restores
+            self.slot_resets
+            or self.relocations
+            or self.checkpoint_stores
+            or self.checkpoint_restores
         )

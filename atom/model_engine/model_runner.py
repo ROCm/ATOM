@@ -4,6 +4,7 @@
 import ctypes
 import gc
 import inspect
+import json
 import logging
 import math
 import os
@@ -150,6 +151,9 @@ support_model_arch_dict = {
 # metadata builder before they are bound. Architectures not listed here route
 # mono decode inside their own model class instead.
 mono_decode_installers = {
+    "DeepseekV4ForCausalLM": (
+        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
+    ),
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
@@ -940,6 +944,13 @@ class ModelRunner:
                 ),
             )
 
+    def get_mono_statistics(self) -> dict:
+        from atom.mono.runtime.statistics import serving_statistics
+
+        return serving_statistics(
+            getattr(self.model, "_v4_mono", None), self.config.mono_decode, self.rank
+        )
+
     def poll_forward_metrics(self):
         if self.gpu_forward_metrics is not None:
             self.gpu_forward_metrics.poll()
@@ -1122,6 +1133,18 @@ class ModelRunner:
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
             close()
+        mono = getattr(getattr(self, "model", None), "_v4_mono", None)
+        if mono is not None:
+            logger.info(
+                "ATOM_V4_MONO_SERVING_STATS %s",
+                json.dumps(mono.serving_status(), sort_keys=True),
+            )
+            torch.cuda.synchronize()
+            if hasattr(self, "graphs"):
+                self.graphs.clear()
+            if hasattr(self, "graph_logits"):
+                self.graph_logits.clear()
+            mono.close()  # collective IPC teardown before the TP group goes away
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
@@ -1131,8 +1154,9 @@ class ModelRunner:
         # 2. Release CUDA graphs
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
-        if isinstance(self.model, UBatchWrapper):
-            self.model.tbo_graphs.clear()
+        model = getattr(self, "model", None)
+        if isinstance(model, UBatchWrapper):
+            model.tbo_graphs.clear()
         # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
         # scales and any indexer cache are regions of it, not attributes.
         for attr in (
@@ -1802,6 +1826,14 @@ class ModelRunner:
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
+        # Mono's lossless production-weight repack is persistent and does not
+        # depend on cache addresses.  Allocate it before measuring the KV
+        # budget so the pool planner accounts for those real resident bytes,
+        # rather than filling the budget with KV first and adding Mono on top.
+        mono = getattr(self.model, "_v4_mono", None)
+        if mono is not None:
+            mono.prepare_weights()
+
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -2144,6 +2176,14 @@ class ModelRunner:
         return pool
 
     def allocate_kv_cache(self, num_kvcache_blocks):
+        mono = getattr(self.model, "_v4_mono", None)
+        if mono is not None and mono.adapter is not None:
+            torch.cuda.synchronize()
+            self.graphs.clear()
+            self.graph_pool = None
+            if hasattr(self, "graph_logits"):
+                self.graph_logits.clear()
+            mono.close()
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
@@ -2281,6 +2321,11 @@ class ModelRunner:
                     f"actual={actual_kv_bytes / (1 << 30):.3f}GB, "
                     f"diff={diff_pct:.1%}"
                 )
+
+        if mono is not None:
+            mono.prepare(
+                cache_rebound=True
+            )  # exclude Mono weights/scratch from KV allocation accounting
 
         # Skip on single-rank: a world_size==1 barrier is a no-op but still
         # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
@@ -3043,6 +3088,11 @@ class ModelRunner:
         input_ids: torch.Tensor,
         batch: ScheduledBatch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        greedy_token_output = bool(getattr(self, "_mono_want_greedy_tokens", False))
+        mono_allow_auto = bool(getattr(self, "_mono_allow_auto", False))
+        # This is per-forward state. Clear it before any operation that can
+        # raise so a failed step cannot leak a sampled token into the next one.
+        self._mono_sampled_tokens = None
         forward_context = get_forward_context()
         context = forward_context.context
         bs = context.scheduled_bs
@@ -3063,12 +3113,44 @@ class ModelRunner:
         # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
+        mono = getattr(self.model, "_v4_mono", None)
+        mono_selected = False
+        if mono is not None:
+            if batch is not None:
+                mono.slots_reset(batch.state_maintenance_ops.slot_resets)
+            mono_selected = mono.publish(
+                input_ids,
+                positions,
+                forward_context,
+                allow_auto=mono_allow_auto,
+            )
+            mono.enforce_selection(forward_context, mono_selected)
+            if not context.is_dummy_run:
+                mono.live_started = True
+        # A captured Mono graph cannot be used for a fork/refused step. Run the
+        # ordinary model eagerly before any cache write instead; no mid-stack retry.
+        graph_key = (
+            context.running_bs,
+            forward_mode.max_seqlen_q,
+        )
+        graph_is_mono = mono is not None and mono.graph_is_current(graph_key)
+        use_cudagraph = forward_mode.use_cudagraph and (
+            mono is None
+            or (graph_key in self.graphs and graph_is_mono == mono_selected)
+        )
+        mono_greedy = bool(
+            mono_selected
+            and greedy_token_output
+            and mono.uses_greedy_terminal
+            and not is_prefill
+            and not hasattr(self, "drafter")
+        )
         # Profiler label. Kind (prefix) distinguishes real/dummy and
         # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
         # `build_run_label`.
         label = build_run_label(
             is_prefill=is_prefill,
-            use_cudagraph=forward_mode.use_cudagraph,
+            use_cudagraph=use_cudagraph,
             is_dummy=context.is_dummy_run,
             tbo_on=forward_context.ubatch_slices is not None,
             scheduled_bs=bs,
@@ -3095,7 +3177,7 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
-        if not forward_mode.use_cudagraph:
+        if not use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
@@ -3177,6 +3259,8 @@ class ModelRunner:
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
                 self._dynamic_chunking.finish_sample(chunk_sample)
+                if mono_selected:
+                    mono.eager_forwards += 1
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
@@ -3213,7 +3297,11 @@ class ModelRunner:
                         if not is_prefill
                         else model_output
                     )
-                    logits = self.model.compute_logits(hidden_states)
+                    if mono_greedy:
+                        logits = None
+                        self._mono_sampled_tokens = mono.greedy_tokens(hidden_states)
+                    else:
+                        logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
@@ -3233,6 +3321,8 @@ class ModelRunner:
                         num_tokens=running_tokens
                     )
                     model_output = self.model(_ids, _pos)
+                    if mono_selected:
+                        mono.eager_forwards += 1
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
                     # model_output is always a plain Tensor; drafter aux capture
@@ -3248,19 +3338,32 @@ class ModelRunner:
                             else scheduled_tokens
                         )
                     ]
-                    logits = self.model.compute_logits(hidden_states)
+                    if mono_greedy:
+                        logits = None
+                        self._mono_sampled_tokens = mono.greedy_tokens(hidden_states)
+                    else:
+                        logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
+                graph_key = (running_bs, forward_mode.max_seqlen_q)
+                if mono is not None:
+                    mono.armed = False  # graph already contains its dispatch; no stale eager authorization
                 self.graphs[graph_key].replay()
+                if mono_selected and graph_is_mono:
+                    mono.graph_replays += 1
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
-                if self.logits_in_graph:
+                if mono_greedy and graph_is_mono:
+                    logits = None
+                    self._mono_sampled_tokens = mono.token_out[:scheduled_tokens]
+                elif self.logits_in_graph:
                     logits = self.graph_logits[graph_key][:scheduled_tokens]
                 else:
                     logits = self.model.compute_logits(hidden_states)
 
+        if mono is not None:
+            mono.armed = False
         return logits, hidden_states
 
     def flush_pp_send(self) -> bool:
@@ -3273,7 +3376,7 @@ class ModelRunner:
     def postprocess(
         self,
         batch: ScheduledBatch,
-        logits: torch.Tensor,
+        logits: torch.Tensor | None,
         temperatures: torch.Tensor,
         top_ks: int | torch.Tensor | None,
         top_ps: float | torch.Tensor | None,
@@ -3293,15 +3396,20 @@ class ModelRunner:
             # sampler's per-row parameters and the logprob gather both. Cut
             # after either and the pad rows divide `[running_bs, V]` by
             # `[scheduled_bs, 1]`.
-            logits = logits[:bs]
-            sampled_tokens = self.sampler(
-                logits,
-                temperatures,
-                top_ks,
-                top_ps,
-                all_greedy,
-                needs_independent_noise=needs_independent_noise,
-            )
+            mono_sampled = getattr(self, "_mono_sampled_tokens", None)
+            if mono_sampled is not None:
+                sampled_tokens = mono_sampled[:bs]
+            else:
+                assert logits is not None
+                logits = logits[:bs]
+                sampled_tokens = self.sampler(
+                    logits,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    all_greedy,
+                    needs_independent_noise=needs_independent_noise,
+                )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
             # No drafts scored -> no verdict; the drafter anchors on each
@@ -3361,6 +3469,7 @@ class ModelRunner:
         need_logprobs = any(batch.return_logprobs)
         sampled_logprobs = None
         if need_logprobs:
+            assert logits is not None
             logits_fp32 = logits.float()
             log_probs = torch.log_softmax(logits_fp32, dim=-1)
             sampled_logprobs = log_probs.gather(
@@ -3494,7 +3603,15 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
-        logits, hidden_states = self.run_model(input_ids, batch)
+        mono_allow_auto = all_greedy and not any(batch.return_logprobs)
+        mono_greedy = mono_allow_auto and not hasattr(self, "drafter")
+        self._mono_allow_auto = mono_allow_auto
+        self._mono_want_greedy_tokens = mono_greedy
+        try:
+            logits, hidden_states = self.run_model(input_ids, batch)
+        finally:
+            self._mono_allow_auto = False
+            self._mono_want_greedy_tokens = False
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3986,6 +4103,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        mono = getattr(self.model, "_v4_mono", None)
+        if mono is not None:
+            from atom.mono.runtime.consensus import MonoUnsupported, tp_agree
+
+            if not tp_agree(not mono.live_started, mono.group):
+                raise MonoUnsupported(
+                    "retire/reset live requests before recapturing V4 Mono graphs"
+                )
+            mono.armed = False
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
         # NCCL sets up peer connections on a group's FIRST collective -- doing
         # that inside a capture hangs. warmup_model() does not cover it: its
@@ -4242,6 +4368,15 @@ class ModelRunner:
                         in_hipgraph=True,
                     )
 
+                    mono = getattr(self.model, "_v4_mono", None)
+                    if mono is not None:
+                        selected = mono.publish(
+                            input_ids[:num_tokens],
+                            positions[:num_tokens],
+                            get_forward_context(),
+                            capture=True,
+                        )
+
                     # Warmup
                     model_positions = (
                         self._mrope_positions_view(num_tokens)
@@ -4250,7 +4385,9 @@ class ModelRunner:
                     )
                     model_output = self.model(input_ids[:num_tokens], model_positions)
                     outputs[:num_tokens] = model_output
-                    if self.logits_in_graph:
+                    if mono is not None and selected and mono.uses_greedy_terminal:
+                        mono.greedy_tokens(outputs[:num_tokens])
+                    elif self.logits_in_graph:
                         self.model.compute_logits(outputs[:num_tokens])
 
                     if _piecewise:
@@ -4279,9 +4416,15 @@ class ModelRunner:
                             torch.cuda.synchronize()
                             prof.step()
                             self._capture_trace_tag = None
+                        if mono is not None:
+                            mono.finish_capture_publication()
                         continue
 
                     # Capture
+                    if mono is not None:
+                        mono.armed = (
+                            selected  # warmup consumed its one-forward authorization
+                        )
                     with (
                         record_function(f"capture_graph_bs_{bs}")
                         if self.mark_trace
@@ -4311,13 +4454,22 @@ class ModelRunner:
                                     input_ids[:num_tokens], model_positions
                                 )
                                 outputs[:num_tokens] = model_output
-                                if self.logits_in_graph:
+                                if (
+                                    mono is not None
+                                    and selected
+                                    and mono.uses_greedy_terminal
+                                ):
+                                    mono.greedy_tokens(outputs[:num_tokens])
+                                elif self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
                                         outputs[:num_tokens]
                                     )
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()
                     self.graphs[(bs, max_q_len)] = graph
+                    if mono is not None:
+                        mono.finish_capture_publication()
+                        mono.remember_graph((bs, max_q_len), selected)
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
                     torch.cuda.synchronize()

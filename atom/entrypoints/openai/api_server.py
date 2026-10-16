@@ -2706,6 +2706,20 @@ async def metrics():
     )
 
 
+@app.get("/debug/mono_stats")
+def get_mono_stats():
+    """Return host-only per-worker execution counters, including disabled V4."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    try:
+        return engine.get_mono_statistics()
+    except Exception as exc:
+        logger.exception("Failed to get Mono statistics")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get Mono statistics: {exc}"
+        ) from exc
+
+
 @app.get("/debug/mtp_stats")
 async def get_mtp_stats():
     """Return current speculative decoding acceptance statistics."""

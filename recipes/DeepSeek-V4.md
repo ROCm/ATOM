@@ -1,5 +1,8 @@
 # DeepSeek-V4 Usage Guide
 
+The optional V4-Pro TP8 Mono backend's module ownership, qualified profiles and
+validation boundaries are documented in [DeepSeek-V4 Mono](../docs/deepseek_v4_mono.md).
+
 [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) is a million-token-context Mixture-of-Experts (MoE) large language model from DeepSeek. It builds on the V3.2 architecture with hash-based expert routing (3 hash layers + sigmoid + bias), a Compressed Sparse Attention (CSA) indexer that selects top-1024 prior tokens per query, and Multi-Latent Attention (MLA) with LoRA-compressed QKV projections. Weights are stored natively in FP8 (E4M3) with UE8M0 block-scaled scales. ATOM ships built-in support via the `DeepseekV4ForCausalLM` architecture — no `--trust-remote-code` is needed.
 
 ## Preparing environment
@@ -151,7 +154,7 @@ Override knobs (escape hatches, normally not needed):
 
 #### Auto-detection logic
 
-The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4.py)):
+The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4/model.py)):
 
 1. **HF config `expert_dtype`** — if `config.json` declares `expert_dtype` (e.g. `"fp8"` / `"fp4"`), use it directly.
 2. **Parser-derived layer spec** — if the ckpt's `quantization_config.layer_quant_config` (Quark) or global config (compressed-tensors / generic) directly produces a per-layer spec for `ffn.experts.*.w*`, that wins.

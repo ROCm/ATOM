@@ -52,12 +52,15 @@ import sys
 
 class RejectServerEncoder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname == "atom.entrypoints.openai.chat_encoders":
-            raise ImportError("server encoders are unavailable in client-only CI")
+        if fullname in {"atom.entrypoints.openai.chat_encoders", "atom.utils"}:
+            raise ImportError("engine utilities are unavailable in client-only CI")
 
 sys.meta_path.insert(0, RejectServerEncoder())
 from atom.benchmarks.benchmark_serving import sample_random_requests
+from atom.benchmarks.mono_stats import configured_profile, configured_policy
 assert callable(sample_random_requests)
+assert configured_profile() == ""
+assert configured_policy() == "auto"
 """,
         ],
         cwd=ROOT,
