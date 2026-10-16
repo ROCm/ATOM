@@ -76,6 +76,7 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.expert_trace import with_expert_trace
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
@@ -3478,6 +3479,7 @@ class ModelRunner:
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
+    @with_expert_trace
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
