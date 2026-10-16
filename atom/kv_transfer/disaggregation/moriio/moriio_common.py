@@ -159,6 +159,10 @@ class MoRIIOConstants:
     # ZMQ handshake message types
     GET_META_MSG = b"get_meta_msg"
     POP_DONE_RECV = b"pop_done_recv"
+    # Serial WRITE mode: the consumer asks the producer to push KV into the
+    # blocks it allocated, and the producer reports back once it has.
+    WRITE_REQ = b"write_req"
+    WRITE_DONE = b"write_done"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 
