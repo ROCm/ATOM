@@ -17,6 +17,10 @@ import torch
 from atom.mono.runtime.aux_taps import AuxTaps
 
 pytest.importorskip("flydsl", reason="importing the K3 mono runner needs FlyDSL")
+# the runner imports `aiter.dist.parallel_state` at module scope, so FlyDSL
+# alone is not enough to collect this file -- the same guard
+# `test_minimax_m3_mono_dispatch.py` puts before its own runner import.
+pytest.importorskip("aiter", reason="the K3 mono runner imports aiter.dist")
 
 from atom.models.kimi_k3.mono.runner import K3MonoDecodeRunner
 
