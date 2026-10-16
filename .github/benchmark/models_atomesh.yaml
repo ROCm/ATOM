@@ -1169,7 +1169,8 @@ models:
         # PART13 with the prefill sized to 0.95 of HBM; at 0.90 each GPU leaves
         # about 29 GB unbudgeted. Shared blocks: about 200K. The decode keeps
         # the common 0.90.
-        - <<: *kimi_k3_1p1d_pp8_dspark3_part13
+        - &kimi_k3_1p1d_pp8_dspark3_part13_mem95
+          <<: *kimi_k3_1p1d_pp8_dspark3_part13
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part13-mem95
           display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-PART13-MEM95
           prefill:
@@ -1181,6 +1182,11 @@ models:
               --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}
               --gpu-memory-utilization 0.95
           run_eval: true
+
+        - <<: *kimi_k3_1p1d_pp8_dspark3_part13_mem95
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c88-part13-mem95
+          concurrency: [88]
+          run_eval: false
 
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
