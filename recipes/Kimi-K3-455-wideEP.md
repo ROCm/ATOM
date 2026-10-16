@@ -569,9 +569,9 @@ export TRITON_CACHE_DIR=/root/.triton/cache
 ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}'
 
 MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --no-enable_prefix_caching)   # accuracy
-# AgentX: prefix caching, sessions pinned to their cache owner
+# AgentX: prefix caching, sessions pinned to their cache owner, KDA state checkpoints only where requests resume
 # export ATOM_DP_SESSION_AFFINITY=1
-# MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching)
+# MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching --state-checkpoint-interval-tokens -1)
 
 cd /tmp
 exec python3 -m atom.entrypoints.openai_server \
@@ -615,6 +615,11 @@ until curl -sf -m 5 http://10.210.11.26:8000/v1/models >/dev/null; do sleep 15; 
   [Known issues](#known-issues). The replicated head avoids it:
   `ATOM_DP_LM_HEAD_MODE=default ATOM_USE_CUSTOM_ALL_GATHER=0`, without `AITER_CUSTOM_AR_USE_SYMM_MEM`. That
   is also the only option at DP > 8, because aiter's gfx1250 custom all-reduce takes 2, 4, 6 or 8 ranks.
+- **`--state-checkpoint-interval-tokens -1`** (AgentX mode). With prefix caching, ATOM keeps a KDA state checkpoint
+  every 8192 tokens of context by default. A K3 checkpoint is 449 MB (69 layers, FP32 recurrent state), so a
+  100k-token session holds about 12 of them in the KV pool. `-1` keeps checkpoints only where a request resumes and
+  at each prompt's end. Expected to cut KV pressure and prefill chunks; not measured yet: the 2026-10-16 AgentX
+  numbers below use the default.
 - **Do not set `--max-model-len`.** K3 needs the full generation budget; see
   [GSM8K](#accuracy-gate-and-gsm8k).
 - **Cold start.** About 8 min in a fresh container, most of it aiter JIT builds.
@@ -684,7 +689,8 @@ export MODEL_PATH=/models/Kimi-K3 AIPERF_MODEL=moonshotai/Kimi-K3 HF_HOME=/root/
 export SERVER_ARGS="--model /models/Kimi-K3 --served-model-name moonshotai/Kimi-K3 --trust-remote-code -tp 1 \
 --data-parallel-size 8 --data-parallel-size-local 4 --enable-expert-parallel --enable-dp-attention \
 --kv_cache_dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
---max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching --disable_uvicorn_access_log"
+--max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching --state-checkpoint-interval-tokens -1 \
+--disable_uvicorn_access_log"
 export AIPERF_DIR=/root/.cache/aiperf-src AIPERF_VENV=/root/.cache/aiperf-venv   # reuse the install between runs
 CONC=32   # 16, 32 or 64
 OUT=/logs/agentic/c${CONC}_$(date +%m%d-%H%M%S); mkdir -p $OUT; cd /tmp
@@ -712,7 +718,8 @@ Neither is aiperf's own per-user p90.
   are now in aiter `main`, as a thin layer (`k3img-20261016-031230-3da6f1dd`).
 - **Server:** AgentX mode (prefix caching, session affinity), flydsl compact dispatch, fp4 dispatch and combine
   wires, online FP8, 16384 batched tokens, 0.90, **`ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`** (the rest of the
-  PrefillDelayer at its defaults), `--max-num-seqs 8` (16 at concurrency 64). A fresh server per point.
+  PrefillDelayer at its defaults), `--max-num-seqs 8` (16 at concurrency 64), and the default
+  `--state-checkpoint-interval-tokens` (8192, not the launch's `-1`). A fresh server per point.
 - **Client:** this section's method with **`AIPERF_BENCHMARK_DURATION=1800`** (30 min, not 60); 10 warm-up requests
   per lane.
 - **Trays:** CT11 (node0) + CT10, no perf_setup.
