@@ -905,6 +905,11 @@ purge_lmcache_disk() {
 #    and on a decode node for the prefill node's masters. A wait on the other
 #    node's part also allows for that node's compaction, which its Store waits
 #    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+#  - MOONCAKE_STORE_WORKER_CONFIG: a JSON object of further mooncake_store.*
+#    worker settings (chunk_tokens, the pool sizes), merged into the config
+#    the launcher derives from the Store it starts; the keys that address the
+#    Store (master, metadata, pools, owner_rdma_devices, local_hostname,
+#    protocol) are the launcher's and refused here.
 # Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
 # transfer engine included (peers with different QP counts cannot connect).
 # The launcher owns the workers' ATOM_KV_OFFLOAD and
@@ -1233,6 +1238,7 @@ check_mooncake_store_settings() {
     echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
     exit 2
   fi
+  check_mooncake_store_worker_config
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
@@ -1713,13 +1719,55 @@ mooncake_pools_json() {
 # the NIC, under per_nic; otherwise every stage reads the one master and stays
 # off the owners' NICs.
 mooncake_store_launcher_config_json() {
-  printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
-  if [[ -n "${mooncake_pool_devices[0]}" ]]; then
-    printf '"mooncake_store.pools":%s}' "$(mooncake_pools_json)"
-  else
-    printf '"mooncake_store.master":"%s:%s",' "${host_ip}" "${ATOMESH_MOONCAKE_MASTER_PORT}"
-    printf '"mooncake_store.metadata":"http://%s:%s/metadata",' "${host_ip}" "${ATOMESH_MOONCAKE_METADATA_PORT}"
-    printf '"mooncake_store.owner_rdma_devices":"%s"}' "$(mooncake_owner_devices_csv)"
+  local derived
+  derived="$(
+    printf '{"mooncake_store.local_hostname":"%s","mooncake_store.protocol":"rdma",' "${host_ip}"
+    if [[ -n "${mooncake_pool_devices[0]}" ]]; then
+      printf '"mooncake_store.pools":%s}' "$(mooncake_pools_json)"
+    else
+      printf '"mooncake_store.master":"%s:%s",' "${host_ip}" "${ATOMESH_MOONCAKE_MASTER_PORT}"
+      printf '"mooncake_store.metadata":"http://%s:%s/metadata",' "${host_ip}" "${ATOMESH_MOONCAKE_METADATA_PORT}"
+      printf '"mooncake_store.owner_rdma_devices":"%s"}' "$(mooncake_owner_devices_csv)"
+    fi
+  )"
+  local extra
+  extra="$(mooncake_setting MOONCAKE_STORE_WORKER_CONFIG)"
+  if [[ -z "${extra}" ]]; then
+    printf '%s' "${derived}"
+    return 0
+  fi
+  python3 -c '
+import json, sys
+config = json.loads(sys.argv[1])
+config.update(json.loads(sys.argv[2]))
+sys.stdout.write(json.dumps(config, separators=(",", ":")))
+' "${derived}" "${extra}"
+}
+
+# Refuses a MOONCAKE_STORE_WORKER_CONFIG that is not a JSON object of
+# mooncake_store.* settings, or that names one the launcher derives.
+check_mooncake_store_worker_config() {
+  local extra
+  extra="$(mooncake_setting MOONCAKE_STORE_WORKER_CONFIG)"
+  [[ -n "${extra}" ]] || return 0
+  local problem
+  if ! problem="$(python3 -c '
+import json, sys
+owned = {"master", "metadata", "pools", "owner_rdma_devices", "local_hostname", "protocol"}
+try:
+    config = json.loads(sys.argv[1])
+except ValueError as exc:
+    sys.exit(f"is not JSON ({exc})")
+if not isinstance(config, dict):
+    sys.exit("is not a JSON object")
+for key in config:
+    if not key.startswith("mooncake_store."):
+        sys.exit(f"names {key}, not a mooncake_store.* setting")
+    if key.split(".", 1)[1] in owned:
+        sys.exit(f"names {key}, which the launcher derives from the Store it starts")
+' "${extra}" 2>&1)"; then
+    echo "[mooncake-store][FAIL] MOONCAKE_STORE_WORKER_CONFIG ${problem}" >&2
+    exit 2
   fi
 }
 

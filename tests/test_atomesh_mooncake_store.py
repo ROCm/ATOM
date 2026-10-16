@@ -36,6 +36,10 @@ PYTHON_STUB = textwrap.dedent(
     if [[ "${1:-}" == "-c" && "${2:-}" == "import mooncake.store" ]]; then
       exit "${STUB_STORE_IMPORT_RC:-0}"
     fi
+    # The launcher's own JSON handling of the worker config runs for real.
+    if [[ "${1:-}" == "-c" && "${2:-}" == *"import json"* ]]; then
+      exec "${REAL_PYTHON}" "$@"
+    fi
     echo "$$ HIP=${HIP_VISIBLE_DEVICES-unset} QP=${MC_NUM_QP_PER_EP-unset} THP=${GLIBC_TUNABLES-unset} BIND=${MC_TCP_BIND_ADDRESS-unset} MR=${MC_MAX_MR_SIZE-unset} HP=${MC_STORE_USE_HUGEPAGE-unset} $*" >> "${STUB_CALLS}"
     case " $* " in
       *" mooncake_master "*)
@@ -478,6 +482,36 @@ stop_mooncake_store
         )
         self.assertEqual(env["OFFLOAD_LOAD_WORKERS"], "2")
         self.assertEqual(env["MC_MAX_MR_SIZE"], "4294967296")
+
+    def test_the_worker_config_is_merged_into_the_derived_one(self):
+        _, env = self.start_and_stop(
+            MOONCAKE_STORE_OWNERS="0:8;1:8",
+            MOONCAKE_STORE_WORKER_CONFIG=(
+                '{"mooncake_store.chunk_tokens": 1024, "mooncake_store.state_pool_mib": 128}'
+            ),
+        )
+        config = json.loads(env["ATOM_KV_OFFLOAD_EXTRA_CONFIG"])
+        self.assertEqual(config["mooncake_store.chunk_tokens"], 1024)
+        self.assertEqual(config["mooncake_store.state_pool_mib"], 128)
+        self.assertEqual(config["mooncake_store.master"], f"{HOST}:{self.master_port}")
+        self.assertEqual(config["mooncake_store.local_hostname"], HOST)
+
+    def test_a_worker_config_the_launcher_cannot_take_is_refused(self):
+        for value, message in (
+            ('{"mooncake_store.master": "10.0.0.9:1"}', "which the launcher derives"),
+            ('{"mooncake_store.pools": {}}', "which the launcher derives"),
+            ('{"chunk_tokens": 1024}', "not a mooncake_store.* setting"),
+            ('["mooncake_store.chunk_tokens"]', "is not a JSON object"),
+            ("{mooncake_store.chunk_tokens: 1}", "is not JSON"),
+        ):
+            with self.subTest(value=value):
+                result = self.run_shell(
+                    "check_mooncake_store_settings\n",
+                    expect_rc=2,
+                    MOONCAKE_STORE_WORKER_CONFIG=value,
+                )
+                self.assertIn("MOONCAKE_STORE_WORKER_CONFIG", result.stderr)
+                self.assertIn(message, result.stderr)
 
     def pools(self, **env):
         result = self.run_shell(
