@@ -1150,6 +1150,38 @@ models:
           concurrency: [56]
           run_eval: false
 
+        # PART12 with one more layer on stage 0. The dense first layer leaves
+        # stage 0 about 13 GB of KV room the MoE-only stages lack; the drafter's
+        # stage, still the one that caps the shared block count, sheds a KDA
+        # layer's 15 GB of weights and keeps its three target MLA layers
+        # (88, 92, 93). Shared blocks: about 148K to about 177K.
+        - &kimi_k3_1p1d_pp8_dspark3_part13
+          <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part13
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-PART13
+          env:
+            common: *kimi_k3_1p1d_pp8_dspark3_common_env
+            prefill:
+              <<: *kimi_k3_1p1d_pp8_dspark3_prefill_env
+              VLLM_PP_LAYER_PARTITION: "13,12,12,12,12,12,12,8"
+          run_eval: false
+
+        # PART13 with the prefill sized to 0.95 of HBM; at 0.90 each GPU leaves
+        # about 29 GB unbudgeted. Shared blocks: about 200K. The decode keeps
+        # the common 0.90.
+        - <<: *kimi_k3_1p1d_pp8_dspark3_part13
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part13-mem95
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-PART13-MEM95
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --enforce-eager
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}
+              --gpu-memory-utilization 0.95
+          run_eval: true
+
         - &kimi_k3_agentic_2p1d
           <<: *kimi_k3_agentic_no_dspark
           name: kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72
