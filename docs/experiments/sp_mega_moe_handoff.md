@@ -4,13 +4,13 @@
 
 当前分支已按用户要求删除 ATOM 前端和 MegaMoE 输出端的运行时 watchdog 检查，tail 的数据与 scale 用一次 `copy_tail` 搬运。受支持的完整 prefill 区域为 `sp_rs_norm → MegaMoE → copy_tail`，不增加替代检查；AITER kernel 内部的数据同步保持原样。接入已整合至 PR #2364 的 `hexwang/atom_sp`，并 rebase 到 ATOM main `2c948339`。rebase 后在纯 AITER main 上通过 209 项定向回归、81 项无 AITER/Triton 的 CPU 检查、9 项 GPU 拷贝/graph 检查、整模型 level 3 / FULL graph 捕获、2K/4K 四卡 trace 和短 decode。每个 rank 各有 57 个前端、56 个 FP8 tail、1 个 BF16 final tail、57 个 copy kernel，watchdog 检查 kernel 为 0。这些是正确性和 profiling 结果，未重新测量端到端吞吐或 GSM8K。 完整 CPU CI suite 也已重跑：8,453 passed、883 skipped、3 xfailed、0 failed；原版 ATOM main `2c948339` 对照为 8,290 passed、871 skipped、3 xfailed、0 failed。
 
-2026-10-16 更新：AITER 固定提交换为 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head（见第 1 节），其 `MegaMoeTP` 在本地行数 ≥ 2048（SP4 下全局 8192 token）时走 big-M kernel。ATOM 侧把 `ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS` 的上限放到 8192（默认仍为 1024），并修复 `copy_tail` 在超过 4096 行的 tile 上只拷前 4096 个 FP8 scale 的问题。32K budget 的 A/B 与 GSM8K 见 3.1 节。
+2026-10-16 更新：AITER 固定提交换为 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head（见第 1 节），其 `MegaMoeTP` 在本地行数 ≥ 2048（SP4 下全局 8192 token）时走 big-M kernel。ATOM 侧去掉 tile 的环境变量，每次 launch 的本地行数自动取 `min(ceil(max_num_batched_tokens / SP), 8192)`，SP 为实际的 SP group 大小（MXFP8 激活的上限为 `256 / SP`，SP4 下为 64），并修复 `copy_tail` 在超过 4096 行的 tile 上只拷前 4096 个 FP8 scale 的问题。32K budget 的 A/B 与 GSM8K 见 3.1 节。分支随后 rebase 到 ATOM main `ffd113bc`。
 
 ## 1. 拉取版本和依赖
 
 ATOM 远程分支：[`hexwang/atom_sp`](https://github.com/ROCm/ATOM/tree/hexwang/atom_sp)。rebase 后的全融合接入提交：[`7b231f15ee4981c1efacb3cc1acd65c65bc257db`](https://github.com/ROCm/ATOM/commit/7b231f15ee4981c1efacb3cc1acd65c65bc257db)。当前实现还包含上述 watchdog 删除与 tail 拷贝合并，使用随分支更新的 [experiment-source.json](../../scripts/experiments/sp_mega_moe/experiment-source.json) 校验实现树。
 
-AITER 固定在 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head [`9cdcf70d5e4efb1f649381e9e30da40a4f193233`](https://github.com/ROCm/aiter/commit/9cdcf70d5e4efb1f649381e9e30da40a4f193233)（尚未合入；其祖先包含此前使用的 main `cc709933`），两组都使用干净源码。默认 tile（1024）在 main `cc709933` 上同样可用；`--max-local-tokens` 达到 2048 及以上需要 big-M。big-M 的 SDMA 需要以 `BUILD_CCO_SDMA=ON` 编译的 MORI：`AITER_MORI_PATH` 指向其安装目录；环境里已装有其他 MORI 时，把该目录加入 `PYTHONPATH`（`run_ab.py` 保留调用方的 `PYTHONPATH`）。遵照用户最后确认，**不安装 tiled sorting 或其他本地补丁**。ATOM 会根据 AITER API 自动关闭 tiled sorting 扩展，native 和小 batch 回退走 main 自带的路径。
+AITER 固定在 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head [`9cdcf70d5e4efb1f649381e9e30da40a4f193233`](https://github.com/ROCm/aiter/commit/9cdcf70d5e4efb1f649381e9e30da40a4f193233)（尚未合入；其祖先包含此前使用的 main `cc709933`），两组都使用干净源码。tile 小于 2048 时（如默认 A/B 的 2K / 4K budget）在 main `cc709933` 上同样可用；tile 达到 2048（budget ≥ 8192，包括 ATOM 默认的 16384）需要 big-M。big-M 的 SDMA 需要以 `BUILD_CCO_SDMA=ON` 编译的 MORI：`AITER_MORI_PATH` 指向其安装目录；环境里已装有其他 MORI 时，把该目录加入 `PYTHONPATH`（`run_ab.py` 保留调用方的 `PYTHONPATH`）。遵照用户最后确认，**不安装 tiled sorting 或其他本地补丁**。ATOM 会根据 AITER API 自动关闭 tiled sorting 扩展，native 和小 batch 回退走 main 自带的路径。
 
 以下路径均可换成新机器的空闲目录；执行后沿用这些 shell 变量：
 
@@ -108,7 +108,7 @@ python "$SP_TOOLS/summarize.py" "$SP_WORK/ab-output100" \
 
 runner 检查依赖和模型，保存 plan、版本、PCI mapping、每组 server/client/telemetry 日志，等待服务就绪后执行客户端。它校验 160 个请求全部成功、实际输入/输出长度一致，在退出路径上停止本次启动的进程组；输出目录必须是新目录，失败结果不会被覆盖。中断或失败后依据 `events.jsonl`、端口和进程/显存核查清理情况。脚本已完成 CPU dry-run、模拟 HTTP 服务的成功/失败清理及结果验收检查、只读 GPU mapping/telemetry 采集；trace 分析器也已读旧档案核对过四卡计数。新机器首次执行才是这个可移植 runner 的完整 GPU 实跑。
 
-正常服务日志应包含 `SP MegaMoE full fusion`、`57 layers`、`tile=1024`、`activation=MXFP4`、`comm=fp8`、`lb_mt=6`，且 native 组没有 MegaMoE 启用日志。若继承了其他 ATOM/AITER 环境变量，先根据 plan 对齐实验配置。
+正常服务日志应包含 `SP MegaMoE full fusion`、`57 layers`、`tile=1024`（2K budget 为 `tile=512`）、`activation=MXFP4`、`comm=fp8`、`lb_mt=6`，且 native 组没有 MegaMoE 启用日志。若继承了其他 ATOM/AITER 环境变量，先根据 plan 对齐实验配置。
 
 独立的 prefill 测量使用同样流程，只把输出长度改为 1：
 
@@ -125,11 +125,10 @@ output=1 的输入吞吐用 `total_input_tokens / duration`；output=100 同时�
 
 ### 3.1 32K budget（big-M）
 
-`max_num_batched_tokens=32768` 时每个 rank 的 prefill 为 8192 行，需要 `--max-local-tokens 8192`；本地行数 ≥ 2048 的 tile 走 big-M。负载与上文相同（128K 输入 + 100 输出，C16，160 个请求）。
+`max_num_batched_tokens=32768` 时每个 rank 的 prefill 为 8192 行，tile 自动为 8192；本地行数 ≥ 2048 的 tile 走 big-M。负载与上文相同（128K 输入 + 100 输出，C16，160 个请求）。
 
 ```bash
-python -u "$SP_TOOLS/run_ab.py" --model "$SP_MODEL" --batches 32768 \
-  --max-local-tokens 8192 --rounds 1 \
+python -u "$SP_TOOLS/run_ab.py" --model "$SP_MODEL" --batches 32768 --rounds 1 \
   --output "$SP_WORK/ab-32k" > "$SP_WORK/ab-32k-driver.log" 2>&1
 python "$SP_TOOLS/summarize.py" "$SP_WORK/ab-32k" > "$SP_WORK/ab-32k-summary.json"
 ```
@@ -145,7 +144,7 @@ mega 服务日志应包含 `tile=8192`。2026-10-16 在 AITER `9cdcf70d` 上先�
 | ITL (ms) | 181.12 | 150.58 | -16.86% |
 | E2EL (ms) | 40,177.75 | 33,619.78 | -16.32% |
 
-warmup 轮总吞吐 +26.64%。每个 32K prefill batch：native 0.583–0.592 s，mega 0.465–0.470 s。GSM8K（完整 1319 题，`--serve mega --batches 32768 --max-local-tokens 8192`，lm_eval local-completions）：3-shot 87.72%（native 87.49%），72-shot 93.78%（native 93.71%）；72-shot 的 prefill token 99.4% 走 big-M。
+warmup 轮总吞吐 +26.64%。每个 32K prefill batch：native 0.583–0.592 s，mega 0.465–0.470 s。GSM8K（完整 1319 题，`--serve mega --batches 32768`，lm_eval local-completions）：3-shot 87.72%（native 87.49%），72-shot 93.78%（native 93.71%）；72-shot 的 prefill token 99.4% 走 big-M。
 
 以上结果来自 tail 用 torch 拷贝、尚无 `copy_tail` 的实验分支；本分支的 `copy_tail` 已通过 8192 行 GPU 拷贝 / graph 测试，整模型复测待补。
 
@@ -216,7 +215,7 @@ lm_eval --model local-chat-completions \
 
 实现入口是 [sp_mega_moe.py](../../atom/model_ops/sp_mega_moe.py) 和 [M3 model.py](../../atom/models/minimax_m3/model.py)。MoE 前端把 residual、Gemma RMSNorm、BF16 gate/logits、sigmoid/bias/top4/shared route 融合为 `SpRsNorm`；当前 SP attention 输出已经是完整本地 token 行，前端使用 singleton TP1 group，不能换成 SP4 reduce-scatter。主体使用 SP4 MegaMoE，57 层共用 runtime；tail 融合 RS、residual、下一层 norm/FP8，最后一层直接输出 final norm 的 BF16。
 
-每个 local tile 最多 `ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS` 行（默认 1024，上限 8192）；prefix 的最后不足 16 行使用原有 kernels，小 token 的 BF16 MoE 回退复用已算好的路由。tail 的不支持形状也保留普通 residual/norm 路径。AITER tail 将 norm 结果先舍入 BF16 再转 FP8，与旧 ATOM 直接从 FP32 norm 转 FP8 并非逐位等价。
+每个 local tile 最多 `min(ceil(max_num_batched_tokens / SP), 8192)` 行，SP 为实际的 SP group 大小（MXFP8 激活的上限为 `256 / SP`），即一次覆盖最大的本地分片；prefix 的最后不足 16 行使用原有 kernels，小 token 的 BF16 MoE 回退复用已算好的路由。tail 的不支持形状也保留普通 residual/norm 路径。AITER tail 将 norm 结果先舍入 BF16 再转 FP8，与旧 ATOM 直接从 FP32 norm 转 FP8 并非逐位等价。
 
 用户给的 [AITER PR #5937 benchmark 链接](https://github.com/ROCm/aiter/pull/5937/changes/9aeac9a60251c79290973ce33f52d18b265da64c) 对应删除 benchmark 的提交，接入对照的是其父提交 `9aeac9a60251c79290973ce33f52d18b265da64c^` 的 `op_tests/op_benchmarks/flydsl/bench_mega_moe_TP.py`；实际 API 来自上述固定 main。
 

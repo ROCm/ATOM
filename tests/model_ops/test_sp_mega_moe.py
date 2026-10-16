@@ -16,6 +16,7 @@ from atom.model_ops.sp_mega_moe import (
     SPMegaMoE,
     _validate_layer,
     initialize_sp_mega_moe,
+    local_token_tile,
 )
 
 
@@ -219,17 +220,31 @@ def test_native_fallback_consumes_fused_routes_without_logits(monkeypatch, sp_mo
 
 @pytest.mark.parametrize(
     "settings",
-    [
-        {"max_local_tokens": 0},
-        {"max_local_tokens": 8193},
-        {"act_dtype": "bf16"},
-        {"comm_dtype": "int4"},
-        {"act_dtype": "fp8", "max_local_tokens": 65},
-    ],
+    [{"act_dtype": "bf16"}, {"comm_dtype": "int4"}],
 )
 def test_unsupported_kernel_settings_are_rejected(settings):
     with pytest.raises(ValueError):
         MegaMoESettings(**settings)
+
+
+@pytest.mark.parametrize(
+    ("budget", "world_size", "act_dtype", "tile"),
+    [
+        (2048, 4, "fp4", 512),
+        (4098, 4, "fp4", 1025),
+        (32768, 4, "fp4", 8192),
+        (65536, 4, "fp4", 8192),
+        (2048, 2, "fp4", 1024),
+        (16385, 8, "fp4", 2049),
+        (65536, 8, "fp4", 8192),
+        (16384, 4, "fp8", 64),
+        (100, 4, "fp8", 25),
+        (16384, 2, "fp8", 128),
+        (16384, 8, "fp8", 32),
+    ],
+)
+def test_tile_covers_the_largest_local_shard(budget, world_size, act_dtype, tile):
+    assert local_token_tile(budget, world_size, act_dtype) == tile
 
 
 def _loaded_layer(moe):
@@ -359,7 +374,6 @@ def test_initialize_shares_prepared_runtime_across_layers(
     monkeypatch.setattr(sp_modules.chip_info, "get_gfx_runtime", lambda: "gfx950")
     monkeypatch.setattr(sp_modules.plugin, "is_plugin_mode", lambda: False)
     monkeypatch.setenv("ATOM_SP_MOE_MEGA", "1")
-    monkeypatch.setenv("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS", "64")
     monkeypatch.setenv("ATOM_SP_MOE_MEGA_ACT_DTYPE", "fp8")
     monkeypatch.setenv("ATOM_SP_MOE_MEGA_COMM_DTYPE", "bf16")
     monkeypatch.setenv("ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE", "1")
@@ -388,6 +402,7 @@ def test_initialize_shares_prepared_runtime_across_layers(
     assert (cfg.rank, cfg.world_size, cfg.experts, cfg.topk) == (2, 4, 129, 5)
     assert cfg.comm_mode == "ag_rs"
     assert cfg.act_dtype == "fp8" and cfg.comm_dtype == "bf16"
+    assert cfg.max_local_tokens == 64
     assert cfg.swiglu_limit == 7.0
     assert cfg.lb_mt == ("6" if lb_mt is None else lb_mt)
     assert factory.call_args.kwargs["group"] is group.cpu_group
