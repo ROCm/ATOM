@@ -2679,7 +2679,9 @@ class MLAAttention(nn.Module):
                     kv_layout="kv_shuffled",
                     kv_csr_layout="token" if use_token_csr else "page",
                     seq_lens=None if use_token_csr else attn_metadata.context_lens[:B],
-                    page_table=None if use_token_csr else attn_metadata.block_tables[:B],
+                    page_table=(
+                        None if use_token_csr else attn_metadata.block_tables[:B]
+                    ),
                     sm_scale=self.scale,
                     causal=causal,
                     q_scale=self._q_scale if q.element_size() == 1 else None,
@@ -3288,8 +3290,7 @@ class MLAAttention(nn.Module):
                         q_out,
                         kv_cache,
                         attn_metadata,
-                        q_prepadded=self._fused_q_head_pad
-                        or self.use_shuffled_asm,
+                        q_prepadded=self._fused_q_head_pad or self.use_shuffled_asm,
                     )
             elif self.dcp_world_size > 1:
                 output = self._dcp_decode(q_out, kv_cache, attn_metadata, use_qrep)
@@ -3298,8 +3299,7 @@ class MLAAttention(nn.Module):
                     q_out,
                     kv_cache,
                     attn_metadata,
-                    q_prepadded=self._fused_q_head_pad
-                    or self.use_shuffled_asm,
+                    q_prepadded=self._fused_q_head_pad or self.use_shuffled_asm,
                 )
 
         return output
