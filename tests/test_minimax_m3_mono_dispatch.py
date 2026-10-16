@@ -39,6 +39,7 @@ def _atom_config(**overrides):
         "max_model_len": 32768,
         "enable_tbo": False,
         "enable_tbo_decode": False,
+        "dspark": SimpleNamespace(confidence_schedule=False, ragged=False),
         "speculative_config": None,
         "compilation_config": SimpleNamespace(cudagraph_mode=_Mode(False)),
     }
@@ -271,14 +272,22 @@ def test_speculative_decoding_is_not_refused(native):
     assert dispatch._config_refusal(cfg) is None
 
 
-def test_dspark_is_refused(native):
-    # DSpark taps the decoder layers with forward hooks the mono kernels skip.
+def test_fixed_dspark_is_not_refused(native):
     spec = SimpleNamespace(use_dspark=lambda: True)
     cfg = _atom_config(speculative_config=spec)
-    assert dispatch._config_refusal(cfg) == "DSpark speculative decoding"
+    assert dispatch._config_refusal(cfg) is None
 
 
-@pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1)])
+@pytest.mark.parametrize("mode", ["confidence_schedule", "ragged"])
+def test_ragged_dspark_is_refused(native, mode):
+    spec = SimpleNamespace(use_dspark=lambda: True)
+    dspark = SimpleNamespace(confidence_schedule=False, ragged=False)
+    setattr(dspark, mode, True)
+    cfg = _atom_config(speculative_config=spec, dspark=dspark)
+    assert dispatch._config_refusal(cfg) == "DSpark confidence schedule / ragged"
+
+
+@pytest.mark.parametrize("q, reqs", [(2, 1), (2, 2), (3, 1), (4, 1), (8, 1), (8, 2)])
 def test_speculative_verify_steps_are_taken(monkeypatch, q, reqs):
     slots = torch.zeros(q * reqs, dtype=torch.int64)
     md = _forward_context(_decode_md(rows=reqs, slots=slots, max_query_len=q))
@@ -439,3 +448,60 @@ def test_run_dense_collects_the_aux_hidden_states_eagle3_asked_for(monkeypatch):
     aux = []
     runner.MonoDecodeRunner.run_dense(_dense_runner(2), *_step(2), (0, 2), aux)
     assert [float(a[0, 0]) for a in aux] == [10.0, 12.0]
+
+
+def test_mono_writes_dspark_aux_from_next_layer_and_final_residual():
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    buffers = (torch.zeros(2, HIDDEN), torch.zeros(2, HIDDEN))
+    stub.aux = SimpleNamespace(layer_ids=(3, 59), buffers=buffers)
+    layer3 = torch.full((2, HIDDEN), 3.0)
+    stub._write_aux(3, layer3)
+    assert torch.equal(buffers[0], layer3)
+
+    stub.sparse = [SimpleNamespace(layer_id=59)]
+    stub.ars = [torch.zeros(2, HIDDEN), torch.full((2, HIDDEN), 4.0)]
+    stub.model = SimpleNamespace(norm=lambda ar, res: (ar, ar + res))
+    stub.debug = False
+    runner.MonoDecodeRunner.finish_step(stub, torch.full((2, HIDDEN), 5.0))
+    assert torch.equal(buffers[1], torch.full((2, HIDDEN), 9.0))
+
+
+def test_dspark_drafter_binds_before_the_lazy_runner_starts():
+    mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
+    mono._uses_dspark = True
+    mono._drafter = None
+    mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
+    drafter = object()
+    mono.bind_drafter(drafter)
+    assert mono._drafter is drafter
+    mono._mono.runner = object()
+    with pytest.raises(RuntimeError, match="after Mono starts"):
+        mono.bind_drafter(object())
+
+
+def test_forward_taps_the_residual_entering_the_next_layer(monkeypatch):
+    monkeypatch.setattr(runner, "get_forward_context", lambda: _forward_context())
+    monkeypatch.setattr(
+        runner,
+        "token_rows",
+        lambda fwd, n: (torch.empty(0), torch.empty(0)),
+    )
+    stub = runner.MonoDecodeRunner.__new__(runner.MonoDecodeRunner)
+    stub.model = SimpleNamespace(aux_hidden_state_layers=())
+    stub.mailboxes = SimpleNamespace(begin_step=lambda: None)
+    stub.dense_mono = False
+    stub.sparse = [SimpleNamespace(layer_id=3), SimpleNamespace(layer_id=4)]
+    stub.timeline = None
+    stub.h = torch.empty(1, HIDDEN)
+    stub.run_dense = lambda *args: torch.zeros(1, HIDDEN)
+    tapped = []
+
+    def sparse(i, *args):
+        stub.h.fill_(i + 1)
+        return torch.zeros(1, HIDDEN)
+
+    stub.run_sparse_layer = sparse
+    stub._write_aux = lambda layer, value: tapped.append((layer, float(value[0, 0])))
+    stub.finish_step = lambda res: res
+    runner.MonoDecodeRunner.forward(stub, *_step(1))
+    assert tapped == [(2, 1.0), (3, 2.0)]
