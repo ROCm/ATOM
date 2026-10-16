@@ -118,6 +118,9 @@ class GDNAttentionMetadata:
     no_initial_state: torch.Tensor | None = None
     non_spec_state_indices_i64: torch.Tensor | None = None
     non_spec_state_indices_in_i64: torch.Tensor | None = None
+    # True if any sequence reads its state from a slot other than the one it
+    # writes. Host-side so backends can skip fork handling without a device sync.
+    has_state_fork: bool = False
     spec_sequence_masks: torch.Tensor | None = None  # shape: [batch,]
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
@@ -204,8 +207,20 @@ class GDNStateMixin(PoolRowsMixin):
             )
 
         self.num_spec = 0
+        spec_config = getattr(model_runner.config, "speculative_config", None)
         if hasattr(model_runner, "drafter"):
             self.num_spec = model_runner.drafter.mtp_k
+        elif spec_config is not None:
+            # Under PP only the last stage has a drafter, but every stage runs the
+            # verify window over its own recurrent state; sized for one token it
+            # would advance state across rejected drafts with no rollback.
+            self.num_spec = int(spec_config.num_speculative_tokens or 0)
+            if self.num_spec == 0:
+                raise ValueError(
+                    "Speculative decoding is configured but "
+                    "num_speculative_tokens is unset, so a pipeline stage with "
+                    "no drafter cannot size its verify window."
+                )
         self.use_spec_decode = self.num_spec > 0
 
         # --- ReplaySSM ------------------------------------------------------
@@ -1159,6 +1174,7 @@ class GDNStateMixin(PoolRowsMixin):
         non_spec_state_indices_in = self.non_spec_state_indices_in_tensor.np
         spec_state_indices = self.spec_state_indices_tensor.np
         fork_srcs = getattr(batch, "state_fork_srcs", None) or ()
+        self._has_state_fork = any(s >= 0 for s in fork_srcs)
         assert not (with_spec and any(s >= 0 for s in fork_srcs)), (
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
@@ -1333,6 +1349,7 @@ class GDNStateMixin(PoolRowsMixin):
             no_initial_state=no_initial_state,
             non_spec_state_indices_i64=non_spec_state_indices_i64,
             non_spec_state_indices_in_i64=non_spec_state_indices_in_i64,
+            has_state_fork=getattr(self, "_has_state_fork", False),
             spec_sequence_masks=spec_sequence_masks,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
