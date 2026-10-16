@@ -333,6 +333,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
+    # Balance MegaMoE prefill with MoonEP (EP4/EP8): --moe-backend mega, or the
+    # fused MoRI v2 transport (ATOM_MORI_V2_FUSED=1) on gfx1250.
+    "ATOM_ENABLE_MOONEP": lambda: os.getenv("ATOM_ENABLE_MOONEP", "0") == "1",
+    # MoonEP prefetch slots per rank for other ranks' hot experts.
+    "MOONEP_PREFETCH_SLOTS": lambda: int(os.getenv("MOONEP_PREFETCH_SLOTS", "8")),
+    # Fused MoRI v2 transport only: smallest DP-group token count of a prefilling
+    # step MoonEP balances; smaller steps keep every route on its owner (a slot
+    # fill costs the same either way). 16384 keeps DSR1 EP4 1k/1k c512 even with
+    # plain Mega (balancing every prefilling step cost 16% there) and gives
+    # 1k/32 c512 +7%.
+    "MOONEP_MIN_BALANCE_TOKENS": lambda: int(
+        os.getenv("MOONEP_MIN_BALANCE_TOKENS", "16384")
+    ),
     "ATOM_MEGA_DECODE_FAST_PATH": lambda: (
         os.getenv("ATOM_MEGA_DECODE_FAST_PATH", "1") == "1"
     ),
