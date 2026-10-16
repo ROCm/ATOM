@@ -61,8 +61,8 @@ def parse_args():
         parser.error(
             "token counts, tile size, warmup, iterations and repeats must be positive"
         )
-    if args.max_local_tokens > 2048:
-        parser.error("SP4 MegaMoE supports at most 2048 local tokens per launch")
+    if args.max_local_tokens > 8192:
+        parser.error("SP4 MegaMoE supports at most 8192 local tokens per launch")
     if args.act_dtype == "fp8" and args.max_local_tokens > 64:
         parser.error("MXFP8 activation requires --max-local-tokens <=64")
     if args.max_relative_l2 <= 0 or args.max_fusion_relative_l2 <= 0:

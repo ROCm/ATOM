@@ -41,8 +41,8 @@ class MegaMoESettings:
             raise ValueError("ATOM_SP_MOE_MEGA_ACT_DTYPE must be fp4 or fp8")
         if self.comm_dtype not in ("fp8", "bf16"):
             raise ValueError("ATOM_SP_MOE_MEGA_COMM_DTYPE must be fp8 or bf16")
-        if not 1 <= self.max_local_tokens <= 2048:
-            raise ValueError("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS must be in [1, 2048]")
+        if not 1 <= self.max_local_tokens <= 8192:
+            raise ValueError("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS must be in [1, 8192]")
         if self.act_dtype == "fp8" and self.max_local_tokens > 64:
             raise ValueError(
                 "AITER #5937 MXFP8 activation supports at most 256 global tokens; "

@@ -221,7 +221,7 @@ def test_native_fallback_consumes_fused_routes_without_logits(monkeypatch, sp_mo
     "settings",
     [
         {"max_local_tokens": 0},
-        {"max_local_tokens": 8192},
+        {"max_local_tokens": 8193},
         {"act_dtype": "bf16"},
         {"comm_dtype": "int4"},
         {"act_dtype": "fp8", "max_local_tokens": 65},

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Require clean AITER main and matching model metadata for the handoff."""
+"""Require the pinned clean AITER checkout and matching model metadata."""
 
 import argparse
 import hashlib
@@ -37,7 +37,7 @@ def main():
     sha = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=aiter, text=True
     ).strip()
-    if sha != expected["aiter_main_commit"]:
+    if sha != expected["aiter_commit"]:
         errors.append(f"AITER HEAD: {sha}")
     aiter_status = subprocess.check_output(
         ["git", "status", "--porcelain", "--untracked-files=normal"],
@@ -46,7 +46,7 @@ def main():
     )
     if aiter_status:
         errors.append(
-            "AITER must be clean main without local patches or untracked files"
+            "AITER must be a clean checkout without local patches or untracked files"
         )
     for name, sha256 in expected["model_metadata_sha256"].items():
         path = args.model / name
