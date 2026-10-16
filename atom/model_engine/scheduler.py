@@ -518,7 +518,9 @@ class ScheduledBatch:
             and envs.ATOM_ENABLE_METRICS_DEVICE_TIMER
         ):
             for i, seq in enumerate(seqs.values()):
-                if i < total_seqs_num_decode or seq.prefill_gpu_complete:
+                # Prefill rows lead (`[prefill | decode]`); a mixed batch's
+                # decode rows trail them.
+                if i >= total_seqs_num_prefill or seq.prefill_gpu_complete:
                     continue
                 # Re-prefill after generation has started is not initial prefill
                 # (also excludes D recomputation following a remote prefill).
@@ -4164,7 +4166,10 @@ class Scheduler:
             # See _batch_seq_lookup: seq may have left running.
             seq_by_id = self._batch_seq_lookup(seqs)
             final = batch.is_final_chunk
-            for i, req_id in enumerate(batch.req_ids):
+            # Prefill rows only: a mixed batch is `[prefill | decode]` and pads
+            # `is_final_chunk` with False for its decode rows, which would
+            # otherwise read as middle chunks and lose their sampled token.
+            for i, req_id in enumerate(batch.req_ids[:num_prefill]):
                 seq = seq_by_id.get(req_id)
                 if seq is None or final is None or not seq.block_table:
                     continue

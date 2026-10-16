@@ -2511,13 +2511,15 @@ def _assert_segment_state(seg_md, *, is_prefill: bool) -> None:
     swa_dest_rows=None / batch_id_per_token=None, and every decode row's SWA
     store is silently skipped -- no error, just wrong attention. Checked
     because a 13-point GSM8K drop with faults=0 is exactly that shape.
+
+    `raise`, not `assert`: `python -O` strips asserts, and what this guards
+    is a silent accuracy loss.
     """
     if is_prefill:
-        assert (
-            seg_md.state is not AttnState.DECODE
-        ), f"prefill segment carries state={seg_md.state}"
-    else:
-        assert seg_md.state is AttnState.DECODE, (
+        if seg_md.state is AttnState.DECODE:
+            raise RuntimeError(f"prefill segment carries state={seg_md.state}")
+    elif seg_md.state is not AttnState.DECODE:
+        raise RuntimeError(
             f"decode segment carries state={seg_md.state}, so its SWA "
             "window write is silently skipped"
         )
@@ -3319,12 +3321,15 @@ class DeepseekV4Attention(nn.Module):
         # which is an out-of-bounds read, not an exception. Check it here, where
         # the numbers are still readable, rather than letting a HIP illegal
         # access surface three kernels later in an unrelated GEMM.
+        # `raise`, not `assert`: `python -O` would strip the check and leave
+        # the out-of-bounds read it exists to stop.
         _declared_d = getattr(attn_md, "num_decode_tokens", None)
-        assert _declared_d is None or _declared_d == n_d, (
-            f"mixed segment sizes disagree: tensor has {hidden.size(0)} rows "
-            f"({n_p} prefill + {n_d} decode) but metadata declares "
-            f"{_declared_d} decode tokens"
-        )
+        if _declared_d is not None and _declared_d != n_d:
+            raise RuntimeError(
+                f"mixed segment sizes disagree: tensor has {hidden.size(0)} rows "
+                f"({n_p} prefill + {n_d} decode) but metadata declares "
+                f"{_declared_d} decode tokens"
+            )
         # Only `input_ids` is still read here -- each segment slices it. The
         # metadata/is_prefill swap and its restore belong to
         # `_segment_forward_context`, per segment.

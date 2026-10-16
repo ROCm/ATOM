@@ -132,6 +132,10 @@ class _FakeConfig:
         max_num_seqs=256,
         max_num_batched_tokens=16384,
         cudagraph_mode=None,
+        chunked_prefill=True,
+        dcp=1,
+        enable_tbo=False,
+        kv_transfer_config=None,
     ):
         self.enable_mixed_prefill_decode = enabled
         self.hf_config = hf if hf is not None else _FakeHF()
@@ -140,6 +144,10 @@ class _FakeConfig:
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
+        self.enable_chunked_prefill = chunked_prefill
+        self.decode_context_parallel_size = dcp
+        self.enable_tbo = enable_tbo
+        self.kv_transfer_config = kv_transfer_config or {}
 
 
 def _v4_hf():
@@ -221,6 +229,74 @@ def test_validator_refuses_sparse_mla():
     cfg = _FakeConfig(hf=_FakeHF(index_topk=2048))
     with pytest.raises(ValueError, match="sparse MLA"):
         cfg._validate_mixed_prefill_decode()
+
+
+# ---- what the mixed split does not cover (PR #2037 review) ----------------
+
+
+@pytest.mark.parametrize("hf_factory", [_FakeHF, _v4_hf], ids=["mla", "v4"])
+def test_validator_refuses_unchunked_prefill(hf_factory):
+    """Unchunked admission takes a prompt whole, past the decode reserve."""
+    _bind()
+    cfg = _FakeConfig(hf=hf_factory(), chunked_prefill=False)
+    with pytest.raises(ValueError, match="chunked prefill off"):
+        cfg._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize("hf_factory", [_FakeHF, _v4_hf], ids=["mla", "v4"])
+def test_validator_refuses_mrope(hf_factory):
+    _bind()
+    hf = hf_factory()
+    hf.rope_parameters = {"mrope_section": [16, 24, 24]}
+    with pytest.raises(ValueError, match="M-RoPE"):
+        _FakeConfig(hf=hf)._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_dcp_on_dense_mla_only():
+    """Dense MLA's own decode half skips DCP; V4's is `prepare_decode`."""
+    _bind()
+    with pytest.raises(ValueError, match="decode context parallel on dense MLA"):
+        _FakeConfig(dcp=2)._validate_mixed_prefill_decode()
+    _FakeConfig(hf=_v4_hf(), dcp=2)._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_mixed_tbo_on_dense_mla_only(monkeypatch):
+    """Only the V4 builder rebuilds a mixed carrier per micro-batch."""
+    _bind()
+    monkeypatch.setenv("ATOM_TBO_MIXED", "1")
+    with pytest.raises(ValueError, match="ATOM_TBO_MIXED on dense MLA"):
+        _FakeConfig(enable_tbo=True)._validate_mixed_prefill_decode()
+    _FakeConfig(hf=_v4_hf(), enable_tbo=True)._validate_mixed_prefill_decode()
+    # Plain TBO keeps vetoing mixed batches, which dense MLA supports.
+    monkeypatch.setenv("ATOM_TBO_MIXED", "0")
+    _FakeConfig(enable_tbo=True)._validate_mixed_prefill_decode()
+
+
+@pytest.mark.parametrize(
+    "env,value",
+    [
+        ("ATOM_MLA_PAGE_SIZE", "2"),
+        ("ATOM_MLA_KV_SHUFFLED", "1"),
+        ("ATOM_USE_TRITON_MLA", "1"),
+    ],
+)
+def test_validator_refuses_non_default_mla_kv_paths(monkeypatch, env, value):
+    """The mixed forward writes and decodes through the default layout only."""
+    _bind()
+    monkeypatch.setenv(env, value)
+    with pytest.raises(ValueError, match="segmented, shuffled or Triton MLA"):
+        _FakeConfig()._validate_mixed_prefill_decode()
+    _FakeConfig(hf=_v4_hf())._validate_mixed_prefill_decode()
+
+
+def test_validator_refuses_pd_consumer_on_dense_mla_only():
+    _bind()
+    consumer = {"kv_role": "kv_consumer"}
+    with pytest.raises(ValueError, match="P/D decode instance on dense MLA"):
+        _FakeConfig(kv_transfer_config=consumer)._validate_mixed_prefill_decode()
+    _FakeConfig(
+        hf=_v4_hf(), kv_transfer_config=consumer
+    )._validate_mixed_prefill_decode()
 
 
 # Every member of the taxonomy, named. The first version of this table tested

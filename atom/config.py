@@ -2766,6 +2766,8 @@ class Config:
         spec = self.speculative_config
         spec_method = None if spec is None else spec.method
         cg_mode = self.compilation_config.cudagraph_mode
+        dense_mla = family == Family.MLA
+        rope_parameters = getattr(hf, "rope_parameters", None) or {}
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
             # The same predicate `DeepseekV4Attention.forward` routes on: a
@@ -2830,6 +2832,71 @@ class Config:
                     "the indexer's top-k selection is built for the whole "
                     "batch and the prefill-MLA path it enables has no "
                     "per-segment form"
+                ),
+            ),
+            # The decode-first `prefill_budget` holds only while prefill is
+            # chunked: unchunked admission takes the first prompt whole even
+            # past the budget, so it can starve the decode rows it reserved.
+            (
+                not self.enable_chunked_prefill,
+                "chunked prefill off",
+                (
+                    "an unchunked prompt is admitted whole even past the "
+                    "decode-first prefill budget, which then cannot hold"
+                ),
+            ),
+            # `prepare_prefill` builds M-RoPE positions over every request in
+            # the batch, decode rows included, and the mixed builders take
+            # only 1-D positions for their decode half.
+            (
+                "mrope_section" in rope_parameters,
+                "M-RoPE",
+                (
+                    "the prefill builder lays M-RoPE positions over the whole "
+                    "mixed batch, decode rows included"
+                ),
+            ),
+            # Dense MLA's mixed split is narrower than V4's: V4's decode half is
+            # the unmodified `prepare_decode`, while `AiterMLA.prepare_mixed`
+            # builds its own and handles none of the following.
+            (
+                dense_mla and self.decode_context_parallel_size > 1,
+                "decode context parallel on dense MLA",
+                (
+                    "the mixed decode half reads global context lengths and "
+                    "skips the DCP query-head gather and partial-output merge"
+                ),
+            ),
+            (
+                dense_mla and self.enable_tbo and envs.ATOM_TBO_MIXED,
+                "ATOM_TBO_MIXED on dense MLA",
+                (
+                    "only the V4 builder rebuilds the mixed carrier per "
+                    "micro-batch; dense MLA's generic rebuild drops its nested "
+                    "prefill/decode metadata"
+                ),
+            ),
+            (
+                dense_mla
+                and (
+                    envs.ATOM_MLA_PAGE_SIZE > 1
+                    or envs.ATOM_MLA_KV_SHUFFLED
+                    or envs.ATOM_USE_TRITON_MLA
+                ),
+                "the segmented, shuffled or Triton MLA KV path on dense MLA",
+                (
+                    "the mixed forward writes KV with plain "
+                    "`concat_and_cache_mla` and decodes through AITER, so a "
+                    "non-default cache layout or decode backend is bypassed"
+                ),
+            ),
+            (
+                dense_mla
+                and (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer",
+                "a P/D decode instance on dense MLA",
+                (
+                    "the mixed decode half lacks `prepare_decode`'s first "
+                    "decode without a local prefill"
                 ),
             ),
         ]
