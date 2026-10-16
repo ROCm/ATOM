@@ -243,6 +243,29 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
         per-request state pool (`GDNStateMixin.state_spec`)."""
         return [page_pool(self._declare_kv_pool().entry_bytes), self.state_spec()]
 
+    def checkpoint_page_unit_bytes(self) -> int | None:
+        """Bytes of one PAGE unit a transfer here actually publishes.
+
+        `ModelRunner` sizes the checkpoint unit from the PAGE class's charged
+        `entry_bytes`. For MLA alone that is already the rows the page geometry
+        walks, so no override is needed. A draft model that owns a KV pool
+        changes that: it joins this class rather than declaring its own
+        (`DraftKvBuilder.sub_pool_specs` -> `page_pool`), which is what riding
+        the target's block ids costs. The state image still lives in the
+        target's MLA rows -- the draft's are derived state, rewritten from the
+        target's hidden states every step -- so the charged class exceeds the
+        published regions by exactly the draft's entry bytes.
+
+        Answer with the target's own declaration, the same one `sub_pool_specs`
+        prices above, so the two agree by construction. `MlaKvPool` answers
+        `entry_bytes` before any block count exists, which matters here: this is
+        consulted while the plan is still being sized, so the pool is not
+        allocated yet and there is no cache tensor to measure.
+        """
+        if not self._uses_paged_checkpoints():
+            return None
+        return int(self._declare_kv_pool().entry_bytes)
+
     def _aligned_index_dim(self) -> int:
         """Indexer entry width, padded to 16B so inductor sees aligned rows."""
         return aligned_index_cache_dim(self.model_runner.config.hf_config)
