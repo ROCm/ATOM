@@ -2217,7 +2217,7 @@ class Scheduler:
         if (
             delayer_allows
             and self.prefill_delayer is not None
-            and self.prefill_delayer.sync_prefill
+            and getattr(self.prefill_delayer, "sync_prefill", False)
         ):
             prefill_seq_limit = 1
 
