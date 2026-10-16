@@ -112,7 +112,7 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r):
 
 
 def test_glm53_weights_mapping_targets_every_compiled_tensor(aiter_iq2r):
-    compiler = pytest.importorskip("aiter.iq2r_glm5_compile")
+    compiler = pytest.importorskip("aiter.quantization.iq2r.glm5.compile")
     from atom.model_loader.weight_names import CheckpointNameRewriter
     from atom.models.deepseek_v2 import GlmMoeDsaForCausalLM
 
