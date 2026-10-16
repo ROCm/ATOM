@@ -11,7 +11,14 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from atom.models.minimax_m3.mono.config import HEAD_DIM, HIDDEN, MAX_TOKENS, PAGE16
+from atom.models.minimax_m3.mono.config import (
+    HEAD_DIM,
+    HIDDEN,
+    MAX_TOKENS,
+    PAGE16,
+    TOKEN_TILE,
+    token_tiles,
+)
 from atom.models.minimax_m3.mono.kernels.common import (
     e8m0_load,
     ld_bf16x4,
@@ -131,6 +138,17 @@ def split_defs(k4ctx):
                             )
                         ]
                     )
+                    if const_expr(tokens > 24):
+                        extra = 24 + fx.min(lane // 2, tokens - 25)
+                        k1_poll(
+                            [
+                                (
+                                    hdone_mb,
+                                    extra * K1_HEAD_TASKS + H + lane % 2,
+                                    1,
+                                )
+                            ]
+                        )
                 gpu.barrier()
                 acquire()
             # Every independent load goes out first: this wave's pages and q.
@@ -483,6 +501,7 @@ def o_defs(k4ctx):
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
     v4f = k4ctx["v4f"]
+    token_stride = k4ctx.get("TOKEN_STRIDE", MAX_TOKENS)
     w_o = k4ctx["w_o"]
     wave = k4ctx["wave"]
     xs = k4ctx["xs"]
@@ -630,7 +649,9 @@ def o_defs(k4ctx):
             gpu.barrier()
             # push bf16 partial rows, wave w -> peer w (to itself too); with AG_RS
             # to the row group's owner rank only
-            push_rows("attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None)
+            push_rows(
+                "attn", t * O_ROWS, O_ROWS, t % W if AG_RS else None, 0, tokens
+            )
             gpu.barrier()
             if const_expr(AG_RS):  # noqa: SIM102
                 # the owner sums every peer's partials in rank order and gathers
@@ -643,7 +664,7 @@ def o_defs(k4ctx):
                         mb_poll,
                         own,
                         lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                            ((src * token_stride + k) * HIDDEN + r) // 2
                         ),
                         W,
                     )
@@ -678,7 +699,7 @@ def o_defs(k4ctx):
                         mb_poll,
                         own,
                         lambda src, k=ptk, r=row: (
-                            ((src * MAX_TOKENS + k) * HIDDEN + r) // 2
+                            ((src * token_stride + k) * HIDDEN + r) // 2
                         ),
                         W,
                     )
@@ -694,4 +715,91 @@ def o_defs(k4ctx):
                         ptk * HIDDEN + row,
                     )
 
-    return {"stage_o": stage_o}
+    def stage_o_wide():
+        """M3.1 S17..S32 o projection with one TOKEN_TILE-row LDS operand."""
+        r_wo = rsrc(w_o)
+        mx_cpw = O_K // 128 // 4
+        for t in range(start("o"), N_O, G):
+            t = fx.Int32(t)
+            rg = t * 2 + wave // 4
+            wts = []
+            wsc = []
+            for p in range_constexpr(mx_cpw):
+                kc = (wave % 4) * mx_cpw + p
+                wts.append(mxfp8_a_tiles(r_wo, rg, O_K, kc, lane))
+                wsc.append(
+                    e8m0_load(
+                        rsrc(s_o),
+                        row_major_scale_index(
+                            rg * 16 + l16, kc * 4 + g4, O_K // 32
+                        ),
+                    )
+                )
+            mb_poll([(mr("attnq_s"), k, 1) for k in range(tokens)])
+            acquire()
+            for t0, n in token_tiles(tokens):
+                rows_to_lds(
+                    tid,
+                    mb("attnq") + fx.Int64(t0 * (O_K // 4) * 4),
+                    n,
+                    O_K // 4,
+                    xs,
+                    O_ROW,
+                )
+                rows_to_lds(
+                    tid,
+                    mb("attnq_sc") + fx.Int64(t0 * (O_K // 32) * 4),
+                    n,
+                    O_K // 32,
+                    xs + OSC_LDS,
+                    OSC_ROW,
+                )
+                gpu.barrier()
+                col = fx.min(l16, n - 1)
+                c = fx.Vector.filled(4, 0.0, fx.Float32)
+                for p in range_constexpr(mx_cpw):
+                    kc = (wave % 4) * mx_cpw + p
+                    c = mfma_scaled(
+                        wts[p],
+                        mx8_b_tiles(xs + col * O_ROW, kc * 32, g4),
+                        c,
+                        wsc[p],
+                        fx.ptr_load(
+                            xs + OSC_LDS + col * OSC_ROW + kc * 4 + g4
+                        ).bitcast(fx.Int32),
+                    )
+                fx.ptr_store(c, red + (wave * 64 + lane) * 4)
+                gpu.barrier()
+                if tid < O_ROWS * n:
+                    local = tid // O_ROWS
+                    grp = (tid % O_ROWS) // 16
+                    rr = tid % 16
+                    fx.ptr_store(
+                        bf16_round(row_sum(red, rr, local, [grp * 4 + w for w in range(4)])),
+                        misc + tid,
+                    )
+                gpu.barrier()
+                push_rows("attn", t * O_ROWS, O_ROWS, t % W, t0, n)
+                gpu.barrier()
+                if (t % W == rank) & (tid < O_ROWS // 2 * n):
+                    local = tid // (O_ROWS // 2)
+                    ptk = t0 + local
+                    row = t * O_ROWS + (tid % (O_ROWS // 2)) * 2
+                    own = preg(sym, SY["attn"], "attn")
+                    a0, a1 = sum_partials(
+                        mb_poll,
+                        own,
+                        lambda src, k=ptk, r=row: (
+                            ((src * token_stride + k) * HIDDEN + r) // 2
+                        ),
+                        W,
+                    )
+                    for w in range_constexpr(W):
+                        mb_put_bf(
+                            preg(peer_addr(w), SY["a_ag"], "a_ag"),
+                            ptk * HIDDEN + row,
+                            [a0, a1],
+                        )
+                gpu.barrier()
+
+    return {"stage_o": stage_o_wide if tokens > TOKEN_TILE else stage_o}

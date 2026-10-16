@@ -10,7 +10,7 @@ import torch
 pytest.importorskip("aiter")
 
 from atom.models.minimax_m3.mono import dispatch, runner
-from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS
+from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS, M31_MAX_TOKENS
 from atom.mono.runtime import deployment
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
@@ -169,11 +169,12 @@ def _forward_context(md=None, is_prefill=False, ubatch_slices=None):
     )
 
 
-def _mono(monkeypatch, fwd, builds=True):
+def _mono(monkeypatch, fwd, builds=True, max_tokens=MAX_TOKENS):
     """An enabled MonoDecode whose runner already exists (no GPU work); its kernels
     build on every rank when ``builds``."""
     mono = dispatch.MonoDecode.__new__(dispatch.MonoDecode)
     mono._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=()))
+    mono._max_tokens = max_tokens
     mono._mono = LazyRunner(None, "MiniMax-M3 mono decode")
     mono._mono.runner = SimpleNamespace(prepare=lambda n: builds)
     monkeypatch.setattr(dispatch, "get_forward_context", lambda: fwd)
@@ -211,6 +212,19 @@ def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
     md = _forward_context(_decode_md(rows=32))
     assert not _mono(monkeypatch, md).supports(*_step(17), None, None)
+
+
+@pytest.mark.parametrize("n", [17, 24, 32])
+def test_m31_s32_steps_are_taken(monkeypatch, n):
+    md = _forward_context(_decode_md(rows=M31_MAX_TOKENS))
+    mono = _mono(monkeypatch, md, max_tokens=M31_MAX_TOKENS)
+    assert mono.supports(*_step(n), None, None)
+
+
+def test_m31_stops_after_s32(monkeypatch):
+    md = _forward_context(_decode_md(rows=33))
+    mono = _mono(monkeypatch, md, max_tokens=M31_MAX_TOKENS)
+    assert not mono.supports(*_step(33), None, None)
 
 
 def test_check_mode_takes_the_same_steps(monkeypatch):
@@ -298,6 +312,13 @@ def test_verify_with_fewer_request_rows_takes_the_original_path(monkeypatch):
     slots = torch.zeros(4, dtype=torch.int64)
     md = _forward_context(_decode_md(rows=1, slots=slots, max_query_len=2))
     assert not _mono(monkeypatch, md).supports(*_step(4), None, None)
+
+
+def test_verify_q_len_stops_at_one_token_tile(monkeypatch):
+    slots = torch.zeros(17, dtype=torch.int64)
+    md = _forward_context(_decode_md(rows=1, slots=slots, max_query_len=17))
+    mono = _mono(monkeypatch, md, max_tokens=M31_MAX_TOKENS)
+    assert not mono.supports(*_step(17), None, None)
 
 
 def test_eagle3_aux_layers_are_taken(monkeypatch):

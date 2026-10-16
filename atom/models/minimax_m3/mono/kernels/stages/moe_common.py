@@ -83,7 +83,7 @@ def moe_common_defs(k4ctx):
     swiglu_limit = k4ctx["swiglu_limit"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
-    sh_up = k4ctx["fpool"] + tokens * (XN8_ROW + XSC_ROW) if k4ctx["WIDE"] else opart
+    sh_up = k4ctx["fpool"] + k4ctx["W_UPP"] if k4ctx["WIDE"] else opart
     w13 = k4ctx["w13"]
     w2 = k4ctx["w2"]
     wave = k4ctx["wave"]
@@ -237,10 +237,10 @@ def moe_common_defs(k4ctx):
             scs.append(e8m0_load(r_s, sc_row + kc // 2 * 256 + kc % 2 * 2))
         return wts, scs
 
-    def sh_compute(j, wts, scs):
+    def sh_compute(j, wts, scs, t0, n):
         """Half task j's GEMV (B column l % 16 = token l % 16) -> swiglu -> the
         shared slot's mid rows 8 j .. + 8 of every token."""
-        col = fx.min(l16, tokens - 1)
+        col = fx.min(l16, n - 1)
         if const_expr(shared_fp8):
             scs, half = scs
             cg_ = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -257,7 +257,7 @@ def moe_common_defs(k4ctx):
             fx.ptr_store(cg_, red + (wave * 64 + lane) * 4)
             fx.ptr_store(cu_, sh_up + (wave * 64 + lane) * 4)
             gpu.barrier()
-            if tid < SH_ROWS * tokens:
+            if tid < SH_ROWS * n:
                 r = tid % SH_ROWS
                 col = tid // SH_ROWS
                 rr = r + half * SH_ROWS
@@ -266,7 +266,7 @@ def moe_common_defs(k4ctx):
                 y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
                 mb_put(
                     mr("mid"),
-                    (col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
+                    ((t0 + col) * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
                     bf16_round(y),
                 )
             gpu.barrier()
@@ -284,7 +284,7 @@ def moe_common_defs(k4ctx):
         fx.ptr_store(c, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         # mid row r = tid % 8 of token tid / 8: gate in tile row r, up in r + 8
-        if tid < SH_ROWS * tokens:
+        if tid < SH_ROWS * n:
             r = tid % SH_ROWS
             col = tid // SH_ROWS
             gsum = row_sum(red, r, col)
@@ -292,7 +292,7 @@ def moe_common_defs(k4ctx):
             y = swiglu_mul_batch([gsum], [usum], fx.Float32(-swiglu_limit))[0]
             mb_put(
                 mr("mid"),
-                (col * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
+                ((t0 + col) * MOE_SLOTS + TOP_K) * INTER + j * SH_ROWS + r,
                 bf16_round(y),
             )
         gpu.barrier()

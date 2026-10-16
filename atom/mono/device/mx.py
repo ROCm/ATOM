@@ -54,18 +54,18 @@ def scale_index(row, col, cols):
     return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
 
 
-def fp4_tile_load(r_w, base, rg, k, st, at):
+def fp4_tile_load(r_w, base, rg, k, st, at, cache_modifier=CM_NT):
     """A lane's 16 B of an FP4 weight's (16, 16)-shuffled 16-row group ``rg``
     (K = ``k``) at 128-k step ``st``: dword ``base`` + the group's 2 k + 256 a
     step + ``at`` (``lane * 4``: 32 fp4, K block lane / 16 of row lane % 16).
-    Nontemporal: a weight a step reads once."""
+    Loads are nontemporal unless a tiled caller reuses the weight."""
     return fx.Vector(
         bo.buffer_load(
             r_w,
             base + rg * (2 * k) + st * 256 + at,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=cache_modifier,
         )
     )
 

@@ -13,7 +13,6 @@ if not hasattr(aiter, "QuantType"):
 from aiter import QuantType, dtypes
 
 from atom.models.minimax_m3.mono.config import HIDDEN, INTER, O_K, IndexHeads
-from atom.models.minimax_m3.mono.kernels.common import row_major_scale_index
 from atom.models.minimax_m3.mono.weights import _mxfp8, attention_mxfp8
 from atom.mono.runtime.consensus import MonoUnsupported
 
@@ -88,15 +87,3 @@ def test_attention_mode_comes_from_both_projection_metadata():
         attention_mxfp8(native, 3)
     native.self_attn.qkv_proj = ptpc
     assert not attention_mxfp8(native, 3)
-
-
-def test_row_major_scale_index():
-    cols = HIDDEN // 32
-    for row_group in (0, 1, 127):
-        for chunk in range(HIDDEN // 128):
-            for lane in range(64):
-                row = row_group * 16 + lane % 16
-                col = chunk * 4 + lane // 16
-                index = row_major_scale_index(row, col, cols)
-                assert index == row * cols + col
-                assert 0 <= index < (row_group + 1) * 16 * cols

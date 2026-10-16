@@ -150,6 +150,7 @@ def emit_index_scores(
     g4 = lane // 16
     r_ic = rsrc(index_cache)
     rows = step_rows(seq_lens, tokens, q_len, heads)
+    new_key_window = tokens if tokens > MAX_TOKENS else MAX_TOKENS
     seq = rows.seq
     # every request's scored blocks in one list, a task per wave across the grid;
     # context-parallel requests' (this rank's blocks) in a second
@@ -188,7 +189,7 @@ def emit_index_scores(
     def new_keys_in(tk, b):
         """Block b of the request ending at token tk may hold keys this launch
         inserts (a speculative verify's earlier rows)."""
-        return (b + 1) * SPARSE_BLOCK > pick(seq, tk) - MAX_TOKENS
+        return (b + 1) * SPARSE_BLOCK > pick(seq, tk) - new_key_window
 
     def cols_of(tk):
         """B column l16's token (the request's token l16, the last one repeated)
@@ -267,7 +268,7 @@ def emit_index_scores(
         def score_cp(tk, b, page):
             """Block b of the request ending at token tk, at ``page``: every head."""
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
-                if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
+                if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - new_key_window:
                     wait_new_keys()
             kw = split_tiles(load_raw(page, tiles), tiles)
             # every pass unrolled, the unused ones skipped: a runtime pass loop
@@ -337,7 +338,7 @@ def emit_index_scores(
         def score_task(tk, b, page):
             """Block b of the request ending at token tk, at ``page``."""
             if const_expr(wait_new_keys is not None):  # noqa: SIM102
-                if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - MAX_TOKENS:
+                if (b + 1) * SPARSE_BLOCK > readlane(seq_lane, tk) - new_key_window:
                     wait_new_keys()
             raw = load_raw(page, tiles)
             col = tk - (q_len - 1) + fx.min(l16, q_len - 1)

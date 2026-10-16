@@ -44,6 +44,7 @@ from atom.models.minimax_m3.mono.config import (
     HIDDEN,
     LOCAL_Q_HEADS,
     MAX_TOKENS,
+    M31_MAX_TOKENS,
     N_ROUTED,
     ONE_INDEX_HEAD,
     TOP_K,
@@ -57,8 +58,6 @@ from atom.models.minimax_m3.mono.kernels.dense_post import (
 )
 from atom.models.minimax_m3.mono.kernels.post_attn import (
     K4_ABI,
-    K4_M31_ABI,
-    K4_SHARED_FP8_ABI,
     TL_POINTS,
     build_post_attn_m31_kernel,
     build_post_attn_kernel,
@@ -72,7 +71,15 @@ from atom.models.minimax_m3.mono.kernels.pre_attn import (
 from atom.models.minimax_m3.mono.kernels.pre_attn import (
     SCRATCH_BYTES as K1_SCRATCH_BYTES,
 )
-from atom.models.minimax_m3.mono.layout import SCRATCH, diag_region_names, sym_layout
+from atom.models.minimax_m3.mono.kernels.pre_attn import (
+    LEGACY_SCRATCH_BYTES as K1_LEGACY_SCRATCH_BYTES,
+)
+from atom.models.minimax_m3.mono.layout import (
+    SCRATCH,
+    diag_region_names,
+    scratch_layout,
+    sym_layout,
+)
 from atom.models.minimax_m3.mono.layout import SCRATCH_BYTES as K4_SCRATCH_BYTES
 from atom.models.minimax_m3.mono.weights import (
     DenseLayer,
@@ -181,7 +188,7 @@ class MonoDecodeRunner:
     def _layer_kernels(self, kernels: dict) -> list:
         """A width's layer kernels, each with its ABI."""
         return [
-            (launch, _KERNEL_ABI.get(kind, self.k4_abi))
+            (launch, _KERNEL_ABI.get(kind, K4_ABI))
             for kind, launch in kernels.items()
         ]
 
@@ -200,6 +207,7 @@ class MonoDecodeRunner:
         if len(attn_modes) != 1:
             raise MonoUnsupported(f"mixed attention layouts {attn_modes}")
         self.native_mxfp8_attn = attn_modes.pop()
+        self.max_tokens = M31_MAX_TOKENS if self.native_mxfp8_attn else MAX_TOKENS
         if require_aux and drafter is None:
             raise MonoUnsupported("no DSpark drafter")
         self.aux = bind_aux_taps(drafter, config.hidden_size) if require_aux else None
@@ -224,13 +232,6 @@ class MonoDecodeRunner:
         self.shared_fp8 = shared_modes.pop()
         if self.native_mxfp8_attn and not self.shared_fp8:
             raise MonoUnsupported("native-MXFP8 attention needs independent shared MLP")
-        self.k4_abi = (
-            K4_M31_ABI
-            if self.native_mxfp8_attn
-            else K4_SHARED_FP8_ABI
-            if self.shared_fp8
-            else K4_ABI
-        )
         # a reusing layer reads the selection an earlier layer of the step left
         # (the original path raises on a cache miss there)
         if not self.sparse[0].index_topk:
@@ -352,11 +353,17 @@ class MonoDecodeRunner:
     def _allocate(self, group) -> None:
         """Scratch, the peer handshake and the activation buffers (every rank)."""
         dev = self.dev
-        self.scratch1 = torch.zeros(K1_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
-        self.scratch4 = torch.zeros(K4_SCRATCH_BYTES, dtype=torch.uint8, device=dev)
+        scratch1_bytes = (
+            K1_SCRATCH_BYTES if self.native_mxfp8_attn else K1_LEGACY_SCRATCH_BYTES
+        )
+        scratch4_bytes = (
+            K4_SCRATCH_BYTES if self.native_mxfp8_attn else SCRATCH["_bytes"]
+        )
+        self.scratch1 = torch.zeros(scratch1_bytes, dtype=torch.uint8, device=dev)
+        self.scratch4 = torch.zeros(scratch4_bytes, dtype=torch.uint8, device=dev)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            sym_layout(self.npes)["_bytes"],
+            sym_layout(self.npes, self.max_tokens)["_bytes"],
             group,
             self.rank,
             self.npes,
@@ -370,18 +377,20 @@ class MonoDecodeRunner:
         # row k = token k of the step; sparse layer i reads ars[i % 2] (the
         # previous layer's output) and writes ars[(i + 1) % 2], likewise h_mids
         self.ars = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
+            torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
+            for _ in range(2)
         ]
         self.h_mids = [
-            torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev) for _ in range(2)
+            torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
+            for _ in range(2)
         ]
-        self.h = torch.empty(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        self.h = torch.empty(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
         self.q = torch.empty(
-            MAX_TOKENS, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
+            self.max_tokens, LOCAL_Q_HEADS * HEAD_DIM, dtype=bf16, device=dev
         )
-        self.iq = torch.empty(MAX_TOKENS, 1, HEAD_DIM, dtype=bf16, device=dev)
+        self.iq = torch.empty(self.max_tokens, 1, HEAD_DIM, dtype=bf16, device=dev)
         # layer 0's residual input: its K1 takes (embedding, 0), acc = embedding
-        self.zero_res = torch.zeros(MAX_TOKENS, HIDDEN, dtype=bf16, device=dev)
+        self.zero_res = torch.zeros(self.max_tokens, HIDDEN, dtype=bf16, device=dev)
         # each layer's K1 pointers that do not change per step (K1_ARGS order)
         self.k1_args = []
         for i, lw in enumerate(self.sparse):
@@ -412,6 +421,8 @@ class MonoDecodeRunner:
 
     def prepare(self, n: int) -> bool:
         """Whether every rank holds the n-token kernel (``WidthBuilds``)."""
+        if not 1 <= n <= self.max_tokens:
+            return False
         return self.k4.prepare(n)
 
     def close(self) -> None:
@@ -576,7 +587,7 @@ class MonoDecodeRunner:
             "slot_mapping": _ptr(sparse_md.slot_mapping), "res": _ptr(res),
             "batch_ids": _ptr(fwd.attn_metadata.batch_id_per_q_token),
         }  # fmt: skip
-        self.k4[n][lw.index_topk](*self.k4_abi.pack(args), stream=stream)
+        self.k4[n][lw.index_topk](*K4_ABI.pack(args), stream=stream)
         return self.h_mids[(i + 1) % 2][:n]
 
     def finish_step(self, res: torch.Tensor) -> torch.Tensor:
@@ -599,7 +610,7 @@ class MonoDecodeRunner:
     def raise_on_given_up_waits(self, n: int) -> None:
         """A debug build's step: raise with every mailbox wait that gave up (its
         region, pair index, tags, CTA) and every rank the fence gave up on."""
-        off = SCRATCH["diag"]
+        off = scratch_layout(n, self.native_mxfp8_attn)["diag"]
         waits = given_up_waits(
             self.scratch4[off : off + DIAG_BYTES],
             region_namer(

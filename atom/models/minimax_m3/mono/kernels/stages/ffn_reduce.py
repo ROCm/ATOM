@@ -30,18 +30,23 @@ def ffn_reduce_defs(k4ctx):
     sym = k4ctx["sym"]
     tid = k4ctx["tid"]
     tokens = k4ctx["tokens"]
+    token_stride = k4ctx.get("TOKEN_STRIDE", MAX_TOKENS)
 
-    def ffn_finish(t):
+    def ffn_finish(t, token0=0, token_count=tokens):
         """misc (row group t's bf16 partial rows, token k's DN_ROWS from k DN_ROWS)
         -> every peer -> rank-ordered sum -> ar_out."""
         # every token's rows: reduce threads take token tid // 16, pair tid % 16
-        row_tok = tid // (DN_ROWS // 2)
+        local_tok = tid // (DN_ROWS // 2)
+        row_tok = token0 + local_tok
         row_pair = tid % (DN_ROWS // 2)
         if const_expr(W > 1):  # push bf16 partial rows: wave w -> peer w
             # (with AG_RS to the row group's owner rank only)
-            push_rows("ffn", t * DN_ROWS, DN_ROWS, t % W if AG_RS else None)
+            push_rows(
+                "ffn", t * DN_ROWS, DN_ROWS, t % W if AG_RS else None,
+                token0, token_count,
+            )  # fmt: skip
             gpu.barrier()
-        if tid < DN_ROWS // 2 * tokens:
+        if tid < DN_ROWS // 2 * token_count:
             row = t * DN_ROWS + row_pair * 2
             if const_expr(W == 1):
                 t0 = fx.ptr_load(misc + tid * 2)
@@ -53,7 +58,7 @@ def ffn_reduce_defs(k4ctx):
                     return sum_partials(
                         mb_poll,
                         own,
-                        lambda src: ((src * MAX_TOKENS + row_tok) * HIDDEN + row) // 2,
+                        lambda src: ((src * token_stride + row_tok) * HIDDEN + row) // 2,
                         W,
                     )
 
@@ -83,8 +88,7 @@ def ffn_reduce_defs(k4ctx):
                     t0, t1 = rank_sum()
             bo.buffer_store(
                 fx.Vector.from_elements([t0, t1], fx.Float32).to(fx.BFloat16),
-                rsrc(ar_out),
-                row_tok * HIDDEN + row,
+                rsrc(ar_out), row_tok * HIDDEN + row,
             )
 
     return {"ffn_finish": ffn_finish}

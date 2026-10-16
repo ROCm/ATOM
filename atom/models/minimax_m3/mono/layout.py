@@ -16,10 +16,12 @@ from atom.models.minimax_m3.mono.config import (
     MAX_INDEX_BLOCKS,
     MAX_SPARSE_KEYS,
     MAX_TOKENS,
+    M31_MAX_TOKENS,
     MOE_SLOTS,
     N_ROUTED,
     PAGE16,
     SPARSE_BLOCK,
+    TOKEN_TILE,
     TOP_K,
     TOPK_BLOCKS,
 )
@@ -70,59 +72,56 @@ SPARSE_TABLE_WORDS = TOPK_BLOCKS * PAGES_PER_BLOCK + 2
 # best (key, block) (indexer context parallelism: the peers' sel_cp)
 SEL_LONG_PAIRS = N_SPLIT * TOPK_BLOCKS * 2
 
-# every region holds MAX_TOKENS rows (token k at k * the one-token size)
-SCRATCH = _layout(
-    [
-        # indexer block scores, token k's block b at pair k * MAX_INDEX_BLOCKS + b
-        ("iscore", MAX_INDEX_BLOCKS * MAX_TOKENS),
-        ("sparse_table", SPARSE_TABLE_WORDS // 2 * MAX_TOKENS),
-        ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * MAX_TOKENS),  # packed bf16 pairs
-        ("sp_m", N_SPLIT * H * MAX_TOKENS),
-        ("sp_l", N_SPLIT * H * MAX_TOKENS),
-        ("attnq", O_K // 4 * MAX_TOKENS // 2),  # merged attention, plain FP8 words
-        ("attnq_s", MAX_TOKENS),  # and its per-token scale
-        # the finished attention all-reduce + residual, bf16 pairs (o tasks -> router)
-        ("a", HIDDEN // 2 * MAX_TOKENS),
-        ("xn8", HIDDEN // 4 * MAX_TOKENS),  # MXFP8 xn, 4 fp8 per word
-        ("xsc", HIDDEN // 32 * MAX_TOKENS),  # and its per-1x32 E8M0 scales
-        # copy c, token k at pairs [(c * MAX_TOKENS + k) * N_ROUTED, ..)
-        # per expert (routing key, sigmoid) pairs, see route_key
-        ("scores", 2 * N_ROUTED * MAX_TOKENS * SCORE_COPIES),
-        ("mid", MOE_SLOTS * INTER * MAX_TOKENS),
-        # routing record read by the tests: token k's expert ids, then weights
-        ("sel", 2 * MOE_SLOTS * MAX_TOKENS),
-        # token k's split task p's candidates: rank r at pairs 2 ((k N_SPLIT + p)
-        # TOPK_BLOCKS + r) + (0 key, 1 block)
-        ("sel_long", SEL_LONG_PAIRS * MAX_TOKENS),
-        # wide: the MXFP8 xn and scales as plain words (every token's row), and a
-        # done flag per router task
-        ("xn8p", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("xscp", HIDDEN // 32 * MAX_TOKENS // 2),
-        ("xndone", N_ROUTER * MAX_TOKENS),
-        # and the mid rows as MXFP8 words, their E8M0 scales a word each (the down
-        # stage's LDS layout), a done flag per up / gate task pair
-        ("mid8p", MOE_SLOTS * INTER * MAX_TOKENS // 8),
-        ("midsp", MOE_SLOTS * INTER // 32 * MAX_TOKENS // 2),
-        ("ugdone", (TOP_K * MAX_TOKENS + 1) * UG_PER_SLOT // 2),
-        # dense layers (dense_post): the post-attention norm's per-token FP8 rows
-        # as plain words, each row's scale (its pair is the flag), and the MLP's
-        # bf16 mid pairs
-        ("dx8", HIDDEN // 4 * MAX_TOKENS // 2),
-        ("dxs", MAX_TOKENS),
-        ("dmid", DENSE_INTER // 2 * MAX_TOKENS),
-        # and (S > 2) each mid row's per-token FP8 as plain words, then its scale
-        ("dmid8", DENSE_INTER // 4 * MAX_TOKENS // 2),
-        ("dmids", MAX_TOKENS),
-        # a debug build's wait records, one a CTA
+
+def _scratch_layout(capacity: int, attn_mxfp8: bool = False):
+    """Scratch regions with ``capacity`` global rows."""
+    items = [
+        # indexer block scores, token k at pair k * MAX_INDEX_BLOCKS + b
+        ("iscore", MAX_INDEX_BLOCKS * capacity),
+        ("sparse_table", SPARSE_TABLE_WORDS // 2 * capacity),
+        ("sp_o", N_SPLIT * H * HEAD_DIM // 2 * capacity),
+        ("sp_m", N_SPLIT * H * capacity),
+        ("sp_l", N_SPLIT * H * capacity),
+        ("attnq", O_K // 4 * capacity // 2),
+        ("attnq_s", capacity),
+        ("a", HIDDEN // 2 * capacity),
+        ("xn8", HIDDEN // 4 * capacity),
+        ("xsc", HIDDEN // 32 * capacity),
+        ("scores", 2 * N_ROUTED * capacity * SCORE_COPIES),
+        ("mid", MOE_SLOTS * INTER * capacity),
+        ("sel", 2 * MOE_SLOTS * capacity),
+        ("sel_long", SEL_LONG_PAIRS * capacity),
+        ("xn8p", HIDDEN // 4 * capacity // 2),
+        ("xscp", HIDDEN // 32 * capacity // 2),
+        ("xndone", N_ROUTER * capacity),
+        ("mid8p", MOE_SLOTS * INTER * capacity // 8),
+        ("midsp", MOE_SLOTS * INTER // 32 * capacity // 2),
+        ("ugdone", (TOP_K * capacity + 1) * UG_PER_SLOT // 2),
+        ("dx8", HIDDEN // 4 * capacity // 2),
+        ("dxs", capacity),
+        ("dmid", DENSE_INTER // 2 * capacity),
+        ("dmid8", DENSE_INTER // 4 * capacity // 2),
+        ("dmids", capacity),
         ("diag", BLOCKS * DIAG_WORDS * 4 // PAIR_BYTES),
-        # M3.1 attention scales stay past every existing scratch region.
-        ("attnq_sc", O_K // 32 * MAX_TOKENS // 2),
     ]
-)
-SCRATCH_BYTES = SCRATCH["_bytes"]
+    if attn_mxfp8:
+        items.append(("attnq_sc", O_K // 32 * capacity // 2))
+    return _layout(items)
 
 
-def sym_layout(npes: int):
+SCRATCH = _scratch_layout(MAX_TOKENS)
+M31_SMALL_SCRATCH = _scratch_layout(MAX_TOKENS, attn_mxfp8=True)
+M31_SCRATCH = _scratch_layout(M31_MAX_TOKENS, attn_mxfp8=True)
+SCRATCH_BYTES = M31_SCRATCH["_bytes"]
+
+
+def scratch_layout(tokens: int, attn_mxfp8: bool = False):
+    if not attn_mxfp8:
+        return SCRATCH
+    return M31_SCRATCH if tokens > MAX_TOKENS else M31_SMALL_SCRATCH
+
+
+def sym_layout(npes: int, capacity: int = MAX_TOKENS):
     """Per-rank symmetric buffer: attn / ffn partial regions, [src rank][token][HIDDEN],
     and the peers' index-selection candidates (``sel_cp``).
 
@@ -134,10 +133,10 @@ def sym_layout(npes: int):
     every peer's layer-L attention push, and a peer only pushes that after it
     finished reading layer L-1's FFN region. So ranks are at most half a layer
     apart and the two regions double-buffer each other."""
-    rows = npes * MAX_TOKENS * HIDDEN // 2
+    rows = npes * capacity * HIDDEN // 2
     # a_ag / ffn_ag: the finished attention / FFN all-reduce rows, each written by
     # its owner rank (the reduce-scatter + all-gather form, S >= AG_RS_FROM)
-    ag = MAX_TOKENS * HIDDEN // 2
+    ag = capacity * HIDDEN // 2
     return _layout(
         [
             ("attn", rows),
@@ -147,7 +146,7 @@ def sym_layout(npes: int):
             # indexer context parallelism: token k's candidates for this rank's
             # index head, source rank s's half h's r-th best at pairs
             # 2 ((k N_SPLIT + 2 s + h) TOPK_BLOCKS + r) + (0 key, 1 block)
-            ("sel_cp", SEL_LONG_PAIRS * MAX_TOKENS),
+            ("sel_cp", SEL_LONG_PAIRS * capacity),
         ]
     )
 
@@ -364,9 +363,19 @@ def pool_words(tokens: int) -> int:
     stage's MXFP8 mids + scales + a zero row."""
     if not wide_moe(tokens):
         return HIDDEN // 2 * tokens
-    rows = MOE_SLOTS * tokens + 1
+    if tokens <= TOKEN_TILE:
+        rows = MOE_SLOTS * tokens + 1
+        return max(
+            WAVES * O_K,
+            tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
+            rows * (MID_ROW + MIDSC_ROW),
+        )
+    rows = MOE_SLOTS * min(tokens, TOKEN_TILE) + 1
+    activation_rows = min(tokens, TOKEN_TILE)
     return max(
         WAVES * O_K,
-        tokens * (XN8_ROW + XSC_ROW + N_ROUTED) + WAVES * 64 * 4,
+        activation_rows * (XN8_ROW + XSC_ROW)
+        + WAVES * 64 * 4
+        + max(tokens * N_ROUTED, 2 * (TOP_K * tokens + 1) * TOKEN_TILE),
         rows * (MID_ROW + MIDSC_ROW),
     )
