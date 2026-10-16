@@ -134,6 +134,7 @@ class EngineCore:
                 config.runner_qualname,
                 config,
                 on_worker_failure=self._send_engine_dead,
+                local_proc_num=config.tp_size_local if config.is_multinode_tp else None,
             )
             self._post_model_load_hook()
             block_info = self.runner_mgr.call_func("get_num_blocks", wait_out=True)
