@@ -205,6 +205,8 @@ on:
 env:
   # C48 ablations use scheduler-selected nodes; a fallback pool also emits -w.
   ATOMESH_NODE_POOL: ''
+  # GPUs on these nodes held ~216 GiB of unreaped memory at job start (Slurm 8677, 8678).
+  ATOMESH_SLURM_EXCLUDE: pit2-p03-g03,pit2-p03-g09
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
