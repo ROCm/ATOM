@@ -1000,7 +1000,8 @@ class ModelRunner:
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
-        local_device_rank = engine_index * stage_span + rank
+        # A TP group that spans nodes has its ranks from tp_rank_start on here.
+        local_device_rank = engine_index * stage_span + rank - config.tp_rank_start
         num_gpus = torch.cuda.device_count()
         if local_device_rank >= num_gpus:
             raise ValueError(
@@ -1030,8 +1031,9 @@ class ModelRunner:
             and not torch.distributed.is_initialized()
         ):
             # Preserve AITER's environment setup when preinitializing its group.
+            visible = config.tp_size_local if config.is_multinode_tp else world_size
             os.environ.setdefault(
-                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(visible)))
             )
             store = torch.distributed.TCPStore(
                 config.parallel_config.data_parallel_master_ip,
@@ -1915,7 +1917,11 @@ class ModelRunner:
         # single source for every entry count, so it must never disagree with
         # the number the pool is actually built at.
         num_kvcache_blocks = plan.paged_entries
-        if config.pipeline_parallel_size > 1 and torch.distributed.is_initialized():
+        # Only rank 0's answer reaches the scheduler; ranks on another node can
+        # have less memory free.
+        if (
+            config.pipeline_parallel_size > 1 or config.is_multinode_tp
+        ) and torch.distributed.is_initialized():
             t = torch.tensor(
                 [num_kvcache_blocks], dtype=torch.int64, device=self.device
             )
