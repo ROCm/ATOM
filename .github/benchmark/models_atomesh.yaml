@@ -1046,7 +1046,66 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_lmcache192_env
 
-        # Non-disaggregated counterpart to the C72 cell above: one server does
+        # High-concurrency DSpark3 PD recipe: recipes/mesh/Agentic-Kimi-K3.md.
+        # State and paged KV share the existing 224 GiB per-rank CPU pool.
+        # Raise only the state retention cap to 128 GiB.
+        # On-demand keeps observed shared-prefix checkpoints in addition to
+        # prompt-end anchors; the fixed-interval ladder remains disabled.
+        - &kimi_k3_agentic_hc_dspark3
+          <<: *kimi_k3_agentic_no_dspark
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48
+          display_topology: 1P1D-TP8-DCP8-DSPARK3
+          concurrency: [48]
+          server:
+            common_args: &kimi_k3_agentic_hc_dspark3_args
+              <<: *kimi_k3_agentic_no_dspark_args
+              max_num_seqs: 96
+              method: dspark
+              draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
+              num_speculative_tokens: 3
+              spec_decode_acceptance_length: 3.00
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill: &kimi_k3_agentic_hc_dspark3_prefill_env
+              <<: *kimi_k3_agentic_lmcache128_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c56
+          concurrency: [56]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 112
+          env: &kimi_k3_agentic_hc_dspark3_reuse_env
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill: *kimi_k3_agentic_hc_dspark3_prefill_env
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 144
+          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark3_args
+              max_num_seqs: 176
+          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+
+        # Non-disaggregated counterpart to the no-draft C72 cell: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
         - <<: *kimi_k3_agentic_no_dspark

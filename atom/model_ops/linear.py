@@ -64,6 +64,23 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
+def _require_mxfp4_preshuffle_triton() -> Callable:
+    global gemm_afp4wfp4_preshuffle
+
+    if gemm_afp4wfp4_preshuffle is None:
+        try:
+            from aiter.ops.triton.gemm_afp4wfp4 import (
+                gemm_afp4wfp4_preshuffle as preshuffle_gemm,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "The selected preshuffled MXFP4 backend requires "
+                "aiter.ops.triton.gemm_afp4wfp4_preshuffle"
+            ) from exc
+        gemm_afp4wfp4_preshuffle = preshuffle_gemm
+    return gemm_afp4wfp4_preshuffle
+
+
 if use_fp4_non_shuffle_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
@@ -76,9 +93,7 @@ else:
 
 if use_triton_gemm():
     try:
-        from aiter.ops.triton.gemm_afp4wfp4 import (
-            gemm_afp4wfp4_preshuffle,
-        )
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
     except ImportError as e:
         logger.warning(f"Triton FP4 GEMM not available: {e}")
         gemm_afp4wfp4_preshuffle = None
@@ -106,6 +121,25 @@ else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_triton = None
     gemm_a8w8_triton = None
+
+
+def use_mxfp4_preshuffle_triton_gemm(
+    params_dtype: torch.dtype,
+    *,
+    arch: str | None = None,
+) -> bool:
+    """Select the consumer compatible with the stored MXFP4 preshuffle layout."""
+    if params_dtype != dtypes.fp4x2 or use_fp4_non_shuffle_triton_gemm():
+        return False
+    if arch is None:
+        from aiter.jit.utils.chip_info import get_gfx_runtime
+
+        arch = get_gfx_runtime()
+    return arch == "gfx1250" or (
+        use_triton_gemm() and gemm_afp4wfp4_preshuffle is not None
+    )
+
+
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
 
 
@@ -217,14 +251,9 @@ def gemm_a4w4_quant(
             otype,
             y,
         )
-    # Preshuffle FP4 Triton path: used when ATOM_USE_TRITON_GEMM is enabled
-    # and the non-shuffle path is disabled. This expects preshuffled weights.
-    elif (
-        params_dtype == dtypes.fp4x2
-        and use_triton_gemm()
-        and not use_fp4_non_shuffle_triton_gemm()
-        and gemm_afp4wfp4_preshuffle is not None
-    ):
+    # Consume ATOM's stored preshuffled weight/scale layout directly.
+    elif use_mxfp4_preshuffle_triton_gemm(params_dtype):
+        preshuffle_gemm = _require_mxfp4_preshuffle_triton()
         m, _ = x.view(-1, x.size(-1)).shape
 
         y = torch.empty(
@@ -255,7 +284,7 @@ def gemm_a4w4_quant(
         else:
             x_scale = x_scale[:m, ...].view(torch.uint8)
 
-        y = gemm_afp4wfp4_preshuffle(
+        y = preshuffle_gemm(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,

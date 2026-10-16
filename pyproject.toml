@@ -53,3 +53,31 @@ atom_model_registry = "atom.plugin.vllm.register:register_model"
 
 [project.entry-points."sglang.srt.plugins"]
 atom_sglang = "atom.plugin.sglang.register:register_plugin"
+
+[tool.ruff.lint.per-file-ignores]
+# FlyDSL consumes these nested functions with its AST rewriter; closure and
+# framework-default lint rewrites change kernel semantics. The exemption
+# follows the FILES, not the directory they used to sit in.
+"atom/models/glm52/mono/kernels/*.py" = ["ALL"]
+"atom/models/glm52/mono/kernels/**/*.py" = ["ALL"]
+# The benches that compare ATOM's vendored copy against FlyDSL's own tree are
+# vendored the same way and carry the same exemption -- black already excludes
+# this directory below, for the same reason.
+"tests/models/glm52/kernels/*.py" = ["ALL"]
+
+[tool.black]
+# The same exemption, for the same reason: the ruff ignores above do not bind
+# black, and these trees are vendored from FlyDSL and kept byte-identical to
+# upstream apart from import rewrites, so that the delta stays reviewable and
+# can be offered back. Reformatting them both breaks that alignment and, per
+# the note above, can change what FlyDSL's rewriter generates.
+#
+# `force-exclude`, not `extend-exclude`: extend-exclude is ignored for paths
+# passed explicitly, which is exactly how both CI and the PostToolUse
+# `auto_lint.py` hook invoke black (`black <file>` on the file just edited).
+force-exclude = '''
+/(
+    atom/models/glm52/mono/kernels
+  | tests/models/glm52/kernels
+)/
+'''

@@ -9,22 +9,28 @@ from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
+import triton
 from aiter.dist.parallel_state import get_tp_group
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_engine.state_runtime import StateTransfer
+from atom.model_engine.state_runtime import StateTransfer, midstep_checkpoint_targets
 from atom.model_ops.attention_gdn import GatedDeltaNet
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
 from atom.utils import CpuGpuBuffer, envs
-from atom.utils.forward_context import AttentionMetaData, Context
+from atom.utils.forward_context import (
+    AttentionMetaData,
+    Context,
+    get_forward_context,
+)
 
 from .aiter_attention import (
     AiterAttentionMetadataBuilder,
     AiterBackend,
+    _mtp_prepare_decode_metadata_kernel,
     kv_indices_generate_triton,
 )
 from .pool_layout.paged_state_copy import (
@@ -132,6 +138,8 @@ class GDNAttentionMetadata:
     # mapping the chunk kernel builds internally. Only computed when there are
     # checkpoints to place against it.
     ssm_chunk_offsets: torch.Tensor | None = None
+    # Conv tokens a checkpoint holds, `conv_kernel - 1`; see `_conv_state_len`.
+    ssm_conv_state_len: int = 0
     # Qwen4Exp-only optional AITER schedule, built once outside the layer loop.
     flydsl_prefill_metadata: object | None = None
     # --- ReplaySSM ---------------------------------------------------------
@@ -1060,6 +1068,16 @@ class GDNStateMixin(PoolRowsMixin):
         if destinations:
             torch._foreach_copy_(destinations, sources)
 
+    def _conv_state_len(self) -> int:
+        """Conv history the prefill conv kernel reads and writes: `kernel - 1`.
+
+        Not the pool's window, which is `kernel - 1 + num_spec` wide for the
+        decode path's speculation. `causal_conv1d_fn` reads a resumed state
+        from positions `[0, kernel - 1)` of the slot and nothing past them, so
+        a checkpoint has to put exactly those tokens exactly there.
+        """
+        return self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
+
     def _checkpoint_targets(self, batch: ScheduledBatch) -> dict | None:
         """Checkpoints this step reaches, as device index tensors.
 
@@ -1089,10 +1107,14 @@ class GDNStateMixin(PoolRowsMixin):
         per-sequence; a shared base silently captures one sequence's state into
         another's checkpoint whenever a batch holds two prefills.
 
-        A target is dropped when this step holds too few tokens before it to
-        fill the conv window. Both halves of a checkpoint must land together —
-        an SSM state at P paired with a conv window from elsewhere is silently
-        wrong, and worse than no checkpoint at all, because it is findable.
+        A target needs the conv window's worth of this step's tokens before it,
+        and an interior one must sit on the step's 64-token grid, because that
+        is where `h` holds a state. `BlockManager.midstep_positions` only
+        reserves positions that satisfy both (`midstep_target_ok`); one that
+        does not reach here raises. Both halves of a checkpoint must land
+        together — an SSM state at P paired with a conv window from elsewhere
+        is silently wrong, and worse than no checkpoint at all, because it is
+        findable.
 
         Slots, not a separate checkpoint region: a checkpoint here IS an
         ordinary pool slot, indexed exactly as every other slot on this path
@@ -1100,35 +1122,24 @@ class GDNStateMixin(PoolRowsMixin):
         speculation to roll back, so it needs no scratch beside it.
         """
         all_saves = getattr(batch, "state_save_all", None)
-        if not all_saves:
+        if not all_saves or not any(all_saves):
             return None
-        # Tokens of conv history a checkpoint needs behind it: the conv state
-        # width. From the config, so it tracks the model rather than assuming.
-        state_len = self.model_runner.config.hf_config.linear_conv_kernel_dim - 1
-        cached = batch.num_cached_tokens
-        sched = batch.num_scheduled_tokens
-        runtime_slots = batch.state_slots_committed
-        limit = self.model_runner.mamba_k_cache.shape[1]
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
 
-        found = []
-        # A seq may hold several reservations (a grid rung, a demand, the
-        # prompt-end anchor); take every one this step reaches.
-        for i, reservations in enumerate(all_saves):
-            if i >= len(runtime_slots):
-                continue
-            start = int(cached[i])
-            end = start + int(sched[i])
-            for dst_slot, p in reservations:
-                dst = int(dst_slot)
-                p = int(p)
-                # `dst >= limit` would mean the scheduler's pool outgrew this
-                # rank's tensor; skipping degrades to "no checkpoint", which
-                # is always safe, where writing would corrupt another slot.
-                if not 0 <= dst < limit:
-                    continue
-                if not (start + state_len <= p <= end):
-                    continue
-                found.append((i, dst, p - start, int(p == end), runtime_slots[i]))
+        # Every reservation is checked against the predicate the scheduler
+        # placed it with, and raises if it fails: `commit_midstep` publishes
+        # its hash after this forward regardless, so a target dropped here is
+        # a findable checkpoint over unwritten bytes.
+        found = midstep_checkpoint_targets(
+            batch.state_rows,
+            batch.num_cached_tokens,
+            batch.num_scheduled_tokens,
+            batch.state_slots_committed,
+            all_saves,
+            num_slots=self.model_runner.mamba_k_cache.shape[1],
+            grid=CHUNK_SIZE,
+            min_offset=self._conv_state_len(),
+        )
         if not found:
             return None
 
@@ -1153,6 +1164,21 @@ class GDNStateMixin(PoolRowsMixin):
         index out of this tensor, and the conv path is handed column 0 alone),
         so this is where a contiguity assumption would have been *invented*
         rather than a place one has to be honoured.
+
+        Every row past the state-holding seqs is reset to PAD_SLOT_ID, which
+        every GDN/KDA kernel skips. The rows a forward publishes are its
+        scheduled seqs, and a seq without a state slot is filtered out of
+        `batch.state_slots`, so such a row would otherwise keep whatever the
+        previous batch wrote there. The DP-sync dummy decode
+        (`ModelRunner.dummy_execution`: one seq, id -1, no slot) is that case.
+        An idle DP rank runs it while its own requests sit unscheduled, for
+        example between prefill chunks while the PrefillDelayer holds. With a
+        stale index its decode updates the conv and recurrent state of the
+        first request of the rank's last real batch in place. That request then
+        continues from a corrupted state. A prefix-cache checkpoint pending
+        from that slot stores the corrupted state for every later hit on the
+        prefix. TP-only serving never runs the dummy, which is why this only
+        shows under DP attention.
         """
         self._check_state_indices_writable()
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
@@ -1163,6 +1189,10 @@ class GDNStateMixin(PoolRowsMixin):
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
         )
+        num_state_rows = len(batch.state_slots)
+        non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
+        non_spec_state_indices_in[num_state_rows:] = PAD_SLOT_ID
+        spec_state_indices[num_state_rows:] = PAD_SLOT_ID
         for idx, slots in enumerate(batch.state_slots):
             non_spec_state_indices[idx] = 0
             non_spec_state_indices_in[idx] = 0
@@ -1187,12 +1217,28 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
+        """Publish `num_bonus + 1` per request, 1 everywhere else, in one copy.
 
-        if self.model_runner.tokenID_processor.num_bonus is None:
+        The counts arrive on the host, and assigning them element by element
+        made each one a blocking `hipMemcpyWithStream`: the first drained the
+        stream, the rest cost ~13us each, so the decode prep grew with batch.
+
+        One non-blocking copy of the whole row replaces the reset and the
+        writes. The destination stays the same tensor -- a captured graph and
+        `replayssm_commit` read it by address -- and a pageable source of this
+        size (4 B x max_bs, far below `_PAGEABLE_H2D_LIMIT`) is staged by the
+        driver and returns without waiting on queued work. A pinned
+        `CpuGpuBuffer` is not used: its GPU half would be per PP ring slot,
+        while this destination is one tensor shared by every slot.
+        """
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is None:
+            self.num_accepted_tokens.fill_(1)
             return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        num_bonus = np.asarray(num_bonus, dtype=np.int32)
+        host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
+        host[: num_bonus.shape[0]] = num_bonus + 1
+        self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
 
     def prepare_gdn_metadata(
         self,
@@ -1513,6 +1559,49 @@ GDN_PAGE_CHECKPOINT_MODEL_TYPES = frozenset(
 )
 
 
+def draft_kv_write_slots(
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    block_size: int,
+    out: torch.Tensor,
+    num_rows: int,
+) -> torch.Tensor:
+    """KV slot of each row's newest token, `context_lens - 1`, written to `out`.
+
+    `block_tables[row, pos // block_size] * block_size + pos % block_size`,
+    the slot the target's own `slot_mapping` gives that position. Rows from
+    `num_rows` on are padding and get -1, which the cache kernels skip.
+
+    On the GPU this is the MHA builder's one-launch kernel; elsewhere (CPU
+    tests) the same arithmetic in torch.
+    """
+    rows = out.shape[0]
+    if out.is_cuda:
+        _mtp_prepare_decode_metadata_kernel[(max(1, triton.cdiv(rows, 128)),)](
+            context_lens,
+            block_tables,
+            out,
+            context_lens,  # positions_in: unread, update_positions is False
+            context_lens,  # positions_out: unread
+            out,  # last_token_indices: unread
+            num_rows,
+            False,  # skip_update
+            False,  # update_context_lens: the proposer already bumped them
+            False,  # update_positions
+            False,  # select_positions
+            block_size,
+            block_tables.stride(0),
+            1,
+            BLOCK=128,
+        )
+    else:
+        pos = (context_lens[:num_rows].to(torch.int64) - 1).clamp(min=0)
+        page = block_tables[:num_rows].gather(1, (pos // block_size).unsqueeze(1))
+        out[:num_rows] = page.squeeze(1).to(torch.int64) * block_size + pos % block_size
+    out[num_rows:] = -1
+    return out
+
+
 class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     BACKEND: ClassVar[type[AiterBackend]] = GDNAttentionBackend
     reorder_batch_threshold: int = 1
@@ -1569,7 +1658,20 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             f":spec={self.num_spec}"
             ":carry=all"
         )
-        return StateTransfer.copy(layout_id)
+        if not envs.ATOM_GDN_STATE_MIDSTEP:
+            return StateTransfer.copy(layout_id)
+        from atom.model_ops.fla_ops.chunk import CHUNK_SIZE
+
+        # Midstep: positions inside a forward are snapshotted from the chunk
+        # kernel's `h` into a scratch slot and stored from there, so prefill
+        # is no longer cut onto rungs. The grid is the kernel's chunk, counted
+        # from each forward's start; the offset is the conv window it slices.
+        return StateTransfer.copy(
+            layout_id,
+            readable_midstep=True,
+            midstep_grid=CHUNK_SIZE,
+            midstep_min_offset=self._conv_state_len(),
+        )
 
     def checkpoint_page_unit_bytes(self) -> int | None:
         """Bytes of one MHA page that a transfer actually publishes.
@@ -1681,6 +1783,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             self.kv_pools.values(), unit_ids, image_bytes=image_bytes
         )
 
+    def page_unit_segments(self, unit_ids):
+        """``page_unit_views`` as raw addresses and sizes, for the store's gather."""
+
+        from atom.model_ops.attentions.pool_layout.mha_page_unit_geometry import (
+            mha_page_unit_segments,
+        )
+
+        regions = self._page_unit_regions()
+        spec = self.model_runner.state_runtime.checkpoint_spec
+        first_region = next(iter(self.kv_pools.values())).region_tensors()[0][1]
+        return mha_page_unit_segments(
+            regions,
+            unit_ids,
+            entries=int(first_region.shape[0]),
+            image_bytes=int(spec.image_bytes),
+        )
+
     def get_kv_transfer_tensors(self):
         """MHA PAGE regions, plus the native checkpoint contract for lmcache_mp."""
 
@@ -1768,6 +1887,11 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
         attn_metadata, positions = super().prepare_prefill(batch, running_bs)
         if batch.block_tables == []:
+            if any(getattr(batch, "state_save_all", None) or ()):
+                raise RuntimeError(
+                    "midstep checkpoints reserved for a prefill with no GDN "
+                    "metadata; nothing would write them"
+                )
             attn_metadata.gdn_metadata = None
             return attn_metadata, positions
         # `super().prepare_prefill` has already marshalled them, and the early
@@ -1777,6 +1901,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         gdn_metadata.ssm_checkpoints = self._checkpoint_targets(batch)
+        gdn_metadata.ssm_conv_state_len = self._conv_state_len()
         if gdn_metadata.ssm_checkpoints is not None:
             # Same mapping the chunk kernel builds internally, computed once
             # per step rather than per layer.
@@ -1849,6 +1974,23 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         # shape guard only compares batch and kv-head count.
         result["flydsl_work_plan"] = self.refresh_flydsl_plan(
             var["context_lens"].gpu[:running_bs]
+        )
+        # Where the draft token this step writes goes. Returned, because a
+        # builder that returns no `slot_mapping` sends `EagleProposer` down its
+        # MLA branch, `kv_indices[kv_indptr[1:] - 1]`: a token slot at page
+        # size 1, but here a PAGE id, which the draft's KV write then treats as
+        # a token slot. That lands the MTP layer's K/V in block `id //
+        # block_size` -- some other request's KV, or the units of a PAGE state
+        # checkpoint, whose image then restores corrupted.
+        # A dummy run's synthetic context_lens can point past block_tables, and
+        # its draft writes nowhere anyway: every row is padding.
+        dummy = get_forward_context().context.is_dummy_run
+        result["slot_mapping"] = draft_kv_write_slots(
+            var["context_lens"].gpu[:running_bs],
+            var["block_tables"].gpu,
+            self.model_runner.block_size,
+            var["slot_mapping"].gpu[:running_bs],
+            0 if dummy else bs,
         )
         return result
 

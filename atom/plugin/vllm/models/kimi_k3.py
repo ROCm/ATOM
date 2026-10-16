@@ -39,7 +39,6 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from atom.config import Config
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
-from atom.models import kimi_k3 as kimi_k3_base
 from atom.models.kimi_k3 import (
     KimiDecoderLayer,
     KimiKDAAttention,
@@ -48,6 +47,10 @@ from atom.models.kimi_k3 import (
 from atom.models.kimi_k3 import (
     KimiK3ForCausalLM as KimiK3ForCausalLMBase,
 )
+
+# the module, not the package: this swaps `KimiKDAAttention` / `KimiLinearModel`
+# in the globals the K3 classes resolve, which live in `...kimi_k3.model`
+from atom.models.kimi_k3 import model as kimi_k3_base
 from atom.models.utils import IntermediateTensors, PPMissingLayer, maybe_prefix
 from atom.plugin.vllm.kda_backend import AtomKimiK3KDAAttentionBackend
 from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
