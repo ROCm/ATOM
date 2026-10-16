@@ -206,7 +206,14 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         kernel_block_size: int,
         graph_buffers: dict | None,
     ) -> torch.Tensor:
-        table = getattr(full_inputs, "kv_cache_block_id_device", None)
+        # RTP refreshes the kernel block table on every Graph replay, but not
+        # kv_cache_block_id_device (that table is only used by cache store).
+        # Derive QSA's physical pages from the live kernel table in Graph mode.
+        table = (
+            None
+            if graph_buffers is not None
+            else getattr(full_inputs, "kv_cache_block_id_device", None)
+        )
         if table is None or table.numel() == 0:
             kernel = cls._select_block_table_for_layer(attn_inputs=full_inputs)
             if kernel is not None and kernel.numel() > 0:
