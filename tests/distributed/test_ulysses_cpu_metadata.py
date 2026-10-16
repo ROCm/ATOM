@@ -43,6 +43,7 @@ def runner_type():
             "sp_local_tokens",
             "sp_graph_input_ids",
             "prepare_inputs",
+            "warmup_max_tokens",
             "warmup_model",
             "_verifies_drafts",
         }
