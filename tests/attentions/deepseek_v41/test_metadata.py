@@ -467,6 +467,7 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
     geo = V41PoolGeometry(1, ((0, 2),), 32, 4, 512, 32)
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.geometry, builder.device, builder.block_size = geo, "cpu", 32
+    builder.config = SimpleNamespace(candidate_topk_blocks=0)
     builder.cache = None
     builder.score_workspace = None
     builder.model_runner = SimpleNamespace(
@@ -501,7 +502,8 @@ def test_startup_dummy_keeps_private_scratch_before_pool_allocation():
         ("verify", 31, 3),
     ],
 )
-def test_parent_preparation_preserves_phase(device, phase, position, length):
+@pytest.mark.parametrize("padded", [False, True])
+def test_parent_preparation_preserves_phase(device, phase, position, length, padded):
     """A one-token parent prefill needs prefill metadata even with DSpark on."""
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("ROCm GPU required")
@@ -543,7 +545,10 @@ def test_parent_preparation_preserves_phase(device, phase, position, length):
     cu.np[:2] = (0, length)
     cu.copy_to_gpu(2)
     if phase == "prefill":
-        metadata, positions = builder.prepare_prefill(batch, 1)
+        if padded:
+            metadata, positions = builder.prepare_prefill_padded(batch, 1, length)
+        else:
+            metadata, positions = builder.prepare_prefill(batch, 1)
     else:
         metadata, positions = builder.prepare_decode(batch, 1, length, length)
     step = metadata.step

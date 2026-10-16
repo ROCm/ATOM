@@ -69,14 +69,16 @@ class BatchStep:
     selected: dict[int, torch.Tensor] = field(default_factory=dict)
     candidates: dict[int, torch.Tensor] = field(default_factory=dict)
     tiles: dict[int, torch.Tensor] = field(default_factory=dict)
-    # candidate source layer -> its `CandidateBlocks`, bound for every layer
-    # its candidates bound
     candidate_blocks: dict[int, object] = field(default_factory=dict)
-    # First layer of an index group -> the `(prefix, pptr, extend, eptr)` one
-    # launch wrote for the whole run.
     group_indices: dict[int, tuple[torch.Tensor, ...]] = field(default_factory=dict)
-    # A split decode's window rows (`indices.build_window_rows`), every layer's.
     window_rows: torch.Tensor | None = None
+    # Backend-owned result storage, shared by eager and graph execution.
+    # Concurrent execution views use distinct namespaces and producer schedules.
+    result_buffers: object | None = None
+    buffer_namespace: object = None
+    candidate_producers: dict[int, int] = field(default_factory=dict)
+    layer_specs: tuple = ()
+    # A split decode's window rows (`indices.build_window_rows`), every layer's.
     # A bounded-replay forward's `ReplayPlan` (`models.deepseek_v41.
     # bounded_replay`): the rows its decoder ran on, for what else reads the
     # decoder's rows after it (the DSpark draft's window). None where the
@@ -144,16 +146,16 @@ class BatchStep:
     def begin_forward(self):
         """Drop what the last forward over this step worked out.
 
-        A capture runs the model twice on one step, so a table surviving into
-        the recorded pass is a kernel that pass skips -- absent from the graph,
-        and read at capture-time values on every replay.
+        Backend workspaces retain bindings: their scheduled GPU producers run
+        on every execution. Standalone eager callers still drop lazy results.
         """
-        self.selected.clear()
-        self.candidates.clear()
-        self.tiles.clear()
-        self.candidate_blocks.clear()
-        self.group_indices.clear()
-        self.window_rows = None
+        if self.result_buffers is None:
+            self.selected.clear()
+            self.candidates.clear()
+            self.tiles.clear()
+            self.candidate_blocks.clear()
+            self.group_indices.clear()
+            self.window_rows = None
         self.replay = None
 
     @property

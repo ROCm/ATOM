@@ -9,17 +9,10 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.config import CUDAGraphMode
 from atom.models.minimax_m3.mono import dispatch, runner
 from atom.mono.runtime import deployment
 from atom.mono.runtime.route import LazyRunner
-
-
-class _Mode:
-    def __init__(self, piecewise):
-        self.piecewise = piecewise
-
-    def requires_piecewise_compilation(self):
-        return self.piecewise
 
 
 def _atom_config(**overrides):
@@ -37,7 +30,7 @@ def _atom_config(**overrides):
         "enable_tbo": False,
         "enable_tbo_decode": False,
         "speculative_config": None,
-        "compilation_config": SimpleNamespace(cudagraph_mode=_Mode(False)),
+        "compilation_config": SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -69,7 +62,11 @@ def test_supported_deployment_has_no_refusal(native):
         ({"max_model_len": (1 << 20) + 1}, "max_model_len"),
         ({"enable_tbo_decode": True}, "TBO"),
         (
-            {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
+            {
+                "compilation_config": SimpleNamespace(
+                    cudagraph_mode=CUDAGraphMode.PIECEWISE
+                )
+            },
             "piecewise",
         ),
     ],

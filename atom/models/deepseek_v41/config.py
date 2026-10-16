@@ -344,19 +344,22 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
+            (
+                "CUDAGraph mode (use FULL, PIECEWISE, AF_PIECEWISE, "
+                "FULL_AND_PIECEWISE or enforce_eager=True)"
+            ),
             not config.enforce_eager
-            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+            and graph_mode
+            not in (
+                CUDAGraphMode.FULL,
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.AF_PIECEWISE,
+                CUDAGraphMode.FULL_AND_PIECEWISE,
+            ),
         ),
         (
             "torch.compile level (use 0 or 3)",
             config.compilation_config.level not in (0, 3),
-        ),
-        (
-            "level 3 CUDA Graph mode (use FULL or enforce_eager=True)",
-            config.compilation_config.level == 3
-            and not config.enforce_eager
-            and graph_mode != CUDAGraphMode.FULL,
         ),
         ("pipeline parallel", config.pipeline_parallel_size != 1),
         (

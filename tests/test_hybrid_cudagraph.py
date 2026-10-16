@@ -1,0 +1,646 @@
+# SPDX-License-Identifier: MIT
+"""Hybrid capture must preserve FULL decode and independent prefill buckets."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+pytest.importorskip("aiter")
+
+from atom.config import CompilationConfig, Config, CUDAGraphMode
+from atom.model_engine import model_runner
+from atom.utils.forward_context import ForwardMode
+
+
+def _runner(mode):
+    class RunnerConfig(SimpleNamespace):
+        @property
+        def prefill_capture_sizes(self):
+            return getattr(self, "prefill_sizes", self.capture_sizes)
+
+    runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+    runner.enforce_eager = False
+    runner.attn_metadata_builder = SimpleNamespace(supports_piecewise_prefill=True)
+    runner.config = RunnerConfig(
+        prefill_context_parallel_size=1,
+        compilation_config=SimpleNamespace(cudagraph_mode=mode),
+        max_num_seqs=256,
+        max_num_batched_tokens=16384,
+    )
+    runner._extra_piecewise_capture_shapes = lambda sizes, qs: []
+    return runner
+
+
+@pytest.mark.parametrize("token_dim,shape", [(0, (3, 4)), (1, (1, 3, 4))])
+def test_token_buffers_share_capacity_without_growing_recorded_storage(
+    token_dim, shape
+):
+    from atom.utils.cuda_graph import StableOutputs
+
+    buffers = StableOutputs(capacity=8, token_dim=token_dim)
+    small = torch.zeros(shape, dtype=torch.bfloat16)
+    large_shape = list(shape)
+    large_shape[token_dim] = 8
+    large = torch.zeros(large_shape, dtype=small.dtype)
+    view = buffers.slot("attention", small)
+    assert buffers.slot("attention", large).data_ptr() == view.data_ptr()
+    assert view.untyped_storage().nbytes() == large.numel() * large.element_size()
+    assert buffers.slot("engram", small).data_ptr() != view.data_ptr()
+    large_shape[token_dim] = 9
+    with pytest.raises(ValueError, match="capacity"):
+        buffers.slot("attention", torch.empty(large_shape, dtype=small.dtype))
+    assert buffers.slot("attention", small).data_ptr() == view.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+def test_token_views_replay_with_separate_bucket_graph_pools():
+    from atom.utils.cuda_graph import StableOutputs
+
+    buffers = StableOutputs(capacity=8)
+    graphs, outputs = {}, {}
+    for tokens in (8, 3):
+        view = buffers.slot("attention", torch.ones(tokens, 4, device="cuda"))
+        view.fill_(1)
+        outputs[tokens] = torch.empty_like(view)
+        outputs[tokens].copy_(view * 3)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=torch.cuda.graph_pool_handle()):
+            outputs[tokens].copy_(view * 3)
+        graphs[tokens] = graph
+    assert graphs[8].pool() != graphs[3].pool()
+    for tokens, value in [(3, 2), (8, 4), (3, 7), (8, 3)]:
+        buffers.slot("attention", outputs[tokens]).fill_(value)
+        graphs[tokens].replay()
+        torch.testing.assert_close(
+            outputs[tokens], torch.full_like(outputs[tokens], 3 * value)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+@pytest.mark.parametrize("void", [False, True])
+def test_piecewise_core_live_prefill_captures_once_and_refreshes_inputs(void):
+    from atom.utils.attn_ffn_piecewise import piecewise_core
+    from atom.utils.cuda_graph import CudagraphCaptureRunner, StableOutputs
+
+    @piecewise_core(capture_prefill=True, copy_per_step=("hidden",))
+    def core(layer, *, hidden: torch.Tensor):
+        layer.state.add_(1)
+        return None if void else hidden * 2
+
+    layer = SimpleNamespace(state=torch.zeros(1, device="cuda"))
+    runner, outputs = CudagraphCaptureRunner(), StableOutputs()
+    context = SimpleNamespace(
+        context=SimpleNamespace(is_dummy_run=False),
+        attn_metadata=SimpleNamespace(state=SimpleNamespace(name="PREFILL")),
+        in_hipgraph=False,
+    )
+    for i, tokens in enumerate((4, 4, 2, 4), 1):
+        result = core(
+            layer,
+            hidden=torch.full((tokens, 2), float(i), device="cuda"),
+            piecewise=True,
+            capture=True,
+            capture_key=("prefill", tokens),
+            forward_context=context,
+            runner=runner,
+            outputs=outputs,
+        )
+        assert layer.state.item() == i
+        if void:
+            assert result is None
+        else:
+            torch.testing.assert_close(result, torch.full_like(result, 2 * i))
+    assert len(runner._graphs) == 2
+
+    # Startup/FULL capture must not create a nested live attention graph.
+    context.in_hipgraph = True
+    context.attn_metadata.state.name = "DECODE"
+    core(
+        layer,
+        hidden=torch.ones(8, 2, device="cuda"),
+        piecewise=True,
+        capture=True,
+        capture_key=("prefill", 8),
+        forward_context=context,
+        runner=runner,
+        outputs=outputs,
+    )
+    assert layer.state.item() == 5
+    assert len(runner._graphs) == 2
+    runner.release_graphs()
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        (CUDAGraphMode.FULL, {CUDAGraphMode.FULL}),
+        (CUDAGraphMode.PIECEWISE, {CUDAGraphMode.PIECEWISE}),
+        (CUDAGraphMode.AF_PIECEWISE, {CUDAGraphMode.PIECEWISE}),
+    ],
+)
+def test_capture_plan_keeps_tail_buckets_out_of_full_decode(mode, expected):
+    runner = _runner(mode)
+    runner.capture_sizes = [8, 2, 1]
+    runner._extra_piecewise_capture_shapes = lambda sizes, qs: [(8, 1), (8, 2)]
+    plan = runner._cudagraph_capture_plan([6])
+    assert {kind for kind, _, _ in plan} == expected
+    full = [(q, sizes) for kind, q, sizes in plan if kind == CUDAGraphMode.FULL]
+    if CUDAGraphMode.FULL in expected:
+        assert full == [(6, [8, 2, 1])]
+    if CUDAGraphMode.PIECEWISE in expected:
+        assert {
+            (q, tuple(sizes))
+            for kind, q, sizes in plan
+            if kind == CUDAGraphMode.PIECEWISE
+        } == {(6, (8, 2, 1)), (1, (8,)), (2, (8,))}
+
+
+def test_hybrid_preserves_dense_small_decode_batches_with_token_prefill():
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = (
+        [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))
+    )
+    plan = runner._cudagraph_capture_plan([6])
+    pw, full = plan
+    assert pw == (CUDAGraphMode.PIECEWISE, 1, runner.config.capture_sizes[::-1])
+    assert full[0:2] == (CUDAGraphMode.FULL, 6)
+    assert len(pw[2]) == 83 and len(full[2]) == 87
+    assert set(range(1, 33)) <= set(full[2])
+    assert full[2][0] == 168 and full[2][-1] == 1
+    assert 102 in full[2]  # 600 real tokens dispatch to 612, BS=102.
+    runner.config.max_num_seqs = 128
+    pw, full = runner._cudagraph_capture_plan([6])
+    assert pw[2][0] == 1024  # Prefill token capacity is independent of max BS.
+    assert full[2][0] == 128
+
+
+def test_hybrid_default_ladder_and_internal_tail_shapes():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        )
+    )
+    assert len(Config.capture_sizes.fget(config)) == 83
+    assert len(Config.prefill_capture_sizes.fget(config)) == 91
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = [6, 192, 768]
+    runner._extra_piecewise_capture_shapes = lambda sizes, qs: [(128, 1), (256, 1)]
+    pw, full = runner._cudagraph_capture_plan([6])
+    assert pw[2] == [768, 256, 192, 128, 6]
+    assert full[2] == [128] + list(range(32, 0, -1))
+
+
+@pytest.mark.parametrize("max_tokens", [1536, 2048, 16384])
+def test_default_2k_prefill_preserves_full_and_draft_decode_ladder(max_tokens):
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+        )
+    )
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.max_num_batched_tokens = max_tokens
+    runner.config.capture_sizes = Config.capture_sizes.fget(config)
+    baseline = runner._cudagraph_capture_plan([1, 2, 4, 6])
+    runner.config.prefill_sizes = Config.prefill_capture_sizes.fget(config)
+    extended = runner._cudagraph_capture_plan([1, 2, 4, 6])
+    assert extended[1:] == baseline[1:]  # Draft uses the union of these BS lists.
+    expected = list(range(1152, min(max_tokens, 2048) + 1, 128))
+    assert extended[0][2] == expected[::-1] + baseline[0][2]
+
+
+@pytest.mark.parametrize("max_seqs,max_tokens", [(256, 16384), (7, 16384), (256, 48)])
+@pytest.mark.parametrize("ceiling", [16, 1024])
+def test_hybrid_small_decode_batches_respect_capacity_and_dispatch_exactly(
+    max_seqs, max_tokens, ceiling
+):
+    import numpy as np
+
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = [1, 2, 4, 8, ceiling]
+    runner.config.max_num_seqs = max_seqs
+    runner.config.max_num_batched_tokens = max_tokens
+    plan = runner._cudagraph_capture_plan([2, 4, 6])
+    by_q = {
+        q: np.asarray(sizes[::-1])
+        for mode, q, sizes in plan
+        if mode == CUDAGraphMode.FULL
+    }
+    union = np.asarray(sorted({int(bs) for sizes in by_q.values() for bs in sizes}))
+    for q, sizes in by_q.items():
+        bound = min(max_seqs, max_tokens // 6, min(ceiling, max_tokens) // q)
+        assert all(0 < bs <= bound for bs in sizes)
+        for bs in range(1, min(32, bound) + 1):
+            batch = SimpleNamespace(
+                total_tokens_num_prefill=0,
+                total_tokens_num=bs * q,
+                total_seqs_num=bs,
+                is_dummy_run=False,
+            )
+            mode = ForwardMode.decide(
+                batch=batch,
+                dp_size=1,
+                dp_group=None,
+                enforce_eager=False,
+                step_needs_eager=False,
+                capture_sizes=union,
+                capture_sizes_by_q=by_q,
+                captured_tokens=None,
+                is_block_drafter=True,
+                tbo_on=False,
+                local_tbo=(False, False, 0, 0),
+                max_seqlen_q=q,
+            )
+            assert mode.use_cudagraph and not mode.piecewise_captured
+            assert mode.running_bs == bs and mode.running_tokens == bs * q
+
+
+@pytest.mark.parametrize("from_cli", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["FULL", "PIECEWISE", "AF_PIECEWISE", "FULL_AND_PIECEWISE"]
+)
+def test_capture_defaults_reach_engine_config_without_explicit_sizes(mode, from_cli):
+    import argparse
+
+    from atom.model_engine.arg_utils import EngineArgs
+
+    if from_cli:
+        parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+        args = EngineArgs.from_cli_args(parser.parse_args(["--cudagraph-mode", mode]))
+    else:
+        args = EngineArgs(cudagraph_mode=mode)
+    kwargs = args._get_engine_kwargs()
+    assert "cudagraph_capture_sizes" not in kwargs
+    config = SimpleNamespace(compilation_config=kwargs["compilation_config"])
+    expected = (
+        [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 1025, 16))
+        if mode == "FULL_AND_PIECEWISE"
+        else [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128, 256, 512]
+    )
+    assert Config.capture_sizes.fget(config) == expected
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [
+        [1024],
+        [8, 128, 704],
+        [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 48, 64, 128, 256, 512],
+    ],
+)
+def test_hybrid_cli_explicit_capture_sizes_override_default(sizes):
+    import argparse
+
+    from atom.model_engine.arg_utils import EngineArgs
+
+    parser = EngineArgs.add_cli_args(argparse.ArgumentParser())
+    args = EngineArgs.from_cli_args(
+        parser.parse_args(
+            [
+                "--cudagraph-mode",
+                "FULL_AND_PIECEWISE",
+                "--cudagraph-capture-sizes",
+                str(sizes),
+            ]
+        )
+    )
+    config = SimpleNamespace(
+        compilation_config=args._get_engine_kwargs()["compilation_config"]
+    )
+    assert Config.capture_sizes.fget(config) == sizes
+    config.capture_sizes = sizes
+    assert Config.prefill_capture_sizes.fget(config) == sizes
+
+
+def test_python_hybrid_capture_ceiling_override_is_preserved():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE, cuda_graph_sizes=[256]
+        )
+    )
+    assert Config.capture_sizes.fget(config) == [1, 2, 4] + list(range(8, 257, 8))
+    config.capture_sizes = Config.capture_sizes.fget(config)
+    assert Config.prefill_capture_sizes.fget(config) == config.capture_sizes
+
+
+def test_independent_prefill_override_does_not_change_decode():
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_capture_sizes=[8, 128, 512],
+            cudagraph_prefill_capture_sizes=[128, 512, 1024, 2048],
+        )
+    )
+    assert Config.capture_sizes.fget(config) == [8, 128, 512]
+    assert Config.prefill_capture_sizes.fget(config) == [128, 512, 1024, 2048]
+
+
+@pytest.mark.parametrize("query,expected_bs", [(2, 100), (6, 102), (4, 100)])
+def test_decode_padding_selects_ladder_for_query(query, expected_bs):
+    import numpy as np
+
+    batch = SimpleNamespace(
+        total_tokens_num_prefill=0,
+        total_tokens_num=100 * query,
+        total_seqs_num=100,
+        is_dummy_run=False,
+    )
+    mode = ForwardMode.decide(
+        batch=batch,
+        dp_size=1,
+        dp_group=None,
+        enforce_eager=False,
+        step_needs_eager=False,
+        capture_sizes=np.asarray([1, 100, 102, 128]),
+        capture_sizes_by_q={2: np.asarray([1, 100, 128]), 6: np.asarray([1, 102, 128])},
+        captured_tokens=None,
+        is_block_drafter=True,
+        tbo_on=False,
+        local_tbo=(False, False, 0, 0),
+        max_seqlen_q=query,
+    )
+    assert mode.running_bs == expected_bs
+    assert mode.running_tokens == expected_bs * query
+    assert mode.use_cudagraph == (query in (2, 6))
+    assert not mode.piecewise_captured
+
+
+def test_hybrid_decode_replays_full_graph_even_when_token_bucket_exists(monkeypatch):
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner._detailed_label_suffix = lambda batch: ""
+    runner._piecewise_sorted_tokens = [6, 12, 48]
+    runner.logits_in_graph = False
+    output = torch.zeros(48, 2)
+    runner.forward_vars = {"outputs": output}
+    calls = []
+
+    def replay():
+        calls.append("full")
+        output.fill_(7)
+
+    runner.graphs = {(8, 6): SimpleNamespace(replay=replay)}
+
+    class Model:
+        def __call__(self, *args):
+            raise AssertionError("hybrid decode must not run piecewise Python")
+
+        def compute_logits(self, hidden):
+            return hidden + 1
+
+    runner.model = Model()
+    mode = ForwardMode(
+        use_cudagraph=True,
+        is_prefill=False,
+        scheduled_bs=3,
+        scheduled_tokens=18,
+        running_bs=8,
+        running_tokens=48,
+        running_tokens_are_unified=True,
+        max_seqlen_q=6,
+        piecewise_captured=False,
+        tbo_collective_active=False,
+    )
+    context = SimpleNamespace(
+        context=SimpleNamespace(
+            scheduled_bs=3,
+            scheduled_tokens=18,
+            running_bs=8,
+            is_prefill=False,
+            is_dummy_run=False,
+            forward_mode=mode,
+            positions=torch.zeros(48, dtype=torch.int64),
+        ),
+        attn_metadata=SimpleNamespace(max_seqlen_q=6),
+        ubatch_slices=None,
+    )
+    monkeypatch.setattr(model_runner, "get_forward_context", lambda: context)
+    logits, hidden = runner.run_model(torch.zeros(18, dtype=torch.int32))
+    assert calls == ["full"]
+    torch.testing.assert_close(hidden, torch.full((18, 2), 7.0))
+    torch.testing.assert_close(logits, torch.full((18, 2), 8.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+def test_full_decode_and_af_prefill_share_model_with_live_metadata(monkeypatch):
+    import numpy as np
+
+    from atom.model_ops.attentions.deepseek_v41.metadata import BatchStep, RequestSpan
+    from atom.models.deepseek_v41 import runtime
+    from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+    from atom.utils import cuda_graph
+    from atom.utils.backends import split_graph
+    from atom.utils.cuda_graph import (
+        BatchDescriptor,
+        CUDAGraphOptions,
+        CUDAGraphWrapper,
+    )
+
+    step = BatchStep(
+        (RequestSpan(0, 0, 0, 4, 0),),
+        torch.zeros(4, device="cuda", dtype=torch.int64),
+        torch.tensor([0, 4], device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.zeros(4, device="cuda", dtype=torch.int32),
+        torch.zeros(1, 1, device="cuda", dtype=torch.int32),
+        scheduled=4,
+        max_q_len=4,
+        request_cached_until=np.zeros(1, dtype=np.int32),
+    )
+    step.indptrs = {0: (step.cu_seqlens_q, None, 0)}
+    cache = SimpleNamespace(pool=torch.zeros(1, device="cuda"))
+
+    class Core:
+        spec = LayerAttentionSpec(0, 0, AttentionMode.WINDOW)
+
+        def __call__(self, hidden, scale, cache, step, rope, queries=None):
+            cache.pool.add_(1)
+            return hidden + step.positions[None, :, None]
+
+    outputs = cuda_graph.StableOutputs(capacity=8, token_dim=1)
+    layer = SimpleNamespace(
+        layer_name="hybrid.layer",
+        attn=Core(),
+        af_piecewise=True,
+        af_zero_copy_hidden=True,
+        piecewise_outputs=outputs,
+    )
+    context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        batch_descriptor=None,
+        in_hipgraph=True,
+        context=SimpleNamespace(is_dummy_run=False),
+        no_compile_layers={"hybrid.layer": (layer, None)},
+        attn_metadata=SimpleNamespace(
+            step=step,
+            cache=cache,
+            queries=None,
+            dummy=False,
+            cudagraph_key=(4,),
+            engram_embeddings={},
+            image_mask=None,
+        ),
+    )
+    from atom.utils import forward_context
+
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: context)
+    monkeypatch.setattr(runtime, "get_forward_context", lambda: context)
+    monkeypatch.setattr(cuda_graph, "get_forward_context", lambda: context)
+    config = SimpleNamespace(compilation_config=SimpleNamespace())
+    pieces = []
+
+    def backend(gm, inputs):
+        split, items = split_graph(gm, [])
+        for item in items:
+            if not item.is_splitting_graph:
+                wrapper = CUDAGraphWrapper(
+                    item.graph,
+                    config,
+                    CUDAGraphMode.PIECEWISE,
+                    CUDAGraphOptions(weak_ref_output=False),
+                )
+                split.__dict__[item.submod_name] = wrapper
+                pieces.append(wrapper)
+        return split
+
+    def forward(hidden):
+        torch.ops.aiter.v41_piecewise_begin(hidden)
+        output = torch.ops.aiter.v41_piecewise_attention(hidden * 2, "hybrid.layer") + 3
+        torch.ops.aiter.v41_piecewise_end(output)
+        return output
+
+    compiled = torch.compile(forward, backend=backend, fullgraph=True, dynamic=True)
+    hidden = torch.ones(1, 4, 2, device="cuda")
+    destination = torch.empty_like(hidden)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        compiled(hidden)
+        context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+        context.batch_descriptor = BatchDescriptor(4)
+        compiled(hidden)
+        context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+        context.batch_descriptor = None
+        compiled(hidden)
+        full = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(full):
+            destination.copy_(compiled(hidden))
+    torch.cuda.current_stream().wait_stream(stream)
+    runner = next(iter(layer._piecewise_core_runners.values()))
+    assert not runner._graphs
+    context.in_hipgraph = False
+    cache.pool.zero_()
+    for i, use_full in enumerate([True, False, True, False], 1):
+        hidden.fill_(i)
+        step.positions.fill_(10 * i)
+        if use_full:
+            full.replay()
+            actual = destination
+        else:
+            context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            context.batch_descriptor = BatchDescriptor(4)
+            actual = compiled(hidden)
+        torch.testing.assert_close(actual, torch.full_like(hidden, 12 * i + 3))
+        assert cache.pool.item() == i
+    assert len(runner._graphs) == 1
+    runner.release_graphs()
+    for piece in pieces:
+        piece.release_graphs()
+
+
+@pytest.mark.parametrize("capacity", [0, 8])
+def test_model_core_uses_token_axis_and_fixed_output_capacity(capacity):
+    from atom.models.deepseek_v41.model import Block
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs(capacity=capacity, token_dim=1)
+    layer = SimpleNamespace(
+        layer_name="test.capacity",
+        attn=lambda x, *args, **kwargs: x + 1,
+    )
+    step = SimpleNamespace(requests=[1])
+    pointers = {}
+    for n, value in [(3, 1.0), (8, 2.0), (3, 3.0)]:
+        result = Block.attention_forward(
+            layer,
+            torch.full((1, n, 2), value),
+            None,
+            step,
+            None,
+            piecewise=True,
+            outputs=outputs,
+        )
+        torch.testing.assert_close(result, torch.full((1, n, 2), value + 1))
+        assert result.data_ptr() == pointers.setdefault(n, result.data_ptr())
+    assert len(outputs._slots) == (1 if capacity else 2)
+    assert (pointers[3] == pointers[8]) == bool(capacity)
+
+
+def test_stable_output_role_keeps_different_shapes_separate():
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs(token_dim=1)
+    small = outputs.deliver("engram", torch.ones(1, 3, 2))
+    large = outputs.deliver("engram", torch.full((1, 8, 2), 5.0))
+    assert small.shape == (1, 3, 2)
+    assert large.shape == (1, 8, 2)
+    assert small.data_ptr() != large.data_ptr()
+    torch.testing.assert_close(small, torch.ones_like(small))
+
+
+@pytest.mark.parametrize("backend", ["base", "v4", "mha", "mla"])
+def test_unsupported_token_prefill_keeps_hybrid_full_decode_ladder(backend):
+    from atom.model_ops.attentions.aiter_attention import AiterAttentionMetadataBuilder
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
+    from atom.model_ops.attentions.backends import AttentionMetadataBuilder
+    from atom.model_ops.attentions.deepseek_v4_attn import (
+        DeepseekV4AttentionMetadataBuilder,
+    )
+
+    builders = {
+        "base": AttentionMetadataBuilder,
+        "v4": DeepseekV4AttentionMetadataBuilder,
+        "mha": AiterAttentionMetadataBuilder,
+        "mla": AiterMLAMetadataBuilder,
+    }
+    runner = _runner(CUDAGraphMode.FULL_AND_PIECEWISE)
+    runner.config.capture_sizes = [6, 192, 608, 768]
+    supported = runner._cudagraph_capture_plan([2, 6])
+    runner.attn_metadata_builder = builders[backend]
+    fallback = runner._cudagraph_capture_plan([2, 6])
+    assert fallback == [entry for entry in supported if entry[0] == CUDAGraphMode.FULL]
+    assert 102 in fallback[1][2]
+    runner.capture_sizes = [8, 2, 1]
+    runner.config.compilation_config.cudagraph_mode = CUDAGraphMode.AF_PIECEWISE
+    assert runner._cudagraph_capture_plan([6]) == [
+        (CUDAGraphMode.PIECEWISE, 6, [8, 2, 1])
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs")
+def test_capacity_results_keep_contiguous_planes_across_graph_shapes():
+    from atom.utils.cuda_graph import StableOutputs
+
+    outputs = StableOutputs()
+    recorded = {}
+    source = torch.zeros(48, device="cuda")
+    for width in (8, 3, 5):
+        shape = (2, width * 3)
+        view = outputs.empty(
+            "indices", shape, capacity=48, dtype=torch.float32, device="cuda"
+        )
+        assert view.is_contiguous()
+        result = torch.empty_like(view)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            view.copy_(source[: view.numel()].view(shape))
+            result.copy_(view + 1)
+        recorded[width] = graph, view, result
+    assert len({view.data_ptr() for _, view, _ in recorded.values()}) == 1
+    for i, width in enumerate((3, 8, 5, 3, 8), 1):
+        source.copy_(torch.arange(48, device="cuda") + i * 100)
+        graph, view, result = recorded[width]
+        graph.replay()
+        torch.testing.assert_close(result, source[: view.numel()].view_as(view) + 1)
+    assert len(outputs._slots) == 1
+    with pytest.raises(ValueError, match="capacity"):
+        outputs.empty("indices", (49,), capacity=48, dtype=torch.float32, device="cuda")

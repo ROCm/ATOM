@@ -402,6 +402,16 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     assert sorted(histories[1].tolist()) == ([5, 7] if image is None else [-1, 5])
 
 
+@pytest.mark.parametrize("dp", [False, True])
+def test_piecewise_token_padding_preserves_single_rank_replay(dp):
+    from atom.config import CUDAGraphMode
+
+    forward = _forward([500], **{"step.width": 512})
+    forward.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+    forward.dp_metadata = object() if dp else None
+    assert replayable(forward, 512) is (not dp)
+
+
 # ── DP attention: the step's DP sync carries each stage's token counts ───
 
 

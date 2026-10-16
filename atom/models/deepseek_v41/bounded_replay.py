@@ -92,7 +92,8 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do padded steps.
+    row. Single-rank PIECEWISE token padding can still replay the live
+    requests' tails.
 
     Under DP attention the decision is not made here: each rank decided from
     its batch before the step (`replays_batch`) and told its group, and it
@@ -113,16 +114,22 @@ def replayable(forward, num_tokens: int) -> bool:
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
     # TBO context still identifies them, including the child at token offset 0.
+    from atom.config import CUDAGraphMode
     from atom.utils.tbo.ubatching import tbo_active
 
     if tbo_active():
         return False
     step = getattr(metadata, "step", None)
+    # Single-rank token padding does not change request spans or the tail plan.
+    token_padding = (
+        getattr(forward, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+        and getattr(forward, "dp_metadata", None) is None
+    )
     return not (
         step is None
         or step.decode
         or num_tokens != step.width
-        or step.width != step.scheduled
+        or (step.width != step.scheduled and not token_padding)
     )
 
 
@@ -272,6 +279,8 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up = _upload(
         device,
         torch.int32,
+        buffers=step.result_buffers,
+        namespace="tail_int",
         rows=rows,
         cu=np.concatenate(([0], ends)),
         batch_ids=batch_ids,
@@ -288,9 +297,19 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up |= _upload(
         device,
         step.positions.dtype,
+        buffers=step.result_buffers,
+        namespace="tail_position",
         positions=positions,
         last_positions=positions[last],
     )
+
+    def keep(name, tensor):
+        return (
+            tensor
+            if step.result_buffers is None
+            else step.result_buffers.deliver(("tail", name), tensor)
+        )
+
     tail = BatchStep(
         tuple(
             RequestSpan(s.request_id, int(start), int(end - n), n, s.slot)
@@ -300,12 +319,17 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
         up["cu"],
         up["slots"],
         up["batch_ids"],
-        step.block_tables.index_select(0, up["requests"]),
+        keep("block_tables", step.block_tables.index_select(0, up["requests"])),
         scheduled=int(ends[-1]),
         max_q_len=int(lengths.max()),
-        visible=dict(
-            zip(step.visible, _gather_rows(up["rows"], *step.visible.values()))
-        ),
+        visible={
+            r: keep(("visible", r), value)
+            for r, value in zip(
+                step.visible, _gather_rows(up["rows"], *step.visible.values())
+            )
+        },
+        result_buffers=step.result_buffers,
+        buffer_namespace="tail",
         request_positions=starts.astype(np.int32),
         swa_replay_start=up["floors"],
         swa_cached_until=up["cached_until"],
@@ -323,18 +347,16 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     )
 
 
-def _upload(device, dtype, **arrays):
+def _upload(device, dtype, *, buffers=None, namespace=None, **arrays):
     """``arrays`` on ``device`` as ``dtype``, in one copy."""
     names = list(arrays)
     host = np.concatenate([np.asarray(arrays[k]) for k in names]).astype(
         torch.empty(0, dtype=dtype).numpy().dtype
     )
-    return dict(
-        zip(
-            names,
-            upload_numpy(host, device).split([len(arrays[k]) for k in names]),
-        )
-    )
+    value = upload_numpy(host, device)
+    if buffers is not None:
+        value = buffers.deliver(namespace, value)
+    return dict(zip(names, value.split([len(arrays[k]) for k in names])))
 
 
 def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
@@ -348,10 +370,25 @@ def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
         ({s.candidate_source for s in specs} - {None} - own) & parent.candidates.keys()
     )
     rows, tail = plan.tail_rows, plan.tail
+    tail.layer_specs = tuple(specs)
     taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
-    tail.selected.update(zip(owners, taken))
+    for owner, value in zip(owners, taken):
+        tail.selected[owner] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "selected", owner), value
+            )
+        )
     taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
-    tail.candidates.update(zip(sources, taken))
+    for source, value in zip(sources, taken):
+        tail.candidates[source] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "candidates", source), value
+            )
+        )
 
 
 @contextlib.contextmanager
@@ -373,7 +410,15 @@ def rows_of(metadata, step, queries=None, rows=None):
     indexed.indptrs = fill_step_indptrs(
         indexed, metadata.cache.geometry, metadata.cache.indptr_buffers
     )
+    if getattr(step, "result_buffers", None) is not None:
+        # Bind the tail's normal backend workspace after its row mapping and
+        # carried results are ready. A query-only boundary remains eager.
+        metadata.cache.prepare_attention(step)
     outer = metadata.step, metadata.queries, metadata.image_mask
+    outer_key = getattr(metadata, "cudagraph_key", None)
+    metadata.cudagraph_key = (
+        metadata.cache.graph_layout(step, queries) if outer_key is not None else None
+    )
     metadata.step, metadata.queries = step, queries
     if rows is not None and outer[2] is not None:
         # [1, tokens]: an MoE router routes image rows by it
@@ -382,5 +427,6 @@ def rows_of(metadata, step, queries=None, rows=None):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
+        metadata.cudagraph_key = outer_key
         outer[0].indptrs = {}
         outer[0].tiles.clear()

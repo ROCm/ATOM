@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from atom.config import CUDAGraphMode
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_loader.weight_utils import local_model_dir
@@ -66,6 +67,8 @@ class DeepseekV41Backend(AttentionBackend):
 
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
+    topology = ()
+    capture_attention = False
     capture_owns_cu_seqlens_q = True
     tbo_comm_stream_priority = -1
 
@@ -123,6 +126,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
         ]
+        self.topology = tuple(topology)
+        self.capture_attention = (
+            model_runner.config.compilation_config.cudagraph_mode
+            in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
+        )
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         from atom.models.deepseek_v41.bounded_replay import (
@@ -407,6 +415,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
+            topology=self.topology,
+            candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -611,6 +621,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                topology=self.topology,
+                candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
             )
             if batch.is_dummy_run
             else self.cache
@@ -752,8 +764,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         return metadata, step.positions
 
-    @staticmethod
     def _assemble_metadata(
+        self,
         cache,
         step,
         rows,
@@ -764,6 +776,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         image_mask=None,
         engram_embeddings=None,
     ):
+        # Plain piecewise runs attention eagerly; FULL records its normal
+        # allocations. Only AF needs result slots shared by separate regions.
+        if self.capture_attention and not dummy:
+            cache.prepare_attention(step)
         metadata = AttentionMetaData(
             cu_seqlens_q=step.cu_seqlens_q,
             max_seqlen_q=step.max_q_len,
@@ -786,7 +802,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         metadata.engram_embeddings = (
             {} if engram_embeddings is None else engram_embeddings
         )
+        metadata.cudagraph_key = self.cudagraph_key(metadata)
         return metadata
+
+    def cudagraph_key(self, metadata):
+        if not self.capture_attention or metadata.dummy:
+            return None
+        return metadata.cache.graph_layout(metadata.step, metadata.queries)
 
     @staticmethod
     def _token_mask(batch, spans, tokens):
@@ -829,6 +851,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 histories[k] = mapping.advance_history(None, compressed)[0]
         return resumes, floors, cached, histories
+
+    supports_piecewise_prefill = True
+
+    def prepare_prefill_padded(self, batch, running_bs, running_tokens):
+        # The request spans stay exact; begin_step marks the padded rows with
+        # batch_id=-1 and extends per-token metadata to the chosen graph bucket.
+        return self._prepare(
+            batch, running_bs, running_tokens, query_prefix_ready=True, is_prefill=True
+        )
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
@@ -1149,6 +1180,34 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def commit_speculative_state(self, metadata, last_token_indices):
         if metadata.cache.pending is not None:
             metadata.cache.commit_tentative(metadata.step, last_token_indices)
+
+    def build_for_piecewise_capture(self, num_tokens):
+        """Capture dense token buckets without binding request-shaped attention."""
+        if not 0 < num_tokens <= self.max_num_batched_tokens:
+            raise ValueError("CSA2 piecewise capture exceeds the token buffer")
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=(),
+            num_scheduled_tokens=(),
+            context_lens=(),
+            state_slots_committed=(),
+            total_seqs_num=0,
+            total_tokens_num=0,
+            is_final_chunk=None,
+            replaying={},
+        )
+        metadata, positions = self._prepare(batch, 1, num_tokens, engram_live=False)
+        metadata.dummy = True
+        metadata.engram_embeddings = {}
+        return metadata, Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=0,
+            scheduled_tokens=0,
+            running_bs=1,
+            running_tokens=num_tokens,
+        )
 
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Binds the serving allocation, as V4 does: a scratch cache would bake

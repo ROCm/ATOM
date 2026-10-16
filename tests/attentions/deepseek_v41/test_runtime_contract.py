@@ -308,27 +308,20 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         validate_runtime_config(value)
 
 
-def test_level3_requires_full_graph_or_eager_runtime():
+@pytest.mark.parametrize(
+    "mode_name", ["FULL", "PIECEWISE", "AF_PIECEWISE", "FULL_AND_PIECEWISE"]
+)
+def test_level3_accepts_full_and_piecewise_modes(mode_name):
     from atom.config import CUDAGraphMode
 
-    validate_runtime_config(runtime_config(compilation_config=SimpleNamespace(level=3)))
     validate_runtime_config(
         runtime_config(
             enforce_eager=False,
             compilation_config=SimpleNamespace(
-                level=3, cudagraph_mode=CUDAGraphMode.FULL
+                level=3, cudagraph_mode=CUDAGraphMode[mode_name]
             ),
         )
     )
-    with pytest.raises(ValueError, match="level 3 CUDA Graph mode"):
-        validate_runtime_config(
-            runtime_config(
-                enforce_eager=False,
-                compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
-                ),
-            )
-        )
 
 
 @pytest.mark.parametrize("rows", [8, 16, 32])
