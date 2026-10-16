@@ -1261,6 +1261,59 @@ models:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
+      # The DSpark4 C88 cell with its prefix tier -- the paged KV chunks and
+      # the KDA state images -- in a Mooncake Store instead of LMCache: ATOM's
+      # mooncake_store offload connector, kimi_k3 layout. Dispatch-only
+      # (suite=mooncake_store). TP8 prefill uses every NIC, so the owners share
+      # them, one pool per NIC (MOONCAKE_STORE_POOLS=per_nic): each rank reads
+      # and writes its own NIC's pool. 8 x 176 GiB on each node, 704 GiB per
+      # NUMA node, on the 2 MiB HugeTLB pages pd_submit.sh asks the Spur prolog
+      # for (hugepages_2m=node0:360448,node1:360448; THP on a node that reserved
+      # none): 352 GiB per rank against the LMCache cell's 224, so the 128 GiB
+      # of hard-pinned state images leave the KV more room than it has there.
+      # Chunks are 1024 tokens, one virtual block of TP8+DCP8 at block 128, as
+      # LMCACHE_CHUNK_SIZE is in the LMCache cell.
+      mooncake_store:
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-mcstore-1m-c88
+          display_topology: 1P1D-TP8-DCP8-DSPARK4-MCSTORE
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_agentic_hc_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            # Restated: a merge cannot drop the LMCache cell's LMCACHE_* keys.
+            # No ATOM_NUMA_BIND, which the LMCache cell sets for its CPU tier:
+            # the owners take 704 GiB of each NUMA node before the workers
+            # start, and each rank then pins ~168 GiB of expert staging to load
+            # its weights. Bound to their node, the prefill ranks stalled
+            # there for 20+ min (run 38873740028); the decode ranks, unbound,
+            # loaded beside the same owners in seconds.
+            prefill:
+              OFFLOAD_PROFILE: "1"
+              OFFLOAD_GPU_STAGING_CHUNKS: "32"
+              # The state images' LRU budget per rank, as in the LMCache cell.
+              OFFLOAD_STATE_CPU_SIZE: "128"
+              MOONCAKE_STORE: "1"
+              MOONCAKE_STORE_POOLS: "per_nic"
+              MOONCAKE_STORE_OWNERS: "0:176:rdma0;0:176:rdma1;0:176:rdma2;0:176:rdma3;1:176:rdma4;1:176:rdma5;1:176:rdma6;1:176:rdma7"
+              MOONCAKE_STORE_DECODE_OWNERS: "0:176:rdma0;0:176:rdma1;0:176:rdma2;0:176:rdma3;1:176:rdma4;1:176:rdma5;1:176:rdma6;1:176:rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              MOONCAKE_STORE_COMPACT_TIMEOUT: "1800"
+              # The owners fault all their memory before the workers start, and
+              # the dropper would evict the loader's prefetched shards: K3 then
+              # took ~170 s a shard from /share_nfs instead of ~3 s.
+              MOONCAKE_STORE_PAGE_CACHE_DROPPER_S: "0"
+              MOONCAKE_STORE_WORKER_CONFIG: '{"mooncake_store.chunk_tokens":1024}'
+              # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301}
+
     accuracy:
       task: gsm8k
       fewshot: 5
