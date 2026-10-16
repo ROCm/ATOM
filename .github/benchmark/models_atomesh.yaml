@@ -1373,7 +1373,7 @@ models:
               ATOM_DRAFT_CUDAGRAPH: '1'
               ATOM_PREFIX_CACHE_POLICY: slru
               ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
-              ATOM_AITER_SCATTER_REF: 2c954755467419d466b55dd15659280420495fe1
+              ATOM_AITER_SCATTER_REF: b1501c49fde104d2d84e38338b1d61351e6638ea
             prefill:
               HIP_VISIBLE_DEVICES: 0,1,2,3
               LMCACHE_LOCAL_CPU: 'True'
@@ -1399,6 +1399,16 @@ models:
             prepare_lmcache_host_memory: true
             mesh_source: image
           run_eval: false
+
+        - <<: *minimax_m3_workspace_c32
+          name: minimax-m3-paged-prefill-kernel-tuning
+          concurrency: [1]
+          benchmark:
+            kind: paged_prefill_tuning
+            prepare_lmcache_host_memory: false
+            mesh_source: image
+          runner:
+            time_limit: '00:20:00'
 
         - <<: *minimax_m3_workspace_c32
           name: minimax-m3-fp4-1p1d-tp4-eagle3-gsm8k-20shot-full-c32

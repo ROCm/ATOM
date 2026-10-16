@@ -39,6 +39,20 @@ if [[ -n "${scatter_aiter_ref}" ]]; then
   source "${ATOMESH_SCRIPT_DIR}/prepare_scatter_aiter_source.sh" "${scatter_aiter_ref}"
 fi
 
+# A standalone kernel workload using the benchmark allocation and artifacts.
+# No model/runtime hooks: this process exits before creating any P/D servers.
+if [[ "${BENCHMARK_KIND:-}" == "paged_prefill_tuning" ]]; then
+  baseline_source="$(mktemp -d /tmp/atomesh-paged-baseline.XXXXXX)"
+  git -C "${baseline_source}" init -q
+  git -C "${baseline_source}" remote add origin https://github.com/ROCm/aiter.git
+  git -C "${baseline_source}" fetch --depth=1 origin 2c954755467419d466b55dd15659280420495fe1
+  git -C "${baseline_source}" checkout --detach FETCH_HEAD
+  git -C "${baseline_source}" submodule update --init --recursive --depth=1
+  exec python3 "${ATOMESH_SCRIPT_DIR}/paged_prefill_tune.py" \
+    --baseline-source "${baseline_source}" \
+    --output "${RUN_DIR}/benchmark_results/paged-prefill-tuning"
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"

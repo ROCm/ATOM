@@ -14,6 +14,7 @@ from pathlib import Path
 
 CASE = "minimax-m3-mxfp4-minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32-workspace_validation"
 CASES = (
+    "minimax-m3-mxfp4-minimax-m3-paged-prefill-kernel-tuning-workspace_validation",
     CASE,
     "minimax-m3-mxfp4-minimax-m3-fp4-1p1d-tp4-eagle3-gsm8k-20shot-full-c32-workspace_validation",
 )
@@ -22,6 +23,8 @@ ROOTS = (
     Path("/it-share/ATOMESH_LOG"),
 )
 PATTERNS = (
+    "slurm_job-*/benchmark_results/paged-prefill-tuning/*.log",
+    "slurm_job-*/benchmark_results/paged-prefill-tuning/*.jsonl",
     "slurm-*.out",
     "slurm-*.err",
     "slurm_job-*/rank-*/*.log",

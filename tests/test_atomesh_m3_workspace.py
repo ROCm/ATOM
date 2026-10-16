@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Validate the two manual MiniMax feature jobs before allocating GPUs."""
+"""Validate the manual MiniMax feature and kernel jobs before allocating GPUs."""
 
 import importlib.util
 import json
@@ -43,13 +43,20 @@ class WorkspaceJobsTest(unittest.TestCase):
                 override_benchmark_concurrency=None,
                 override_eval_concurrency=None,
             )
-            self.assertEqual(len(cells), 2)
+            self.assertEqual(len(cells), 3)
+            micro = next(
+                c for c in cells if c["benchmark"]["kind"] == "paged_prefill_tuning"
+            )
+            self.assertEqual(micro["num_nodes"], 1)
+            self.assertEqual(micro["runner"]["time_limit"], "00:20:00")
+            self.assertFalse(micro["benchmark"]["prepare_lmcache_host_memory"])
+            cells = [c for c in cells if c is not micro]
             live_spec = importlib.util.spec_from_file_location(
                 "m3_workspace_live", SCRIPT.with_name("collect_minimax_live_logs.py")
             )
             live = importlib.util.module_from_spec(live_spec)
             live_spec.loader.exec_module(live)
-            self.assertEqual(set(live.CASES), {cell["id"] for cell in cells})
+            self.assertEqual(set(live.CASES), {cell["id"] for cell in cells + [micro]})
             perf = next(c for c in cells if not c["eval_only"])
             accuracy = next(c for c in cells if c["eval_only"])
             self.assertEqual(perf["benchmark"]["benchmark_duration"], 3600)
