@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +35,8 @@ logger = logging.getLogger("atom")
 # exporter has recorded it more than 32 times; a fence gets a fresh event after
 # this many records.
 _FENCE_MAX_RECORDS = 31
+# Poll period while a queued submission waits for its fence to complete.
+_READY_POLL_S = 0.0005
 
 
 class _ProducerFences:
@@ -85,10 +88,19 @@ class _TransferThread:
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._thread.start()
 
-    def submit(self, fn: Callable[..., Any], *args: Any) -> None:
+    def submit(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        ready: Callable[[], bool] | None = None,
+    ) -> None:
+        """Queue ``fn(*args)``; with ``ready``, run it once ``ready()`` is true.
+
+        Later submissions wait behind it: the queue keeps submission order.
+        """
         with self._idle:
             self._outstanding += 1
-        self._queue.put((fn, args))
+        self._queue.put((fn, args, ready))
 
     def take_spent(self) -> list[tuple[Any, ...]]:
         """Arguments of finished calls, for the forward thread to drop."""
@@ -118,13 +130,28 @@ class _TransferThread:
         self._queue.put(None)
         self._thread.join(timeout)
 
+    @staticmethod
+    def _wait_ready(ready: Callable[[], bool]) -> None:
+        while True:
+            try:
+                if ready():
+                    return
+            except Exception:
+                # Cannot tell: submit anyway, the server's stream wait still
+                # orders the transfer behind the fence.
+                logger.warning("LMCache MP transfer fence query failed", exc_info=True)
+                return
+            time.sleep(_READY_POLL_S)
+
     def _run(self) -> None:
         while True:
             item = self._queue.get()
             if item is None:
                 return
-            fn, args = item
+            fn, args, ready = item
             try:
+                if ready is not None:
+                    self._wait_ready(ready)
                 fn(*args)
             except BaseException as exc:  # re-raised by raise_error
                 logger.exception("LMCache MP transfer submission failed")
@@ -133,7 +160,7 @@ class _TransferThread:
             finally:
                 with self._spent_lock:
                     self._spent.append(args)
-                del fn, args, item
+                del fn, args, ready, item
                 with self._idle:
                     self._outstanding -= 1
                     if not self._outstanding:

@@ -106,8 +106,10 @@ class LMCacheMPConnector(KVConnectorBase):
         # reused producer fences it needs (see `transfer_thread`).
         self._transfer: _TransferThread | None = None
         self._fences: _ProducerFences | None = None
-        # Same-step saves of the current step, submitted by `after_forward`.
+        # Same-step saves of the current step, held until their forward is
+        # enqueued (`after_forward`) -- and, inline, until it has finished.
         self._after_forward_saves: list[LMCacheReqMeta] = []
+        self._after_forward_ran = False
         self._late_flush_logged = False
 
     def register_kv_caches(
@@ -233,9 +235,10 @@ class LMCacheMPConnector(KVConnectorBase):
             raise RuntimeError("lmcache_mp KV caches are not registered")
 
         self._settle_transfer_thread()
-        # Saves of a step whose `after_forward` never ran: this fence follows
-        # that forward too.
-        self._flush_after_forward(late=True)
+        # Saves still held from the previous step: this fence follows its
+        # forward too.
+        self._flush_after_forward()
+        self._after_forward_ran = False
         event = None
         for req in metadata.requests:
             load = req.load_spec is not None and self._do_load
@@ -253,19 +256,34 @@ class LMCacheMPConnector(KVConnectorBase):
                 self._dispatch(self._submit_save, req, event)
 
     def after_forward(self) -> None:
-        """Submit this step's same-step saves behind its forward.
+        """Fence this step's same-step saves behind its forward.
 
         Called by the model runner right after the step's forward is enqueued
-        (before sampling), so the fence follows every kernel that writes the
-        saved blocks and the server can prepare the store while they run.
+        (before sampling). The fence is recorded here, but a save goes out only
+        once that fence has completed: the server waits for a producer event on
+        the cache's one copy stream and stages block ids with a host-blocking
+        copy, so a save that reached it mid-forward would hold every transfer
+        queued behind it -- loads included -- until the forward ended. With the
+        transfer thread the save is submitted as soon as the fence completes;
+        inline, `get_finished` submits it after the forward has returned.
         """
-        self._flush_after_forward()
+        self._after_forward_ran = True
+        transfer = self._transfer
+        if transfer is None or not self._after_forward_saves:
+            return
+        saves, self._after_forward_saves = self._after_forward_saves, []
+        event = self._producer_fence()
+        for req in saves:
+            transfer.submit(self._submit_save, req, event, ready=event.query)
 
-    def _flush_after_forward(self, *, late: bool = False) -> None:
+    def _flush_after_forward(self) -> None:
+        """Submit held same-step saves; their forward is enqueued or done."""
         saves, self._after_forward_saves = self._after_forward_saves, []
         if not saves:
             return
-        if late and not self._late_flush_logged:
+        if (
+            self._transfer is not None or not self._after_forward_ran
+        ) and not self._late_flush_logged:
             self._late_flush_logged = True
             logger.warning(
                 "LMCache MP: same-step saves were not submitted after their "
@@ -526,9 +544,9 @@ class LMCacheMPConnector(KVConnectorBase):
         """Start of `get_finished`, which runs after the step's forward.
 
         The forward is done, so destroying replaced fences no longer waits on
-        it; and saves its `after_forward` missed still follow it.
+        it, and same-step saves held for it can go out.
         """
-        self._flush_after_forward(late=True)
+        self._flush_after_forward()
         self._settle_transfer_thread()
         if self._fences is not None:
             self._fences.release_retired()

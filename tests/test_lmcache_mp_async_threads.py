@@ -286,57 +286,108 @@ def _meta(*requests):
     return meta
 
 
+class _Fence:
+    """A recorded producer event the test completes by hand."""
+
+    def __init__(self, name):
+        self.name = name
+        self.done = threading.Event()
+
+    def query(self):
+        return self.done.is_set()
+
+    def __repr__(self):
+        return self.name
+
+
 def _fenced_worker(adapter, *, threaded):
     worker = mp_worker.LMCacheMPConnector(_config())
     worker._adapter = adapter
     worker.chunk_size = 8
     worker.block_size = 8
-    fences = iter(f"fence{i}" for i in range(100))
-    worker._producer_fence = lambda: next(fences)
+    worker.fences = []
+
+    def fence():
+        worker.fences.append(_Fence(f"fence{len(worker.fences)}"))
+        return worker.fences[-1]
+
+    worker._producer_fence = fence
     if threaded:
         worker._fences = SimpleNamespace(release_retired=lambda: None)
         worker._transfer = transfer_thread._TransferThread("mp-transfer-test")
     return worker
 
 
+def _submitted(adapter):
+    return [(rid, repr(ev)) for rid, _, ev, _ in adapter.saves]
+
+
 @pytest.mark.usefixtures("fake_lmcache_modules")
-@pytest.mark.parametrize("threaded", [False, True])
-def test_same_step_save_waits_for_after_forward_and_its_own_fence(threaded):
+def test_threaded_same_step_save_goes_out_once_its_forward_fence_completes():
     adapter = _RecordingAdapter()
-    worker = _fenced_worker(adapter, threaded=threaded)
+    worker = _fenced_worker(adapter, threaded=True)
     try:
         worker.start_load_kv(
             _meta(_save(1, after_forward=False), _save(2, after_forward=True))
         )
-        if threaded:
-            worker._transfer.drain(5.0)
+        worker._transfer.drain(5.0)
         # The earlier-step save goes out behind the pre-forward fence ...
-        assert [(rid, ev) for rid, _, ev, _ in adapter.saves] == [
-            ("atom-offload-dp0:1", "fence0")
-        ]
+        assert _submitted(adapter) == [("atom-offload-dp0:1", "fence0")]
         worker.after_forward()
-        if threaded:
-            worker._transfer.drain(5.0)
-        # ... the same-step one behind a fence recorded after the forward.
-        assert [(rid, ev) for rid, _, ev, _ in adapter.saves][1] == (
-            "atom-offload-dp0:2",
-            "fence1",
-        )
-        expected = {"producer_event_recorded": True} if threaded else {}
-        assert adapter.kwargs == [expected, expected]
+        time.sleep(0.02)
+        # ... the same-step one waits for the fence recorded after the forward
+        assert len(adapter.saves) == 1
+        worker.fences[1].done.set()
+        assert worker._transfer.drain(5.0)
+        assert _submitted(adapter)[1] == ("atom-offload-dp0:2", "fence1")
+        assert adapter.kwargs == [{"producer_event_recorded": True}] * 2
+        worker.get_finished()
+        assert len(adapter.saves) == 2  # nothing left to flush
     finally:
         worker.close()
 
 
 @pytest.mark.usefixtures("fake_lmcache_modules")
-def test_same_step_saves_left_by_a_missing_hook_go_out_in_get_finished():
+def test_inline_same_step_save_goes_out_after_the_forward_returns():
     adapter = _RecordingAdapter()
     worker = _fenced_worker(adapter, threaded=False)
     worker.start_load_kv(_meta(_save(3, after_forward=True)))
+    worker.after_forward()  # inline: never submits mid-forward
     assert adapter.saves == []
     worker.get_finished()  # runs after the forward on the same thread
-    # Recorded there, so it still follows the forward.
-    assert [ev for _, _, ev, _ in adapter.saves] == ["fence0"]
+    assert _submitted(adapter) == [("atom-offload-dp0:3", "fence0")]
+    assert adapter.kwargs == [{}]
+    assert not worker._late_flush_logged
+
+
+@pytest.mark.usefixtures("fake_lmcache_modules")
+def test_same_step_saves_left_by_a_missing_hook_go_out_in_get_finished():
+    adapter = _RecordingAdapter()
+    worker = _fenced_worker(adapter, threaded=True)
+    try:
+        worker.start_load_kv(_meta(_save(4, after_forward=True)))
+        worker.get_finished()  # the runner never called after_forward
+        assert worker._transfer.drain(5.0)
+        assert _submitted(adapter) == [("atom-offload-dp0:4", "fence0")]
+        assert worker._late_flush_logged
+    finally:
+        worker.close()
+
+
+def test_transfer_thread_holds_later_submissions_behind_an_unready_one():
+    gate = threading.Event()
+    seen = []
+    thread = transfer_thread._TransferThread("mp-transfer-test")
+    try:
+        thread.submit(seen.append, "same-step save", ready=gate.is_set)
+        thread.submit(seen.append, "next load")
+        time.sleep(0.02)
+        assert seen == []
+        gate.set()
+        assert thread.drain(5.0)
+        assert seen == ["same-step save", "next load"]
+    finally:
+        thread.close(5.0)
 
 
 @pytest.mark.usefixtures("fake_lmcache_modules")

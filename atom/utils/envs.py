@@ -1313,7 +1313,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # forward thread, fenced by reused producer events.
     "OFFLOAD_MP_TRANSFER_THREAD": lambda: _flag_env("OFFLOAD_MP_TRANSFER_THREAD"),
     # lmcache_mp: a prefill chunk's save is emitted in the step that computes
-    # it and submitted right after that step's forward is enqueued.
+    # it and submitted once that step's forward has finished, instead of at the
+    # next step.
     "OFFLOAD_MP_SAVE_SAME_STEP": lambda: _flag_env("OFFLOAD_MP_SAVE_SAME_STEP"),
     # Admit a prefill without waiting for its external-tier lookup when the HBM
     # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
