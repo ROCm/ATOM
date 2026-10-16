@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from atom.model_ops.engram.device.hashing import EngramHashTables, engram_row_indices
-from atom.model_ops.engram.device.staging import engram_staging_cls
+from atom.model_ops.engram.device.staging import EngramStaging
 from atom.model_ops.engram.device.uva import uva_gather_into
 from atom.model_ops.engram.host import EngramHost, EngramPrefetcher, EngramRequest
 from atom.utils import CpuGpuBuffer, envs
@@ -43,7 +43,7 @@ class EngramUva:
             host.max_num_tokens, num_hash_heads, dtype=torch.int64, device=host.device
         )
         self._ids_staging = None
-        self.overlap = engram_staging_cls()(self) if envs.ATOM_ENGRAM_OVERLAP else None
+        self.overlap = EngramStaging(self) if envs.ATOM_ENGRAM_OVERLAP else None
 
     def _rows_from_host(self, requests, rows):
         """Hash on the host and stage the indices through pinned memory.

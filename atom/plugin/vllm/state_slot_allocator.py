@@ -54,19 +54,34 @@ class StateSlotAllocator:
         self._key_to_slot: dict[object, int] = {}
         self._slot_to_key: list[object] = [None] * self.num_slots
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
+        # Slots bound outside a batch, by `reserve`, and not yet claimed by
+        # one. They are live without being active: a parked request's restore
+        # has already written bytes into them. See `reserve`.
+        self._reserved: set = set()
+        self._last_active: set = set()
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
         self.last_fresh_rows: list[int] = []
 
     def release(self, req_keys) -> list[int]:
-        """Return the slots of requests vLLM has finished, preempted or resumed."""
+        """Return the slots of requests vLLM has finished, preempted or resumed.
+
+        A reservation is dropped with the key. Reservations are not otherwise
+        reclaimed until the slot is the least-recently-seen eviction victim,
+        so a request cancelled between its tier load and its first forward
+        would hold one indefinitely. `_last_seen` is reset with it, or the
+        freed slot keeps a recency that makes it the last victim chosen.
+        """
         freed = []
         for k in req_keys:
+            self._reserved.discard(k)
             slot = self._key_to_slot.pop(k, None)
             if slot is None:
                 continue
             self._slot_to_key[slot] = None
-            self._free.append(slot)
+            self._last_seen[slot] = -1
+            if slot not in self._free:
+                self._free.append(slot)
             freed.append(slot)
         return freed
 
@@ -76,7 +91,6 @@ class StateSlotAllocator:
         ``req_keys`` is a per-request sequence of stable, hashable keys (the
         ``req_id`` strings), aligned with the batch rows.
         """
-        self._step += 1
         # Pull num_computed to a Python list in one C call (per-element
         # numpy-scalar -> int was the dominant cost of this per-decode-step
         # loop). req_keys is already a host-side list[str]. Local-bind the
@@ -90,6 +104,23 @@ class StateSlotAllocator:
         )
         n = len(keys)
         active = set(keys)
+        # Reserved-but-unclaimed slots are live too: one holds bytes a parked
+        # request's restore already wrote, and handing it to a batch member
+        # puts two requests on one ring. They are not in `active` because
+        # their request has no batch row yet -- which is why reservations
+        # exist at all.
+        live = active | self._reserved
+        if len(live) > self.num_slots:
+            raise RuntimeError(
+                f"state slot capacity exceeded: {len(active)} active requests + "
+                f"{len(self._reserved - active)} unclaimed restores > "
+                f"{self.num_slots} slots"
+            )
+        # Stepped only once the batch is known to fit: an overfull batch must
+        # leave the allocator exactly as it found it, or the caller that
+        # catches the refusal sees a clock that moved and an eviction order
+        # that shifted with it.
+        self._step += 1
         key_to_slot = self._key_to_slot
         slot_to_key = self._slot_to_key
         last_seen = self._last_seen
@@ -101,7 +132,7 @@ class StateSlotAllocator:
             k = keys[i]
             slot = key_to_slot.get(k)
             if slot is None:
-                slot = self._acquire(active)
+                slot = self._acquire(live)
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)
@@ -112,7 +143,96 @@ class StateSlotAllocator:
             slots[i] = slot
             last_seen[slot] = step
         self.last_fresh_rows = fresh
+        # The batch now owns these: a reservation has been claimed, and the
+        # set a future reservation must not evict is this batch, not the
+        # accumulated history.
+        self._reserved -= active
+        self._last_active = active
         return np.asarray(slots, dtype=np.int32), reset
+
+    def slot_for(self, key):
+        """This key's slot, or None if it has none.
+
+        A reader that needs the slot outside a forward -- the offload leg
+        snapshotting a request's state -- must not create one by asking.
+        """
+        return self._key_to_slot.get(key)
+
+    def reserve(self, key):
+        """Bind *key* to a slot now, outside any batch. Idempotent.
+
+        A connector that restores per-request state has to write it before the
+        request is ever scheduled, and ``assign`` only runs from inside a
+        forward. Reserving is also what keeps the following ``assign`` from
+        reporting the slot as freshly allocated: that report means "reset me",
+        and resetting would zero the bytes the restore just wrote.
+
+        The reservation counts as a sighting, so a slot reserved this step is
+        not the eviction victim chosen by the next one.
+
+        Returns None when every slot belongs to the current batch or to
+        another reservation. That is a real condition, not a corner case:
+        reservations are for requests that are NOT in the batch, so
+        `batch + reservations` can exceed the pool even though vLLM caps
+        concurrency at its size. The caller must then decline the restore and
+        let the request recompute -- taking a slot anyway puts two requests on
+        one ring, which is how this was found (two requests straddling one
+        cursor by a token each).
+        """
+        self._step += 1
+        slot = self._key_to_slot.get(key)
+        if slot is None:
+            # Live = the last batch's keys plus reservations not yet claimed.
+            # A finished request's stale entry is deliberately NOT live: it is
+            # exactly what this reservation should be recycling.
+            slot = self._acquire_unused(self._last_active | self._reserved)
+            if slot is None:
+                return None
+            self._key_to_slot[key] = slot
+            self._slot_to_key[slot] = key
+        self._reserved.add(key)
+        self._last_seen[slot] = self._step
+        return slot
+
+    def release_unclaimed(self, key) -> bool:
+        """Release *key* only if it is a reservation no batch ever claimed.
+
+        That is the whole leak: `reserve` binds a slot for a request parked on
+        a restore, and only the `assign` that claims it clears the
+        reservation, so a request aborted before it ever reaches a forward
+        keeps its slot for good.
+
+        A request that *did* run is deliberately left alone. Its slot is
+        recycled by `_acquire`'s eviction exactly as before, and releasing it
+        eagerly instead measured -21% throughput: the slot churn tripled the
+        stores (16.5 to 59.5 per window) and cost 20% on ITL, because each
+        store is a 5 MiB device-to-host copy contending with decode. The leak
+        is real and the fix for it has to be this narrow.
+        """
+        if key not in self._reserved:
+            return False
+        # `release` takes the batch form -- a bare string would be iterated
+        # character by character and release nothing.
+        self.release([key])
+        return True
+
+    def _acquire_unused(self, live: set):
+        """A slot no live tenant holds, or None without changing ownership."""
+        if self._free:
+            return self._free.pop()
+        victim, victim_seen = None, None
+        for s in range(self.num_slots):
+            if self._slot_to_key[s] in live:
+                continue
+            if victim_seen is None or self._last_seen[s] < victim_seen:
+                victim, victim_seen = s, self._last_seen[s]
+        if victim is None:
+            return None
+        old = self._slot_to_key[victim]
+        if old is not None:
+            self._key_to_slot.pop(old, None)
+        self._slot_to_key[victim] = None
+        return victim
 
     def lookup(self, req_keys) -> np.ndarray:
         """The slots ``req_keys`` are bound to, without binding or resetting any."""

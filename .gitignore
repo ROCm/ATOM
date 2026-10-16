@@ -63,7 +63,3 @@ online_quant_info_*.json
 # so it lands in `git status` on every local run and gets committed by accident.
 # That has happened before (#1662 removed one), hence the rule rather than care.
 unit-report.xml
-
-# Run artefacts from tools/v41_gsm8k_recipe.sh (fingerprints, shas, identity
-# dumps). Two of these directories were committed before this rule existed.
-.gsm8k_*/

@@ -481,6 +481,22 @@ def register_model() -> None:
 
     apply_vllm_v4_prefix_install()
 
+    # Register the V4.1 adapter for the PAGE-backed checkpoint mechanism and
+    # install its hooks. Same install site and the same reason as above, plus
+    # one of its own: EngineCore sizes the pool through the mechanism's
+    # `get_kv_cache_configs` hook, so the adapter has to exist there as well
+    # as in the workers that carve.
+    #
+    # Inert for every other model (the adapter's `matches` is V4.1's config
+    # test) and for V4.1 itself until prefix caching is on
+    # (`state_checkpoints_on`). The reserve patch above defers to it when it
+    # is, so the STATE tail is withheld exactly once.
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        apply_vllm_v41_prefix_install,
+    )
+
+    apply_vllm_v41_prefix_install()
+
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 
     register_gdn_attention_backend()

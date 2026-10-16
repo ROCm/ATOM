@@ -93,13 +93,13 @@ def test_reservations_do_not_evict_each_other():
 def test_releasing_returns_the_slot_to_the_pool():
     allocator = StateSlotAllocator(1)
     first = allocator.reserve("r0")
-    allocator.release("r0")
+    allocator.release(["r0"])
     assert allocator.reserve("r1") == first
 
 
 def test_releasing_an_unknown_key_is_a_no_op():
     allocator = StateSlotAllocator(2)
-    allocator.release("never-seen")
+    allocator.release(["never-seen"])
     assert allocator.reserve("r0") == allocator.reserve("r0")
 
 
@@ -107,7 +107,7 @@ def test_a_released_slot_is_reset_for_its_next_tenant():
     """Release must not leave the next request reading the old one's state."""
     allocator = StateSlotAllocator(1)
     allocator.reserve("r0")
-    allocator.release("r0")
+    allocator.release(["r0"])
     _, reset = allocator.assign(["r1"], [4096])
     assert reset == {0}
 

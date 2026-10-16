@@ -463,6 +463,51 @@ def validate_runtime_config(config):
             _kv_transfer_unsupported(config, on_vllm_plugin),
         ),
         ("RapidServe", config.enable_rapidserve),
+        # DSpark is admitted on the plugin: vLLM owns the draft (it ships
+        # `DSparkV41DraftModel`), proposes from it and decides acceptance with
+        # its own rejection sampler, and what the bridge owes is the CSA2
+        # state a verify step leaves behind. Every other method still has no
+        # driver here, and the platform gate names which one was asked for.
+        (
+            "speculative decoding other than DSpark on the vLLM plugin",
+            on_vllm_plugin
+            and config.speculative_config is not None
+            and getattr(config.speculative_config, "method", None) != "dspark",
+        ),
+        # Not a TODO, and not a flag. vLLM's prefix cache requires the
+        # backend to have left recoverable state at each complete block
+        # boundary -- registering a cached block IS that claim -- and a V4.1
+        # forward leaves state only at the end of the query, never at an
+        # interior boundary. Zeroing `num_prefill_checkpoint_blocks` does not
+        # opt out of the claim: align mode caches the last full block anyway
+        # and the group still answers that boundary (measured).
+        #
+        # The offload connector is what makes reuse admissible instead: it
+        # stores STATE at whole-PAGE boundaries and caps every hit -- vLLM's
+        # own included, through the scheduler mixin -- to one it holds.
+        # Without it there is nothing to cap against. Reviving a block-table
+        # hit on its own means exporting state at a given offset
+        # (`MambaPrefillCheckpointExporter`), which for V4.1 means splitting
+        # `engram_compress`'s plan there.
+        (
+            (
+                "prefix caching on the vLLM plugin without "
+                "AtomLMCacheOffloadConnector"
+            ),
+            on_vllm_plugin
+            and config.enable_prefix_caching
+            and not _kv_connector_owns_v41_state(config)
+            # Checkpoint images are the other owner of that state, and they
+            # own it without a tier: vLLM holds the image in blocks it hashes
+            # under the same prefix and reports a hit only when the pages and
+            # the image are both cached, so the hit is already a complete
+            # resume. The sentence above -- "the STATE side is not replayed
+            # by a block-table hit" -- is what stops being true.
+            #
+            # This clause used to be missing while the comment above already
+            # described it, so the exemption it documents was never applied.
+            and not _v41_state_checkpoints_own_state(config),
+        ),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),
         (

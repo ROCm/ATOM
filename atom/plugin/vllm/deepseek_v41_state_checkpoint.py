@@ -53,7 +53,6 @@ from atom.plugin.vllm.paged_state_checkpoint import (
     install,
     register_state_checkpoint_adapter,
     register_state_checkpoint_layers,
-    state_checkpoint_copy_funcs,
 )
 from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
     SchedulerStateCheckpoints,
@@ -263,10 +262,6 @@ def register_deepseek_v41_state_checkpoint_layers(vllm_config) -> list[str]:
         vllm_config,
         AtomDeepseekV41StateCheckpointLayer,
     )
-
-
-def deepseek_v41_image_state_copy_funcs(mamba_types):
-    return {t: state_checkpoint_copy_funcs() for t in mamba_types}
 
 
 def _native_checkpoint_defaults() -> tuple[int, bool]:

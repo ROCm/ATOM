@@ -49,25 +49,6 @@ class EngramStep:
     candidates: torch.Tensor | None
 
 
-_staging_cls = None
-
-
-def set_engram_staging_cls(cls) -> None:
-    """Pick the `EngramStaging` the Engram runtime builds. Idempotent.
-
-    A frontend with its own answer to `_forks` states it here rather than
-    having this file ask after it, so `model_ops` names no frontend.
-    """
-    global _staging_cls
-
-    _staging_cls = cls
-
-
-def engram_staging_cls():
-    """The class to build; `EngramStaging` unless a frontend replaced it."""
-    return _staging_cls or EngramStaging
-
-
 class EngramStaging:
     def __init__(self, uva):
         self.uva = uva
@@ -84,7 +65,6 @@ class EngramStaging:
             host.max_num_tokens, dtype=torch.int32, device=host.device
         )
         self.step = None
-        self.forked = True
         self.flat = {
             layer: torch.empty(
                 host.max_num_tokens,
@@ -202,67 +182,16 @@ class EngramStaging:
                 live=step.live,
             )
 
-    def _forks(self) -> bool:
-        """Whether to prefetch on a side stream.
-
-        True, and a frontend that breaks captures keeps it true: the overlap
-        between the gather and the layers consuming it is the whole point of
-        the fork, and giving it up is not the price of a breakable capture.
-        What that costs instead is that the two orderings below have to be
-        issued outside the captured segment -- see `_await_layer`.
-
-        The hook stays because a frontend that can do neither has somewhere to
-        say so, and because `consume` and `join` must not order against a
-        stream that was never forked.
-        """
-        return True
-
-    def _await_layer(self, event) -> None:
-        """Order the compute stream behind one layer's prefetch.
-
-        Issued where the layer needs its rows, so later layers' lookups keep
-        running. A frontend whose capture segments end mid-forward overrides
-        this to issue the wait outside the segment: the event was recorded on
-        a stream the capture does not own, and a captured stream waiting on it
-        is refused with `hipErrorStreamCaptureIsolation` ("dependency created
-        on uncaptured work in another stream").
-        """
-        torch.cuda.current_stream(self.host.device).wait_event(event)
-
-    def _await_fork(self) -> None:
-        """Order the compute stream behind every outstanding lookup.
-
-        The same boundary question as `_await_layer`, for the whole stream
-        rather than one layer's event.
-        """
-        torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
-
     def start(self, width):
+        host = self.host
         self._snapshot(width)
-        # Remembered for `consume` and `join`, which otherwise order against a
-        # stream that was never forked.
-        self.forked = self._forks()
+        compute = torch.cuda.current_stream(host.device)
+        # Get the parent BEFORE entering the guard: waiting on ourselves
+        # would neither order the inputs nor join the graph capture.
+        self.stream.wait_stream(compute)
         # past the fork: the side stream reads the snapshot, not the cursor
         self._advance_cursor(width)
-        self._prefetch(width)
-
-    def _prefetch(self, width):
-        """Fork, and issue every layer's lookup on the stream that results.
-
-        Split from `start` so a frontend can wrap exactly this in a capture
-        break. It has to be exactly this: the fork and the lookups belong to
-        the same segment, and `_snapshot` and `_advance_cursor` write state the
-        break would otherwise re-run on every replay.
-        """
-        host = self.host
-        compute = torch.cuda.current_stream(host.device)
-        forking = self.forked
-        issuing = self.stream if forking else compute
-        if forking:
-            # Get the parent BEFORE entering the guard: waiting on ourselves
-            # would neither order the inputs nor join the graph capture.
-            self.stream.wait_stream(compute)
-        with torch.cuda.stream(issuing):
+        with torch.cuda.stream(self.stream):
             for layer in host.layer_ids:
                 ids = engram_snapshot_indices(
                     self.uva.hash_tables,
@@ -296,13 +225,11 @@ class EngramStaging:
                 elif host._tp_group is None:
                     host.buffers[layer].gpu[:width].copy_(self.flat[layer][:width])
                 # Ready means the complete embedding, including TP reassembly.
-                if forking:
-                    self.done[layer].record(issuing)
+                self.done[layer].record(self.stream)
 
     def consume(self, layer, width):
         host = self.host
-        if self.forked:
-            self._await_layer(self.done[layer])
+        torch.cuda.current_stream(host.device).wait_event(self.done[layer])
         if host._tp_group is not None and self.collective is None:
             out = self.flat[layer][:width]
             out = host._tp_group.all_gather(out, use_custom=True, dim=1)
@@ -311,8 +238,7 @@ class EngramStaging:
 
     def join(self):
         # Close the fork even if a partial forward did not consume every layer.
-        if self.forked:
-            self._await_fork()
+        torch.cuda.current_stream(self.host.device).wait_stream(self.stream)
 
 
 class EngramStagedRows(dict):

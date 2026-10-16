@@ -168,6 +168,25 @@ def _split_v41_proxy_layers(kv_cache_spec):
     return proxy, rest
 
 
+def _is_v41_image_layer(name: str) -> bool:
+    """Whether a layer is one PAGE unit of a V4.1 checkpoint image.
+
+    Asks the adapter rather than matching a string here, so the suffix has one
+    owner. False when the mechanism is not importable, which is every build
+    that has no checkpoints at all.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+        )
+
+        return bool(
+            register_v41_state_checkpoint_adapter().is_state_checkpoint_layer(name)
+        )
+    except Exception:  # noqa: BLE001 - no mechanism means no checkpoint layers
+        return False
+
+
 def _spec_is_v41_proxy_with_draft(kv_cache_spec) -> bool:
     proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
     return bool(proxy) and bool(rest)
@@ -187,41 +206,73 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
     from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
     proxy, rest = _split_v41_proxy_layers(kv_cache_spec)
+    # Checkpoint layers are neither the proxy nor the draft: each is one PAGE
+    # unit of a STATE image and `paged_state_checkpoint` requires them as k
+    # SINGLE-layer MambaSpec groups. Lumping them in with the draft is what
+    # vLLM rejects as "All layers in the same KV cache group must be the
+    # same" -- measured, engine down at startup with checkpoints on.
+    images = {name: spec for name, spec in rest.items() if _is_v41_image_layer(name)}
+    rest = {name: spec for name, spec in rest.items() if name not in images}
     proxy_specs = list(proxy.values())
-    draft_specs = list(rest.values())
     groups = [
         KVCacheGroupSpec(
             layer_names=list(proxy),
             kv_cache_spec=proxy_specs[0].merge(proxy_specs),
-        ),
-        KVCacheGroupSpec(
-            layer_names=list(rest),
-            kv_cache_spec=draft_specs[0].merge(draft_specs),
-        ),
+        )
     ]
+    groups += [
+        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec)
+        for name, spec in images.items()
+    ]
+    if rest:
+        draft_specs = list(rest.values())
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=list(rest),
+                kv_cache_spec=draft_specs[0].merge(draft_specs),
+            )
+        )
     logger.info(
-        "ATOM plugin: V4.1 target pool and draft KV kept in separate groups "
-        "(proxy page %d B at block %d, draft page %d B at block %d).",
+        "ATOM plugin: V4.1 kept in %d separate KV cache groups "
+        "(proxy page %d B at block %d; %d checkpoint group(s); "
+        "%d draft group(s)).",
+        len(groups),
         groups[0].kv_cache_spec.page_size_bytes,
         groups[0].kv_cache_spec.block_size,
-        groups[1].kv_cache_spec.page_size_bytes,
-        groups[1].kv_cache_spec.block_size,
+        len(images),
+        1 if rest else 0,
     )
     return groups
 
 
 def _groups_have_v41_proxy(kv_cache_groups) -> bool:
+    """True when the heterogeneous (per-layer slice) allocator is needed.
+
+    It is needed for the draft's pool, whose page is not a whole multiple of
+    the proxy's. Checkpoint groups are NOT a second pool: their page is the
+    proxy's page, and `check_state_checkpoint_groups` requires them overlaid
+    on it at byte 0 (vLLM's own allocator does exactly that). Counting them
+    here gave every checkpoint its own slice -- they landed at
+    `i * page * num_blocks` and the pool divisor became the sum of all nine
+    pages -- so checkpoints without a draft could never boot.
+
+    With no checkpoint layers this is the previous test: a proxy occupies one
+    group, so "some group is neither proxy nor checkpoint" and "len >= 2"
+    agree.
+    """
     from atom.plugin.vllm.deepseek_v41_bridge import (
         ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
     )
 
-    if len(kv_cache_groups) < 2:
-        return False
-    return any(
-        name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME)
-        for group in kv_cache_groups
-        for name in group.layer_names
-    )
+    has_proxy = False
+    has_other_pool = False
+    for group in kv_cache_groups:
+        for name in group.layer_names:
+            if name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME):
+                has_proxy = True
+            elif not _is_v41_image_layer(name):
+                has_other_pool = True
+    return has_proxy and has_other_pool
 
 
 def _spec_has_heterogeneous_mla_mha_backend(kv_cache_spec) -> bool:
@@ -501,12 +552,8 @@ def _heterogeneous_pool_bytes_per_block(kv_cache_groups) -> int:
     divisor that disagrees with the builder's yields a different `num_blocks`
     per rank, which the scheduler then rejects.
     """
-    return sum(
-        layer_spec.page_size_bytes
-        for group in kv_cache_groups
-        if not getattr(group, "host_resident", False)
-        for _layer_name, layer_spec in _iter_group_layer_specs(group)
-    )
+    overlay_page, slice_pairs = _v41_overlay_split(kv_cache_groups)[1:]
+    return overlay_page + sum(int(spec.page_size_bytes) for _n, spec in slice_pairs)
 
 
 def _iter_group_layer_specs(group):

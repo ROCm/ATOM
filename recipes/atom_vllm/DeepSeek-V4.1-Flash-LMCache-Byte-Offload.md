@@ -72,58 +72,35 @@ or launcher exit alone. Stop only the verified processes belonging to your run.
 
 ### Fixed-manifest GSM8K
 
-Client dependencies: `lm_eval==0.4.13`, `aiohttp`, `prometheus_client`, and an
-existing official GSM8K Arrow cache. Preparation is offline/CPU-only. Render
-once, then reuse the **same manifest for all four passes**, without resampling
-few-shot examples:
+Render the official test1319/5-shot prompts **once** and reuse the same
+manifest for all four passes (ON twice, then OFF twice) -- GSM8K resamples its
+few-shot exemplars per question, so a re-render changes the prompts and the
+two arms stop being comparable. Score with the official strict/flexible
+filters over raw completions, at concurrency 16, temperature and seed 0, and a
+4096-token budget.
 
-```bash
-python tools/gsm8k_fixed_manifest.py prepare \
-  --dataset-cache /path/to/existing/gsm8k/arrow-cache \
-  --model DeepSeek-V4.1-Flash --output results/gsm8k-prepared
-
-# Run twice on ON, then twice on OFF; use a fresh output for every pass.
-ARM=on PASS=1 PHASE=cold  # pass 2: PHASE=warm; then ARM=off, passes 1 and 2
-python tools/gsm8k_fixed_manifest.py run \
-  --manifest results/gsm8k-prepared/manifest.jsonl \
-  --endpoint http://127.0.0.1:8021/v1/completions \
-  --arm "$ARM" --phase "$PHASE" --pass-id "$ARM-p$PASS" \
-  --output "results/gsm8k-$ARM-p$PASS"
-```
-
-The tool uses official test1319/5-shot prompts and official strict/flexible
-filters, raw completions, concurrency 16, temperature/seed 0 and a 4096-token
-budget. All 1319 responses must complete and be scored; any length truncation
-fails the complete-accuracy gate. ON pass 2 requires actual CPU supply >=10% of
-all response prompt tokens. Three source counters must sum to that same token
-count. A measurement PASS alone does not establish accuracy equivalence.
+All 1319 responses must complete and be scored; any length truncation fails
+the gate. The second ON pass must show the tier actually supplying at least
+10% of response prompt tokens, and the three source counters (local HBM, tier,
+recomputed) must sum to that same token count -- a measurement that passes
+without the tier supplying anything says nothing about the tier. A passing
+measurement alone does not establish accuracy equivalence.
 
 ### Fixed-request performance
 
-Generate each manifest once (`C=16,24`, `R=1,2,3`), then reuse it on both arms:
+Generate each request set once per `(concurrency, round)` and reuse it on both
+arms. Prime a dozen distinct documents serially (one output token each), then
+measure streaming requests with unique tails and a fixed output length
+(`ignore_eos=true`). Measure from first dispatch to last complete response,
+including ramp and drain but excluding the prime and any metric scrapes.
 
-```bash
-C=16 R=1
-python tools/kv_offload_perf_acceptance.py manifest \
-  --case graph-dspark-mp --round "$R" --concurrency "$C" \
-  --model DeepSeek-V4.1-Flash --output "results/perf-r$R-c$C.json"
-
-ARM=on  # Repeat unchanged on OFF, using the same manifest.
-python tools/kv_offload_perf_acceptance.py run \
-  --manifest "results/perf-r$R-c$C.json" --arm "$ARM" \
-  --base-url http://127.0.0.1:8021 --output-root results/performance
-```
-
-Each round primes 12 distinct documents serially (one output token), then
-measures 240 streaming requests with unique tails and exactly 64 output tokens
-(`ignore_eos=true`). The window is first measured dispatch through last complete
-response, including ramp/drain but excluding prime and metric scrapes. Require
-all 240 requests, `[DONE]`, usage, and valid source accounting; ON actual CPU
-supply must exceed 50%. Never report partial-success throughput. Use the tool's
-`compare` command only for two passing summaries with identical manifests and
-the current validator version. Prime completion is not a PAGE/STATE save barrier;
-this is not a proven steady-state warm-cache window. Use fast local output storage:
-synchronous evidence writes can delay the client event loop and observed latency.
+Require every request to complete with `[DONE]`, usage and valid source
+accounting; on ON the tier's share must exceed 50%. Never report throughput
+from a partially successful run, and only compare two passing summaries taken
+from identical request sets. Priming is not a PAGE/STATE save barrier, so this
+is not a proven steady-state warm-cache window. Write evidence to fast local
+storage: synchronous writes can stall the client event loop and inflate the
+latency you measure.
 
 ## Test results
 

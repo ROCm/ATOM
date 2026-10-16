@@ -364,66 +364,9 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def _attn_out_buffer(self, hidden):
-        """A buffer for the attention rows, or None to let them be returned.
-
-        None here, which is ATOM's own shape: the kernels answer in a buffer
-        of their own and it is handed back up by return value, with nothing
-        allocated and nothing copied.
-
-        A frontend that breaks a capture around `_attend_block` replaces this
-        with a real allocation, because a broken-out region may not hand back
-        a fresh tensor -- its address would change every replay while the
-        captured segments after it still point at the first one. Allocating
-        here puts the buffer in what stays inside the graph, so the capture
-        records one address and every replay finds it.
-        """
-        return
-
     def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
-        attn_out = self._attn_out_buffer(hidden)
-        rows = self._attend_block(
-            attn_out, hidden, hidden_scale, cache, step, rope, queries
-        )
-        return self._project_out(
-            rows if attn_out is None else attn_out,
-            rope,
-            cache.rope_positions(step) if queries is None else queries.positions,
-        )
-
-    def _attend_block(
-        self, attn_out, hidden, hidden_scale, cache, step, rope, queries=None
-    ):
-        """Everything from the compressor fork to the attention rows.
-
-        Uses the `step` it is handed, and nothing else. An earlier version
-        took it from `cache.current_step` instead, to survive a capture that
-        binds this call's arguments once -- but that is a fact about one
-        frontend, and here it silently overrode the caller. Bounded replay
-        re-enters with a *tail* Step while the cache still holds the whole
-        forward's, so a 1024-token prefill with a 128-token window handed
-        attention 128 rows and a Step describing 1024. The frontend that
-        needs the substitution now makes it in its own wrapper
-        (`atom.plugin.vllm.v41_core_overrides`), inside the eager region, so
-        native keeps the Step its caller chose.
-
-        The wide eager region, and wide on purpose. Upstream keeps a narrower
-        one for Model Runner V2 and a wide one for V1, because V1's piecewise
-        capture produces garbage with the narrow region (vllm #51430) -- the
-        attention input preparation stays in the graph and the replay reuses
-        it. Wide is correct under both; narrow is an optimisation under one.
-        Picking by runner would mean a config-dependent choice whose wrong
-        side is silent, so this takes the side that is right either way until
-        there is a measurement saying the narrower region is worth it.
-
-        With a buffer it writes into it and returns None, which is the
-        contract the decorator is held to: a region that returned rows would
-        hand back a new address every step and a replay reruns no host code to
-        find it. Without one -- ATOM's own path, where nothing is decorated --
-        it returns the rows and nothing is allocated or copied.
-        """
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
@@ -435,22 +378,6 @@ class Attention(nn.Module):
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        return self._attend(
-            attn_out, query, kv_normed, selecting, cache, step, rope, queries
-        )
-
-    def _attend(
-        self, attn_out, query, kv_normed, selecting, cache, step, rope, queries=None
-    ):
-        """The sparse indexer's join and the MLA attention.
-
-        With `attn_out` it writes there and returns None, which is the
-        contract a breakable-cudagraph eager region is held to. Without one --
-        ATOM's own path -- it returns the rows and allocates nothing. Keeping
-        the placement here, rather than returning rows and letting `forward`
-        put them away, is what lets this region be marked without
-        restructuring it again later.
-        """
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
         # `write_window` below, which is nothing when that fold happened.
@@ -474,9 +401,6 @@ class Attention(nn.Module):
             else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
-        # None on ATOM's own path: nothing was allocated to land in, so the
-        # kernels answer where they like and the rows go back by return value.
-        flat_out = None if attn_out is None else attn_out.flatten(0, 1)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
             if cache.packed:
@@ -515,20 +439,12 @@ class Attention(nn.Module):
                 second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
-                out=flat_query if flat_out is None else flat_out,
+                out=flat_query,
             )
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
-        if flat_out is None:
-            # ATOM's own shape, unchanged: hand the rows back and let the
-            # caller project them. No allocation, no copy.
-            return output.view_as(query)
-        # A caller that supplied a buffer gets the rows in it. `out=` is a
-        # request, not a guarantee: these kernels are shared with V4 and may
-        # answer in a buffer of their own, and the decode pair is not even
-        # offered one. Ignoring the return would leave the buffer holding
-        # whatever was there before, with nothing raised -- and a broken-out
-        # region has to write through the caller's buffer to be one at all.
-        if output.data_ptr() != flat_out.data_ptr():
-            flat_out.copy_(output)
-        return None
+        return self._project_out(
+            output.view_as(query),
+            rope,
+            cache.rope_positions(step) if queries is None else queries.positions,
+        )

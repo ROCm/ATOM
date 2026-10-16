@@ -67,7 +67,7 @@ def test_the_deferral_is_decided_where_both_are_visible():
     import inspect
 
     src = inspect.getsource(reserve_mod.deepseek_v41_state_reserve_blocks)
-    assert "_images_own_the_tail" in src
+    assert "_state_checkpoints_own_the_tail" in src
 
 
 def test_register_installs_both_and_the_image_path_after_the_patch():
