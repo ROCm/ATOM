@@ -666,7 +666,9 @@ def qk_norm_rope_maybe_quant(
     # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [., rd//2, 1, 1].
     cos_2d = cos_cache.squeeze(-2).squeeze(-2)
     sin_2d = sin_cache.squeeze(-2).squeeze(-2)
-    if envs.ATOM_V4_USE_GLUON:
+    # The Gluon kernel always writes the SWA cache, but prefill writes it after
+    # the attention. Use the Gluon kernel only when the caller gives the SWA cache.
+    if envs.ATOM_V4_USE_GLUON and swa_nope_scale_buff is not None:
         from aiter.ops.triton.fusions.fused_qk_norm_rope_group_quant import (
             fused_qk_norm_rope_group_quant as gluon_fused_qk_norm_rope_group_quant,
         )
@@ -681,7 +683,7 @@ def qk_norm_rope_maybe_quant(
             eps,
             swa_nope=swa_nope_scale_buff,
             swa_rope=swa_rope_buff,
-            swa_rows=swa_dest_rows,
+            swa_dest_rows=swa_dest_rows,
             batch_ids=batch_id_per_q_token,
         )
         # The callers read K as [T, 1, .]. The Gluon kernel returns [T, .], so add
