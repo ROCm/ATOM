@@ -525,6 +525,9 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
+  if [[ -n "${ATOMESH_SLURM_EXCLUDE:-}" ]]; then
+    SBATCH_CMD+=(--exclude "${ATOMESH_SLURM_EXCLUDE}")
+  fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
     --error "${SLURM_ERROR}"
