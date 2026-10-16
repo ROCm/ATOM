@@ -204,6 +204,10 @@ class LMCacheMPConnector(KVConnectorBase):
         )
         self.chunk_size: int | None = None
         self._num_recurrent_groups = 0
+        # How many engine groups each snapshot was published as; see
+        # `register_kv_caches`. Empty until registration.
+        self._recurrent_splits: list[int] = []
+        self._num_recurrent_engine_groups = 0
         self._adapter: Any = None
         self._is_kv_writer = True
         self._pending_saves: dict[str, _PendingSave] = {}
@@ -352,17 +356,32 @@ class LMCacheMPConnector(KVConnectorBase):
         # into one object group (`kv_layer_groups.build_object_groups`), the
         # null-chunk test then sees the attention group's real ids and skips
         # nothing, and the window that restores only the last snapshot is gone.
-        groups.extend(
-            EngineGroupInfo(
-                engine_group_id=1 + ordinal,
-                layer_indices=recurrent.tensor_indices,
-                tokens_per_block=recurrent.tokens_per_block,
-                sw_size_tokens=recurrent.tokens_per_block,
-                recurrent_state=True,
-            )
-            for ordinal, recurrent in enumerate(views.recurrent)
-        )
+        #
+        # One info per copy-kernel identity, not per snapshot: the server
+        # splits each engine group by physical transfer identity and then
+        # requires exactly one info per resulting kernel group. A backend
+        # whose planes share a layout has one split per snapshot and is
+        # numbered exactly as before; V4.1's PAGE unit is heterogeneous and
+        # needs several. `_recurrent_splits` records how many each snapshot
+        # became so `_recurrent_block_ids` can name the same block in each.
+        next_group_id = 1
+        self._recurrent_splits = []
+        for recurrent in views.recurrent:
+            splits = recurrent.layout_splits or (recurrent.tensor_indices,)
+            self._recurrent_splits.append(len(splits))
+            for indices in splits:
+                groups.append(
+                    EngineGroupInfo(
+                        engine_group_id=next_group_id,
+                        layer_indices=indices,
+                        tokens_per_block=recurrent.tokens_per_block,
+                        sw_size_tokens=recurrent.tokens_per_block,
+                        recurrent_state=True,
+                    )
+                )
+                next_group_id += 1
         self._num_recurrent_groups = len(views.recurrent)
+        self._num_recurrent_engine_groups = sum(self._recurrent_splits)
         try:
             adapter.register_kv_caches(views.tensors, engine_group_infos=groups)
             chunk_size = offcfg._strict_integer(
@@ -384,12 +403,14 @@ class LMCacheMPConnector(KVConnectorBase):
         self.chunk_size = chunk_size
         logger.info(
             "LMCache MP registered rank=%d tensors=%d groups=%d "
-            "recurrent_groups=%d bytes_per_block=%d chunk=%d tp_replication=%d "
+            "recurrent_groups=%d recurrent_engine_groups=%d "
+            "bytes_per_block=%d chunk=%d tp_replication=%d "
             "writer=%s save=%s load=%s",
             rank,
             len(views.tensors),
             len(views.layer_groups),
             len(views.recurrent),
+            self._num_recurrent_engine_groups,
             views.bytes_per_block,
             self.chunk_size,
             requested_replication,
@@ -558,7 +579,18 @@ class LMCacheMPConnector(KVConnectorBase):
                 f"{end}; the state would not continue the KV it ships with"
             )
         count = (end - start) // int(self.chunk_size)
-        return [[0] * (count - 1) + [int(block)] for block in state.block_ids]
+        # One list per ENGINE group. A snapshot published as several engine
+        # groups (heterogeneous planes; see `register_kv_caches`) names the
+        # same block in each of them -- they are different plane sets of one
+        # PAGE unit, not different units.
+        out: list[list[int]] = []
+        # One split each is what a homogeneous snapshot gets and what the
+        # mechanism did before splitting existed, so it is also the right
+        # reading of an empty list: the count is set, the shape is not.
+        splits_per_group = self._recurrent_splits or [1] * self._num_recurrent_groups
+        for block, splits in zip(state.block_ids, splits_per_group, strict=True):
+            out.extend([[0] * (count - 1) + [int(block)]] * splits)
+        return out
 
     def _submit_load(self, req: LMCacheReqMeta, pooled: _PooledIpcEvent) -> None:
         from lmcache.integration.atom import AtomMPTransferSpec

@@ -287,9 +287,24 @@ def _stable_config_value(value: Any) -> Any:
 # look like, so it must not reach the namespace digest.
 _PAGE_PLACEMENT_FIELDS = frozenset({"target_parallel_config", "draft_parallel_config"})
 
+# Speculative-decoding behaviour each process decides for itself. Like the
+# placement fields above these say nothing about what the PAGE bytes look
+# like, and hashing them splits the namespace in two.
+#
+# Measured on DeepSeek-V4.1-Flash with DSpark on the `mp` backend: the four
+# workers hashed `disable_eagle_block_drop: false` and the scheduler hashed
+# `true`, so the workers registered their layout under
+# `atom-page-v3-290a23f2...` while every lookup asked for
+# `atom-page-v3-dbdf5a1c...`. The tier logged `Stored 2560 tokens` for the
+# saves and `No GPU context found for model ... during lookup` for the reads,
+# and the arm ran at a flat zero hit rate with no error on the engine side --
+# the third time this module has been bitten by a per-process field reaching
+# the digest (see `_PAGE_PLACEMENT_FIELDS` and `_canonical_head_dim`).
+_PAGE_SPECULATIVE_BEHAVIOUR_FIELDS = frozenset({"disable_eagle_block_drop"})
+
 
 def _stable_speculative_config(value: Any) -> Any:
-    """The speculative config with per-process placement removed.
+    """The speculative config with everything per-process removed.
 
     The parallel configs carry this process' own coordinates -- `rank`,
     `data_parallel_rank`, `node_rank` -- so hashing them gives every TP rank a
@@ -304,11 +319,8 @@ def _stable_speculative_config(value: Any) -> Any:
 
     stable = _stable_config_value(value)
     if isinstance(stable, dict):
-        return {
-            key: item
-            for key, item in stable.items()
-            if key not in _PAGE_PLACEMENT_FIELDS
-        }
+        dropped = _PAGE_PLACEMENT_FIELDS | _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS
+        return {key: item for key, item in stable.items() if key not in dropped}
     return stable
 
 

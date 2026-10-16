@@ -35,7 +35,7 @@ reports a load finished once both halves have landed.
 import logging
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -78,6 +78,32 @@ logger = logging.getLogger("atom")
 # native engine's reconcile cadence (`model_engine.scheduler`) keeps the per-step
 # cost off the scheduling path.
 _SAVE_RECONCILE_INTERVAL_S = 5.0
+
+
+@dataclass(frozen=True)
+class _V41RideViews:
+    """`build_mp_recurrent_groups`' input: planes and block count per group.
+
+    The same duck type `KdaPageViews` satisfies, with the fields that builder
+    actually reads. A dataclass rather than the real views because V4.1's
+    recurrent groups own no tensors of their own -- they alias the PAGE
+    planes -- so there is nothing for those views to allocate or carve.
+    """
+
+    groups: tuple[tuple["torch.Tensor", ...], ...]
+    num_blocks: tuple[int, ...]
+
+
+def _v41_checkpoint_group_ids(kv_cache_config) -> tuple[int, ...]:
+    """The state-checkpoint groups in key-space order.
+
+    Ascending group id, which is the order vLLM declared them in and the
+    order the worker registers the recurrent engine groups in. The order *is*
+    the key space: a transfer that names the blocks in one order cannot be
+    read back in another, so both halves derive it the same way rather than
+    passing it between them.
+    """
+    return tuple(sorted(int(gid) for gid in _v41_image_group_ids(kv_cache_config)))
 
 
 def _v41_image_group_ids(kv_cache_config) -> set:
@@ -407,6 +433,12 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         from atom.plugin.vllm.deepseek_v41_bridge import is_deepseek_v41_vllm_config
 
         self._is_deepseek_v41 = is_deepseek_v41_vllm_config(vllm_config)
+        # The groups the state checkpoints are written into, in key-space
+        # order. Both halves read this one field rather than deriving the
+        # order twice; see `_v41_checkpoint_group_ids`.
+        self._v41_checkpoint_group_ids = (
+            _v41_checkpoint_group_ids(kv_cache_config) if self._is_deepseek_v41 else ()
+        )
         self._attn_group_id = self._resolve_attention_group(kv_cache_config)
         # Transports freeze the PAGE namespace during construction. Project the
         # resolved group's geometry into our private shim first, without changing
@@ -599,12 +631,21 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
     @property
     def _state_rides_mp(self) -> bool:
-        """True when the recurrent groups are published to the MP server."""
-        return (
-            self._offload_backend == "mp"
-            and bool(self._mamba_groups)
-            and self._state_transport == "mp"
-        )
+        """True when the state groups are published to the MP server.
+
+        Two backends reach this, and the state they publish is the same
+        shape: vLLM-hashed blocks of a group registered beside the PAGE
+        planes. Kimi-K3 publishes its mamba groups; DeepSeek-V4.1 publishes
+        the groups its state checkpoints are written into, which are blocks
+        of the proxy pool the PAGE planes already alias. Either way the
+        alternative -- an LMCache engine of this connector's own, in this
+        process, beside the one in the server -- is what this replaces.
+        """
+        if self._offload_backend != "mp" or self._state_transport != "mp":
+            return False
+        if self._is_deepseek_v41:
+            return bool(self._v41_checkpoint_group_ids)
+        return bool(self._mamba_groups)
 
     def _resolve_state_cpu_size_gb(self) -> float:
         """Host GiB for the recurrent state tier's own pool under ``mp``.
@@ -857,6 +898,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 f"state image block {image_block}. A boundary claimed on one grid is "
                 "hashed on the other, so nothing stored would ever be found."
             )
+        rides_page = self._state_rides_mp
+        if rides_page:
+            self._refuse_v41_ride_without_dense_checkpoints(int(grid))
         self._v41_planner = V41BoundaryPlanner(
             hash_block_size=int(hash_block_size),
             boundary_grid=grid,
@@ -867,16 +911,84 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             ),
             world_size=self._world_size,
             state_checkpoints_can_serve=_v41_state_checkpoints_can_serve(vllm_config),
+            checkpoint_group_ids=self._v41_checkpoint_group_ids,
+            rides_page=rides_page,
         )
         self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
+        if rides_page:
+            self._scheduler.install_recurrent_state_hook(
+                self._v41_state_for_transfer,
+                self._v41_planner.retire_ride_pins,
+            )
         logger.info(
             "ATOM LMCache offload: V4.1 state leg on (interval=%d, "
-            "hash_block=%d, chunk=%d, world=%d)",
+            "hash_block=%d, chunk=%d, world=%d, rides_page=%s, "
+            "checkpoint_groups=%s)",
             interval,
             int(hash_block_size),
             int(self._scheduler.chunk_size),
             self._world_size,
+            rides_page,
+            ",".join(str(g) for g in self._v41_checkpoint_group_ids) or "-",
         )
+
+    def _refuse_v41_ride_without_dense_checkpoints(self, grid: int) -> None:
+        """A ride needs a state checkpoint at EVERY chunk boundary.
+
+        One save spans many chunks and carries exactly one image -- the
+        boundary it ends on -- with the earlier chunks' recurrent ids nulled.
+        If a later lookup can report a hit at one of those earlier chunk
+        boundaries, the PAGE bytes come back with no image behind them, and
+        `cap_hit` under a ride has no index left to catch it with: it trusts
+        that whatever the lookup reported present is present with its state.
+        That trust is only earned when every chunk boundary is a checkpoint,
+        which is what the recurrent backends this mechanism was built for
+        (K3's KDA, GDN) get for free -- they snapshot every align block.
+
+        V4.1 does not: its checkpoints are placed on an interval, 8192 tokens
+        by default, so 31 of every 32 chunk boundaries would have none. Rather
+        than serve a prefix whose state is someone else's, refuse here and
+        name the setting that fixes it. The cost of the fix is more checkpoint
+        blocks held in the proxy pool; the cost of not refusing is a wrong
+        answer nothing reports.
+        """
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import V41ImagePlacement
+
+        placement = V41ImagePlacement.from_env()
+        interval = int(placement.interval)
+        chunk = int(self._scheduler.chunk_size)
+        if interval == chunk:
+            return
+        raise ValueError(
+            "ATOM offload connector: DeepSeek-V4.1 state cannot ride the PAGE "
+            f"object with a checkpoint interval of {interval} tokens against "
+            f"an LMCache chunk of {chunk}. A save carries one image, at the "
+            "boundary it ends on, so every chunk boundary must be a "
+            "checkpoint. Bring the two together from either side -- "
+            f"ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS={chunk}, or an LMCache "
+            f"chunk of {interval} on the server and the client, which is the "
+            "cheaper one: the interval decides how often a checkpoint is "
+            "written, while the chunk only decides how coarse a tier hit is, "
+            "and a V4.1 hit is already quantised to a checkpoint. Or keep "
+            "the state on a pool of its own with "
+            "lmcache.mp.state_transport='own-pool'."
+        )
+
+    def _v41_state_for_transfer(self, seq, end: int, operation=None):
+        """Which state image the transfer ending at *end* carries.
+
+        The scheduler holds a ``SeqView``, which has no block hashes; the
+        planner needs vLLM's own request object for them, and this connector
+        is the only side that has both.
+        """
+        planner = self._v41_planner
+        if planner is None:
+            return None
+        req_id = str(seq.id)
+        request = self._requests.get(req_id)
+        if request is None:
+            return None
+        return planner.take_ride_state(request, req_id, end, operation=operation)
 
     def _init_kda_planner(self, vllm_config, kv_cache_config) -> None:
         """Stand up the scheduler half of the recurrent leg, if there is one."""
@@ -998,12 +1110,16 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 # registration time, and a transfer that referenced a group
                 # nobody registered would be refused chunk by chunk at
                 # runtime rather than once, here.
-                self._kda_views = self._build_kda_views(per_group, list(groups))
+                if self._is_deepseek_v41:
+                    ride_views = self._v41_ride_views(tensors, num_blocks)
+                else:
+                    self._kda_views = self._build_kda_views(per_group, list(groups))
+                    ride_views = self._kda_views
                 object.__setattr__(
                     transfer_tensors,
                     "recurrent_page_groups",
                     build_mp_recurrent_groups(
-                        self._kda_views,
+                        ride_views,
                         tokens_per_block=int(self._config.kv_cache_block_size),
                     ),
                 )
@@ -1029,7 +1145,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # state rides the PAGE object -- there is then no second engine, no
         # second pool and no leg of its own to drive.
         if self._is_deepseek_v41:
-            self._init_v41_state_tier()
+            if not self._state_rides_mp:
+                self._init_v41_state_tier()
         elif not self._state_rides_mp:
             self._init_kda_tier(per_group, list(groups))
         logger.info(
@@ -1182,6 +1299,42 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         return KdaPageViews(
             tensors_by_group, layout_id=build_layout_id(specs, tensors_by_group)
+        )
+
+    def _v41_ride_views(self, tensors, num_blocks: int):
+        """The state-checkpoint groups as recurrent planes, for the MP layout.
+
+        One recurrent engine group per checkpoint group, every one of them
+        aliasing the *same* PAGE planes that were just registered. That is
+        not a duplicate registration but the whole mechanism: a V4.1 state
+        image is `k` consecutive PAGE units, the checkpoint groups are the
+        `k` columns vLLM hashes and allocates blocks in, and a block id in
+        column `j` is a page id in the one pool. So each group needs its own
+        engine block-id list -- which is what a separate engine group buys --
+        over bytes it shares with the others.
+
+        Built from the tensors `_v41_page_tensors` just produced rather than
+        from the cache again: the plane ORDER is the key space, and a second
+        derivation could only ever disagree with the first.
+
+        The STATE region is deliberately absent. It is addressed by request
+        slot, so it has no block id to name; what the tier carries is the
+        checkpoint image already copied into PAGE units by
+        `execute_paged_state_copies`, which is the only form of this state
+        that a later request can be restored from.
+        """
+        planes = tuple(tensor.k_cache for tensor in tensors)
+        count = len(self._v41_checkpoint_group_ids)
+        if not count:
+            raise ValueError(
+                "ATOM offload connector: DeepSeek-V4.1 state was asked to ride "
+                "the PAGE object, but no state-checkpoint group is registered. "
+                "Enable state checkpoints, or set "
+                "lmcache.mp.state_transport='own-pool'."
+            )
+        return _V41RideViews(
+            groups=tuple(planes for _ in range(count)),
+            num_blocks=tuple(int(num_blocks) for _ in range(count)),
         )
 
     def _v41_page_tensors(self):
@@ -2003,6 +2156,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         self._gpu_block_pool = gpu_block_pool
         if self._kda_planner is not None:
             self._kda_planner.bind_gpu_block_pool(gpu_block_pool)
+        if self._v41_planner is not None:
+            self._v41_planner.bind_gpu_block_pool(gpu_block_pool)
 
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
@@ -2138,7 +2293,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # forward meets as a stale cursor and the engine does not survive.
             # Refusing turns it into the miss it actually is.
             if not self._v41_planner.resolve_load(
-                request, num_total_computed, tuple(attention_blocks)
+                request,
+                num_total_computed,
+                tuple(attention_blocks),
+                group_blocks=groups,
             ):
                 self._v41_planner.refuse_admission(request, attention_blocks)
 

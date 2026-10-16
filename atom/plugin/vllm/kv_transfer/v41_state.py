@@ -50,6 +50,7 @@ import torch
 from atom.model_engine.state_offload import StateOffloadIndex
 
 from .kda_state import KdaLoad, KdaStore, boundary_prefix_hash
+from .page_ride import NULL_BLOCK_ID, PageRideMixin
 
 logger = logging.getLogger("atom")
 
@@ -362,7 +363,7 @@ def last_planner():
     return _LAST_PLANNER
 
 
-class V41BoundaryPlanner:
+class V41BoundaryPlanner(PageRideMixin):
     """Scheduler half: picks the boundaries, and caps hits to them.
 
     Everything this decides is about keeping one invariant: a request that vLLM
@@ -384,6 +385,8 @@ class V41BoundaryPlanner:
         can_store: bool = True,
         can_load: bool = True,
         state_checkpoints_can_serve: bool = False,
+        checkpoint_group_ids: tuple[int, ...] = (),
+        rides_page: bool = False,
     ) -> None:
         self.hash_block_size = int(hash_block_size)
         # Two different things that used to be one.
@@ -408,6 +411,25 @@ class V41BoundaryPlanner:
             )
         self.chunk_size = int(chunk_size)
         self.state_interval = int(state_interval)
+        # Under `mp` the checkpoint groups are registered as engine groups of
+        # their own, so a PAGE transfer names one block in each and carries
+        # the image with the KV it continues. This planner then decides only
+        # *which* boundary each transfer rides with: there is no second tier
+        # to drive, no blob to stage and no store or load job to queue.
+        self.rides_page = bool(rides_page)
+        # The groups holding the image, in the order the worker registered
+        # them -- that order is the key space, so it is taken from the caller
+        # rather than rebuilt here.
+        self.ride_group_ids = tuple(int(g) for g in checkpoint_group_ids)
+        # A V4.1 boundary may sit only on a whole PAGE edge, which with a
+        # DSpark draft group is coarser than the engine-wide hash unit.
+        self.ride_boundary_grid = self.boundary_grid
+        if self.rides_page and not self.ride_group_ids:
+            raise ValueError(
+                "DeepSeek-V4.1 state offload: the image cannot ride the PAGE "
+                "object with no checkpoint group to name it; a transfer would "
+                "carry KV whose state is someone else's"
+            )
         self._world_size = max(1, int(world_size))
         # Decided by the caller, which holds the VllmConfig. Asking vLLM for
         # its *current* config from here returns None -- the scheduler calls
@@ -486,6 +508,8 @@ class V41BoundaryPlanner:
             "local_cap_withdrawn": 0,
             "admission_refused": 0,
         }
+        # Seeds the `ride_*` counters too; see `page_ride.RIDE_COUNTERS`.
+        self._init_page_ride()
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
         self._warned_unarmed = False
@@ -570,6 +594,18 @@ class V41BoundaryPlanner:
             )
             return 0
         block_hashes = getattr(request, "block_hashes", None) or ()
+        if self.rides_page:
+            # No index to probe: the KV and the image that continues it are
+            # one object, so whatever the dense lookup reported present is
+            # present with its image. What still has to hold is the *shape*
+            # -- a hit must end on a whole PAGE edge for there to be a stored
+            # image at all -- and that is what this truncation is.
+            boundary = (hit // self.boundary_grid) * self.boundary_grid
+            if boundary <= 0:
+                self._counters["cap_declined"] += 1
+                return 0
+            self._counters["cap_kept"] += 1
+            return min(hit, boundary)
         # Descend the BLOCK grid, not the interval ladder. The store side
         # offers any block-aligned frontier spaced an interval apart, plus the
         # prompt-end anchor, so the boundaries that exist are not multiples of
@@ -803,6 +839,11 @@ class V41BoundaryPlanner:
         to come back to.
         """
         accepted: list[V41Store] = []
+        if self.rides_page:
+            # Nothing to drive: the PAGE save commits the image with the KV,
+            # and its source blocks are resolved at build time by
+            # `source_blocks_for`, from the same hash-keyed pool lookup.
+            return accepted
         if not self._index.can_store:
             return accepted
         for req_id, frontier in (frontiers or {}).items():
@@ -919,8 +960,39 @@ class V41BoundaryPlanner:
                 self._index.note_stored(pending.prefix_hash)
 
     # -- load ------------------------------------------------------------
+    def _boundary_blocks(
+        self, group_blocks, num_total_computed: int
+    ) -> tuple[int, ...]:
+        """This boundary's destination block in each checkpoint group, or ``()``.
+
+        All or nothing: an image scattered into some of its groups leaves the
+        rest holding the previous occupant's state, which is the half restore
+        this module exists to prevent. One unresolved group fails the load.
+        """
+        if not group_blocks or num_total_computed % self.boundary_grid:
+            return ()
+        row = (int(num_total_computed) - 1) // self.boundary_grid
+        if row < 0:
+            return ()
+        block_ids: list[int] = []
+        for group_id in self.ride_group_ids:
+            if group_id >= len(group_blocks):
+                return ()
+            blocks = group_blocks[group_id]
+            if row >= len(blocks):
+                return ()
+            block_id = int(blocks[row])
+            if block_id <= NULL_BLOCK_ID:
+                return ()
+            block_ids.append(block_id)
+        return tuple(block_ids)
+
     def resolve_load(
-        self, request, num_total_computed: int, error_block_ids=()
+        self,
+        request,
+        num_total_computed: int,
+        error_block_ids=(),
+        group_blocks=(),
     ) -> bool:
         """Queue the state load for a request whose PAGE prefix was restored.
 
@@ -946,6 +1018,17 @@ class V41BoundaryPlanner:
         if prefix_hash is None:
             return False
         req_id = str(request.request_id)
+        if self.rides_page:
+            # The PAGE load restores these same blocks as part of its own
+            # object, so there is no job to queue -- only the destination to
+            # name, which is what the transfer spec carries. Unresolvable is
+            # a refusal, not a quiet skip: the admission has already happened.
+            block_ids = self._boundary_blocks(group_blocks, boundary)
+            if not block_ids:
+                self._counters["ride_missing"] += 1
+                return False
+            self._record_ride_boundary(req_id, boundary, block_ids)
+            return True
         if not self._index.request_load(req_id, prefix_hash):
             return False
         self._loads.append(
@@ -976,6 +1059,15 @@ class V41BoundaryPlanner:
         boundary design rests on and had never been enforced.
         """
         self._counters["admission_refused"] += 1
+        if self.rides_page:
+            # There is no state leg to refuse through: the image travels
+            # inside the PAGE object, so the decline that matters was already
+            # made by the scheduler, which does not emit a transfer whose
+            # `take_ride_state` came back None. Queueing a job here instead
+            # parks the request on a load nothing will ever complete --
+            # measured as one request WAITING forever with 75% of the KV pool
+            # free and the lookup re-running every scheduler pass.
+            return
         self._loads.append(
             KdaLoad(
                 str(request.request_id),
@@ -1011,6 +1103,9 @@ class V41BoundaryPlanner:
         self._last_offered.pop(str(req_id), None)
         self._local_caps.pop(str(req_id), None)
         self._local_cap_withdrawn.discard(str(req_id))
+        # The recorded ride destinations go with it: a preempted request
+        # reallocates, so its old blocks name someone else's bytes.
+        self.forget_ride(req_id)
 
     # -- observability ---------------------------------------------------
     def stats(self) -> dict[str, int]:

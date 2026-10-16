@@ -123,6 +123,20 @@ class _RecurrentViews:
     num_blocks: int
     tokens_per_block: int
     bytes_per_block: int
+    #: ``tensor_indices`` split by copy-kernel identity, in registration
+    #: order. LMCache splits every engine group by physical transfer identity
+    #: (dtype and per-block shape) and then requires one engine group info per
+    #: resulting kernel group, so a group whose planes are heterogeneous has
+    #: to be published as several. One recurrent snapshot is still one
+    #: snapshot: the splits all name the same block, which is why the caller
+    #: repeats the block id across them rather than asking for more ids.
+    #:
+    #: A backend whose planes share a layout -- K3's KDA, GDN -- gets exactly
+    #: one split here and is published as it always was. DeepSeek-V4.1 does
+    #: not: its PAGE unit is a main page plus index rows of other shapes, so
+    #: its eight checkpoint groups published eleven infos for twenty-seven
+    #: kernel groups and the server refused the registration.
+    layout_splits: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,12 +262,20 @@ def _build_recurrent_views(
             tensors[f"recurrent.{ordinal}.{page.index}.{role}"] = page.view
             indices.append(page.index)
         index += len(validated)
+        by_layout: dict[tuple, list[int]] = {}
+        for page in validated:
+            layout = (
+                page.view.dtype,
+                tuple(int(dim) for dim in page.view.shape[1:]),
+            )
+            by_layout.setdefault(layout, []).append(page.index)
         built.append(
             _RecurrentViews(
                 tensor_indices=tuple(indices),
                 num_blocks=num_blocks,
                 tokens_per_block=tokens_per_block,
                 bytes_per_block=sum(page.unit_bytes for page in validated),
+                layout_splits=tuple(tuple(group) for group in by_layout.values()),
             )
         )
     return tuple(built)
