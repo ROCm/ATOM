@@ -18,34 +18,13 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
-from atom.utils import envs
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
+from atom.model_ops.sparse_indexer_chunk import logits_rows, plane_rows
 
 # A packed row starts on a 256-byte boundary, which the row-group scorer's
 # stores need to run at speed, and on a whole candidate block, so its block
 # maxima start at its logits' start over the block.
 ROW_ALIGN = 64
-
-
-def plane_rows(width):
-    """Query rows a `width`-column logits plane may hold at once.
-
-    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
-    elements wraps to a negative address. `width` follows the model-length cap
-    and not the live context, so only a long-context configuration can get
-    there; wherever a batch already fits, this leaves it in one piece.
-    """
-    return max(1, (2**31 - 1) // width)
-
-
-def logits_rows(rows, width):
-    """One logits band's rows, shared by allocation and execution."""
-    return min(
-        plane_rows(width),
-        sparse_indexer_row_chunk(
-            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-        ),
-    )
 
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
@@ -255,12 +234,3 @@ class _TileWorkspace:
 
     def unit_table(self, ratio, tokens, width):
         return _view(self._tiles[ratio], tokens, width)
-
-
-def _view(flat, rows, width):
-    if rows * width > flat.numel():
-        raise ValueError(
-            f"a [{rows}, {width}] scorer temporary exceeds its workspace of "
-            f"{flat.numel()} elements"
-        )
-    return flat[: rows * width].view(rows, width)

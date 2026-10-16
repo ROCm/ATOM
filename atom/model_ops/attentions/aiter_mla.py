@@ -49,11 +49,11 @@ from atom.model_ops.attention_mla import (
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )
-from atom.model_ops.deepseek_v41.score_workspace import logits_rows
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
 )
+from atom.model_ops.sparse_indexer_chunk import decode_band_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -804,12 +804,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ]
             if ws_users and self.dcp_world_size == 1 and not self._indexer_fp4:
                 width = model_runner.config.max_model_len
-                decode_rows = max(
-                    logits_rows(self.max_bs * max_seqlen_qo, width), max_seqlen_qo
+                rows = decode_band_rows(
+                    self.max_bs * max_seqlen_qo, width, max_seqlen_qo
                 )
-                ws = torch.empty(
-                    decode_rows * width, dtype=torch.float32, device=self.device
-                )
+                ws = torch.empty(rows * width, dtype=torch.float32, device=self.device)
                 for m in ws_users:
                     m.indexer_logits_ws = ws
                 logger.info(

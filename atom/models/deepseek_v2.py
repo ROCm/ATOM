@@ -92,7 +92,6 @@ from atom.model_ops.dcp_ops import (
     dcp_decode_candidate_exchange_fused,
     triton_filter_and_convert_dcp_index_prefill,
 )
-from atom.model_ops.deepseek_v41.score_workspace import logits_rows
 from atom.model_ops.embed_head import (
     ParallelLMHead,
     ReplicatedEmbedding,
@@ -113,6 +112,8 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_chunk import (
     dcp_qsplit_rows,
+    decode_band_rows,
+    flat_view,
     sparse_indexer_row_chunk,
 )
 from atom.model_ops.sparse_indexer_fp4 import (
@@ -1579,20 +1580,23 @@ def _prefill_mqa_logits_fp4(
     return logits
 
 
-def _decode_band_rows(
-    ws: torch.Tensor | None, rows: int, width: int, next_n: int
-) -> int:
-    """Rows per decode chunk, in whole requests."""
-    band = logits_rows(rows, width)
-    if ws is not None and ws.numel() >= width * next_n:
-        band = min(band, ws.numel() // width)
-    return min(rows, max(next_n, band // next_n * next_n))
+_warned_no_logits_ws = False
 
 
-def _indexer_logits(ws: torch.Tensor | None, rows: int, width: int) -> torch.Tensor:
-    """`[rows, width]` view of the workspace, or a new tensor if it is too small."""
-    if ws is not None and ws.numel() >= rows * width:
-        return ws[: rows * width].view(rows, width)
+def _decode_logits(ws: torch.Tensor | None, rows: int, width: int) -> torch.Tensor:
+    """`[rows, width]` band of the shared workspace (fails if it is too small),
+    or a per-forward tensor, once warned, when no workspace was bound."""
+    global _warned_no_logits_ws
+    if ws is not None:
+        return flat_view(ws, rows, width)
+    if not _warned_no_logits_ws:
+        _warned_no_logits_ws = True
+        logger.warning(
+            "Sparse indexer: no logits workspace bound; decode logits are "
+            "allocated per forward (%d x %d fp32)",
+            rows,
+            width,
+        )
     return torch.empty(rows, width, dtype=torch.float32, device="cuda")
 
 
@@ -2068,8 +2072,17 @@ def sparse_attn_indexer(
             )
         else:
             # Score in chunks of whole requests (as V4.1).
-            band = _decode_band_rows(indexer_logits_ws, num_rows, max_model_len, next_n)
-            logits = _indexer_logits(indexer_logits_ws, band, max_model_len)
+            band = decode_band_rows(
+                num_rows,
+                max_model_len,
+                next_n,
+                (
+                    None
+                    if indexer_logits_ws is None
+                    else indexer_logits_ws.numel() // max_model_len
+                ),
+            )
+            logits = _decode_logits(indexer_logits_ws, band, max_model_len)
             for r0 in range(0, num_rows, band):
                 r1 = min(r0 + band, num_rows)
                 b0, b1 = r0 // next_n, r1 // next_n
@@ -2426,7 +2439,7 @@ class Indexer(nn.Module):
         )
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         # Set by the MLA metadata builder (aiter_mla.py).
-        self.indexer_logits_ws = torch.empty(0, dtype=torch.float32, device="cuda")
+        self.indexer_logits_ws: torch.Tensor | None = None
         atom_config.compilation_config.static_forward_context[prefix] = self
 
         # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
