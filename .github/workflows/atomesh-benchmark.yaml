@@ -124,9 +124,6 @@ on:
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part12,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c88-part12,
             kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c56-part12,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part13,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c72-part13-mem95,
-            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-agentic-lmcache-1m-c88-part13-mem95,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c72,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c128,
             kimi-k3-mxfp4-2p1d-tp8-dcp8-agentic-lmcache-1m-c256
