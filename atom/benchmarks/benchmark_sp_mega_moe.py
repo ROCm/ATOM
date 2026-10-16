@@ -22,7 +22,6 @@ def parse_args():
     parser.add_argument(
         "--tokens", nargs="+", type=int, default=[64, 128, 8192, 16384, 32768]
     )
-    parser.add_argument("--max-local-tokens", type=int, default=1024)
     parser.add_argument("--act-dtype", choices=["fp4", "fp8"], default="fp4")
     parser.add_argument("--comm-dtype", choices=["fp8", "bf16"], default="fp8")
     parser.add_argument("--warmup", type=int, default=3)
@@ -48,23 +47,8 @@ def parse_args():
         "--trace", action="store_true", help="Profile one fused 2K call per rank"
     )
     args = parser.parse_args()
-    if (
-        min(
-            *args.tokens,
-            args.max_local_tokens,
-            args.warmup,
-            args.iterations,
-            args.repeats,
-        )
-        < 1
-    ):
-        parser.error(
-            "token counts, tile size, warmup, iterations and repeats must be positive"
-        )
-    if args.max_local_tokens > 8192:
-        parser.error("SP4 MegaMoE supports at most 8192 local tokens per launch")
-    if args.act_dtype == "fp8" and args.max_local_tokens > 64:
-        parser.error("MXFP8 activation requires --max-local-tokens <=64")
+    if min(*args.tokens, args.warmup, args.iterations, args.repeats) < 1:
+        parser.error("token counts, warmup, iterations and repeats must be positive")
     if args.max_relative_l2 <= 0 or args.max_fusion_relative_l2 <= 0:
         parser.error("relative L2 limits must be positive")
     if args.cooldown < 0:
@@ -78,9 +62,6 @@ def case_matrix(args):
             "global_tokens": tokens,
             "padded_global_tokens": math.ceil(tokens / 4) * 4,
             "local_tokens": math.ceil(tokens / 4),
-            "mega_launches_per_layer": math.ceil(
-                math.ceil(tokens / 4) / args.max_local_tokens
-            ),
             "candidate_activation": "MX" + args.act_dtype.upper(),
             "candidate_communication": args.comm_dtype,
         }
@@ -101,7 +82,6 @@ def main():
         ATOM_USE_TRITON_MOE_DECODE="0",
         ATOM_MOE_GU_ITLV="0",
         ATOM_SP_MOE_MEGA="1",
-        ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS=str(args.max_local_tokens),
         ATOM_SP_MOE_MEGA_ACT_DTYPE=args.act_dtype,
         ATOM_SP_MOE_MEGA_COMM_DTYPE=args.comm_dtype,
         ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE=(
@@ -196,6 +176,8 @@ def main():
         else:
             initialize_sp_mega_moe(block, config)
     backend = layer._sp_mega_moe
+    # Derived from max_num_batched_tokens, the largest case here.
+    tile = backend.runtime.max_local_tokens
 
     def all_rank_max(value):
         values = [None] * 4
@@ -242,6 +224,7 @@ def main():
         "scope": "synthetic single M3 MoE layer, native routing and SP collectives; excludes router GEMM",
         "aiter": importlib.metadata.version("amd-aiter"),
         "flydsl": importlib.metadata.version("flydsl"),
+        "max_local_tokens": tile,
         "settings": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
@@ -344,12 +327,10 @@ def main():
             selected = backend.supports(layer, x)
             row["selected_backend"] = "mega" if selected else "native"
             row["mega_launch_config"] = (
-                str(backend.runtime.launch_config(min(m, args.max_local_tokens)))
-                if selected
-                else None
+                str(backend.runtime.launch_config(min(m, tile))) if selected else None
             )
+            row["mega_launches_per_layer"] = math.ceil(m / tile) if selected else 0
             if not selected:
-                row["mega_launches_per_layer"] = 0
                 row["candidate_activation"] = row["native_activation"]
                 row["candidate_communication"] = "native"
             results["rows"].append(row)

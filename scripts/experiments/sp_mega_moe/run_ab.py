@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 
 
-def common_env(max_local_tokens):
+def common_env():
     env = os.environ.copy()
     env.update(
         PYTHONPATH=os.pathsep.join(filter(None, (str(ROOT), env.get("PYTHONPATH")))),
@@ -39,7 +39,6 @@ def common_env(max_local_tokens):
         ATOM_USE_TRITON_MOE_DECODE="0",
         ATOM_MOE_GU_ITLV="0",
         ATOM_M3_TP_REPLICATED_O_PROJ="0",
-        ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS=str(max_local_tokens),
         ATOM_SP_MOE_MEGA_ACT_DTYPE="fp4",
         ATOM_SP_MOE_MEGA_COMM_DTYPE="fp8",
         ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE="0",
@@ -219,7 +218,6 @@ def main():
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--batches", type=int, nargs="+", default=[4096, 2048])
     parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--max-local-tokens", type=int, default=1024)
     parser.add_argument("--output-len", type=int, choices=[1, 100], default=100)
     parser.add_argument(
         "--serve", choices=["native", "mega"], help="Start one server only"
@@ -234,7 +232,7 @@ def main():
     if args.profile_dir and not args.serve:
         parser.error("Use --serve for profiling; throughput runs have no profiler")
     args.output = args.output.resolve()
-    env = common_env(args.max_local_tokens)
+    env = common_env()
     cases = []
     for repeat in range(args.rounds if not args.serve else 1):
         modes = ("native", "mega") if repeat % 2 == 0 else ("mega", "native")

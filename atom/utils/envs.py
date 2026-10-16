@@ -279,9 +279,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # Experimental AITER #5937 all-gather + MoE + reduce-scatter, native M3 SP4.
     "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "0") == "1",
-    "ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS": lambda: int(
-        os.getenv("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS", "1024")
-    ),
     "ATOM_SP_MOE_MEGA_ACT_DTYPE": lambda: os.getenv(
         "ATOM_SP_MOE_MEGA_ACT_DTYPE", "fp4"
     ),

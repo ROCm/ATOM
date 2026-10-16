@@ -10,6 +10,7 @@ Large token shards are tiled locally, with the same tiles on every SP rank.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from itertools import pairwise
@@ -29,9 +30,23 @@ def copy_tail(source, source_scale, out, out_scale):
     copy(source, source_scale, out, out_scale)
 
 
+# AITER's largest big-M tier: 32768 global tokens over 4 ranks.
+MAX_LOCAL_TOKENS = 8192
+# AITER #5937 MXFP8 activation supports at most 256 global tokens.
+MXFP8_MAX_GLOBAL_TOKENS = 256
+
+
+def local_token_tile(max_num_batched_tokens, world_size, act_dtype):
+    """Rows per launch: the largest local shard, within AITER's supported range."""
+    if act_dtype == "fp8":
+        cap = MXFP8_MAX_GLOBAL_TOKENS // world_size
+    else:
+        cap = MAX_LOCAL_TOKENS
+    return min(math.ceil(max_num_batched_tokens / world_size), cap)
+
+
 @dataclass(frozen=True)
 class MegaMoESettings:
-    max_local_tokens: int = 1024
     act_dtype: str = "fp4"
     comm_dtype: str = "fp8"
     allow_activation_change: bool = False
@@ -41,13 +56,6 @@ class MegaMoESettings:
             raise ValueError("ATOM_SP_MOE_MEGA_ACT_DTYPE must be fp4 or fp8")
         if self.comm_dtype not in ("fp8", "bf16"):
             raise ValueError("ATOM_SP_MOE_MEGA_COMM_DTYPE must be fp8 or bf16")
-        if not 1 <= self.max_local_tokens <= 8192:
-            raise ValueError("ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS must be in [1, 8192]")
-        if self.act_dtype == "fp8" and self.max_local_tokens > 64:
-            raise ValueError(
-                "AITER #5937 MXFP8 activation supports at most 256 global tokens; "
-                "set ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS<=64 for SP4"
-            )
 
 
 def _weights(layer):
@@ -426,10 +434,13 @@ def initialize_sp_mega_moe(model, config):
             "without TBO, RapidServe, speculative decoding or EPLB"
         )
     settings = MegaMoESettings(
-        max_local_tokens=envs.ATOM_SP_MOE_MEGA_MAX_LOCAL_TOKENS,
         act_dtype=envs.ATOM_SP_MOE_MEGA_ACT_DTYPE,
         comm_dtype=envs.ATOM_SP_MOE_MEGA_COMM_DTYPE,
         allow_activation_change=envs.ATOM_SP_MOE_MEGA_ALLOW_ACTIVATION_CHANGE,
+    )
+    group = get_sp_group()
+    tile = local_token_tile(
+        config.max_num_batched_tokens, group.world_size, settings.act_dtype
     )
     # The plugin decorator constructs the original class, not its lazy wrapper.
     moe_type = getattr(FusedMoE, "__wrapped__", FusedMoE)
@@ -472,7 +483,6 @@ def initialize_sp_mega_moe(model, config):
             "SP MegaMoE requires AITER main with MegaMoeTP (#5937)"
         ) from exc
 
-    group = get_sp_group()
     # M3 prefill needs larger row tiles than AITER's generic MT3 default.
     # Preserve AITER's explicit overrides, including token-dependent tables.
     lb_mt = os.getenv("AITER_MEGAMOE_TP_LB_MT", "6")
@@ -484,7 +494,7 @@ def initialize_sp_mega_moe(model, config):
             inter_dim=768,
             experts=129,
             topk=5,
-            max_local_tokens=settings.max_local_tokens,
+            max_local_tokens=tile,
             activation=layers[0].activation,
             swiglu_limit=limits.pop(),
             comm_mode="ag_rs",
@@ -500,7 +510,7 @@ def initialize_sp_mega_moe(model, config):
     # Prepare each distinct launch variant once. Cover every possible remainder
     # of a local tile so an unseen graph bucket cannot compile during capture.
     representatives = {}
-    for rows in range(1, settings.max_local_tokens + 1):
+    for rows in range(1, tile + 1):
         # Tail eligibility can change inside a launch bucket (TN_MAX).
         key = (
             (runtime.launch_config(rows), runtime.tail_ok(rows))
@@ -544,7 +554,7 @@ def initialize_sp_mega_moe(model, config):
         "activation=MX%s, weights=MXFP4, comm=%s, lb_mt=%s, "
         "allow_activation_change=%s; larger shards use multiple launches",
         len(layers),
-        settings.max_local_tokens,
+        tile,
         settings.act_dtype.upper(),
         settings.comm_dtype,
         lb_mt,
