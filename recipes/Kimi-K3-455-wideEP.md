@@ -597,7 +597,7 @@ exec python3 -m atom.entrypoints.openai_server \
   -tp 1 --data-parallel-size 8 --data-parallel-size-local 4 --data-parallel-rank "$DPRANK" \
   --data-parallel-master-ip "$MASTER" --data-parallel-master-port 29500 --data-parallel-base-port 29700 \
   --enable-expert-parallel --enable-dp-attention \
-  --kv_cache_dtype fp8 --index-cache-dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
+  --kv_cache_dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
   --online_quant_config "$ONLINE_QUANT" "${MODE_ARGS[@]}" --disable_uvicorn_access_log
 ```
 
@@ -703,7 +703,7 @@ server for every concurrency.
 export MODEL_PATH=/models/Kimi-K3 AIPERF_MODEL=moonshotai/Kimi-K3 HF_HOME=/root/.cache/huggingface
 export SERVER_ARGS="--model /models/Kimi-K3 --served-model-name moonshotai/Kimi-K3 --trust-remote-code -tp 1 \
 --data-parallel-size 8 --data-parallel-size-local 4 --enable-expert-parallel --enable-dp-attention \
---kv_cache_dtype fp8 --index-cache-dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
+--kv_cache_dtype fp8 --cudagraph-mode FULL --max-num-seqs 8 \
 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.90 --enable_prefix_caching --disable_uvicorn_access_log"
 export AIPERF_DIR=/root/.cache/aiperf-src AIPERF_VENV=/root/.cache/aiperf-venv   # reuse the install between runs
 CONC=32   # 16, 32 or 64
