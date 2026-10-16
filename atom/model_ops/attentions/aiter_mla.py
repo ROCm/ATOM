@@ -49,6 +49,7 @@ from atom.model_ops.attention_mla import (
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
 )
+from atom.model_ops.deepseek_v41.score_workspace import logits_rows
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
@@ -627,6 +628,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
+            # Shared indexer decode logits workspace.
+            # Allocated before the memory profile so the KV budget counts it.
+            self._indexer_logits_ws = None
+            if self.dcp_world_size == 1:
+                width = model_runner.config.max_model_len
+                decode_rows = max(
+                    logits_rows(self.max_bs * max_seqlen_qo, width), max_seqlen_qo
+                )
+                self._indexer_logits_ws = torch.empty(
+                    decode_rows * width, dtype=torch.float32, device=self.device
+                )
+                logger.info(
+                    "Sparse indexer logits workspace: %.2f GiB",
+                    self._indexer_logits_ws.numel() * 4 / (1 << 30),
+                )
             # DCP sparse decode compacts each rank's owned top-k slots to the
             # front (no -1 holes), so the per-request region length becomes data-
             # AND layer-dependent.
@@ -803,6 +819,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                     tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
                     tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
+                    if self._indexer_logits_ws is not None and hasattr(
+                        tgt, "indexer_logits_ws"
+                    ):
+                        tgt.indexer_logits_ws = self._indexer_logits_ws
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
