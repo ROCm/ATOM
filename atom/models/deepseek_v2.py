@@ -127,6 +127,7 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    is_neox_rope_style,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -318,23 +319,6 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
     )
-
-
-def _is_neox_rope_style(
-    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
-) -> bool:
-    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
-
-    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
-    an interleave flag of True means ``is_neox_style=False``. A missing or null
-    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
-    that predate the flag, which differs per rope instance (see call sites):
-    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
-    """
-    interleave = getattr(config, interleave_attr, None)
-    if interleave is None:
-        return default_is_neox
-    return not bool(interleave)
 
 
 def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
@@ -2717,7 +2701,7 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             # DeepSeek's main MLA rope is interleaved (is_neox_style=False) when
             # unspecified; GLM-5.x sets rope_interleave=true, i.e. also interleaved.
-            is_neox_style=_is_neox_rope_style(
+            is_neox_style=is_neox_rope_style(
                 config, "rope_interleave", default_is_neox=False
             ),
         )
@@ -2741,7 +2725,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 # DeepSeek-V3.2's indexer rope is neox (is_neox_style=True) when
                 # unspecified; GLM-5.x sets indexer_rope_interleave=true to override
                 # it to interleaved.
-                is_neox_style=_is_neox_rope_style(
+                is_neox_style=is_neox_rope_style(
                     config, "indexer_rope_interleave", default_is_neox=True
                 ),
             )
@@ -3580,3 +3564,30 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
+
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+    ):
+        super().__init__(atom_config, prefix, layer_type)
+
+        from atom.models.glm52.mono.dispatch import MonoDecode
+
+        self._mono = MonoDecode(self, atom_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

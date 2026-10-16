@@ -134,11 +134,19 @@ optional target graphs; its draft
 windows, accepted-prefix state, calibration profile, supported scope and **quality
 limitations** are in [the DSpark guide](deepseek_v41_dspark.md). Packed
 speculative caches and multimodal speculation are rejected, as are
-PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe, plugin
-execution and EPLB — all before loading. `lmcache_mp` offloads PAGE units and
+PP/CP, DP without DP attention, decode TBO, KV transfer other than `lmcache_mp`, RapidServe
+and EPLB — all before loading. Plugin execution is no longer among them: V4.1
+runs on the vLLM plugin backend, described in
+[the plugin backend guide](vllm_plugin_backend_guide.md). `lmcache_mp` offloads PAGE units and
 restores STATE through the same PAGE-backed checkpoint images the local prefix
 cache uses (`get_kv_transfer_tensors` publishes each plane of a unit, in
 `StateCopies` order).
+
+That admission is native-only. On the plugin backend every KV connector is
+refused, `lmcache_mp` included: vLLM resolves the connector through its own
+registry, so what runs there is vLLM's `LMCacheMPConnector` rather than the
+ATOM transport that publishes those checkpoint images, and a hit would restore
+PAGEs whose STATE nobody wrote.
 DP attention supports text requests and prefill TBO.
 Compilation level 3 is admitted with FULL graphs or eager execution; the
 [AgentX recipe](../recipes/DeepSeek-V4.1-Flash-Agentic.md) records TP2/TP4

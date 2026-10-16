@@ -45,6 +45,7 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "K3DSparkModel": "atom.plugin.vllm.models.kimi_k3_dspark:KimiK3DSparkVllm",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "DeepseekV41ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "Eagle3LlamaForCausalLM": ATOM_CAUSAL_LM_MODEL_WRAPPER,
@@ -89,16 +90,97 @@ class MiniMaxM3Config(PretrainedConfig):
             setattr(text_config, name, value)
 
 
+class DeepseekV41TextConfig(PretrainedConfig):
+    """The ``text_config`` block, as a class that survives serialization.
+
+    ``model_type`` has to be a *class* attribute: ``PretrainedConfig.to_dict``
+    ends with ``output["model_type"] = self.__class__.model_type``, so an
+    instance attribute is overwritten by the base class's ``""`` on the way
+    out. That is what made vLLM's resolved config unnormalizable, which is
+    what made ``--hf-overrides`` unreachable for V4.1 -- the bridge read the
+    checkpoint off disk instead, and the override was never in that file.
+
+    Naming the type also makes ``transformers`` run its RoPE back-compat on
+    this class, which logs once per config load:
+
+        DeepseekV41TextConfig got `key=rope_scaling` in kwargs but hasn't set
+        it as attribute.
+
+    Cosmetic -- ``rope_scaling`` arrives intact, and the normalized config is
+    byte-identical either way. Declaring ``rope_parameters`` on the class is
+    what the message asks for and what ``configuration_utils.py``'s
+    ``hasattr`` test reads, but it does not silence this; the construction
+    that warns is not the one this shim makes, and chasing it was not worth
+    more than the three attempts it got. Left as noise rather than papered
+    over with a change that does not do what its comment would claim.
+    """
+
+    model_type = "deepseek_v41_text"
+
+
+def _text_config_from_dict(values: dict) -> PretrainedConfig:
+    """Build a text config out of a checkpoint's nested ``text_config`` block.
+
+    Assigned after construction rather than passed as keyword arguments:
+    ``PretrainedConfig.__post_init__`` standardizes RoPE parameters, and that
+    reads ``max_position_embeddings`` off the instance before the base
+    initializer has assigned the keywords it was handed. A checkpoint that
+    declares both -- DeepSeek-V4.1 declares ``rope_scaling`` with a YaRN factor
+    -- therefore raises out of `transformers` before vLLM ever builds its
+    ``ModelConfig``. Setting the fields afterwards standardizes RoPE off a
+    fully populated object.
+    """
+    config = DeepseekV41TextConfig()
+    for name, value in values.items():
+        setattr(config, name, value)
+    return config
+
+
+class DeepseekV41Config(PretrainedConfig):
+    """Minimal local config shim for DeepSeek-V4.1 checkpoints.
+
+    ``transformers`` does not know the ``deepseek_v41`` model type, so vLLM's
+    ``AutoConfig.from_pretrained`` on the checkpoint raises before the ATOM
+    platform is ever consulted. Registering this shim lets vLLM build its
+    ``ModelConfig``; ATOM itself never reads it -- the plugin's V4.1 bridge
+    goes back to ``atom.config.get_hf_config`` for the normalized
+    ``DeepseekV41TextConfig`` the runtime model expects.
+
+    The checkpoint nests every text hyperparameter under ``text_config``, so
+    expose it under the attribute name ``PretrainedConfig.get_text_config``
+    looks for; that is how vLLM finds ``hidden_size``, ``num_hidden_layers``
+    and friends.
+    """
+
+    model_type = "deepseek_v41"
+
+    def __init__(
+        self,
+        text_config: dict | PretrainedConfig | None = None,
+        vision_config: dict | None = None,
+        **kwargs,
+    ):
+        if isinstance(text_config, dict):
+            text_config = _text_config_from_dict(text_config)
+
+        self.text_config = text_config
+        self.vision_config = vision_config
+        self.hidden_size = getattr(text_config, "hidden_size", None)
+
+        super().__init__(**kwargs)
+
+
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
 
 
 def _register_hf_configs() -> None:
-    try:
-        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
-    except ValueError as exc:
-        if "already used by a Transformers config" not in str(exc):
-            raise
+    for config_cls in (MiniMaxM3Config, DeepseekV41Config):
+        try:
+            AutoConfig.register(config_cls.model_type, config_cls)
+        except ValueError as exc:
+            if "already used by a Transformers config" not in str(exc):
+                raise
 
 
 def _register_mxfp8_quantization_config() -> None:
@@ -143,6 +225,59 @@ def _register_mxfp8_quantization_config() -> None:
             return None
 
 
+_DUMMY_RUN_COVERAGE_LOGGED = False
+
+
+def _install_shared_vllm_patches() -> None:
+    """The patches both registration hooks need, installed from either.
+
+    Both hooks run them because neither is guaranteed to: vLLM resolves the
+    platform class from inside its own ``import vllm``, so ``register_platform``
+    can be swallowed whole and its coverage line never printed -- which is how
+    the dummy-run marking once covered nothing while the synthetic batches went
+    on taking real STATE slots. Every one of these is idempotent, so installing
+    twice costs nothing.
+
+    Kept in one function because it was two pasted copies, which drifted: the
+    coverage line was logged from both, so a normal run reported it twice. It is
+    logged here only by the call that installs something.
+    """
+    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
+        apply_vllm_v4_block_reuse_patch,
+        apply_vllm_v4_profile_cache_patch,
+    )
+    from atom.plugin.vllm.vllm_runtime import apply_vllm_dummy_run_patch
+
+    apply_vllm_v4_block_reuse_patch()
+    # Unconditionally, not from whoever registers a proxy layer. It was
+    # installed from V4's registration, so V4.1 -- which registers its own
+    # layer -- never got it, and the flag its bind reads never left a default
+    # that did not exist until this week. That is the third V4 guard V4.1
+    # missed for being opt-in (markers, attributes, now an installer), so this
+    # one stops being opt-in: `_mark_v4_proxy_cache_mode` only touches layers
+    # carrying `_atom_v4_proxy_layer`, which makes it a no-op everywhere else.
+    apply_vllm_v4_profile_cache_patch()
+
+    # Which forwards are vLLM's own, for a model that keeps per-request state.
+    global _DUMMY_RUN_COVERAGE_LOGGED
+    covered = apply_vllm_dummy_run_patch()
+    if not covered:
+        # Said out loud, every time. Covering nothing is the failure this count
+        # exists to expose -- synthetic batches then take the STATE slots real
+        # requests hold -- and logging only the good case trades a misleading
+        # number for an ambiguous silence: "did not install" and "installed,
+        # and this is the second call" read identically when neither prints.
+        logger.warning(
+            "ATOM plugin: dummy-run marking covers no runner class; vLLM's "
+            "synthetic batches will not be recognised as synthetic"
+        )
+    elif not _DUMMY_RUN_COVERAGE_LOGGED:
+        _DUMMY_RUN_COVERAGE_LOGGED = True
+        logger.info(
+            "ATOM plugin: dummy-run marking covers %d runner class(es)", covered
+        )
+
+
 def register_platform() -> str | None:
 
     if disable_vllm_plugin:
@@ -173,11 +308,7 @@ def register_platform() -> str | None:
     # DeepSeek-V4's packed proxy arena cannot immediately recycle block ids;
     # install the targeted scheduler-side queue-order compatibility patch before
     # any KVCacheManager is constructed.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
-    )
-
-    apply_vllm_v4_block_reuse_patch()
+    _install_shared_vllm_patches()
 
     _register_kv_connectors()
 
@@ -307,12 +438,24 @@ def register_model() -> None:
 
     _set_plugin_mode()
     # The general-plugin hook runs in the EngineCore process that owns the
-    # scheduler/KVCacheManager; install this here as well as in the platform hook.
-    from atom.plugin.vllm.deepseek_v4_prefix_patch import (
-        apply_vllm_v4_block_reuse_patch,
+    # scheduler/KVCacheManager; install these here as well as in the platform
+    # hook, which vLLM does not always reach.
+    _install_shared_vllm_patches()
+
+    # DeepSeek-V4.1 needs its CSA2 STATE tail withheld from the block pool
+    # before EngineCore sizes the KV cache. This hook is the only one that is
+    # reliably reached: vLLM resolves the platform class from inside its own
+    # ``import vllm``, so ``register_platform`` -- and with it
+    # ``ATOMPlatform.check_and_update_config`` -- can fail on a partially
+    # initialized ``vllm`` package and be swallowed, leaving the stock ROCm
+    # platform in place. Installing is a no-op for every other model:
+    # ``deepseek_v41_state_reserve_blocks`` returns 0 unless the config it is
+    # handed is V4.1's.
+    from atom.plugin.vllm.deepseek_v41_state_reserve_patch import (
+        apply_vllm_v41_state_reserve_patch,
     )
 
-    apply_vllm_v4_block_reuse_patch()
+    apply_vllm_v41_state_reserve_patch()
 
     # vLLM auto-enables the breakable cudagraph for V4 while building
     # VllmConfig, which happens after this hook in every process.
@@ -424,3 +567,13 @@ def register_model() -> None:
     )
 
     apply_vllm_req_id_passthrough_patch()
+    from atom.plugin.vllm.v41_speculative import (
+        patch_v41_speculative_commit,
+        patch_v41_speculative_scheduling,
+    )
+
+    # The other half of V4.1's tentative speculative step: the builder stages
+    # it, this commits the accepted prefix once the sampler has judged it.
+    patch_v41_speculative_commit()
+    # Runs in the EngineCore process, which is where the scheduler lives.
+    patch_v41_speculative_scheduling()
