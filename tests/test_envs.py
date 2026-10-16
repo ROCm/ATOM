@@ -43,6 +43,7 @@ _ATOM_ENV_VARS = [
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
     "ATOM_MEGA_MASK_PAD_ROWS",
+    "ATOM_GRAPH_QUEUE_PAD",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -108,6 +109,9 @@ class TestEnvsDefaults:
     def test_metrics_device_timer_default_disabled(self):
         assert _get_envs().ATOM_ENABLE_METRICS_DEVICE_TIMER is False
 
+    def test_graph_queue_pad_default_disabled(self):
+        assert _get_envs().ATOM_GRAPH_QUEUE_PAD == "0"
+
     def test_metrics_update_interval_default(self, caplog):
         assert _get_envs().ATOM_METRICS_UPDATE_INTERVAL_S == 1.0
         assert not caplog.records
@@ -165,6 +169,11 @@ class TestEnvsOverrides:
     def test_mhc_use_bf16_override(self, monkeypatch, value, expected):
         monkeypatch.setenv("ATOM_MHC_USE_BF16", value)
         assert _get_envs().ATOM_MHC_USE_BF16 is expected
+
+    @pytest.mark.parametrize("value", ["auto", "3"])
+    def test_graph_queue_pad_override(self, monkeypatch, value):
+        monkeypatch.setenv("ATOM_GRAPH_QUEUE_PAD", value)
+        assert _get_envs().ATOM_GRAPH_QUEUE_PAD == value
 
     def test_dp_rank_override(self, monkeypatch):
         monkeypatch.setenv("ATOM_DP_RANK", "3")
