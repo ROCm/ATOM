@@ -36,6 +36,7 @@ PATTERNS = (
 )
 MAX_FILE_BYTES = 8 << 20
 MAX_TOTAL_BYTES = 64 << 20
+MAX_DIAGNOSTIC_BYTES = 2 << 20
 
 
 def run_id(value):
@@ -126,7 +127,11 @@ def collect(target, output, *, roots=ROOTS):
                 continue
             row["runs"].append(str(source))
             for pattern in PATTERNS:
-                for path in sorted(source.glob(pattern)):
+                # Rotated history must not crowd out another rank's live evidence.
+                for path in sorted(
+                    source.glob(pattern),
+                    key=lambda path: (".previous." in path.name, path),
+                ):
                     resolved = path.resolve()
                     if (
                         resolved in seen
@@ -143,7 +148,10 @@ def collect(target, output, *, roots=ROOTS):
                     try:
                         with resolved.open("rb") as stream:
                             size = os.fstat(stream.fileno()).st_size
-                            count = min(size, MAX_FILE_BYTES, MAX_TOTAL_BYTES - used)
+                            file_limit = MAX_FILE_BYTES
+                            if "runtime-diagnostics" in relative.parts:
+                                file_limit = min(file_limit, MAX_DIAGNOSTIC_BYTES)
+                            count = min(size, file_limit, MAX_TOTAL_BYTES - used)
                             stream.seek(max(0, size - count))
                             data = stream.read(count)
                         destination.parent.mkdir(parents=True, exist_ok=True)
