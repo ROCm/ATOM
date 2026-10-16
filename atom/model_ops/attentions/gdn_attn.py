@@ -1153,6 +1153,21 @@ class GDNStateMixin(PoolRowsMixin):
         index out of this tensor, and the conv path is handed column 0 alone),
         so this is where a contiguity assumption would have been *invented*
         rather than a place one has to be honoured.
+
+        Every row past the state-holding seqs is reset to PAD_SLOT_ID, which
+        every GDN/KDA kernel skips. The rows a forward publishes are its
+        scheduled seqs, and a seq without a state slot is filtered out of
+        `batch.state_slots`, so such a row would otherwise keep whatever the
+        previous batch wrote there. The DP-sync dummy decode
+        (`ModelRunner.dummy_execution`: one seq, id -1, no slot) is that case.
+        An idle DP rank runs it while its own requests sit unscheduled, for
+        example between prefill chunks while the PrefillDelayer holds. With a
+        stale index its decode updates the conv and recurrent state of the
+        first request of the rank's last real batch in place. That request then
+        continues from a corrupted state. A prefix-cache checkpoint pending
+        from that slot stores the corrupted state for every later hit on the
+        prefix. TP-only serving never runs the dummy, which is why this only
+        shows under DP attention.
         """
         self._check_state_indices_writable()
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
@@ -1163,6 +1178,10 @@ class GDNStateMixin(PoolRowsMixin):
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
         )
+        num_state_rows = len(batch.state_slots)
+        non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
+        non_spec_state_indices_in[num_state_rows:] = PAD_SLOT_ID
+        spec_state_indices[num_state_rows:] = PAD_SLOT_ID
         for idx, slots in enumerate(batch.state_slots):
             non_spec_state_indices[idx] = 0
             non_spec_state_indices_in[idx] = 0
@@ -1187,12 +1206,28 @@ class GDNStateMixin(PoolRowsMixin):
                     non_spec_state_indices[idx] = committed
 
     def prepare_num_accepted_tokens(self, batch: ScheduledBatch):
-        self.num_accepted_tokens.fill_(1)
+        """Publish `num_bonus + 1` per request, 1 everywhere else, in one copy.
 
-        if self.model_runner.tokenID_processor.num_bonus is None:
+        The counts arrive on the host, and assigning them element by element
+        made each one a blocking `hipMemcpyWithStream`: the first drained the
+        stream, the rest cost ~13us each, so the decode prep grew with batch.
+
+        One non-blocking copy of the whole row replaces the reset and the
+        writes. The destination stays the same tensor -- a captured graph and
+        `replayssm_commit` read it by address -- and a pageable source of this
+        size (4 B x max_bs, far below `_PAGEABLE_H2D_LIMIT`) is staged by the
+        driver and returns without waiting on queued work. A pinned
+        `CpuGpuBuffer` is not used: its GPU half would be per PP ring slot,
+        while this destination is one tensor shared by every slot.
+        """
+        num_bonus = self.model_runner.tokenID_processor.num_bonus
+        if num_bonus is None:
+            self.num_accepted_tokens.fill_(1)
             return
-        for idx, num_bonus in enumerate(self.model_runner.tokenID_processor.num_bonus):
-            self.num_accepted_tokens[idx] = num_bonus + 1
+        num_bonus = np.asarray(num_bonus, dtype=np.int32)
+        host = np.ones(self.num_accepted_tokens.shape, dtype=np.int32)
+        host[: num_bonus.shape[0]] = num_bonus + 1
+        self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
 
     def prepare_gdn_metadata(
         self,

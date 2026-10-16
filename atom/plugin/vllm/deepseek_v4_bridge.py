@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import functools
 import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -208,55 +210,16 @@ def _proxy_region_byte_sizes(
 
 
 def _proxy_page_bytes(vllm_config) -> int:
-    from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
-        UnifiedPoolGeometry,
-    )
+    """What one 128-token block really costs: both plane envelopes + indexer.
 
-    hf = vllm_config.model_config.hf_config
-    ratios, _dense, csa_layers, _hca = _layer_counts(hf)
-    head_dim = int(getattr(hf, "head_dim", 512))
-    rope_head_dim = _v4_rope_head_dim(hf)
-    index_head_dim = int(getattr(hf, "index_head_dim", 128))
-    kv_fp8 = _v4_kv_fp8(vllm_config)
-    _arena_planes, arena_rows, _row_widths = _v4_state_layout(vllm_config, kv_fp8)
-    win = _v4_win_with_spec(vllm_config, int(getattr(hf, "sliding_window", 128)))
-    max_num_seqs = int(getattr(vllm_config.scheduler_config, "max_num_seqs", 1))
-    max_model_len = int(vllm_config.model_config.max_model_len)
-    min_blocks = max(
-        1,
-        (max_model_len + ATOM_DEEPSEEK_V4_BLOCK_SIZE - 1)
-        // ATOM_DEEPSEEK_V4_BLOCK_SIZE,
-    )
-    geometry = UnifiedPoolGeometry(
-        ratios,
-        num_blocks=min_blocks,
-        num_slots=max_num_seqs,
-        ring_slots=win,
-        block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
-        arena_rows=arena_rows,
-    )
-    from atom.model_ops.attentions.pool_layout.entry_arena import plan_regions
+    The per-request slots are not in this price. They are withheld from the
+    block pool as a tail
+    (`deepseek_v4_state_checkpoint.V4StateCheckpointSizing.usable_blocks`), so vLLM's
+    block count is a block count and every state checkpoint page is a real page.
+    """
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_state_checkpoint_sizing
 
-    regions = _proxy_region_byte_sizes(
-        geometry=geometry,
-        csa_layers=csa_layers,
-        num_blocks=min_blocks,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        index_head_dim=index_head_dim,
-        kv_fp8=kv_fp8,
-    )
-    _, total = plan_regions(regions)
-    # vLLM 0.26 may pack this cache after another layer at a non-aligned
-    # storage offset. Budget one-time leading slack so the runtime carve can
-    # move its first plane to the 256B boundary EntryMajorArena requires.
-    total += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - 1
-    page_bytes = (total + min_blocks - 1) // min_blocks
-    if page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT:
-        page_bytes += ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT - (
-            page_bytes % ATOM_DEEPSEEK_V4_PROXY_ALIGNMENT
-        )
-    return page_bytes
+    return v4_state_checkpoint_sizing(vllm_config).page_bytes
 
 
 def _proxy_block_major_view(proxy_kv_cache: torch.Tensor) -> torch.Tensor:
@@ -270,6 +233,42 @@ def _proxy_block_major_view(proxy_kv_cache: torch.Tensor) -> torch.Tensor:
     if not proxy_kv_cache.is_contiguous():
         raise ValueError("DeepSeek V4 proxy cache must be block-major contiguous")
     return proxy_kv_cache
+
+
+def _proxy_through_slot_tail(proxy_kv_cache: torch.Tensor, nbytes: int) -> torch.Tensor:
+    """The proxy's first ``nbytes`` as ``[blocks, page]``, past the end of its view.
+
+    vLLM sizes each layer view by ``kv_cache_config.num_blocks``, which the state
+    checkpoint hook lowered to the schedulable blocks; the slot tail it withheld is
+    still allocated right after them (``KVCacheTensor.size`` is unchanged).
+    """
+    view = _proxy_block_major_view(proxy_kv_cache)
+    page = int(view[0].numel())
+    return view.as_strided((-(-int(nbytes) // page), page), (page, 1))
+
+
+def _proxy_carve_source(proxy_kv_cache: torch.Tensor, sizing, ratios):
+    """``(carve_cache, carve_blocks)`` for a proxy layer that carves ``ratios``.
+
+    The hook lowers ``num_blocks`` for the whole KV-cache config, so every proxy
+    layer in it has the withheld tail right after its own view (the MTP draft's
+    proxy is not in it: it shares the target's tensor). A proxy carves its
+    view's blocks plus its own slots there; the slots must fit in what the hook
+    priced from the checkpoint.
+    """
+    blocks = int(_proxy_block_major_view(proxy_kv_cache).shape[0])
+    ratios = tuple(int(r) for r in ratios)
+    own = dataclasses.replace(
+        sizing, ratios=ratios, n_csa=sum(1 for r in ratios if r == 4)
+    )
+    nbytes = own.carve_bytes(blocks)
+    if nbytes > sizing.carve_bytes(blocks):
+        raise ValueError(
+            f"DeepSeek V4 proxy carving {len(ratios)} layers needs {nbytes} B for "
+            f"{blocks} blocks + slots, more than the {sizing.carve_bytes(blocks)} B "
+            "the pool withheld for the checkpoint's layers"
+        )
+    return _proxy_through_slot_tail(proxy_kv_cache, nbytes), blocks
 
 
 def slice_deepseek_v4_proxy_cache_views(
@@ -287,8 +286,13 @@ def slice_deepseek_v4_proxy_cache_views(
     arena_planes=None,
     arena_rows: int = 0,
     row_widths: list[int] | None = None,
+    num_blocks: int | None = None,
 ) -> dict[str, object]:
-    """Carve native-equivalent unified V4 planes from vLLM proxy storage."""
+    """Carve native-equivalent unified V4 planes from vLLM proxy storage.
+
+    ``num_blocks`` is how many blocks the pool may hand out; it defaults to the
+    tensor's own count. The slots take the bytes past those blocks.
+    """
     from atom.model_ops.attentions.pool_layout.entry_arena import (
         EntryMajorArena,
         SplitEntryMajorArena,
@@ -304,7 +308,13 @@ def slice_deepseek_v4_proxy_cache_views(
     ratios = [int(r) for r in compress_ratios]
     index_dim = _index_row_bytes(index_head_dim)
     physical = _proxy_block_major_view(proxy_kv_cache)
-    num_blocks = int(physical.shape[0])
+    tensor_blocks = int(physical.shape[0])
+    num_blocks = tensor_blocks if num_blocks is None else int(num_blocks)
+    if not 0 < num_blocks <= tensor_blocks:
+        raise ValueError(
+            f"DeepSeek V4 proxy carve of {num_blocks} blocks does not fit a "
+            f"{tensor_blocks}-block tensor"
+        )
     raw = physical.reshape(-1)
     if raw.dtype is not torch.uint8:
         raise ValueError(f"DeepSeek V4 proxy cache must be uint8, got {raw.dtype}")
@@ -365,9 +375,13 @@ def slice_deepseek_v4_proxy_cache_views(
             .view(geometry.plane_rows, rope_head_dim)
         )
         region_idx += 1
+    csa_indexer_pool = None
     if n_csa:
         per_layer_indexer = num_blocks * csa_rows * index_dim
         indexer_blob = take_region(region_idx)
+        csa_indexer_pool = indexer_blob.view(dtypes.fp8).view(
+            n_csa, num_blocks, csa_rows, index_dim
+        )
         for layer_idx in range(n_csa):
             sl = indexer_blob[
                 layer_idx * per_layer_indexer : (layer_idx + 1) * per_layer_indexer
@@ -433,6 +447,11 @@ def slice_deepseek_v4_proxy_cache_views(
 
     return {
         "geometry": geometry,
+        "num_blocks": num_blocks,
+        "kv_plane": kv_plane,
+        "kv_plane_rope": kv_plane_rope,
+        "csa_indexer_pool": csa_indexer_pool,
+        "arena_planes": arena_planes,
         "state_arena": arena,
         "unified": unified,
         "csa_main": csa_main,
@@ -565,16 +584,32 @@ class AtomDeepseekV4ProxyMetadataBuilder(AttentionMetadataBuilder):
             num_spec_tokens=self._num_spec_tokens,
             cudagraph_token_sizes=self._cg_token_sizes,
         )
+        if not capturing:
+            from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
+                check_v4_dispatch_consistency,
+            )
+
+            check_v4_dispatch_consistency(md.state, common_attn_metadata)
         # Native ATOM enables V4 compressor side-stream launches only while the
         # forward is being captured into a HIP/CUDA graph. vLLM builds this metadata
         # on the capture path, so carry the signal into ATOM's forward context.
         md.in_hipgraph = bool(capturing)
-        # Selective per-slot reset OUTSIDE the captured region. For decode this
-        # is empty (no fresh slots are bound mid-generation); it fires for the
-        # prefill chunk that first allocates a request's slot, which is eager.
-        reset_slots = getattr(md, "reset_slots", None)
-        if reset_slots:
-            reset_deepseek_v4_state_slots(model, reset_slots)
+        # State checkpoint ops and the selective per-slot reset, OUTSIDE the captured
+        # region. For decode the reset is empty (no fresh slots are bound
+        # mid-generation); it fires for the prefill chunk that first allocates a
+        # request's slot, which is eager.
+        from atom.plugin.vllm.paged_state_checkpoint import run_state_checkpoint_step
+
+        run_state_checkpoint_step(
+            getattr(model, "_atom_state_checkpoint_worker", None),
+            md,
+            capturing=capturing,
+            plan=lambda: _plan_deepseek_v4_state_checkpoint_ops(
+                model, md, common_attn_metadata
+            ),
+            reset_fn=lambda slots: reset_deepseek_v4_state_slots(model, slots),
+            name="DeepSeek-V4",
+        )
         common_attn_metadata.atom_v4_md = md
         return common_attn_metadata
 
@@ -614,9 +649,16 @@ class AtomDeepseekV4ProxyBackend(AttentionBackend):
 
 
 class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
-    def __init__(self, prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME):
+    def __init__(
+        self,
+        prefix: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+        kv_sharing_target_layer_name: str | None = None,
+    ):
         super().__init__()
         self.prefix = prefix
+        # Set on the MTP draft's proxy: vLLM allocates nothing for it and binds
+        # it to the target proxy's tensor (`apply_vllm_v4_draft_kv_sharing_patch`).
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self._atom_v4_proxy_layer = True
         self._atom_v4_profiling_kv_cache = False
         self.kv_cache = torch.tensor([])
@@ -641,21 +683,72 @@ class AtomDeepseekV4ProxyAttention(nn.Module, AttentionLayerBase):
 def register_deepseek_v4_proxy_layer(
     vllm_config,
     layer_name: str = ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME,
+    kv_sharing_target_layer_name: str | None = None,
 ) -> AtomDeepseekV4ProxyAttention:
     from atom.plugin.vllm.deepseek_v4_prefix_patch import (
         apply_vllm_v4_profile_cache_patch,
     )
 
     apply_vllm_v4_profile_cache_patch()
+    if kv_sharing_target_layer_name is not None:
+        apply_vllm_v4_draft_kv_sharing_patch()
     sfc = vllm_config.compilation_config.static_forward_context
     existing = sfc.get(layer_name)
     if isinstance(existing, AtomDeepseekV4ProxyAttention):
         return existing
     if existing is not None:
         raise ValueError(f"Duplicate layer name: {layer_name}")
-    proxy = AtomDeepseekV4ProxyAttention(prefix=layer_name)
+    proxy = AtomDeepseekV4ProxyAttention(
+        prefix=layer_name,
+        kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+    )
     sfc[layer_name] = proxy
     return proxy
+
+
+def _v4_kv_sharing_layers(static_forward_context) -> dict[str, str]:
+    """V4 proxy layers that reuse another proxy's KV: ``{layer: target}``."""
+    return {
+        name: layer.kv_sharing_target_layer_name
+        for name, layer in static_forward_context.items()
+        if isinstance(layer, AtomDeepseekV4ProxyAttention)
+        and layer.kv_sharing_target_layer_name
+    }
+
+
+def apply_vllm_v4_draft_kv_sharing_patch() -> None:
+    """Let the MTP draft's proxy use the target proxy's KV instead of its own.
+
+    vLLM's V1 runner honours ``kv_sharing_target_layer_name`` only on its own
+    ``Attention`` class (``GPUModelRunner.get_kv_cache_spec``): such a layer gets
+    no spec, so no pages, and is recorded in ``shared_kv_cache_layers``, which
+    the rest of vLLM already handles -- ``initialize_kv_cache_tensors`` hands it
+    the target's tensor and ``add_kv_sharing_layers_to_kv_cache_groups`` puts it
+    in the target's group, where the drafter finds it for its metadata builder.
+    The proxy is a bare ``AttentionLayerBase``, so this does the same for it.
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    original = GPUModelRunner.get_kv_cache_spec
+    if getattr(original, "_atom_v4_draft_kv_sharing_patched", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped_get_kv_cache_spec(self, *args, **kwargs):
+        specs = original(self, *args, **kwargs)
+        shared = _v4_kv_sharing_layers(self.compilation_config.static_forward_context)
+        for name, target in shared.items():
+            if target not in specs:
+                raise RuntimeError(
+                    f"DeepSeek-V4 proxy {name} shares the KV of {target}, which "
+                    "has no KV cache spec in this worker"
+                )
+            specs.pop(name, None)
+            self.shared_kv_cache_layers[name] = target
+        return specs
+
+    wrapped_get_kv_cache_spec._atom_v4_draft_kv_sharing_patched = True
+    GPUModelRunner.get_kv_cache_spec = wrapped_get_kv_cache_spec
 
 
 def _bind_compressor_state(
@@ -896,12 +989,32 @@ def bind_deepseek_v4_proxy_cache_views(
     ptr = proxy.kv_cache.untyped_storage().data_ptr()
     if getattr(model, "_atom_vllm_v4_proxy_cache_ptr", None) == ptr:
         return True
+    if proxy.kv_sharing_target_layer_name:
+        return _bind_deepseek_v4_draft_to_target_slot(model, vllm_config, proxy, ptr)
     ratios = [int(r) for r in model.args.compress_ratios]
     num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
     # Stash the per-request state-slot allocator and the geometry parameters
-    # the bridge cannot read from common_attn_metadata.
+    # the bridge cannot read from common_attn_metadata. Slots come back on
+    # vLLM's finished / preempted / resumed events, never by guessing.
     if not hasattr(model, "_atom_v4_slot_allocator"):
-        model._atom_v4_slot_allocator = _V4StateSlotAllocator(num_slots)
+        from atom.plugin.vllm.paged_state_checkpoint import register_slot_allocator
+
+        model._atom_v4_slot_allocator = _V4StateSlotAllocator(
+            num_slots, evict_lru=False
+        )
+        register_slot_allocator(model._atom_v4_slot_allocator)
+    is_target = layer_name == ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import v4_state_checkpoint_sizing
+
+    sizing = v4_state_checkpoint_sizing(vllm_config)
+    if is_target and list(sizing.ratios) != ratios:
+        raise RuntimeError(
+            f"DeepSeek-V4 sizing priced {len(sizing.ratios)} layers but the "
+            f"target model carves {len(ratios)}"
+        )
+    # vLLM views exactly the blocks the scheduler was told
+    # (`get_kv_cache_configs` hook); the bytes past them hold the slots.
+    carve_cache, carve_blocks = _proxy_carve_source(proxy.kv_cache, sizing, ratios)
     window_size = int(model.args.window_size)
     win_with_spec = _v4_win_with_spec(vllm_config, window_size)
     # Single fp8 authority for the whole bind (must agree with the _proxy_page_bytes
@@ -921,7 +1034,7 @@ def bind_deepseek_v4_proxy_cache_views(
             "256B-aligned; EntryMajorArena cannot retype carved planes safely"
         )
     views = slice_deepseek_v4_proxy_cache_views(
-        proxy.kv_cache,
+        carve_cache,
         compress_ratios=ratios,
         num_slots=num_slots,
         window_size=win_with_spec,
@@ -932,10 +1045,14 @@ def bind_deepseek_v4_proxy_cache_views(
         arena_planes=arena_planes,
         arena_rows=arena_rows,
         row_widths=row_widths,
+        num_blocks=carve_blocks,
     )
     geometry = views["geometry"]
     model._atom_v4_geometry = geometry
-    arena = views["state_arena"]
+    model._atom_v4_is_target = is_target
+    model._atom_state_checkpoint_worker = None
+    if is_target:
+        _bind_deepseek_v4_state_checkpoint(model, vllm_config, sizing, views, proxy)
     model._atom_v4_meta_params = SimpleNamespace(
         num_slots=num_slots,
         window_size=window_size,
@@ -944,10 +1061,105 @@ def bind_deepseek_v4_proxy_cache_views(
         kv_fp8=kv_fp8,
         geometry=geometry,
     )
+    model._atom_v4_views = views
+    model._atom_v4_carve_ratios = ratios
+    _bind_v4_attn_layers(
+        model,
+        views,
+        ratios,
+        kv_fp8=kv_fp8,
+        win_with_spec=win_with_spec,
+        main_write_mode=main_write_mode,
+        vllm_config=vllm_config,
+    )
+    # Stash the model on the proxy so the metadata builder (which only sees
+    # vllm_config) can reach it.
+    proxy._atom_v4_model = model
+    _ensure_v4_decode_bufs(model, vllm_config, ratios, proxy.kv_cache.device)
+    model._atom_vllm_v4_proxy_cache_ptr = ptr
+    return True
+
+
+def _bind_deepseek_v4_draft_to_target_slot(model, vllm_config, proxy, ptr) -> bool:
+    """Bind the MTP draft onto the target's carve, as native does.
+
+    The draft's proxy has no KV of its own: vLLM hands it the target proxy's
+    tensor. The draft's layers are layers of the target's slot (the target
+    carves every ratio the checkpoint lists, MTP layer included), so each binds
+    to the target's view of its own ``layer_id``, and the draft uses the
+    target's slot allocator, geometry and per-slot reset. It keeps its own
+    decode-metadata buffers: its build overwrites them after the target's
+    forward is enqueued, which the target's buffers must not see.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    target_name = proxy.kv_sharing_target_layer_name
+    target_proxy = sfc.get(target_name)
+    target = getattr(target_proxy, "_atom_v4_model", None)
+    if target is None or getattr(target, "_atom_vllm_v4_proxy_cache_ptr", None) != ptr:
+        # The target forwards first in every step; until it has bound this very
+        # tensor the draft stays on the dummy path.
+        return False
+    views = target._atom_v4_views
+    ratios = list(target._atom_v4_carve_ratios)
+    draft_ratios = [int(r) for r in model.args.compress_ratios]
+    if draft_ratios != ratios:
+        raise RuntimeError(
+            f"DeepSeek-V4 MTP draft lists compress ratios {draft_ratios} but the "
+            f"target's slot carves {ratios}"
+        )
+    params = target._atom_v4_meta_params
+    kv_fp8 = bool(params.kv_fp8)
+    attns = _bind_v4_attn_layers(
+        model,
+        views,
+        ratios,
+        kv_fp8=kv_fp8,
+        win_with_spec=int(params.cs),
+        main_write_mode="main_2buff_fp8" if kv_fp8 else "bf16",
+        vllm_config=vllm_config,
+    )
+    model._atom_v4_slot_allocator = _V4SharedSlotLookup(target._atom_v4_slot_allocator)
+    model._atom_v4_geometry = target._atom_v4_geometry
+    model._atom_v4_meta_params = params
+    model._atom_v4_is_target = False
+    model._atom_state_checkpoint_worker = None
+    # The target's per-slot reset covers the draft's rows of the slot too.
+    target._atom_v4_slot_sharers = attns
+    proxy._atom_v4_model = model
+    _ensure_v4_decode_bufs(model, vllm_config, ratios, proxy.kv_cache.device)
+    model._atom_vllm_v4_proxy_cache_ptr = ptr
+    logger.info(
+        "ATOM DeepSeek-V4 MTP draft bound to the target's slot: layers %s of %d",
+        [int(a.layer_id) for a in attns],
+        len(ratios),
+    )
+    return True
+
+
+def _bind_v4_attn_layers(
+    model,
+    views,
+    ratios,
+    *,
+    kv_fp8: bool,
+    win_with_spec: int,
+    main_write_mode: str,
+    vllm_config,
+) -> list:
+    """Point every attention module of ``model`` at its layer's carved views."""
+    geometry = views["geometry"]
+    arena = views["state_arena"]
+    attns = []
     for fallback_layer_id, block in enumerate(_deepseek_v4_blocks(model)):
         attn = block.attn
         layer_id = int(getattr(attn, "layer_id", fallback_layer_id))
         ratio = int(attn.compress_ratio)
+        if ratio != int(ratios[layer_id]):
+            raise RuntimeError(
+                f"DeepSeek-V4 layer {layer_id} has ratio {ratio} but the carve "
+                f"placed it as {ratios[layer_id]}"
+            )
+        attns.append(attn)
         attn.unified_kv = views["unified"][layer_id]
         attn.swa_kv = attn.unified_kv
         attn.swa_plane = attn.unified_kv
@@ -1004,12 +1216,15 @@ def bind_deepseek_v4_proxy_cache_views(
                 write_mode=main_write_mode,
                 kv_cache_rope=views["hca_main_rope"][hca_i],
             )
+    return attns
+
+
+def _ensure_v4_decode_bufs(model, vllm_config, ratios, device) -> None:
     # Persistent decode-metadata buffers for the FULL decode CUDA/HIP graph.
     # Allocated once (sized to the worst-case decode shape) so build() can
     # refresh them in place each step; the captured kernels read stable
-    # addresses. Eager prefill never touches them. Stash the model on the proxy
-    # so the metadata builder (which only sees vllm_config) can reach it.
-    proxy._atom_v4_model = model
+    # addresses. Eager prefill never touches them.
+    num_slots = max(1, int(vllm_config.scheduler_config.max_num_seqs))
     if not hasattr(model, "_atom_v4_decode_bufs"):
         max_spec = _v4_max_spec_steps(vllm_config)
         max_model_len = int(vllm_config.model_config.max_model_len)
@@ -1023,11 +1238,86 @@ def bind_deepseek_v4_proxy_cache_views(
             index_topk=int(getattr(model.args, "index_topk", 1024)),
             max_committed_hca=max_committed_hca,
             ratios_overlap=ratios_overlap,
-            device=proxy.kv_cache.device,
+            device=device,
             max_blocks=max_committed_hca,
         )
-    model._atom_vllm_v4_proxy_cache_ptr = ptr
-    return True
+
+
+def _bind_deepseek_v4_state_checkpoint(
+    model, vllm_config, sizing, views, proxy
+) -> None:
+    """Attach the state checkpoint worker when vLLM gave this worker the k state
+    checkpoint groups."""
+    from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+        deepseek_v4_state_checkpoint_layer_names,
+        deepseek_v4_state_checkpoints_on,
+        make_v4_state_checkpoint_copier,
+        register_v4_state_checkpoint_adapter,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        PagedStateCheckpointLayer,
+        StateCheckpointWorker,
+        register_state_checkpoint_worker,
+    )
+
+    if not deepseek_v4_state_checkpoints_on(vllm_config):
+        return
+    sfc = vllm_config.compilation_config.static_forward_context
+    names = deepseek_v4_state_checkpoint_layer_names(sizing.k)
+    layers = [sfc.get(n) for n in names]
+    gids = [getattr(layer, "_atom_state_checkpoint_group_id", None) for layer in layers]
+    unbound = any(not isinstance(x, PagedStateCheckpointLayer) for x in layers)
+    if unbound or any(g is None for g in gids):
+        raise RuntimeError(
+            "DeepSeek-V4 prefix caching is on but this worker has no bound state "
+            f"checkpoint groups for {names[:2]}...; refusing to serve bare prefix hits"
+        )
+    copier = make_v4_state_checkpoint_copier(
+        sizing, views, num_blocks=views["num_blocks"], device=proxy.kv_cache.device
+    )
+    copier.warmup_per_req_cache()
+    model._atom_state_checkpoint_worker = StateCheckpointWorker(
+        register_v4_state_checkpoint_adapter(), copier, gids
+    )
+    register_state_checkpoint_worker(model._atom_state_checkpoint_worker)
+    logger.info(
+        "ATOM DeepSeek-V4 state checkpoint prefix bound: page_bytes=%d "
+        "page_unit_bytes=%d units_per_checkpoint=%d image_bytes=%d block_size=%d "
+        "slots=%d carve_blocks=%d state_checkpoint_group_ids=%s",
+        sizing.page_bytes,
+        sizing.page_unit_bytes,
+        sizing.k,
+        sizing.image_bytes,
+        ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        sizing.num_slots,
+        views["num_blocks"],
+        gids,
+    )
+
+
+def _plan_deepseek_v4_state_checkpoint_ops(model, md, common_attn_metadata) -> None:
+    """This step's restores and stores
+    (``paged_state_checkpoint.plan_state_checkpoint_ops``) over the V4 rows: the bound
+    slot, ``chunk_start`` and query length of every real row, and the rows bound to a
+    fresh slot by this build."""
+    from atom.plugin.vllm.paged_state_checkpoint import plan_state_checkpoint_ops
+
+    rows = getattr(md, "_atom_v4_real_rows", 0)
+    if not rows:
+        return
+    q_np = common_attn_metadata.query_start_loc_cpu[: rows + 1].numpy()
+    plan_state_checkpoint_ops(
+        getattr(model, "_atom_state_checkpoint_worker", None),
+        md,
+        rows=rows,
+        slots=md._atom_v4_slot_groups,
+        chunk_start=md.chunk_start_per_seq_cpu,
+        lens=np.diff(q_np),
+        fresh_rows=md._atom_v4_fresh_rows,
+        block=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        is_target=getattr(model, "_atom_v4_is_target", False),
+        name="DeepSeek-V4",
+    )
 
 
 def reset_deepseek_v4_state_slots(model, slots) -> None:
@@ -1045,9 +1335,12 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
     layers = getattr(getattr(model, "model", None), "layers", [])
     if not layers:
         return
+    # Modules of another model (the MTP draft) bound into these same slots.
+    attns = [getattr(block, "attn", None) for block in layers]
+    attns += list(getattr(model, "_atom_v4_slot_sharers", ()))
     device = None
-    for block in layers:
-        swa = getattr(getattr(block, "attn", None), "swa_kv", None)
+    for attn in attns:
+        swa = getattr(attn, "swa_kv", None)
         if isinstance(swa, torch.Tensor):
             device = swa.device
             break
@@ -1055,8 +1348,7 @@ def reset_deepseek_v4_state_slots(model, slots) -> None:
         return
     physical_slots = sorted(int(s) for s in slots)
     idx = torch.as_tensor(physical_slots, dtype=torch.long, device=device)
-    for block in layers:
-        attn = getattr(block, "attn", None)
+    for attn in attns:
         if attn is None:
             continue
         swa = getattr(attn, "swa_plane", None)
@@ -1204,6 +1496,32 @@ def _is_pure_uniform_decode(common_attn_metadata, decode_q: int) -> bool:
     return max_q == decode_q and num_tokens == decode_q * num_reqs
 
 
+def _indexer_decode_group(lens, decode_q: int, is_prefilling=None) -> tuple[int, int]:
+    """Rows of a prefill-classified step that take the paged decode indexer.
+
+    The leading contiguous run of rows sharing the first row's length, when
+    that is a decode / verify length (``<= decode_q``), and that are not still
+    prefilling. A prefilling row of decode length -- the lone last prompt token
+    after a prefill cut, or a one-token extend after a full prefix hit -- is a
+    prefill row to native ATOM, whose prefill forward scores it on the dense
+    ``_score_topk_prefill`` path; here it ends the decode group the same way a
+    longer row does, so the dense group is never empty on a prefill-classified
+    step. Returns ``(num_decodes, decode_next_n)``.
+    """
+    num_reqs = len(lens)
+    if num_reqs == 0 or int(lens[0]) > decode_q:
+        return 0, 1
+    next_n = int(lens[0])
+    stop = np.asarray(lens) != next_n
+    if is_prefilling is not None:
+        pref = is_prefilling[:num_reqs]
+        if isinstance(pref, torch.Tensor):
+            pref = pref.cpu().numpy()
+        stop = stop | np.asarray(pref, dtype=bool)
+    first = np.nonzero(stop)[0]
+    return (int(first[0]) if first.size else num_reqs), next_n
+
+
 def _counts_to_indptr(counts: np.ndarray) -> np.ndarray:
     out = np.zeros(len(counts) + 1, dtype=np.int32)
     out[1:] = np.cumsum(counts, dtype=np.int32)
@@ -1263,20 +1581,39 @@ class _V4StateSlotAllocator:
     bound to an unseen ``req_id``, or when a known ``req_id`` reappears with
     ``num_computed == 0`` -- vLLM recomputes preempted requests from scratch
     under the same id, so the slot's accumulated state must be cleared on resume.
+    ``last_fresh_rows`` lists the batch rows bound to a new slot by the last
+    ``assign``; a fresh row with ``num_computed > 0`` is a prefix hit whose slot
+    the caller has to restore before the forward.
 
-    Slots are reclaimed lazily on exhaustion by evicting the least-recently-seen
-    slot whose ``req_id`` is absent from the current step (its request finished
-    or was preempted). vLLM caps concurrency at ``num_slots`` (max_num_seqs), so
-    a request that is live this step never has its slot evicted.
+    With ``evict_lru`` (the default) slots are reclaimed lazily on exhaustion by
+    evicting the least-recently-seen slot whose ``req_id`` is absent from the
+    current step. Without it slots come back only through ``release`` -- the
+    caller feeds it vLLM's finished / preempted / resumed request ids -- and an
+    exhausted free list is an error rather than a guess about which request is
+    gone.
     """
 
-    def __init__(self, num_slots: int):
+    def __init__(self, num_slots: int, *, evict_lru: bool = True):
         self.num_slots = max(1, int(num_slots))
+        self.evict_lru = bool(evict_lru)
         self._key_to_slot: dict[object, int] = {}
         self._slot_to_key: list[object] = [None] * self.num_slots
         self._free: list[int] = list(range(self.num_slots - 1, -1, -1))
         self._last_seen: list[int] = [-1] * self.num_slots
         self._step = 0
+        self.last_fresh_rows: list[int] = []
+
+    def release(self, req_keys) -> list[int]:
+        """Return the slots of requests vLLM has finished, preempted or resumed."""
+        freed = []
+        for k in req_keys:
+            slot = self._key_to_slot.pop(k, None)
+            if slot is None:
+                continue
+            self._slot_to_key[slot] = None
+            self._free.append(slot)
+            freed.append(slot)
+        return freed
 
     def assign(self, req_keys, num_computed):
         """Return ``(slots: np.int32[num_reqs], reset_slots: set[int])``.
@@ -1304,6 +1641,7 @@ class _V4StateSlotAllocator:
         step = self._step
         slots = [0] * n
         reset: set[int] = set()
+        fresh: list[int] = []
         for i in range(n):
             k = keys[i]
             slot = key_to_slot.get(k)
@@ -1312,16 +1650,35 @@ class _V4StateSlotAllocator:
                 key_to_slot[k] = slot
                 slot_to_key[slot] = k
                 reset.add(slot)
+                fresh.append(i)
             elif nc[i] == 0:
                 # Known request recomputed from scratch (preemption resume).
                 reset.add(slot)
             slots[i] = slot
             last_seen[slot] = step
+        self.last_fresh_rows = fresh
         return np.asarray(slots, dtype=np.int32), reset
+
+    def lookup(self, req_keys) -> np.ndarray:
+        """The slots ``req_keys`` are bound to, without binding or resetting any."""
+        key_to_slot = self._key_to_slot
+        missing = [k for k in req_keys if k not in key_to_slot]
+        if missing:
+            raise RuntimeError(
+                f"requests {sorted(map(str, missing))[:4]} have no state slot; the "
+                "target binds one before anything else may read it"
+            )
+        return np.asarray([key_to_slot[k] for k in req_keys], dtype=np.int32)
 
     def _acquire(self, active: set) -> int:
         if self._free:
             return self._free.pop()
+        if not self.evict_lru:
+            raise RuntimeError(
+                f"all {self.num_slots} state slots are bound to live requests "
+                f"({sorted(map(str, self._key_to_slot))[:4]}...); a slot comes back "
+                "only when vLLM reports its request finished or preempted"
+            )
         victim = -1
         victim_seen = None
         for s in range(self.num_slots):
@@ -1339,6 +1696,22 @@ class _V4StateSlotAllocator:
             self._key_to_slot.pop(old, None)
         self._slot_to_key[victim] = None
         return victim
+
+
+class _V4SharedSlotLookup:
+    """The target's slot allocator as a model sharing its slots sees it.
+
+    The MTP draft forwards the requests the target forwarded earlier in the same
+    step, so every request already has its slot, and binding, resetting and
+    releasing stay with the target. ``assign`` only looks the slots up.
+    """
+
+    def __init__(self, owner: _V4StateSlotAllocator):
+        self.owner = owner
+        self.last_fresh_rows: list[int] = []
+
+    def assign(self, req_keys, num_computed):
+        return self.owner.lookup(list(req_keys)), set()
 
 
 def build_atom_v4_attention_metadata(
@@ -1488,6 +1861,8 @@ def build_atom_v4_attention_metadata(
             "apply_vllm_req_id_passthrough_patch() ran at model registration "
             "and is still active."
         )
+    md._atom_v4_real_rows = 0
+    md._atom_v4_fresh_rows = []
     if not real_slots or len(req_ids) < scheduled_bs:
         # Capture / profiling / warmup / empty synthetic batch (patch ran but
         # there are no -- or too few -- real request ids): throwaway arange
@@ -1503,6 +1878,9 @@ def build_atom_v4_attention_metadata(
         # -1 so the per-token decode kernels never read them.
         slot_arr = np.zeros(num_reqs, dtype=np.int32)
         slot_arr[:scheduled_bs] = slot_real
+        md._atom_v4_real_rows = scheduled_bs
+        md._atom_v4_fresh_rows = list(getattr(slot_allocator, "last_fresh_rows", []))
+    md._atom_v4_slot_groups = slot_arr
     physical_slot_arr = np.asarray(
         [md.pool_geometry.physical_slot(int(slot)) for slot in slot_arr],
         dtype=np.int32,
@@ -1661,7 +2039,8 @@ def build_atom_v4_attention_metadata(
         # decode group as the leading contiguous run of rows that share the
         # FIRST row's length (only when that is a decode/verify length,
         # `<= decode_q`), and end it at the first row that differs -- whether a
-        # short decode straggler or a longer prefill row. Everything from there
+        # short decode straggler or a longer prefill row -- or that is still
+        # prefilling (see `_indexer_decode_group`). Everything from there
         # flows to the dense prefill path below, which handles arbitrary per-row
         # query lengths. This is memory-safe: the long-context verify rows are
         # emitted first, so they stay on the paged path, and only the (few)
@@ -1669,13 +2048,11 @@ def build_atom_v4_attention_metadata(
         # its `[total_tokens, total_committed]` logits never explode the way
         # they would if every running seq were summed in. `lens` is a CPU numpy
         # array (from `query_start_loc.cpu()`), so this adds no H2D/D2H sync.
-        if num_reqs > 0 and int(lens[0]) <= decode_q:
-            idx_decode_next_n = int(lens[0])
-            mismatch = np.nonzero(lens != idx_decode_next_n)[0]
-            idx_num_decodes = int(mismatch[0]) if mismatch.size else num_reqs
-        else:
-            idx_decode_next_n = 1
-            idx_num_decodes = 0
+        idx_num_decodes, idx_decode_next_n = _indexer_decode_group(
+            lens[:num_reqs],
+            decode_q,
+            getattr(common_attn_metadata, "is_prefilling", None),
+        )
         idx_num_decode_tokens = int(q_np[idx_num_decodes]) if idx_num_decodes > 0 else 0
     _populate_indexer(
         md,

@@ -110,6 +110,7 @@ cannot affect a server that does not use the feature.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
 ## Kernel / backend selection
 
@@ -165,7 +166,9 @@ combine knob as a quality/throughput tradeoff.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
-| **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MORI_V2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
+| **ATOM_MEGA_STAGE2_FUSED** | bool | 1 (true) | Under `ATOM_MORI_V2=1`, run the MoE layer on aiter's `MegaMoEGfx1250` (MegaMoE): the gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's v2 op-layer with plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
+| **ATOM_MEGA_STAGE1_FUSED** | bool | 1 (true) | MegaMoE compact stage 1 (aiter `stage1_fused`): routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM's per-expert rows directly. Only takes effect with `ATOM_MEGA_STAGE2_FUSED=1` and `MEGA_DISPATCH_WIRE=fp8`/`fp4`; a bf16 wire keeps the token-major path. Not supported together with the Triton experts. |
+| **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MEGA_STAGE2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
 | **ATOM_MEGA_DECODE_MTPR** | int | 128 | Capacity (rows per rank) of the small MegaMoEV2 instance that DP-unified decode / verify / draft passes reuse (`ATOM_MEGA_DECODE_FAST_PATH=1`); one of 128, 256, 512, 1024. A pass with more rows falls back to the instance sized for `max_num_batched_tokens`. Size it to cover the DP-padded decode graphs (`running_bs * (num_speculative_tokens + 1)` rows); above 128 the instance stays on aiter's fixed-slot path only if `AITER_MEGA_FIXED_SLOT_MAX_MTPR` admits it (511 / 1023 / 2047), otherwise it runs compact. |
 | **ATOM_MEGA_MASK_PAD_ROWS** | bool | 1 (true) | By default, the MegaMoE backend (`--moe-backend mega`) and the fused MoRI v2 transport (`ATOM_MORI_V2_FUSED=1`, FlyDSL experts) route this rank's DP pad rows (past `scheduled_tokens` on a step padded to the DP group's `running_tokens`) to expert `-1`: they are not dispatched or computed and come back as zeros, so identical pad rows also stop piling onto the same experts. Covers target and draft passes, eager and CUDA graph. With an aiter whose MegaMoEV2 masks `-1` slots in combine (`supports_combine_mask`) the op returns the zeros; otherwise ATOM zeroes only the padded rows with a small Triton kernel. Set to `0` to disable. Not used by plugin frontends. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
@@ -319,6 +322,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## Prefix cache lookup
+
+All three default on and move work off the scheduler thread.
+`ATOM_FRONTEND_PREFIX_HASH=0` and `ATOM_PREFIX_WALK_MEMO=0` give the same hits.
+`ATOM_PREFIX_FAST_WALK=0` does not always: the fast walk compares tokens only on the last hit block, so a
+64-bit xxhash chained-hash collision on an interior block reuses another
+prompt's KV with no error (wrong output). `0` compares every hit block's tokens
+and catches it; set it when chasing a corruption that does not reproduce.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens, beside the request in the ADD message (never inside a pickled `Sequence`; with `DisaggCoreManager` only the decode engine, which allocates, gets it). The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks after prefill, so prefill hashes no prompt block on the scheduler thread (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens; the LMCache/offload and PD-transfer publish paths still hash their blocks). Any mismatch falls back to engine-side hashing. Read in the API server process. |
+| **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
+| **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
+
 ## State checkpoints
 
 For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
@@ -333,6 +351,8 @@ flag below. Details in the state-checkpoint section of the
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
 | **ATOM_DSV4_STATE_REPLAY** | bool | 0 (false) | DeepSeek-V4: keep a prefix hit that reaches past the nearest state checkpoint by more than the window's receptive field (7,748 tokens on V4-Pro, 7,875 with MTP or DSpark) and recompute only that field below it, which rebuilds the state exactly, instead of resuming at the checkpoint (`Config.state_replay_tokens`). Off on anything but the DeepSeek-V4 trunk with compress ratios 4 / 128, and with context parallelism, a speculative method other than MTP or the model's own DSpark layers (not a separate `--draft-model`), prefix caching off, or a KV connector other than LMCache MP offload alone. With that one LMCache saves carry the PAGE KV alone, no state image (the native layout registers the PAGE group alone, under a namespace of its own, so a stock LMCache server's hit is how far that KV reaches), and a hit whose PAGE KV LMCache holds past the HBM prefix loads that KV alone and replays below it. Every other model, and DeepSeek-V4 without the replay, keeps storing images. |
+| **ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS** | int | — (the model's native interval) | vLLM plugin (DeepSeek-V4 state checkpoints): overrides the checkpoint interval in tokens, snapped down to a multiple of the block size. `>0` a rung every N tokens plus the prompt-end anchor and the demand rung; `-1` no rungs, anchor and demand only; `0` no state checkpoint is published, so there is no prefix hit at all (vLLM reports a hit only when every state checkpoint group is cached; the state checkpoint groups still allocate their working blocks). |
+| **ATOM_STATE_CHECKPOINT_CHECK_BLOCKS** | bool | 0 (false) | vLLM plugin (state checkpoints) diagnostic: after every schedule, raise if a request holds more than two blocks in any state checkpoint group. |
 
 ### LMCache offload tier
 
