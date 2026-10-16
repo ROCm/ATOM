@@ -272,6 +272,7 @@ def run_finish_tp8(c, bid):
 def run_finish_s2(c0, c1, bid):
     """Run S=2 by sharing dense weights and balancing routed work together."""
 
+    c0["weight_cache"] = c1["weight_cache"] = 0
     run_hc_finish_s2(c0, c1, bid)
     run_input_quant_s2(c0, c1, bid)
     run_router_s2(c0, c1, bid)
@@ -283,6 +284,8 @@ def run_finish_s2(c0, c1, bid):
 def run_finish_s4(c0, c1, c2, c3, bid):
     """Run two independent S=2 pairs concurrently on half grids."""
 
+    for c in (c0, c1, c2, c3):
+        c["weight_cache"] = 0
     pair_blocks = BLOCKS // 2
     if bid < pair_blocks:
         local = bid
@@ -304,10 +307,6 @@ def run_finish_s4(c0, c1, c2, c3, bid):
 def run_finish_tp8_hc_pair(c0, c1, bid, paired_g1=False, static_g1=False, shared_only=False):
     """Share HC/router weights; retain independent expert-owned G1/G2."""
     run_hc_finish_s2(c0, c1, bid)
-    task = first_task(bid, UP_GROUP0)
-    if task < HC_UP_GROUPS:
-        _stage_up_group(c0, task)
-        _stage_up_group(c1, task)
     run_input_quant_s2(c0, c1, bid)
     run_router_s2(c0, c1, bid)
     if shared_only:

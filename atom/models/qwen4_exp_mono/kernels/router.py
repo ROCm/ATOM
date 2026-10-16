@@ -113,8 +113,10 @@ def _stage_router_s2(c0, c1, task):
     """One router weight tile produces the two token rows."""
 
     tid, lane, wave = c0["tid"], c0["lane"], c0["wave"]
-    c0["poll"]([(c0["up_ready"], i, 1) for i in range(HC_OUT_TASKS)])
-    c1["poll"]([(c1["up_ready"], i, 1) for i in range(HC_OUT_TASKS)])
+    if tid == 0:
+        c0["poll"]([(c0["up_group_ready"], group, 1) for group in range(2)])
+        c1["poll"]([(c1["up_group_ready"], group, 1) for group in range(2)])
+    gpu.barrier()
 
     if tid < HIDDEN // 8:
         at = tid * 8

@@ -811,6 +811,11 @@ def run_hc_finish_s2(c0, c1, bid):
     if task < HC_OUT_TASKS:
         _stage_up_s2(c0, c1, task)
 
+    task = first_task(bid, UP_GROUP0)
+    if task < HC_UP_GROUPS:
+        _stage_up_group(c0, task)
+        _stage_up_group(c1, task)
+
 
 @traced
 def run_hc_finish_s2_partition(c0, c1, bid):
@@ -835,3 +840,8 @@ def run_hc_finish_s2_partition(c0, c1, bid):
     task = bid + S4_PAIR_BLOCKS
     if task < HC_OUT_TASKS:
         _stage_up_s2(c0, c1, task)
+
+    if bid >= S4_PAIR_BLOCKS - HC_UP_GROUPS:
+        group = bid - (S4_PAIR_BLOCKS - HC_UP_GROUPS)
+        _stage_up_group(c0, group)
+        _stage_up_group(c1, group)

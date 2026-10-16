@@ -111,6 +111,12 @@ class QwenMonoRunner:
         if self.model.model.return_hc_state:
             raise MonoUnsupported("Qwen mono does not serve speculative target output")
         self.layers = self.model.model.layers
+        if self.tp == 1:
+            # S4 rows avoid the native GEMM seam and its strided inject logits.
+            for layer in self.layers:
+                layer.attn_hyper_connection.hc_rows_max = 4
+                layer.mlp_hyper_connection.hc_rows_max = 4
+            self.model.model.hyper_connection_mixer.hc_rows_max = 4
         self.plan = make_plan(self.layers)
         self.weights = bind_model(self.model, self.plan, self.tp)
 
@@ -759,6 +765,9 @@ class QwenMonoRunner:
         bound = weights.gdn
         if bound is None:
             raise RuntimeError(f"Qwen layer {layer_id} has no bound GDN weights")
+        # Native HC uses a slice of its rank+inject GEMM output at S > 2.
+        # The Mono ABI requires packed per-token inject logits.
+        raw = raw.contiguous()
         hc, moe = weights.mlp_hc, weights.moe
         streams_out = view.streams_out[layer_id & 1]
         args = gdn_layer.ABI.pack(

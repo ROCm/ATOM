@@ -276,7 +276,7 @@ def test_s1_finish_abi_and_scratch_are_fixed_and_compact():
     assert finish_shape.ROUTER_TASKS == 33
     assert finish_shape.G1_TASKS == 440
     assert finish_shape.G2_TASKS == 160
-    assert finish.scratch_bytes() == 57_424
+    assert finish.scratch_bytes() == 57_680
     finish_spans = sorted(
         (off, off + size, name) for name, (off, size) in finish_layout.items()
     )
@@ -342,8 +342,8 @@ def test_tp8_gdn_k1_k2_have_fixed_shape_abis_and_fit_the_workspace():
 
 
 def test_workspace_is_aligned_and_matches_the_layer_contract():
-    assert finish.scratch_bytes() == 57_424
-    assert state.LAYER_SCRATCH_BYTES == 144_640
+    assert finish.scratch_bytes() == 57_680
+    assert state.LAYER_SCRATCH_BYTES == 144_896
     assert state.LAYER_SCRATCH_BYTES % 16 == 0
     assert state.QSA_PRE_SCRATCH_BYTES == qsa_pre.scratch_bytes()
     assert state.QSA_PRE_SCRATCH_BYTES % 16 == 0

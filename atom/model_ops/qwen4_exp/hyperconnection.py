@@ -163,7 +163,7 @@ class Qwen4ExpHyperConnection(nn.Module):
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight
         eps = self.hc_norm.variance_epsilon
-        if hyper_input.shape[0] <= HC_ROWS_MAX:
+        if hyper_input.shape[0] <= getattr(self, "hc_rows_max", HC_ROWS_MAX):
             h, mixed, raw = hc_rows(
                 hyper_input,
                 self.hc_norm.weight,

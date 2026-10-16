@@ -150,7 +150,7 @@ def _load_fp8_weight(c, expert, row_group, kb):
             base + tile * 256 + lane * 4,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=c.get("weight_cache", CM_NT),
         )
     )
     hi = fx.Vector(
@@ -159,7 +159,7 @@ def _load_fp8_weight(c, expert, row_group, kb):
             base + (tile + 1) * 256 + lane * 4,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=c.get("weight_cache", CM_NT),
         )
     )
     return [
@@ -183,7 +183,7 @@ def _load_w13_scale(c, expert, row_block, kb, scalar=False):
     return _ld_f32(
         c["args"]["routed_w13_scale"],
         at,
-        CM_NT,
+        c.get("weight_cache", CM_NT),
     )
 
 
@@ -347,8 +347,10 @@ def _stage_shared_g1_s2(c0, c1, part):
     tid, lane, wave = c0["tid"], c0["lane"], c0["wave"]
     shared_intermediate = c0.get("shared_intermediate", INTERMEDIATE)
     shared_parts = shared_intermediate // G1_COLS
-    c0["poll"]([(c0["up_ready"], task, 1) for task in range(HC_OUT_TASKS)])
-    c1["poll"]([(c1["up_ready"], task, 1) for task in range(HC_OUT_TASKS)])
+    if tid == 0:
+        c0["poll"]([(c0["up_group_ready"], group, 1) for group in range(2)])
+        c1["poll"]([(c1["up_group_ready"], group, 1) for group in range(2)])
+    gpu.barrier()
     if tid < HIDDEN // 8:
         at = tid * 8
         x0 = fx.Vector(
@@ -382,12 +384,20 @@ def _stage_shared_g1_s2(c0, c1, part):
         k0 = (wave + WAVES * k_pass) * 32 + 8 * (lane // 16)
         x = _ld_lds_bf8(c0["x"], token * HIDDEN + k0)
         gate = mfma_bf16(
-            _ld_bf8(c0["args"]["shared_w13"], gate_row * HIDDEN + k0, CM_NT),
+            _ld_bf8(
+                c0["args"]["shared_w13"],
+                gate_row * HIDDEN + k0,
+                c0.get("weight_cache", CM_NT),
+            ),
             x,
             gate,
         )
         up = mfma_bf16(
-            _ld_bf8(c0["args"]["shared_w13"], up_row * HIDDEN + k0, CM_NT),
+            _ld_bf8(
+                c0["args"]["shared_w13"],
+                up_row * HIDDEN + k0,
+                c0.get("weight_cache", CM_NT),
+            ),
             x,
             up,
         )
@@ -517,38 +527,52 @@ def run_g1_tp8_s2(c0, c1, bid, static=False):
 
 @traced
 def run_g1_s2(c0, c1, bid):
-    """Share the dense expert, then balance both routed task sets together."""
-
+    """Retain each token activation across its 128-owner routed schedule."""
     shared = (bid - G1_START + BLOCKS) % BLOCKS
     if shared < G1_SHARED_TASKS:
         _stage_shared_g1_s2(c0, c1, shared)
-
-    task = bid
-    while task < G1_S2_ROUTED_TASKS:
-        _stage_routed_g1_s2(c0, c1, task)
-        task = _take_g1_task_s2(c0)
-
-
-@traced
-def run_g1_s2_partition(c0, c1, bid):
-    """Run one S=4 token pair with a static, balanced routed partition."""
-
-    shared = (bid - G1_START + G1_S4_PAIR_FIXED) % G1_S4_PAIR_FIXED
-    if shared < G1_SHARED_TASKS:
-        _stage_shared_g1_s2(c0, c1, shared)
-
-    # Routed tasks have equal shape. Alternate CTA ownership so the forty
-    # shared producers delay twenty CTAs from each token, then give each CTA a
-    # fixed 64-way stride. This removes one atomic claim and one LDS queue
-    # barrier per routed task without widening readiness beyond this pair.
     routed = bid // 2
     if bid % 2 == 0:
         _stage_routed_xq(c0)
         while routed < G1_ROUTED_TASKS:
             _stage_routed_g1(c0, routed, G1_SHARED_TASKS + routed, staged=True)
-            routed += G1_S4_PAIR_FIXED // 2
+            routed += BLOCKS // 2
     else:
         _stage_routed_xq(c1)
         while routed < G1_ROUTED_TASKS:
             _stage_routed_g1(c1, routed, G1_SHARED_TASKS + routed, staged=True)
-            routed += G1_S4_PAIR_FIXED // 2
+            routed += BLOCKS // 2
+
+
+@traced
+def run_g1_s2_partition(c0, c1, bid):
+    """Keep LDS activation across fixed and dynamically claimed S4 tiles."""
+    shared = (bid - G1_START + G1_S4_PAIR_FIXED) % G1_S4_PAIR_FIXED
+    if shared < G1_SHARED_TASKS:
+        _stage_shared_g1_s2(c0, c1, shared)
+    if bid % 2 == 0:
+        _run_token(c0, bid // 2, 0, c0["g1_queue"])
+    else:
+        _run_token(c1, bid // 2, 1, c0["g1_queue"])
+
+
+@traced
+def _take(queue_base, tag, tid, queue_lds, second):
+    if tid == 0:
+        at = queue_base + fx.Int64((tag + second * 64) * 4)
+        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4), at)
+        task = G1_S4_PAIR_FIXED // 2 + fx.llvm.atomic_add(
+            ptr, fx.Int32(1), syncscope="agent"
+        )
+        fx.ptr_store(task, queue_lds)
+    gpu.barrier()
+    return fx.ptr_load(queue_lds)
+
+
+@traced
+def _run_token(c, task, second, queue_base):
+    tid, tag, queue_lds = c["tid"], c["tag"], c["queue"]
+    _stage_routed_xq(c)
+    while task < G1_ROUTED_TASKS:
+        _stage_routed_g1(c, task, G1_SHARED_TASKS + task, staged=True)
+        task = _take(queue_base, tag, tid, queue_lds, second)

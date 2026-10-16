@@ -219,7 +219,7 @@ def _position_index(c, axis):
 def _stage_projection_input(c):
     """Wait for HC front once per CTA and stage its BF16 row in LDS."""
 
-    c["poll"]([(c["up_ready"], task, 1) for task in range(HIDDEN // ROWS)])
+    c["poll"]([(c["up_group_ready"], group, 1) for group in range(2)])
     if c["tid"] < HIDDEN // 8:
         at = c["tid"] * 8
         value = fx.Vector(
@@ -239,8 +239,8 @@ def _stage_projection_input(c):
 def _stage_projection_input_s2(c0, c1):
     """Stage two HC rows once so one projection weight load serves both."""
 
-    c0["poll"]([(c0["up_ready"], task, 1) for task in range(HIDDEN // ROWS)])
-    c1["poll"]([(c1["up_ready"], task, 1) for task in range(HIDDEN // ROWS)])
+    c0["poll"]([(c0["up_group_ready"], group, 1) for group in range(2)])
+    c1["poll"]([(c1["up_group_ready"], group, 1) for group in range(2)])
     if c0["tid"] < HIDDEN // 8:
         at = c0["tid"] * 8
         value0 = fx.Vector(
@@ -895,6 +895,9 @@ def build_qsa_pre(key: MonoBuild):
                         token_scratch,
                         layout["hc_up_ready"][0],
                         "hc_up_ready",
+                    ),
+                    "up_group_ready": sreg(
+                        token_scratch, layout["up_group_ready"][0], "up_group_ready"
                     ),
                     "qkv_ready": sreg(
                         token_scratch,

@@ -746,9 +746,7 @@ def _publish_attention_groups(c, bid, owner=0):
     attention_ready, selection_ready = c["attention_ready"], c["selection_ready"]
     if bid == owner:
         if tid == 0:
-            poll(
-                [(head_ready, head, 1) for head in range(HEADS_PER_ATTN_GROUP)]
-            )
+            poll([(head_ready, head, 1) for head in range(HEADS_PER_ATTN_GROUP)])
         gpu.barrier()
         if tid == 0:
             put(attention_ready, 0, 1)
@@ -775,7 +773,9 @@ def _stage_oproj(c, task):
     red, attn_out = c["red"], c["attn_out"]
     partial = c.get("oproj_partial", False)
     streams, attn_raw, streams_out = (
-        c["args"]["streams"], c["args"]["attn_raw"], c["args"]["streams_out"]
+        c["args"]["streams"],
+        c["args"]["attn_raw"],
+        c["args"]["streams_out"],
     )
     if tid == 0:
         poll([(attention_ready, 0, 1)])
@@ -814,7 +814,9 @@ def _stage_oproj_grouped(c, task):
     poll = c["poll"]
     red, attn_out = c["red"], c["attn_out"]
     streams, attn_raw, streams_out = (
-        c["args"]["streams"], c["args"]["attn_raw"], c["args"]["streams_out"]
+        c["args"]["streams"],
+        c["args"]["attn_raw"],
+        c["args"]["streams_out"],
     )
     row = task * OPROJ_ROWS + lane % OPROJ_ROWS
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -846,18 +848,58 @@ def _stage_oproj_grouped(c, task):
 
 
 @traced
+def _stage_oproj_columns(contexts, task, grouped):
+    c0 = contexts[0]
+    tid, lane, wave = c0["tid"], c0["lane"], c0["wave"]
+    token = fx.min(lane % 16, len(contexts) - 1)
+    gated = contexts[-1]["gated"]
+    for t, c in enumerate(contexts[:-1]):
+        gated = (token == t).select(c["gated"], gated)
+    row = task * OPROJ_ROWS + lane % OPROJ_ROWS
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for group in range_constexpr(ATTN_HEAD_GROUPS if grouped else 1):
+        for c in contexts:
+            ready = c["attention_ready"] if group == 0 else c["selection_ready"]
+            if tid == 0:
+                c["poll"]([(ready, 0, 1)])
+        gpu.barrier()
+        for k_pass in range_constexpr(
+            group * HEADS_PER_ATTN_GROUP if grouped else 0,
+            (group + 1) * HEADS_PER_ATTN_GROUP if grouped else OPROJ_K_STEPS_PER_WAVE,
+        ):
+            k0 = (wave + WAVES * k_pass) * 32 + 8 * (lane // OPROJ_ROWS)
+            weight = _ld_bf8(c0["args"]["o_proj"], row * QSA_Q_SIZE + k0, CM_NT)
+            value = _ld_bf8(gated, k0, CM_DEV)
+            acc = mfma_bf16(weight, value, acc)
+    fx.ptr_store(acc, c0["red"] + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    for t, c in enumerate(contexts):
+        if tid < OPROJ_ROWS // 2:
+            row0 = 2 * tid
+            v0 = bf16_round(row_sum(c0["red"], row0, t))
+            v1 = bf16_round(row_sum(c0["red"], row0 + 1, t))
+            _st_bf(c["attn_out"], task * OPROJ_ROWS + row0, v0, CM_DEV)
+            _st_bf(c["attn_out"], task * OPROJ_ROWS + row0 + 1, v1, CM_DEV)
+            combine_gdn_output_pair_raw(
+                c["args"]["streams"],
+                c["args"]["attn_raw"],
+                c["args"]["streams_out"],
+                task,
+                row0,
+                v0,
+                v1,
+            )
+        publish(c["put"], c["oproj_ready"], task, 1, tid == 0)
+
+
+@traced
 def _publish_output_groups(c, bid, owner=0):
     tid, poll, put = c["tid"], c["poll"], c["put"]
     oproj_ready, output_ready = c["oproj_ready"], c["output_group_ready"]
     if bid == owner:
         if tid == 0:
             for start in range_constexpr(0, 96, 8):
-                poll(
-                    [
-                        (oproj_ready, start + j, 1)
-                        for j in range(min(8, 96 - start))
-                    ]
-                )
+                poll([(oproj_ready, start + j, 1) for j in range(min(8, 96 - start))])
         gpu.barrier()
         if tid == 0:
             put(output_ready, 0, 1)
@@ -910,9 +952,7 @@ def build_qsa_post(
     smem = (
         QsaPostSmem
         if key.tokens == 1
-        else QsaPostS2Smem
-        if key.tokens == 2
-        else QsaPostS4Smem
+        else QsaPostS2Smem if key.tokens == 2 else QsaPostS4Smem
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -1145,15 +1185,8 @@ def build_qsa_post(
             c1["red"] = halves.finish.peek().red.ptr
             c2["red"] = halves.finish.peek().red.ptr
             c3["red"] = halves.finish.peek().red.ptr
-            for unit in range(first_task(bid, 0), 4 * OPROJ_TASKS, BLOCKS):
-                if unit < OPROJ_TASKS:
-                    stage_oproj(c0, unit)
-                if (unit >= OPROJ_TASKS) & (unit < 2 * OPROJ_TASKS):
-                    stage_oproj(c1, unit - OPROJ_TASKS)
-                if (unit >= 2 * OPROJ_TASKS) & (unit < 3 * OPROJ_TASKS):
-                    stage_oproj(c2, unit - 2 * OPROJ_TASKS)
-                if unit >= 3 * OPROJ_TASKS:
-                    stage_oproj(c3, unit - 3 * OPROJ_TASKS)
+            for task in range(first_task(bid, 0), OPROJ_TASKS, BLOCKS):
+                _stage_oproj_columns((c0, c1, c2, c3), task, direct)
             _publish_output_groups(c0, bid, 0)
             _publish_output_groups(c1, bid, 2)
             _publish_output_groups(c2, bid, 4)

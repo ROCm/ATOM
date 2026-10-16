@@ -31,7 +31,7 @@ from atom.mono.device.ops import (
     traced,
     wave_sum,
 )
-from atom.mono.device.sync import publish, sreg
+from atom.mono.device.sync import Addr, publish, sreg
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
 ROWS = 16
@@ -156,12 +156,11 @@ def projection_accumulator(weight, task, lane, wave, activation):
     return acc
 
 
-def projection_accumulator_s2(weight, task, lane, wave, activation0, activation1):
-    """Reuse one projection weight stream for two activation rows."""
-
+def projection_accumulator_columns(weight, task, lane, wave, activation, tokens):
+    """Compute token rows in distinct MFMA B columns with one weight stream."""
     row = task * ROWS + lane % ROWS
-    acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc1 = fx.Vector.filled(4, 0.0, fx.Float32)
+    sample = fx.min(lane % ROWS, fx.Int32(tokens - 1))
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for k_pass in range_constexpr(K_STEPS_PER_WAVE):
         k0 = (wave + WAVES * k_pass) * K_STEP + 8 * (lane // ROWS)
         w = fx.Vector(
@@ -173,68 +172,14 @@ def projection_accumulator_s2(weight, task, lane, wave, activation0, activation1
                 cache_modifier=0,
             )
         ).bitcast(fx.BFloat16)
-        x0 = fx.Vector(
+        x = fx.Vector(
             fx.ptr_load(
-                activation0 + k0 // 2,
+                activation + sample * (HIDDEN // 2) + k0 // 2,
                 result_type=T.vec(4, T.i32),
             )
         ).bitcast(fx.BFloat16)
-        x1 = fx.Vector(
-            fx.ptr_load(
-                activation1 + k0 // 2,
-                result_type=T.vec(4, T.i32),
-            )
-        ).bitcast(fx.BFloat16)
-        acc0 = mfma_bf16(w, x0, acc0)
-        acc1 = mfma_bf16(w, x1, acc1)
-    return acc0, acc1
-
-
-def projection_accumulator_s4(
-    weight,
-    task,
-    lane,
-    wave,
-    activation0,
-    activation1,
-    activation2,
-    activation3,
-):
-    """Reuse one projection weight stream for a four-row decode tile."""
-
-    row = task * ROWS + lane % ROWS
-    acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc1 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc2 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc3 = fx.Vector.filled(4, 0.0, fx.Float32)
-    for k_pass in range_constexpr(K_STEPS_PER_WAVE):
-        k0 = (wave + WAVES * k_pass) * K_STEP + 8 * (lane // ROWS)
-        w = fx.Vector(
-            bo.buffer_load(
-                rsrc(weight),
-                (row * HIDDEN + k0) // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=0,
-            )
-        ).bitcast(fx.BFloat16)
-        x0 = fx.Vector(
-            fx.ptr_load(activation0 + k0 // 2, result_type=T.vec(4, T.i32))
-        ).bitcast(fx.BFloat16)
-        x1 = fx.Vector(
-            fx.ptr_load(activation1 + k0 // 2, result_type=T.vec(4, T.i32))
-        ).bitcast(fx.BFloat16)
-        x2 = fx.Vector(
-            fx.ptr_load(activation2 + k0 // 2, result_type=T.vec(4, T.i32))
-        ).bitcast(fx.BFloat16)
-        x3 = fx.Vector(
-            fx.ptr_load(activation3 + k0 // 2, result_type=T.vec(4, T.i32))
-        ).bitcast(fx.BFloat16)
-        acc0 = mfma_bf16(w, x0, acc0)
-        acc1 = mfma_bf16(w, x1, acc1)
-        acc2 = mfma_bf16(w, x2, acc2)
-        acc3 = mfma_bf16(w, x3, acc3)
-    return acc0, acc1, acc2, acc3
+        acc = mfma_bf16(w, x, acc)
+    return acc
 
 
 def _ld_bf(ptr, index):
@@ -292,9 +237,15 @@ def conv_projection_value(
     old2 = _ld_bf(conv_state, read_base + 2 * GDN_CONV_DIM)
     # Native causal_conv1d_update rounds each BF16 product before FP32 addition.
     acc = _bf16_round_strict(old0 * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH))
-    acc = acc + _bf16_round_strict(old1 * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 1))
-    acc = acc + _bf16_round_strict(old2 * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 2))
-    acc = acc + _bf16_round_strict(projected * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 3))
+    acc = acc + _bf16_round_strict(
+        old1 * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 1)
+    )
+    acc = acc + _bf16_round_strict(
+        old2 * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 2)
+    )
+    acc = acc + _bf16_round_strict(
+        projected * _ld_bf(conv_weight, channel * GDN_CONV_WIDTH + 3)
+    )
     _st_bf(conv_state, write_base, old1)
     _st_bf(conv_state, write_base + GDN_CONV_DIM, old2)
     _st_bf(conv_state, write_base + 2 * GDN_CONV_DIM, projected)
@@ -371,15 +322,14 @@ def projection_conv_task_s2(
 ):
     """Project one N16 tile for two tokens with one weight load stream."""
 
-    acc0, acc1 = projection_accumulator_s2(
-        weight, task, lane, wave, activation0, activation1
-    )
-    fx.ptr_store(acc0, reduction + (wave * 64 + lane) * 4)
+    acc = projection_accumulator_columns(weight, task, lane, wave, activation0, 2)
+    fx.ptr_store(acc, reduction + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+    local0 = tid - 0
+    if (tid >= 0) & (tid < 16):
+        channel = task * ROWS + local0
+        projected = bf16_round(row_sum(reduction, local0, 0))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -389,26 +339,13 @@ def projection_conv_task_s2(
                 write_slot0,
             )
             _st_bf(out0, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0),
-                row_sum(reduction, row0 + 1, 0),
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out0),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
-    gpu.barrier()
-    fx.ptr_store(acc1, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+        else:
+            _st_bf(out0, channel, projected, CM_DEV)
+    local1 = tid - 16
+    if (tid >= 16) & (tid < 32):
+        channel = task * ROWS + local1
+        projected = bf16_round(row_sum(reduction, local1, 1))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -418,19 +355,8 @@ def projection_conv_task_s2(
                 write_slot1,
             )
             _st_bf(out1, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0),
-                row_sum(reduction, row0 + 1, 0),
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out1),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
+        else:
+            _st_bf(out1, channel, projected, CM_DEV)
     gpu.barrier()
 
 
@@ -463,23 +389,14 @@ def projection_conv_task_s4(
 ):
     """Project one N16 tile for four tokens with one weight load stream."""
 
-    acc0, acc1, acc2, acc3 = projection_accumulator_s4(
-        weight,
-        task,
-        lane,
-        wave,
-        activation0,
-        activation1,
-        activation2,
-        activation3,
-    )
-
-    fx.ptr_store(acc0, reduction + (wave * 64 + lane) * 4)
+    acc = projection_accumulator_columns(weight, task, lane, wave, activation0, 4)
+    fx.ptr_store(acc, reduction + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+    local0 = tid - 0
+    if (tid >= 0) & (tid < 16):
+        channel = task * ROWS + local0
+        projected = bf16_round(row_sum(reduction, local0, 0))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -489,26 +406,13 @@ def projection_conv_task_s4(
                 write_slot0,
             )
             _st_bf(out0, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0), row_sum(reduction, row0 + 1, 0)
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out0),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
-    gpu.barrier()
-
-    fx.ptr_store(acc1, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+        else:
+            _st_bf(out0, channel, projected, CM_DEV)
+    local1 = tid - 16
+    if (tid >= 16) & (tid < 32):
+        channel = task * ROWS + local1
+        projected = bf16_round(row_sum(reduction, local1, 1))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -518,26 +422,13 @@ def projection_conv_task_s4(
                 write_slot1,
             )
             _st_bf(out1, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0), row_sum(reduction, row0 + 1, 0)
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out1),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
-    gpu.barrier()
-
-    fx.ptr_store(acc2, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+        else:
+            _st_bf(out1, channel, projected, CM_DEV)
+    local2 = tid - 32
+    if (tid >= 32) & (tid < 48):
+        channel = task * ROWS + local2
+        projected = bf16_round(row_sum(reduction, local2, 2))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -547,26 +438,13 @@ def projection_conv_task_s4(
                 write_slot2,
             )
             _st_bf(out2, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0), row_sum(reduction, row0 + 1, 0)
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out2),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
-    gpu.barrier()
-
-    fx.ptr_store(acc3, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if task < CONV_TASKS:
-        if tid < ROWS:
-            channel = task * ROWS + tid
-            projected = bf16_round(row_sum(reduction, tid, 0))
+        else:
+            _st_bf(out2, channel, projected, CM_DEV)
+    local3 = tid - 48
+    if (tid >= 48) & (tid < 64):
+        channel = task * ROWS + local3
+        projected = bf16_round(row_sum(reduction, local3, 3))
+        if task < CONV_TASKS:
             value = conv_projection_value(
                 projected,
                 channel,
@@ -576,18 +454,8 @@ def projection_conv_task_s4(
                 write_slot3,
             )
             _st_bf(out3, channel, value, CM_DEV)
-    else:
-        if tid < ROWS // 2:
-            row0 = 2 * tid
-            value = bf16_pair(
-                row_sum(reduction, row0, 0), row_sum(reduction, row0 + 1, 0)
-            )
-            bo.buffer_store(
-                value.bitcast(fx.Int32),
-                rsrc(out3),
-                task * (ROWS // 2) + tid,
-                cache_modifier=CM_DEV,
-            )
+        else:
+            _st_bf(out3, channel, projected, CM_DEV)
     gpu.barrier()
 
 
@@ -663,31 +531,31 @@ def output_projection_accumulator(normed, k_start, lane, wave, weight_ops):
     return acc
 
 
-def output_projection_accumulators_s4(
-    normed0,
-    normed1,
-    normed2,
-    normed3,
-    weight,
-    tile,
+def output_projection_accumulator_columns(
+    normed,
     k_start,
-    k_steps,
     lane,
     wave,
-    first_weight_ops,
+    weight_ops,
+    weight=None,
+    tile=0,
+    k_steps=None,
 ):
-    """Consume one bounded prefetch window, then stream the remaining weights."""
-
-    row = tile * ROWS + lane % ROWS
-    acc0 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc1 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc2 = fx.Vector.filled(4, 0.0, fx.Float32)
-    acc3 = fx.Vector.filled(4, 0.0, fx.Float32)
-    for k_pass in range_constexpr(k_steps):
+    """Reuse each weight fragment across independent token columns."""
+    sample = fx.min(lane % ROWS, fx.Int32(len(normed) - 1))
+    selected = normed[0]
+    for token in range_constexpr(1, len(normed)):
+        selected = (sample == token).select(normed[token], selected)
+    # Buffer descriptors are uniform; put the varying token address in voffset.
+    token_offset = fx.Int32((selected - normed[0]) // 4)
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    steps = len(weight_ops) if k_steps is None else k_steps
+    for k_pass in range_constexpr(steps):
         k0 = k_start + (wave + WAVES * k_pass) * K_STEP + 8 * (lane // ROWS)
-        if k_pass < S4_OUTPUT_PREFETCH_STEPS:
-            w = first_weight_ops[k_pass]
+        if k_pass < len(weight_ops):
+            w = weight_ops[k_pass]
         else:
+            row = tile * ROWS + lane % ROWS
             w = fx.Vector(
                 bo.buffer_load(
                     rsrc(weight),
@@ -697,47 +565,17 @@ def output_projection_accumulators_s4(
                     cache_modifier=0,
                 )
             ).bitcast(fx.BFloat16)
-        x0 = fx.Vector(
+        x = fx.Vector(
             bo.buffer_load(
-                rsrc(normed0),
-                k0 // 2,
+                rsrc(normed[0]),
+                token_offset + k0 // 2,
                 vec_width=4,
                 dtype=T.i32,
                 cache_modifier=CM_DEV,
             )
         ).bitcast(fx.BFloat16)
-        x1 = fx.Vector(
-            bo.buffer_load(
-                rsrc(normed1),
-                k0 // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        ).bitcast(fx.BFloat16)
-        x2 = fx.Vector(
-            bo.buffer_load(
-                rsrc(normed2),
-                k0 // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        ).bitcast(fx.BFloat16)
-        x3 = fx.Vector(
-            bo.buffer_load(
-                rsrc(normed3),
-                k0 // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        ).bitcast(fx.BFloat16)
-        acc0 = mfma_bf16(w, x0, acc0)
-        acc1 = mfma_bf16(w, x1, acc1)
-        acc2 = mfma_bf16(w, x2, acc2)
-        acc3 = mfma_bf16(w, x3, acc3)
-    return acc0, acc1, acc2, acc3
+        acc = mfma_bf16(w, x, acc)
+    return acc
 
 
 @traced
@@ -851,24 +689,21 @@ def output_projection_direct_task_s4(
 ):
     """Complete one output tile for four tokens from one weight batch."""
 
-    acc0, acc1, acc2, acc3 = output_projection_accumulators_s4(
-        normed0,
-        normed1,
-        normed2,
-        normed3,
-        weight,
-        tile,
+    acc = output_projection_accumulator_columns(
+        (normed0, normed1, normed2, normed3),
         0,
-        GDR_OUT_FULL_K_STEPS_PER_WAVE,
         lane,
         wave,
         first_weight_ops,
+        weight,
+        tile,
+        GDR_OUT_FULL_K_STEPS_PER_WAVE,
     )
-
-    fx.ptr_store(acc0, reduction + (wave * 64 + lane) * 4)
+    fx.ptr_store(acc, reduction + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < ROWS // 2:
-        row0 = 2 * tid
+    if tid >= 0 and tid < 8:
+        local = tid - 0
+        row0 = 2 * local
         value0 = bf16_round(row_sum(reduction, row0, 0))
         value1 = bf16_round(row_sum(reduction, row0 + 1, 0))
         if const_expr(after_pair0 is not None):
@@ -876,55 +711,46 @@ def output_projection_direct_task_s4(
         bo.buffer_store(
             bf16_pair(value0, value1).bitcast(fx.Int32),
             rsrc(out0),
-            tile * (ROWS // 2) + tid,
+            tile * (ROWS // 2) + local,
             cache_modifier=output_cache_modifier,
         )
-    gpu.barrier()
-
-    fx.ptr_store(acc1, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS // 2:
-        row0 = 2 * tid
-        value0 = bf16_round(row_sum(reduction, row0, 0))
-        value1 = bf16_round(row_sum(reduction, row0 + 1, 0))
+    if tid >= 8 and tid < 16:
+        local = tid - 8
+        row0 = 2 * local
+        value0 = bf16_round(row_sum(reduction, row0, 1))
+        value1 = bf16_round(row_sum(reduction, row0 + 1, 1))
         if const_expr(after_pair1 is not None):
             after_pair1(tile, row0, value0, value1)
         bo.buffer_store(
             bf16_pair(value0, value1).bitcast(fx.Int32),
             rsrc(out1),
-            tile * (ROWS // 2) + tid,
+            tile * (ROWS // 2) + local,
             cache_modifier=output_cache_modifier,
         )
-    gpu.barrier()
-
-    fx.ptr_store(acc2, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS // 2:
-        row0 = 2 * tid
-        value0 = bf16_round(row_sum(reduction, row0, 0))
-        value1 = bf16_round(row_sum(reduction, row0 + 1, 0))
+    if tid >= 16 and tid < 24:
+        local = tid - 16
+        row0 = 2 * local
+        value0 = bf16_round(row_sum(reduction, row0, 2))
+        value1 = bf16_round(row_sum(reduction, row0 + 1, 2))
         if const_expr(after_pair2 is not None):
             after_pair2(tile, row0, value0, value1)
         bo.buffer_store(
             bf16_pair(value0, value1).bitcast(fx.Int32),
             rsrc(out2),
-            tile * (ROWS // 2) + tid,
+            tile * (ROWS // 2) + local,
             cache_modifier=output_cache_modifier,
         )
-    gpu.barrier()
-
-    fx.ptr_store(acc3, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS // 2:
-        row0 = 2 * tid
-        value0 = bf16_round(row_sum(reduction, row0, 0))
-        value1 = bf16_round(row_sum(reduction, row0 + 1, 0))
+    if tid >= 24 and tid < 32:
+        local = tid - 24
+        row0 = 2 * local
+        value0 = bf16_round(row_sum(reduction, row0, 3))
+        value1 = bf16_round(row_sum(reduction, row0 + 1, 3))
         if const_expr(after_pair3 is not None):
             after_pair3(tile, row0, value0, value1)
         bo.buffer_store(
             bf16_pair(value0, value1).bitcast(fx.Int32),
             rsrc(out3),
-            tile * (ROWS // 2) + tid,
+            tile * (ROWS // 2) + local,
             cache_modifier=output_cache_modifier,
         )
 
@@ -1031,66 +857,54 @@ def output_projection_partial_task_s4(
 
     split = task // GDR_OUT_SPLIT_TILES
     k_start = split * GDR_OUT_SPLIT_K
-    acc0, acc1, acc2, acc3 = output_projection_accumulators_s4(
-        normed0,
-        normed1,
-        normed2,
-        normed3,
-        weight,
-        GDR_OUT_DIRECT_TASKS + task % GDR_OUT_SPLIT_TILES,
+    acc = output_projection_accumulator_columns(
+        (normed0, normed1, normed2, normed3),
         k_start,
-        GDR_OUT_K_STEPS_PER_WAVE,
         lane,
         wave,
         first_weight_ops,
+        weight,
+        GDR_OUT_DIRECT_TASKS + task % GDR_OUT_SPLIT_TILES,
+        GDR_OUT_K_STEPS_PER_WAVE,
     )
-
-    fx.ptr_store(acc0, reduction + (wave * 64 + lane) * 4)
+    fx.ptr_store(acc, reduction + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < ROWS:
+    if tid >= 0 and tid < 16:
+        local = tid - 0
         bo.buffer_store(
-            row_sum(reduction, tid, 0),
+            row_sum(reduction, local, 0),
             rsrc(partials0),
-            task * ROWS + tid,
+            task * ROWS + local,
             cache_modifier=CM_DEV,
         )
     publish(put, partial_ready0, task, fx.Int32(1), tid == 0)
-    gpu.barrier()
-
-    fx.ptr_store(acc1, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS:
+    if tid >= 16 and tid < 32:
+        local = tid - 16
         bo.buffer_store(
-            row_sum(reduction, tid, 0),
+            row_sum(reduction, local, 1),
             rsrc(partials1),
-            task * ROWS + tid,
+            task * ROWS + local,
             cache_modifier=CM_DEV,
         )
-    publish(put, partial_ready1, task, fx.Int32(1), tid == 0)
-    gpu.barrier()
-
-    fx.ptr_store(acc2, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS:
+    publish(put, partial_ready1, task, fx.Int32(1), tid == 16)
+    if tid >= 32 and tid < 48:
+        local = tid - 32
         bo.buffer_store(
-            row_sum(reduction, tid, 0),
+            row_sum(reduction, local, 2),
             rsrc(partials2),
-            task * ROWS + tid,
+            task * ROWS + local,
             cache_modifier=CM_DEV,
         )
-    publish(put, partial_ready2, task, fx.Int32(1), tid == 0)
-    gpu.barrier()
-
-    fx.ptr_store(acc3, reduction + (wave * 64 + lane) * 4)
-    gpu.barrier()
-    if tid < ROWS:
+    publish(put, partial_ready2, task, fx.Int32(1), tid == 32)
+    if tid >= 48 and tid < 64:
+        local = tid - 48
         bo.buffer_store(
-            row_sum(reduction, tid, 0),
+            row_sum(reduction, local, 3),
             rsrc(partials3),
-            task * ROWS + tid,
+            task * ROWS + local,
             cache_modifier=CM_DEV,
         )
-    publish(put, partial_ready3, task, fx.Int32(1), tid == 0)
+    publish(put, partial_ready3, task, fx.Int32(1), tid == 48)
 
 
 @traced
@@ -2135,109 +1949,43 @@ def run_gdn_s4(
 
     if bid < 2 * GDR_TASKS:
         for recurrence_round in range_constexpr(2):
-            recurrence_unit = bid + 2 * GDR_TASKS * recurrence_round
-            recurrence_token = recurrence_unit // GDR_TASKS
-            recurrence_task = recurrence_unit % GDR_TASKS
-            if recurrence_token == 0:
-                _wait_gdr_dependencies(
-                    mailbox.poll, projected_ready0, recurrence_task, tid
-                )
-                emit_gdr_decode_task(
-                    *_gdr_projection_views(
-                        args0["projected"],
-                        args0["dt_bias"],
-                        args0["A_log"],
-                        args0["read_indices"],
-                        args0["write_indices"],
-                        args0["state"],
-                        args0["core"],
-                    ),
-                    fx.Int32(1),
-                    tid,
-                    recurrence_task,
-                )
-                publish(
-                    mailbox.put,
-                    recurrence_ready0,
-                    recurrence_task,
-                    fx.Int32(1),
-                    tid == 0,
-                )
-            if recurrence_token == 1:
-                _wait_gdr_dependencies(
-                    mailbox.poll, projected_ready1, recurrence_task, tid
-                )
-                emit_gdr_decode_task(
-                    *_gdr_projection_views(
-                        args1["projected"],
-                        args1["dt_bias"],
-                        args1["A_log"],
-                        args1["read_indices"],
-                        args1["write_indices"],
-                        args1["state"],
-                        args1["core"],
-                    ),
-                    fx.Int32(1),
-                    tid,
-                    recurrence_task,
-                )
-                publish(
-                    mailbox.put,
-                    recurrence_ready1,
-                    recurrence_task,
-                    fx.Int32(1),
-                    tid == 0,
-                )
-            if recurrence_token == 2:
-                _wait_gdr_dependencies(
-                    mailbox.poll, projected_ready2, recurrence_task, tid
-                )
-                emit_gdr_decode_task(
-                    *_gdr_projection_views(
-                        args2["projected"],
-                        args2["dt_bias"],
-                        args2["A_log"],
-                        args2["read_indices"],
-                        args2["write_indices"],
-                        args2["state"],
-                        args2["core"],
-                    ),
-                    fx.Int32(1),
-                    tid,
-                    recurrence_task,
-                )
-                publish(
-                    mailbox.put,
-                    recurrence_ready2,
-                    recurrence_task,
-                    fx.Int32(1),
-                    tid == 0,
-                )
-            if recurrence_token == 3:
-                _wait_gdr_dependencies(
-                    mailbox.poll, projected_ready3, recurrence_task, tid
-                )
-                emit_gdr_decode_task(
-                    *_gdr_projection_views(
-                        args3["projected"],
-                        args3["dt_bias"],
-                        args3["A_log"],
-                        args3["read_indices"],
-                        args3["write_indices"],
-                        args3["state"],
-                        args3["core"],
-                    ),
-                    fx.Int32(1),
-                    tid,
-                    recurrence_task,
-                )
-                publish(
-                    mailbox.put,
-                    recurrence_ready3,
-                    recurrence_task,
-                    fx.Int32(1),
-                    tid == 0,
-                )
+            unit = bid + 2 * GDR_TASKS * recurrence_round
+            token = unit // GDR_TASKS
+            task = unit % GDR_TASKS
+            pointers = []
+            for key in (
+                "projected",
+                "dt_bias",
+                "A_log",
+                "read_indices",
+                "write_indices",
+                "state",
+                "core",
+            ):
+                ptr = args0[key]
+                for index, args in enumerate((args1, args2, args3), 1):
+                    ptr = (token == index).select(args[key], ptr)
+                pointers.append(ptr)
+            ready = projected_ready0.value
+            rec_ready = recurrence_ready0.value
+            for index, pready, rready in (
+                (1, projected_ready1, recurrence_ready1),
+                (2, projected_ready2, recurrence_ready2),
+                (3, projected_ready3, recurrence_ready3),
+            ):
+                ready = (token == index).select(pready.value, ready)
+                rec_ready = (token == index).select(rready.value, rec_ready)
+            selected_ready = Addr(
+                projected_ready0.region, projected_ready0.space, ready
+            )
+            selected_rec = Addr(
+                recurrence_ready0.region, recurrence_ready0.space, rec_ready
+            )
+            _wait_gdr_dependencies(mailbox.poll, selected_ready, task, tid)
+            emit_gdr_decode_task(
+                *_gdr_projection_views(*pointers), fx.Int32(1), tid, task
+            )
+            publish(mailbox.put, selected_rec, task, fx.Int32(1), tid == 0)
     else:
         worker = bid - 2 * GDR_TASKS
         for round_id in range_constexpr(GDR_Z_TASKS // (2 * (BLOCKS - 2 * GDR_TASKS))):

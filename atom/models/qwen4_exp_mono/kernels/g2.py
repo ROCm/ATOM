@@ -9,8 +9,9 @@ buffer contract without materializing ``[topk, H]`` global partials.
 """
 
 import flydsl.expr as fx
+from atom.mono.device.sync import Addr
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.qwen4_exp_mono.config import HIDDEN, INTERMEDIATE, TOPK
@@ -116,7 +117,7 @@ def _load_w2(c, w2, expert, row_group, kb):
             base + tile * 256 + lane * 4,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=c.get("weight_cache", CM_NT),
         )
     )
     hi = fx.Vector(
@@ -125,7 +126,7 @@ def _load_w2(c, w2, expert, row_group, kb):
             base + (tile + 1) * 256 + lane * 4,
             vec_width=4,
             dtype=T.i32,
-            cache_modifier=CM_NT,
+            cache_modifier=c.get("weight_cache", CM_NT),
         )
     )
     return [
@@ -143,8 +144,10 @@ def _shared_g2(c, part):
     paired_shared = c.get("paired_shared_g2", False)
     if c.get("preloaded_shared_g2", False):
         if tid < G2_COLS:
-            fx.ptr_store(_ld_bf(c["args"]["moe_out"], part * G2_COLS + tid, CM_DEV),
-                         c["up"] + G2_COLS + tid)
+            fx.ptr_store(
+                _ld_bf(c["args"]["moe_out"], part * G2_COLS + tid, CM_DEV),
+                c["up"] + G2_COLS + tid,
+            )
             fx.ptr_store(fx.Float32(0.0), c["up"] + tid)
         gpu.barrier()
         return
@@ -169,11 +172,15 @@ def _shared_g2(c, part):
         )
         fx.ptr_store(words, c["x"] + tid * 4)
         if paired_shared:
-            other = fx.Vector(bo.buffer_load(
-                rsrc(c["paired_shared_scratch"]),
-                _scratch_word(c, "shared_mid") + tid * 4,
-                vec_width=4, dtype=T.i32, cache_modifier=CM_DEV,
-            ))
+            other = fx.Vector(
+                bo.buffer_load(
+                    rsrc(c["paired_shared_scratch"]),
+                    _scratch_word(c, "shared_mid") + tid * 4,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
             other = (tid < shared_vecs).select(other, fx.Vector.filled(4, 0, fx.Int32))
             fx.ptr_store(other, c["x"] + shared_lds_vecs * 4 + tid * 4)
     gpu.barrier()
@@ -195,12 +202,18 @@ def _shared_g2(c, part):
                 row * shared_intermediate + k0,
                 k0 < shared_intermediate,
                 HIDDEN * shared_intermediate * 2,
-                CM_NT,
+                c.get("weight_cache", CM_NT),
             ),
             (k0 < shared_intermediate).select(
-                _ld_lds_bf8(c["x"],
-                            k0 + (fx.min(lane % 16, 1) * shared_lds_vecs * 8
-                                  if paired_shared else 0)),
+                _ld_lds_bf8(
+                    c["x"],
+                    k0
+                    + (
+                        fx.min(lane % 16, 1) * shared_lds_vecs * 8
+                        if paired_shared
+                        else 0
+                    ),
+                ),
                 fx.Vector.filled(8, 0.0, fx.BFloat16),
             ),
             fx.Vector.filled(4, 0.0, fx.Float32),
@@ -213,8 +226,12 @@ def _shared_g2(c, part):
         fx.ptr_store(bf16_round(row_sum(c["red"], tid, 0)), c["up"] + G2_COLS + tid)
         fx.ptr_store(fx.Float32(0.0), c["up"] + tid)
         if paired_shared:
-            _st_bf(c["paired_shared_output"], part * G2_COLS + tid,
-                   bf16_round(row_sum(c["red"], tid, 1)), CM_DEV)
+            _st_bf(
+                c["paired_shared_output"],
+                part * G2_COLS + tid,
+                bf16_round(row_sum(c["red"], tid, 1)),
+                CM_DEV,
+            )
     gpu.barrier()
 
 
@@ -225,10 +242,13 @@ def _routed_slot(c, part, slot):
         _scratch_f32(c, "route_weights", slot).bitcast(fx.Int32)
     ).bitcast(fx.Float32)
     active = route_weight > fx.Float32(0.0)
+    weight_cache = c.get("weight_cache", CM_NT)
     if active:
         c["poll"](
-            [(c["midq_ready"], slot * MIDQ_GROUPS + group, 1)
-             for group in range(MIDQ_GROUPS)]
+            [
+                (c["midq_ready"], slot * MIDQ_GROUPS + group, 1)
+                for group in range(MIDQ_GROUPS)
+            ]
         )
         expert = fx.Int32(
             bo.buffer_load(
@@ -250,7 +270,7 @@ def _routed_slot(c, part, slot):
         w_scale = _ld_f32(
             routed_w2_scale,
             (expert * W2_SCALE_ROWS + part // 8) * K_BLOCKS + use_kb,
-            CM_NT,
+            weight_cache,
         )
         scale = (wave < K_BLOCKS).select(a_scale * w_scale, fx.Float32(0.0))
         fx.ptr_store(acc * scale, c["red"] + (wave * 64 + lane) * 4)
@@ -322,14 +342,32 @@ def _take_g2_rank_s2(c):
 
 @traced
 def _stage_g2_s2(c0, c1, task):
-    """Run one interleaved (token, output tile) task."""
-
-    token = task % 2
-    part = task // 2
-    if token == 0:
-        _stage_g2(c0, part)
-    else:
-        _stage_g2(c1, part)
+    if const_expr(c0.get("expert_owned", False)):
+        if task % 2 == 0:
+            _stage_g2(c0, task // 2)
+        else:
+            _stage_g2(c1, task // 2)
+        return
+    first = task % 2 == 0
+    selected = dict(c0)
+    for field in (
+        "scratch",
+        "midq",
+        "midq_scale",
+        "route_ids",
+        "route_weights",
+        "shared_gate",
+        "shared_mid",
+    ):
+        selected[field] = first.select(c0[field], c1[field])
+    for field in ("shared_mid_ready", "midq_ready"):
+        a, b = c0[field], c1[field]
+        selected[field] = Addr(a.region, a.space, first.select(a.value, b.value))
+    selected["args"] = dict(c0["args"])
+    selected["args"]["moe_out"] = first.select(
+        c0["args"]["moe_out"], c1["args"]["moe_out"]
+    )
+    _stage_g2(selected, task // 2)
 
 
 @traced
