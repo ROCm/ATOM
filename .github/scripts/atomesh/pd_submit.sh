@@ -370,11 +370,15 @@ fi
 
 if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == "prefix-read-fixed" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" require-ready
-  # A non-empty NODE_LIST becomes -w/--exclude; the scheduler must pick both nodes.
+  # The matrix must not pin nodes; the scheduler picks both from the pool below.
   if [[ -n "${NODE_LIST}" ]]; then
     echo "prefix READ case requires scheduler allocation, got NODE_LIST=${NODE_LIST}" >&2
     exit 1
   fi
+  pool_json="$(python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_prefix_read.py" candidate-pool \
+    --partition "${SLURM_PARTITION}" --controller "${SPUR_CONTROLLER_ADDR}")"
+  NODE_LIST="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["pool"])' <<< "${pool_json}")"
+  echo "prefix_read_candidate_pool=${NODE_LIST} required_nodes=${NUM_NODES}"
 fi
 mkdir -p "${LOG_ROOT}"
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then

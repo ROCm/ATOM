@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,9 @@ RELATIVE = "distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py"
 TARGET = "/usr/local/lib/python3.12/dist-packages/vllm/" + RELATIVE
 PAYLOAD = ".github/benchmark/prefix-read-fixed"
 LOCAL_READY = "LOCAL_CHECKS_PASSED_RUNTIME_GATED"
+# shortcut: hand-picked suspected faulty nodes (g10 Spur step dispatch, g12 ~1.5 TB
+# host memory missing, 2026-10-16); drop each once the cluster admins clear it.
+AVOID_NODES = ("pit2-p03-g10", "pit2-p03-g12")
 
 
 def digest(path: Path) -> str:
@@ -374,12 +378,47 @@ def verify_image(image: str) -> dict:
     }
 
 
+def candidate_pool(inventory: str, partition: str, avoid=AVOID_NODES) -> dict:
+    """Whole-partition 8-GPU -w pool for Spur to pick from, minus avoided nodes."""
+    if not partition:
+        raise RuntimeError("unknown target partition")
+    nodes = []
+    for section in re.split(r"(?=\bNodeName=)", inventory):
+        fields = dict(
+            re.findall(r"(?:^|\s)(NodeName|State|Partitions|Gres)=(\S+)", section)
+        )
+        gpus = sum(
+            int(re.match(r"\d+", item.rsplit(":", 1)[1]).group())
+            for item in fields.get("Gres", "").split(",")
+            if item.startswith("gpu:") and re.match(r"\d+", item.rsplit(":", 1)[1])
+        )
+        if (
+            "NodeName" in fields
+            and fields["NodeName"] not in avoid
+            and partition in fields.get("Partitions", "").split(",")
+            and gpus >= 8
+            and not re.search(r"DOWN|DRAIN|FAIL", fields.get("State", ""))
+        ):
+            nodes.append(fields["NodeName"])
+    if len(nodes) < 2:
+        raise RuntimeError(f"candidate pool too small: {nodes}")
+    return {"pool": ",".join(sorted(nodes)), "avoided": list(avoid)}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
-        choices=["require-ready", "verify-bundle", "host-preflight", "verify-image"],
+        choices=[
+            "require-ready",
+            "verify-bundle",
+            "host-preflight",
+            "verify-image",
+            "candidate-pool",
+        ],
     )
+    parser.add_argument("--partition", default="")
+    parser.add_argument("--controller", default="")
     parser.add_argument(
         "--repo", type=Path, default=Path(__file__).resolve().parents[3]
     )
@@ -395,6 +434,14 @@ def main() -> None:
         result = verify_bundle(options.repo)
     elif options.command == "verify-image":
         result = verify_image(options.image)
+    elif options.command == "candidate-pool":
+        command = ["scontrol"]
+        if options.controller:
+            command += ["--controller", options.controller]
+        inventory = subprocess.check_output(
+            command + ["show", "nodes"], text=True, timeout=20
+        )
+        result = candidate_pool(inventory, options.partition)
     else:
         if any(
             value is None

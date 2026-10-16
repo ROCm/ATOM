@@ -71,7 +71,7 @@
     "minimum_free_bytes_uncached": 214748364800,
     "minimum_free_bytes_cached": 42949672960,
     "cgroup_headroom_checked": true,
-    "allocation": "sbatch --nodes 2 --gres gpu:8 in the agreed account/partition/QoS, empty NODE_LIST (no -w); resource checks run on the allocated hosts only"
+    "allocation": "sbatch --nodes 2 --gres gpu:8 in the agreed account/partition/QoS; Spur picks both nodes from a -w pool of every 8-GPU partition node minus AVOID_NODES (user-approved 2026-10-16: g10 Spur step dispatch, g12 host memory); resource checks run on the allocated hosts only"
   },
   "observer": {
     "installed": true,
@@ -116,15 +116,15 @@
     ".github/scripts/atomesh/pd_matrix.py": "7b1683a392b6b3b6ce76c9567fe024eb510f2fc805b43e7064f6748e5c7d8d4d",
     ".github/scripts/atomesh/pd_prefix_client.py": "2b580a9a4ec10d2437611d16954c90ac8be328e63e7985157f0353e089817746",
     ".github/scripts/atomesh/pd_prefix_gate.py": "aca51ff6e4c7efa11828141d7b5cbc7e11e3e15b4c2ee327c85f20847db35a3d",
-    ".github/scripts/atomesh/pd_prefix_read.py": "8a50bb55ad2062bcaa91681e5d3e3ae3a38457d9bbc3c7a78b9c9d448ac75cb3",
+    ".github/scripts/atomesh/pd_prefix_read.py": "4ecebf422729f617669c135aae63498bf5ff6921560ddf65ce56384b94b18102",
     ".github/scripts/atomesh/pd_prefix_read_mount.sh": "b5c93e0464b497acc66969edc10fe190806e75a455b668335800f80bd3498ae3",
     ".github/scripts/atomesh/pd_prefix_runtime.py": "deefcb034f2f1526180c2c65885f105ef8e891f27992f53dfc4361def8d6085d",
     ".github/scripts/atomesh/pd_server_atom.sh": "8072434dbf9e9e01575da874396cabbe9239be315d3c4a48c2b16bc264e08de7",
     ".github/scripts/atomesh/pd_server_vllm.sh": "697d48d48d3f8f1ba771edbe28533a6e8199999fc5a1886fc94269f23ae374ee",
     ".github/scripts/atomesh/pd_slurm_job.sh": "5e27ddcafd3a55870eace490400f9560d92691b4b2a6bfe81d8738967f3fb835",
-    ".github/scripts/atomesh/pd_submit.sh": "4a953166feccab7066fac82810da365de982b0d003c99765ffa88cd3ebd7ee19",
+    ".github/scripts/atomesh/pd_submit.sh": "f33f51a1ee786b480ced5c343a77ba3356e3cf745c43250169173f7ef38378d4",
     ".github/workflows/atomesh-benchmark.yaml": "ceda82c3f386b0b0961a79384dbe5f5b7bab5d2f523fb4437beaa0e99eac783a",
-    "tests/test_prefix_read_harness.py": "363460f76173294f65fc70901be020957069dcb7509a8aabae7849b0164331b6",
+    "tests/test_prefix_read_harness.py": "30e3a745ea13b7137d555c20c3e2f149dfb515adf31b41d7c44132d4f21edeb6",
     "tests/test_prefix_read_lifecycle.py": "e58abd91c966b217f48d2ee14fd6af30d3b40f0bde0cc57ff47192f05ddf890c",
     "tests/test_prefix_read_runtime_integration.py": "904417b912a33727d7f81cd76871850ad654b059777173527911e17a6f7e1bd2",
     ".github/scripts/slurm_submit_helpers.sh": "a6f8e4ba1a896adb68e080de0afa0e0dfedbe94fe3b89fa8afd92500c961f377"

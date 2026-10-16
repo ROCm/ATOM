@@ -271,6 +271,27 @@ def test_unsharded_model_without_index(tmp_path):
     assert result["shards"] == [{"path": "model.safetensors", "bytes": 7}]
 
 
+def test_candidate_pool_drops_avoided_and_non_gpu_nodes():
+    gpus = ",".join(["gpu:mi355x:1"] * 8)
+    inventory = "\n".join(
+        [
+            f"NodeName=pit2-p03-g10 State=IDLE Partitions=amd-spur Gres={gpus}",
+            f"NodeName=pit2-p03-g11 State=ALLOCATED Partitions=amd-sglang Gres={gpus}",
+            f"NodeName=pit2-p03-g12 State=MIXED Partitions=amd-spur Gres={gpus}",
+            f"NodeName=pit2-p03-g25 State=IDLE Partitions=amd-spur Gres={gpus}",
+            f"NodeName=pit2-p03-g26 State=IDLE+DRAIN Partitions=amd-spur Gres={gpus}",
+            "NodeName=pit2-p03-g53 State=ALLOCATED Partitions=amd-spur Gres=gpu:mi355x:8",
+            "NodeName=pit2-vm-amd-large-02 State=IDLE Partitions=amd-spur Gres=(null)",
+        ]
+    )
+    result = helper.candidate_pool(inventory, "amd-spur")
+    assert result["pool"] == "pit2-p03-g25,pit2-p03-g53"
+    with pytest.raises(RuntimeError, match="too small"):
+        helper.candidate_pool(inventory, "amd-spur", avoid=("pit2-p03-g25",) + helper.AVOID_NODES)
+    with pytest.raises(RuntimeError, match="partition"):
+        helper.candidate_pool(inventory, "")
+
+
 def test_client_spawned_children_do_not_rerun_aiperf(tmp_path):
     client = tmp_path / "prefix-read-fixed/client"
     (client / "aiperf/timing").mkdir(parents=True)
