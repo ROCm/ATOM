@@ -36,6 +36,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_scatter_rows
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 
@@ -665,6 +666,34 @@ def qk_norm_rope_maybe_quant(
     # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [., rd//2, 1, 1].
     cos_2d = cos_cache.squeeze(-2).squeeze(-2)
     sin_2d = sin_cache.squeeze(-2).squeeze(-2)
+    # The Gluon kernel always writes the SWA cache, but prefill writes it after
+    # the attention. Use the Gluon kernel only when the caller gives the SWA cache.
+    if envs.ATOM_V4_USE_GLUON and swa_nope_scale_buff is not None:
+        from aiter.ops.triton.fusions.fused_qk_norm_rope_group_quant import (
+            fused_qk_norm_rope_group_quant as gluon_fused_qk_norm_rope_group_quant,
+        )
+
+        q_packed, q_rope, k_packed, k_rope = gluon_fused_qk_norm_rope_group_quant(
+            q.view(num_tokens, n_local_heads, head_dim),
+            kv,
+            kv_weight,
+            positions,
+            cos_2d,
+            sin_2d,
+            eps,
+            swa_nope=swa_nope_scale_buff,
+            swa_rope=swa_rope_buff,
+            swa_dest_rows=swa_dest_rows,
+            batch_ids=batch_id_per_q_token,
+        )
+        # The compiled graph checks that K is [T, 1, .] (see _qkn_placeholder). The
+        # Gluon kernel returns [T, .]. Add the size-1 KV head axis.
+        return QKNormRopeOut(
+            q_packed=q_packed,
+            q_rope=q_rope,
+            k_packed=k_packed.unsqueeze(1),
+            k_rope=k_rope.unsqueeze(1),
+        )
     q_packed, q_rope, k_packed, k_rope = fused_qk_norm_rope_group_quant(
         q.view(num_tokens, n_local_heads, head_dim),
         kv,
