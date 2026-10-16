@@ -15,6 +15,7 @@ from atom.model_ops.deepseek_v41.mhc_pre_delayed import pre_delayed
 from atom.model_ops.deepseek_v41.rotary import RotaryEmbedding
 from atom.model_ops.embed_head import VocabParallelEmbedding
 from atom.model_ops.engram.device.layer import EngramOp
+from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
@@ -158,16 +159,26 @@ class Block(nn.Module):
         # projection.
         return SinglePassHCState(residual, pre, output, post, comb)
 
-    def forward(self, state, cache, step, rope, embeddings=None, image_mask=None):
+    def forward(
+        self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
+    ):
+        """``queries``: bounded replay's `QueryRows`, the rows the rest of the
+        layer runs on, those the attention outputs (the runtime's reads them
+        off the forward context, `runtime.v41_attention`)."""
         normed, residual, pre, post, comb = self.prepare_attention(
             state, embeddings, image_mask
         )
         output = self.attention_forward(normed, cache, step, rope)
+        if queries is not None:
+            residual, pre, post, comb = queries.take(residual, pre, post, comb)
+        return self.ffn_forward(output, residual, pre, post, comb)
+
+    def ffn_forward(self, output, residual, pre, post, comb):
+        """The layer after its attention: ``output`` and the seam's state."""
         normed, residual, pre, post, comb = self.prepare_ffn(
             output, residual, pre, post, comb
         )
-        output = self.ffn(normed)
-        return self.finish_ffn(output, residual, pre, post, comb)
+        return self.finish_ffn(self.ffn(normed), residual, pre, post, comb)
 
 
 class DeepseekV41ForCausalLM(nn.Module):
@@ -304,12 +315,11 @@ class DeepseekV41ForCausalLM(nn.Module):
         )
 
     def begin_forward(self, hidden, engram_embeddings):
-        stage = getattr(engram_embeddings, "stage", None)
-        if stage is not None:
-            stage()
+        if isinstance(engram_embeddings, EngramStagedRows):
+            engram_embeddings.stage()
 
     def end_forward(self, hidden, engram_embeddings):
-        if getattr(engram_embeddings, "stage", None) is not None:
+        if isinstance(engram_embeddings, EngramStagedRows):
             engram_embeddings.join()
 
     def forward_hidden(

@@ -115,6 +115,7 @@ def _hash_with(indexer_dcp_only: bool) -> str:
         hf_config=SimpleNamespace(),
         max_model_len=4096,
         max_num_seqs=256,
+        speculative_config=None,
     )
     return Config.compute_hash(stub)
 

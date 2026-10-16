@@ -32,6 +32,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "hybrid": "hybrid",
     "dense": "dense",
     "kimi_k3": "kimi_k3",
+    "qwen": "qwen",
     "m3": "m3",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
@@ -77,14 +78,14 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
     {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
 )
 
-# Layouts that own a tier for a model's per-request *recurrent* state. Today only
-# `kimi_k3` (the kimi_linear KDA state); `hybrid` (DSV4 sparse-attention
-# checkpoints) is not recurrent-state and dense<->hybrid is a legitimate operator
-# override for namespace separation. An explicit `offload_layout` override may not
-# downgrade a recurrent-state model to a layout that owns no tier for it (silent
-# wrong output) -- see `select_offload_layout`. GDN/linear model types are refused
-# outright in `_layout_from_model`, so no override can resurrect them.
-_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3"})
+# Layouts that own a tier for a model's per-request *recurrent* state.
+# `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
+# PAGE image. `hybrid` (DSV4 sparse-attention checkpoints) is not
+# recurrent-state and dense<->hybrid is a legitimate operator override for
+# namespace separation. An explicit `offload_layout` override may not
+# downgrade a recurrent-state model to a layout that owns no tier for it
+# (silent wrong output) -- see `select_offload_layout`.
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen"})
 
 logger = logging.getLogger("atom")
 
@@ -170,11 +171,11 @@ def select_offload_layout(config) -> str:
 
 
 def _layout_from_model(config) -> str:
-    """The dense/hybrid/kimi_k3 layout the model itself implies (no override).
+    """The dense/hybrid/kimi_k3/qwen layout the model itself implies (no override).
 
-    May raise: a GDN/linear model that no layout owns a state tier for is
-    refused here (the message names the cause) rather than left to die deep in
-    `register_kv_caches` as a byte-layout mismatch.
+    GDN selects ``qwen``, a subclass of the K3 tier: that tier packs a PAGE
+    image and does not assume KDA shapes. ``dense`` is refused for these
+    models because it would restore KV over a stale slot.
     """
     hf_config = getattr(config, "hf_config", None)
     if hf_config is None:
@@ -208,21 +209,13 @@ def _layout_from_model(config) -> str:
         return "kimi_k3"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
-    # GDN/linear models carry a per-request recurrent state no layout owns a
-    # tier for; `dense` would restore a KV prefix over stale state (silent wrong
-    # output). The dense codec fails closed on the state tensor, but that fires
-    # deep in `register_kv_caches` as a byte-layout mismatch -- refuse here where
-    # the message can name the cause.
+    # GDN publishes the same PAGE-image contract the kimi_k3 tier already
+    # packs (`page_unit_views` in, `state_entry_views` out). The layout name
+    # is `qwen` so the shell builds `QwenOffloadConnector`, which inherits
+    # that tier and does not assume KDA shapes. `dense` would restore KV
+    # over a stale slot.
     if model_type in _GDN_LINEAR_MODEL_TYPES:
-        raise ValueError(
-            "lmcache_offload does not support GDN/linear-attention models "
-            f"(model_type={model_type!r}; e.g. "
-            "Qwen3-Next, Qwen3.5). These carry a per-request recurrent state "
-            "that no offload layout owns a tier for -- restoring their KV "
-            "prefix while that state is stale is silent wrong output. Disable "
-            "offload for this model, or use a state-owning layout once one "
-            "exists for it (kimi_k3 owns only the kimi_linear family)."
-        )
+        return "qwen"
     return "dense"
 
 
@@ -287,6 +280,48 @@ def snapshot_page_hf_geometry(hf: object) -> dict[str, Any]:
     so both hash the same values even after a worker mutates `hf_config`.
     """
     return _stable_hf_geometry(hf)
+
+
+# hf_config fields that set how an attention layer encodes K and V on their way
+# into its cache: the same tokens' KV bytes differ when any of them does, at the
+# same geometry and weights. They are the rotary embedding K is cached with,
+# under every name a model reads it by (MiMo-V2's sliding-window layers have a
+# base of their own, `swa_rope_theta`), and the scale MiMo-V2 multiplies V by
+# (`attention_value_scale`).
+_HF_KV_ENCODING_FIELDS = (
+    "rope_parameters",
+    "rope_scaling",
+    "rope_theta",
+    "swa_rope_theta",
+    "partial_rotary_factor",
+    "rotary_dim",
+    "rope_interleave",
+    "indexer_rope_interleave",
+    "max_position_embeddings",
+    "original_max_position_embeddings",
+    "attention_value_scale",
+)
+
+
+def snapshot_kv_encoding(hf: object) -> str:
+    """How ``hf`` (and its text config) encodes K and V, as canonical JSON.
+
+    Taken once at config time, as the geometry is: a worker changes these
+    settings while it builds the model (``llama.py`` adds
+    ``original_max_position_embeddings`` to ``rope_parameters``), which would
+    give it another namespace than its scheduler's. Never raises, since
+    `Config` takes it for every KV transfer config: a value JSON cannot hold is
+    spelled by ``str``.
+    """
+    fields: dict[str, Any] = {
+        name: getattr(hf, name, None) for name in _HF_KV_ENCODING_FIELDS
+    }
+    text = getattr(hf, "text_config", None)
+    if text is not None and text is not hf:
+        fields["text_config"] = {
+            name: getattr(text, name, None) for name in _HF_KV_ENCODING_FIELDS
+        }
+    return json.dumps(fields, sort_keys=True, default=str)
 
 
 def build_page_namespace(
@@ -472,6 +507,39 @@ def lmcache_replica_world_size(config) -> int:
     return max(1, pp_size * tp_size)
 
 
+def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
+    """Reject lookup-server worker ids outside this replica-local world."""
+
+    world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    worker_ids = getattr(cfg, "lookup_server_worker_ids", None)
+    if worker_ids is None:
+        return
+    if not isinstance(worker_ids, (list, tuple)):
+        # Preserve the public configuration-error contract requested for invalid
+        # lookup scope values, rather than leaking Python container semantics.
+        raise ValueError(  # noqa: TRY004
+            "LMCache lookup_server_worker_ids must be a list or tuple of worker ids, "
+            f"got {type(worker_ids).__name__}"
+        )
+    if not worker_ids:
+        return
+    normalized = [
+        _strict_integer(f"LMCache lookup server worker id[{index}]", worker_id)
+        for index, worker_id in enumerate(worker_ids)
+    ]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must not contain duplicate worker ids; "
+            f"got {normalized}"
+        )
+    invalid = [worker_id for worker_id in normalized if worker_id >= world_size]
+    if invalid:
+        raise ValueError(
+            "LMCache lookup_server_worker_ids must be within the replica-local "
+            f"world [0, {world_size}); got {normalized}"
+        )
+
+
 def scale_cpu_size_for_pp(cfg, config) -> None:
     """Split the CPU offload budget across PP stages by layer count.
 
@@ -619,6 +687,7 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
     )
     chunk_size = _strict_integer("LMCache chunk size", cfg.chunk_size, minimum=1)
     world_size = _strict_integer("LMCache world size", world_size, minimum=1)
+    validate_lmcache_lookup_scope(cfg, world_size)
     worker_id = _strict_integer("LMCache worker id", worker_id)
     if worker_id >= world_size:
         raise ValueError("LMCache worker id must be within the world")

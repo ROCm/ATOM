@@ -259,6 +259,14 @@ class DeepseekV41DSpark(DSparkDraftModel):
             return
         metadata = forward.attn_metadata
         cache, step = metadata.cache, metadata.step
+        plan = step.replay
+        if plan is not None:
+            # A replayed forward ran the decoder, whose rows these come from,
+            # on its tail alone: the draft's window takes the same rows.
+            if plan.tail is None:
+                return
+            rows, step = plan.tail_rows, plan.tail
+            aux_concat, positions = aux_concat[rows], positions[rows]
         # The forward's own width, padding included, because that is what the
         # target just ran and what these buffers therefore hold. A padding row
         # belongs to a zero-length request in `cu_seqlens_q`, so it is
@@ -596,20 +604,24 @@ class DeepseekV41DSpark(DSparkDraftModel):
         base_logits = tgemm.mm(normed, head.weight).view(B, T, -1)  # [B, T, V/tp]
         tp_group = get_tp_group()
         use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
-        out_ids = anchor_ids.new_empty(B, T + 1)
-        out_ids[:, 0] = anchor_ids
-        markov_embeds = [
+        # Position k's id lands in column k and is position k + 1's previous
+        # id; position 0 reads the anchors where they are, not a copy of them.
+        out_ids = anchor_ids.new_empty(B, T)
+        # Each step writes its W1[x] rows into its column of this block, so
+        # the confidence head reads them without a stack.
+        markov_w1 = last.markov_head.markov_w1.weight
+        markov_embeds = markov_w1.new_empty(B, T, markov_w1.shape[1])
+        for k in range(T):
             dspark_markov_argmax_tp(
                 base_logits[:, k],
-                out_ids[:, k],
+                anchor_ids if k == 0 else out_ids[:, k - 1],
                 last.markov_head.markov_w1.weight,
                 last.markov_head.markov_w2.weight,
-                out_ids[:, k + 1],
+                out_ids[:, k],
                 head.vocab_start_idx,
                 tp_group,
                 use_custom=use_custom,
+                embed_out=markov_embeds[:, k],
             )
-            for k in range(T)
-        ]
-        confidence = last.confidence_head(hc_hidden, torch.stack(markov_embeds, dim=1))
-        return out_ids[:, 1:], confidence
+        confidence = last.confidence_head(hc_hidden, markov_embeds)
+        return out_ids, confidence

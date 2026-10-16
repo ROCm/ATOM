@@ -664,7 +664,7 @@ jobs:
           ARG GPU_ARCH
           ARG AITER_REPO
           ARG AITER_COMMIT
-          RUN pip install -U lm-eval[api]
+          RUN pip install -U "lm-eval[api]" "datasets==5.0.0"
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
           RUN pip show hf_transfer || true

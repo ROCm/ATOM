@@ -24,14 +24,15 @@ DIAG = 1 << 24
 # per build: its builder, ABI, base key and one other value per field
 BUILDS = {
     "k1": (
-        k1.build_attn_pre, k1.ABI, k1.AttnPreBuild(tokens=6),
-        {"tokens": 12, "fold": False, "feeds_index": True, "index_fp4": True,
-         "aux": True, "tp": 2, "timeline": True, "diag_off": DIAG},
+        k1.build_attn_pre, k1.ABI, k1.AttnPreBuild(tokens=12),
+        {"tokens": 24, "fold": False, "feeds_index": True, "index_fp4": True,
+         "aux": True, "tp": 2, "timeline": True, "diag_off": DIAG,
+         "tok_par": True},
     ),
     "k2a": (
-        k2a.build_attn_post, k2a.ABI, k2a.AttnPostBuild(tokens=6),
-        {"tokens": 12, "index_bound_max": 65536, "index_fp4": True, "tp": 2,
-         "timeline": True, "diag_off": DIAG},
+        k2a.build_attn_post, k2a.ABI, k2a.AttnPostBuild(tokens=12),
+        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "tp": 2,
+         "timeline": True, "diag_off": DIAG, "tok_par": True},
     ),
     "k2b": (
         k2b.build_moe, k2b.ABI, MoeBuild(tokens=6),
@@ -39,9 +40,10 @@ BUILDS = {
          "diag_off": DIAG, "ug_groups": 1},
     ),
     "k2": (
-        k2.build_layer_post, k2.ABI, k2.LayerPostBuild(tokens=6),
-        {"tokens": 12, "index_bound_max": 65536, "index_fp4": True, "experts": 128,
-         "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1},
+        k2.build_layer_post, k2.ABI, k2.LayerPostBuild(tokens=12),
+        {"tokens": 24, "index_bound_max": 65536, "index_fp4": True, "experts": 128,
+         "topk": 3, "tp": 2, "timeline": True, "diag_off": DIAG, "ug_groups": 1,
+         "tok_par": True},
     ),
 }  # fmt: skip
 CASES = [(b, f) for b, (_, _, _, other) in BUILDS.items() for f in sorted(other)]

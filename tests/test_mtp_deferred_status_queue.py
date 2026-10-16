@@ -292,6 +292,33 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
     assert ModelRunner._producer_graph_shapes(producer) is None
 
 
+@pytest.mark.parametrize(
+    ("is_pd_producer", "drafter", "is_prefill", "is_dummy_run", "expected"),
+    [
+        (False, True, False, False, True),
+        # The producer's decode surfaces a deferred T0 at q=1: no drafts, so a
+        # rejection pass would select over zero target rows.
+        (True, True, False, False, False),
+        (False, True, True, False, False),
+        (False, True, False, True, False),
+        (True, True, False, True, False),
+        (False, False, False, False, False),
+    ],
+)
+def test_only_a_drafting_decode_verifies(
+    is_pd_producer, drafter, is_prefill, is_dummy_run, expected
+):
+    """Both the spec-decode metadata and its packed indices follow this
+    predicate, so a producer step neither scores nor publishes drafts."""
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
+    if drafter:
+        runner.drafter = SimpleNamespace(mtp_k=3)
+    batch = SimpleNamespace(is_dummy_run=is_dummy_run)
+
+    assert ModelRunner._verifies_drafts(runner, batch, is_prefill) is expected
+
+
 def test_middle_prefills_preserve_status_until_mixed_final_batch():
     processor = _processor()
 
@@ -314,7 +341,9 @@ def test_middle_prefills_preserve_status_until_mixed_final_batch():
     np.testing.assert_array_equal(processor.prev_bonus_num, [1])
 
 
-def test_deferred_decode_returns_the_flat_width_it_staged():
+def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
+    """A deferred-output processor whose next decode admits `new_curr`."""
+    bs = len(cu_seqlens_q) - 1
     processor = object.__new__(tokenIDProcessor)
     processor.input_ids = SimpleNamespace(
         np=np.zeros(16, dtype=np.int32),
@@ -322,9 +351,9 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         copy_to_gpu=mock.Mock(),
     )
     processor.decode_src = SimpleNamespace(
-        np=np.zeros(2, dtype=np.int32),
-        gpu=np.zeros(2, dtype=np.int32),
-        copy_to_gpu=mock.Mock(return_value=np.zeros(2, dtype=np.int32)),
+        np=np.zeros(bs, dtype=np.int32),
+        gpu=np.zeros(bs, dtype=np.int32),
+        copy_to_gpu=mock.Mock(return_value=np.zeros(bs, dtype=np.int32)),
     )
     input_ids_group = SimpleNamespace(
         counts=[None, None],
@@ -338,9 +367,9 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
-    processor.prev_token_ids = np.zeros(2, dtype=np.int32)
+    processor.pending_mtp_status_copies = []
+    processor.prev_token_ids = np.zeros(bs, dtype=np.int32)
     processor.draft_token_ids = None
-    cu_seqlens_q = np.array([0, 4, 8], dtype=np.int32)
     forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}
     processor.runner = SimpleNamespace(
         enforce_eager=True,
@@ -362,8 +391,15 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         return_value=SimpleNamespace(
             deferred_curr=np.array([], dtype=np.int32),
             deferred_prev=np.array([], dtype=np.int32),
-            new_curr=np.array([0, 1], dtype=np.int32),
+            new_curr=np.array(new_curr, dtype=np.int32),
         )
+    )
+    return processor, input_ids_group
+
+
+def test_deferred_decode_returns_the_flat_width_it_staged():
+    processor, input_ids_group = _deferred_processor(
+        np.array([0, 4, 8], dtype=np.int32), [0, 1]
     )
 
     batch = SimpleNamespace(
@@ -376,6 +412,7 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
         total_seqs_num_decode=2,
         num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
         req_ids=[10, 11],
+        num_spec_step=3,
         scheduled_spec_decode_tokens=np.arange(6, dtype=np.int32).reshape(2, 3),
         num_rejected=np.zeros(2, dtype=np.int32),
         num_bonus=np.zeros(2, dtype=np.int32),
@@ -390,3 +427,35 @@ def test_deferred_decode_returns_the_flat_width_it_staged():
     assert result.shape == (8,)
     assert input_ids_group.counts == [8, 2]
     fill_ids.assert_called_once()
+    # Both requests are new, so their draft columns come from the draft table,
+    # not from `scheduled_tokens` (which would leave 1-3 and 5-7 here).
+    np.testing.assert_array_equal(processor.input_ids.np[1:4], [0, 1, 2])
+    np.testing.assert_array_equal(processor.input_ids.np[5:8], [3, 4, 5])
+
+
+def test_a_producer_dp_dummy_stages_without_a_draft_table():
+    """A producer keeps `use_spec` (its drafter writes context KV) but its DP
+    dummy is q=1 with `num_spec_step=0`, so the batch has no
+    `scheduled_spec_decode_tokens`. The dummy is always a new sequence; reading
+    the draft table for it raised AttributeError on every idle DPA rank."""
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.drafter = SimpleNamespace(mtp_k=3)
+    runner.tokenID_processor = SimpleNamespace(is_pd_producer=True)
+    runner.block_size = 16
+    runner.label = "runner"
+    seen = []
+    runner.forward = seen.append
+    ModelRunner.dummy_execution(runner)
+    (batch,) = seen
+    assert batch.num_spec_step == 0
+    spec = getattr(batch, "scheduled_spec_decode_tokens", None)
+    assert spec is None or spec.size == 0
+
+    processor, input_ids_group = _deferred_processor(
+        np.array([0, 1], dtype=np.int32), [0]
+    )
+    with mock.patch("atom.model_engine.model_runner.fill_deferred_decode_ids"):
+        result = tokenIDProcessor.prepare_input_ids(processor, batch, 1)
+
+    assert result.shape == (1,)
+    assert input_ids_group.counts == [1, 1]

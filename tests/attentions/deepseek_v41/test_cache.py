@@ -21,8 +21,65 @@ from atom.model_ops.attentions.deepseek_v41.cache import (
     PagedAttentionCache,
 )
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
+from atom.model_ops.v4_kernels import make_compress_plans
 from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
+from atom.utils import CpuGpuBuffer
 from tests.attentions.deepseek_v41.helpers import geometry
+
+
+def carried(geo, entry):
+    """The bytes of a STATE entry a checkpoint image holds, in image order."""
+    return torch.cat([entry[at : at + n] for at, n in geo.checkpoint_image_ranges])
+
+
+def checkpoint_spec(geo):
+    return PagedStateCheckpointSpec(
+        page_unit_bytes=geo.paged_bytes,
+        slot_bytes=geo.state_bytes,
+        layout_id=geo.layout_id,
+        image_bytes=geo.checkpoint_image_bytes,
+    )
+
+
+def window_lens(geo, *, start, extend):
+    """Each compression group's `window_len`: its leading tokens read from the
+    compressor tails rather than from this forward."""
+    buffers = {
+        ratio: {
+            "compress": CpuGpuBuffer(
+                extend + 1, 4, dtype=torch.int32, device="cpu", pin_memory=False
+            ),
+            "write": CpuGpuBuffer(
+                extend + 1, 4, dtype=torch.int32, device="cpu", pin_memory=False
+            ),
+        }
+        for ratio, _ in geo.compress_ratios
+    }
+    plans = make_compress_plans(
+        np.asarray([extend], dtype=np.int32),
+        np.asarray([start + extend], dtype=np.int32),
+        geo.compress_ratios,
+        plan_buffers=buffers,
+        extra_write=0,
+    )
+    # No host plan is a forward that closes no group.
+    return {
+        ratio: np.zeros(0) if rows is None else rows[:, 3]
+        for ratio, rows in ((r, p.compress_plan_cpu) for r, p in plans.items())
+    }
+
+
+@pytest.mark.parametrize("extend", [1, 2, 3, 64])
+def test_a_resume_at_a_page_boundary_reads_no_compressor_tail(small_config, extend):
+    """Checkpoints leave the compressor tails out, which holds only while no
+    group straddles a PAGE boundary; a forward starting off one does read them."""
+    geo = geometry(small_config)
+    assert 2 in dict(geo.compress_ratios)
+    for start in (geo.block_size, 3 * geo.block_size):
+        for lens in window_lens(geo, start=start, extend=extend).values():
+            assert not lens.any()
+    if extend > 1:
+        assert window_lens(geo, start=geo.block_size + 1, extend=extend)[2].any()
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -36,9 +93,7 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
     # plane puts 32 tokens in a PAGE, and the fixture's own 4-token window
     # leaves a state entry that fits in a single one.
     geo = replace(geometry(small_config), packed=packed, window_size=32)
-    spec = PagedStateCheckpointSpec(
-        geo.paged_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
-    )
+    spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     # Enough PAGEs for the interleaved unit ids below, which is what makes the
     # image land in units that are not consecutive.
@@ -59,19 +114,25 @@ def test_checkpoint_fork_rollback_relocation_and_slot_reuse(
         )
     )
     cache.cursor[2] = torch.tensor([3, 19, -1, 27], device=device)
-    original = copies.entry(2).clone()
+    original = carried(geo, copies.entry(2))
     units = tuple(range(1, 2 * spec.units_per_checkpoint, 2))
     store = CheckpointStoreOp(2, units, spec.image_bytes, spec.layout_id)
     restore = CheckpointRestoreOp(1, units, spec.image_bytes, spec.layout_id)
     copies.execute([store], [restore])
-    torch.testing.assert_close(copies.entry(1), original, rtol=0, atol=0)
+    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
     cache.state_bytes[1].fill_(93)  # rejected / cancelled tentative suffix
     copies.execute([], [restore])
-    torch.testing.assert_close(copies.entry(1), original, rtol=0, atol=0)
+    torch.testing.assert_close(carried(geo, copies.entry(1)), original, rtol=0, atol=0)
+    # The compressor tails are not in the image: a restore leaves the slot's own.
+    image_bytes = torch.zeros(geo.state_bytes, dtype=torch.bool, device=device)
+    for at, n in geo.checkpoint_image_ranges:
+        image_bytes[at : at + n] = True
+    assert (copies.entry(1)[~image_bytes] == 93).all()
+    restored = copies.entry(1).clone()
     cache.state_bytes[0].fill_(71)
     old_zero = copies.entry(0).clone()
     copies.relocate([(1, 0), (0, 1)])
-    torch.testing.assert_close(copies.entry(0), original, rtol=0, atol=0)
+    torch.testing.assert_close(copies.entry(0), restored, rtol=0, atol=0)
     torch.testing.assert_close(copies.entry(1), old_zero, rtol=0, atol=0)
     span = PagedRequest(27, 3, 0, 1, 0, (32, 33))
     step = begin_step(cache, [span])
@@ -115,9 +176,7 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     )
 
     geo = replace(geometry(small_config), packed=packed, window_size=32)
-    spec = PagedStateCheckpointSpec(
-        geo.paged_bytes, geo.state_bytes, geo.layout_id, geo.state_bytes
-    )
+    spec = checkpoint_spec(geo)
     assert spec.units_per_checkpoint > 1
     pages = max(40, 2 * spec.units_per_checkpoint)
     cache = PagedAttentionCache(geo, pages, 4, "cpu")
@@ -163,7 +222,10 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
         ]
     )
     torch.testing.assert_close(
-        image, cache.state_bytes[2][: spec.image_bytes], rtol=0, atol=0
+        image,
+        carried(geo, cache.state_bytes[2]),
+        rtol=0,
+        atol=0,
     )
 
     builder.model_runner.config.kv_transfer_config = None
@@ -402,7 +464,9 @@ def test_graph_plan_sentinel_rows_do_not_write_to_live_pages():
         geo.compress_ratios,
         plan_buffers={
             2: {
-                name: CpuGpuBuffer(8, 4, dtype=torch.int32, device="cpu")
+                name: CpuGpuBuffer(
+                    8, 4, dtype=torch.int32, device="cpu", pin_memory=False
+                )
                 for name in ("compress", "write")
             }
         },
@@ -465,7 +529,7 @@ def test_key_rope_positions_span_the_grid_and_carry_its_sentinels():
 
     def build(with_key_rope):
         buffers = {
-            name: CpuGpuBuffer(8, 4, dtype=torch.int32, device="cpu")
+            name: CpuGpuBuffer(8, 4, dtype=torch.int32, device="cpu", pin_memory=False)
             for name in ("compress", "write")
         }
         if with_key_rope:
@@ -540,6 +604,54 @@ def test_a_deferred_probe_skips_the_slot_its_own_step_resets(small_config, devic
     assert cache.cursor[0, 0] == 0
     # The probe carries slot 0's pre-reset row; position 0 is what excludes it.
     cache.prepare_state(begin_step(cache, [replace(fresh, request_id=32)]))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("histories", [True, False])
+def test_a_forward_recomputing_below_its_state_keeps_it(
+    small_config, device, histories
+):
+    """A forward starting below the point its state is at (decoder bounded
+    replay backing off): the slot must be at that point, keeps its state, and
+    its cursor's history starts over from the forward's own start; a rebuild
+    from the same start (encoder replay: no state came along) resets it."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("ROCm GPU required")
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, device)
+    cache.state_bytes[0].fill_(5)
+    cache.cursor[0] = torch.tensor([48, 19, -1, 27], device=device)
+    kept = [cache.state.view(name)[:, 0].clone() for name in ("window", "compress_kv")]
+    request = PagedRequest(41, 32, 0, 20, 0, (0, 1))
+    start = np.asarray([[7, 8, 9]], np.int64)
+
+    def prepare(cached_until):
+        step = begin_step(
+            cache,
+            [request],
+            floors=np.asarray([32], np.int32),
+            cached_until=np.asarray([cached_until], np.int32),
+            start_histories=start,
+        )
+        return cache.prepare_state(step, histories=histories)
+
+    restored = prepare(48)
+    if histories:
+        np.testing.assert_array_equal(restored, start)
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
+    for name, before in zip(("window", "compress_kv"), kept):
+        assert torch.equal(cache.state.view(name)[:, 0], before)
+    # where the slot is not at the point the forward resumes from
+    cache.cursor[0, 0] = 40
+    with pytest.raises(ValueError, match="needs state at 48"):
+        prepare(48)
+        cache.prepare_state(begin_step(cache, [replace(request, request_id=42)]))
+    # a rebuild: nothing kept below its start, the slot starts over there
+    cache.cursor[0] = torch.tensor([91, 19, -1, 27], device=device)
+    prepare(0)
+    for name in ("window", "compress_kv"):
+        assert cache.state.view(name)[:, 0].count_nonzero() == 0
+    assert cache.cursor[0, 1:].tolist() == [7, 8, 9]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

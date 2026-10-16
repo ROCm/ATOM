@@ -47,6 +47,24 @@ logger = logging.getLogger("atom")
 NATIVE_STATE_MP_STORE_CHANNEL = "native_state_mp_store"
 
 
+def stores_state_images(replay_tokens: int) -> bool:
+    """Whether native-state saves carry a state image: only without a bounded
+    replay (`replay_tokens`, 0 when off).
+
+    With one (DeepSeek-V4, ATOM_DSV4_STATE_REPLAY) the replay rebuilds the
+    state from the PAGE KV, so saves store that alone, the layout registers no
+    image group, and LMCache's own hit is the PAGE KV's extent. Without one a
+    save must carry its image: nothing could resume from PAGE alone, and for a
+    state with no bounded receptive field (Kimi-K3's KDA, GDN) no replay could
+    stand in for it. The scheduler and every worker ask with the one replay
+    length the engine runs, `Config.state_replay_tokens` (set once on the
+    engine's config, which a `multi` connector copies to its offload leg as
+    is), and register under the namespace their answer names
+    (`_model_namespace`).
+    """
+    return not replay_tokens
+
+
 def require_native_state_server(adapter: Any, config: Any) -> None:
     """Validate native transfer geometry shared with the LMCache server."""
     configured_chunk = int(
@@ -118,7 +136,12 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 "replicated"
             )
         self._is_kv_writer = rank % requested_replication == 0
-        adapter = _make_worker_adapter(self._config, rank, checkpoint_spec=spec)
+        images = stores_state_images(
+            int(getattr(self._config, "state_replay_tokens", 0) or 0)
+        )
+        adapter = _make_worker_adapter(
+            self._config, rank, checkpoint_spec=spec, images=images
+        )
         try:
             require_native_state_server(adapter, self._config)
             chunk_size = int(adapter.lmcache_tokens_per_chunk)
@@ -127,6 +150,7 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 block_size=self.block_size,
                 chunk_size=chunk_size,
                 num_blocks=num_blocks,
+                images=images,
             )
             adapter.register_kv_caches(
                 {
@@ -154,9 +178,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         if callable(reserve):
             reserve(self._restore_descriptor_slots)
         logger.info(
-            "LMCache MP native state registered rank=%d native_image=%d "
+            "LMCache MP native state registered rank=%d images=%s native_image=%d "
             "units=%d groups=%d chunk=%d",
             rank,
+            images,
             spec.image_bytes,
             spec.units_per_checkpoint,
             len(layout.kernel_groups),
@@ -182,6 +207,18 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             )
         if state.boundary_tokens != end or len(req.token_ids) != end:
             raise ValueError("native STATE and PAGE endpoints must match")
+        count = (end - start) // self.chunk_size
+        if state.kv_only != (not self._native_layout.images):
+            # PAGE alone exactly when the layout registered no image group: the
+            # scheduler and this worker asked `stores_state_images` the same.
+            raise ValueError(
+                "a KV-only native transfer needs a layout without images, and "
+                "only it"
+            )
+        if state.kv_only:
+            if state.unit_ids or state.destination_slot is not None:
+                raise ValueError("a KV-only native transfer moves no image")
+            return [self._block_slice(req, start, end)]
         if loading and state.destination_slot is None:
             raise ValueError("native-state restore requires a destination SLOT")
         if not loading and state.destination_slot is not None:
@@ -190,7 +227,6 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
         pages = self._block_slice(req, start, end)
         if set(pages) & set(unit_ids):
             raise ValueError("checkpoint PAGE units must not overlap KV PAGE blocks")
-        count = (end - start) // self.chunk_size
         # Earlier chunks have PAGE only. A boundary image is indivisible: all
         # its ordinal groups are present at exactly the same final chunk.
         return [pages] + [[-1] * (count - 1) + [unit] for unit in unit_ids]
@@ -432,6 +468,10 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
                 )
                 return False
             if result is not True:
+                return True
+            if pending.request.native_state.kv_only:
+                # PAGE alone: nothing to restore; the replay rebuilds the state.
+                pending.restore_succeeded = True
                 return True
             try:
                 if not self._begin_restore(pending):

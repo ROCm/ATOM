@@ -21,6 +21,7 @@ def _hash(**overrides):
         "hf_config": SimpleNamespace(),
         "max_model_len": 4096,
         "max_num_seqs": 256,
+        "speculative_config": None,
     }
     fields.update(overrides)
     return Config.compute_hash(SimpleNamespace(**fields))
