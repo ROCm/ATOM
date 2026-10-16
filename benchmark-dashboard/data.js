@@ -1,60 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792154995224,
+  "lastUpdate": 1792155193025,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "c61fbfb0e5fabd478978ba04801fb80028240176",
-          "message": "perf(minimax-m3): route the sparse selection to the kernel its row count wins on (#2205)\n\n* perf(minimax-m3): run the sparse selection on ASM where the shape pays for it\n\nM3 sparse attention ran every selection through the Gluon split-KV decode\nkernel. Both halves -- a decode's sequences and a prefill's per-token\n\"sequences\" -- feed the same compacted 16-page block table, so which kernel\nis right is a property of the row count, not of the caller.\n\nAbove ~32 rows the monolithic ASM kernel wins. 8192/1024 conc 64 goes\n26,514 -> 35,440 tok/s (+33.7%), 100k/10 conc 50 tp4 goes 39,862 -> 50,561\n(+26.8%), and attention falls 24.11s -> 7.56s on a trace. GSM8K 0.9447/0.9454\nand acceptance 72.45% both sit inside the n=3 alternating baseline.\n\nBelow that it loses: ASM is launch-bound at those sizes while split-KV still\ncovers the GPU. Measured 12.7/14.2us (ASM) against 9.4/10.4us (gluon) at 1/32\nrows, so those shapes keep the kernel they had. _gluon_one_pass_max_rows\nderives the floor from the CU count and aiter's own split cap instead of\nrestating a constant that could drift away from it.\n\nThe prefill half was avoiding a pa_fwd_asm \"maskless-fp8 NaN at the 256-token\nboundary\". 32768 rows over every causal length 1..2048 give zero NaN and cos\n0.9993 against gluon, so that avoidance is dropped.\n\nBoth entries now share one implementation, so the kernel choice and the gluon\nlaunch each exist once rather than twice. The decode entry's output is bitwise\nequal to calling that implementation directly, on both sides of the floor.\n\n* fix(quant): scale fp8 KV by the cache dtype's range, not a literal 240\n\nThe fused qk-norm/RoPE/cache-insert kernel divided by 240.0, the max of\ne4m3fnuz, while aiter.dtypes.fp8 on this build is e4m3fn with a max of 448.\nTake the range from the tensor the kernel stores into, so the scale and the\nstore that spends it cannot be set independently and disagree.\n\nQuality-neutral over a 6-run alternating GSM8K comparison (the two arms'\nintervals overlap completely); the value is that the two stop being two.",
-          "timestamp": "2026-09-12T06:55:01Z",
-          "url": "https://github.com/ROCm/ATOM/commit/c61fbfb0e5fabd478978ba04801fb80028240176"
-        },
-        "date": 1789246077516,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3-32B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8795,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620088437 | Threshold: 0.8 | BaselineModel: Qwen/Qwen3-32B-FP8 | BaselineNote: Adds max_gen_toks=1024 for the MI308 CI gsm8k path to avoid truncating Qwen3-32B reasoning output. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260911 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8939 | fewshot: 3 | Model: /models/Qwen/Qwen3-32B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.84,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620088437 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260911 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8271 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-PTPC-FP8 TP1 accuracy (GSM8K)",
-            "value": 0.8514,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620088437 | Threshold: 0.76 | BaselineModel: amd/Qwen3.5-35B-A3B-PTPC-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260911 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8355 | fewshot: 3 | Model: /models/amd/Qwen3.5-35B-A3B-PTPC-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
-            "value": 0.881,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620088437 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260911 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8643 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
-            "value": 0.8658,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34620088437 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.17-nightly_20260911 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8491 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -262801,6 +262749,34 @@ window.BENCHMARK_DATA = {
             "value": 0.8916,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38882524080 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610151507 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1622 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "id": "c25a7c732f14b11ecd3116967b687bbc91591940",
+          "message": "ci(atomesh): wait for the Spur job to turn RUNNING before srun dispatch\n\nSpur can start the batch script up to a minute before the controller\nmarks the job RUNNING. The dispatch srun then fails with \"job is not\nrunning (state: Pending)\", the batch exits, and the job later sits\nRUNNING with only the peer placeholders (jobs 8703/8713/8720/8730/8731).\nPoll scontrol while the job is PENDING or CONFIGURING, up to 10 min.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-16T12:41:31Z",
+          "url": "https://github.com/ROCm/ATOM/commit/c25a7c732f14b11ecd3116967b687bbc91591940"
+        },
+        "date": 1792155192223,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::Kimi-K3-MXFP4 mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark7 1048576/1024 c=16 perf point",
+            "value": 25.7803,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/38885664369 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P2D-TP8-DCP8-DSPARK7 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9648%2C%22cache_hit_tokens%22%3A309752832%2C%22cache_total_tokens%22%3A321057595%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A2290%2C%22concurrency%22%3A16%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark7%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A2%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3616.8311%2C%22e2el_ms%22%3A8207.5382%2C%22e2el_p90%22%3A19140.3076%2C%22e2el_p99%22%3A69751.4973%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A88767.6471%2C%22input_tput_per_gpu%22%3A3698.652%2C%22interactivity%22%3A55.327%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A2287%2C%22interactivity_p90_itl%22%3A119.2273%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A7.1571%2C%22itl_p90%22%3A8.3873%2C%22median_e2el_ms%22%3A3733.6916%2C%22median_itl_ms%22%3A6.988%2C%22median_tpot_ms%22%3A6.988%2C%22median_ttft_ms%22%3A777.5833%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A16%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A7%2C%22osl%22%3A1024%2C%22output_tput%22%3A618.7275%2C%22output_tput_per_gpu%22%3A25.7803%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.6309%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p2d-isl1048576-osl1024-conc16-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F38885664369%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-7%22%2C%22total_gpu%22%3A24%2C%22total_tput%22%3A89386.3746%2C%22tpot_ms%22%3A7.1571%2C%22tpot_p90%22%3A8.3873%2C%22tpot_p99%22%3A9.1279%2C%22tput_per_gpu%22%3A3724.4323%2C%22ttft_ms%22%3A1226.2719%2C%22ttft_p90%22%3A2094.2612%2C%22ttft_p99%22%3A8623.6469%7D"
           }
         ]
       }
