@@ -12,12 +12,16 @@ from atom.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5MoeConfig,
     Qwen3_5MoeForCausalLM as Qwen3_5MoeForCausalLMBase,
+    _apply_bf16_in_proj_mapping,
     detect_fused_expert_format,
     get_fused_expert_mapping,
     load_fused_expert_weights,
     maybe_prefix,
 )
-from atom.plugin.vllm.model_wrapper import ATOMForConditionalGeneration
+from atom.plugin.vllm.model_wrapper import (
+    ATOMForConditionalGeneration,
+    ATOMMoEForCausalLM,
+)
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -27,7 +31,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.models.interfaces import IsHybrid
+from vllm.model_executor.models.interfaces import IsHybrid, SupportsMRoPE
 from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration as vLLMQwen3_5,
     Qwen3_5MoeForConditionalGeneration as vLLMQwen3_5Moe,
@@ -41,6 +45,22 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+
+def _ssm_cache_dtype(vllm_config: VllmConfig) -> str:
+    # vLLM's mamba_ssm_cache_dtype defaults to "auto" and resolves to the model
+    # dtype. The Qwen3.5 family declares the state precision mamba_ssm_dtype in
+    # model checkpoints and it can differ from model dtype. If unset, use
+    # state dtype from model config otherwise respect the
+    # --mamba-ssm-cache-dtype flag.
+    cache_config = vllm_config.cache_config
+    if cache_config.mamba_ssm_cache_dtype != "auto":
+        return cache_config.mamba_ssm_cache_dtype
+    return getattr(
+        vllm_config.model_config.hf_text_config,
+        "mamba_ssm_dtype",
+        cache_config.mamba_ssm_cache_dtype,
+    )
 
 
 class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
@@ -57,8 +77,10 @@ class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
             speculative_config=speculative_config,
             prefix=prefix,
         )
-        self.model_config = atom_config.plugin_config.vllm_config.model_config
-        self.cache_config = atom_config.plugin_config.vllm_config.cache_config
+        vllm_config = atom_config.plugin_config.vllm_config
+        self.model_config = vllm_config.model_config
+        self.cache_config = vllm_config.cache_config
+        self.ssm_cache_dtype = _ssm_cache_dtype(vllm_config)
         self.tp_rank = get_tensor_model_parallel_rank()
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -69,7 +91,7 @@ class Qwen3_5GatedDeltaNetVllm(Qwen3_5GatedDeltaNet, MambaBase):
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
-            self.cache_config.mamba_ssm_cache_dtype,
+            self.ssm_cache_dtype,
         )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -99,13 +121,38 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoeForCausalLMBase):
-    def __init__(self, *args, **kwargs):
+    # Text-only Qwen3.5-family checkpoints (Qwen3.8) store weights under
+    # `model.`/`lm_head.` with no vision tower, so the module names line up
+    # with this class directly and no prefix rewrite is needed
+    # However, there are some packed remaps that ForConditionalGeneration
+    # carries but ForCausalLM does not.
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkv": ("in_proj_qkvz", (0, 1, 2)),
+        "in_proj_z": ("in_proj_qkvz", 3),
+        "in_proj_b": ("in_proj_ba", 0),
+        "in_proj_a": ("in_proj_ba", 1),
+        ".gate.": (".gate.", 0),
+        "shared_expert_gate": ("gate", 1),
+    }
+
+    def __init__(self, atom_config: Config, prefix: str = ""):
         original_gdn_cls = qwen3_5_base.Qwen3_5GatedDeltaNet
         qwen3_5_base.Qwen3_5GatedDeltaNet = Qwen3_5GatedDeltaNetVllm
         try:
-            super().__init__(*args, **kwargs)
+            super().__init__(atom_config=atom_config, prefix=prefix)
         finally:
             qwen3_5_base.Qwen3_5GatedDeltaNet = original_gdn_cls
+        # A BF16 checkpoint fuses the GDN input projections into one
+        # `in_proj_qkvzba`; quantized ones keep qkvz and ba apart.
+        self.packed_modules_mapping = _apply_bf16_in_proj_mapping(
+            dict(self.packed_modules_mapping), atom_config
+        )
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -359,7 +406,7 @@ class Qwen3_5ForConditionalGeneration(ATOMForConditionalGeneration, IsHybrid):
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
-            vllm_config.cache_config.mamba_ssm_cache_dtype,
+            _ssm_cache_dtype(vllm_config),
         )
 
     @classmethod
@@ -403,5 +450,79 @@ class Qwen3_5ForConditionalGeneration(ATOMForConditionalGeneration, IsHybrid):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5ForConditionalGeneration, IsHybrid):
+    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        return self.model.get_expert_mapping()
+
+
+class Qwen3_5MoeForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid, SupportsMRoPE):
+    """vLLM entry point for text-only Qwen3.5-family MoE checkpoints.
+
+    Qwen3.8-2.4T-A95B declares `Qwen3_5MoeForCausalLM`: the same hybrid
+    (full attention + Gated DeltaNet) MoE backbone as Qwen3.5-MoE, but with a
+    flat text config and no vision tower, so it needs the plain causal-LM
+    wrapper rather than the `ForConditionalGeneration` one.
+
+    The checkpoint keeps the family's `mrope_section` rope parameters, so the
+    rotary embedding is still M-RoPE and vLLM's runner asks every request for
+    3-D positions. Text-only prompts make all three T/H/W sections share the
+    token index, which is what `get_mrope_input_positions` below returns.
+    """
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list,
+    ) -> tuple[torch.Tensor, int]:
+        if mm_features:
+            raise NotImplementedError(
+                "Qwen3_5MoeForCausalLM is the text-only entry point for the "
+                "Qwen3.5 family; serve image/video through "
+                "Qwen3_5MoeForConditionalGeneration instead."
+            )
+        num_tokens = len(input_tokens)
+        positions = torch.arange(num_tokens, dtype=torch.long).unsqueeze(0).repeat(3, 1)
+        # Every section advances with the token index, so decode positions need
+        # no correction against the prompt length.
+        return positions, 0
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(
+        cls,
+        vllm_config: VllmConfig,
+    ) -> tuple[torch.dtype, torch.dtype]:
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            _ssm_cache_dtype(vllm_config),
+        )
+
+    @classmethod
+    def get_mamba_state_shape_from_config(
+        cls, vllm_config: VllmConfig
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        parallel_config = vllm_config.parallel_config
+        hf_config = vllm_config.model_config.hf_text_config
+        tp_size = parallel_config.tensor_parallel_size
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            tp_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
