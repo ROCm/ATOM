@@ -309,6 +309,18 @@ def patch_v41_speculative_commit() -> int:
                     )
                 count = int(num_rejected.shape[0])
                 v41_commit_speculative_state(_anchors(num_rejected, starts, count))
+                # The step's checkpoint stores waited for this commit: the
+                # copier validates every slot against the cache's committed
+                # cursor, so one issued from `execute_model` (before the
+                # sampler ran) raises instead of storing. Flushing here is the
+                # speculative path's equivalent of that site.
+                from atom.plugin.vllm.paged_state_checkpoint import (
+                    _workers,
+                    flush_worker,
+                )
+
+                for _worker in list(_workers.values()):
+                    flush_worker(_worker)
             # Forwarded by keyword, so a caller that omitted the optional
             # argument reaches the original having omitted it too rather than
             # being given a None this wrapper invented.

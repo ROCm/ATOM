@@ -696,8 +696,20 @@ def install_v41_store_sites() -> int:
             # of the following boundary -- planned 2560 stored at cursor 3072,
             # planned 3072 at 3584, planned 3584 at 3630 -- and a later hit on
             # one of those boundaries got back a state one checkpoint ahead.
-            for worker in list(_workers.values()):
-                flush_worker(worker)
+            # ... unless a speculative step is still outstanding. DSpark's
+            # accepted prefix is committed by `postprocess_sampled`, which
+            # runs after this returns, and a store issued before that commit
+            # reaches `StateCopies._validate` -> `cache.require_committed()`
+            # and raises "Commit the accepted prefix before reusing or
+            # checkpointing state". The speculative wrapper flushes instead,
+            # immediately after it commits.
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                v41_speculative_step_is_pending,
+            )
+
+            if not v41_speculative_step_is_pending():
+                for worker in list(_workers.values()):
+                    flush_worker(worker)
             return output
 
         execute_model._atom_v41_store_site = True
