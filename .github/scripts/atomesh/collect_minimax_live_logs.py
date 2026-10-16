@@ -50,6 +50,7 @@ def scheduler_state(target):
         "SPUR_CONTROLLER_ADDR"
     ):
         command += ["--controller", os.environ["SPUR_CONTROLLER_ADDR"]]
+    base_command = command.copy()
     command += ["--noheader", "--format=%i|%j|%T|%M|%R|%N"]
     try:
         result = subprocess.run(
@@ -60,11 +61,44 @@ def scheduler_state(target):
             fields = line.split("|")
             if len(fields) >= 6 and fields[1].strip().startswith(f"{CASE}-{target}-"):
                 rows.append(line)
-        return {
+        state = {
             "returncode": result.returncode,
             "rows": rows,
             "stderr": result.stderr[-4096:],
         }
+        pending = [
+            line.split("|")[0].strip()
+            for line in rows
+            if line.split("|")[2].strip() == "PENDING"
+        ]
+        pending = [job for job in pending if re.fullmatch(r"[0-9]+", job)]
+        if pending:
+            try:
+                estimate = subprocess.run(
+                    base_command
+                    + [
+                        "--start",
+                        "--noheader",
+                        "--jobs=" + ",".join(pending),
+                        "--format=%i|%S|%R|%N",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    check=False,
+                )
+                state["start_estimate"] = {
+                    "returncode": estimate.returncode,
+                    "rows": [
+                        line
+                        for line in estimate.stdout.splitlines()
+                        if line.split("|")[0].strip() in pending
+                    ],
+                    "stderr": estimate.stderr[-4096:],
+                }
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                state["start_estimate"] = {"error": str(exc)}
+        return state
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"error": str(exc)}
 
