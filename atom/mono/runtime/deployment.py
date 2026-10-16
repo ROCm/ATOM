@@ -7,6 +7,7 @@ a model's own list extends."""
 from atom.config import CompilationLevel
 from atom.mono.plan.shard import shard_refusal
 from atom.plugin.prepare import is_sglang, is_vllm
+from atom.utils import resolve_obj_by_qualname
 
 
 def _requires_piecewise_compilation(atom_config) -> bool:
@@ -22,6 +23,38 @@ def _requires_piecewise_compilation(atom_config) -> bool:
         getattr(atom_config, "compilation_config", None), "cudagraph_mode", None
     )
     return bool(cudagraph_mode) and cudagraph_mode.requires_piecewise_compilation()
+
+
+def _takes_weight_updates(atom_config) -> bool:
+    """Whether this deployment's model runner can be handed a rollout weight
+    sync (``WeightUpdaterMixin``: ``RLHFModelRunner``, not the base runner).
+
+    A sync rewrites the model's parameter buffers IN PLACE -- deliberately, so
+    a captured decode graph keeps its addresses (`weight_updater`'s
+    `_await_readers_of`). Mono does not read every weight in place: GLM-5.2
+    requantizes the attention projections at bind time and K3 dequantizes the
+    latent MoE, and both cache the result for the life of the runner
+    (`glm52/mono/weights.py`'s `layer_weights`, kept in `_weights` /
+    `_prepared`). After a sync those copies are the OLD weights, nothing
+    changes address, and no shape or dtype check can notice -- the server goes
+    on answering, wrongly.
+
+    Invalidating the copies from `weight_updater` is the real fix. Until that
+    lands with numerics behind it, the two features are kept apart so they can
+    never silently combine.
+
+    Resolving the qualname is free in a live deployment: `engine_core` has
+    already imported that class to construct the runner. A name that will not
+    resolve is treated as updatable, because this refusal only costs speed
+    while guessing wrong costs correctness.
+    """
+    qualname = getattr(atom_config, "runner_qualname", None)
+    if not qualname:
+        return False
+    try:
+        return hasattr(resolve_obj_by_qualname(qualname), "update_weights")
+    except Exception:  # noqa: BLE001 - an unresolvable runner is not provably safe
+        return True
 
 
 def common_refusals(
@@ -53,6 +86,11 @@ def common_refusals(
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
+        (
+            not _takes_weight_updates(atom_config),
+            "rollout weight updates (mono caches weight copies a sync "
+            "would not reach)",
+        ),
         # `model_runner.py` wraps the model -- and the drafter, which K3 mono
         # needs -- in `torch.compile(fullgraph=True)` at this level and only
         # this level (levels 2 and 3 go through the decorator instead, and

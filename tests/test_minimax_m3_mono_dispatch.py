@@ -301,3 +301,47 @@ def test_disabled_mono_never_takes_a_step(monkeypatch):
     mono = _mono(monkeypatch, _forward_context())
     mono._mono.enabled = False
     assert not mono.supports(*_step(1), None, None)
+
+
+# --- rollout weight sync -----------------------------------------------------
+# A weight sync rewrites parameter buffers in place, so nothing moves address
+# and no shape or dtype check fires; the mono binds that cache a requantized or
+# dequantized copy go on serving the pre-sync weights. Until `weight_updater`
+# invalidates those copies, a runner that can take a sync must not get mono.
+
+
+class _UpdatingRunner:
+    def update_weights(self, named_tensors, clear_kv_cache=True):
+        raise NotImplementedError
+
+
+class _PlainRunner:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("resolved", "refused"),
+    [(_PlainRunner, False), (_UpdatingRunner, True)],
+)
+def test_a_runner_that_takes_weight_updates_is_refused(
+    native, monkeypatch, resolved, refused
+):
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", lambda _: resolved)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="a.runner.Class"))
+    assert (why is not None and "rollout weight updates" in why) is refused
+
+
+def test_an_unresolvable_runner_is_refused(native, monkeypatch):
+    """Guessing wrong costs correctness; refusing only costs speed."""
+
+    def _boom(_):
+        raise ImportError("no such module")
+
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", _boom)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="gone.Runner"))
+    assert "rollout weight updates" in why
+
+
+def test_a_config_without_a_runner_qualname_is_unaffected(native):
+    """SGLang builds its own `atom_config` and sets no runner."""
+    assert dispatch._config_refusal(_atom_config()) is None
