@@ -68,7 +68,7 @@ STATE_LOAD_DISPOSITION_CHANNEL = "k3_state_load_disposition"
 _SAVE_STALL_DEFAULT_S = 120.0
 
 
-def save_stall_seconds() -> float:
+def save_stall_seconds(abandon: float | None = None) -> float:
     """Seconds a save may sit before this connector calls the path stalled.
 
     Kept strictly under the scheduler's abandon window by construction. The two
@@ -84,9 +84,11 @@ def save_stall_seconds() -> float:
     force-unpinned the source), but never above the 120 s default, so the
     ordering holds for every pin value and the default behaviour is unchanged.
     When reclamation is disabled (abandon <= 0) there is no window to stay
-    under, so use the default.
+    under, so use the default. ``abandon`` is the scheduler's own window when it
+    has one that is not LMCache's (the Mooncake Store's setting).
     """
-    abandon = offload_save_abandon_timeout_s()
+    if abandon is None:
+        abandon = offload_save_abandon_timeout_s()
     if abandon <= 0:
         return _SAVE_STALL_DEFAULT_S
     return min(_SAVE_STALL_DEFAULT_S, abandon - _SAVE_ABANDON_MARGIN_S)
@@ -140,6 +142,31 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
 
     # -- tier construction -------------------------------------------------
     def _build_state_tier(self, transfer_tensors) -> None:
+        geometry = self._state_tier_geometry(transfer_tensors)
+        if geometry is None:
+            return
+        backend, entry_bytes, layout_id, rank, world = geometry
+        codec = self._make_state_codec(backend, entry_bytes, layout_id, rank, world)
+        # No index here: StateOffloadIndex lives in the engine process; both
+        # directions report and the engine applies.
+        self._state_tier = StateOffloadTier(codec)
+        logger.info(
+            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
+            "backend=%s, max_state_entries=%d, layout=%s",
+            entry_bytes / (1 << 20),
+            rank,
+            type(codec).__name__,
+            codec._max_entries,
+            layout_id,
+        )
+
+    def _state_tier_geometry(self, transfer_tensors):
+        """The tier's backend, entry size, layout id, rank and world, or None.
+
+        None, with the reason logged, wherever the tier must stay off: PP, no
+        published backend or layout id, a backend without both state views,
+        or a checkpoint image whose size differs from an Active Slot's.
+        """
         from aiter.dist.parallel_state import get_tp_group
 
         # PP breaks the tier: the CacheEngineKey has no PP component, so two
@@ -214,8 +241,11 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
             )
             return
 
-        tp = get_tp_group()
-        rank, world = pp_aware_rank_and_world(self._config, tp)
+        rank, world = pp_aware_rank_and_world(self._config, get_tp_group())
+        return backend, entry_bytes, layout_id, rank, world
+
+    def _make_state_codec(self, backend, entry_bytes, layout_id, rank, world):
+        """The codec that moves images through the LMCache CPU pool."""
         cfg = offcfg.build_lmcache_config(
             getattr(self._config, "kv_transfer_config", None)
         )
@@ -243,17 +273,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         # Share the allocator, but cap state retention separately so old
         # checkpoints cannot consume nearly the whole paged-KV CPU pool.
         codec.bind_storage_manager(self._engine.storage_manager)
-        # No index here: StateOffloadIndex lives in the engine process; both
-        # directions report and the engine applies.
-        self._state_tier = StateOffloadTier(codec)
-        logger.info(
-            "kimi_k3 offload: state tier up, entry=%.2f MiB rank=%d, "
-            "sharing the paged-KV CPU pool, max_state_entries=%d, layout=%s",
-            entry_bytes / (1 << 20),
-            rank,
-            codec._max_entries,
-            layout_id,
-        )
+        return codec
 
     # -- per-step ----------------------------------------------------------
     def start_load_kv(self, metadata) -> None:
@@ -574,7 +594,7 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
         harmlessly for the long-departed request. `<= 0` disables reclamation
         (the operator turned the pin timeout off), matching those reconcilers.
         """
-        window = offload_save_abandon_timeout_s()
+        window = self._save_abandon_timeout_s()
         if window <= 0:
             return
         reclaimed = self._joint_park.reclaim_stale_parks(window)
@@ -586,15 +606,17 @@ class KimiK3OffloadConnector(DenseOffloadConnector):
                 reclaimed,
             )
 
+    def _save_abandon_timeout_s(self) -> float:
+        """The engine's save-abandon window: LMCache's pin timeout plus margin."""
+        return offload_save_abandon_timeout_s()
 
-class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
-    """Scheduler side: dense KV, plus the state tier's load queue and the
-    save-stall guard that keeps a stopped backend from stopping the engine.
 
-    Inherits `StateOffloadFace` -- the only offload scheduler that hosts the KDA
-    state tier -- so routing can select it with `isinstance` rather than probing
-    for a method the delegating shell defines on every layout (see
-    `StateOffloadFace` and the shell's `has_state_tier`)."""
+class KimiK3StateSchedulerMixin:
+    """The state tier's scheduler half, over any chunked KV transport.
+
+    Listed ahead of the transport's scheduler (`DenseOffloadScheduler` for
+    LMCache, the Mooncake Store's), whose methods its `super()` calls reach.
+    """
 
     _supports_early_block_release = False
 
@@ -703,7 +725,9 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
             self._warned_save_stalled = False
             return
         oldest = min(self._save_inflight_since.values())
-        self._save_stalled = (now - oldest) > save_stall_seconds()
+        self._save_stalled = (now - oldest) > save_stall_seconds(
+            self.save_abandon_timeout_s()
+        )
         if self._save_stalled and not self._warned_save_stalled:
             self._warned_save_stalled = True
             logger.warning(
@@ -912,3 +936,15 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         survived = self._state_load_survived
         self._state_load_survived = set()
         return survived
+
+
+class KimiK3OffloadScheduler(
+    KimiK3StateSchedulerMixin, DenseOffloadScheduler, StateOffloadFace
+):
+    """Scheduler side: dense KV, plus the state tier's load queue and the
+    save-stall guard that keeps a stopped backend from stopping the engine.
+
+    Inherits `StateOffloadFace` -- the only offload scheduler that hosts the KDA
+    state tier -- so routing can select it with `isinstance` rather than probing
+    for a method the delegating shell defines on every layout (see
+    `StateOffloadFace` and the shell's `has_state_tier`)."""
