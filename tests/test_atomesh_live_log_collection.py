@@ -78,6 +78,9 @@ class LiveLogsTest(unittest.TestCase):
         workflow = yaml.safe_load(
             (ROOT / ".github/workflows/atomesh-benchmark.yaml").read_text()
         )
+        load_if = workflow["jobs"]["load-config"]["if"]
+        self.assertIn("inputs.collect_minimax_run != ''", load_if)
+        self.assertIn("!inputs.run_model_benchmark", load_if)
         job = workflow["jobs"]["collect-minimax-live-logs"]
         self.assertIn("!inputs.run_model_benchmark", job["if"])
         commands = "\n".join(step.get("run", "") for step in job["steps"])
