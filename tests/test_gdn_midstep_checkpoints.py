@@ -13,6 +13,7 @@ Qwen3.5 runs on.
 """
 
 import random
+from types import SimpleNamespace
 
 import pytest
 from test_state_checkpoint import (
@@ -377,3 +378,34 @@ class TestPagedMidstep:
         assert len(second) == 2
         assert {op.src_slot for op in first}.isdisjoint(op.src_slot for op in second)
         assert coord.checkpoints_kept == 4
+
+    def test_the_copy_budget_is_one_definition(self, monkeypatch):
+        """The coordinator's per-batch budget is the runner's staging capacity,
+        read from one function, so the two cannot drift apart."""
+        from atom.model_engine import block_manager, page_unit_checkpoint
+
+        assert page_unit_checkpoint.checkpoint_copy_ops_per_batch(3) == 6
+        coord = self.bm(max_num_seqs=3).paged_state_checkpoints
+        assert coord._max_ops_per_batch == 6
+        monkeypatch.setattr(
+            block_manager, "checkpoint_copy_ops_per_batch", lambda n: 7 * n
+        )
+        coord = self.bm(max_num_seqs=3).paged_state_checkpoints
+        assert coord._max_ops_per_batch == 21
+
+    def test_the_runner_stages_the_same_budget(self, monkeypatch):
+        backends = pytest.importorskip(
+            "atom.model_ops.attentions.backends", reason="needs aiter and torch"
+        )
+        sized = []
+        monkeypatch.setattr(
+            backends, "DescriptorStaging", lambda n, device: sized.append(n)
+        )
+        monkeypatch.setattr(backends, "checkpoint_copy_ops_per_batch", lambda n: 7 * n)
+        builder = SimpleNamespace(
+            _checkpoint_copy_plan=lambda: SimpleNamespace(num_spans=2),
+            _checkpoint_descriptor_device=lambda: "cpu",
+            model_runner=SimpleNamespace(config=SimpleNamespace(max_num_seqs=3)),
+        )
+        backends.AttentionMetadataBuilder._checkpoint_staging(builder)
+        assert sized == [7 * 3 * 2]  # budget x spans per copy

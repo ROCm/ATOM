@@ -24,7 +24,10 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointCoordinator,
+    checkpoint_copy_ops_per_batch,
+)
 from atom.model_engine.prefix_hash import (
     block_hash,
     chained_block_hashes,
@@ -367,10 +370,11 @@ class BlockManager:
         self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
         if self.paged_state_checkpoints is not None:
             # A PAGE midstep checkpoint is copied into a scratch slot from
-            # this pool, then stored from there. The runner stages two copies
-            # per sequence (`AttentionMetadataBuilder._checkpoint_staging`).
+            # this pool, then stored from there, within the copy budget the
+            # runner's descriptor staging is sized to: one definition for both.
             self.paged_state_checkpoints.attach_midstep_scratch(
-                self.state, 2 * int(getattr(config, "max_num_seqs", 0) or 0)
+                self.state,
+                checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
             )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked

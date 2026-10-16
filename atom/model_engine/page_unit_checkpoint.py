@@ -90,6 +90,19 @@ class PagedStateCheckpointSpec:
         )
 
 
+def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
+    """PAGE checkpoint copies one batch's descriptor holds, stores and restores.
+
+    One store and one restore per sequence. The runner sizes its pinned
+    descriptor staging with this (`AttentionMetadataBuilder.
+    _checkpoint_staging`), and the coordinator bounds how many queued midstep
+    stores one batch begins with it (`attach_midstep_scratch`). Both read it
+    from here: a coordinator that began more than the staging holds would make
+    `build()` raise mid-serving.
+    """
+    return 2 * int(max_num_seqs or 0)
+
+
 @dataclass(frozen=True)
 class CheckpointStoreOp:
     """Scatter the checkpointed part of an Active Slot into PAGE units."""
