@@ -25,7 +25,7 @@ figures are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`.
 | **Memory** | `peak_torch` 248 GB and `available_for_kv` about 101 GB per rank. With the layers left in BF16 the figures were 294 GB and 56 GB |
 | Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
-| Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 32 and 64 in [Agentic](#agentic-agentx); 16 to follow |
+| Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
 
 Contents:
 
@@ -712,7 +712,7 @@ Neither is aiperf's own per-user p90.
 
 ### Results
 
-#### 2026-10-16: the 20261014 image, concurrency 32 and 64 (16 to follow)
+#### 2026-10-16: the 20261014 image, concurrency 16, 32 and 64
 
 - **Image:** the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`, plus K3's grouped-MoE tuning rows that
   are now in aiter `main`, as a thin layer (`k3img-20261016-031230-3da6f1dd`).
@@ -722,16 +722,17 @@ Neither is aiperf's own per-user p90.
   `--state-checkpoint-interval-tokens` (8192, not the launch's `-1`). A fresh server per point.
 - **Client:** this section's method with **`AIPERF_BENCHMARK_DURATION=1800`** (30 min, not 60); 10 warm-up requests
   per lane.
-- **Trays:** no perf_setup. Concurrency 32 on CT11 (node0) + CT10; 64 on CT7 (node0) + CT15, after CT10 went down
-  (a host CPU fatal error) as the second point started.
+- **Trays:** no perf_setup. Concurrency 32 on CT11 (node0) + CT10; 64 and then 16 on CT7 (node0) + CT15, after CT10
+  went down (a host CPU fatal error) as the second point started.
 
 | concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit (theoretical) | valid |
 |---|---|---|---|---|---|---|---|---|---|
+| 16 | **11.29** | **27.77** | **4,078** | 30.6 | 5.9 / 14.1 s | 29 / 36 ms | 541 | 96.3% (96.6%) | yes |
 | 32 | **5.76** | **8.00** | **5,575** | 35.5 | 3.5 / 11.6 s | 56 / 125 ms | 936 | 92.8% (95.7%) | yes |
 | 64 | **0.90** | **1.28** | **3,165** | 17.3 | 7.7 / 79.8 s | 120 / 779 ms | 579 | 78.8% (95.3%) | yes |
 
 **At 64 the KV pool is full** (92% on average, 98% at p90, on every rank) and 501 KDA state checkpoints were
-evicted in the 30 min, against 110 at 32. The prefix cache hit falls to 78.8% of the 95.3% the traces allow, so
+evicted in the 30 min, against 110 at 32 and 5 at 16. The prefix cache hit falls to 78.8% of the 95.3% the traces allow, so
 about 78% of the prefill was recomputing evicted prefixes, and throughput falls below concurrency 32's.
 `--state-checkpoint-interval-tokens -1` (now in the launch, not in these runs) targets the checkpoints.
 
