@@ -7,7 +7,10 @@ use super::{
 };
 use crate::{
     core::UNKNOWN_MODEL_ID,
-    routers::comm::metrics_utils::{error_type_from_status, route_to_endpoint},
+    routers::comm::{
+        error::MeshLocalError,
+        metrics_utils::{error_type_from_status, route_to_endpoint},
+    },
 };
 use axum::{body::Body, response::Response};
 use http::StatusCode;
@@ -103,8 +106,9 @@ impl RequestMetrics {
             self.streaming = false;
         }
         let (parts, inner) = response.into_parts();
-        // Empty responses may never be polled by hyper.
-        if inner.is_end_stream() {
+        // Empty responses may never be polled by hyper, and ingress replaces the
+        // body of Mesh-local errors before it is polled.
+        if inner.is_end_stream() || parts.extensions.get::<MeshLocalError>().is_some() {
             self.finish(self.status, None);
         }
         Response::from_parts(
@@ -211,6 +215,37 @@ mod tests {
             })
             .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
             .sum()
+    }
+
+    #[tokio::test]
+    async fn mesh_local_error_records_its_status_before_ingress_replaces_the_body() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let response = RequestMetrics::new("http", "regular", "m", "/v1/chat/completions", false)
+            .wrap_response(crate::routers::comm::error::service_unavailable(
+                "no_workers",
+                "No available workers",
+            ));
+        drop(MeshLocalError::format_response(
+            "/v1/chat/completions",
+            response,
+        ));
+        let rendered = handle.render();
+        assert_eq!(
+            total(&rendered, "mesh_router_request_errors_total", &["canceled"]),
+            0.0,
+            "{rendered}"
+        );
+        assert_eq!(
+            total(
+                &rendered,
+                "mesh_router_request_errors_total",
+                &[&format!("error_type=\"{}\"", metrics_labels::ERROR_BACKEND)]
+            ),
+            1.0,
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
