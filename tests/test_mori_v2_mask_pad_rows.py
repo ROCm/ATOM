@@ -23,6 +23,45 @@ TOPK = 9
 DIM = 16
 
 
+def test_prepare_forwards_exact_device_row_count(monkeypatch):
+    class FakeOp:
+        @staticmethod
+        def dispatch(a1, weights, _scales, ids, *, return_routing):
+            assert return_routing
+            return (
+                a1,
+                weights,
+                None,
+                ids,
+                torch.tensor([a1.shape[0]], dtype=torch.int32),
+                object(),
+            )
+
+    monkeypatch.setattr(mv2.envs, "ATOM_USE_TRITON_MOE", False)
+    pf = mv2.MoriV2PrepareAndFinalize.__new__(mv2.MoriV2PrepareAndFinalize)
+    pf._op = FakeOp()
+    pf._routing = None
+    hidden = torch.ones((2, DIM), dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 33, 66, 99, 32], [1, 34, 67, 100, 32]])
+    weights = torch.ones_like(ids, dtype=torch.float32)
+    expert_map = torch.full((130,), -1, dtype=torch.int32)
+
+    _, _, metadata, dispatched_ids, dispatched_weights = pf.prepare(
+        hidden,
+        weights,
+        ids,
+        num_experts=132,
+        expert_map=expert_map,
+        apply_router_weight_on_input=False,
+        quant_config=None,
+    )
+
+    assert torch.equal(dispatched_ids, ids.to(torch.int32))
+    assert torch.equal(dispatched_weights, weights)
+    assert metadata.expert_num_tokens.item() == hidden.shape[0]
+    assert pf.needs_dispatch_output_trim() is False
+
+
 @pytest.fixture
 def run(monkeypatch):
     seen = {}
