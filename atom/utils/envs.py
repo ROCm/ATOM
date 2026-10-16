@@ -497,6 +497,58 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
     "ATOM_GLM52_INDEXER_CP": lambda: (os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1"),
+    # ---- GLM-5.2 mono kernel schedule A/B switches -------------------------
+    #
+    # Six knobs on the vendored FlyDSL kernel's SCHEDULE. Every one of them is
+    # bit-identical either way: they change the order and batching of work, not
+    # the arithmetic, so the only thing they buy is an in-process A/B of a
+    # scheduling decision against the one it replaced. The defaults are the
+    # measured winners; the per-switch reasoning and the sweep tables live at
+    # each one's definition in kernels/kernel.py and kernels/layout.py.
+    #
+    # Read at BUILD time, inside `build_glm5_monokernel` and the two layout
+    # helpers -- not per step -- so a change takes effect on the next build.
+    # `envs.__getattr__` re-reads on every access, which is what keeps that
+    # true.
+    #
+    # Not `ATOM_`-prefixed: these are the vendored kernel's own switch names,
+    # and renaming them here would silently stop a name an operator already
+    # has in a script.
+    #
+    # `_flag_env` rather than the `== "1"` these replaced. That is a real
+    # change at the edges and a deliberate one: the kernel's test read ANY
+    # other value as off, so `MONO_R2_OFF=true` turned round 2 ON -- the
+    # opposite of what the operator wrote, silently, in a switch whose only
+    # job is to make an A/B mean something. That trap was survivable while
+    # these were undiscoverable; documenting them as `bool` is a promise to
+    # accept what a bool is written as, so the parsing has to keep it.
+    #
+    # The bench these were swept with (`bench_glm52_atom_shape.py --ab-env`)
+    # lives in FlyDSL's tree and is not vendored into ATOM.
+    #
+    # 0 restores the per-unit expert resolution the DN_HOIST group replaces.
+    "MONO_DN_HOIST": lambda: _flag_env("MONO_DN_HOIST", "1"),
+    # 1 turns off every round-2 schedule change at once (MONO_SPLIT_QHEADS,
+    # MONO_UG_SCALE_PAIR and the PTPC batching), so the whole round can be
+    # A/B'd against the previous kernel in one interleaved process.
+    "MONO_R2_OFF": lambda: _flag_env("MONO_R2_OFF", "0"),
+    # 0 restores staging all H attention heads into the Q tile instead of one
+    # head group's WAVES rows.
+    "MONO_SPLIT_QHEADS": lambda: _flag_env("MONO_SPLIT_QHEADS", "1"),
+    # 0 restores the per-unit 1-byte MXFP4 scale gather in the up/gate stage.
+    "MONO_UG_SCALE_PAIR": lambda: _flag_env("MONO_UG_SCALE_PAIR", "1"),
+    # Expert-down weight tiles a wave keeps in flight. Unset means "the
+    # measured default for this width", which is why these two are int | None
+    # and not an int with a default: no single value reproduces the width
+    # -dependent choice `down_prefetch_batch` makes.
+    "MONO_DN_BATCH": lambda: (
+        int(raw) if (raw := os.getenv("MONO_DN_BATCH", "")) else None
+    ),
+    # (sample, group) cells `stage_x_pairs_ptpc` stages together; 1 restores
+    # the per-cell walk, <= 0 batches every cell. Unset as above.
+    "MONO_PTPC_CHUNK": lambda: (
+        int(raw) if (raw := os.getenv("MONO_PTPC_CHUNK", "")) else None
+    ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
