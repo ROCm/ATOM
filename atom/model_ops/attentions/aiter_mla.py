@@ -628,21 +628,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # Shared indexer decode logits workspace.
-            # Allocated before the memory profile so the KV budget counts it.
-            self._indexer_logits_ws = None
-            if self.dcp_world_size == 1:
-                width = model_runner.config.max_model_len
-                decode_rows = max(
-                    logits_rows(self.max_bs * max_seqlen_qo, width), max_seqlen_qo
-                )
-                self._indexer_logits_ws = torch.empty(
-                    decode_rows * width, dtype=torch.float32, device=self.device
-                )
-                logger.info(
-                    "Sparse indexer logits workspace: %.2f GiB",
-                    self._indexer_logits_ws.numel() * 4 / (1 << 30),
-                )
             # DCP sparse decode compacts each rank's owned top-k slots to the
             # front (no -1 holes), so the per-request region length becomes data-
             # AND layer-dependent.
@@ -808,6 +793,29 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
+            # Shared indexer decode logits workspace (like V4.1's ScoreWorkspace),
+            # only for indexers that use it (FP8, native op, no DCP).
+            # Allocated before the memory profile so the KV budget counts it.
+            ws_users = [
+                m
+                for m in sfc.values()
+                if callable(getattr(m, "uses_logits_workspace", None))
+                and m.uses_logits_workspace()
+            ]
+            if ws_users and self.dcp_world_size == 1 and not self._indexer_fp4:
+                width = model_runner.config.max_model_len
+                decode_rows = max(
+                    logits_rows(self.max_bs * max_seqlen_qo, width), max_seqlen_qo
+                )
+                ws = torch.empty(
+                    decode_rows * width, dtype=torch.float32, device=self.device
+                )
+                for m in ws_users:
+                    m.indexer_logits_ws = ws
+                logger.info(
+                    "Sparse indexer logits workspace: %.2f GiB",
+                    ws.numel() * 4 / (1 << 30),
+                )
             for module in sfc.values():
                 impl = getattr(module, "impl", None)
                 # DCP compact buffers ride along with the indices buffer: the
@@ -819,10 +827,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     tgt.sparse_kv_indices_buffer = self._sparse_kv_indices_gpu
                     tgt.dcp_sparse_kv_indptr_buffer = self._dcp_sparse_kv_indptr_gpu
                     tgt.dcp_owned_counts_buffer = self._dcp_owned_counts_gpu
-                    if self._indexer_logits_ws is not None and hasattr(
-                        tgt, "indexer_logits_ws"
-                    ):
-                        tgt.indexer_logits_ws = self._indexer_logits_ws
 
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
