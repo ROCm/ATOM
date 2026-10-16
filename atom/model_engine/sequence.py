@@ -219,8 +219,12 @@ class OffloadJointRecord:
     kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
-    # covers. `num_cached_tokens` stays at the HBM prefix until both legs
-    # report, which keeps the forward honest if either fails.
+    # covers. An aligned hit leaves `num_cached_tokens` at the HBM prefix
+    # until both legs report. An unaligned hit lowers it to the chunk floor
+    # at allocate time and refills `[floor, hbm)` privately. A failed leg
+    # returns to that HBM hit (`hbm_hit_tokens`) when the hit's blocks and
+    # state are still recoverable, and disowns to token 0 only when they
+    # are not.
     boundary_tokens: int = 0
     # Content hash of that boundary's last block, for the state leg.
     boundary_hash: int = -1
@@ -228,20 +232,26 @@ class OffloadJointRecord:
     # the boundary above, which is at or past it. The request still only claims
     # the boundary -- see `_claim_after_load`.
     kv_tokens: int = 0
-    # How far `allocate` claimed straight out of the HBM prefix cache, in
-    # tokens. Above `num_cached_tokens`, not below it: the blocks in
-    # `(hit, compressed_hit]` hold this prompt's KV and are still indexed --
-    # the state gate cut the hit, the KV never went anywhere. Claiming them is
-    # what keeps the KV leg from paying LMCache to resend what the pool already
-    # has, and it is where that leg starts.
+    # How far `allocate` claimed out of the HBM prefix cache, in tokens, and
+    # where the KV leg starts. After allocate this is at or above
+    # `num_cached_tokens`. A compressed hit past the gated hit claims resident
+    # blocks above the HBM prefix. An unaligned hit lowers `num_cached_tokens`
+    # to this floor, so the partial chunk is private rather than shared. The
+    # blocks in `(hit, compressed_hit]` still hold this prompt's KV; claiming
+    # them is what keeps the KV leg from paying LMCache to resend what the
+    # pool already has.
     claim_tokens: int = 0
+    # The gated HBM hit, in tokens, when `allocate` lowered
+    # `num_cached_tokens` below it to refill a partial chunk. 0 when the hit
+    # was not lowered. A failed joint resumes here instead of at token 0.
+    hbm_hit_tokens: int = 0
 
     def reset_joint(self) -> None:
         """Drop the joint boundary and both of its transfer spans.
 
-        The four joint fields move together -- a boundary is meaningless
-        without the KV span aimed at it and the prefix claimed below it -- so
-        the sites that abandon a joint load in full clear them through here
+        The joint fields move together -- a boundary is meaningless without
+        the KV span aimed at it and the prefix claimed below it -- so the
+        sites that abandon a joint load in full clear them through here
         rather than by hand. Leaves `load_hash` and `kv_prefix_tokens`
         untouched: they are set on their own paths and are not part of the
         boundary this drops.
@@ -250,6 +260,7 @@ class OffloadJointRecord:
         self.boundary_hash = -1
         self.kv_tokens = 0
         self.claim_tokens = 0
+        self.hbm_hit_tokens = 0
 
 
 class Sequence:
