@@ -44,6 +44,12 @@ class WorkspaceJobsTest(unittest.TestCase):
                 override_eval_concurrency=None,
             )
             self.assertEqual(len(cells), 2)
+            live_spec = importlib.util.spec_from_file_location(
+                "m3_workspace_live", SCRIPT.with_name("collect_minimax_live_logs.py")
+            )
+            live = importlib.util.module_from_spec(live_spec)
+            live_spec.loader.exec_module(live)
+            self.assertEqual(set(live.CASES), {cell["id"] for cell in cells})
             perf = next(c for c in cells if not c["eval_only"])
             accuracy = next(c for c in cells if c["eval_only"])
             self.assertEqual(perf["benchmark"]["benchmark_duration"], 3600)
