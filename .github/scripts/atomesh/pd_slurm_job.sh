@@ -187,29 +187,50 @@ pre_cleanup_local() {
   set -e
 }
 
+# Prints "<gpu> <used MB>" for the first GPU above ATOMESH_GPU_BUSY_MB.
+busiest_gpu_over_limit() {
+  local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
+  local used line gpu_idx
+  command -v amd-smi >/dev/null 2>&1 || return 1
+  while read -r line; do
+    [[ "${line}" =~ ^[[:space:]]*[0-9]+ ]] || continue
+    gpu_idx="$(awk '{print $1}' <<<"${line}")"
+    used="$(awk '{print $3}' <<<"${line}")"
+    used="${used%MB}"
+    [[ "${used}" =~ ^[0-9]+$ ]] || continue
+    if (( used > max_used_mb )); then
+      echo "${gpu_idx} ${used}"
+      return 0
+    fi
+  done < <(amd-smi monitor -v 2>/dev/null | tail -n +2)
+  return 1
+}
+
 # Spur often ignores --exclusive. If another job already holds VRAM, model
 # load fails with opaque HIP OOM ("0 bytes free"). Fail fast with a clear
 # message so the cell is not attributed to the model or LMCache sizing.
+# Containers pre_cleanup_local just stopped release VRAM only after a while,
+# so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is recorded in
+# RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
 assert_gpus_idle() {
   local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
-  local used line gpu_idx
-  if command -v amd-smi >/dev/null 2>&1; then
-    while read -r line; do
-      [[ "${line}" =~ ^[[:space:]]*[0-9]+ ]] || continue
-      gpu_idx="$(awk '{print $1}' <<<"${line}")"
-      used="$(awk '{print $3}' <<<"${line}")"
-      used="${used%MB}"
-      [[ "${used}" =~ ^[0-9]+$ ]] || continue
-      if (( used > max_used_mb )); then
-        echo "ERROR: $(hostname) GPU ${gpu_idx} already uses ${used} MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
-        amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
-        docker ps --format '  {{.Names}}\t{{.Status}}' 2>/dev/null | head -20 >&2 || true
-        return 1
-      fi
-    done < <(amd-smi monitor -v 2>/dev/null | tail -n +2)
-  elif command -v rocm-smi >/dev/null 2>&1; then
-    rocm-smi --showmemuse 2>/dev/null | head -40 || true
+  local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-90}"
+  local deadline=$((SECONDS + wait_s))
+  local busy
+  if ! command -v amd-smi >/dev/null 2>&1; then
+    command -v rocm-smi >/dev/null 2>&1 && { rocm-smi --showmemuse 2>/dev/null | head -40 || true; }
+    return 0
   fi
+  while busy="$(busiest_gpu_over_limit)"; do
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: $(hostname) GPU ${busy%% *} already uses ${busy##* } MB VRAM (limit ${max_used_mb} MB). Spur co-scheduled another job on this node; refusing to start." >&2
+      amd-smi monitor -v 2>/dev/null | head -20 >&2 || true
+      docker ps --format '  {{.Names}}\t{{.Status}}' 2>/dev/null | head -20 >&2 || true
+      mkdir -p "${RUN_DIR}/gpu-busy" 2>/dev/null && touch "${RUN_DIR}/gpu-busy/$(hostname)" 2>/dev/null
+      return 1
+    fi
+    sleep 10
+  done
   return 0
 }
 
@@ -571,6 +592,12 @@ if [[ "${1:-}" == "--spur-worker" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "--spur-preflight" ]]; then
+  pre_cleanup_local
+  assert_gpus_idle
+  exit $?
+fi
+
 if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
   # Spur sbatch runs the batch script only on the first allocated node; the
   # other nodes run placeholders until an srun step dispatches their workers.
@@ -587,6 +614,23 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
   DISPATCH_DIR="${RUN_DIR}/.spur-dispatch-${ATOMESH_RUN_TOKEN:-0}"
   if mkdir "${DISPATCH_DIR}" 2>/dev/null; then
     hostname > "${DISPATCH_DIR}/owner" 2>/dev/null || true
+    # Check every node before any worker starts, so a busy node fails the job
+    # in seconds instead of leaving its peers waiting for a service that never
+    # comes up.
+    echo "=== Spur job ${JOB_ID}: GPU preflight on ${NUM_NODES} node(s) ==="
+    preflight_rc=0
+    srun \
+      --nodes="${NUM_NODES}" \
+      --ntasks="${NUM_NODES}" \
+      --ntasks-per-node=1 \
+      bash "${REPO_ROOT}/.github/scripts/atomesh/pd_slurm_job.sh" --spur-preflight \
+      || preflight_rc=$?
+    if [[ "${preflight_rc}" -ne 0 ]]; then
+      echo "=== Spur job ${JOB_ID}: GPU preflight failed rc=${preflight_rc}; busy: $(ls "${RUN_DIR}/gpu-busy" 2>/dev/null | paste -sd, -) ===" >&2
+      printf '%s\n' "${preflight_rc}" > "${DISPATCH_DIR}/rc.tmp"
+      mv "${DISPATCH_DIR}/rc.tmp" "${DISPATCH_DIR}/rc"
+      exit "${preflight_rc}"
+    fi
     echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers from $(hostname) ==="
     dispatch_rc=0
     srun \
