@@ -348,15 +348,18 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 )
             else:
                 has_initial = torch.ones_like(indices, dtype=torch.bool)
-        return Qwen4ExpPLEMetadata(
+        metadata = Qwen4ExpPLEMetadata(
             query_start_loc=attn_metadata.plugin_metadata.rtp_cu_seqlens_q,
             ngram_state=runtime._rtp_ple_ngram,
             state_indices_in=input_indices,
             state_indices_out=indices,
             has_initial_state=has_initial,
             conv_state=runtime._rtp_ple_conv,
-            rtp_spec_state_indices=spec_indices,
         )
+        # RTP-only per-candidate slots are deliberately not part of the
+        # framework-neutral Qwen4ExpPLEMetadata dataclass.
+        metadata.rtp_spec_state_indices = spec_indices
+        return metadata
 
     @classmethod
     @contextmanager
