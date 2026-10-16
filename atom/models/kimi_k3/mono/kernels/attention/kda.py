@@ -306,7 +306,14 @@ def stage_slice(c, task):
                 # attention's output (the input prefix is not read)
                 pre = dl
             else:
-                pre = [bf16r(pre[j] + dl[j]) for j in range(4)]
+                # fp32, like production. `apply_attn_res` accumulates
+                # `prefix + add (+ add2)` in fp32, uses that fp32 value as the
+                # last softmax candidate and rounds only where it STORES the
+                # prefix -- which `bf4_words` below already does. Rounding here
+                # as well put an extra bf16 step into the candidate score, the
+                # softmax weights and the mixed row of every layer that takes a
+                # delta, compounding over ~60 layers.
+                pre = [pre[j] + dl[j] for j in range(4)]
             if live & is_pre:
                 bo.buffer_store(
                     bf4_words(pre), rsrc(a["prefix"]), (t * HIDDEN + col) // 2
