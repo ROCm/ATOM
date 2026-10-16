@@ -12,6 +12,10 @@ first let both through.
 import pytest
 
 pytest.importorskip("flydsl", reason="the GLM mono runner is FlyDSL source")
+# `runner.py` also binds the TP group through `aiter.dist.parallel_state` at
+# module scope, so FlyDSL alone is not enough to collect this file -- the same
+# guard `test_mono_runner.py` and `test_fused_indexer_dispatch.py` carry.
+pytest.importorskip("aiter", reason="the GLM mono runner imports aiter.dist")
 
 from atom.models.glm52.mono.runner import Glm52MonoRunner
 
