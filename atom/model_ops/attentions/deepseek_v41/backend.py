@@ -125,6 +125,19 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
+        from atom.models.deepseek_v41.bounded_replay import (
+            decoder_replay_unsupported,
+        )
+
+        # Whether prefills report per-stage token counts under DP attention
+        # (`dp_stage_report`): the runtime model replays exactly when this
+        # holds (`DeepseekV41RuntimeModel.__init__`). The DP width is not
+        # read here -- DPA rank expansion settles it after this builder is
+        # made; `prepare_model` asks only when it is above one.
+        self._decoder_replays = (
+            getattr(model_runner.config, "enable_decoder_swa_bounded_replay", False)
+            and decoder_replay_unsupported(self.config) is None
+        )
         self.geometry = V41PoolGeometry(
             len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
             tuple(
@@ -204,6 +217,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.block_table_cols,
             self.device,
             pages=self._page_bound(model_runner.config.gpu_memory_utilization),
+            # A candidate-consuming layer's plane is as wide as the candidate
+            # list, which the checkpoint fixes and `max_model_len` does not
+            # bound. Short contexts make it the widest plane in the model.
+            candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
         )
         logger.info(
             "V4.1 score workspace: %s logits, %.2f GiB",
@@ -349,6 +366,16 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         total = torch.cuda.mem_get_info(self.device)[1]
         left = int(total * utilization) - torch.cuda.memory_allocated(self.device)
         return max(1, left // self.geometry.paged_bytes)
+
+    def dp_stage_report(self, batch):
+        """Decoder bounded replay under DP attention: this rank's decoder and
+        last-layer token counts for the step's DP sync
+        (`bounded_replay.decoder_stage_report`)."""
+        if not self._decoder_replays:
+            return None
+        from atom.models.deepseek_v41.bounded_replay import decoder_stage_report
+
+        return decoder_stage_report(batch, self.geometry.window_size)
 
     def step_needs_eager(self, batch):
         """True when the step's rows cannot all be packed at once: a captured

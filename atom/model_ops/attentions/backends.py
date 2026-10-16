@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.utils.forward_context import BoundedReplayDPReport
 
 import numpy as np
 import torch
@@ -172,6 +173,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
+
+    def dp_stage_report(self, batch: ScheduledBatch) -> "BoundedReplayDPReport | None":
+        """This rank's `BoundedReplayDPReport` for the step's DP sync, or None when the
+        model runs every MoE layer on every row of the step.
+
+        A model whose prefill runs some MoE layers on other rows (DeepSeek-V4.1
+        decoder bounded replay) reports its per-stage token counts here, from
+        the batch alone, so they ride `ForwardMode.decide`'s one packed
+        all_gather. Must return None on every step, or a report of one fixed
+        layout on every step and every rank."""
+        return None
 
     def step_needs_eager(self, batch: ScheduledBatch) -> bool:
         """True when this backend cannot run `batch`'s decode from a captured

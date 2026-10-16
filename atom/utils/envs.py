@@ -313,18 +313,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the gfx1250-capable path. Only takes effect when the mori all2all path is
     # active (dp_size>1 + expert-parallel + mori installed).
     "ATOM_MORI_V2": lambda: os.getenv("ATOM_MORI_V2", "0") == "1",
-    # gemm2-fused EP combine: the a8w4 grouped gemm2 epilogue P2P-writes its
-    # weighted per-(token,k) results straight into the peers' combine staging, so
-    # combine only barriers + sums. Requires the a8w4 (fp8 act + mxfp4 weight)
+    # MegaMoE stage 2 (gemm2-fused EP combine): the grouped gemm2 epilogue
+    # P2P-writes its weighted per-(token,k) results straight into the peers'
+    # combine staging, so combine only barriers + sums. Requires the mxfp4 weight
     # path; ignored unless ATOM_MORI_V2 is on.
     # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
-    # the fused dispatch/combine pair (its dispatch kernel is picked by aiter's
-    # own MEGA_DISPATCH=flydsl|mori), 0 binds mori's v2 op-layer running plain
-    # gather, i.e. the untouched upstream baseline.
-    "ATOM_MORI_V2_FUSED": lambda: os.getenv("ATOM_MORI_V2_FUSED", "0") == "1",
+    # the fused dispatch/combine pair, 0 binds mori's v2 op-layer running plain
+    # gather, i.e. the untouched upstream baseline. Formerly ATOM_MORI_V2_FUSED.
+    "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
-    # always combines in bf16. Ignored unless ATOM_MORI_V2_FUSED is on.
+    # always combines in bf16. Ignored unless ATOM_MEGA_STAGE2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
+    # MegaMoE compact-plan stage 1 (aiter stage1_fused): routing/layout planning
+    # fused with a flydsl TDM dispatch that writes the grouped GEMM's per-expert
+    # rows directly. Needs ATOM_MEGA_STAGE2_FUSED and an fp8/fp4
+    # MEGA_DISPATCH_WIRE; a bf16 wire keeps the token-major path regardless of
+    # this flag.
+    "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
@@ -406,6 +411,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # matched again. 0 keeps the old placement.
     "ATOM_STATE_CHECKPOINT_END_MARGIN": lambda: max(
         0, int(os.getenv("ATOM_STATE_CHECKPOINT_END_MARGIN", "0"))
+    ),
+    # vLLM plugin, state checkpoints: overrides the native checkpoint interval
+    # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
+    # Unset: the model's native default.
+    "ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS": lambda: (
+        int(v) if (v := os.getenv("ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS")) else None
+    ),
+    # vLLM plugin, state checkpoints: after every schedule, check that no
+    # request holds more than two blocks per state checkpoint group (diagnostic).
+    "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
+        os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
@@ -766,6 +782,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
     ),
+    # vLLM plugin, DeepSeek-V4: directory for per-process cudagraph dispatch
+    # counters (modes, overridden steps, guard trips), one JSON file per
+    # process, rewritten every step. Unset: off.
+    "ATOM_V4_CG_INSTR_DIR": lambda: os.getenv("ATOM_V4_CG_INSTR_DIR") or None,
     "ATOM_USE_CUSTOM_ALL_GATHER": lambda: (
         os.getenv("ATOM_USE_CUSTOM_ALL_GATHER", "1").lower() == "1"
     ),
@@ -989,6 +1009,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Memoise a waiting request's prefix walk across the per-tick probes (the
+    # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
+    # "0" re-walks every tick.
+    "ATOM_PREFIX_WALK_MEMO": lambda: (os.getenv("ATOM_PREFIX_WALK_MEMO", "1") == "1"),
+    # Hash the prompt block chain in the frontend and ship it to the engine.
+    # "0" leaves all hashing to the engine.
+    "ATOM_FRONTEND_PREFIX_HASH": lambda: (
+        os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
+    ),
+    # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
+    # claims. "0" walks block by block with a token compare per block.
+    "ATOM_PREFIX_FAST_WALK": lambda: (os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1"),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
