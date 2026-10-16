@@ -415,11 +415,20 @@ class Glm52MonoRunner:
         return mono_layers(self._lm.model)
 
     def prepare(self, rows: int) -> bool:
-        chunk_samples = glm5_kernel_samples(rows, self._query_length)
-        if any(chunk == chunk_samples for _, chunk in self._ops):
-            return True
+        # `_refused` is keyed by ROWS, and the reuse test below by kernel chunk.
+        # Asking the chunk first answered for a `rows` the chunk cannot speak
+        # for: a refused width, or a chunked one that `_build` refuses because
+        # its launches would share a mailbox epoch. `samples` includes cudagraph
+        # pad rows while `supports` gates on `scheduled_bs`, so a `prepare(15)`
+        # really does arrive while a chunk-5 op exists, and answering True there
+        # runs 15 rows on the chunk-5 build.
         if rows in self._refused:
             return False
+        chunk_samples = glm5_kernel_samples(rows, self._query_length)
+        if rows == chunk_samples and any(
+            chunk == chunk_samples for _, chunk in self._ops
+        ):
+            return True
         if torch.cuda.is_current_stream_capturing():
             return False
         return self._build(rows)
