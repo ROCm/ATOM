@@ -159,7 +159,7 @@ def gpu_memory(name):
     return used
 
 
-def prepare():
+def prepare(label=None):
     folder = root()
     folder.mkdir(parents=True, exist_ok=False)
     (folder / "code").mkdir()
@@ -170,7 +170,9 @@ def prepare():
             "images": IMAGES,
             "atom_shas": SHAS,
             "client": "agentx-harness==1.0.10",
-            "client_python": "3.11",
+            "client_python": "3.11.14",
+            "phases": [label] if label else list(IMAGES),
+            "baseline_run_id": os.environ.get("TP4_C1_BASELINE_RUN_ID"),
             "model": MODEL,
             "tp": 4,
             "concurrency": 1,
@@ -193,6 +195,8 @@ def prepare():
             | {"Config": None, "ContainerConfig": None},
         )
     client = container_name("client")
+    frozen = Path(__file__).with_name("tp4_c1_client.lock")
+    shutil.copy2(frozen, folder / "client-requirements.reference.lock")
     docker_start(client, IMAGES["official"])
     call(
         [
@@ -216,14 +220,18 @@ def prepare():
                 "-lc",
                 "set -euo pipefail\n"
                 "command -v uv >/dev/null || python3 -m pip install uv==0.9.2\n"
-                "uv venv --python 3.11 /study/client-venv\n"
-                'uv pip install --python /study/client-venv/bin/python agentx-harness==1.0.10 "datasets>=4.7.0"\n'
+                "uv venv --python 3.11.14 /study/client-venv\n"
+                "uv pip sync --python /study/client-venv/bin/python /study/client-requirements.reference.lock\n"
                 "/study/client-venv/bin/agentx --version\n"
                 "uv pip freeze --python /study/client-venv/bin/python > /study/client-requirements.lock\n",
             ],
             stdout=stream,
             stderr=subprocess.STDOUT,
         )
+    expected = (folder / "client-requirements.reference.lock").read_text().splitlines()
+    actual = (folder / "client-requirements.lock").read_text().splitlines()
+    if sorted(actual) != sorted(expected):
+        raise RuntimeError("Recreated client dependencies differ from the completed baseline")
     print("One common AgentX 1.0.10 / Python 3.11 client is ready", flush=True)
 
 
@@ -261,6 +269,28 @@ def serve(label):
     )
 
 
+def wait_for_free_gpus(name, folder, timeout=300):
+    """Allow asynchronous VRAM release; never stop another workload."""
+    deadline = time.monotonic() + timeout
+    observations = []
+    consecutive_free = 0
+    while True:
+        used = gpu_memory(name)
+        observations.append({"time": time.time(), "used_bytes": used})
+        write(folder / "gpu-release-wait.json", observations)
+        free = all(value <= 1024**3 for value in used.values())
+        consecutive_free = consecutive_free + 1 if free else 0
+        if consecutive_free >= 2:
+            write(folder / "gpu-before.json", used)
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPUs remain occupied after {timeout}s; refusing to interrupt work: {used}"
+            )
+        print(f"Waiting for two free GPU samples: {used}", flush=True)
+        time.sleep(5)
+
+
 def run(label):
     folder = root() / label
     folder.mkdir(exist_ok=False)
@@ -269,12 +299,7 @@ def run(label):
     docker_start(name, IMAGES[label], gpu=True)
     process = None
     try:
-        before = gpu_memory(name)
-        write(folder / "gpu-before.json", before)
-        if any(value > 1024**3 for value in before.values()):
-            raise RuntimeError(
-                f"Selected GPUs already occupied; refusing to interrupt existing work: {before}"
-            )
+        wait_for_free_gpus(name, folder)
         with (folder / "server.log").open("w") as log:
             process = subprocess.Popen(
                 [
@@ -458,7 +483,7 @@ if __name__ == "__main__":
     if args.operation in ("serve", "run") and not args.label:
         parser.error("serve/run require a label")
     if args.operation == "prepare":
-        prepare()
+        prepare(args.label)
     elif args.operation == "serve":
         serve(args.label)
     elif args.operation == "run":

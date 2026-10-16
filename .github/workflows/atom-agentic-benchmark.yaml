@@ -1,5 +1,5 @@
 name: ATOM Agentic Benchmark
-run-name: TP4 C1 image A/B · ${{ github.actor }}
+run-name: TP4 C1 · current image · baseline 38855733134 · ${{ github.actor }}
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   compare:
-    name: TP4 C1 · 1012 then 1015 · same runner and client
+    name: TP4 C1 · 1015 · same runner and frozen baseline client
     runs-on: [self-hosted, pit2-p03-g08]
     timeout-minutes: 300
     steps:
@@ -21,26 +21,14 @@ jobs:
         with:
           path: tp4-c1-study
           persist-credentials: false
-      - name: Prepare two pinned images and one frozen AgentX client
+      - name: Recreate baseline AgentX client from its exact dependency lock
         id: prepare
         timeout-minutes: 40
         env:
           HF_TOKEN: ${{ secrets.AMD_HF_TOKEN }}
-        run: python3 tp4-c1-study/.github/scripts/image_ab.py prepare
-      - name: Official image · TP4 C1 · 3600 seconds
-        id: official
-        timeout-minutes: 130
-        run: python3 tp4-c1-study/.github/scripts/image_ab.py run official
-      - name: Upload official image evidence
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: tp4-c1-official-${{ github.run_attempt }}
-          path: tp4-c1-results/${{ github.run_id }}-${{ github.run_attempt }}/official/
-          if-no-files-found: warn
-          retention-days: 15
+          TP4_C1_BASELINE_RUN_ID: '38855733134'
+        run: python3 tp4-c1-study/.github/scripts/image_ab.py prepare current
       - name: Current image · TP4 C1 · 3600 seconds
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.official.outcome == 'success' }}
         timeout-minutes: 130
         run: python3 tp4-c1-study/.github/scripts/image_ab.py run current
       - name: Upload current image evidence and experiment identity
