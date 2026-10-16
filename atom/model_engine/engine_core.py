@@ -22,6 +22,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
+from atom.model_engine.prefix_hash import attach_shipped_chains
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
 from atom.model_engine.sequence import (
     Sequence,
@@ -745,7 +746,8 @@ class EngineCore:
                     obj = sock.recv(copy=False)
                     received_at = time.perf_counter()
                     try:
-                        request_type, reqs = pickle.loads(obj)
+                        # ADD may carry the seqs' shipped prompt chains third.
+                        request_type, reqs, *chains = pickle.loads(obj)
                     except Exception:
                         # This thread is the only way requests reach the engine,
                         # so letting it die strands every later request: the
@@ -759,6 +761,7 @@ class EngineCore:
                         )
                         continue
                     if request_type == EngineCoreRequestType.ADD:
+                        attach_shipped_chains(reqs, *chains)
                         for req in reqs:
                             SchedulerMetrics.enqueue(req, received_at=received_at)
                         req_ids = [req.id for req in reqs]
@@ -822,9 +825,6 @@ class EngineCore:
                     seq for seq in seqs if seq.status != SequenceStatus.EXIT_ENGINE
                 ]
                 num_valid = len(valid_seqs)
-                for seq in valid_seqs:
-                    # Unconsumed if the seq never reached a prefix probe.
-                    seq.prompt_hash_chain = None
                 if num_valid > 0:
                     obj = pickle.dumps((EngineCoreRequestType.ADD, valid_seqs))
                     socket.send(obj)

@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Admission host-overhead switches must not change answers: the fast prefix walk
-# (`ATOM_PREFIX_FAST_WALK`), the delayer's probe memo (`..._PROBE_MEMO`) and the
-# frontend-hashed prompt chain (`ATOM_FRONTEND_PREFIX_HASH`).
+# (`ATOM_PREFIX_FAST_WALK`), the per-tick walk memo (`ATOM_PREFIX_WALK_MEMO`) and
+# the frontend-hashed prompt chain (`ATOM_FRONTEND_PREFIX_HASH`).
 
 import array
+import importlib
 import pickle
+import queue
 import random
+import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +26,12 @@ from test_state_checkpoint import (
 )
 
 from atom.model_engine.block_manager import BlockManager
-from atom.model_engine.prefix_hash import chained_block_hashes, ship_prompt_hash_chain
+from atom.model_engine.prefix_hash import (
+    attach_shipped_chains,
+    chained_block_hashes,
+    ship_prompt_hash_chain,
+    take_shipped_chains,
+)
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 
@@ -219,6 +228,66 @@ def test_allocate_checks_only_the_ids_it_claims(monkeypatch):
         assert seq.num_cached_tokens == claimed * BLOCK
 
 
+class CountingIndex(dict):
+    lookups = 0
+
+    def get(self, *a):
+        self.lookups += 1
+        return super().get(*a)
+
+
+@pytest.mark.parametrize("hit", [0, 1, 8, 40])
+def test_a_walk_looks_up_near_its_hit_not_the_whole_chain(hit):
+    """The first block alone, then rounds of 16, 64, ...: a cold 400-block
+    prompt costs one lookup."""
+    tokens = list(range(BLOCK * 400 + 1))
+    bm = BlockManager(prefix_config(num_kvcache_blocks=1024))
+    if hit:
+        published(tokens[: hit * BLOCK], bm)
+    bm.kv._hash_to_block_id = index = CountingIndex(bm.kv._hash_to_block_id)
+    assert bm.can_allocate(shipped_seq(tokens), record=False) == hit
+    assert index.lookups <= max(1, 4 * hit + 16)
+
+
+def test_publish_revokes_the_hash_a_block_held():
+    """Indexed content never changes: a new hash on an indexed block drops
+    its old one, as an eviction does, for the memo and `allocate` too."""
+    bm = published(range(40))
+    seq = Sequence(list(range(40)) + [900], BLOCK)
+    assert bm.can_allocate_memoized(seq) == exact(bm, seq) == 10
+    old = bm._prompt_hashes(seq)[3]
+    block_id = bm.kv.lookup(old)
+    bm.kv.publish(block_id, 12345, array.array("i", [7] * BLOCK))
+    assert bm.kv.lookup(old) == -1 and bm.total_evicted_blocks == 1
+    assert bm.can_allocate_memoized(seq) == 3
+    assert bm.allocate(seq, 10) and seq.num_cached_tokens == 3 * BLOCK
+
+
+def test_only_a_moved_or_dropped_hash_bumps_the_index_version():
+    """`allocate` skips revalidation while it holds: not bumped by a
+    republish in place or a new hash."""
+    bm = published(range(40))
+    kv, version = bm.kv, bm.kv.index_version
+    h = chained_block_hashes(list(range(8)), BLOCK, 0, 2, -1)[1]
+    block = kv.block(kv.lookup(h))
+    kv.publish(block.block_id, block.hash, block.token_ids)
+    published(range(100, 140), bm)
+    assert kv.index_version == version
+    kv.publish(bm._fresh_block(), block.hash, block.token_ids)  # remapped
+    assert kv.index_version == version + 1
+
+
+def test_chain_to_continues_only_a_prefix_of_the_prompt_chain():
+    bm = BlockManager(prefix_config())
+    seq = Sequence(PROMPT, BLOCK)
+    want = reference_chain(PROMPT, BLOCK, -1, 10)
+    assert bm._chain_to(seq, [], 10) == want == bm._prompt_hashes(seq)
+    assert bm._chain_to(seq, want[:4], 10) == want
+    other = reference_chain(PROMPT, BLOCK, 7, 10)  # another seed's chain
+    assert bm._chain_to(seq, other[:4], 10) == other
+    assert bm._prompt_hashes(seq) == want
+
+
 @pytest.mark.parametrize("block,fast_hit,slow_hit", [(9, 9, 9), (4, 10, 4)])
 def test_hash_collision(block, fast_hit, slow_hit):
     """Only the last hit block's tokens are compared (the documented trade-off)."""
@@ -346,13 +415,20 @@ def test_shipped_chain_equals_engine_chain(seed, dcp, length):
     engine_bm._chain_to(engine_seq, [], length // hbs)
     engine_chain = engine_bm._prompt_hashes(engine_seq)
     assert engine_chain == whole[: length // hbs]
-    seq = pickle.loads(pickle.dumps(shipped_seq(tokens, seed, hbs)))  # the IPC
+    [seq] = over_ipc([shipped_seq(tokens, seed, hbs)])
     assert seq.prompt_hash_chain[:3] == (hbs, seed, length)
     assert seq.prompt_hash_chain.hashes.tolist() == engine_chain
     bm = BlockManager(prefix_config(decode_context_parallel_size=dcp))
     assert bm._prompt_hashes(seq) == engine_chain
     assert (bm.shipped_chains_adopted, bm.shipped_chains_rejected) == (1, 0)
     assert seq.prompt_hash_chain is None  # consumed
+
+
+def over_ipc(seqs):
+    """The ADD frame's trip: seqs pickled, their chains beside them."""
+    seqs, chains = pickle.loads(pickle.dumps((seqs, take_shipped_chains(seqs))))
+    attach_shipped_chains(seqs, chains)
+    return seqs
 
 
 PROMPT = list(range(40)) + [900, 901, 902]
@@ -431,51 +507,54 @@ def test_frontend_preprocess_ships_the_chain():
     assert off.preprocess(tokens, SamplingParams()).prompt_hash_chain is None
 
 
-def test_the_frontend_drops_the_chain_once_sent():
+def _real(name, monkeypatch):
+    """`name` imported for real, even over a stub (no `__file__`) another test
+    file left in `sys.modules`."""
+    if getattr(sys.modules.get(name), "__file__", None) is None:
+        monkeypatch.delitem(sys.modules, name, raising=False)
     with stubbed_aiter():
-        from atom.model_engine.engine_core_mgr import CoreManager
-    mgr = object.__new__(CoreManager)
-    mgr.label, mgr.pp_size, mgr.local_engine_count = "test", 1, 1
-    mgr._seq_id_to_callback, sent = {}, []
-    mgr._send_request = lambda rank, payload: sent.extend(pickle.loads(payload)[1])
+        return importlib.import_module(name)
+
+
+@pytest.mark.parametrize("manager", ["CoreManager", "DisaggCoreManager"])
+def test_the_chain_rides_beside_the_seqs(monkeypatch, manager):
+    """Frontend to engine in the ADD frame, next to the seqs; the frontend
+    keeps no copy, and the disaggregated prefill engine (no BlockManager)
+    gets none."""
     tokens = list(range(41))
     seqs = _processor().preprocess_fanout(tokens, SamplingParams(n=3, temperature=0.8))
-    mgr.add_request(seqs)
-    want = reference_chain(tokens, BLOCK, -1, 10)
-    assert [s.prompt_hash_chain.hashes.tolist() for s in sent] == [want] * 3
-    assert all(s.prompt_hash_chain is None for s in seqs)
-
-
-def test_the_engine_sends_seqs_back_without_a_chain(tmp_path):
-    """A seq aborted while waiting never reached a probe to consume it."""
-    import queue
-    import threading
-
-    import zmq
-
-    with stubbed_aiter():
-        from atom.model_engine.engine_core import EngineCore
-    from atom.model_engine.sequence import get_exit_sequence
-
-    address = f"ipc://{tmp_path}/out"
-    ctx = zmq.Context()
-    pull = ctx.socket(zmq.PULL)
-    pull.setsockopt(zmq.LINGER, 0)
-    pull.setsockopt(zmq.RCVTIMEO, 10_000)
-    pull.bind(address)
-    core = SimpleNamespace(label="test", output_queue=queue.Queue())
-    core.output_queue.put([shipped_seq(range(41)), get_exit_sequence()])
-    out = threading.Thread(
-        target=EngineCore.process_output_sockets, args=(core, address)
+    mgr = object.__new__(
+        getattr(_real("atom.model_engine.engine_core_mgr", monkeypatch), manager)
     )
-    out.start()
-    try:
-        sent = pickle.loads(pull.recv())[1]
-    finally:
-        out.join(10)
-        pull.close()
-        ctx.term()
-    assert [s.prompt_hash_chain for s in sent] == [None]
+    mgr.label, mgr.pp_size, mgr.local_engine_count = "test", 1, 1
+    mgr._seq_id_to_callback, frames = {}, []
+    mgr._send_request = lambda rank, payload: frames.append((rank, payload))
+    mgr.add_request(seqs)
+    assert all(s.prompt_hash_chain is None for s in seqs)
+    if manager == "DisaggCoreManager":
+        (rank, frame), (prefill, prefill_frame) = frames
+        assert (rank, prefill, len(pickle.loads(prefill_frame))) == (1, 0, 2)
+    else:
+        [(rank, frame)] = frames
+    core = _real("atom.model_engine.engine_core", monkeypatch)
+    feed = iter([frame, pickle.dumps((core.EngineCoreRequestType.SHUTDOWN, None))])
+    sock = SimpleNamespace(send=lambda _: None, recv=lambda **_: next(feed))
+    monkeypatch.setattr(core, "make_zmq_socket", lambda *a, **kw: nullcontext(sock))
+    poller = SimpleNamespace(register=lambda *a: None, poll=lambda: [(sock, 1)])
+    monkeypatch.setattr(core.zmq, "Poller", lambda: poller)
+    engine = object.__new__(core.EngineCore)
+    engine.label, engine.input_queue = "test", queue.Queue()
+    engine.process_input_sockets("input", "control")
+    want = reference_chain(tokens, BLOCK, -1, 10)
+    got = engine.input_queue.get_nowait()
+    assert [s.prompt_hash_chain.hashes.tolist() for s in got] == [want] * 3
+
+
+def test_a_pickled_seq_never_carries_a_chain():
+    """Neither to the engine (the ADD frame carries it) nor back."""
+    seq = shipped_seq(PROMPT)
+    assert pickle.loads(pickle.dumps(seq)).prompt_hash_chain is None
+    assert seq.prompt_hash_chain is not None
 
 
 def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
@@ -491,13 +570,13 @@ def test_the_chain_counters_reach_the_periodic_stats(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "var", ["PREFIX_FAST_WALK", "PREFILL_DELAYER_PROBE_MEMO", "FRONTEND_PREFIX_HASH"]
+    "var", ["PREFIX_FAST_WALK", "PREFIX_WALK_MEMO", "FRONTEND_PREFIX_HASH"]
 )
 def test_off_switch(monkeypatch, var):
     monkeypatch.setenv("ATOM_" + var, "0")
     bm = published(range(40))
     assert bm.fast_prefix_walk == (var != "PREFIX_FAST_WALK")
-    assert bm.walk_memo == (var != "PREFILL_DELAYER_PROBE_MEMO")
+    assert bm.walk_memo == (var != "PREFIX_WALK_MEMO")
     seq = shipped_seq(list(range(40)) + [900])
     assert (seq.prompt_hash_chain is None) == (var == "FRONTEND_PREFIX_HASH")
     assert bm.can_allocate_memoized(seq) == exact(bm, seq) == 10

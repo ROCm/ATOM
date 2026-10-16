@@ -368,12 +368,11 @@ def allocate(self, seq: Sequence):
 
 **KV Cache allocation:**
 
-1. Iterates over `seq.num_blocks` blocks.
-2. For each block, computes hash if the block is full (`len(token_ids) == block_size`). Partial (last) blocks get `hash = -1`.
-3. If prefix caching is enabled, looks up `kv.lookup(h)`:
-   - **Cache hit:** Verifies `token_ids` match, then `kv.claim(block_id)` — `ref_count += 1` if live, otherwise take it off the free list with its contents intact. Deliberately not `kv.allocate`, whose reset would drop the hash and destroy the entry for everyone else. Increments `seq.num_cached_tokens` by `block_size`.
-   - **Cache miss:** `kv.pop()` then `kv.allocate()`.
-4. Full blocks are registered by `kv.publish(block_id, h, token_ids)`.
+1. Claims the hit blocks `can_allocate` found. On the fast walk (`ATOM_PREFIX_FAST_WALK`) it takes the ids of the seq's last walk as one run (`kv.claim_many`), after checking only that their hashes still resolve to them (no check while `kv.index_version` is unchanged). Otherwise, and for a joint tail past that run, it names each block from the prompt chain (`_prompt_hashes`) and claims `kv.lookup(h)`. It compares no tokens: the walk did (the last hit block on the fast walk, every hit block on the per-block walk).
+   - `kv.claim(block_id)`: `ref_count += 1` if live, otherwise take it off the free list with its contents intact. Deliberately not `kv.allocate`, whose reset would drop the hash and destroy the entry for everyone else.
+   - A hash evicted since the probe stops the claim there and lowers the cached count to what was claimed.
+2. The rest of the block table is fresh blocks (`_fresh_block`: `kv.pop()` then `kv.allocate()`), and `seq.num_cached_tokens` is the cached blocks times the hash block size.
+3. Full blocks are registered after their forward by `hash_blocks` (`kv.publish(block_id, h, token_ids)`), which also revokes another hash the block was still indexed under: indexed content never changes.
 
 **Per-request cache allocation (if `seq.has_per_req_cache`):**
 
@@ -451,11 +450,11 @@ gates, the bounded replay, the checkpoint demand/end, the count of hit blocks
 already in use, and the fit. `allocate` claims the block ids the seq's last
 walk found, unless the index changed under them.
 
-The delayer and the DP chunk-cost estimate call `can_allocate_memoized`. It
-reuses a seq's walk until a hash the walk read is evicted or remapped, or the
-hash at its first miss is published (`ATOM_PREFILL_DELAYER_PROBE_MEMO` lists
-every trigger), and runs the same evaluation on every call, so it returns what
-`can_allocate` would. `allocate` revalidates only the ids it claims.
+The probes that run every tick (the delayer's head check and probe, the DP
+chunk-cost estimate) call `can_allocate_memoized`. It reuses a seq's walk until
+a hash the walk read leaves the index or is remapped, or the hash at its first
+miss is published (`ATOM_PREFIX_WALK_MEMO` lists every trigger), and runs the
+same evaluation on every call, so it returns what `can_allocate` would. `allocate` revalidates only the ids it claims.
 
 `can_append` checks whether the next decode extension needs additional blocks,
 including speculative tokens and the active cache layout.

@@ -124,6 +124,10 @@ _RECENT_INDEX_CHANGES = 8192
 # from MIN to MAX; bounds the hashing wasted past the first miss.
 _WALK_HASH_ROUND_MIN = 64
 _WALK_HASH_ROUND_MAX = 1024
+# Blocks `_hit_walk` looks up per round on the cached chain: the first block
+# alone, then 16, growing 4x; bounds the lookups past the first miss to ~4x
+# the hit.
+_WALK_LOOKUP_ROUND_MIN = 16
 
 
 @dataclass(slots=True)
@@ -199,7 +203,7 @@ class BlockManager:
         self._recent_index_changes: deque[int] = deque(maxlen=_RECENT_INDEX_CHANGES)
         self._index_changes = 0
         self._index_clears = 0
-        self.walk_memo: bool = envs.ATOM_PREFILL_DELAYER_PROBE_MEMO
+        self.walk_memo: bool = envs.ATOM_PREFIX_WALK_MEMO
         # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
         self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
         # Each seq's last fast walk, for its `allocate` to claim.
@@ -1035,8 +1039,10 @@ class BlockManager:
         caller's loop variable holds a hash that is not in the chain.
         """
         prompt = self._prompt_hashes(seq)
-        # `block_hashes` is a prefix of the prompt chain: continue it in one slice.
         chain = list(block_hashes)
+        k = min(len(chain), len(prompt))
+        if k and (chain[0], chain[k - 1]) != (prompt[0], prompt[k - 1]):
+            prompt = []  # Not a prefix of the prompt chain: hash past it.
         chain += prompt[len(chain) : blocks]
         h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
@@ -1210,10 +1216,12 @@ class BlockManager:
     def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
         """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
 
-        Resolves the chain with one `map`, hashing ahead in rounds past the
-        cached prompt chain. Tokens are compared on the last hit block only:
-        indexed contents cannot change (`publish` writes fresh blocks,
-        `allocate` unindexes first), so a mismatch is a 64-bit hash collision,
+        Looks the cached prompt chain up with `map` in rounds growing from the
+        first block alone (`_WALK_LOOKUP_ROUND_MIN`), so a cold prompt costs
+        one lookup, and hashes ahead in rounds past it. Tokens are compared on
+        the last hit block only: indexed contents cannot change (`publish`
+        revokes a block's old hash, `allocate` unindexes first), so a mismatch
+        is a 64-bit hash collision,
         and then every block is compared as the per-block walk did. A collision
         on an interior block alone goes undetected (vLLM compares none).
         """
@@ -1222,10 +1230,12 @@ class BlockManager:
         hashes: list[int] = []
         ids: list = []
         hash_round = _WALK_HASH_ROUND_MIN
+        look = 1
         while len(hashes) < n:
             k = len(hashes)
             if k < len(prompt):
-                new = prompt[k:n]
+                new = prompt[k : min(n, k + look)]
+                look = max(4 * look, _WALK_LOOKUP_ROUND_MIN)
             else:
                 end = min(n, k + hash_round)
                 new = chained_block_hashes(

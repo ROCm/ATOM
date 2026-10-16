@@ -1153,6 +1153,21 @@ class GDNStateMixin(PoolRowsMixin):
         index out of this tensor, and the conv path is handed column 0 alone),
         so this is where a contiguity assumption would have been *invented*
         rather than a place one has to be honoured.
+
+        Every row past the state-holding seqs is reset to PAD_SLOT_ID, which
+        every GDN/KDA kernel skips. The rows a forward publishes are its
+        scheduled seqs, and a seq without a state slot is filtered out of
+        `batch.state_slots`, so such a row would otherwise keep whatever the
+        previous batch wrote there. The DP-sync dummy decode
+        (`ModelRunner.dummy_execution`: one seq, id -1, no slot) is that case.
+        An idle DP rank runs it while its own requests sit unscheduled, for
+        example between prefill chunks while the PrefillDelayer holds. With a
+        stale index its decode updates the conv and recurrent state of the
+        first request of the rank's last real batch in place. That request then
+        continues from a corrupted state. A prefix-cache checkpoint pending
+        from that slot stores the corrupted state for every later hit on the
+        prefix. TP-only serving never runs the dummy, which is why this only
+        shows under DP attention.
         """
         self._check_state_indices_writable()
         non_spec_state_indices = self.non_spec_state_indices_tensor.np
@@ -1163,6 +1178,10 @@ class GDNStateMixin(PoolRowsMixin):
             "state fork on the spec-decode path: spec_state_indices_tensor has "
             "no read-side counterpart (BlockManager only forks onto prefill)"
         )
+        num_state_rows = len(batch.state_slots)
+        non_spec_state_indices[num_state_rows:] = PAD_SLOT_ID
+        non_spec_state_indices_in[num_state_rows:] = PAD_SLOT_ID
+        spec_state_indices[num_state_rows:] = PAD_SLOT_ID
         for idx, slots in enumerate(batch.state_slots):
             non_spec_state_indices[idx] = 0
             non_spec_state_indices_in[idx] = 0

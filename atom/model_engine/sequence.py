@@ -387,9 +387,9 @@ class Sequence:
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
         # `prefix_hash.ShippedChain`, consumed by
-        # `BlockManager._adopt_shipped_chain`; None = the engine hashes it.
-        # Dropped by the frontend once sent (`CoreManager.add_request`) and by
-        # the engine before a seq goes back (`EngineCore.process_output_sockets`).
+        # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
+        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
+        # inside a pickled seq (`__getstate__`).
         self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
@@ -600,6 +600,12 @@ class Sequence:
         self.last_token = token_id
         self.output_tokens.append(token_id)
         self.num_tokens += 1
+
+    def __getstate__(self):
+        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        state = self.__dict__.copy()
+        state["prompt_hash_chain"] = None
+        return state
 
     # def __getstate__(self):
     #     return (
