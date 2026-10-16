@@ -14,6 +14,7 @@ import types
 import pytest
 import torch
 
+from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, Dims
 from atom.models.kimi_k3.mono.layouts import unshuffle_scale, unshuffle_weight
 
 # (rows, packed columns) of the planes K3's bind actually undoes, and two small
@@ -125,18 +126,84 @@ def test_shuffled_scale_is_still_inverse_permuted():
     assert torch.equal(got, _reference(packed, scale))
 
 
-def test_a_bound_band_does_not_retain_the_whole_plane():
-    """A row `narrow` of a row-major tensor is already contiguous, so
-    `.contiguous()` returns the same view and the full dequantized plane stays
-    alive behind it. K3 binds one TP band per rank out of a 49 MiB temporary;
-    holding the temporary costs ~43 MiB a layer a rank, which runs the lazy
-    bind out of memory and silently drops mono back to the production path."""
-    plane = torch.arange(256 * 64, dtype=torch.bfloat16).reshape(256, 64)
-    band = plane.narrow(0, 64, 64)
-    assert band.is_contiguous() and band.contiguous() is band
+def _bf16(*shape):
+    return torch.zeros(*shape, dtype=torch.bfloat16)
 
-    bound = band.clone()
-    assert torch.equal(bound, band)
-    assert bound.is_contiguous()
-    assert bound.untyped_storage().nbytes() == band.numel() * band.element_size()
-    assert bound.untyped_storage().nbytes() < plane.untyped_storage().nbytes()
+
+def _norm(n):
+    return types.SimpleNamespace(weight=_bf16(n), eps=1e-5)
+
+
+def _lin(*shape):
+    return types.SimpleNamespace(weight=_bf16(*shape))
+
+
+def _moe_layer(dims, plane):
+    """A decoder layer stubbed down to exactly what `bind_moe` reads."""
+    seam = types.SimpleNamespace(
+        norm=_norm(HIDDEN), proj=_norm(HIDDEN), out_norm=_norm(HIDDEN)
+    )
+    gate = types.SimpleNamespace(
+        weight=_bf16(EXPERTS, HIDDEN),
+        e_score_correction_bias=torch.zeros(EXPERTS, dtype=torch.bfloat16),
+    )
+    moe = types.SimpleNamespace(
+        use_latent_moe=True,
+        gate=gate,
+        routed_expert_norm=_norm(LATENT),
+        shared_experts=types.SimpleNamespace(
+            gate_up_proj=_lin(2 * dims.sh_inter, HIDDEN),
+            down_proj=_lin(HIDDEN, dims.sh_inter),
+        ),
+        routed_expert_up_proj=plane,
+        routed_expert_down_proj=None,
+    )
+    return types.SimpleNamespace(
+        block_sparse_moe=moe,
+        mlp_attn_res=seam,
+        self_attn=types.SimpleNamespace(o_proj=_lin(HIDDEN, dims.proj)),
+    )
+
+
+def test_the_bound_up_projection_band_owns_its_storage(monkeypatch):
+    """`bind_moe` must COPY this rank's band out of the dequantized plane.
+
+    A row `narrow` of a row-major tensor is already contiguous, so
+    `.contiguous()` hands back the same view and the whole 7168x3584 bf16
+    plane stays alive behind the band: 49 MiB held per mono layer per rank to
+    carry 6.1 MiB. That is memory the lazy bind does not have, and running out
+    of it drops the deployment back to the production path.
+
+    Driven through `bind_moe` with a mock dequantizer rather than asserted on a
+    bare tensor: the storage assertion below only means something if it is the
+    production call site producing the tensor. Checking `narrow().clone()` on a
+    tensor built in the test would restate torch's semantics and stay green
+    with production reverted.
+    """
+    from atom.models.kimi_k3.mono import weights as w
+
+    dims = Dims(8)
+    rank = 1
+    torch.manual_seed(0)
+    plane = torch.randn(HIDDEN, LATENT, dtype=torch.bfloat16)
+
+    # the real one needs preshuffled MXFP4 bytes; `bind_moe` only cares that it
+    # returns the dequantized plane. The down-projection is passed straight
+    # through, so a stand-in keeps the fixture off a second 49 MiB allocation.
+    def _dequant(module, name, shape):
+        return plane if module is plane else _bf16(*shape)
+
+    monkeypatch.setattr(w, "_mxfp4_to_bf16", _dequant)
+    # the expert planes are 1.2 GB and 616 MB a layer; `_experts` validates
+    # them and `bind_moe` passes them through untouched
+    stub = torch.zeros(1, dtype=torch.uint8)
+    monkeypatch.setattr(w, "_experts", lambda *a: (stub, stub, stub, stub))
+
+    bound = w.bind_moe(_moe_layer(dims, plane), 1, dims, rank)
+
+    expected = plane[rank * dims.up_n : (rank + 1) * dims.up_n]
+    assert torch.equal(bound.w_up, expected)
+    assert bound.w_up.is_contiguous()
+    # the whole claim: the band carries its own 6.1 MiB, not the plane's 49
+    assert bound.w_up.untyped_storage().nbytes() == dims.up_n * LATENT * 2
+    assert bound.w_up.untyped_storage().nbytes() < plane.untyped_storage().nbytes()
