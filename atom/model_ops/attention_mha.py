@@ -19,8 +19,10 @@ from atom.model_ops.base_attention import (
     dense_decode_splits,
     gluon_decode_over_limit,
     gluon_decode_supports_arch,
+    is_per_token_kv_scale,
     run_pa_decode,
     run_pa_fwd_asm,
+    unified_attention_reads_per_token_kv_scales,
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -181,19 +183,25 @@ class PagedAttentionImpl(nn.Module):
         return q.shape[1] % k.shape[1] == 0
 
     def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
-        """unified_attention carries one descale for the whole tensor.
+        """Refuse per-token KV scales where unified_attention cannot read them.
 
-        Feeding it a per-token cache is not an error downstream, just wrong
-        numbers, so it has to be refused here. Both phases route into unified on
-        the same conditions, so both check.
+        An aiter without per-token support reads one descale for the whole
+        tensor and returns wrong numbers, not an error. With support, aiter
+        reads them only in decode and raises for the other paths itself.
         """
-        if (k_scale is not None and k_scale.numel() > 1) or (
-            v_scale is not None and v_scale.numel() > 1
-        ):
+        if not is_per_token_kv_scale(k_scale, v_scale):
+            return
+        if phase != "decode" or not unified_attention_reads_per_token_kv_scales():
             raise NotImplementedError(
                 f"layer {self.layer_num} takes unified_attention for {phase}, "
                 "which cannot carry its per-token KV scales"
             )
+
+    def _unified_kv_descales(self, k_scale, v_scale):
+        """Per-token cache scales if the layer has them, else the tensor scale."""
+        if is_per_token_kv_scale(k_scale, v_scale):
+            return k_scale, v_scale
+        return self.kv_scale, self.kv_scale
 
     def forward_impl(
         self,
@@ -600,6 +608,7 @@ class PagedAttentionImpl(nn.Module):
         """
         attn_metadata = fwd_ctx.attn_metadata
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
+        k_descale, v_descale = self._unified_kv_descales(k_scale, v_scale)
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
@@ -625,8 +634,8 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
-            v_descale=self.kv_scale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
         )

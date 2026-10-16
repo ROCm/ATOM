@@ -241,12 +241,14 @@ def _sparse_pa_ran_on_asm(
     """
     from atom.model_ops.base_attention import (
         PA_ASM_MAX_QUERY_GROUP_SIZE,
+        pa_fwd_asm_supports_arch,
         run_pa_fwd_asm,
     )
 
     rows, group, head_dim = q.shape
     if (
-        k_scale is None
+        not pa_fwd_asm_supports_arch()
+        or k_scale is None
         or not _is_fp8_kv_cache_tensor(k_cache)
         or group > PA_ASM_MAX_QUERY_GROUP_SIZE
         or rows <= _gluon_one_pass_max_rows(q.device.index)
@@ -1369,16 +1371,26 @@ def _sparse_unified_per_row(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
 ) -> None:
-    """Run each sparse row as a length-one sequence through unified attention."""
-    from aiter.ops.triton.unified_attention import unified_attention
+    """Run each sparse row as a length-one sequence through unified attention.
 
-    if (k_scale is not None and k_scale.numel() > 1) or (
-        v_scale is not None and v_scale.numel() > 1
-    ):
-        raise NotImplementedError(
-            "gfx1250 MiniMax-M3 sparse attention requires bf16 KV cache; "
-            "unified_attention cannot consume per-token fp8 KV scales"
-        )
+    fp8 per-token scales collapse like the cache, to one kv head per page.
+    """
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    from atom.model_ops.base_attention import (
+        is_per_token_kv_scale,
+        unified_attention_reads_per_token_kv_scales,
+    )
+
+    if is_per_token_kv_scale(k_scale, v_scale):
+        if not unified_attention_reads_per_token_kv_scales():
+            raise NotImplementedError(
+                "gfx1250 MiniMax-M3 sparse attention with fp8 KV cache needs an "
+                "aiter unified_attention that reads per-token KV scales"
+            )
+        pages, page_size = k_cache.shape[0], k_scale.shape[-1]
+        k_scale = k_scale.view(pages, 1, page_size)
+        v_scale = v_scale.view(pages, 1, page_size)
 
     rows = q.shape[0]
     unified_attention(
