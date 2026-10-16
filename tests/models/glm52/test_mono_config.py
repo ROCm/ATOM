@@ -282,3 +282,44 @@ def test_neox_indexer_rope_is_refused_and_its_default_is_the_refused_one(
         assert why == f"indexer_rope_interleave={seen!r}"
     else:
         assert why is None
+
+
+@pytest.mark.parametrize(
+    ("n_group", "topk_group", "refused"),
+    [
+        (_MISSING, _MISSING, False),  # ungrouped checkpoint -> global top-k
+        (None, None, False),  # explicit nulls read the same way
+        (1, 1, False),  # one group IS the whole expert set
+        (8, 8, False),  # every group kept -> the mask is a no-op
+        (8, 1, True),  # one group of eight: 7/8 of the experts masked out
+        (8, 4, True),  # DeepSeek-V3's shape
+        (4, 2, True),
+    ],
+)
+def test_a_grouped_router_is_refused_but_an_all_groups_one_is_not(
+    n_group, topk_group, refused
+):
+    """Production takes the top-k inside the best `topk_group` groups; the
+    kernel's `route_top8` takes a plain global top-8 with no group structure.
+
+    The boundary is the point: `topk_group == n_group` keeps every group, so
+    `masked_fill` changes nothing and production's top-k IS the global one over
+    `sigmoid + bias` -- the same key the kernel sorts on. Refusing on
+    "grouped at all" would disarm mono for every checkpoint that merely
+    declares groups it does not use, and refusing on nothing lets a genuinely
+    grouped one silently pick different experts.
+    """
+    cfg = _served_tp4_fp8_config(
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4)
+    ).hf_config
+    for name, value in (("n_group", n_group), ("topk_group", topk_group)):
+        if value is _MISSING:
+            assert not hasattr(cfg, name)
+        else:
+            setattr(cfg, name, value)
+    why = model_geometry_refusal(cfg, GLM5_CONFIG, 8)
+    if refused:
+        assert why == f"grouped top-k (n_group={n_group}, topk_group={topk_group})"
+    else:
+        # `is None`, so the checks above the gate are known to pass
+        assert why is None

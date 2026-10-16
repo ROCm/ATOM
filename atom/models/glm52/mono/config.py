@@ -187,6 +187,30 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
             return f"{name}={getattr(hf_config, name, None)!r}"
     if hf_config.moe_intermediate_size != shard.inter * tp_size:
         return "expert width"
+    # Production routes this MoE with GROUPED top-k -- `deepseek_v2.py` passes
+    # `use_grouped_topk=True, num_expert_group=config.n_group,
+    # topk_group=config.topk_group` -- which scores each group by the sum of
+    # its best two experts, keeps the best `topk_group` groups and zeroes every
+    # expert outside them before taking the top-k (aiter `ops/topk.py`).
+    # `route_top8` (`kernels/kernel.py`) is a plain global top-8 over all
+    # N_EXPERTS: `wave_umax_dpp` reduces across every lane and there is no group
+    # structure in it anywhere.
+    #
+    # The two agree only where the masking is a no-op. With every group kept,
+    # `masked_fill` leaves `scores_for_choice` untouched and production's top-k
+    # IS the global one over `sigmoid + bias` -- the same key `route_top8`
+    # sorts on. With a group left out, mono picks a different expert set
+    # whenever the global top 8 straddles it: different output, no error, no
+    # fallback. `topk_method` is pinned to `noaux_tc` above, which is the
+    # grouped method, so this is reachable rather than theoretical.
+    #
+    # Not an `expected` entry: those compare for equality, and what matters
+    # here is the RELATION between the two, plus the absent-reads-as-ungrouped
+    # default that a bare equality check cannot express.
+    n_group = getattr(hf_config, "n_group", None) or 1
+    topk_group = getattr(hf_config, "topk_group", None) or 1
+    if topk_group < n_group:
+        return f"grouped top-k (n_group={n_group}, topk_group={topk_group})"
     # The kernel rotates adjacent pairs unconditionally (`kernel.py`: x0, x1 at
     # `pr*2` and `pr*2 + 1`), i.e. interleaved / GPT-J, with no NeoX branch, for
     # both the MLA rope and the fused indexer's own, independent one. A
