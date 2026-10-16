@@ -1122,6 +1122,45 @@ models:
             cudagraph_mode: FULL
             compilation_level: 3
 
+        # 1P2D DSpark7 at C16: the mid-band DCP8 C16 cell (ReplaySSM on, 128 GiB
+        # LMCache tier) with the interactive band's 7-token draft at golden AL
+        # 3.84 and a second TP8+DCP8 decode node.
+        - <<: *kimi_k3_agentic_dcp8_lmcache
+          name: kimi-k3-mxfp4-1p2d-tp8-dcp8-dspark7-agentic-lmcache-1m-c16
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK7
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [16]
+          server:
+            common_args: *kimi_k3_agentic_dspark7_args
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+
+        # 1P2D TP8 DSpark7: the interactive-band TP8 cell (no LMCache, ReplaySSM
+        # off) with a second TP8 decode node.
+        - &kimi_k3_agentic_1p2d_tp8
+          <<: *kimi_k3_agentic_tp8
+          name: kimi-k3-mxfp4-1p2d-tp8-dspark7-agentic-1m-c4
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DSPARK7
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [4]
+          decode:
+            workers: 2
+            tp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
+
+        - <<: *kimi_k3_agentic_1p2d_tp8
+          name: kimi-k3-mxfp4-1p2d-tp8-dspark7-agentic-1m-c12
+          concurrency: [12]
+
         # Non-disaggregated counterpart to the no-draft C72 cell: one server does
         # prefill and decode on a single node, same workload and same server
         # knobs, so the pair isolates what the P/D split itself is worth.
