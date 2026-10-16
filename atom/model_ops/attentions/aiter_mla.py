@@ -283,6 +283,7 @@ class AiterMLABackend(AttentionBackend):
 
 
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
+    supplies_token_slots = True
     # EagleProposer folds the per-draft-step position/context bump into
     # prepare_mtp_decode's fused kernel when this is set (matches the MHA
     # backend). The fused kernel handles both sparse and dense MLA.

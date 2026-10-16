@@ -141,7 +141,7 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     batch.return_logprobs = [True] * scheduled_bs
     captured = {}
     runner = _runner(seen)
-    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp: (
+    runner.tokenID_processor.prepare_sampled_ids = lambda b, ids, ev, lp, **_k: (
         captured.update(logprobs=lp) or ({}, {})
     )
 
@@ -156,6 +156,46 @@ def test_the_logprob_gather_reads_the_cut_logits(monkeypatch):
     )
 
     assert captured["logprobs"].shape == (scheduled_bs,)
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_route_capture_off_runs_none_of_its_step_hooks(monkeypatch, deferred):
+    """With `enable_return_routed_experts` off, postprocess never reads slots,
+    stores, or attaches, and passes the token copy no route callback."""
+    monkeypatch.setattr(
+        mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(spec_decode_metadata=None),
+    )
+    monkeypatch.setattr(
+        mod, "get_tp_group", lambda: types.SimpleNamespace(world_size=1)
+    )
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("route hook ran with capture off")
+
+    monkeypatch.setattr(mod, "current_slot_mapping", _forbidden)
+    runner = _runner({})
+    runner._store_routed_experts_step = _forbidden
+    runner._attach_routed_experts = _forbidden
+    runner.tokenID_processor.is_deferred_out = deferred
+    runner.tokenID_processor.prev_batch = _batch(2) if deferred else None
+    after_recv = []
+    runner.tokenID_processor.prepare_sampled_ids = lambda *a, **k: (
+        after_recv.append(k.get("after_recv")) or ({}, {})
+    )
+
+    runner.postprocess(
+        batch=_batch(2),
+        logits=torch.zeros(2, 8),
+        temperatures=torch.ones(2),
+        top_ks=None,
+        top_ps=None,
+        all_greedy=False,
+        hidden_states=None,
+    )
+
+    assert after_recv == [None]
 
 
 def test_prefill_really_does_run_wider_than_it_scheduled():

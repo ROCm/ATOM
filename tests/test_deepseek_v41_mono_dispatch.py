@@ -51,6 +51,7 @@ def _atom_config(**overrides):
         "dspark": SimpleNamespace(confidence_schedule=False, ragged=False),
         "hf_config": SimpleNamespace(**_HF),
         "max_model_len": 1 << 20,
+        "enable_return_routed_experts": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -102,6 +103,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
         ({"enable_tbo": True}, "TBO"),
         ({"enable_tbo_decode": True}, "TBO"),
+        ({"enable_return_routed_experts": True}, "routed-expert capture"),
         (
             {
                 "compilation_config": SimpleNamespace(
