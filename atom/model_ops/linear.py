@@ -64,6 +64,23 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
+def use_mxfp4_n32k4_scale(weight: torch.Tensor) -> bool:
+    """Whether this per_1x32 FP4 weight is held with the 32x4 e8m0 scale layout that
+    aiter's gemm_a4w4 reads on gfx1250, instead of the Gluon one.
+
+    Only the layout is decided here: aiter's gemm_a4w4 picks the backend (a tuned FlyDSL
+    kernel, else asm) for every shape and M."""
+    if (
+        not envs.ATOM_FP4_MXSCALE_USE_32X4_SCALE_SHUFFLE
+        or use_fp4_non_shuffle_triton_gemm()
+        or weight.dim() != 2
+    ):
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx1250"
+
+
 def _require_mxfp4_preshuffle_triton() -> Callable:
     global gemm_afp4wfp4_preshuffle
 
@@ -197,6 +214,7 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    scale_layout_n32k4: bool = False,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -212,7 +230,22 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    scale_layout_n32k4: bool = False,
 ) -> torch.Tensor:
+    # The weight scale is held in aiter's 32x4 layout: quantize the activation into
+    # the matching layout and let gemm_a4w4 pick the tuned kernel for this shape.
+    if scale_layout_n32k4:
+        if x_scale is not None:
+            raise NotImplementedError(
+                "a 32x4 weight scale needs the activation quantized here; an "
+                "upstream x_scale is in the Gluon layout"
+            )
+        xq, xs = get_hip_quant(QuantType.per_1x32)(
+            x.view(-1, x.size(-1)),
+            quant_dtype=params_dtype,
+            scale_layout_m32k4=True,
+        )
+        return gemm_a4w4(xq, weight, xs, weight_scale, dtype=otype)
     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
     # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
     if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
@@ -1277,10 +1310,17 @@ class LinearBase(nn.Module):
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
+        self.fp4_n32k4_scale = False
         if self.quant_type.value == QuantType.per_1x32.value and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
-            self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+            if self.params_dtype == dtypes.fp4x2 and use_mxfp4_n32k4_scale(self.weight):
+                from aiter.ops.shuffle import shuffle_mxfp8fp4_scale
+
+                self.fp4_n32k4_scale = True
+                self.weight_scale.data = shuffle_mxfp8fp4_scale(self.weight_scale.data)
+            else:
+                self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
     def _maybe_pad_a8w8_preshuffle_output(self) -> bool:
         # The other half of the shuffle decision `process_weights_after_loading`
@@ -1519,6 +1559,7 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
+                    getattr(self, "fp4_n32k4_scale", False),
                 )
                 if self.bias is not None:
                     y += self.bias
