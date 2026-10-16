@@ -3062,10 +3062,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # nothing here writes the host copy.
         ctx["cu_seqlens_q"] = var["cu_seqlens_q"].gpu[: running_bs + 1]
 
+        # Plan only the sequences q/o have rows for. While a DP peer prefills,
+        # running_tokens is this rank's own count, yet the persistent kernel
+        # reads q and writes o for every work item, zero-KV padding included.
+        q_rows_bs = min(running_bs, running_tokens // max_seqlen_q)
+        assert q_rows_bs >= scheduled_bs, (
+            f"{running_tokens} decode rows cannot hold {scheduled_bs} sequences "
+            f"of max_seqlen_q={max_seqlen_q}"
+        )
         if is_sparse_mtp:
-            ctx_mla_ps = self.set_mla_persistent_worker_buffers(
-                running_bs, max_seqlen_q
-            )
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(q_rows_bs, max_seqlen_q)
             ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
                 running_tokens
             )
@@ -3083,7 +3089,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # that padded nothing reaches here with the two equal, and then this
             # is a no-op -- but eager no longer implies that, since a DP-unified
             # batch pads off the graph path too.
-            meta_bs = scheduled_bs if cp_round_robin else running_bs
+            meta_bs = scheduled_bs if cp_round_robin else q_rows_bs
             ctx_mla_ps = self.set_mla_persistent_worker_buffers(
                 meta_bs, max_seqlen_q, is_cp_round_robin=cp_round_robin
             )
