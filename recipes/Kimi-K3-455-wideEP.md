@@ -9,7 +9,9 @@ Full-size **Kimi-K3** on **two gfx1250 B0 trays, 4 GPUs each (432 GiB/GPU, SPX)*
 - **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261014`. It was rebuilt in the afternoon of 2026-10-14 and replaces
   the morning build under the same tag.
   - ATOM and aiter are at `main` of 2026-10-14, and mori is at a `main` commit.
-  - On top: eight unmerged PRs (six ATOM, two aiter), and the launch scripts in `/opt/k3`.
+  - On top: eight PRs that were not in `main` when the image was built (six ATOM, two aiter), and the launch
+    scripts in `/opt/k3`. Five of the eight have merged since and one was closed: see
+    [PRs in this image](#prs-in-this-image).
   - The launch quantizes the BF16 layers to FP8 online at load.
   - The ROCm, torch, Triton and FlyDSL stack comes from `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`.
   - See [Container and patches](#container-and-patches).
@@ -413,8 +415,8 @@ Then compare `find . -type f -printf '%P %s\n' | sort` on both sides.
 
 | | commit | on `main` |
 |---|---|---|
-| ATOM, `/app/ATOM` | `0adc6456` | `main` of 2026-10-14, plus six unmerged PRs (below) |
-| aiter, `/app/aiter` | `1305f0c8` | `main` of 2026-10-14, plus two unmerged PRs (below); aiter #5431 and #5844 are merged there |
+| ATOM, `/app/ATOM` | `0adc6456` | `main` of 2026-10-14, plus six PRs (below) |
+| aiter, `/app/aiter` | `1305f0c8` | `main` of 2026-10-14, plus two PRs (below); aiter #5431 and #5844 are merged there |
 | mori, `/app/mori` | `695d4c03` | `main` of 2026-10-10. This is the last commit before mori #745 (EPv2 1250x EP8), whose interface aiter `main` does not use yet (aiter #6430) |
 
 The previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261013`, ran ATOM, aiter and mori from the bring-up team's
@@ -459,21 +461,28 @@ sudo docker run -d --name k3dp8 \
 segments with `rm -f /dev/shm/psm_* /dev/shm/nccl-*`. Do this only when no other container shares the host's
 `/dev/shm`.
 
-### Unmerged PRs in this image
+### PRs in this image
 
-| PR | what it does | why K3 needs it |
-|---|---|---|
-| [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | resets stateless rows to PAD, so the DP dummy decode cannot update a live KDA state | with `--enable_prefix_caching`, the dummy decode poisoned a rank's cached prefixes |
-| [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | the Triton MLA decode addresses KV rows with int64 ids | with prefix caching and a large KV pool it decoded NaN past row 3,728,270. Only the Triton MLA decode (`ATOM_USE_TRITON_MLA=1`) has the bug; this launch runs aiter's |
-| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | ATOM picks MegaMoE's dispatch kernel (`MEGA_DISPATCH` overrides) and sizes the cco arena for the compact plan | without it, ATOM `main` always runs mori's dispatch on the fp4 wire |
-| [ATOM #2557](https://github.com/ROCm/ATOM/pull/2557) | plans the persistent MLA decode over the q/o rows that exist | while a peer DP rank prefills, the plan covered more rows than q/o have, and the kernel read and wrote past them |
-| [ATOM #2554](https://github.com/ROCm/ATOM/pull/2554) | online per_1x128 FP8 with E8M0 block scales on gfx1250 | without it, the online FP8 layers keep FP32 scales and run the generic Triton blockscale GEMM instead of aiter's mxfp8_128 FlyDSL GEMM. It also adapts K3's fused norm and sigmoid quant producers and KDA's `o_norm` |
-| [ATOM #2466](https://github.com/ROCm/ATOM/pull/2466) | gfx1250's MXFP4 (per_1x32) linear layers always use the Triton preshuffle GEMM | the ASM FP4 GEMM expects another scale permutation and silently corrupts outputs. This is why the launch no longer sets `ATOM_USE_TRITON_GEMM=1` |
-| [aiter #6121](https://github.com/ROCm/aiter/pull/6121) | gfx1250 FlyDSL `gather_kv_b_proj`: one kernel for K3's MLA cached-prefix expansion, from an FP8 cache with a ptpc FP8 `kv_b_proj` | the fused Triton gather hits an LLVM PHI assertion on gfx1250 in chunked prefill. With #6121, ATOM #2380's unfused fallback is not needed (below) |
-| [aiter #6530](https://github.com/ROCm/aiter/pull/6530) | Kimi-K3's tuned mxfp8_128 blockscale GEMM table for gfx1250 | picks the FlyDSL kernel for each of K3's FP8 GEMM shapes. Only the PR's own commit is applied; its branch also carries four newer `main` commits |
+None of the eight was in `main` of 2026-10-14. The last column is their state upstream on 2026-10-16. The image
+carries the revisions in the patch table further down; #2532, #2533 and aiter #6121 merged in later revisions.
+
+| PR | what it does | why K3 needs it | upstream, 2026-10-16 |
+|---|---|---|---|
+| [ATOM #2532](https://github.com/ROCm/ATOM/pull/2532) | resets stateless rows to PAD, so the DP dummy decode cannot update a live KDA state | with `--enable_prefix_caching`, the dummy decode poisoned a rank's cached prefixes | merged 10-16 (`7600b022`) |
+| [ATOM #2533](https://github.com/ROCm/ATOM/pull/2533) | the Triton MLA decode addresses KV rows with int64 ids | with prefix caching and a large KV pool it decoded NaN past row 3,728,270. Only the Triton MLA decode (`ATOM_USE_TRITON_MLA=1`) has the bug; this launch runs aiter's | merged 10-16 (`cd3bf5f6`) |
+| [ATOM #2522](https://github.com/ROCm/ATOM/pull/2522) | ATOM picks MegaMoE's dispatch kernel (`MEGA_DISPATCH` overrides) and sizes the cco arena for the compact plan | without it, ATOM `main` of 2026-10-14 always runs mori's dispatch on the fp4 wire | closed 10-15, not merged. `main` took [ATOM #2384](https://github.com/ROCm/ATOM/pull/2384) instead (10-15, `4010dca4`): MegaMoE's fused stage 1 and stage 2 on by default, with fp8/fp4 dispatch wires. Not in this image |
+| [ATOM #2557](https://github.com/ROCm/ATOM/pull/2557) | plans the persistent MLA decode over the q/o rows that exist | while a peer DP rank prefills, the plan covered more rows than q/o have, and the kernel read and wrote past them | open (newer revision `8a24a910`) |
+| [ATOM #2554](https://github.com/ROCm/ATOM/pull/2554) | online per_1x128 FP8 with E8M0 block scales on gfx1250 | without it, the online FP8 layers keep FP32 scales and run the generic Triton blockscale GEMM instead of aiter's mxfp8_128 FlyDSL GEMM. It also adapts K3's fused norm and sigmoid quant producers and KDA's `o_norm` | open |
+| [ATOM #2466](https://github.com/ROCm/ATOM/pull/2466) | gfx1250's MXFP4 (per_1x32) linear layers always use the Triton preshuffle GEMM | the ASM FP4 GEMM expects another scale permutation and silently corrupts outputs. This is why the launch no longer sets `ATOM_USE_TRITON_GEMM=1` | merged 10-15 (`0ed16fb2`) |
+| [aiter #6121](https://github.com/ROCm/aiter/pull/6121) | gfx1250 FlyDSL `gather_kv_b_proj`: one kernel for K3's MLA cached-prefix expansion, from an FP8 cache with a ptpc FP8 `kv_b_proj` | the fused Triton gather hits an LLVM PHI assertion on gfx1250 in chunked prefill. With #6121, ATOM #2380's unfused fallback is not needed (below) | merged 10-15 (`9bedcd4f`) |
+| [aiter #6530](https://github.com/ROCm/aiter/pull/6530) | Kimi-K3's tuned mxfp8_128 blockscale GEMM table for gfx1250 | picks the FlyDSL kernel for each of K3's FP8 GEMM shapes. Only the PR's own commit is applied; its branch also carries four newer `main` commits | open |
 
 - **Already in `main`:** aiter #5431, the symm_mem custom all-reduce for the allgather LM head, which also skips
   mori's shmem init on gfx125x. And aiter #5844, the FlyDSL PS1 MLA decode.
+- **Merged after this image: aiter [#6438](https://github.com/ROCm/aiter/pull/6438)** (2026-10-15, `d1fd7ea5`),
+  27 tuned grouped-MoE rows for K3's EP16 and DP8/EP8 shapes, CSV only. Without it the server logs
+  `no grouped CSV config matched (token=… experts=112 …)` and runs default tiles for those shapes. The 2026-10-16
+  AgentX runs add it on top of this image.
 - **Not in this image: ATOM [#2380](https://github.com/ROCm/ATOM/pull/2380)**, the unfused torch `gather_kv_b_proj`
   (closed upstream).
   - With the launch's online quantization, `kv_b_proj` is ptpc FP8 and aiter #6121 serves the gather, so the
@@ -728,6 +737,33 @@ Neither is aiperf's own per-user p90.
 
 Not measured with this image yet.
 
+#### Reference: ATOM on MI355X, from InferenceX (2026-10-15)
+
+For Pareto charts against this page's points. Source: the
+[InferenceX Kimi-K3 dashboard](https://inferencex.semianalysis.com/inference/kimi-k3) (SemiAnalysis), read on
+2026-10-16 from its API (`/api/v1/benchmarks?model=Kimi-K3`). ATOM's latest MI355X points there:
+
+- **Run:** 2026-10-15, [workflow 38676890603](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/38676890603),
+  image `rocm/atom-dev:nightly_202610131505`, 3600 s per point.
+- **Setup:** one node of 8 MI355X; TP 8, no EP, no DP attention; FP4; **MTP speculative decoding on**;
+  InferenceX's agentic trace replay.
+- **P90 interactivity** is the dashboard's x axis, `p90_intvty` = 1 / p90(ITL). Compare it with this page's
+  `1 / p90(ITL)` column, not with the E2E-normalized one.
+- **Throughput per GPU** is the dashboard's y axis, `tput_per_gpu`: input plus output tokens per second over the
+  8 GPUs, the same definition as this page's.
+
+| concurrency | P90 interactivity, 1 / p90(ITL), tok/s/user | throughput per GPU (total), tok/s | output tok/s per GPU | p90 TTFT | p90 ITL | requests | GPU prefix cache hit |
+|---|---|---|---|---|---|---|---|
+| 16 | **57.01** | **9,013** | 65.9 | 2.90 s | 17.5 ms | 2,046 | 94.0% |
+| 48 | **23.55** | **17,097** | 115.7 | 8.08 s | 42.5 ms | 3,629 | 77.3% |
+| 56 | **20.68** | **17,482** | 127.8 | 13.20 s | 48.3 ms | 3,973 | 87.9% |
+
+Not like for like:
+- MI355X, one node, TP 8 there, against MI455 (gfx1250), two trays, DP 8 / EP 8 here.
+- MTP is on there and off here. MTP shortens ITL, so it raises interactivity directly.
+
+The same run also has concurrency 1, 4, 14 and 72.
+
 #### Earlier sweep: concurrency 8, 16, 32 and 48 (2026-10-11)
 
 Kept for reference. Measured on CT2 + CT3 with an earlier stack:
@@ -770,7 +806,7 @@ Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`
 |---|---|
 | Every token is `!`, service otherwise fine | A0 silicon without translation. See [A0 and B0](#a0-and-b0-silicon) |
 | All ranks of a tray exit with code 255 at startup, without a traceback; the log has `[AMD-SMI] missing symbol amdsmi_init` | mori's topology loader opens `libamd_smi.so`. TheRock's wheels ship only `libamd_smi.so.27`, so it falls through to `librocm_smi64`, finds no `amdsmi_init` and calls `exit(-1)`. Set `MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27` |
-| `[MORI-V2] Created MegaMoE: … dispatch=mori` although `MEGA_DISPATCH=flydsl` | Patch 2 (#2522) is missing: ATOM `main` alone always runs mori's dispatch on the fp4 wire |
+| `[MORI-V2] Created MegaMoE: … dispatch=mori` although `MEGA_DISPATCH=flydsl` | Patch 2 (#2522) is missing: ATOM `main` of 2026-10-14 alone always runs mori's dispatch on the fp4 wire. Later `main` has ATOM #2384 instead |
 | `RuntimeError: ccoMemAlloc failed: -1` at MoE init, after `Out of heap memory! Requested: 6222249984 bytes` | The compact plan runs, but the cco arena was sized for the token-major plan. Patch 2 sizes it |
 | With `--enable_prefix_caching`: answers end in `!!!!…` up to `max_tokens` or come back empty, per rank or in bursts | #2532 and #2533 (patch 1) are missing. To check a server, send one prompt under two dozen session ids (`x-session-id`, `x-dynamo-session-id`) and look for `!!!!` |
 | All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: … Timed out waiting 1800000ms`; meanwhile `[aiter] No available shared memory broadcast block found` repeats | The allgather LM head's custom all-gather hung on one rank. rocgdb shows that rank in `aiter::ag_gfx1250_lastdim<bf16, 8>` and the others in `tdm_compact_plan`. Seen twice in a few hours of GSM8K, never in AgentX runs. Workaround: the replicated head. Watch the `Engine 00x: Avg` lines, not the log's mtime: they stop |
