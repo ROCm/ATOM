@@ -500,6 +500,33 @@ def fused_compress_attn(
     # is plain. (Back-compat: legacy quant=True → quant_mode None → _mode "fp8".)
     quant = _mode in ("fp8", "per_row_fp8", "fp4")
 
+    if _fp4 and envs.ATOM_V4_USE_GLUON:
+        # A warmup call has no cache. Skip it.
+        if kv_cache is not None:
+            from aiter.ops.triton.fusions.fused_compress_attn import (
+                fused_compress_attn_fp4,
+            )
+
+            fused_compress_attn_fp4(
+                kv_in,
+                score_in,
+                kv_state,
+                score_state,
+                state_slot_mapping,
+                plan.compress_plan_gpu,
+                ape,
+                rms_weight,
+                rms_eps,
+                # The RoPE tables are [max_pos, 1, 1, 32]. The Gluon kernel needs
+                # [max_pos, 32].
+                cos_cache.reshape(cos_cache.shape[0], -1),
+                sin_cache.reshape(sin_cache.shape[0], -1),
+                kv_cache,
+                cache_scale,
+                block_tables,
+            )
+        return
+
     # ------------------------------------------------------------------
     # flydsl dispatch. Pure-GPU time on V4-Pro beats Triton 0.9x→2.9x
     # across the relevant N_compress range; the small-N gap is bridged
@@ -597,9 +624,9 @@ def fused_compress_attn(
         return
 
     if _fp4:
-        # FP4 indexer scatter only exists in the flydsl kernel — the Triton
-        # fallback below has no FP4 path. Reaching here means flydsl is
-        # unavailable or the shape is unsupported.
+        # FP4 indexer scatter exists only in the flydsl kernel and in the Gluon
+        # kernel above (ATOM_V4_USE_GLUON=1) — the Triton fallback below has no FP4
+        # path. Reaching here means flydsl is unavailable or the shape is unsupported.
         raise RuntimeError(
             "quant_mode='fp4' requires the flydsl fused_compress_attn kernel "
             f"(available={flydsl_fused_compress_attn is not None}, "
