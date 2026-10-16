@@ -587,6 +587,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: draw the DSpark draft block from
+    # softmax(logits / T) and accept with the probability-ratio rule
+    # (`coin * q < p`) instead of proposing greedily and accepting only on exact
+    # equality with the target's own draw. Both halves or neither: a ratio
+    # kernel over a greedy delta q is an arithmetic no-op (sum_x min(p, q) =
+    # p(x*), which is what the exact-match kernel already computes), and a
+    # sampled draft under exact-match acceptance matches the target's draw
+    # strictly less often than a greedy one does.
+    #
+    # Defaults off, deliberately: it changes the emitted token distribution
+    # (both rules are target-exact, but they are not the same draw), and the
+    # house convention is that a behaviour-changing flag defaults off. A
+    # top-k/top-p batch is not refused -- the draft's q is unfiltered, so that
+    # step drops back to exact-match acceptance against the target's filtered
+    # draw, which is still lossless and only accepts less often. That drop is
+    # batch-wide (the accept kernel has one rule per launch and no exact-match
+    # branch to route a single row into), so such a batch also drafts greedily
+    # for that step and runs exactly the flag-off pair.
+    #
+    # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
+    # q is a full-vocab fp32 tensor per draft position and has to cross the step
+    # boundary. Twice over -- the block head's scratch, plus a persistent store
+    # of 2 x max_num_seqs per-request row blocks, because an intervening
+    # prefill-only step would otherwise overwrite the scratch rows a decode
+    # request's pending verify reads. The draft step also de-fuses, trading step
+    # latency for acceptance. Temperature-0 is unaffected: an all-greedy batch
+    # keeps the exact-match kernel, and a greedy row in a mixed batch draws a
+    # delta q that makes the ratio rule degenerate to exact match.
+    #
+    # Only a draft model that declares `supports_lossless_draft` honours it;
+    # any other flavor silently keeps the greedy pair. Not implemented under PP
+    # or PCP, which warn and fall back. Read at drafter construction, so it must
+    # be set before the server starts.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
+        os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

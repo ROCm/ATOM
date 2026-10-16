@@ -276,3 +276,59 @@ def test_sharded_step_writes_its_embed_column_in_place():
             embed_out=block[:, k],
         )
     assert torch.equal(block, torch.stack(fresh, dim=1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [1, 32])
+def test_the_sampling_kernel_is_the_argmax_kernel_at_temperature_zero(rows):
+    """ATOM_SPEC_LOSSLESS_SAMPLING arms `dspark_markov_sample` in place of
+    `dspark_markov_argmax`, so at T=0 the two FUSED kernels have to agree on
+    the id, chained position by position.
+
+    The CPU half of this claim is `tests/test_spec_lossless_no_op_at_t0.py`,
+    which pins the torch references it has to be able to reach without aiter.
+    This is the half that runs what production runs, and it is GPU- and
+    aiter-gated, so CI (`.github/scripts/run_unit_tests.sh`) does not see it.
+
+    T is `SAMPLER_EPS` rather than 0 because `prepare_sample` clamps it there
+    to keep the softmax out of a division by zero, and `greedy_mask` is what
+    then turns the exponential race into the argmax. Both are set, which is
+    exactly what `stage_draft_sampling` does for a greedy row -- the pair also
+    makes the published q the delta the id was drawn from, asserted here for
+    the same reason the accept kernel needs it to be true.
+    """
+    torch.manual_seed(7)
+    from atom.model_ops.dspark_markov_sample import dspark_markov_sample
+    from atom.model_ops.sampler import SAMPLER_EPS
+
+    steps, vocab, rank = 4, 2048, 128
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    temperatures = torch.full((rows,), SAMPLER_EPS, device="cuda")
+    greedy_mask = torch.ones(rows, dtype=torch.int32, device="cuda")
+    seed = torch.zeros(1, dtype=torch.int32, device="cuda")
+    probs = torch.empty(rows, vocab, dtype=torch.float32, device="cuda")
+
+    drawn, greedy = prev, prev
+    for k in range(steps):
+        ref_ids = _ids(rows, "cuda")
+        dspark_markov_argmax(base, greedy, w1, w2, ref_ids)
+        ids = _ids(rows, "cuda")
+        dspark_markov_sample(
+            base,
+            drawn,
+            w1,
+            w2,
+            ids,
+            probs,
+            temperatures,
+            greedy_mask,
+            seed,
+            k * rows * vocab,
+        )
+        assert torch.equal(ids, ref_ids), k
+        # q is the delta that argmax drew from, which is what makes
+        # `sum_x min(p, q) = p(x*)` an identity for a greedy row.
+        expected = torch.zeros_like(probs)
+        expected.scatter_(1, ids.view(-1, 1), 1.0)
+        torch.testing.assert_close(probs, expected, rtol=0, atol=0)
+        drawn, greedy = ids, ref_ids

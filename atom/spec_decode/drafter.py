@@ -343,6 +343,38 @@ class Drafter(abc.ABC):
         drafter uses fixed-length verification."""
         return None
 
+    # ---- lossless speculative sampling (DSpark-only; no-ops elsewhere) ----
+    #
+    # These four no-ops are the guard. `EagleProposer` and every MTP/EAGLE3
+    # drafter inherits them unchanged, which keeps the probability-ratio accept
+    # rule unreachable from any flavor that has not been ported: the runner
+    # calls the hooks unconditionally and gets None back.
+    #
+    # Typed hooks rather than `getattr(drafter, "draft_probs", None)` probes:
+    # a flavor that renames one should break the call site, not quietly stop
+    # publishing q.
+
+    @property
+    def draft_probs(self) -> torch.Tensor | None:
+        """``[slots * T, V]`` fp32 q, one row block per live request, or None
+        when this drafter proposes greedily -- every flavor but DSpark, and
+        DSpark with ``ATOM_SPEC_LOSSLESS_SAMPLING=0``, which is the default."""
+        return None
+
+    def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
+        """``[len(req_ids)]`` int32 mapping each request to its first q row."""
+        return None
+
+    def stage_draft_sampling_host(self, batch, bs: int, group) -> None:
+        """Stage the draft sampler's per-step inputs into pinned host buffers
+        and claim their counts in `prepare_sample`'s own `sampling` H2D
+        publication, which is what carries them to the device."""
+        return
+
+    def record_draft_probs_slots(self, req_ids) -> None:
+        """Park the q just drafted into each request's own persistent rows."""
+        return
+
     @property
     def draft_kv_duplicates_propose(self) -> bool:
         """Is `compute_draft_kv` the pass propose's first draft step redoes?
