@@ -527,6 +527,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # Qwen3.8-Flash-Next MonoKernel opt-in. The current production scope is the
+    # exact TP1 checkpoint and S=1 decode; unsupported steps keep the original
+    # model path.
+    "ATOM_QWEN_MONO_ENABLE": lambda: _flag_env("ATOM_QWEN_MONO_ENABLE"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.
@@ -931,6 +935,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"
     ),
     "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # First real decode step's final hidden/logits/argmax. Dummy graph capture
+    # and prefill are skipped, so paired FULL-graph runs can compare the same
+    # production boundary without adding hooks inside the captured graph.
+    "ATOM_FWD_OUTPUT_DUMP_PATH": lambda: os.getenv(
+        "ATOM_FWD_OUTPUT_DUMP_PATH", ""
+    ),
     # Per-rank weight dump + sys.exit(0) — for byte-equal weight comparison.
     "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
     "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", "0"),

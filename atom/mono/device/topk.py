@@ -3,9 +3,9 @@
 """A CTA's exact top-k of up to ``LDS_KEYS`` fp32 values, the answer of aiter's
 ``top_k_per_row_decode(stable=True)``: ranked by the fp32 bits' u32 order key
 (-0 below +0, NaN above +inf), ties to the lowest index, emitted ascending by
-index, -1 padded. P0.7 pinned the key and the tie rule against aiter;
-``lds_topk_timing.py CHECK=1`` (skill mono-indexer) pins this routine against
-that rule on ties, +-0, NaN and +-inf at every edge n.
+index, -1 padded. The DeepSeek V4.1 indexer validation pins the key and tie
+rule against aiter on ties, +-0, NaN and +-inf at every edge n. This module is
+model-independent so persistent kernels can share one exact selection primitive.
 
 Thread i holds ``per_thread`` consecutive indices from i x per_thread, as
 keys in LDS, so thread order is index order and one block scan places the

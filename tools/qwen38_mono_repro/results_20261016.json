@@ -1,0 +1,206 @@
+{
+  "date": "2026-10-16",
+  "status": "single-startup A/B performance reproduction; not ABAB or production quality acceptance",
+  "tp": 8,
+  "node": "crsuse2-m2m-080",
+  "job": 217242,
+  "aiter_commit": "5d36825eb35e3dfd20011dea874cd13f73c41f2f",
+  "max_num_seqs": 2,
+  "capture_sizes": [
+    1,
+    2
+  ],
+  "warmup_rounds": 1,
+  "measured_rounds": 7,
+  "output_tokens_per_request": 128,
+  "paths": {
+    "native": "native",
+    "mono_s1": "TP8 Mono",
+    "mono_s2": "partial-Mono native attention + paired finish"
+  },
+  "production_tp8_gate": false,
+  "native": {
+    "summary": {
+      "1": {
+        "client_decode_ms": 6.88700347951078,
+        "server_tpot_ms": 6.8999999999999995,
+        "decode_tokens_s": 145.20103016864385,
+        "decode_tokens_s_per_gpu": 18.15012877108048,
+        "end_to_end_tokens_s": 132.47883219529143,
+        "max_device_vram_gib": 262.7772674560547
+      },
+      "2": {
+        "client_decode_ms": 7.133175481398275,
+        "server_tpot_ms": 7.1000000000000005,
+        "decode_tokens_s": 280.3800362427018,
+        "decode_tokens_s_per_gpu": 35.047504530337726,
+        "end_to_end_tokens_s": 257.80143651847,
+        "max_device_vram_gib": 262.7813835144043
+      }
+    },
+    "round_tpot_ms": [
+      {
+        "conc": 1,
+        "rep": 0,
+        "tpot_ms": 6.894556543078479
+      },
+      {
+        "conc": 1,
+        "rep": 1,
+        "tpot_ms": 6.898464883077801
+      },
+      {
+        "conc": 1,
+        "rep": 2,
+        "tpot_ms": 6.88700347951078
+      },
+      {
+        "conc": 1,
+        "rep": 3,
+        "tpot_ms": 6.884032566129692
+      },
+      {
+        "conc": 1,
+        "rep": 4,
+        "tpot_ms": 6.89111499324089
+      },
+      {
+        "conc": 1,
+        "rep": 5,
+        "tpot_ms": 6.886303516758943
+      },
+      {
+        "conc": 1,
+        "rep": 6,
+        "tpot_ms": 6.886731677449594
+      },
+      {
+        "conc": 2,
+        "rep": 0,
+        "tpot_ms": 7.146449000323851
+      },
+      {
+        "conc": 2,
+        "rep": 1,
+        "tpot_ms": 7.133711238880092
+      },
+      {
+        "conc": 2,
+        "rep": 2,
+        "tpot_ms": 7.130637506542243
+      },
+      {
+        "conc": 2,
+        "rep": 3,
+        "tpot_ms": 7.133175481398275
+      },
+      {
+        "conc": 2,
+        "rep": 4,
+        "tpot_ms": 7.133094207068362
+      },
+      {
+        "conc": 2,
+        "rep": 5,
+        "tpot_ms": 7.125762827371753
+      },
+      {
+        "conc": 2,
+        "rep": 6,
+        "tpot_ms": 7.140059637407384
+      }
+    ]
+  },
+  "mono": {
+    "summary": {
+      "1": {
+        "client_decode_ms": 4.597894534949712,
+        "server_tpot_ms": 4.6,
+        "decode_tokens_s": 217.4908520408107,
+        "decode_tokens_s_per_gpu": 27.186356505101337,
+        "end_to_end_tokens_s": 189.5816509441832,
+        "max_device_vram_gib": 262.7454643249512
+      },
+      "2": {
+        "client_decode_ms": 7.013215686034734,
+        "server_tpot_ms": 7,
+        "decode_tokens_s": 285.17588643146354,
+        "decode_tokens_s_per_gpu": 35.64698580393294,
+        "end_to_end_tokens_s": 261.70761353113363,
+        "max_device_vram_gib": 262.7495994567871
+      }
+    },
+    "round_tpot_ms": [
+      {
+        "conc": 1,
+        "rep": 0,
+        "tpot_ms": 4.596349403180007
+      },
+      {
+        "conc": 1,
+        "rep": 1,
+        "tpot_ms": 4.597815803414959
+      },
+      {
+        "conc": 1,
+        "rep": 2,
+        "tpot_ms": 4.603026235860399
+      },
+      {
+        "conc": 1,
+        "rep": 3,
+        "tpot_ms": 4.598466039595642
+      },
+      {
+        "conc": 1,
+        "rep": 4,
+        "tpot_ms": 4.59600455809062
+      },
+      {
+        "conc": 1,
+        "rep": 5,
+        "tpot_ms": 4.597894534949712
+      },
+      {
+        "conc": 1,
+        "rep": 6,
+        "tpot_ms": 4.5990692733369
+      },
+      {
+        "conc": 2,
+        "rep": 0,
+        "tpot_ms": 6.981888859408109
+      },
+      {
+        "conc": 2,
+        "rep": 1,
+        "tpot_ms": 7.015522588701464
+      },
+      {
+        "conc": 2,
+        "rep": 2,
+        "tpot_ms": 7.012790133604619
+      },
+      {
+        "conc": 2,
+        "rep": 3,
+        "tpot_ms": 7.013251130758073
+      },
+      {
+        "conc": 2,
+        "rep": 4,
+        "tpot_ms": 7.012498274087671
+      },
+      {
+        "conc": 2,
+        "rep": 5,
+        "tpot_ms": 7.013490078967857
+      },
+      {
+        "conc": 2,
+        "rep": 6,
+        "tpot_ms": 7.013215686034734
+      }
+    ]
+  }
+}

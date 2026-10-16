@@ -8,6 +8,7 @@ module is safe to wire into hot paths in production.
 Env vars (all defined in atom/utils/envs.py):
   ATOM_FWD_DUMP_DIR / ATOM_FWD_DUMP_LAYERS / ATOM_FWD_DUMP_BLOCK_CLASS /
   ATOM_FWD_DUMP_LAYER_ATTR / ATOM_FWD_DUMP_ONE_SHOT
+  ATOM_FWD_OUTPUT_DUMP_PATH
   ATOM_WEIGHT_DUMP_DIR / ATOM_WEIGHT_DUMP_LAYERS / ATOM_WEIGHT_DUMP_EXIT
   ATOM_DEBUG_TOPK / ATOM_DEBUG_TOPK_PATH
 
@@ -63,6 +64,57 @@ def _get_world_size() -> int:
 
 
 # === Forward dump ====================================================
+
+
+_forward_output_dumped_paths: set[str] = set()
+
+
+def maybe_dump_forward_outputs(
+    hidden_states: torch.Tensor | None,
+    logits: torch.Tensor | None,
+    *,
+    is_prefill: bool,
+    is_dummy: bool,
+) -> None:
+    """Save the first real decode step's final hidden, logits and argmax.
+
+    This runs after model execution, outside the graph body. Graph-capture
+    dummy passes and prefills are skipped, so a server can set one output path
+    at startup and receive the first production decode result. The path is
+    written once per process and replaced atomically.
+    """
+    path = envs.ATOM_FWD_OUTPUT_DUMP_PATH
+    if (
+        not path
+        or path in _forward_output_dumped_paths
+        or is_prefill
+        or is_dummy
+        or hidden_states is None
+        or logits is None
+        or _get_rank() != 0
+    ):
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+
+    hidden_cpu = hidden_states.detach().cpu()
+    logits_cpu = logits.detach().cpu()
+    packet = {
+        "hidden": hidden_cpu,
+        "logits": logits_cpu,
+        "argmax": logits_cpu.float().argmax(dim=-1),
+        "hidden_shape": tuple(hidden_cpu.shape),
+        "logits_shape": tuple(logits_cpu.shape),
+        "hidden_dtype": str(hidden_cpu.dtype),
+        "logits_dtype": str(logits_cpu.dtype),
+    }
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    torch.save(packet, tmp)
+    os.replace(tmp, path)
+    _forward_output_dumped_paths.add(path)
 
 
 def _output_tensor(output) -> torch.Tensor | None:
@@ -300,9 +352,8 @@ def maybe_log_topk(logits: torch.Tensor, prefix: str = "") -> None:
 
     probs = logits.float().softmax(dim=-1)
     top = probs.topk(k, dim=-1)
-    out_path = envs.ATOM_DEBUG_TOPK_PATH
-    fp = open(out_path, "a", encoding="utf-8") if out_path else sys.stderr
-    try:
+
+    def write(fp) -> None:
         for row in range(logits.size(0)):
             triples = " ".join(
                 f"{int(top.indices[row, j].item())}:"
@@ -310,6 +361,10 @@ def maybe_log_topk(logits: torch.Tensor, prefix: str = "") -> None:
                 for j in range(k)
             )
             print(f"{prefix}row{row} top{k}: {triples}", file=fp, flush=True)
-    finally:
-        if out_path:
-            fp.close()
+
+    out_path = envs.ATOM_DEBUG_TOPK_PATH
+    if not out_path:
+        write(sys.stderr)
+        return
+    with open(out_path, "a", encoding="utf-8") as fp:
+        write(fp)
