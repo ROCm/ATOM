@@ -34,6 +34,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
     StateTransfer,
 )
+from atom.sampling_params import SamplingParams
 
 BLOCK = 4
 MIN_FORK = 8
@@ -2628,12 +2629,12 @@ class TestPromptEndAnchorTemplateMargin:
         self._next_token = iter(range(1000, 10**7))
         self._monkeypatch = monkeypatch
 
-    def _bm(self, margin=None):
+    def _bm(self, margin=None, block=None, runtime=PAGED_COPY_RUNTIME):
         if margin is not None:
             self._monkeypatch.setenv("ATOM_STATE_CHECKPOINT_END_MARGIN", str(margin))
         return make_block_manager(
             ckpt_config(
-                kv_cache_block_size=self.BLOCK,
+                kv_cache_block_size=block or self.BLOCK,
                 num_kvcache_blocks=600,
                 max_num_batched_tokens=4096,
                 max_model_len=4096,
@@ -2641,7 +2642,7 @@ class TestPromptEndAnchorTemplateMargin:
                 state_checkpoint_interval_tokens=-1,
                 state_checkpoint_demand=False,
             ),
-            state_runtime=PAGED_COPY_RUNTIME,
+            state_runtime=runtime,
         )
 
     def _fresh(self, n):
@@ -2753,6 +2754,132 @@ class TestPromptEndAnchorTemplateMargin:
             )
             bm.can_allocate(seq)
             assert seq.checkpoint_end_pos == 6 * self.BLOCK, margin  # (131-32)//16*16
+
+    # ── The margin's range (review of #2589) ────────────────────────────────
+
+    def _anchor(self, margin, length, **kw):
+        """`checkpoint_end_pos` for a fresh `length`-token prompt."""
+        bm = self._bm(margin, **kw)
+        block = kw.get("block", self.BLOCK)
+        seq = Sequence(self._prompt([], length), block, has_per_req_cache=True)
+        assert bm.can_allocate(seq) >= 0
+        return seq.checkpoint_end_pos
+
+    @pytest.mark.parametrize("r", range(16))
+    def test_a_large_margin_backs_off_several_blocks(self, r):
+        """`at most one more block` holds only while the margin exceeds the room
+        by no more than a block. Margin 40 at block 16 (room 0) puts the anchor
+        at the last boundary at least 40 tokens before the end: 2 or 3 blocks
+        behind the margin-0 anchor, and the next turn still resumes there."""
+        margin, length = 40, 6 * self.BLOCK + r
+        a0 = self._anchor(0, length)
+        self._next_token = iter(range(1000, 10**7))
+        bm = self._bm(margin)
+        t1 = self._prompt([], length)
+        _, anchor = self._run_turn(bm, t1)
+        assert anchor == (length - margin) // self.BLOCK * self.BLOCK
+        # Two or three blocks behind, never more than ceil(margin / block).
+        assert 2 <= (a0 - anchor) // self.BLOCK <= -(-margin // self.BLOCK)
+        t2 = self._prompt(self._as_history(t1, self._fresh(37)), len(t1) + 80)
+        resumed, _ = self._run_turn(bm, t2)
+        assert resumed == anchor > 0
+
+    @pytest.mark.parametrize("length", [12, 40, 41, 55])
+    def test_a_prompt_inside_margin_plus_a_block_keeps_no_anchor(self, length):
+        """The anchor needs a whole block before `P - margin`; a prompt shorter
+        than `margin + block` keeps none, and its next turn resumes from 0."""
+        margin = 40
+        bm = self._bm(margin)
+        t1 = self._prompt([], length)
+        _, anchor = self._run_turn(bm, t1)
+        assert anchor == 0
+        t2 = self._prompt(self._as_history(t1, self._fresh(37)), len(t1) + 80)
+        resumed, _ = self._run_turn(bm, t2)
+        assert resumed == 0
+
+    def test_the_first_prompt_long_enough_gets_an_anchor(self):
+        assert self._anchor(40, 40 + self.BLOCK - 1) == 0
+        assert self._anchor(40, 40 + self.BLOCK) == self.BLOCK
+
+    @pytest.mark.parametrize("block", [4, 16, 64])
+    @pytest.mark.parametrize("room, margin", [(8, 5), (8, 12), (8, 8), (0, 5)])
+    def test_room_and_margin_combine_by_max_not_sum(self, block, room, margin):
+        """Other block sizes, and a backend with its own successor room (a fork
+        of `room` tokens; 0 is PAGE): the anchor is the last block boundary
+        `max(room, margin)` before the end, capped one block short of it."""
+        runtime = (
+            PAGED_COPY_RUNTIME
+            if room == 0
+            else StateRuntime(transfer=StateTransfer.fork(room))
+        )
+        for length in range(block + 9, 4 * block + 9):
+            got = self._anchor(margin, length, block=block, runtime=runtime)
+            want = min(
+                (length - max(room, margin)) // block * block,
+                (-(-length // block) - 1) * block,
+            )
+            assert got == max(want, 0), (length, got, want)
+            summed = (length - room - margin) // block * block
+            if summed != want and want > 0:
+                assert got != summed
+
+    def test_the_scheduler_cuts_at_the_margin_anchor_and_the_next_turn_resumes(
+        self,
+    ):
+        """The real path: `Scheduler.schedule` cuts the prefill at the anchor
+        the margin placed, the PAGE store completes, and the follow-up whose
+        template dropped `<think>\\n` resumes there."""
+        self._monkeypatch.setenv(
+            "ATOM_STATE_CHECKPOINT_END_MARGIN", str(self.QWEN35_MARGIN)
+        )
+        sched = Scheduler(
+            ckpt_config(
+                kv_cache_block_size=self.BLOCK,
+                num_kvcache_blocks=600,
+                max_num_batched_tokens=4096,
+                max_model_len=4096,
+                pool_entries={"state": 8},
+                state_checkpoint_interval_tokens=-1,
+                state_checkpoint_demand=False,
+            ),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        bm = sched.block_manager
+
+        def serve(tokens):
+            seq = Sequence(
+                tokens,
+                self.BLOCK,
+                SamplingParams(max_tokens=1, ignore_eos=True),
+                has_per_req_cache=True,
+            )
+            sched.add(seq)
+            ends, resumed, anchor = [], None, None
+            while not seq.is_finished:
+                batch, active = sched.schedule()
+                if batch.total_seqs_num_prefill:
+                    if resumed is None:
+                        resumed = batch.num_cached_tokens[0]
+                        anchor = seq.checkpoint_end_pos  # cleared once freed
+                    ends.append(int(batch.context_lens[0]))
+                sched.postprocess(
+                    list(active.values()),
+                    ScheduledBatchOutput(
+                        [seq.id], [(7,)], None, None, None, is_deferred_out=False
+                    ),
+                    batch=batch,
+                )
+            sched.schedule()  # completes the store begun with the last batch
+            return anchor, ends, resumed
+
+        t1 = self._prompt([], 4 * self.BLOCK + 1)  # P % 16 == 1, the bug's case
+        anchor, ends1, _ = serve(t1)
+        assert anchor == 3 * self.BLOCK and len(t1) - anchor >= self.QWEN35_MARGIN
+        assert ends1 == [anchor, len(t1)]  # the prefill was cut at the anchor
+        assert bm.checkpoint_funnel()["chunks_cut_for_end"] == 1
+        t2 = self._prompt(self._as_history(t1, self._fresh(37)), len(t1) + 80)
+        _, _, resumed = serve(t2)
+        assert resumed == anchor
 
 
 class TestLadderOffButCheckpointingOn:

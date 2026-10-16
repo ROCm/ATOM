@@ -404,11 +404,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
     # Tokens kept between the prompt-end state checkpoint and the prompt end,
-    # on top of the backend's own successor room. A chat template rewrites the
-    # tail of an assistant turn when the next user turn is appended (Qwen3.5
-    # drops the generation prompt's `<think>`), so the next prompt diverges a
-    # few tokens before this one ends; an anchor inside that suffix is never
-    # matched again. 0 keeps the old placement.
+    # at least; the backend's own successor room still applies when it is
+    # larger. A chat template rewrites the tail of an assistant turn when the
+    # next user turn is appended (Qwen3.5 drops the generation prompt's
+    # `<think>`), so the next prompt diverges a few tokens before this one
+    # ends; an anchor inside that suffix is never matched again. 0 keeps the
+    # old placement. See docs/environment_variables.md for what a margin wider
+    # than a block costs.
     "ATOM_STATE_CHECKPOINT_END_MARGIN": lambda: max(
         0, int(os.getenv("ATOM_STATE_CHECKPOINT_END_MARGIN", "0"))
     ),

@@ -2355,6 +2355,13 @@ class BlockManager:
         # Measured on Qwen3.5 AgentX: with no margin, prompts of length
         # 16k + 1 put the divergence inside the anchor's block, and their
         # follow-ups resumed from the anchor 1 time in 282 (95.6% otherwise).
+        #
+        # The larger of the room and the margin, not their sum. Against no
+        # margin the anchor moves back by up to `ceil((margin - room) / block)`
+        # blocks -- one for Qwen3.5's 5 over a PAGE room of 0 -- so a margin
+        # wider than a block costs a verbatim resend several blocks, and a
+        # prompt shorter than `margin + block` keeps no anchor (`end` below is
+        # 0). Pinned by `TestPromptEndAnchorTemplateMargin`.
         room = max(int(room), self.state_checkpoint_end_margin)
         # The rightmost grid position that still leaves `room` behind it.
         #
