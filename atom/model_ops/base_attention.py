@@ -128,6 +128,14 @@ def gluon_decode_over_limit(max_qlen: int, num_heads: int, num_kv_heads: int) ->
     return max_qlen > PA_GLUON_MAX_QUERY_LEN or group_p2 > PA_GLUON_MAX_QUERY_GROUP_SIZE
 
 
+@functools.cache
+def gluon_decode_supports_arch() -> bool:
+    """Whether aiter's pa_decode_gluon supports the current GPU."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() in ("gfx942", "gfx950")
+
+
 def run_pa_fwd_asm(
     q: torch.Tensor,
     k_cache: torch.Tensor,
