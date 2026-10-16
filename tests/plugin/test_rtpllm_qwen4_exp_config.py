@@ -1026,6 +1026,24 @@ def test_qwen4_exp_recovered_physical_table_respects_prewarmed_buffer_stride(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_graph_qsa_ignores_stale_physical_block_table(monkeypatch):
+    device = torch.device("cuda")
+    kernel = torch.tensor([[28, 29, 30, 31, 32, 33, 34, 35]], device=device)
+    stale_physical = torch.tensor([[100, 101]], device=device)
+    full_inputs = SimpleNamespace(
+        kv_cache_block_id_device=stale_physical,
+        kv_cache_kernel_block_id_device=kernel,
+    )
+    buffer = torch.empty((1, 2), dtype=torch.int32, device=device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    table = RTPQwen4ExpContext._resolve_qsa_block_table(
+        full_inputs, 64, 16, {"physical_block_table_i32": buffer}
+    )
+    assert table.cpu().tolist() == [[7, 8]]
+    assert table.data_ptr() != stale_physical.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_qwen4_exp_graph_state_and_qsa_slots_handle_boundary_and_padding():
     device = torch.device("cuda")
     table = torch.tensor(
