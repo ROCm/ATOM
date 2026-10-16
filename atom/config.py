@@ -2856,6 +2856,14 @@ class Config:
                     "mixed batch, decode rows included"
                 ),
             ),
+            (
+                self.prefill_context_parallel_size > 1,
+                "prefill context parallel",
+                (
+                    "the PCP round-robin query split and its attention reindex "
+                    "run over the whole batch, decode rows included"
+                ),
+            ),
             # Dense MLA's mixed split is narrower than V4's: V4's decode half is
             # the unmodified `prepare_decode`, while `AiterMLA.prepare_mixed`
             # builds its own and handles none of the following.

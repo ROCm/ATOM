@@ -48,12 +48,15 @@ class _Batch:
         total_seqs_num_prefill=0,
         total_seqs_num_decode=0,
         total_tokens_num=0,
+        total_tokens_num_prefill=0,
         is_dummy_run=False,
     ):
         self.is_mixed = is_mixed
         self.total_seqs_num_prefill = total_seqs_num_prefill
         self.total_seqs_num_decode = total_seqs_num_decode
+        self.total_seqs_num = total_seqs_num_prefill + total_seqs_num_decode
         self.total_tokens_num = total_tokens_num
+        self.total_tokens_num_prefill = total_tokens_num_prefill
         self.is_dummy_run = is_dummy_run
 
 
@@ -104,6 +107,26 @@ def test_mixed_batch_vetoes_split_on_decode_path():
     )
     assert can_split is False
     assert (ub0, ub1) == (0, 0)
+
+
+def test_mixed_batch_reaches_the_mixed_split_when_enabled(monkeypatch):
+    """With ATOM_TBO_MIXED=1 the same batch goes to the mixed split instead."""
+    monkeypatch.setenv("ATOM_TBO_MIXED", "1")
+    toks = _PREFILL_TOKENS + [1, 1, 1, 1]
+    _, can_split, ub0, ub1 = local_tbo_precompute(
+        _Config(),
+        _Batch(
+            is_mixed=True,
+            total_seqs_num_prefill=2,
+            total_seqs_num_decode=4,
+            total_tokens_num=sum(toks),
+            total_tokens_num_prefill=sum(_PREFILL_TOKENS),
+        ),
+        True,
+        np.asarray(toks, dtype=np.int64),
+    )
+    assert can_split is True
+    assert ub0 > 0 and ub1 > 0 and ub0 + ub1 == sum(toks)
 
 
 @pytest.mark.parametrize("is_prefill", [True, False])
