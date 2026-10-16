@@ -33,8 +33,17 @@ if ! cargo --version >/dev/null 2>&1; then
   export RUSTUP_HOME="${target_dir}/rustup-home"
   export PATH="${CARGO_HOME}/bin:${PATH}"
   export RUSTUP_TOOLCHAIN="${ATOMESH_MESH_RUST_TOOLCHAIN:-1.94.0}"
+  rust_arch="$(uname -m)"
+  toolchain="${RUSTUP_TOOLCHAIN}-${rust_arch}-unknown-linux-gnu"
+  # rustup counts a toolchain directory as installed, so one whose install was
+  # cut short (no manifest) survives rustup-init and fails every build after it.
+  if [[ -d "${RUSTUP_HOME}/toolchains/${toolchain}" &&
+        ! -f "${RUSTUP_HOME}/toolchains/${toolchain}/lib/rustlib/multirust-channel-manifest.toml" ]]; then
+    echo "[build] reinstalling Rust ${toolchain}: its install was interrupted" >&2
+    rm -rf "${RUSTUP_HOME}/toolchains/${toolchain}" \
+      "${RUSTUP_HOME}/update-hashes/${toolchain}"
+  fi
   if ! cargo --version >/dev/null 2>&1; then
-    rust_arch="$(uname -m)"
     case "${rust_arch}" in
       x86_64|aarch64) ;;
       *) echo "Unsupported Rust build architecture: ${rust_arch}" >&2; exit 2 ;;
@@ -52,12 +61,25 @@ if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
-if ! cargo build --profile "${profile}" --bin atomesh \
-  "${lock_args[@]}" \
-  --manifest-path "${build_dir}/source/Cargo.toml" \
-  --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1; then
+build_mesh() {
+  cargo build --profile "${profile}" --bin atomesh \
+    "${lock_args[@]}" \
+    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
+}
+if ! build_mesh; then
   cat "${log_dir}/mesh-build.log" >&2
-  exit 1
+  if [[ "${CARGO_HOME:-}" != "${target_dir}/cargo-home" ]]; then
+    exit 1
+  fi
+  # Cargo trusts crates already unpacked in the fallback cache, so files lost
+  # from them (an interrupted unpack) fail every build until they are refetched.
+  echo "[build] retrying with the cached crates refetched" >&2
+  rm -rf "${CARGO_HOME}/registry/src" "${CARGO_HOME}/registry/cache"
+  if ! build_mesh; then
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
