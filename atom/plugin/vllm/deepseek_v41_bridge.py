@@ -651,6 +651,16 @@ def _v41_stage_outside_forward(
         running_bs=running_bs,
         running_tokens=running_tokens,
         capturing=synthetic,
+        # The slots this step committed, carried out for the state
+        # checkpoints. They belong to `batch`, not to this object, and the
+        # checkpoint path reads them off `prepared`: without this field
+        # `_v41_state_checkpoints_around_forward` returns at its own gate on
+        # every step, so no checkpoint is ever planned, the blocks a save
+        # ships stay the zeros they were allocated as, and the first hit that
+        # resumes from one reports `needs state at N, found 0`. Nothing in
+        # between logs a thing -- the save rides, the tier stores and the load
+        # restores, all faithfully carrying zeros.
+        state_slots_committed=list(batch.state_slots_committed),
     )
 
 
@@ -1986,7 +1996,8 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
     )
 
     adapter = register_v41_state_checkpoint_adapter()
-    if not state_checkpoints_on(adapter, vllm_config) or prepared is None:
+    _on = state_checkpoints_on(adapter, vllm_config)
+    if not _on or prepared is None:
         return
     snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
     slots = getattr(prepared, "state_slots_committed", None)

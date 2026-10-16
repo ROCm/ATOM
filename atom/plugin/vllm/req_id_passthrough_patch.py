@@ -150,13 +150,32 @@ class _V2InputBatchView:
     def __getitem__(self, group_id):
         view = self._cache.get(group_id)
         if view is None:
+            import numpy as np
+
             table = self._tables[group_id]
-            # Rows are request-state slots, not batch positions: the table is
-            # handed over as the runner keeps it. Measured -- a lone request
-            # sitting in slot 54 is addressed as row 54, and reordering the
-            # table to batch order (via `idx_mapping_np`) cut it to one row and
-            # put that index out of bounds.
-            view = _BlockTableGroupView(_HostMirror(table.cpu().numpy()))
+            host = table.cpu().numpy()
+            # The runner keeps this table in request-state-slot order --
+            # vLLM's own name for the mapping says so: `idx_mapping_np` is
+            # documented `batch_idx -> req_state_idx`. Every caller of
+            # `state_checkpoint_unit_ids` addresses it by BATCH row instead:
+            # the shared mechanism passes its step row indices, and V4.1's
+            # restore hook passes a position in `req_ids`. On V1 those are the
+            # same space and the table needs no translation; here they are
+            # not, so the rows are gathered into batch order once, and every
+            # reader gets the V1 contract back.
+            #
+            # Unreordered this reads another request's blocks, or an unwritten
+            # row, and the bytes land in a state slot as a checkpoint. With
+            # one request in flight the two orders often coincide, which is
+            # why a sequential arm restores correctly and gsm8k at
+            # concurrency 32 dies on the first ride-backed load with
+            # "needs state at 1280, found -4643142014259413360".
+            mapping = getattr(self._batch, "idx_mapping_np", None)
+            if mapping is not None:
+                rows = np.asarray(mapping[: int(self._batch.num_reqs)], dtype=np.intp)
+                if rows.size and int(rows.max()) < host.shape[0]:
+                    host = host[rows]
+            view = _BlockTableGroupView(_HostMirror(host))
             self._cache[group_id] = view
         return view
 

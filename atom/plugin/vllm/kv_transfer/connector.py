@@ -987,10 +987,17 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         planner = self._v41_planner
         if planner is None:
+            logger.info("ATOM ride hook: no planner (end=%d)", int(end))
             return None
         req_id = str(seq.id)
         request = self._requests.get(req_id)
         if request is None:
+            logger.info(
+                "ATOM ride hook: req %s not held (end=%d, op=%s)",
+                req_id,
+                int(end),
+                operation,
+            )
             return None
         return planner.take_ride_state(request, req_id, end, operation=operation)
 

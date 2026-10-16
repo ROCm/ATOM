@@ -562,10 +562,9 @@ def install_v41_runner_state_events() -> int:
             PSI._event_counts["finished"] += len(finished)
             PSI._event_counts["preempted"] += len(preempted)
             PSI._event_counts["resumed"] += len(resumed)
+            _plan = getattr(scheduler_output, "atom_state_checkpoint_stores", None)
             PSI._store_plan.clear()
-            PSI._store_plan.update(
-                getattr(scheduler_output, "atom_state_checkpoint_stores", None) or {}
-            )
+            PSI._store_plan.update(_plan or {})
             PSI._decode_plan.clear()
             PSI._decode_plan.update(
                 getattr(

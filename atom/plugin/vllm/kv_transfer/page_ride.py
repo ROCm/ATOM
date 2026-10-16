@@ -33,6 +33,7 @@ The host planner must provide:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 #: The counters this mixin keeps. Seeded by the host so a planner's stats line
@@ -56,6 +57,8 @@ RIDE_COUNTERS = (
 #: is the authority; it is mirrored rather than imported so this module stays
 #: importable in a unit test that has no vLLM. A block id at or below it is
 #: not a real block.
+logger = logging.getLogger("atom")
+
 NULL_BLOCK_ID = 0
 
 
