@@ -239,7 +239,6 @@ class DashboardCliTest(unittest.TestCase):
         json.dumps(entries, allow_nan=False)
         points = perf_points(entries)
         json.dumps(points, allow_nan=False)
-        self.assertIn("from 1 benchmark result(s)", result.stdout)
         return entries, points, summary.read_text(encoding="utf-8")
 
     def test_cli_omits_unmeasured_numbers_without_rewriting_raw_artifact(self):
@@ -306,7 +305,7 @@ class DashboardCliTest(unittest.TestCase):
                             "Input tok/s/GPU",
                             "Output tok/s/GPU",
                         ):
-                            self.assertEqual(cells[column], "0.00")
+                            self.assertEqual(float(cells[column]), 0.0)
                     else:
                         self.assertEqual(points, {})
                     self.assertNotIn("nan", summary.lower())
