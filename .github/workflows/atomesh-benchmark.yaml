@@ -132,6 +132,11 @@ on:
             kimi-k3-mxfp4-1p1d-tp8-dcp8-agentic-lmcache-1m-c72-torch-profile,
             kimi-k3-mxfp4-agg-pp8-tp1-agentic-lmcache-1m-c72-torch-profile
 
+          Kimi-K3 (accuracy suite, GSM8K only):
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-part12,
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-base,
+            kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-stage
+
           Kimi-K2.5:
             kimi-k25-1p1d-tp4,kimi-k25-1p1d-tp4-tp8,
             kimi-k25-2p1d-tp4,kimi-k25-1p2d-tp4

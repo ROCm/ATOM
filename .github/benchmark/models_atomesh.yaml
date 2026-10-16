@@ -1226,6 +1226,28 @@ models:
               ATOM_PROFILER_TIMEOUT: "1800"
             decode: *kimi_k3_agentic_agg_pp8_decode_env
 
+      # GSM8K-only runs of the PP8 DSpark3 1P1D cell. The eval phase drops the
+      # forced acceptance length, so every draft is verified; the three differ
+      # only in MLA staging and the layer split.
+      accuracy:
+        - <<: *kimi_k3_1p1d_pp8_dspark3_part12
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-part12
+          eval_only: true
+
+        - <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-base
+          display_topology: 1P1D-PP8-DCP8-TP1-TP8-DSPARK3-NOSTAGE
+          env:
+            common: *kimi_k3_1p1d_pp8_dspark3_common_env
+            prefill:
+              <<: *kimi_k3_1p1d_pp8_dspark3_prefill_env
+              ATOM_PD_MLA_STAGING_CHUNK_PAGES: "0"
+          eval_only: true
+
+        - <<: *kimi_k3_1p1d_pp8_dspark3
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark3-gsm8k-c72-stage
+          eval_only: true
+
     accuracy:
       task: gsm8k
       fewshot: 5
