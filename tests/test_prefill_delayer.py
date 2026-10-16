@@ -1,16 +1,16 @@
 """Unit tests for PrefillDelayer — the prefill coalescer.
 
-The delayer's only cross-process dependency is a single
-``torch.distributed.all_reduce(SUM)`` over its internal buffer. We patch that so
-a single test process behaves as one DP rank whose local values ARE the global
-sum (dp_size=1), and inject extra ranks explicitly where alignment matters.
+The delayer does no communication itself: a tick is ``local_counts()``, summed
+over the DP ranks (the scheduler's DPScheduleSync does that with one
+``all_reduce(SUM)``), then ``decide()``. These tests do the sum themselves: a
+single test process is one DP rank whose local counts ARE the global sum
+(dp_size=1), with extra ranks injected explicitly where alignment matters.
 
 No GPU / real distributed group needed.
 """
 
-from unittest import mock
-
 import pytest
+import torch
 
 from atom.model_engine.prefill_delayer import PrefillDelayer
 
@@ -23,10 +23,10 @@ def _noop_all_reduce(tensor, op=None, group=None):
 
 
 def _add_rank(slots):
-    """all_reduce mock that adds one more rank's contribution to the buffer.
+    """all_reduce stand-in that adds one more rank's contribution to the counts.
 
-    `slots` maps buffer index → that sibling rank's value (indices per
-    PrefillDelayer._reduce_buf: 0=prefillable, 1=pending, 2=running_decode).
+    `slots` maps count index → that sibling rank's value (indices per
+    PrefillDelayer.local_counts: 0=prefillable, 1=pending, 2=running_decode).
     """
 
     def f(tensor, op=None, group=None):
@@ -40,7 +40,6 @@ def _add_rank(slots):
 def make_delayer(**kw):
     defaults = {
         "dp_size": 1,
-        "cpu_group": None,
         "max_num_batched_tokens": MAX_BATCHED,
         "target_fill": 0.7,
         "ttft_max_ticks": 30,
@@ -51,12 +50,6 @@ def make_delayer(**kw):
         "prefill_decode_interval": 0,
     }
     defaults.update(kw)
-    # The cross-DP all_reduce only runs when cpu_group is not None (dp=1/TP-only
-    # skips it — there is no sibling to align with). Multi-rank tests mock
-    # all_reduce to inject sibling contributions, so they need a non-None group
-    # for that branch to execute. Real dp>1 always has a cpu_group; mirror that.
-    if defaults["dp_size"] > 1 and defaults["cpu_group"] is None:
-        defaults["cpu_group"] = object()  # sentinel; all_reduce is mocked in call()
     return PrefillDelayer(**defaults)
 
 
@@ -71,15 +64,21 @@ def call(
     oldest_waiting_age_ms=0.0,
     reduce=_noop_all_reduce,
 ):
-    with mock.patch("torch.distributed.all_reduce", reduce):
-        return d.should_allow_prefill(
+    """One tick: this rank's counts, summed by `reduce` the way the DP schedule
+    sync's all_reduce sums them, then the decision."""
+    counts = torch.tensor(
+        d.local_counts(
             prefillable=prefillable,
             pending_tokens=pending_tokens,
             running_decode_batch=running_decode_batch,
             kv_usage=kv_usage,
             has_partial=has_partial,
             oldest_waiting_age_ms=oldest_waiting_age_ms,
-        )
+        ),
+        dtype=torch.int64,
+    )
+    reduce(counts)
+    return d.decide(counts.tolist())
 
 
 def skip_first(d):
@@ -346,6 +345,39 @@ class TestPrefillDecodeInterval:
         peer_prefill_ran = _add_rank({7: 1})
         assert call(d, pending_tokens=1000, reduce=peer_prefill_ran) is False
         assert d._stat_hold_decode_interval == 1
+
+
+class TestSingleSchedulerForm:
+    def test_decides_from_its_own_counts(self):
+        d = make_delayer()
+        assert d.should_allow_prefill(prefillable=True, pending_tokens=0) is True
+        # threshold = 0.7 * 16384; 1000 is below it and decode is running → HOLD
+        assert (
+            d.should_allow_prefill(
+                prefillable=True,
+                pending_tokens=1000,
+                running_decode_batch=64,
+                kv_usage=0.5,
+            )
+            is False
+        )
+        assert d._stat_hold == 1
+
+    def test_cross_dp_delayer_refuses_it(self):
+        # Its own counts alone would never pass the alignment gate.
+        d = make_delayer(dp_size=2)
+        with pytest.raises(RuntimeError, match="summed over the DP ranks"):
+            d.should_allow_prefill(prefillable=True, pending_tokens=0)
+
+
+class TestFailedSum:
+    def test_admits_and_ends_the_hold_episode(self):
+        d = make_delayer(dp_size=2, ttft_max_ticks=1000)
+        skip_first(d)
+        assert call(d, pending_tokens=1000, reduce=_add_rank({})) is False
+        assert d._hold_ticks == 1
+        assert d.decide(None) is True
+        assert d._hold_ticks == 0
 
 
 class TestStatsDistinct:
