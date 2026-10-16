@@ -75,6 +75,41 @@ except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
     flydsl_fused_compress_attn = None
     flydsl_hca_compress_attn = None
 
+# Optional aiter Gluon kernel (gfx1250) for the CSA Indexer FP4 compressor. None
+# when aiter does not have it; that path then keeps the flydsl kernel.
+try:
+    from aiter.ops.triton.fusions.fused_compress_attn import (
+        fused_compress_attn_fp4 as gluon_fused_compress_attn_fp4,
+    )
+except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
+    gluon_fused_compress_attn_fp4 = None
+
+
+def _use_gluon_fp4_compress(
+    shape_key, use_ue8m0, kv_in, score_in, kv_state, score_state, plan
+):
+    """True when the Gluon kernel takes this call: the V4-Pro CSA Indexer FP4
+    shape on gfx1250 (natural FP4 layout), with inputs the kernel can read."""
+    if gluon_fused_compress_attn_fp4 is None or not envs.ATOM_V4_USE_GLUON:
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250" or shape_key != (128, 64, 4, True):
+        return False
+    # Rows of a state slot must be contiguous; the slots can be strided.
+    states_ok = all(
+        t.stride(1) == 256 and t.stride(2) == 1 and t.stride(0) % 8 == 0
+        for t in (kv_state, score_state)
+    )
+    return (
+        use_ue8m0
+        and states_ok
+        and kv_in.stride(0) == score_in.stride(0)
+        and kv_in.stride(0) % 8 == 0
+        and plan.compress_plan_gpu.is_contiguous()
+    )
+
+
 # Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
 # kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
 # Extend as more configs are validated.
@@ -538,6 +573,35 @@ def fused_compress_attn(
         and not quant
         and _shape_key == (512, 64, 128, False)
     )
+    if (
+        _fp4
+        and latent_out is None
+        and rotated_out is None
+        and _use_gluon_fp4_compress(
+            _shape_key, use_ue8m0, kv_in, score_in, kv_state, score_state, plan
+        )
+    ):
+        # CSA Indexer FP4 on aiter's Gluon gfx1250 kernel. The cache row is the
+        # only output, so a call with no cache bound (warmup) has nothing to do.
+        if kv_cache is not None and block_tables is not None:
+            assert kv_cache.shape[1] == k_per_block
+            gluon_fused_compress_attn_fp4(
+                kv_in,
+                score_in,
+                kv_state,
+                score_state,
+                state_slot_mapping,
+                plan.compress_plan_gpu,
+                ape,
+                rms_weight,
+                rms_eps,
+                cos_cache.reshape(cos_cache.shape[0], -1),
+                sin_cache.reshape(sin_cache.shape[0], -1),
+                kv_cache,
+                cache_scale,
+                block_tables,
+            )
+        return
     if _hca_use:
         # main_2buff_fp8: native group_fp8 2buff scatter (nope-fp8 into
         # kv_cache, bf16 rope into k_rope_cache). Otherwise plain bf16.

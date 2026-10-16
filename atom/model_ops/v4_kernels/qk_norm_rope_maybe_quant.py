@@ -36,6 +36,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_scatter_rows
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 
@@ -97,6 +98,38 @@ try:
     _FLYDSL_AVAILABLE = True
 except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
     _FLYDSL_AVAILABLE = False
+
+# Optional aiter Gluon kernel (gfx1250) for the fp8 2buff path. None when aiter
+# does not have it; the fp8 path then keeps the HIP kernel.
+try:
+    from aiter.ops.triton.fusions.fused_qk_norm_rope_group_quant import (
+        fused_qk_norm_rope_group_quant as gluon_fused_qk_norm_rope_group_quant,
+    )
+except Exception:  # noqa: BLE001 -- optional kernel; absence is the whole answer
+    gluon_fused_qk_norm_rope_group_quant = None
+
+
+def _use_gluon_qk(q3, kv2, cos_2d, rope_head_dim, swa_nope, swa_rows, batch_ids):
+    """True when the Gluon kernel takes this fp8 2buff call: gfx1250, the V4-Pro
+    shape, and rows the kernel's TDM loads can read (16-byte aligned)."""
+    if gluon_fused_qk_norm_rope_group_quant is None or not envs.ATOM_V4_USE_GLUON:
+        return False
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx1250" or rope_head_dim != 64:
+        return False
+    if q3.shape[2] != 512 or q3.shape[1] % 8 or tuple(kv2.shape) != (q3.shape[0], 512):
+        return False
+    if swa_nope is not None and (swa_rows is None or batch_ids is None):
+        return False
+    rows_ok = all(t.data_ptr() % 16 == 0 and t.stride(0) % 8 == 0 for t in (q3, kv2))
+    return (
+        rows_ok
+        and q3.stride(1) == 512
+        and q3.stride(2) == 1
+        and kv2.stride(1) == 1
+        and cos_2d.is_contiguous()
+    )
 
 
 # AMD MI3 native e4m3 variant. aiter's a8w8 path and the existing
@@ -665,8 +698,42 @@ def qk_norm_rope_maybe_quant(
     # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [., rd//2, 1, 1].
     cos_2d = cos_cache.squeeze(-2).squeeze(-2)
     sin_2d = sin_cache.squeeze(-2).squeeze(-2)
+    q3 = q.view(num_tokens, n_local_heads, head_dim)
+    kv2 = kv.reshape(num_tokens, kv.shape[-1])
+    if _use_gluon_qk(
+        q3,
+        kv2,
+        cos_2d,
+        rope_head_dim,
+        swa_nope_scale_buff,
+        swa_dest_rows,
+        batch_id_per_q_token,
+    ):
+        # Same op on aiter's Gluon gfx1250 kernel. The SWA write skips a token
+        # whose row is < 0 or whose batch id is < 0 (CUDA-graph pad).
+        q_packed, q_rope, k_packed, k_rope = gluon_fused_qk_norm_rope_group_quant(
+            q3,
+            kv2,
+            kv_weight,
+            positions,
+            cos_2d,
+            sin_2d,
+            eps,
+            swa_nope=swa_nope_scale_buff,
+            swa_rope=swa_rope_buff,
+            swa_rows=swa_dest_rows,
+            batch_ids=batch_id_per_q_token,
+        )
+        # The Gluon kernel returns [T, 512] / [T, 64] K rows: give them the
+        # [T, 1, .] shape of the HIP op.
+        return QKNormRopeOut(
+            q_packed=q_packed,
+            q_rope=q_rope,
+            k_packed=k_packed.unsqueeze(1),
+            k_rope=k_rope.unsqueeze(1),
+        )
     q_packed, q_rope, k_packed, k_rope = fused_qk_norm_rope_group_quant(
-        q.view(num_tokens, n_local_heads, head_dim),
+        q3,
         kv,
         kv_weight,
         positions,
