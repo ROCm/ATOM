@@ -943,6 +943,32 @@ kill -KILL "${other}"
         self.assertIn("DROPPER RUNS", result.stdout)
         self.assertIn("OTHER SURVIVES", result.stdout)
 
+    def test_the_page_cache_dropper_runs_as_long_as_the_case_says(self):
+        result = self.run_shell(
+            """
+start_mooncake_page_cache_dropper
+mooncake_page_cache_dropper_running && echo "DROPPER RUNS"
+stop_mooncake_store
+""",
+            MOONCAKE_STORE_PAGE_CACHE_DROPPER_S="600",
+        )
+        self.assertIn("DROPPER RUNS", result.stdout)
+        (call,) = [c for c in self.calls.read_text().splitlines() if " --every " in c]
+        self.assertIn(" --every 45 --for 600 /models/m", f"{call} ")
+        result = self.run_shell(
+            """
+start_mooncake_page_cache_dropper
+echo "PID=${mooncake_page_cache_dropper_pid}"
+""",
+            MOONCAKE_STORE_PAGE_CACHE_DROPPER_S="0",
+        )
+        self.assertIn("PID=\n", result.stdout + "\n")
+        self.run_shell(
+            "check_mooncake_store_settings\n",
+            expect_rc=2,
+            MOONCAKE_STORE_PAGE_CACHE_DROPPER_S="-1",
+        )
+
     def test_an_owner_dying_before_ready_stops_the_store(self):
         self.run_shell(
             "start_mooncake_store\n",

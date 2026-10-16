@@ -885,6 +885,11 @@ purge_lmcache_disk() {
 #    the owners pin huge pages under MPOL_BIND, so the clean page cache of
 #    these goes first; each node must then fit its pins with 128 GiB to spare,
 #    and is compacted for them (numa_memory_budget.py --compact).
+#  - MOONCAKE_STORE_PAGE_CACHE_DROPPER_S (default 1800): owners on transparent
+#    huge pages keep the model's page cache dropped every 45 s for this long
+#    while the workers load. 0 drops it only once, before the owners pin: a
+#    model loaded from a network filesystem through a prefetch, as Kimi-K3's
+#    is, then reads every evicted shard again, about 40x slower.
 #  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
 #    compaction; a node that does not compact in time can leave an owner 4 KiB
 #    pages its NICs refuse to register.
@@ -1240,6 +1245,7 @@ check_mooncake_store_settings() {
   fi
   check_mooncake_store_worker_config
   require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
+  require_mooncake_store_number MOONCAKE_STORE_PAGE_CACHE_DROPPER_S 1800 integer
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
   case "$(mooncake_setting MOONCAKE_STORE_HUGETLB auto)" in
@@ -1593,15 +1599,18 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s for 30 min while the workers load
-# weights, which would refill it; page cache is per file, so this serves every
-# node. Owners on the HugeTLB pool hold their memory already.
+# Drops the model's page cache every 45 s for MOONCAKE_STORE_PAGE_CACHE_DROPPER_S
+# (default 30 min) while the workers load weights, which would refill it; page
+# cache is per file, so this serves every node. Owners on the HugeTLB pool hold
+# their memory already, and 0 starts no dropper.
 start_mooncake_page_cache_dropper() {
-  if [[ "${mooncake_owner_hugetlb}" == "1" ]]; then
+  local seconds
+  seconds="$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROPPER_S 1800)"
+  if [[ "${mooncake_owner_hugetlb}" == "1" || "$(( 10#${seconds} ))" == "0" ]]; then
     return 0
   fi
   setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
-    --every 45 --for 1800 "${MODEL_PATH}" &
+    --every 45 --for "$(( 10#${seconds} ))" "${MODEL_PATH}" &
   mooncake_page_cache_dropper_pid=$!
   # Until the child execs, its cmdline is this shell's, and a cleanup in that
   # window would take the dropper for another process and leave it running:
