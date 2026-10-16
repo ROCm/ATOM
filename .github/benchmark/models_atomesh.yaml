@@ -383,13 +383,20 @@ models:
               OFFLOAD_MIN_LOAD_TOKENS: "0"
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
-            decode: &glm52_cpp4_dcp4_decode_env
-              HIP_VISIBLE_DEVICES: "4,5,6,7"
-              # Ranks share identical communicator groups instead of creating
-              # duplicates, freeing decode memory for KV.
-              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            decode:
+              <<: &glm52_cpp4_dcp4_decode_env
+                HIP_VISIBLE_DEVICES: "4,5,6,7"
+                # Ranks share identical communicator groups instead of creating
+                # duplicates, freeing decode memory for KV.
+                AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+                DECODE_KV_TRANSFER_CONFIG: >-
+                  {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+              # Decode GPUs 4-7 sit on other rails than prefill GPUs 0-3, and
+              # Spur MI350X rails do not route to each other (QP->RTR times
+              # out). Registering decode memory on every HCA lets
+              # MC_ENABLE_DEST_DEVICE_AFFINITY pick the prefill GPU's rail.
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
@@ -483,7 +490,7 @@ models:
             decode:
               HIP_VISIBLE_DEVICES: "4,5,6,7"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -549,7 +556,7 @@ models:
                 {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
             decode:
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
           benchmark:
             <<: *agentic_1m_aiperf
             wait_server_timeout: 5400
@@ -597,7 +604,7 @@ models:
               PYTHONNOUSERSITE: "1"
               MC_DISABLE_HIP: "1"
               DECODE_KV_TRANSFER_CONFIG: >-
-                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
+                {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
 
         - <<: *glm52_agentic_cpp4_tp4_mtp5
           name: glm-52-mxfp4-1p3d-cpp4-tp4-mtp5-agentic-lmcache-1m-c16
