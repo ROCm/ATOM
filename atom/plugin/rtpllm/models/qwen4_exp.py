@@ -441,6 +441,11 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             atom_model = prepare_model(config=self, engine="rtpllm")
             atom_model = atom_model.to(target_device)
             if getattr(self.model_config, "atom_qwen4_exp_mtp_target", False):
+                from atom.plugin.rtpllm.models.qwen4_exp_mtp_hooks import (
+                    bind_qwen4_exp_mtp_hooks,
+                )
+
+                bind_qwen4_exp_mtp_hooks(atom_model)
                 atom_model.model.return_hc_state = True
             load_model_in_plugin_mode(
                 model=atom_model,
