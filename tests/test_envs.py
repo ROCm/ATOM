@@ -42,6 +42,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_MEGA_MASK_PAD_ROWS",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -148,6 +149,9 @@ class TestEnvsDefaults:
 
     def test_use_flydsl_fp8_prefill_attn_default(self):
         assert _get_envs().ATOM_USE_FLYDSL_FP8_PREFILL_ATTN is False
+
+    def test_mega_mask_pad_rows_default_enabled(self):
+        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is True
 
     def test_unknown_attr_raises(self):
         with pytest.raises(AttributeError):
@@ -291,6 +295,10 @@ class TestEnvsOverrides:
     def test_use_flydsl_gather_kv_b_proj_only_one_enables(self, monkeypatch):
         monkeypatch.setenv("ATOM_USE_FLYDSL_GATHER_KV_B_PROJ", "true")
         assert _get_envs().ATOM_USE_FLYDSL_GATHER_KV_B_PROJ is False
+
+    def test_mega_mask_pad_rows_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("ATOM_MEGA_MASK_PAD_ROWS", "0")
+        assert _get_envs().ATOM_MEGA_MASK_PAD_ROWS is False
 
 
 class TestIsSet:

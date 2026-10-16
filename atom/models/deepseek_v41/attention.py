@@ -279,9 +279,11 @@ class Attention(nn.Module):
         """Every compression boundary in the batch, in one call.
 
         The cache owns where the main latent lands; what comes back is the
-        unrotated latent, which is all the index key needs.
+        unrotated latent, which is all the index key needs. A step without a
+        compress plan is some rows of a forward whose compression ran over
+        all of them (bounded replay): nothing to do.
         """
-        if not self.spec.ratio or self.compressor is None:
+        if not self.spec.ratio or self.compressor is None or not step.plans:
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
@@ -362,29 +364,41 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def forward(self, hidden, hidden_scale, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+        """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
+        layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         selecting = self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
+        if queries is not None:
+            qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
         # `write_window` below, which is nothing when that fold happened.
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step
-        )
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step
+            )
+            cache.rotate_query(query, rope, queries.positions)
         # A forked compressor is already inside this join, having been waited
         # at the scorer; where the scorer itself was not forked it waited on
         # the main stream instead and there is nothing left to join here.
         if selecting is not None:
             selecting.wait_stream(self.index_stream)
-        prefix, prefix_indptr, second, second_indptr = cache.attention_indices(
-            self.spec, step
+        prefix, prefix_indptr, second, second_indptr = (
+            cache.attention_indices(self.spec, step)
+            if queries is None
+            else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
         if step.decode:
@@ -430,5 +444,7 @@ class Attention(nn.Module):
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
         return self._project_out(
-            output.view_as(query), rope, cache.rope_positions(step)
+            output.view_as(query),
+            rope,
+            cache.rope_positions(step) if queries is None else queries.positions,
         )

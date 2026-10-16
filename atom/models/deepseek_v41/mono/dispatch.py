@@ -8,9 +8,10 @@ runtime model's own forward dispatches to its compiled graphs (``runtime``);
 mono routing sits outside them, before any compiled code runs.
 
 The configuration is checked once (``config.config_refusal``). A target step
-is then routed only when it is a DSpark verify of up to ``MAX_ROWS`` rows (a
-graph's padding rows included), however many requests they are. The DSpark
-draft model is wrapped the same way (``MonoDraftModel``): its block backbone of
+is then routed only when it is a decode (a DSpark verify of any length a
+request, or a token a request) of up to ``MAX_ROWS`` rows (a graph's padding
+rows included), however many requests they are and however they split them.
+The DSpark draft model is wrapped the same way (``MonoDraftModel``): its block backbone of
 up to ``MAX_REQUESTS`` requests runs on ``draft_runner``, after a prefill as
 after a decode. Every per-step input read is TP-uniform: the kernels wait on
 every peer rank, so ranks that disagreed would wait on each other for ever (a
@@ -37,8 +38,8 @@ logger = logging.getLogger("atom")
 
 
 def step_supported(input_ids: torch.Tensor, inputs_embeds) -> bool:
-    """Is this forward a DSpark verify step of up to ``MAX_ROWS`` rows? Its
-    width, not the scheduled request count: a captured graph's width is the one
+    """Is this forward a decode step of up to ``MAX_ROWS`` rows? Its width,
+    not the scheduled request count: a captured graph's width is the one
     its replays run, while the scheduled count differs from replay to replay."""
     rows = input_ids.numel()
     if inputs_embeds is not None or not 0 < rows <= MAX_ROWS:
@@ -50,7 +51,7 @@ def step_supported(input_ids: torch.Tensor, inputs_embeds) -> bool:
     step = getattr(md, "step", None)
     if step is None or getattr(md, "image_mask", None) is not None:
         return False
-    return step.decode and step.tentative and step.width == rows
+    return step.decode and step.width == rows
 
 
 class MonoDecodeModel(nn.Module):

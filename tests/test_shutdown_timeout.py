@@ -102,6 +102,7 @@ def _runner_manager(children):
     mgr.procs = children
     mgr.output_thread = SimpleNamespace(join=lambda timeout=None: None)
     mgr.kv_output_threads = []
+    mgr.rpc_output_threads = []
     mgr.outputs_queue = queue.Queue()
     mgr.parent_finalizer = lambda: None
     return mgr.exit

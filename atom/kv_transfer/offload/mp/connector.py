@@ -43,6 +43,16 @@ def _publishes_native_state(transfer_tensors: Any) -> bool:
     return True
 
 
+def _has_per_request_state(kv_caches: Any) -> bool:
+    """Whether registration includes a slot-addressed recurrent state."""
+
+    if not kv_caches:
+        return False
+    return any(
+        getattr(value, "per_request_state", False) for value in kv_caches.values()
+    )
+
+
 def _copies_paged_state(transfer_tensors: Any) -> bool:
     """Whether the backend keeps PAGE-backed state checkpoints.
 
@@ -92,6 +102,16 @@ class LMCacheMPConnector(KVConnectorBase):
                 "lmcache_mp: this backend keeps PAGE-backed state checkpoints "
                 "but publishes no paged_state_checkpoint_spec and "
                 "execute_paged_state_copies for the native-state transfer"
+            )
+        elif _has_per_request_state(kv_caches):
+            # Fork-slot GDN (pipeline parallelism, RapidServe) publishes no
+            # checkpoint image. PAGE-only would restore full-attention KV
+            # over that stale state.
+            raise ValueError(
+                "lmcache_mp: per-request recurrent state is registered, but "
+                "this backend publishes no PAGE checkpoint. PAGE-only offload "
+                "would restore KV over stale state. Enable prefix caching "
+                "without pipeline parallelism or RapidServe, or disable offload."
             )
         else:
             impl = mp_worker.LMCacheMPConnector(self._config)
@@ -196,6 +216,14 @@ class LMCacheMPConnectorScheduler(KVConnectorSchedulerBase):
     def lookup_pending(self, seq: Any) -> bool:
         pending = getattr(self._require_impl(), "lookup_pending", None)
         return bool(pending(seq)) if callable(pending) else False
+
+    def can_detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        check = getattr(self._require_impl(), "can_detach_lookup", None)
+        return bool(check(seq, num_hbm_tokens)) if callable(check) else False
+
+    def detach_lookup(self, seq: Any, num_hbm_tokens: int) -> bool:
+        commit = getattr(self._require_impl(), "detach_lookup", None)
+        return bool(commit(seq, num_hbm_tokens)) if callable(commit) else False
 
     def should_defer_free(self, seq: Any) -> bool:
         return self._require_impl().should_defer_free(seq)

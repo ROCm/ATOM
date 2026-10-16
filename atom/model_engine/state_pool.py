@@ -454,6 +454,10 @@ class StateSlotPool:
         """
         if not self.applies(seq):
             return hit
+        if self.transfer.replays:
+            # Nothing is kept: the forward resuming at any boundary rebuilds the
+            # state from the hash block below it (`StateTransfer.replay`).
+            return hit
         hbs = self.hash_block_size
         for i in range(hit - 1, -1, -1):
             checkpointed = block_hashes[i] in self.hash_to_slot

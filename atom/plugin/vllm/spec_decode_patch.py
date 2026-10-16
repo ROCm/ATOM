@@ -626,8 +626,6 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
             num_tokens = target_token_ids.shape[0]
             self.input_ids[:num_tokens] = target_token_ids
             self.input_ids[token_indices_to_sample] = next_token_ids
-            if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
-                target_positions = target_positions[0]
             self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states
             return num_tokens, token_indices_to_sample, cad

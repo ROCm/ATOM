@@ -49,7 +49,8 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
     QS_M_TILES,
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
-from atom.models.deepseek_v41.mono.state import bind_aux_taps
+from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes
+from atom.models.deepseek_v41.mono.state import AuxTaps, bind_aux_taps
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.walk_plan import walk_plan_name
 from atom.models.deepseek_v41.mono.weights import bind_model
@@ -119,8 +120,17 @@ class V41MonoDecodeRunner:
     here; ``draft_runner.DraftMonoRunner`` sets its own."""
 
     max_rows = MAX_ROWS
+    # token parallel from this many rows (and a multiple of the TP size): the
+    # sublayers' all-reduces become reduce-scatters, the per-token stages run on
+    # each rank's own tokens. Below it the gather's extra hop costs more than a
+    # rank's few tokens save
+    tok_par_from = 12
     experts, topk = EXPERTS, TOPK
     ug_groups = 2
+    # below this many rows an ug task takes one FP4 group, not ug_groups: a
+    # small step's tasks end closer together. The outputs are the same to the
+    # bit either way
+    fine_ug_below = 7
     # the index plane is FP4: K1 quantizes the indexer query for, and K2a
     # scores with, ``index_score_fp4``
     index_fp4 = False
@@ -135,13 +145,12 @@ class V41MonoDecodeRunner:
 
     def _bind_agreed(self, bind) -> None:
         """``bind()`` on every rank, then, once every rank agreed it did, the
-        collective peer buffer (the attention and FFN partials' landing zone)."""
+        collective peer buffer (``peer_layout``)."""
         group = get_tp_group().cpu_group
         bind_agreed(bind, group)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            k2a.peer_bytes(self.max_rows, self.tp)
-            + k2b.peer_bytes(self.max_rows, self.tp),
+            peer_bytes(self.max_rows, self.tp),
             group,
             self.rank,
             self.tp,
@@ -157,12 +166,21 @@ class V41MonoDecodeRunner:
         return 0 < rows <= self.max_rows and self.widths.prepare(rows)
 
     def _bind(self, model, drafter) -> None:
-        if drafter is None:
-            raise MonoUnsupported("no drafter")
         self.model = model
         self._bind_rank()
         self.layers = bind_model(model, self.tp)
-        self.aux = bind_aux_taps(drafter, model.config.hidden_size)
+        # without a drafter no layer taps its residual
+        self.aux = (
+            AuxTaps((), ())
+            if drafter is None
+            else bind_aux_taps(drafter, model.config.hidden_size)
+        )
+        if not self._custom_gather_fits():
+            logger.warning(
+                "V4.1 mono: token parallel is off, its row gather has no custom "
+                "all-gather (the NCCL one cannot be captured)"
+            )
+            self.tok_par_from = self.max_rows + 1
         for rope in (model.window_rope, model.global_rope):
             for table in (rope.cos_cache, rope.sin_cache):
                 if table.dtype != torch.bfloat16 or table.shape[-1] != k1.HALF:
@@ -217,6 +235,37 @@ class V41MonoDecodeRunner:
         self.tp = get_tensor_model_parallel_world_size()
         self.dims = Dims(self.tp)
 
+    def _custom_gather_fits(self) -> bool:
+        """Whether the widest step's ``_gather_rows`` takes aiter's custom
+        all-gather (``ATOM_USE_CUSTOM_ALL_GATHER``, the group's ``ca_comm`` and
+        its size limit): the same on every rank."""
+        if not envs.ATOM_USE_CUSTOM_ALL_GATHER:
+            return False
+        group = get_tp_group()
+        ca = getattr(group.device_communicator, "ca_comm", None)
+        if ca is None or ca.disabled:
+            return False
+        rows = self.max_rows // self.tp
+        widest = torch.empty(
+            rows,
+            1 + len(self.aux.buffers),
+            k1.HIDDEN,
+            dtype=torch.bfloat16,
+            device="meta",
+        )
+        return bool(ca.should_custom_ag(widest))
+
+    def _tok_par(self, s: int) -> bool:
+        """Whether an s-row step runs token parallel (``tok_par_from``); never
+        in check mode, which compares each kernel's whole rows, nor with K2
+        split, whose separate K2b would read rows K2a's owner never gathered."""
+        return (
+            not self.check
+            and not self.split_k2
+            and s >= self.tok_par_from
+            and s % self.tp == 0
+        )
+
     def _layer_keys(self, s: int) -> list:
         """K1's build of every layer for an s-row step."""
         # layer 0 starts from the embeddings and an Engram layer settles first:
@@ -231,6 +280,7 @@ class V41MonoDecodeRunner:
                 tp=self.tp,
                 timeline=self.timeline,
                 diag_off=self.diag_off,
+                tok_par=self._tok_par(s),
             )
             for spec, block in zip(self.model.topology, self.model.layers)
         ]
@@ -245,7 +295,8 @@ class V41MonoDecodeRunner:
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
-            ug_groups=self.ug_groups,
+            ug_groups=1 if s < self.fine_ug_below else self.ug_groups,
+            tok_par=self._tok_par(s),
         )
 
     def _rows_build(self, s: int) -> RowsBuild:
@@ -443,11 +494,26 @@ class V41MonoDecodeRunner:
             pre, post, comb = self.gates_ffn
             state = SinglePassHCState(self.res_ffn, pre, self.ffn_out, post, comb)
         hidden = state.collapse()
+        if self._tok_par(rows):
+            hidden = self._gather_rows(hidden, rows)
         model.end_forward(hidden, None)
         self._raise_on_given_up_waits(rows)
         for timeline in self.timelines.values():
             timeline.step_done(rows)
         return hidden.squeeze(0)
+
+    def _gather_rows(self, hidden, rows):
+        """A token-parallel step's every row from its owner: the collapsed
+        hidden state and the drafter's taps, one all-gather (each rank holds
+        its own tokens' rows only)."""
+        n = rows // self.tp
+        lo = self.rank * n
+        taps = [buf[lo : lo + n] for buf in self.aux.buffers]
+        mine = torch.stack([hidden[0, lo : lo + n], *taps], dim=1)
+        every = get_tp_group().all_gather(mine, use_custom=True, dim=0)
+        for k, buf in enumerate(self.aux.buffers):
+            buf[:rows].copy_(every[:, k + 1])
+        return every[:, 0].contiguous().unsqueeze(0)
 
     def _front(self, layer_id, key, weights, state, cache, step, rope):
         """K1 -> (the residual after the owed post, the seam's (pre, post, comb));
@@ -481,7 +547,7 @@ class V41MonoDecodeRunner:
             "pre_out": p(pre), "q_out": p(self.q), "normed": p(self.normed),
             "qr_out": p(self.qr), "qrs_out": p(self.qr_scale),
             "aux": 0 if aux is None else p(aux), **self._index_projection_args(key, weights),
-            "scratch": p(self.scratch), "layer": layer_id,
+            "scratch": p(self.scratch), **self.peers.kernel_args(), "layer": layer_id,
             "tl": self._timeline_ptr("k1", layer_id),
         })  # fmt: skip
         # the caller's stream: a FlyDSL launcher left to its default submits on the

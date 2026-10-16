@@ -564,6 +564,13 @@ class EngineStats:
                 f"evicted this interval {evicted_iv} "
                 f"(total {occ['evicted_total']})"
             )
+            # Rejected chains are rehashed on the scheduler thread.
+            bm = self.block_manager
+            logger.info(
+                f"[Prompt Chains] frontend-hashed: "
+                f"adopted {bm.shipped_chains_adopted}, "
+                f"rejected {bm.shipped_chains_rejected}"
+            )
         self._log_pools()
         if self.total_offload_tokens:
             logger.info(

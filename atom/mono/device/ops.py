@@ -32,7 +32,7 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
@@ -326,17 +326,29 @@ def ld_dev(ptr, i, words=1):
 LOAD_BATCH = 4  # rounds of a strided loop whose loads go out together
 
 
+def first_rounds(tid, n, load, batch=LOAD_BATCH):
+    """``batched_rounds``' first batch of loads, issued by a caller ahead of a
+    wait the loads do not depend on (``batched_rounds(..., first=)``)."""
+    rounds = -(-n // THREADS)
+    return [load(fx.min(tid + THREADS * i, n - 1)) for i in range(min(batch, rounds))]
+
+
 @traced
-def batched_rounds(tid, n, load, use, batch=LOAD_BATCH):
+def batched_rounds(tid, n, load, use, batch=LOAD_BATCH, first=None):
     """A CTA's strided loop over elements v = tid + THREADS i < n (n a Python
     int): ``load(v)`` of ``batch`` rounds issued before any ``use(v, loaded)``.
     A round whose ``use`` stores to global memory keeps the next round's loads
     behind it (they may alias), so the rounds' loads would go out in series. A
-    round past n loads element n - 1 (in range) and uses nothing."""
+    round past n loads element n - 1 (in range) and uses nothing. ``first``:
+    the first batch's loads, already issued (``first_rounds``)."""
     rounds = -(-n // THREADS)
+    assert first is None or len(first) == min(batch, rounds), (len(first), n)
     for b0 in range_constexpr(0, rounds, batch):
         idx = range(b0, min(b0 + batch, rounds))
-        got = [load(fx.min(tid + THREADS * i, n - 1)) for i in idx]
+        if const_expr(b0 == 0 and first is not None):
+            got = first
+        else:
+            got = [load(fx.min(tid + THREADS * i, n - 1)) for i in idx]
         for i, g in zip(idx, got):
             v = tid + THREADS * i
             if v < n:

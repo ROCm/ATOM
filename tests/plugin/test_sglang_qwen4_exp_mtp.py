@@ -8,6 +8,7 @@ import torch
 from atom.plugin.config import _build_atom_speculative_config_from_sglang
 from atom.plugin.sglang.models.qwen4_exp import (
     flatten_qwen4_exp_hc,
+    hide_fused_shared_expert_suffix,
     reshape_qwen4_exp_hc,
 )
 from atom.plugin.sglang.patches import qwen4_exp_rocm_patch as rocm_patch
@@ -423,3 +424,41 @@ def test_hip_verify_tree_greedy_uses_triton_only_for_qwen4_exp():
     assert out[0][0].item() == 7
     assert out[1] is accept_index
     assert out[2] is accept_num
+
+
+def test_stacked_loader_sees_only_the_routed_ep_range():
+    """EP rank 0 is the map #2418 makes non-contiguous; hide only that prefix."""
+
+    from atom.model_ops.fused_moe.expert_layout import determine_expert_map
+
+    num_routed = 512
+    local_num, expert_map = determine_expert_map(2, 0, num_routed)
+    fused_map = torch.cat(
+        (
+            expert_map,
+            torch.tensor([local_num], dtype=torch.int32),
+            torch.tensor([-1], dtype=torch.int32),
+        )
+    )
+    positives = torch.nonzero(fused_map >= 0).flatten()
+    first, last = int(positives[0]), int(positives[-1])
+    assert last - first + 1 != int(positives.numel())
+
+    experts = SimpleNamespace(
+        expert_map=fused_map,
+        expert_layout=SimpleNamespace(num_routed=num_routed),
+    )
+    seen = {}
+
+    def install(obj):
+        local = torch.nonzero(obj.expert_map >= 0).flatten()
+        first_i, last_i = int(local[0]), int(local[-1])
+        seen["slice"] = slice(first_i, last_i + 1)
+        seen["length"] = int(obj.expert_map.shape[0])
+
+    hide_fused_shared_expert_suffix(experts, install)
+    assert seen["length"] == num_routed
+    assert seen["slice"] == slice(0, local_num)
+    assert experts.expert_map is fused_map
+    assert experts.expert_map.shape[0] == num_routed + 2
+    assert int(experts.expert_map[-2]) == local_num
