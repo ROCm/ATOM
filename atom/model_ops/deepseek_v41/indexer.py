@@ -2,15 +2,18 @@
 """CSA2 candidate block selection: level one of the two-level index top-k.
 
 A source layer picks the blocks, and the layers after it score their own rows
-only inside them (`restrict_to_candidates`). Both are read out of the FP8 plane
-by `paged_scoring`, which is the only index scorer there is -- and which bands
-the plane so that these kernels' `row * stride` stays inside int32.
+only inside them -- by paging over the kept list (`candidate_table`), which is
+what makes the mask below a twin rather than a step. The picking is read out
+of the FP8 plane by `paged_scoring`, which is the only index scorer there is --
+and which bands the plane so that this kernel's `row * stride` stays inside
+int32.
 """
 
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.topk import top_k_per_row_decode
+from triton.language.extra import libdevice
 
 
 def _blocks(width, block_size):
@@ -83,15 +86,17 @@ def _restrict_lanes(rows):
     return min(256, max(1, 16384 // max(rows, 1)))
 
 
-def restrict_to_candidates(logits, candidates, visible, block_size, tile=64):
+def restrict_to_candidates_reference(logits, candidates, visible, block_size, tile=64):
     """-inf every column outside the candidate blocks, in place.
 
+    Nothing calls this: `candidate_table` reaches the same selection by paging
+    over the kept list instead. Kept as the judge of that -- restating it in the
+    test would be the same addressing written twice.
+
     The blocks are an earlier layer's, picked from that layer's own scores, so
-    this is not redundant with the top-k below it: a row this layer ranks
+    this is not redundant with the top-k after it: a row this layer ranks
     highly can sit in a block that layer did not keep, and dropping it is the
-    mechanism. Masking a fully scored width selects the same rows as scoring
-    only the kept ones, and the blocks stay a list of ids because the column
-    mask they stand for is the largest allocation on a long-context step.
+    mechanism.
     """
     rows, width = logits.shape
     topk_blocks = candidates.shape[-1]
@@ -111,39 +116,74 @@ def restrict_to_candidates(logits, candidates, visible, block_size, tile=64):
     )
 
 
-@triton.jit
+def _maxima_lanes(rows):
+    """Programs per row for `_block_maxima_kernel`, about 2048 in the grid.
+
+    A tile is one load and one max, so extra lanes have little latency to hide
+    and an idle one is pure launch cost: the grid wants to fill the machine
+    once and no more. Within about 10% of the best lane count from 6 to 8191
+    rows and 2k to 256k context.
+    """
+    return min(256, max(1, 2048 // max(rows, 1)))
+
+
+@triton.jit(do_not_specialize=["lanes"])
 def _block_maxima_kernel(
     logits,
     visible,
     maxima,
     ends,
-    blocks,
+    starts,
+    block_starts,
     logits_stride,
     maxima_stride,
+    lanes,
     BLOCK: tl.constexpr,
     TILE: tl.constexpr,
+    PACKED: tl.constexpr,
 ):
-    """Each block's best visible score, `+inf` on the row's newest block.
+    """Each block's best visible score, exclusive `+inf` on the newest block.
 
     The newest block holds the most recent tokens and is only partly filled, so
     it is pinned rather than left to be outscored. `ends` is the top-k's row
     bound in blocks, written here because this pass already knows it.
+
+    Reserve `+inf` for that pin: another infinite score can tie it out of
+    top-k, and NaNs can defeat the ordering entirely. Either would violate
+    `candidate_table`'s newest-block invariant and let its computed context
+    exceed the compacted allocation. Ignore NaNs and cap other blocks at the
+    largest finite score before inserting the pin.
+
+    Nothing past a row's `ends` is read or written: the top-k stops there, and
+    the width is the block table's -- `max_model_len` -- not the row's context.
+    `lanes` programs stride over a row's tiles, so the grid is fixed for a
+    captured shape while the work follows the context. It is a runtime value
+    and never specialized: it follows the row count, which on an eager prefill
+    is any token count, and one compile per value would land in serving.
+
+    `PACKED`: a row's logits start at `starts[row]` of a flat buffer and its
+    maxima at `block_starts[row]` (`PackedRows`), not a stride apart; both
+    are otherwise unread.
     """
     row = tl.program_id(0)
+    if PACKED:
+        logits_row = logits + tl.load(starts + row)
+        maxima_row = maxima + tl.load(block_starts + row)
+    else:
+        logits_row = logits + row * logits_stride
+        maxima_row = maxima + row * maxima_stride
     seen = tl.load(visible + row).to(tl.int32)
-    ids = tl.program_id(1) * TILE + tl.arange(0, TILE)
-    columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
-    scores = tl.load(
-        logits + row * logits_stride + columns,
-        columns < seen,
-        other=float("-inf"),
-    )
-    best = tl.max(scores, axis=1)
-    newest = (seen - 1) // BLOCK
-    best = tl.where((seen > 0) & (ids == newest), float("inf"), best)
-    tl.store(maxima + row * maxima_stride + ids, best, ids < blocks)
+    last = tl.cdiv(seen, BLOCK)
+    for tile in range(tl.program_id(1), tl.cdiv(last, TILE), lanes):
+        ids = tile * TILE + tl.arange(0, TILE)
+        columns = ids[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+        scores = tl.load(logits_row + columns, columns < seen, other=float("-inf"))
+        best = tl.max(tl.where(libdevice.isnan(scores), float("-inf"), scores), axis=1)
+        best = tl.minimum(best, 3.4028234663852886e38)
+        best = tl.where(ids == last - 1, float("inf"), best)
+        tl.store(maxima_row + ids, best, ids < last)
     if tl.program_id(1) == 0:
-        tl.store(ends + row, (seen + BLOCK - 1) // BLOCK)
+        tl.store(ends + row, last)
 
 
 def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
@@ -157,18 +197,7 @@ def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
     topk_blocks = out.shape[-1]
     blocks = _blocks(width, block_size)
     maxima = torch.empty(rows, blocks, dtype=torch.float32, device=logits.device)
-    ends = torch.empty(rows, dtype=torch.int32, device=logits.device)
-    _block_maxima_kernel[(rows, triton.cdiv(blocks, tile))](
-        logits,
-        visible,
-        maxima,
-        ends,
-        blocks,
-        logits.stride(0),
-        maxima.stride(0),
-        BLOCK=block_size,
-        TILE=tile,
-    )
+    ends = _block_maxima(logits, visible, maxima, block_size, blocks, tile)
     # The decode entry point: its prefill sibling would want a row-start array
     # as well, and every row here starts at zero.
     top_k_per_row_decode(
@@ -182,3 +211,72 @@ def pick_candidate_blocks(logits, visible, block_size, out, tile=64):
         k=topk_blocks,
         stable=True,
     )
+
+
+def pick_candidate_blocks_packed(
+    logits,
+    offsets,
+    maxima,
+    block_offsets,
+    visible,
+    block_size,
+    out,
+    plane_width,
+    tile=64,
+):
+    """`pick_candidate_blocks` on packed logits (`ScoreWorkspace`): row r's at
+    `offsets[r]` of the flat `logits`, its block maxima to `block_offsets[r]`
+    of the flat `maxima`. `plane_width` is the width of the plane the rows
+    stand for, which picks the top-k that plane would.
+    """
+    rows = visible.shape[0]
+    blocks = _blocks(plane_width, block_size)
+    ends = _block_maxima(
+        logits,
+        visible,
+        maxima,
+        block_size,
+        blocks,
+        tile,
+        packed=(offsets, block_offsets),
+    )
+    top_k_per_row_decode(
+        maxima,
+        1,
+        ends,
+        out,
+        rows,
+        0,
+        1,
+        k=out.shape[-1],
+        stable=True,
+        row_starts=block_offsets,
+        plane_width=blocks,
+    )
+
+
+def _block_maxima(logits, visible, maxima, block_size, blocks, tile, packed=None):
+    """`_block_maxima_kernel` over a plane, or packed rows (`packed`: their
+    logits and maxima starts); each row's block count."""
+    rows = visible.shape[0]
+    ends = torch.empty(rows, dtype=torch.int32, device=visible.device)
+    lanes = min(_maxima_lanes(rows), triton.cdiv(blocks, tile))
+    if packed is None:
+        starts = block_starts = None
+        strides = (logits.stride(0), maxima.stride(0))
+    else:
+        (starts, block_starts), strides = packed, (0, 0)
+    _block_maxima_kernel[(rows, lanes)](
+        logits,
+        visible,
+        maxima,
+        ends,
+        starts,
+        block_starts,
+        *strides,
+        lanes,
+        BLOCK=block_size,
+        TILE=tile,
+        PACKED=packed is not None,
+    )
+    return ends

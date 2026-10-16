@@ -68,8 +68,52 @@ _QWEN4_EXP_HF_MAPPER = WeightsMapper(
 )
 
 
+def hide_fused_shared_expert_suffix(experts: Any, install: Any) -> None:
+    """Show the stacked loader only the contiguous routed EP range.
+
+    ``#2418`` appends fused shared-expert slot ids after the ``-1`` holes in
+    ``expert_map``. Native ``install_stacked_expert_loaders`` rejects that
+    gap. The stacked checkpoint has only routed rows, and the closures it
+    installs capture the slice, so the full map can be restored for fused
+    forward immediately after.
+    """
+
+    expert_map = getattr(experts, "expert_map", None)
+    num_routed = int(
+        getattr(getattr(experts, "expert_layout", None), "num_routed", 0) or 0
+    )
+    if (
+        not torch.is_tensor(expert_map)
+        or num_routed <= 0
+        or int(expert_map.shape[0]) <= num_routed
+    ):
+        install(experts)
+        return
+    saved = expert_map
+    experts.expert_map = expert_map[:num_routed]
+    try:
+        install(experts)
+    finally:
+        experts.expert_map = saved
+
+
+def install_routed_stacked_expert_loader() -> None:
+    import atom.models.qwen4_exp as native
+
+    current = native.install_stacked_expert_loaders
+    if getattr(current, "_atom_hides_fused_shared_suffix", False):
+        return
+
+    def install(experts: Any) -> None:
+        hide_fused_shared_expert_suffix(experts, current)
+
+    install._atom_hides_fused_shared_suffix = True
+    native.install_stacked_expert_loaders = install
+
+
 def apply_prepare_qwen4_exp_adaptations(atom_config: Any, model_arch: str) -> None:
     del model_arch
+    install_routed_stacked_expert_loader()
     native = _require_native()
     quant_config = getattr(atom_config, "quant_config", None)
     if quant_config is None:
@@ -81,13 +125,11 @@ def apply_prepare_qwen4_exp_adaptations(atom_config: Any, model_arch: str) -> No
     # them onto ``in_proj_qkvzba`` here rewrites PTPC exclude ``in_proj_b/a``
     # onto the same name as quantized ``in_proj_qkv/z``, so the layer builds
     # unquantized ``qkvzba`` and drops ``weight_scale`` (72 tensors / 36 GDN).
-    packed = {
-        **dict(getattr(native, "packed_modules_mapping", {})),
-        **{
-            f".ngram_embedding.shard_{shard}.": (".ngram_embedding.", shard)
-            for shard in range(ngram_parts)
-        },
-    }
+    from atom.models.qwen4_exp import qwen4_exp_packed_modules_mapping
+
+    packed = qwen4_exp_packed_modules_mapping(
+        dict(getattr(native, "packed_modules_mapping", {})), ngram_parts
+    )
     quant_config.remap_layer_name(
         atom_config.hf_config,
         packed_modules_mapping=packed,
@@ -103,6 +145,27 @@ def _sequence_positions(positions: torch.Tensor) -> torch.Tensor:
     if positions.ndim == 2 and positions.shape[0] in (1, 3):
         return positions[0]
     return positions.reshape(-1)
+
+
+def flatten_qwen4_exp_hc(hidden: torch.Tensor) -> torch.Tensor:
+    """``[N, hc, H]`` → ``[N, hc*H]`` for SGLang EAGLE hidden storage."""
+    if hidden.ndim == 3:
+        return hidden.flatten(1)
+    return hidden
+
+
+def reshape_qwen4_exp_hc(
+    hidden: torch.Tensor, *, hidden_size: int, hc_count: int
+) -> torch.Tensor:
+    """Restore the exact Native HC bundle from SGLang's hidden storage."""
+    if hidden.ndim == 3 and tuple(hidden.shape[1:]) == (hc_count, hidden_size):
+        return hidden
+    if hidden.ndim == 2 and hidden.shape[1] == hc_count * hidden_size:
+        return hidden.view(hidden.shape[0], hc_count, hidden_size)
+    raise ValueError(
+        f"Flash MTP hidden_states must have shape [N, {hc_count * hidden_size}] "
+        f"or [N, {hc_count}, {hidden_size}], got {tuple(hidden.shape)}"
+    )
 
 
 def _lm_positions_for_runtime(runtime: SGLangPluginRuntime) -> torch.Tensor:
@@ -228,6 +291,9 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
         if input_ids is None:
             return self.model.embed_tokens
         return self.model.get_input_embeddings(input_ids)
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self._atom_lm.get_expert_mapping()
@@ -367,6 +433,19 @@ class Qwen4ExpForConditionalGeneration(nn.Module):
 
         if not self.pp_group.is_last_rank:
             return hidden
+        # Speculative target exports flattened HC into EAGLE via
+        # hidden_states_before_norm. Logits still mix first (same as Native
+        # compute_logits), so the existing ParallelLMHead path is unchanged.
+        if torch.is_tensor(hidden) and hidden.ndim == 3:
+            flat = flatten_qwen4_exp_hc(hidden)
+            mixed, _ = self.model.hyper_connection_mixer.mix(flat)
+            return self.logits_processor(
+                input_ids,
+                mixed,
+                self.lm_head,
+                forward_batch,
+                hidden_states_before_norm=flat,
+            )
         return self.logits_processor(input_ids, hidden, self.lm_head, forward_batch)
 
 

@@ -37,12 +37,21 @@ def _export_tensor(t: torch.Tensor, retain: list | None = None) -> dict:
     copy's storage — if it is left to go out of scope here, the consumer's IPC
     view points at freed memory. The producer must therefore hold a reference for
     as long as the consumer might read it, i.e. the life of the process.
+
+    A zero-element tensor carries `share_cuda_args=None`: there is no zero-byte
+    allocation to hand out, so `_share_cuda_()` answers with Nones in the handle
+    / ref-counter / event slots and the consumer's `_new_shared_cuda` rejects the
+    tuple outright. The consumer rebuilds those locally — they own no bytes, so
+    nothing is actually shared by sharing them. Buffers and plain tensor attrs
+    are already screened by `numel() > 0` at their export sites; parameters are
+    not, which is the one path that reached `_share_cuda_()` with an empty
+    storage.
     """
     src = t
     t = t.contiguous()
     if retain is not None and t is not src:
         retain.append(t)
-    share_cuda_args = t.untyped_storage()._share_cuda_()
+    share_cuda_args = None if t.numel() == 0 else t.untyped_storage()._share_cuda_()
     return {
         "share_cuda_args": share_cuda_args,
         "dtype": t.dtype,
@@ -56,7 +65,10 @@ def _import_tensor(meta: dict) -> torch.Tensor:
     """Reconstruct a CUDA tensor from the dict produced by _export_tensor.
 
     Calls UntypedStorage._new_shared_cuda() which calls hipIpcOpenMemHandle.
+    Empty tensors carry no handle (see _export_tensor) and are rebuilt locally.
     """
+    if meta["share_cuda_args"] is None:
+        return torch.empty(meta["shape"], dtype=meta["dtype"], device="cuda")
     storage = torch.UntypedStorage._new_shared_cuda(*meta["share_cuda_args"])
     t = torch.empty(0, dtype=meta["dtype"], device="cuda")
     t.set_(storage, meta["storage_offset"], meta["shape"], meta["stride"])
@@ -319,14 +331,30 @@ def export_model_weight_handles(
     # names (e.g. e_score_correction_bias, shared by gate + experts) is exported
     # under EVERY name — otherwise the consumer only materializes one of the
     # aliased registrations and the other stays on meta.
+    empty_params: list[str] = []
     for name, param in model.named_parameters(remove_duplicate=False):
         key = f"__param__{name}"
+        if param.data.numel() == 0:
+            empty_params.append(name)
         handles[key] = _export_tensor(param.data, retain)
         # Read attrs off the Parameter object, not param.data — process_weights
         # stamps the Parameter (e.g. `layer.w13_weight.is_shuffled = True`).
         attrs = _tensor_meta_attrs(param)
         if attrs:
             tensor_attrs[key] = attrs
+    if empty_params:
+        # Named, not just counted: an empty parameter is exported handle-free and
+        # rebuilt on the consumer, which is correct for one that is legitimately
+        # empty and silent for one that is empty because the shape it was sized
+        # from came out zero (an EP split that left this rank no experts, say).
+        # Only the name distinguishes the two, so say it rather than hide it.
+        logger.warning(
+            "[WT-EXPORT] %d zero-element parameter(s) carry no IPC handle and are "
+            "rebuilt locally on decode: %s%s",
+            len(empty_params),
+            empty_params[:10],
+            " ..." if len(empty_params) > 10 else "",
+        )
     # Registered buffers (non-persistent included).
     for name, buf in model.named_buffers():
         if isinstance(buf, torch.Tensor) and buf.is_cuda and buf.numel() > 0:
@@ -490,7 +518,18 @@ def _import_model_weights_impl(model: nn.Module, handles: dict) -> None:
     for key, meta in handles.items():
         if key == _META_KEY:
             continue
-        t = _import_tensor(meta)
+        try:
+            t = _import_tensor(meta)
+        except Exception as exc:
+            # `_import_tensor` sees only the metadata dict, so a handle torch
+            # refuses surfaces as a bare TypeError naming argument positions and
+            # not the tensor they came from -- across 3000+ handles that leaves
+            # nothing to act on. Say which one.
+            raise RuntimeError(
+                f"IPC import failed for {key!r} "
+                f"(dtype={meta.get('dtype')}, shape={tuple(meta.get('shape', ()))}): "
+                f"{exc}"
+            ) from exc
         if key.startswith("__param__"):
             # Rebuild the Parameter around the imported CUDA view (set_data fails
             # for meta->cuda). Create the slot if the consumer's meta model lacks

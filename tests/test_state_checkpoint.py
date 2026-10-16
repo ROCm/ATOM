@@ -2501,6 +2501,19 @@ class TestPromptEndAnchor:
             assert n - anchor >= MIN_FORK, n  # and it leaves the fork its room
             assert bm.checkpointers_at(seq, anchor), n  # so it is really kept
 
+    def test_the_anchor_leaves_the_model_its_final_forward(self):
+        """With `min_final_prefill_rows`, a forward resuming at the anchor
+        finishes the prompt with at least that many rows, so it never backs
+        off below the checkpoint it resumes (`BlockManager.replay_start`)."""
+        bm = make_block_manager(demand_config())
+        bm.min_final_prefill_rows = 10
+        for n in (40, 44, 45, 50):
+            seq = stateful_seq(list(range(1000 * n, 1000 * n + n)))
+            bm.can_allocate(seq)
+            anchor = seq.checkpoint_end_pos
+            assert anchor % BLOCK == 0 and n - anchor >= 10, n
+            assert bm.replay_start(seq, anchor, hit=False) == anchor, n
+
     def test_a_prompt_with_no_room_for_an_anchor_gets_none(self):
         bm = make_block_manager(demand_config())
         seq = stateful_seq(list(range(MIN_FORK)))

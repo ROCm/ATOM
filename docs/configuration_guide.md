@@ -40,13 +40,17 @@ Defined in `atom/config.py`. The root dataclass that the engine consumes.
 | `kv_cache_block_size` | `int` | `16` | Block size for paged KV cache; must be a multiple of 16 or exactly 1. The FP4 sparse indexer requires exactly 64 |
 | `num_kvcache_blocks` | `int` | `-1` | Number of KV cache blocks (`-1` = auto) |
 | `kv_cache_dtype` | `str` | `"bf16"` | KV cache data type (`"bf16"` or `"fp8"`) |
-| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`, the only format its paged index scorer reads; anything else is refused by the V4.1 runtime gate before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
+| `index_cache_dtype` | `str \| None` | `None` | Indexer-cache dtype, resolved after model detection. Native single-node DeepSeek-V4 defaults to `"fp4"` except on gfx942; plugin and KV-transfer integrations retain `"fp8"`. DeepSeek-V4.1 defaults to `"fp8"`; its runtime also takes `"fp4"` (the official E2M1 + E8M0 arithmetic in the row-group scorer's page-8 layout, values and scales in two planes, which needs `candidate_block_size` 8) and refuses any other format before weights load, rather than overridden here. Other models inherit `kv_cache_dtype`. An explicit `"bf16"`, `"fp8"`, or `"fp4"` value is preserved. `"fp4"` is honoured only where the FP4 mqa-logits kernels apply -- gfx950, an indexer head dim of 128, an indexer head count that is a multiple of 16, and `--block-size 64`; anything else logs one warning and scores in FP8. It runs under DCP, and is refused outright under PCP and KV transfer rather than falling back. |
 | `enable_prefix_caching` | `bool` | `False` | Enable prefix caching to reuse KV blocks across requests sharing the same prefix |
 | `enable_log_stats` | `bool` | `True` | Emit the periodic engine-status line (running/waiting reqs, KV usage, prefix-cache hit rate, prompt/generation throughput). Applies to offline `LLM(...)` as well as to the server. Scoped to that line: `[MTP Stats]` and `[Cache Stats]` have their own gates |
 | `throughput_log_interval` | `float` | `10.0` | Seconds between engine-status lines. Must be > 0 |
 | `cache_hit_rate_window` | `int` | `1000` | Requests in the sliding window behind the engine-status line's prefix-cache hit rate. Must be > 0. Only that line is windowed; `/metrics` and `[Cache Stats]` stay cumulative |
 | `state_checkpoint_interval_tokens` | `int` | `8192` | For models with per-request state (DeepSeek-V4 compressor ring, GDN recurrent state, Kimi-K3 KDA): tokens between rungs of the checkpoint ladder. The sign carries three policies — `>0` a rung every N tokens (must be a multiple of the prefix-cache hash block size), `0` checkpointing off entirely, `-1` ladder off while the prompt-end anchor and the demand rung still place. See the state-checkpoint section of the [scheduling & KV cache guide](scheduling_kv_cache_guide.md) |
 | `state_checkpoint_demand` | `bool` | `True` | Whether a prefix hit refused for want of a checkpoint may place a rung of its own. Off leaves the prompt-end anchor as the only placement. Overridden by `ATOM_STATE_CHECKPOINT_DEMAND` |
+| `enable_decoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: prefill runs the decoder (layers 20..39) only on the rows the next forward reads, its windows truncated there (the V4.1 report's SWA Bounded Replay). Faster prefill, not numerically equivalent to a full prefill. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#decoder-swa-bounded-replay) |
+| `enable_encoder_swa_bounded_replay` | `bool` | `True` | DeepSeek-V4.1 only: a prefix hit resumes without a state checkpoint, rebuilding the sliding-window state from the hash block below the hit; no state checkpoint is kept. See [DeepSeek-V4.1 runtime](deepseek_v41_runtime.md#encoder-swa-bounded-replay) |
+| `min_final_prefill_rows` | `int` | `0` | Set by the model, not a flag: the fewest rows the forward finishing a prompt runs; one resuming closer to the end starts earlier, on the hash-block grid (`BlockManager.replay_start`). DeepSeek-V4.1 with decoder bounded replay: `sliding_window` |
+| `replay_history_tokens` | `int` | `0` | Set by the model, not a flag: the tokens before a forward that starts below where its prefill resumed which the backend reads (`Replay.history_ids`). DeepSeek-V4.1: its Engram n-gram lookback, `engram_max_ngram_size - 1` |
 | `port` | `int` | `8006` | Engine internal communication port |
 | `torch_profiler_dir` | `str \| None` | `os.getenv("ATOM_TORCH_PROFILER_DIR", None)` | Directory for saving PyTorch profiler traces; creates the directory if it does not exist |
 | `compilation_config` | `CompilationConfig` | `CompilationConfig()` | Compilation and CUDA graph settings (see Section 2) |
@@ -93,7 +97,7 @@ Defined in `atom/config.py`. Controls torch.compile and CUDA graph behaviour.
 | `level` | `int` | `0` | Compilation level (see table above); must be 0 — 3 |
 | `use_cudagraph` | `bool` | `True` | Whether to use CUDA graphs |
 | `cudagraph_capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes for CUDA graph capture; overrides `cuda_graph_sizes` when set |
-| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1,2,4,8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
+| `cuda_graph_sizes` | `list[int]` | `[]` (post-init: `[512]`) | CUDA graph sizing strategy: 1 value generates `[1..8] + range(16, N+1, 16)`; multiple values used as-is; empty defaults to `[512]` |
 | `debug_dump_path` | `str` | `""` | Path to dump debug / compilation information |
 | `cache_dir` | `str` | `""` | Directory for compilation caches |
 | `use_inductor` | `bool` | `True` | Enable TorchInductor backend |
@@ -263,7 +267,7 @@ Defined in `atom/config.py`. Controls data parallelism. Environment variables
 | `data_parallel_rank` | `int` | `0` | First **global** DP rank owned by this node; overridden by `ATOM_DP_RANK` |
 | `data_parallel_rank_local` | `Optional[int]` | `None` | Local rank within the data-parallel group (SPMD mode); overridden by `ATOM_DP_RANK_LOCAL` |
 | `data_parallel_master_port` | `int` | `29500` | Port used by the data-parallel master for process group initialization |
-| `data_parallel_base_port` | `int` | `get_open_port()` | Base port for data-parallel communication (dynamically assigned) |
+| `data_parallel_base_port` | `int` | `0` | Model-runner TCPStore port; automatically bound for single-node runs, explicitly shared across nodes |
 | `data_parallel_master_ip` | `str` | `"127.0.0.1"` | IP address of the data-parallel master |
 
 **Computed property:**
@@ -366,7 +370,7 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--index-cache-dtype`, `--index_cache_dtype` | | `str` | `None` | Indexer-cache dtype; choices: `bf16`, `fp8`, `fp4`. When omitted, uses the architecture- and integration-aware `Config.index_cache_dtype` defaults described above. |
 | `--block-size` | | `int` | `16` | KV cache block size (maps to `kv_cache_block_size`); the FP4 sparse indexer requires exactly 64 |
 | `--max-model-len` | | `int` | `None` | Maximum model context length; defaults to `hf_config.max_position_embeddings` |
-| `--cudagraph-capture-sizes` | | `str` | `"[1,2,4,8,16,32,48,64,128,256]"` | CUDA graph capture sizes as a Python list string |
+| `--cudagraph-capture-sizes` | | `str` | `"[1,2,3,4,5,6,7,8,16,32,48,64,128,256,512]"` (every batch of 1..8: a padded one runs the next size's step) | CUDA graph capture sizes as a Python list string |
 | `--level` | | `int` | `3` | Compilation level (0 — 3) |
 | `--load_dummy` | | `{empty,zero,xavier}` (optional value) | `None` | Dummy weights: bare/`=empty` skip load; `=zero` all-zero; `=xavier` xavier(bf16)/constant-magnitude(fp4/fp8) |
 | `--enable-expert-parallel` | | flag | `False` | Enable Expert Parallelism (EP MoE) |
@@ -377,6 +381,8 @@ all flags via `add_cli_args()` and converts them into a `Config` via
 | `--max-num-batched-tokens` | | `int` | `16384` | Maximum number of tokens to batch in the async engine |
 | `--state-checkpoint-interval-tokens` | | `int` | `8192` | Tokens between rungs of the per-request state checkpoint ladder; must be a multiple of the prefix-cache hash block size. `0` turns checkpointing off entirely; **`-1` turns off only the ladder**, leaving the prompt-end anchor and the demand rung as the placements. Prompts shorter than one interval publish no rung. A rung also quantizes prefill chunk boundaries, since a checkpoint is only valid where a forward ends exactly on one — which is most of what `-1` buys back |
 | `--state-checkpoint-demand` / `--no-state-checkpoint-demand` | | `bool` | on | Let a prefix hit that was refused for want of a checkpoint place a rung of its own. Off leaves the prompt-end anchor as the only placement. `ATOM_STATE_CHECKPOINT_DEMAND=0` overrides this without touching a launch script |
+| `--decoder-swa-bounded-replay` / `--no-decoder-swa-bounded-replay` | `--enable-decoder-swa-bounded-replay` | `bool` | on | DeepSeek-V4.1 only: the forward finishing a prompt runs the decoder (layers 20..39) on its last 128 rows only, their windows truncated at the first of them, and layer 39's query on the last row; one that does not finish runs none of it past layer 20's compression (the V4.1 report's SWA Bounded Replay). Not numerically equivalent to a full prefill. No effect on other models |
+| `--encoder-swa-bounded-replay` / `--no-encoder-swa-bounded-replay` | `--enable-encoder-swa-bounded-replay` | `bool` | on | DeepSeek-V4.1 only: a prefix hit resumes without a state checkpoint, recomputing the hash block below the hit to rebuild the sliding-window state (no cached row is rewritten); no state checkpoint is kept, so none cuts a prefill chunk. Not numerically equivalent to resuming a checkpoint. No effect on other models |
 | `--max-num-seqs` | | `int` | `512` | Maximum number of sequences to batch together |
 | `--gpu-memory-utilization` | | `float` | `0.9` | Fraction of GPU memory to use (0.0 — 1.0) |
 | `--scheduler-delay-factor` | | `float` | `0.0` | Delay factor multiplied by previous prompt latency before scheduling next prompt |

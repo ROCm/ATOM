@@ -1,6 +1,6 @@
-# Reusable benchmark template: runs ONE (model variant × scenario) config across
-# its concurrency list. The caller (atom-benchmark.yaml) matrixes over configs
-# and invokes this once per config; this workflow matrixes over `concurrency`.
+# Reusable benchmark template: runs ONE model config across its concurrency list.
+# The random and agentic callers matrix over configs
+# and invoke this once per config; this workflow matrixes over `concurrency`.
 # Two-level fan-out keeps both matrices under GitHub's 256-job-per-matrix limit
 # while every (config × conc) cell still runs as its own parallel job. Mirrors
 # the scenario-sharded reusable-workflow pattern in InferenceX run-sweep.
@@ -26,6 +26,9 @@ on:
         type: string
         required: false
         default: ""
+      bench_kind:
+        type: string
+        default: random
       bench_args:
         type: string
         required: false
@@ -38,17 +41,21 @@ on:
         type: string
         required: true
       isl:
+        description: "Random workload input length; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       osl:
+        description: "Random workload output length; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       ratio:
+        description: "Random workload length ratio; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       ratio_str:
+        description: "Random workload ratio label; unused for agentic replay"
         type: string
-        required: true
+        default: ""
       concurrency:
         description: "JSON array of concurrency values (second-level matrix)"
         type: string
@@ -57,6 +64,10 @@ on:
         type: string
         required: false
         default: "rocm/atom-dev:latest"
+      image_display:
+        description: "Optional name resolved from the same immutable image digest"
+        type: string
+        default: ""
       enable_profiler:
         type: boolean
         required: false
@@ -72,6 +83,10 @@ on:
       atom_commit:
         type: string
         required: false
+        default: ""
+      aiter_wheel_artifact_id:
+        description: "Optional wheel artifact from this run, resolved once by the caller"
+        type: string
         default: ""
       aiter_commit:
         type: string
@@ -94,13 +109,17 @@ jobs:
     runs-on: ${{ inputs.runner }}
 
     env:
+      BENCH_KIND: ${{ inputs.bench_kind }}
       MODEL_PATH: ${{ inputs.model_path }}
       ARGS: ${{ inputs.server_args }}
       ISL: ${{ inputs.isl }}
       OSL: ${{ inputs.osl }}
       CONC: ${{ matrix.conc }}
       RANDOM_RANGE_RATIO: ${{ inputs.ratio }}
-      RESULT_FILENAME: ${{ inputs.prefix }}${{ inputs.suffix }}-${{ inputs.isl }}-${{ inputs.osl }}-${{ matrix.conc }}-${{ inputs.ratio_str }}
+      RESULT_FILENAME: >-
+        ${{ inputs.bench_kind == 'aiperf_agentic'
+            && format('{0}{1}-c{2}', inputs.prefix, inputs.suffix, matrix.conc)
+            || format('{0}{1}-{2}-{3}-{4}-{5}', inputs.prefix, inputs.suffix, inputs.isl, inputs.osl, matrix.conc, inputs.ratio_str) }}
 
     steps:
       - name: Kill all Docker containers
@@ -119,7 +138,17 @@ jobs:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.atom_commit || github.ref }}
+          ref: ${{ inputs.atom_commit || github.sha }}
+
+      - name: Validate AITER override selection
+        env:
+          AITER_REF: ${{ inputs.aiter_commit }}
+          AITER_ARTIFACT: ${{ inputs.aiter_wheel_artifact_id }}
+        run: |
+          if [[ -n "$AITER_REF" && -n "$AITER_ARTIFACT" ]]; then
+            echo "::error::Choose an AITER source ref or a wheel, not both"
+            exit 1
+          fi
 
       - name: Start container + download model
         uses: ./.github/actions/atom-bench-container
@@ -133,9 +162,33 @@ jobs:
           download-required: "true"
           container-env: >-
             -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }}
+            -e ATOM_BENCHMARK_CAPTURE=1 -e BENCH_KIND=${{ env.BENCH_KIND }}
             -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }}
             -e ENABLE_TORCH_PROFILER=${{ inputs.enable_profiler && '1' || '0' }}
             -e ENABLE_RTL_PROFILER=${{ inputs.enable_rtl && '1' || '0' }}
+
+      - name: Prepare AITER wheel directory
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/benchmark-aiter-whl"
+          rm -f "$RUNNER_TEMP/benchmark-aiter-whl"/amd_aiter*.whl "$RUNNER_TEMP/benchmark-aiter-whl/SHA256SUMS"
+
+      - name: Download pinned AITER wheel
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        uses: actions/download-artifact@v5
+        with:
+          artifact-ids: ${{ inputs.aiter_wheel_artifact_id }}
+          path: ${{ runner.temp }}/benchmark-aiter-whl
+          merge-multiple: true
+
+      - name: Verify and install requested AITER wheel
+        if: ${{ inputs.aiter_wheel_artifact_id != '' }}
+        env:
+          CONTAINER_NAME: atom-benchmark
+          AITER_WHL_DIR: ${{ runner.temp }}/benchmark-aiter-whl
+        run: |
+          (cd "$AITER_WHL_DIR" && sha256sum --check SHA256SUMS)
+          bash .github/scripts/install_aiter_wheel.sh
 
       - name: Reinstall AITER from requested ref
         if: ${{ inputs.aiter_commit != '' }}
@@ -144,30 +197,55 @@ jobs:
           AITER_GIT_REF: ${{ inputs.aiter_commit }}
         run: bash .github/scripts/install_aiter_from_ref.sh
 
+      - name: Verify checked-out ATOM code
+        run: |
+          docker exec -i -e EXPECTED_ATOM_SHA="$(git rev-parse HEAD)" atom-benchmark python3 - <<'PY'
+          import importlib.util
+          import os
+          import subprocess
+          from pathlib import Path
+
+          source = Path(importlib.util.find_spec("atom").origin).resolve().parent
+          expected_source = Path("/workspace/atom").resolve()
+          if source != expected_source:
+              raise SystemExit(f"ATOM imports from {source}, expected {expected_source}")
+          sha = subprocess.check_output(
+              ["git", "-c", "safe.directory=/workspace", "-C", "/workspace", "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          if sha != os.environ["EXPECTED_ATOM_SHA"]:
+              raise SystemExit(f"Checkout SHA mismatch: {sha}")
+          print(f"Executing ATOM checkout {sha} from {source}; image supplies the runtime.")
+          PY
+
       - name: Collect GPU info (inside container)
         id: gpu-info
         env:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          REQUESTED_IMAGE: ${{ inputs.image }}
+          IMAGE_DISPLAY: ${{ inputs.image_display || inputs.image }}
         run: |
+          set -euo pipefail
           RUNNER_HINT="${{ inputs.runner }}"
           bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
-          # Resolve latest → nightly_YYYYMMDDHHMMSS for dashboard display
-          DOCKER_IMAGE="${{ inputs.image }}"
-          if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
-            RESOLVED_IMAGE=""
-            if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
-              RESOLVED_IMAGE="$(echo "$RESOLUTION_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("resolved_image",""))')" || true
-            fi
-            DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
-          fi
+          # A registry's latest may have changed since startup. Use the name
+          # resolved with this run's digest, never a second remote lookup.
+          DOCKER_IMAGE="$IMAGE_DISPLAY"
+          IMAGE_ID=$(docker inspect --format '{{.Image}}' atom-benchmark)
+          EXPECTED_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$REQUESTED_IMAGE")
+          test "$IMAGE_ID" = "$EXPECTED_IMAGE_ID"
+          echo "image_digest=${IMAGE_ID}" >> "$GITHUB_OUTPUT"
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
           echo "Docker: ${DOCKER_IMAGE}"
 
       - name: Run benchmark
-        timeout-minutes: 80
+        timeout-minutes: ${{ inputs.bench_kind == 'aiperf_agentic' && 180 || 80 }}
         env:
           EXTRA_LAUNCH_ARGS: ${{ inputs.extra_args }}
+          BENCH_EXTRA_ARGS: ${{ inputs.bench_args }}
+          GPU_NAME: ${{ steps.gpu-info.outputs.gpu_name }}
+          ROCM_VERSION: ${{ steps.gpu-info.outputs.rocm_version }}
+          DOCKER_IMAGE: ${{ steps.gpu-info.outputs.docker_image }}
+          ATOM_IMAGE_DIGEST: ${{ steps.gpu-info.outputs.image_digest }}
         run: |
           set -euo pipefail
           if [ -n "${MODEL_HOST_ROOT:-}" ]; then model_path="/models/${{ env.MODEL_PATH }}"
@@ -188,8 +266,12 @@ jobs:
           docker exec \
             -e ENABLE_TORCH_PROFILER="${{ inputs.enable_profiler && '1' || '0' }}" \
             -e RESULT_FILENAME="${{ env.RESULT_FILENAME }}" \
-            -e SERVER_ARGS="$ARGS" \
-            -e BENCH_EXTRA_ARGS="${{ inputs.bench_args }}" \
+            -e SERVER_ARGS="$ARGS $EXTRA_LAUNCH_ARGS" \
+            -e BENCH_EXTRA_ARGS -e BENCH_KIND \
+            -e GPU_NAME -e ROCM_VERSION \
+            -e DOCKER_IMAGE -e ATOM_IMAGE_DIGEST \
+            -e GITHUB_REPOSITORY -e GITHUB_RUN_ID -e GITHUB_RUN_ATTEMPT \
+            -e GITHUB_JOB -e GITHUB_SHA -e GITHUB_WORKFLOW_REF \
             -e MP="$model_path" \
             atom-benchmark bash -lc '.github/scripts/atom_test.sh benchmark "$MP"'
 
@@ -242,6 +324,14 @@ jobs:
           with open(path, encoding="utf-8") as f:
               data = json.load(f)
 
+          if data.get("benchmark_kind") == "aiperf_agentic":
+              completed = int(data.get("successful_requests", 0))
+              duration = float(data.get("benchmark_duration_s", 0))
+              if completed <= 0 or duration <= 0:
+                  sys.exit("Agentic benchmark has no successful profiling requests or duration")
+              print(f"Validated agentic result: {completed} requests, {duration}s")
+              sys.exit(0)
+
           num_prompts = int(data.get("num_prompts"))
           completed = int(data.get("completed"))
           if completed != num_prompts:
@@ -259,11 +349,11 @@ jobs:
           PY
 
       - name: Copy profiler traces
-        if: inputs.enable_profiler
+        if: always() && inputs.enable_profiler
         run: docker cp atom-benchmark:/app/trace ./profiler-traces 2>/dev/null || true
 
       - name: Upload profiler traces
-        if: inputs.enable_profiler
+        if: always() && inputs.enable_profiler
         uses: actions/upload-artifact@v7
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
@@ -288,6 +378,94 @@ jobs:
         with:
           name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
+
+      # The container binds the checkout at /workspace. Upload before cleanup,
+      # even after benchmark/validation failure. Each completed cell is usable
+      # immediately; the optional run index is not a prerequisite.
+      - name: Prepare bundle summary
+        if: always()
+        run: |
+          python3 -m atom.benchmarks.results summary-package \
+            "benchmark-bundles/$RESULT_FILENAME" --output "bundle-summaries/$RESULT_FILENAME"
+
+      - name: Upload versioned summary
+        id: bundle-summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-benchmark-summary-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
+          path: bundle-summaries/${{ env.RESULT_FILENAME }}/
+          if-no-files-found: warn
+          retention-days: 15
+
+      - name: Upload complete bundle
+        id: bundle-full
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-benchmark-bundle-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
+          path: benchmark-bundles/${{ env.RESULT_FILENAME }}/
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 15
+
+      - name: Save logs after launch or packaging failure
+        if: failure() || cancelled()
+        run: |
+          docker exec -e EVIDENCE="/workspace/benchmark-evidence/$RESULT_FILENAME" \
+            atom-benchmark bash -lc '
+              mkdir -p "$EVIDENCE"
+              for file in /tmp/atom_server.log /tmp/atom_client.log /tmp/atom-benchmark-launch.json; do
+                if [ -f "$file" ]; then cp "$file" "$EVIDENCE/"; fi
+              done
+            ' || true
+
+      - name: Preserve unpackaged failure evidence
+        id: bundle-diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: atom-benchmark-diagnostics-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
+          path: benchmark-evidence/${{ env.RESULT_FILENAME }}/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Link agentic point artifacts
+        if: always() && inputs.bench_kind == 'aiperf_agentic'
+        uses: actions/github-script@v7
+        env:
+          POINT_DISPLAY: ${{ inputs.display }}
+          POINT_STATUS: ${{ job.status }}
+          SUMMARY_URL: ${{ steps.bundle-summary.outputs.artifact-url }}
+          BUNDLE_URL: ${{ steps.bundle-full.outputs.artifact-url }}
+          DIAGNOSTICS_URL: ${{ steps.bundle-diagnostics.outputs.artifact-url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const escape = value => String(value).replace(/[&<>"']/g, char =>
+              ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[char]));
+            core.summary.addHeading(escape(`${process.env.POINT_DISPLAY} · c=${process.env.CONC}`));
+            core.summary.addRaw(`Status before cleanup: ${escape(process.env.POINT_STATUS)}\n\n`);
+            const validationPath = path.join('benchmark-bundles', process.env.RESULT_FILENAME, 'validation.json');
+            if (fs.existsSync(validationPath)) {
+              const validation = JSON.parse(fs.readFileSync(validationPath, 'utf8'));
+              core.summary.addRaw(`Bundle complete: ${validation.complete}; measurement valid: ${validation.measurement_valid}\n\n`);
+              for (const reason of validation.missing || []) {
+                core.summary.addRaw(`- ${escape(reason)}\n`);
+                core.warning(`Bundle incomplete: ${reason}`);
+              }
+              core.summary.addRaw('\n');
+            }
+            for (const [label, url] of [
+              ['Summary bundle', process.env.SUMMARY_URL],
+              ['Full bundle', process.env.BUNDLE_URL],
+              ['Failure diagnostics', process.env.DIAGNOSTICS_URL],
+            ]) {
+              if (url) core.summary.addLink(label, url).addBreak();
+            }
+            core.summary.addRaw('\nA full-bundle upload may contain partial evidence after failure; check its manifest status.\n');
+            await core.summary.write();
 
       - name: Clean Up
         if: always()

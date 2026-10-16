@@ -63,8 +63,8 @@ def test_cpu_policy_is_available_through_lmcache_registry():
     assert isinstance(get_cache_policy("ATOM_SLRU"), SLRUCachePolicy)
 
 
-@pytest.mark.parametrize("all_ranks", [False, True])
-def test_offload_configuration_keeps_lookup_scope_explicit(monkeypatch, all_ranks):
+@pytest.mark.parametrize("rank_zero_only", [False, True])
+def test_offload_configuration_keeps_lookup_scope_explicit(monkeypatch, rank_zero_only):
     from lmcache.v1.config import LMCacheEngineConfig
 
     from atom.kv_transfer.offload.config import build_lmcache_config
@@ -82,10 +82,11 @@ def test_offload_configuration_keeps_lookup_scope_explicit(monkeypatch, all_rank
         ),
     )
     extra = {"lmcache.cache_policy": "ATOM_SLRU"}
-    if all_ranks:
-        extra["lmcache.lookup_server_worker_ids"] = []
+    if rank_zero_only:
+        extra["lmcache.lookup_server_worker_ids"] = [0]
     cfg = build_lmcache_config({"kv_connector_extra_config": extra})
-    assert cfg.lookup_server_worker_ids == ([] if all_ranks else [0])
+    # The default is every worker, so the override is the narrowing one.
+    assert cfg.lookup_server_worker_ids == ([0] if rank_zero_only else [])
     assert cfg.max_local_cpu_size == 256
     assert cfg.local_disk is None
 

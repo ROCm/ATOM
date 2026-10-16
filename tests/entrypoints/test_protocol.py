@@ -16,6 +16,7 @@ from atom.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    resolve_prompt_token_ids,
 )
 
 # ============================================================================
@@ -394,3 +395,38 @@ class TestResponseModels:
             error={"message": "Not found", "type": "invalid_request_error", "code": 404}
         )
         assert err.error["message"] == "Not found"
+
+
+# ============================================================================
+# Pre-tokenized prompts (PD decode reuses the prefill node's token ids)
+# ============================================================================
+
+
+class TestPromptTokenIds:
+    """Prompt ID validation and text-input precedence."""
+
+    def test_both_locations_agreeing_is_fine(self):
+        ids = [9, 9]
+        assert resolve_prompt_token_ids(ids, {"prompt_token_ids": ids}) == ids
+
+    @pytest.mark.parametrize(
+        "prompt_ids,kv_ids,error",
+        [
+            ([], None, "empty"),
+            (None, [], "empty"),
+            (None, "5,6", "non-negative integers"),
+            (None, [-1], "non-negative integers"),
+            (None, ["a"], "non-negative integers"),
+        ],
+    )
+    def test_invalid_ids_are_rejected(self, prompt_ids, kv_ids, error):
+        with pytest.raises(ValueError, match=error):
+            resolve_prompt_token_ids(prompt_ids, {"prompt_token_ids": kv_ids})
+
+    def test_completion_prompt_or_tokens_prefers_ids(self):
+        request = CompletionRequest(prompt="ignored", prompt_token_ids=[1, 2])
+        assert request.get_prompt_or_tokens() == [1, 2]
+
+    def test_completion_requires_one_of_the_two(self):
+        with pytest.raises(ValueError, match="'prompt' or 'prompt_token_ids'"):
+            CompletionRequest().get_prompt_or_tokens()

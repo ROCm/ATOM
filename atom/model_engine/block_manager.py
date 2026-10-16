@@ -139,6 +139,7 @@ class BlockManager:
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = self.block_size * self.dcp_world_size
+        self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
         # Content hashes only: pool hits and resource fit are always rechecked.
         # Weak keys keep this scheduler-side cache out of request serialization.
@@ -875,6 +876,13 @@ class BlockManager:
             chain.append(h)
         return chain
 
+    def prefix_hash_chain(
+        self, seq: Sequence, block_hashes: list[int], blocks: int
+    ) -> list[int]:
+        """`block_hashes` continued to `blocks` entries, for callers outside
+        the manager. Seeded from `seq.cache_seed` like every chain it mints."""
+        return self._chain_to(seq, block_hashes, blocks)
+
     def can_allocate(
         self,
         seq: Sequence,
@@ -1191,6 +1199,23 @@ class BlockManager:
             seq.offload_joint.boundary_hash = -1
         return True
 
+    def replay_start(self, seq: Sequence, start: int, *, hit: bool) -> int:
+        """Where a prefill resuming at `start` begins, early enough to rebuild
+        what its forward reads below `start`: under a `replay` state transfer
+        and at a `hit`, the state (one hash block); and in a forward finishing
+        the prompt, `min_final_prefill_rows` rows before its end (decoder
+        bounded replay), on the hash-block grid. `start` itself everywhere
+        else."""
+        if not (seq.has_per_req_cache and start):
+            return start
+        hbs = self.hash_block_size
+        if hit and self.state.transfer.replays:
+            start -= hbs
+        short = self.min_final_prefill_rows - (seq.num_tokens - start)
+        if short > 0:
+            start = (start - short) // hbs * hbs
+        return max(0, start)
+
     def _state_leg_secured(self, seq: Sequence) -> bool:
         """Whether something will really put state behind this seq's boundary.
 
@@ -1279,6 +1304,10 @@ class BlockManager:
             self.state_gate_lost_boundary += 1
             return False
 
+        if self.state.transfer.replays:
+            # Nothing to resume or load: a fresh slot, as for a cold start; the
+            # forward rebuilds the state (`replay_start`).
+            hit_hash = -1
         src = self.state.lookup(hit_hash) if hit_hash != -1 else -1
         if src < 0:
             wants_load = self._tier_can_serve(hit_hash)
@@ -1654,7 +1683,8 @@ class BlockManager:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
-        start = base // hbs
+        # A replaying forward's rows below where it resumed are published.
+        start = max(base, seq.replay_until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
@@ -1964,6 +1994,10 @@ class BlockManager:
         )
         if isinf(room):
             return
+        # A forward resuming there and finishing the prompt with fewer rows
+        # than the model's final forward runs would back off below it
+        # (`replay_start`), recomputing what the checkpoint saves.
+        room = max(room, self.min_final_prefill_rows)
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the
@@ -2606,7 +2640,11 @@ class BlockManager:
         return num_full - start
 
     def deallocate_partial(
-        self, seq: Sequence, protected_block_ids: frozenset[int]
+        self,
+        seq: Sequence,
+        protected_block_ids: frozenset[int],
+        *,
+        per_request_state_safe: bool = False,
     ) -> None:
         """Deallocate `seq` now, except block IDs a pending offload save reads.
 
@@ -2624,20 +2662,15 @@ class BlockManager:
         request is deallocated normally. This makes ownership explicit: shared
         prefix blocks retain their other owners, while the save owns exactly
         one refcount share until ``free_leased_blocks`` releases it.
+
+        Per-request recurrent state is fail-closed: its active slots may be
+        released here only when the connector explicitly confirms that every
+        state source needed after request teardown has an independent lease.
         """
-        if seq.has_per_req_cache:
-            # Per-request recurrent state (GDN/hybrid checkpoints) has release
-            # ordering this simplified path never replicates (orphan load
-            # slots, `state_offload.abandon_load`, fork-source pins -- see
-            # `deallocate` below). Not reachable today: every offload connector
-            # that can drive early release sets `_permit_per_request_state =
-            # False` and rejects such a model at `register_kv_caches`. Kept as
-            # an explicit guard rather than a silent skip, so a future
-            # hybrid connector that both permits per-request state and enables
-            # early release fails loudly here instead of freeing a leased PAGE
-            # or leaking a state slot.
+        if seq.has_per_req_cache and not per_request_state_safe:
             raise RuntimeError(
-                "partial PAGE deallocation is unsupported for per-request state"
+                "partial PAGE deallocation is unsupported for per-request "
+                "state without an explicit connector safety capability"
             )
         table = set(seq.block_table)
         unknown = set(protected_block_ids) - table
@@ -2648,6 +2681,57 @@ class BlockManager:
         for block_id in protected_block_ids:
             self.kv.claim(block_id)
         self.deallocate(seq)
+
+    def acquire_offload_prefix(
+        self,
+        seq: Sequence,
+        start_tokens: int,
+        end_tokens: int,
+    ) -> tuple[list[int], int, tuple[int, ...]]:
+        """Claim the still-resident contiguous prefix used by a late save.
+
+        A finished request no longer owns its old physical block table. Each
+        block is therefore resolved again through the content hash index and
+        token-checked before it is claimed. The scan stops at the first gap so
+        the returned range can never describe a cache object with a hole.
+        """
+        hbs = self._hash_block_size()
+        if (
+            start_tokens < 0
+            or end_tokens < start_tokens
+            or start_tokens % hbs
+            or end_tokens % hbs
+        ):
+            raise ValueError(
+                f"offload source range [{start_tokens}, {end_tokens}) must "
+                f"align to hash block size {hbs}"
+            )
+        end_block = end_tokens // hbs
+        start_block = start_tokens // hbs
+        block_ids = [-1] * end_block
+        claimed: list[int] = []
+        parent_hash = seq.cache_seed
+        available_end = start_tokens
+        for index in range(end_block):
+            token_ids = self._hash_block_tokens(seq, index)
+            block_hash = self.compute_hash(token_ids, parent_hash)
+            parent_hash = block_hash
+            if index < start_block:
+                continue
+            block_id = self.kv.lookup(block_hash)
+            if block_id < 0:
+                break
+            block = self.kv.block(block_id)
+            if block.hash != block_hash or block.token_ids != token_ids:
+                break
+            self.kv.claim(block_id)
+            claimed.append(block_id)
+            block_ids[index] = block_id
+            available_end = (index + 1) * hbs
+        # The caller may have to trim a partial LMCache chunk from the tail.
+        # Preserve token order until that trim is complete; a set is suitable
+        # only after the exact ordered prefix has been selected.
+        return block_ids, available_end, tuple(claimed)
 
     def free_leased_blocks(self, block_ids) -> None:
         """Return block IDs a `deallocate_partial` lease held back, to the pool.
@@ -2670,6 +2754,7 @@ class BlockManager:
         # The block table is gone, so nothing of this seq is hashed any more.
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
+        seq.replay = None
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.

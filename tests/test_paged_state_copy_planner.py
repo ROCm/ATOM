@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from atom.model_ops.attentions.pool_layout.paged_state_copy import (
+    DescriptorStaging,
     launch_copy_descriptor,
     plan_segmented_copy,
 )
@@ -277,3 +278,41 @@ def test_a_flat_dst_bases_is_refused_by_this_guard_not_by_numpy():
 
     with pytest.raises(ValueError, match="one row of bases per copy"):
         plan.write_descriptor(out, three, np.zeros(3, dtype=np.int64))
+
+
+def test_descriptor_slots_have_independent_staging():
+    """Slot 0 is the step's; an out-of-band restore's slot never shares it."""
+    staging = DescriptorStaging(3, "cpu")
+    staging.rows(0)[0, 0] = 7
+    assert staging.rows(0)[0, 0] == 7
+    assert staging.rows(1)[0, 0] == 0
+    assert staging.rows(1).shape == (3, 3)
+    staging.rows(1)[:2] = 5
+    assert staging.upload(1, 2).tolist() == [[5, 5, 5], [5, 5, 5]]
+    with pytest.raises(ValueError, match="non-negative"):
+        staging.rows(-1)
+
+
+def test_descriptor_staging_waits_for_its_last_upload_before_reuse(monkeypatch):
+    """A pinned host buffer is rewritten only after the H2D that read it ran."""
+    events = []
+
+    class Event:
+        def __init__(self):
+            self.log = []
+            events.append(self)
+
+        def record(self):
+            self.log.append("record")
+
+        def synchronize(self):
+            self.log.append("synchronize")
+
+    staging = DescriptorStaging(2, "cpu")
+    host = torch.zeros(2, 3, dtype=torch.int64)
+    staging._slots[4] = (host, torch.zeros_like(host), Event())
+    staging.rows(4)
+    staging.upload(4, 1)
+    staging.rows(4)
+    staging.rows(4)
+    assert events[0].log == ["record", "synchronize"]

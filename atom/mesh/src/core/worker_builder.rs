@@ -575,7 +575,6 @@ mod tests {
             .connection_mode(ConnectionMode::Http)
             .labels(labels.clone())
             .health_config(health_config.clone())
-            .api_key("test_api_key")
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080@3");
@@ -643,15 +642,6 @@ mod tests {
                 bootstrap_port: Some(9000)
             }
         );
-    }
-
-    #[test]
-    fn test_basic_worker_api_key() {
-        let worker = BasicWorkerBuilder::new("http://w:8000")
-            .api_key("secret-key-123")
-            .build();
-
-        assert_eq!(worker.metadata().api_key.as_deref(), Some("secret-key-123"));
     }
 
     #[test]
@@ -744,15 +734,6 @@ mod tests {
         assert_eq!(worker.dp_rank(), Some(0));
         assert_eq!(worker.dp_size(), Some(4));
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
-    }
-
-    #[test]
-    fn test_dp_aware_worker_api_key() {
-        let worker = DPAwareWorkerBuilder::new("http://w:8000", 0, 2)
-            .api_key("dp-key")
-            .build();
-
-        assert_eq!(worker.metadata().api_key.as_deref(), Some("dp-key"));
     }
 
     #[test]

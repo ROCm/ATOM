@@ -94,6 +94,38 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         raise ValueError(msg)
 
 
+def _select_hybrid_aware_scheduler(vllm_config) -> None:
+    """Point vLLM at a scheduler whose KV-load-failure recovery knows about
+    multiple KV cache groups.
+
+    Gated on a KV connector being configured, because that is what makes the
+    path reachable at all: without one no load can fail, and the override would
+    change nothing. It is NOT gated on the model being hybrid -- the group
+    count is not known yet here (``kv_cache_groups`` are built after memory
+    profiling), and the override handles a single group exactly as vLLM does.
+
+    Failing to select the subclass must never be fatal: vLLM's own scheduler
+    still runs every model that does not hit a failed tier load, so a problem
+    here is logged and stepped over rather than taking the engine down at boot.
+    """
+    sc = getattr(vllm_config, "scheduler_config", None)
+    if sc is None or getattr(vllm_config, "kv_transfer_config", None) is None:
+        return
+    try:
+        from atom.plugin.vllm.scheduler import select_scheduler_cls
+
+        chosen = select_scheduler_cls(sc)
+    except Exception:
+        logger.warning(
+            "ATOM: could not select a hybrid-aware scheduler; vLLM's own "
+            "scheduler will be used.",
+            exc_info=True,
+        )
+        return
+    if chosen is not None:
+        sc.scheduler_cls = chosen
+
+
 if not disable_vllm_plugin:
     from vllm.platforms.rocm import RocmPlatform
 
@@ -110,6 +142,7 @@ if not disable_vllm_plugin:
         def check_and_update_config(cls, vllm_config) -> None:
             super().check_and_update_config(vllm_config)
             _enforce_deepseek_v4_constraints(vllm_config)
+            _select_hybrid_aware_scheduler(vllm_config)
 
 else:
     ATOMPlatform = None

@@ -4,9 +4,11 @@
 """Which transports the FP4 sparse indexer refuses, and which it serves.
 
 `--index_cache_dtype fp4` stores the indexer keys as two planes -- packed E2M1
-and a separate e8m0 exponent plane. `KVTransferRegion`'s role vocabulary has a
-single `INDEX_CACHE_ROLE` for the indexer, so a transport that addresses the
-cache through the region map cannot describe the second plane and is refused.
+and a separate e8m0 exponent plane. The P/D backends and the non-dense offload
+layouts parse a single `INDEX_CACHE_ROLE` region per layer, so they cannot place
+the second plane and are refused. `lmcache_mp` is served: it groups regions by
+per-block shape and copies whole blocks, so the scale plane is one more region
+(`test_lmcache_mp_builder_views` pins what it publishes).
 
 Dense offload does not read the region map at all: `DenseOffloadConnector
 .register_kv_caches` takes `transfer_tensors` and ignores it, building its codec
@@ -14,9 +16,8 @@ from the `KVCacheTensor`s, which carry both planes. Refusing it as well -- which
 a blanket `if config.kv_transfer_config` does -- costs FP4 the offload path for a
 reason that is not about it.
 
-"Offload" is not the line, though: `lmcache_mp` is offload and `_build_cache_views`
-raises on a None `KVTransferTensors`, and the hybrid/m3/kimi_k3 layouts source
-their PAGE bytes from `block_regions`. The line is whether the region map is read,
+"Offload" is not the line, though: the hybrid/m3/kimi_k3 layouts source their
+PAGE bytes from `block_regions`. The line is whether the region map is read,
 which `topology_uses_pd_staging` does not answer -- it is about compressor P/D
 staging, and `lmcache_mp` declares that False. These pin the real predicate.
 
@@ -97,15 +98,50 @@ def test_fp4_indexer_refuses_region_map_transports(connector):
         AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
 
 
-def test_fp4_indexer_refuses_lmcache_mp():
-    """Offload that DOES read the regions is still refused.
+def _passes_the_gate(builder) -> bool:
+    """True when the gate let the call through to the (sentinel) pool."""
+    try:
+        AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
+    except AttributeError:
+        return True
+    return False
 
-    `lmcache_mp` registers with `requires_pd_staging=False`, so a gate keyed on
-    that flag lets it through -- and then `_build_cache_views` raises
-    "lmcache_mp requires KVTransferTensors" during cache registration, which is
-    a worse failure than the refusal it skipped.
+
+def test_fp4_indexer_serves_lmcache_mp():
+    """`lmcache_mp` reads the regions and is served: it carries both planes.
+
+    Returning None would not do -- `_build_cache_views` raises "lmcache_mp
+    requires KVTransferTensors" -- so the gate has to fall through to building
+    the regions, which reaches the sentinel pool here.
     """
-    builder = _fp4_builder({"kv_connector": "lmcache_mp"})
+    assert _passes_the_gate(_fp4_builder({"kv_connector": "lmcache_mp"}))
+
+
+def test_fp4_indexer_serves_multi_whose_only_region_reader_is_lmcache_mp():
+    builder = _fp4_builder(
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+                {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+            ],
+        }
+    )
+
+    assert _passes_the_gate(builder)
+
+
+def test_fp4_indexer_refuses_lmcache_mp_beside_a_pd_backend():
+    """The P/D sub would read the same regions, so the topology is refused."""
+    builder = _fp4_builder(
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                {"kv_connector": "mooncake", "kv_role": "kv_producer"},
+            ],
+        }
+    )
 
     with pytest.raises(NotImplementedError, match="region map"):
         AiterMLAMetadataBuilder.get_kv_transfer_tensors(builder)
@@ -198,6 +234,65 @@ def test_region_map_verdict_comes_from_the_registration():
             KVConnectorFactory._registry.pop(name, None)
             KVConnectorFactory._requires_pd_staging.pop(name, None)
             KVConnectorFactory._reads_block_regions.pop(name, None)
+            KVConnectorFactory._copies_whole_block_regions.pop(name, None)
+
+
+def test_fp4_service_comes_from_the_registration_not_the_name():
+    """Serving FP4 to a region reader is declared as `copies_whole_block_regions`.
+
+    A new whole-block copier is served without anyone adding its name to the
+    attention backend, and one that does not declare it is refused -- even
+    beside `lmcache_mp` in a `multi`.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    KVConnectorFactory.register(
+        "fp4gate_probe_whole_blocks",
+        worker_module="atom.kv_transfer.offload.mp.connector",
+        worker_class="LMCacheMPConnector",
+        scheduler_module="atom.kv_transfer.offload.mp.connector",
+        scheduler_class="LMCacheMPConnectorScheduler",
+        copies_whole_block_regions=True,
+    )
+    KVConnectorFactory.register(
+        "fp4gate_probe_region_parser",
+        worker_module="atom.kv_transfer.offload.mp.connector",
+        worker_class="LMCacheMPConnector",
+        scheduler_module="atom.kv_transfer.offload.mp.connector",
+        scheduler_class="LMCacheMPConnectorScheduler",
+    )
+    try:
+        assert _passes_the_gate(
+            _fp4_builder({"kv_connector": "fp4gate_probe_whole_blocks"})
+        )
+        assert _passes_the_gate(
+            _fp4_builder(
+                {
+                    "kv_connector": "multi",
+                    "connectors": [
+                        {"kv_connector": "fp4gate_probe_whole_blocks"},
+                        {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                    ],
+                }
+            )
+        )
+        refused = _fp4_builder(
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "lmcache_mp", "kv_role": "offload"},
+                    {"kv_connector": "fp4gate_probe_region_parser"},
+                ],
+            }
+        )
+        with pytest.raises(NotImplementedError, match="region map"):
+            AiterMLAMetadataBuilder.get_kv_transfer_tensors(refused)
+    finally:
+        for name in ("fp4gate_probe_whole_blocks", "fp4gate_probe_region_parser"):
+            KVConnectorFactory._registry.pop(name, None)
+            KVConnectorFactory._requires_pd_staging.pop(name, None)
+            KVConnectorFactory._reads_block_regions.pop(name, None)
+            KVConnectorFactory._copies_whole_block_regions.pop(name, None)
 
 
 def test_fp4_gate_reads_the_shared_connector_predicate():
@@ -209,7 +304,8 @@ def test_fp4_gate_reads_the_shared_connector_predicate():
     """
     from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
-    for connector in ("lmcache_offload", "lmcache_mp", "mooncake", "moriio", "multi"):
+    # `lmcache_mp` reads the regions too but is served; see above.
+    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
         cfg = {"kv_connector": connector}
         builder = _fp4_builder(cfg)
         refused = KVConnectorFactory.topology_reads_block_regions(

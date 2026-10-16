@@ -9,9 +9,13 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-from atom.models.deepseek_v41.config import normalize_hf_config, validate_runtime_config
+from atom.models.deepseek_v41.config import (
+    normalize_hf_config,
+    validate_runtime_config,
+    validate_tbo_parallelism,
+)
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
 
 
 def _runtime_pieces():
@@ -57,7 +61,11 @@ def test_production_geometry_has_only_four_global_owners():
     assert geo.paged_bytes == 32 * (3 / 2 + 1) * (512 * 2 + 132)
     assert sum(f.bytes_per_entry for f in geo.state_fields) <= geo.state_bytes
     assert geo.state_fields[0].layers == 40
-    assert all(field.in_checkpoint for field in geo.state_fields)
+    # Rings and cursor are checkpointed; the compressor tails are not.
+    assert [f.name for f in geo.state_fields if f.in_checkpoint] == [
+        "window",
+        "cursor",
+    ]
 
 
 def runtime_config(**overrides):
@@ -82,7 +90,8 @@ def runtime_config(**overrides):
         "kv_cache_block_size": 16,
         "tensor_parallel_size": 4,
         "enable_expert_parallel": True,
-        "hf_config": SimpleNamespace(),
+        "hf_config": SimpleNamespace(sliding_window=128),
+        "enable_encoder_swa_bounded_replay": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -98,8 +107,6 @@ def runtime_config(**overrides):
         {"prefill_context_parallel_size": 2},
         {"decode_context_parallel_size": 2},
         {"parallel_config": SimpleNamespace(data_parallel_size=2)},
-        {"enable_dp_attention": True},
-        {"enable_tbo": True},
         {"enable_tbo_decode": True},
         {"kv_transfer_config": {"connector": "moriio"}},
         {"enable_rapidserve": True},
@@ -109,12 +116,45 @@ def runtime_config(**overrides):
         {"kv_cache_dtype": "fp8"},
         {"index_cache_dtype": "bf16"},
         {"kv_cache_block_size": 3},
+        # a hit's one-PAGE rebuild would not cover the window
+        {"enable_encoder_swa_bounded_replay": True},
     ],
 )
 def test_unimplemented_modes_fail_before_loading(override):
     validate_runtime_config(runtime_config())
     with pytest.raises(ValueError):
         validate_runtime_config(runtime_config(**override))
+
+
+def test_lmcache_mp_is_the_only_kv_transfer_admitted():
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    for connector in ("lmcache_offload", "mooncake", "moriio", "multi"):
+        with pytest.raises(ValueError, match="KV transfer other than lmcache_mp"):
+            validate_runtime_config(
+                runtime_config(kv_transfer_config={"kv_connector": connector})
+            )
+    with pytest.raises(ValueError, match="RapidServe"):
+        validate_runtime_config(
+            runtime_config(
+                kv_transfer_config={"kv_connector": "lmcache_mp"},
+                enable_rapidserve=True,
+            )
+        )
+
+
+def _attach_uncompiled_backbone(model):
+    """The runtime model's one compiled graph, built bare and run uncompiled,
+    for a model assembled without its constructor."""
+    from atom.models.deepseek_v41 import runtime
+
+    model.replay = False
+    backbone = runtime._Backbone.__new__(runtime._Backbone)
+    torch.nn.Module.__init__(backbone)
+    backbone.do_not_compile = True
+    backbone.__dict__["owner"] = model
+    model.backbone = backbone
 
 
 def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
@@ -125,7 +165,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
     cache.backing.fill_(57)
     before = cache.backing.clone()
-    step = cache.begin_step([])
+    step = begin_step(cache, [])
     metadata = SimpleNamespace(
         step=step,
         cache=cache,
@@ -142,6 +182,7 @@ def test_empty_rank_padding_has_no_cache_writes(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     # No layers are constructed: a step with no requests must not reach one.
     output = model(torch.zeros(8, dtype=torch.int32), torch.zeros(8, dtype=torch.int32))
     assert output.shape == (8, 64) and output.count_nonzero() == 0
@@ -163,7 +204,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
 
     geo = V41PoolGeometry(2, ((1, 2),), 32, 4, 512, 32)
     cache = PagedAttentionCache(geo, 4, 2, "cpu")
-    step = cache.begin_step([RequestSpan(0, 0, 0, 1, 0, (0,))], plans={})
+    step = begin_step(cache, [PagedRequest(0, 0, 0, 1, 0, (0,))], plans={})
     memos = {name: getattr(step, name) for name in ("selected", "candidates")}
     for name, memo in memos.items():
         memo["what the last forward worked out"] = name
@@ -191,6 +232,7 @@ def test_a_forward_reads_nothing_the_forward_before_it_selected(monkeypatch):
     model.topology = []
     model.layers = torch.nn.ModuleList()
     model.embed = torch.nn.Embedding(16, 64)
+    _attach_uncompiled_backbone(model)
     model(torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     assert seen == {name: {} for name in memos}
 
@@ -213,27 +255,39 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
     )
 
 
-@pytest.mark.parametrize("index_dtype", ["bf16", "fp4"])
-def test_an_index_plane_other_than_fp8_is_refused(index_dtype):
-    """The paged scorer is the only one a cache has, and it reads FP8.
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp8_e4m3"])
+def test_an_index_plane_other_than_fp8_or_fp4_is_refused(index_dtype):
+    """The paged scorer reads FP8 or FP4 and nothing else.
 
     A plane stored otherwise has no reader, which is a load-time refusal and
-    not a slower path: the format is the runtime's, not a tuning knob.
+    not a slower path.
     """
-    with pytest.raises(ValueError, match="index plane other than fp8"):
+    with pytest.raises(ValueError, match="index plane other than fp8 or fp4"):
         validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
+
+
+@pytest.mark.parametrize("index_dtype", ["fp8", "fp4"])
+def test_an_fp8_or_fp4_index_plane_is_admitted(index_dtype):
+    validate_runtime_config(runtime_config(index_cache_dtype=index_dtype))
 
 
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("dynamic", [False, True])
-def test_native_dspark_passes_production_admission(graph, dynamic):
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("level", [0, 3])
+def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, level):
     from atom.config import CUDAGraphMode, DSparkConfig
 
     value = runtime_config(
         model="/model",
+        tensor_parallel_size=tp_size,
+        enable_expert_parallel=False,
         enforce_eager=not graph,
         compilation_config=SimpleNamespace(
-            level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+            level=level,
+            cudagraph_mode=(
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+            ),
         ),
         hf_config=SimpleNamespace(),
         speculative_config=SimpleNamespace(
@@ -275,3 +329,199 @@ def test_level3_requires_full_graph_or_eager_runtime():
                 ),
             )
         )
+
+
+@pytest.mark.parametrize("rows", [8, 16, 32])
+def test_shortening_the_index_block_moves_bytes_without_adding_any(rows):
+    """A block's length is a layout choice, not a capacity one.
+
+    The data and the scales are packed with nothing between them, so the block
+    grows and shrinks in step with the rows it holds and a row's share is the
+    same number at every length. Choosing 8 to make a candidate list a block
+    table therefore costs no pool capacity -- only the granularity at which
+    the two regions interleave changes.
+    """
+    geo = V41PoolGeometry(
+        40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True, index_block_rows=rows
+    )
+    assert geo.index_row_bytes == 132
+    assert (
+        geo.paged_bytes
+        == V41PoolGeometry(
+            40, ((2, 2), (20, 1)), 64, 128, 512, 128, packed=True
+        ).paged_bytes
+    )
+
+
+@pytest.mark.parametrize("rows", [4, 12, 24, 20])
+def test_an_index_block_the_scorer_cannot_page_over_is_refused(rows):
+    """`pa_mqa_logits` takes whole 16-row MFMA tiles, or exactly 8.
+
+    Nothing downstream would report a block of 12: the writer would interleave
+    at one length and the scorer read at another, which is a wrong score and
+    not a fault. So the geometry is where it has to be caught.
+    """
+    with pytest.raises(ValueError, match="whole 16-row MFMA tiles"):
+        V41PoolGeometry(40, ((2, 2), (20, 1)), 64, 128, 512, 128, index_block_rows=rows)
+
+
+def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
+    """The second gate: legal block length, but a PAGE that cannot hold it.
+
+    Ratio 2 halves the PAGE before the count is taken, so the floor is twice
+    the block -- which is why this fires on 16 rows at a 16-token PAGE.
+    """
+    with pytest.raises(ValueError, match="needs whole 16-row blocks"):
+        V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128)
+    V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])
+@pytest.mark.parametrize("tbo", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_dpa_admission_before_and_after_engine_normalization(tp, dp, tbo, ep):
+    validate_runtime_config(
+        runtime_config(
+            enable_dp_attention=True,
+            enable_tbo=tbo,
+            enable_expert_parallel=ep,
+            tensor_parallel_size=tp,
+            parallel_config=SimpleNamespace(data_parallel_size=dp),
+        )
+    )
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("dp_size", [1, 2, 4])
+@pytest.mark.parametrize("dpa", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+def test_prefill_tbo_requires_multi_rank_dpa(tp_size, dp_size, dpa, ep):
+    cfg = runtime_config(
+        enable_tbo=True,
+        tensor_parallel_size=tp_size,
+        enable_dp_attention=dpa,
+        enable_expert_parallel=ep,
+        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
+    )
+    if dpa:
+        # Config construction can precede the legacy DP kwargs, so rank-count
+        # admission belongs to the model's startup check below.
+        validate_runtime_config(cfg)
+    if dpa and tp_size * dp_size > 1:
+        validate_tbo_parallelism(cfg)
+        cfg.enable_tbo_decode = True
+        with pytest.raises(ValueError, match="decode TBO"):
+            validate_runtime_config(cfg)
+    else:
+        with pytest.raises(ValueError, match="prefill TBO"):
+            validate_runtime_config(cfg)
+            validate_tbo_parallelism(cfg)
+
+
+@pytest.mark.parametrize("tp,dp", [(4, 1), (2, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("level", [0, 3])
+def test_real_config_accepts_tbo_before_dpa_rank_expansion(
+    monkeypatch, tp, dp, ep, level
+):
+    from atom import config as config_module
+    from atom.config import CompilationConfig, Config, ParallelConfig
+    from atom.model_engine.engine_core_mgr import iter_dp_rank_assignments
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures"
+    # The quantization parser resolves AITER enums. Only bypass that GPU
+    # dependency; execute the real Config.__post_init__, HF config load,
+    # V4.1 admission check and engine rank planner on CPU.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    cfg = Config(
+        model=str(fixture),
+        tensor_parallel_size=tp,
+        parallel_config=ParallelConfig(data_parallel_size=dp),
+        enable_dp_attention=True,
+        enable_expert_parallel=ep,
+        enable_tbo=True,
+        compilation_config=CompilationConfig(level=level),
+        enforce_eager=level == 0,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+    )
+    assert cfg.tensor_parallel_size == tp
+    assert cfg.parallel_config.data_parallel_size == dp
+    assert len(iter_dp_rank_assignments(cfg)) == tp * dp
+
+
+@pytest.mark.parametrize("tp,dp", [(1, 1), (4, 1), (2, 4)])
+def test_tbo_admission_is_stable_across_dp_normalization(tp, dp):
+    cfg = runtime_config(
+        enable_dp_attention=True,
+        enable_tbo=True,
+        tensor_parallel_size=tp,
+        parallel_config=SimpleNamespace(data_parallel_size=dp),
+    )
+    for _ in range(2):
+        validate_runtime_config(cfg)
+        if tp * dp > 1:
+            validate_tbo_parallelism(cfg)
+        else:
+            with pytest.raises(ValueError, match="multi-rank DP attention"):
+                validate_tbo_parallelism(cfg)
+        cfg.parallel_config.data_parallel_size = tp * dp
+        cfg.tensor_parallel_size = 1
+
+
+@pytest.mark.parametrize("explicit_parallel", [False, True])
+def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
+    import atom.config as config_module
+    import atom.model_engine.llm_engine as engine_module
+
+    fixture = Path(__file__).parents[2] / "models/deepseek_v41/fixtures/config.json"
+    hf = normalize_hf_config(json.loads(fixture.read_text()))
+    monkeypatch.setattr(config_module, "get_hf_config", lambda *args, **kwargs: hf)
+    monkeypatch.setattr(config_module, "get_generation_config", lambda *args: None)
+    # Quantization resolves AITER enums; keep this admission test CPU-only.
+    monkeypatch.setattr(config_module, "QuantizationConfig", lambda *args: None)
+    validated = []
+
+    def start_core(config):
+        # Exercise the unchanged LLMEngine constructor through its handoff to
+        # CoreManager without starting GPU workers.
+        validate_tbo_parallelism(config)
+        assert (
+            config.tensor_parallel_size * config.parallel_config.data_parallel_size == 4
+        )
+        assert config.parallel_config.data_parallel_master_port == 27123
+        validated.append(config.parallel_config)
+
+    monkeypatch.setattr(engine_module, "CoreManager", start_core)
+    monkeypatch.setattr(
+        engine_module,
+        "_load_tokenizer",
+        lambda *args: SimpleNamespace(bos_token_id=0, eos_token_id=1),
+    )
+    kwargs = {"data_parallel_size": 4, "data_parallel_master_port": 27123}
+    if explicit_parallel:
+        parallel = config_module.ParallelConfig(
+            data_parallel_size=4,
+            data_parallel_size_local=2,
+            data_parallel_master_port=27123,
+        )
+        kwargs.update(
+            parallel_config=parallel,
+            data_parallel_size=8,
+            data_parallel_master_port=27124,
+        )
+    engine_module.LLMEngine(
+        "v41-test",
+        tensor_parallel_size=1,
+        enable_dp_attention=True,
+        enable_tbo=True,
+        enable_tbo_decode=False,
+        enforce_eager=True,
+        kv_cache_dtype="bf16",
+        index_cache_dtype="fp8",
+        **kwargs,
+    )
+    assert len(validated) == 1
+    if explicit_parallel:
+        assert validated[0] is parallel
+        assert validated[0].data_parallel_size_local == 2

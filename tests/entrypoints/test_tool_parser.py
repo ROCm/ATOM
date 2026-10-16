@@ -147,7 +147,7 @@ class TestParseToolCalls:
             "I'll fetch that URL for you."
             "<|tool_calls_section_begin|>"
             "<|tool_call_begin|>functions.curl:0"
-            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "GET", "headers": {"Authorization": "Bearer token123"}}'
+            '<|tool_call_argument_begin|>{"url": "https://api.example.com/data", "method": "GET", "headers": {"Accept": "application/json"}}'
             "<|tool_call_end|>"
             "<|tool_calls_section_end|>"
         )
@@ -159,7 +159,7 @@ class TestParseToolCalls:
         args = tool_calls[0].function["arguments"]
         assert "https://api.example.com/data" in args
         assert '"method": "GET"' in args
-        assert '"Authorization"' in args
+        assert '"Accept": "application/json"' in args
 
     def test_tool_call_with_complex_args(self):
         args = (

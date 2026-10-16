@@ -706,11 +706,11 @@ class DeclineDuringArrivalTest(unittest.TestCase):
 class DrafterSkipsUnwantedTensorsTest(unittest.TestCase):
     """A drafter load must not materialize the target model's weights.
 
-    The drafter reads the *target's* checkpoint to pick out the MTP block. With
-    `ATOM_DISABLE_MMAP=true` -- which CI sets -- a shard is read whole and
-    deserialized whole, so the win comes from not reading shards that hold
-    nothing wanted at all (see RealSafetensorsIteratorTest). This test pins the
-    loader's half of that contract: it must reject by name, up front.
+    The drafter reads the *target's* checkpoint to pick out the MTP block, so
+    the win comes from not reading what it does not want: whole shards by
+    header (see RealSafetensorsIteratorTest), and within a shard the byte span
+    outside the wanted tensors. This test pins the loader's half of that
+    contract: it must reject by name, up front.
     """
 
     NUM_LAYERS = 1
@@ -774,8 +774,8 @@ class RealSafetensorsIteratorTest(unittest.TestCase):
             real_open = builtins.open
 
             def _tracking_open(file, *args, **kwargs):
-                # The header probe opens the file too; only count reads that go
-                # past it, which is what `safetensors.torch.load` does.
+                # The header probe opens the file too, so a skipped shard may
+                # be opened once but never again to read its tensors.
                 if isinstance(file, str) and file.endswith(".safetensors"):
                     opened.append(file)
                 return real_open(file, *args, **kwargs)

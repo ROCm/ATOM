@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -31,16 +31,121 @@ def new_token_ids(token_ids=()) -> array.array:
     return array.array("i", token_ids)
 
 
-def new_block_table(block_ids=()) -> array.array:
-    """A sequence's physical block ids.
+# Drawn once per table and once per non-append mutation of one, never reused.
+# A `version` therefore names an epoch during which one specific table only
+# ever grew, which is what `block_table_codec` needs to ship a forward's block
+# tables as appends alone -- see `BlockTable`.
+_block_table_versions = count()
+
+
+class BlockTable(array.array):
+    """A sequence's physical block ids, tagged with a mutation `version`.
 
     An `array("i")` rather than a list because every forward marshals these
     into the int32 `block_tables` buffer, where a list costs one CPython int
     unboxing per block (~17k per step at 50 seqs x 100k ctx) and an array is a
     memcpy. It behaves as a list for append/pop/index/len/iterate; it has no
     `.clear()` (use `del bt[:]`) and no `.copy()` (use `list(bt)`).
+
+    `version` is what makes the table's own growth self-describing: it is
+    redrawn by every mutation that is *not* an append, so
+
+        same version and a length of at least n  =>  the first n ids are the
+        same ids they were when that version was last observed
+
+    with no need to re-read the prefix. `BlockTableDeltaEncoder` turns that
+    into "send only the ids appended since the last step". Appends deliberately
+    do not redraw it, so the hot path (`BlockManager.allocate` appending one
+    block per decode step) keeps the inherited C `array.append` with no Python
+    frame on top -- 40 ns against 36 for a plain `array`, which is the subclass
+    method lookup and nothing else.
+
+    A version is a global draw rather than a per-table counter so that a fresh
+    table for a recycled request id can never look like a known one:
+    independent tables never share a version. The RPC decoder may retain
+    a version when it copies a row to append: those immutable snapshots share
+    one prefix lineage, and equal lengths still identify identical contents.
     """
-    return array.array("i", block_ids)
+
+    __slots__ = ("version",)
+
+    def __new__(cls, block_ids=()):
+        return super().__new__(cls, "i", block_ids)
+
+    def __init__(self, block_ids=()):
+        self.version = next(_block_table_versions)
+
+    # A copy is a different table and must draw its own version, or two tables
+    # would answer for one. All three hooks are needed: `array` supplies its
+    # own `__copy__`/`__deepcopy__`, which hand back a bare `array` and drop
+    # the version silently, and its reconstructor leaves the attribute unset,
+    # which surfaces much later as an AttributeError in whoever reads it.
+
+    def __reduce_ex__(self, protocol):
+        return _rebuild_block_table, (self.tobytes(),)
+
+    def __copy__(self):
+        return _rebuild_block_table(self.tobytes())
+
+    def __deepcopy__(self, memo):
+        return _rebuild_block_table(self.tobytes())
+
+
+def _rebuild_block_table(raw: bytes) -> "BlockTable":
+    table = BlockTable()
+    table.frombytes(raw)
+    return table
+
+
+def _revises_block_table(name: str) -> Callable:
+    """Wrap `array.array.<name>` so it redraws the table's version first."""
+    inherited = getattr(array.array, name)
+
+    def revise(self, *args):
+        self.version = next(_block_table_versions)
+        return inherited(self, *args)
+
+    revise.__name__ = name
+    revise.__qualname__ = f"BlockTable.{name}"
+    revise.__doc__ = f"`array.array.{name}`, plus a new version."
+    return revise
+
+
+# Every `array` mutator that can disturb ids already in the table. The ones
+# left out -- `append`, `extend`, `frombytes`, `fromfile`, `fromlist` and
+# `__iadd__` -- only ever add past the end, which is exactly the case the
+# version is defined to survive. Assigned in a loop so the reviewable artifact
+# is this list rather than eight near-identical bodies.
+for _mutator in (
+    "__setitem__",
+    "__delitem__",
+    "__imul__",
+    "byteswap",
+    "insert",
+    "pop",
+    "remove",
+    "reverse",
+):
+    setattr(BlockTable, _mutator, _revises_block_table(_mutator))
+del _mutator
+
+
+def new_block_table(block_ids=()) -> BlockTable:
+    """A sequence's physical block ids. See `BlockTable`."""
+    return BlockTable(block_ids)
+
+
+class Replay(NamedTuple):
+    """A prefill forward starting below the point its seq resumed at: that
+    point -- the cache holds every row below it --, whether the rows below are
+    the seq's state (a `replay` state transfer brought none; otherwise the
+    state is the one at `until`), and the tokens just before the forward, for
+    state a backend derives from the preceding tokens (V4.1's Engram n-gram
+    history, `Config.replay_history_tokens` of them)."""
+
+    until: int
+    rebuilds: bool
+    history_ids: tuple[int, ...]
 
 
 class SequenceStatus(Enum):
@@ -66,6 +171,20 @@ def get_exit_sequence():
     exit_seq = Sequence([-1], 1)
     exit_seq.status = SequenceStatus.EXIT_ENGINE
     return exit_seq
+
+
+def resumes_offload_prefill(seq) -> bool:
+    """True when an offload load already settled and `seq` keeps its blocks.
+
+    Such a request resumes its suffix prefill without matching the prefix
+    again. Shared by the scheduler's admission and the offload connector's
+    lookup prefetch, which must agree: a lookup sent for a request that skips
+    the match is never consumed and only holds read locks.
+    """
+    return (
+        getattr(seq, "offload_loaded", False)
+        or getattr(seq, "offload_load_failed", False)
+    ) and len(seq.block_table) > 0
 
 
 @dataclass
@@ -194,6 +313,10 @@ class Sequence:
         self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # The prefill forward scheduled last, where it backed off below the
+        # point it resumed at (`BlockManager.replay_start`); None when it did
+        # not.
+        self.replay: Replay | None = None
         # Tokens whose blocks are registered in the prefix cache: through the
         # prompt as chunks finalize, then on through decode as generated blocks
         # fill (BlockManager.hash_decode_blocks). Distinct from
@@ -421,6 +544,12 @@ class Sequence:
 
     def __getitem__(self, key):
         return self.token_ids[key]
+
+    @property
+    def replay_until(self) -> int:
+        """Where the prefill forward scheduled last resumed, 0 when it did not
+        back off below it."""
+        return 0 if self.replay is None else self.replay.until
 
     @property
     def num_tokens(self):

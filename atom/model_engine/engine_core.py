@@ -45,6 +45,41 @@ from atom.utils.gc_utils import (
 
 logger = logging.getLogger("atom")
 
+# How often a prefill engine reports its unapplied BlockAssignment backlog.
+# Per receive thread, so a burst of 128 assignments logs once, not 128 times.
+_ASSIGNMENT_LOG_INTERVAL_S = 5.0
+
+
+def _describe_prefill_queue(seqs: list) -> str:
+    """Summarize one PrefillScheduler queue: partial split, statuses, a sample.
+
+    Counting a queue says a prompt is stuck; saying WHICH queue holds a
+    `is_partial_prefill` sequence says why. `_schedule` builds its candidates
+    from `waiting` alone, so a partial that reached `running` can never be
+    offered its remainder -- and the two look identical in a bare length.
+
+    `progress` is `num_cached_tokens` against the prompt length, which
+    distinguishes a prompt mid-chunk from one that never started.
+    """
+    if not seqs:
+        return "[]"
+    partial = sum(1 for s in seqs if getattr(s, "is_partial_prefill", False))
+    statuses: dict[str, int] = {}
+    for s in seqs:
+        st = getattr(s, "status", None)
+        statuses[getattr(st, "name", str(st))] = (
+            statuses.get(getattr(st, "name", str(st)), 0) + 1
+        )
+    head = seqs[0]
+    progress = (
+        f" head=seq{getattr(head, 'id', '?')}"
+        f" cached={getattr(head, 'num_cached_tokens', '?')}"
+        f"/{getattr(head, 'num_prompt_tokens', '?')}"
+        f" partial={getattr(head, 'is_partial_prefill', '?')}"
+        f" blocks={len(getattr(head, 'block_table', ()) or ())}"
+    )
+    return f"[n={len(seqs)} partial={partial} status={statuses}{progress}]"
+
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
 # idle token-poll timeout and is far below any transfer latency.
@@ -62,9 +97,25 @@ class EngineCore:
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
 
+    # Diagnostic counters the input thread touches. Class-level defaults so the
+    # thread works on an engine built past `__init__` -- tests drive
+    # `process_input_sockets` on a bare `EngineCore.__new__(...)`, and a
+    # counter that only existed as an instance attribute raised there. `+=`
+    # rebinds onto the instance on first use, so per-engine state is unchanged.
+    _adds_received = 0
+    _dummy_seq = 0
+    _dummy_inflight_since: float | None = None
+
     def __init__(self, config: Config, input_address: str, output_address: str):
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
+        # Sequences this process's input thread has decoded off the wire.
+        self._adds_received = 0
+        # Dummy forwards this engine has COMPLETED, and the monotonic time the
+        # in-flight one started (None when none is running). See the DP busy
+        # loop; the prefill monitor reports both.
+        self._dummy_seq = 0
+        self._dummy_inflight_since: float | None = None
         self.output_queue = queue.Queue[list[Sequence]]()
         self.stream_output_queue = (
             queue.Queue()
@@ -77,6 +128,10 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # Separate from memory residency: an update in progress, or one that
+        # failed after an in-place write, must not serve.
+        self._weight_sync_fenced = False
+        self._rl_weights_inconsistent = False
         self.input_address = input_address
         self.output_address = output_address
         # Control traffic arrives on its own socket so CoreManager can keep the
@@ -240,6 +295,7 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
+                exchange_prefill_costs=self.scheduler.cost_balance,
             )
         )
 
@@ -314,13 +370,17 @@ class EngineCore:
                 "runner exit call failed; shared memory may already be freed",
                 exc_info=True,
             )
+        # One deadline for all workers, so a long ATOM_SHUTDOWN_TIMEOUT_S is not
+        # paid once per worker.
+        timeout = envs.ATOM_SHUTDOWN_TIMEOUT_S
+        deadline = time.monotonic() + timeout
         for proc in self.runner_mgr.procs:
             try:
                 alive = proc.is_alive()
             except ValueError:
                 continue  # process object already closed by CoreManager
             if alive:
-                proc.join(timeout=5)
+                proc.join(timeout=max(deadline - time.monotonic(), 0))
                 # The join above has a timeout; nothing after it did. A worker
                 # that outlives it keeps its VRAM slice and its all-reduce IPC
                 # handles, and `multiprocessing`'s atexit handler then joins the
@@ -334,9 +394,11 @@ class EngineCore:
                 try:
                     if proc.is_alive():
                         logger.warning(
-                            "%s: worker pid=%s still alive after 5s; terminating",
+                            "%s: worker pid=%s still alive after %gs "
+                            "(ATOM_SHUTDOWN_TIMEOUT_S); terminating",
                             self.label,
                             getattr(proc, "pid", "?"),
+                            timeout,
                         )
                         proc.terminate()
                         proc.join(timeout=5)
@@ -386,7 +448,7 @@ class EngineCore:
         When offloaded, busy-wait with a short delay to avoid CPU spin.
         Returns True if the caller should skip model execution this tick.
         """
-        if self._is_rl_weights_offloaded:
+        if self._is_rl_weights_offloaded or self._weight_sync_fenced:
             time.sleep(0.01)
             return True
         return False
@@ -698,6 +760,11 @@ class EngineCore:
                     if request_type == EngineCoreRequestType.ADD:
                         for req in reqs:
                             SchedulerMetrics.enqueue(req, received_at=received_at)
+                        # Counted where the frame is decoded, before the queue.
+                        # Separates "the ADD never reached this process" from
+                        # "it arrived and the busy loop never drained it" --
+                        # the two look identical from the scheduler's side.
+                        self._adds_received += len(reqs)
                         req_ids = [req.id for req in reqs]
                         logger.debug(
                             f"{self.label}: input get {request_type} {req_ids}"
@@ -851,14 +918,15 @@ class DPEngineCoreProc(EngineCore):
                     self.utility_handler.push_metrics()
                 self.scheduler.heartbeat_throughput(now)
                 shutdown = shutdown or self.pull_and_process_input_queue()
-                local_unfinished = (
-                    not self.scheduler.is_finished()
-                    and not self._is_rl_weights_offloaded
+                local_unfinished = not self.scheduler.is_finished() and not (
+                    self._is_rl_weights_offloaded or self._weight_sync_fenced
                 )
 
                 global_has_unfinished, global_shutdown, global_offloaded = (
                     self._sync_dp_state(
-                        local_unfinished, shutdown, self._is_rl_weights_offloaded
+                        local_unfinished,
+                        shutdown,
+                        self._is_rl_weights_offloaded or self._weight_sync_fenced,
                     )
                 )
 
@@ -883,7 +951,21 @@ class DPEngineCoreProc(EngineCore):
 
                 executed = self._process_engine_step()
                 if not executed:
+                    # Timestamped rather than logged, because this runs on most
+                    # idle iterations and bracketing it would flood the log. A
+                    # hang here is invisible from anywhere else: the call is the
+                    # last statement of the iteration, so a dummy forward that
+                    # never returns stops the loop before it can come back
+                    # around to `pull_and_process_input_queue`, and the symptom
+                    # surfaces as requests sitting in the input queue with no
+                    # error on any log. One rank is enough to drag the whole
+                    # group in -- `_sync_dp_state` above makes every rank take
+                    # this branch as soon as any one of them has work. A
+                    # monitor reports the timestamp when it stops moving.
+                    self._dummy_inflight_since = time.monotonic()
                     self._execute_dummy_batch()
+                    self._dummy_inflight_since = None
+                    self._dummy_seq += 1
 
                 self.engines_running = global_has_unfinished
         finally:
@@ -1039,6 +1121,10 @@ class PrefillEngineCore(DPEngineCoreProc):
         # handles are valid nowhere else — so each list is narrowed to one entry
         # and the loops below stay single-element fan-outs.
         self._pair_rank = config.disagg_decode_rank
+        # Assignments this process has matched onto a waiting sequence.
+        # Reported by the monitor: a backlog that never converts says the step
+        # that would convert it is not running.
+        self._assignments_applied = 0
         k = self._pair_rank
         # PULL: BlockAssignment from THIS pair's decode rank only.
         self._disagg_d2p_addr = config.disagg_d2p_addrs[k]
@@ -1199,6 +1285,79 @@ class PrefillEngineCore(DPEngineCoreProc):
             name="PrefillEngineCore-AssignmentRecv",
         )
         self._assignment_thread.start()
+        # Reports on a timer rather than on arrival. Every assignment for a
+        # burst lands within the first second, after which the receive thread
+        # blocks in recv() forever -- so an arrival-triggered report only ever
+        # samples the startup instant, when `waiting` is legitimately 0
+        # (add_request sends decode's ADD before prefill's, so decode can admit
+        # and assign before prefill's copy is even on the wire).
+        self._assignment_monitor_thread = threading.Thread(
+            target=self._monitor_assignment_backlog,
+            daemon=True,
+            name="PrefillEngineCore-AssignmentMonitor",
+        )
+        self._assignment_monitor_thread.start()
+
+    def _monitor_assignment_backlog(self):
+        """Report held-but-unapplied assignments on a timer, forever.
+
+        Diagnostic for a prefill that never runs. `_apply_pending_assignments`
+        -- the only consumer of `_pending_assignments` -- is reachable solely
+        from `_process_engine_step`, which `DPEngineCoreProc.busy_loop` skips
+        whenever `_sync_dp_state` reports the whole group idle. An empty
+        `waiting` makes this rank idle, so if the ADD never lands the step is
+        skipped, assignments are never read, and `waiting` stays empty: nothing
+        recovers and nothing is logged. This thread sits outside that gate.
+
+        Steady state readings, once the burst has settled:
+          backlog>0, waiting=0  -> assignments arrive, the ADD does not
+          backlog>0, waiting>0  -> both arrived; the stall is downstream
+          backlog=0, waiting>0  -> assignments were applied; stall is in
+                                   schedule() or the worker RPC
+        """
+        while True:
+            time.sleep(_ASSIGNMENT_LOG_INTERVAL_S)
+            sched = self.scheduler
+            if sched is None:
+                continue
+            with sched._pending_lock:
+                backlog = len(self._pending_assignments)
+            waiting_q = list(getattr(sched, "waiting", ()))
+            running_q = list(getattr(sched, "running", ()))
+            waiting = len(waiting_q)
+            running = len(running_q)
+            # An in-flight dummy counts as something to say even with nothing
+            # owed: a forward stuck before the first request would otherwise
+            # look identical to a genuinely idle engine.
+            if (
+                not backlog
+                and not waiting
+                and not running
+                and self._dummy_inflight_since is None
+            ):
+                continue  # genuinely idle: nothing owed, nothing to say
+            # A dummy forward in flight for longer than one report interval is
+            # not slow, it is stuck: this is an empty batch, not real work.
+            since = self._dummy_inflight_since
+            stuck_for = (
+                f"{time.monotonic() - since:.1f}s" if since is not None else "-"
+            )
+            logger.info(
+                "PrefillEngineCore[pair %d]: assignment backlog=%d | waiting=%d "
+                "running=%d | applied=%d | adds_received=%d queued=%d | "
+                "dummy_done=%d dummy_inflight=%s | waiting%s running%s",
+                self._pair_rank,
+                backlog,
+                waiting,
+                running,
+                self._assignments_applied,
+                self._adds_received,
+                self.input_queue.qsize(),
+                self._dummy_seq,
+                stuck_for,
+                _describe_prefill_queue(waiting_q),
+                _describe_prefill_queue(running_q),
+            )
 
     def _recv_block_assignments(self):
         """Background thread: pulls BlockAssignment messages from decode."""
@@ -1236,6 +1395,7 @@ class PrefillEngineCore(DPEngineCoreProc):
             for seq in self.scheduler.waiting:
                 if seq.id in self._pending_assignments:
                     assignment = self._pending_assignments.pop(seq.id)
+                    self._assignments_applied += 1
                     seq.block_table = new_block_table(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
                     # The STATE slots decode allocated for this request. This

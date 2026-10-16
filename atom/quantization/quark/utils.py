@@ -112,6 +112,326 @@ def dequant_per_block_fp8(
 # Optional E8M0 dtype: only available on newer torch builds.
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
+_NVFP4_BLOCK_SIZE = 16
+# Two E2M1 values share one uint8, so a 16-value block is 8 packed bytes wide.
+_NVFP4_PACKED_GROUP = _NVFP4_BLOCK_SIZE // 2
+_FP4_E2M1_LUT = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+# One device copy of the table per device, kept because the decode kernel
+# gathers from it on every call (weight loading touches hundreds of layers).
+_FP4_E2M1_LUT_BY_DEVICE: dict[torch.device, torch.Tensor] = {}
+
+
+def _fp4_e2m1_lut(device: torch.device) -> torch.Tensor:
+    lut = _FP4_E2M1_LUT_BY_DEVICE.get(device)
+    if lut is None:
+        lut = _FP4_E2M1_LUT.to(device=device)
+        _FP4_E2M1_LUT_BY_DEVICE[device] = lut
+    return lut
+
+
+def _dequantize_nvfp4_torch(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    out_dtype: torch.dtype,
+    high_nibble_first: bool,
+) -> torch.Tensor:
+    """Reference NVFP4 decode in pure torch.
+
+    Kept as the CPU path (Triton needs a GPU) and as the oracle the Triton
+    kernel is checked against in ``tests/test_nvfp4_dequant_triton.py``. It
+    shares :func:`_check_nvfp4_inputs` and :func:`_nvfp4_global_scale_per_row`
+    with the Triton path so the two accept and reject exactly the same inputs --
+    a decoder that validates differently depending on the device is a trap.
+    """
+    rows, _packed_cols, logical_cols = _check_nvfp4_inputs(weight, weight_scale)
+
+    low = (weight & 0xF).to(torch.int64)
+    high = (weight >> 4).to(torch.int64)
+    first, second = (high, low) if high_nibble_first else (low, high)
+    lut = _fp4_e2m1_lut(weight.device)
+    dequantized = torch.empty(
+        rows, logical_cols, dtype=torch.float32, device=weight.device
+    )
+    dequantized[:, 0::2] = lut[first]
+    dequantized[:, 1::2] = lut[second]
+
+    global_scale, per_row = _nvfp4_global_scale_per_row(
+        weight_scale_2, rows, weight.device
+    )
+    scale = weight_scale.to(torch.float32) * (
+        global_scale.view(-1, 1) if per_row else global_scale.view(())
+    )
+    scale = scale.repeat_interleave(_NVFP4_BLOCK_SIZE, dim=-1)
+    return (dequantized * scale).to(out_dtype)
+
+
+@triton.jit
+def _nvfp4_dequant_kernel(  # type: ignore[no-untyped-def]
+    w_ptr,  # uint8 [rows, packed_cols], two E2M1 values per byte
+    s_ptr,  # E4M3 [rows, packed_cols // PACKED_GROUP] block scales
+    g_ptr,  # fp32 global scale, one value or one per row
+    lut_ptr,  # fp32 [16] E2M1 decode table
+    y_ptr,  # out [rows, packed_cols * 2]
+    rows,
+    packed_cols,
+    w_row_stride,
+    s_row_stride,
+    y_row_stride,
+    GLOBAL_SCALE_PER_ROW: tl.constexpr,
+    HIGH_NIBBLE_FIRST: tl.constexpr,
+    PACKED_GROUP: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_PACKED_COLS: tl.constexpr,
+    BLOCK_SCALE_COLS: tl.constexpr,
+):
+    """Unpack E2M1 nibbles and apply the block and global scales.
+
+    One program owns a ``BLOCK_ROWS x BLOCK_PACKED_COLS`` tile of packed bytes,
+    i.e. ``2 * BLOCK_PACKED_COLS`` logical columns. ``BLOCK_PACKED_COLS`` is a
+    multiple of ``PACKED_GROUP``, so a tile never splits a scale block and each
+    block scale is read exactly once.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    # int64 rows: `row * row_stride` is the only term that can leave int32
+    # range (a gathered TP weight is already within ~4x of it), and on this
+    # memory-bound kernel the wider index costs nothing.
+    row_offs = (pid_m * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
+    row_mask = row_offs < rows
+
+    # Packed bytes: low/high nibble of each byte are two adjacent logical values.
+    col_offs = pid_n * BLOCK_PACKED_COLS + tl.arange(0, BLOCK_PACKED_COLS)
+    byte_mask = row_mask[:, None] & (col_offs[None, :] < packed_cols)
+    packed = tl.load(
+        w_ptr + row_offs[:, None] * w_row_stride + col_offs[None, :],
+        mask=byte_mask,
+        other=0,
+    ).to(tl.int32)
+    low = packed & 0xF
+    high = (packed >> 4) & 0xF
+    if HIGH_NIBBLE_FIRST:
+        first, second = high, low
+    else:
+        first, second = low, high
+    # Indices are always in [0, 16), so the gather needs no mask.
+    val_first = tl.load(lut_ptr + first)
+    val_second = tl.load(lut_ptr + second)
+
+    # Block scales: one per PACKED_GROUP bytes, broadcast back over the tile.
+    scale_cols = packed_cols // PACKED_GROUP
+    scale_offs = pid_n * BLOCK_SCALE_COLS + tl.arange(0, BLOCK_SCALE_COLS)
+    scale = tl.load(
+        s_ptr + row_offs[:, None] * s_row_stride + scale_offs[None, :],
+        mask=row_mask[:, None] & (scale_offs[None, :] < scale_cols),
+        other=0.0,
+    ).to(tl.float32)
+    # NVFP4 is a two-level format: the E4M3 block scale is always paired with
+    # an FP32 global scale, so this multiply is unconditional.
+    if GLOBAL_SCALE_PER_ROW:
+        global_scale = tl.load(g_ptr + row_offs, mask=row_mask, other=0.0)
+        scale = scale * global_scale[:, None]
+    else:
+        scale = scale * tl.load(g_ptr)
+    scale = tl.reshape(
+        tl.broadcast_to(
+            scale[:, :, None], (BLOCK_ROWS, BLOCK_SCALE_COLS, PACKED_GROUP)
+        ),
+        (BLOCK_ROWS, BLOCK_PACKED_COLS),
+    )
+
+    # Interleave restores logical order: byte j feeds columns 2j and 2j+1.
+    out = tl.interleave(val_first * scale, val_second * scale)
+    out_offs = pid_n * (2 * BLOCK_PACKED_COLS) + tl.arange(0, 2 * BLOCK_PACKED_COLS)
+    tl.store(
+        y_ptr + row_offs[:, None] * y_row_stride + out_offs[None, :],
+        out.to(y_ptr.dtype.element_ty),
+        mask=row_mask[:, None] & (out_offs[None, :] < 2 * packed_cols),
+    )
+
+
+def _check_nvfp4_inputs(
+    weight: torch.Tensor, weight_scale: torch.Tensor
+) -> tuple[int, int, int]:
+    """Validate the NVFP4 wire format and return ``(rows, packed_cols, K)``."""
+    if weight.ndim != 2 or weight_scale.ndim != 2:
+        raise ValueError(
+            "NVFP4 dequantization expects 2D weight and scale tensors, got "
+            f"weight={tuple(weight.shape)}, scale={tuple(weight_scale.shape)}."
+        )
+    if weight.dtype != torch.uint8:
+        raise TypeError(
+            f"NVFP4 packed weight must use uint8 storage, got {weight.dtype}."
+        )
+    # Both decode paths convert the scale by value, so raw scale bytes would
+    # decode consistently wrong (0x38 -> 56.0 instead of 1.0) on CPU and GPU
+    # alike; only this check can catch them.
+    if weight_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            "NVFP4 block scale must be float8_e4m3fn, got "
+            f"{weight_scale.dtype}; view raw scale bytes as float8_e4m3fn "
+            "instead of casting them by value."
+        )
+
+    rows, packed_cols = weight.shape
+    logical_cols = packed_cols * 2
+    if logical_cols % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"NVFP4 logical K={logical_cols} must be divisible by "
+            f"group_size={_NVFP4_BLOCK_SIZE}."
+        )
+    expected_scale_shape = (rows, logical_cols // _NVFP4_BLOCK_SIZE)
+    if tuple(weight_scale.shape) != expected_scale_shape:
+        raise ValueError(
+            f"NVFP4 scale shape {tuple(weight_scale.shape)} does not match "
+            f"expected {expected_scale_shape}."
+        )
+    return rows, packed_cols, logical_cols
+
+
+def _nvfp4_global_scale_per_row(
+    weight_scale_2: torch.Tensor, rows: int, device: torch.device
+) -> tuple[torch.Tensor, bool]:
+    """Normalize the NVFP4 global scale to a scalar or one FP32 value per row.
+
+    NVFP4 checkpoints carry ``weight_scale_2`` either per tensor (one scalar,
+    as the MoE path passes per expert projection) or per output row (as the
+    Linear path passes after expanding one scalar per merged output partition).
+    Both collapse to a row-indexed lookup; anything else -- a value per scale
+    *block*, say -- is a caller bug rather than a layout this decoder supports.
+
+    :return: ``(scale, is_per_row)``; ``scale`` is contiguous FP32 on ``device``.
+    """
+    if weight_scale_2 is None:
+        raise ValueError(
+            "NVFP4 is a two-level format and always carries a global weight "
+            "scale; weight_scale_2 is None. A layer that reaches this point "
+            "without one failed to load its *_weight_scale_2 checkpoint tensor."
+        )
+    scale_2 = weight_scale_2.to(device=device, dtype=torch.float32)
+    if scale_2.numel() == 1:
+        return scale_2.reshape(1).contiguous(), False
+    if scale_2.numel() == rows and scale_2.shape[-1] == 1:
+        return scale_2.reshape(rows).contiguous(), True
+    raise ValueError(
+        "NVFP4 global scale must be a scalar or one value per weight row "
+        f"(rows={rows}), got shape {tuple(weight_scale_2.shape)}."
+    )
+
+
+def dequantize_nvfp4(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    high_nibble_first: bool = False,
+) -> torch.Tensor:
+    """Decode Quark or NVIDIA ModelOpt NVFP4 into a floating-point 2D weight.
+
+    ``weight`` stores two E2M1 values per uint8, ``weight_scale`` stores one
+    E4M3 scale per 16 logical values, and ``weight_scale_2`` is the FP32 global
+    multiplier. This mirrors SGLang's NVFP4 source decoder used by its online
+    NVFP4-to-MXFP4 path.
+
+    All three are required: NVFP4 is a two-level format by definition, so a
+    layer without a global scale is not an NVFP4 layer. Both ATOM call sites
+    (``LinearBase.online_quantize_weight`` and ``FusedMoE._online_quant``)
+    always pass one, and a ``None`` reaching here means the checkpoint's
+    ``*_weight_scale_2`` never loaded -- silently dropping it would scale the
+    whole weight wrong, so it raises instead.
+
+    ``out_dtype`` defaults to ``torch.get_default_dtype()`` -- the model dtype,
+    which ``ModelRunner`` installs before any weight is loaded -- matching every
+    other dequant helper here (:func:`dequant_per_tensor_fp8`,
+    :func:`dequant_per_channel_fp8`, :func:`dequant_per_block_fp8`,
+    :func:`dequant_mxfp8`). Decoding to FP32 instead would be pure waste: the
+    only consumer is :func:`quant_weight_online`, and
+    :func:`quant_mxfp4_online_even` casts anything that is not already
+    FP16/BF16 down to BF16 before quantizing. Emitting BF16 here is *bit
+    identical* to that -- the arithmetic still happens in FP32 and is rounded
+    once, just at the store rather than in a second full-width pass -- while
+    halving both the output tensor and the bytes the MXFP4 quantizer reads.
+
+    On GPU this runs as a single Triton kernel: unpack, LUT decode, block scale
+    and global scale are fused, so the only tensor materialized is the output.
+    The torch path (:func:`_dequantize_nvfp4_torch`) built a full FP32 nibble
+    tensor plus a full-width ``repeat_interleave``'d scale tensor first -- three
+    K-wide temporaries per weight, on a path that runs for every layer at load.
+    It remains the reference and the CPU fallback.
+    """
+    if out_dtype is None:
+        out_dtype = torch.get_default_dtype()
+    if not weight.is_cuda:
+        return _dequantize_nvfp4_torch(
+            weight, weight_scale, weight_scale_2, out_dtype, high_nibble_first
+        )
+
+    rows, packed_cols, logical_cols = _check_nvfp4_inputs(weight, weight_scale)
+    # Validate before the empty-tensor shortcut, so a bad global scale is
+    # reported on every shape rather than only on the ones that launch.
+    global_scale, global_scale_per_row = _nvfp4_global_scale_per_row(
+        weight_scale_2, rows, weight.device
+    )
+    out = torch.empty(rows, logical_cols, dtype=out_dtype, device=weight.device)
+    if out.numel() == 0:
+        return out
+
+    # The kernel indexes columns directly, so only the row stride is free.
+    if weight.stride(1) != 1:
+        weight = weight.contiguous()
+    if weight_scale.stride(1) != 1:
+        weight_scale = weight_scale.contiguous()
+
+    block_packed_cols = min(
+        128, max(_NVFP4_PACKED_GROUP, triton.next_power_of_2(packed_cols))
+    )
+    block_rows = min(8, triton.next_power_of_2(rows))
+    grid = (
+        triton.cdiv(rows, block_rows),
+        triton.cdiv(packed_cols, block_packed_cols),
+    )
+    _nvfp4_dequant_kernel[grid](
+        weight,
+        weight_scale,
+        global_scale,
+        _fp4_e2m1_lut(weight.device),
+        out,
+        rows,
+        packed_cols,
+        weight.stride(0),
+        weight_scale.stride(0),
+        out.stride(0),
+        GLOBAL_SCALE_PER_ROW=global_scale_per_row,
+        HIGH_NIBBLE_FIRST=high_nibble_first,
+        PACKED_GROUP=_NVFP4_PACKED_GROUP,
+        BLOCK_ROWS=block_rows,
+        BLOCK_PACKED_COLS=block_packed_cols,
+        BLOCK_SCALE_COLS=block_packed_cols // _NVFP4_PACKED_GROUP,
+        num_warps=4,
+    )
+    return out
+
 
 def _mx_block_scale_dtype():
     """The block-scale dtype mandated by the MX (microscaling) format: E8M0.
@@ -226,10 +546,10 @@ def dequant_weight_online(
 ) -> torch.Tensor:
     """Dequantize an online-quant SOURCE weight back to the default float dtype.
 
-    Single entry point shared by the Linear and MoE online-quant paths and the
-    inverse counterpart of :func:`quant_weight_online`: it turns an
-    already-quantized weight back into float so it can be re-quantized to a
-    different target format.
+    Shared by the Linear and MoE online-quant paths for every source except
+    NVFP4 (decoded by :func:`dequantize_nvfp4`), and the inverse counterpart
+    of :func:`quant_weight_online`: it turns an already-quantized weight back
+    into float so it can be re-quantized to a different target format.
 
     A source is identified by BOTH its ``quant_type`` (the block layout) and its
     element ``quant_dtype``. The layout alone is not enough: ``per_1x32`` is the

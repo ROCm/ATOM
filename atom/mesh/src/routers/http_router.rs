@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -26,7 +26,7 @@ use crate::{
     },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, MeshMetrics},
+        metrics::{metrics_labels, MeshMetrics},
     },
     protocols::{
         chat::ChatCompletionRequest,
@@ -138,20 +138,17 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
-        let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
-        // Record request start (Layer 2)
-        MeshMetrics::record_router_request(
+        let observation = crate::observability::request::RequestMetrics::new(
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
             model,
-            endpoint,
-            bool_to_static_str(is_stream),
+            route,
+            is_stream,
         );
 
         let response = RetryExecutor::execute_response_with_retry(
@@ -189,28 +186,7 @@ impl Router {
         )
         .await;
 
-        if response.status().is_success() {
-            let duration = start.elapsed();
-            MeshMetrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_status(response.status()) {
-            MeshMetrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
-        }
-
-        response
+        observation.wrap_response(response)
     }
 
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(

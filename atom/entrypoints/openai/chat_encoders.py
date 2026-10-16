@@ -18,8 +18,9 @@ import os
 import pathlib
 from typing import Any
 
-from huggingface_hub import snapshot_download
 from jinja2 import TemplateError
+
+from atom.model_loader.weight_utils import local_model_dir
 
 from .chat_encoder_adapters import (
     MessageEncoderAdapter,
@@ -28,15 +29,6 @@ from .chat_encoder_adapters import (
 from .protocol import ChatMessage
 
 logger = logging.getLogger("atom")
-
-
-def _resolve_model_path(model: str) -> str:
-    if os.path.isdir(model):
-        return model
-    try:
-        return snapshot_download(model, local_files_only=True, allow_patterns=[])
-    except Exception:  # noqa: BLE001
-        return model
 
 
 def _load_encoder_from_dir(model_path: str) -> MessageEncoderAdapter | None:
@@ -112,7 +104,7 @@ def load_custom_message_encoder(model_path: str) -> MessageEncoderAdapter | None
     ``chat_template`` path. Result should be cached by the caller — this does
     filesystem IO and a Python import.
     """
-    return _load_encoder_from_dir(_resolve_model_path(model_path))
+    return _load_encoder_from_dir(local_model_dir(model_path))
 
 
 # The smallest request that makes a template show its framing. Nothing is

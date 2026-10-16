@@ -2,6 +2,9 @@
 # The digest prevents this historical tag from being moved underneath us.
 ARG BASE_IMAGE="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
 ARG GPU_ARCH="gfx942;gfx950"
+# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
+# LMCache section of atom_image.
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 # ROCm 10 flavor: pass --build-arg BASE_IMAGE=rocm10-base to build the whole
 # image on the pip-installed ROCm 10 SDK below instead of the rocm/pytorch
 # apt image. All ROCm 10 component versions are ARGs so the 10.1 tracking
@@ -430,6 +433,9 @@ else:
         print("torch_utils.py already carries the torch.Stream branch (upstream fix landed)")
 PY
 
+# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
+FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
+
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
 # --------------------------------------------------------------------
@@ -470,6 +476,15 @@ RUN echo "========== [ATOM] Installing MORI nightly ==========" && \
 # ROCm build whose version string doesn't match rocm-hip's declared dependency,
 # leaving dpkg in a broken state that blocks all subsequent apt-get install calls.
 ARG INSTALL_MOONCAKE=1
+# Mooncake Store (WITH_STORE=ON) on top of the TransferEngine: the
+# `mooncake.store` client of the mooncake_store offload connector
+# (ATOM_KV_OFFLOAD=mooncake_store) and the `mooncake_master` /
+# `mooncake_client` processes the atomesh launcher starts (MOONCAKE_STORE=1).
+# On by default: nothing runs the Store unless one of those two asks for it, so
+# P->D KV through the TransferEngine moves as it does without the Store.
+# INSTALL_MOONCAKE_STORE=0 configures WITH_STORE=OFF, for a base on which a
+# Store dependency (cachelib) does not build.
+ARG INSTALL_MOONCAKE_STORE=1
 # Upstream Mooncake release tag with HIP dma-buf MR support.
 # Note: this tag does not include the Ionic QP atomic resource clamp.
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
@@ -527,14 +542,17 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
 # both protocols and excludes HIP IPC for cross-host transfers.
 # USE_HIP_DMABUF must compile into rdma_transport (rdma_context.cpp). Without
 # hsa-runtime64, CMake silently disables dma-buf and GPU MRs stay on ibv_reg_mr.
-# ATOM only consumes the TransferEngine (`mooncake.engine`), so Mooncake Store
-# and its Rust bindings stay off: they add build surface (cachelib, cargo) that
-# nothing here loads. WITH_STORE_RUST=ON is a hard error without WITH_STORE.
+# ATOM consumes the TransferEngine (`mooncake.engine`) for P->D, and Mooncake
+# Store only with INSTALL_MOONCAKE_STORE=1. The Store's Rust bindings stay off:
+# nothing here loads them, and WITH_STORE_RUST=ON is a hard error without
+# WITH_STORE.
 # HIP hipify copies tests/*.cpp into the build tree but not headers such as
 # rdma_test_peers.h, so BUILD_UNIT_TESTS=ON fails. Upstream ROCm CI also sets
 # BUILD_UNIT_TESTS=OFF; examples are unused in this image.
 RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
-        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON) =========="; \
+        MC_WITH_STORE=OFF; \
+        if [ "${INSTALL_MOONCAKE_STORE}" = "1" ]; then MC_WITH_STORE=ON; fi; \
+        echo "========== [MC 3/4] Build and install Mooncake (USE_HIP=ON USE_HIP_DMABUF=${USE_HIP_DMABUF} ENABLE_MULTI_PROTOCOL=ON WITH_STORE=${MC_WITH_STORE}) =========="; \
         HSA_PREFIXS="/opt/rocm"; \
         for cfg in /opt/rocm/lib/cmake/hsa-runtime64/hsa-runtime64Config.cmake \
                    /opt/rocm/lib64/cmake/hsa-runtime64/hsa-runtime64Config.cmake; do \
@@ -543,7 +561,7 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         mkdir -p /app/mooncake/build && cd /app/mooncake/build \
         && cmake .. -DUSE_HIP=ON -DUSE_HIP_DMABUF=${USE_HIP_DMABUF} -DUSE_ETCD=ON \
              -DENABLE_MULTI_PROTOCOL=ON \
-             -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+             -DWITH_TE=ON -DWITH_STORE=${MC_WITH_STORE} -DWITH_STORE_RUST=OFF \
              -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
              -DCMAKE_PREFIX_PATH="${HSA_PREFIXS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}" \
              > /tmp/mooncake-cmake.log 2>&1 \
@@ -551,6 +569,8 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && cat /tmp/mooncake-cmake.log \
         && { grep -qx 'ENABLE_MULTI_PROTOCOL:BOOL=ON' CMakeCache.txt \
              || { echo "ERROR: Mooncake multi-protocol support is required for cross-host RDMA with HIP"; exit 1; }; } \
+        && { grep -qx "WITH_STORE:BOOL=${MC_WITH_STORE}" CMakeCache.txt \
+             || { echo "ERROR: Mooncake was not configured WITH_STORE=${MC_WITH_STORE}"; exit 1; }; } \
         && if [ "${USE_HIP_DMABUF}" = "ON" ]; then \
              grep -q "HIP dmabuf MR registration enabled" /tmp/mooncake-cmake.log \
                || { echo "ERROR: HIP dma-buf was not enabled (hsa-runtime64 missing?)"; \
@@ -568,6 +588,12 @@ RUN if [ "${INSTALL_MOONCAKE}" = "1" ]; then \
         && ldconfig \
         && ( grep -a -R -l "ibv_reg_dmabuf_mr" /usr/local/lib /opt/venv 2>/dev/null | head -n 1 \
              || { echo "ERROR: installed Mooncake libs have no ibv_reg_dmabuf_mr"; exit 1; } ) \
+        && if [ "${MC_WITH_STORE}" = "ON" ]; then \
+             { command -v mooncake_master && command -v mooncake_client \
+               || { echo "ERROR: Mooncake Store binaries mooncake_master / mooncake_client are missing"; exit 1; }; } \
+             && { "${VENV_PYTHON}" -c "from mooncake.store import MooncakeDistributedStore" \
+               || { echo "ERROR: the mooncake.store Python module does not import"; exit 1; }; }; \
+           fi \
         && echo "--- Clean up build artifacts ---" \
         && rm -rf /app/mooncake/build /app/mooncake/.git; \
     fi
@@ -620,11 +646,13 @@ RUN pip install rocm-trace-lite && \
 # runs out of file descriptors on the docker default nofile limit (os error 24,
 # "could not execute process rustc (never executed)"); raise it for this step.
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
     ulimit -n 65536 && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
@@ -637,11 +665,15 @@ RUN echo "========== Install atomesh binary ==========" && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install the official wheel built for the image's exact PyTorch ABI. Keep
-# --no-deps so pip cannot replace the preinstalled ROCm torch stack.
-ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc3-rocm-torch210/lmcache-0.5.5rc3%2Brocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
+# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
+# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
+# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
+# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
+# workflow opens the PR that moves the pin. The expected lmcache.__version__
+# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
+# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
+# image's torch.
+ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
 # Docker builds do not expose a GPU, so LMCache's torch.cuda.is_available()
 # backend predicate is overridden only in the validation process below.
 # Two install paths, because the published wheel targets one ABI: its filename
@@ -655,19 +687,25 @@ ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e735
 # tells the two apart. Collapse this back to one path once a matching wheel
 # exists.
 ARG LMCACHE_TAG=v0.4.5
-RUN if [ -z "${ROCM_HOME}" ]; then \
+RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
+    if [ -z "${ROCM_HOME}" ]; then \
       echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-          curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
-          echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+          set -- /tmp/lmcache-wheel/*.whl && \
+          { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
+          lmcache_wheel="$1" && \
+          lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
+              's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
+          { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
+          echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
           "${VENV_PYTHON}" -m pip install \
               prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
               blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
               cachetools cryptography numba openai py-cpuinfo \
               opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
               opentelemetry-exporter-otlp==1.40.0 \
-              opentelemetry-exporter-prometheus==0.61b0 && \
-          "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
-          rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+              opentelemetry-exporter-prometheus==0.61b0 \
+              "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
+          "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
           "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
       from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
       from lmcache.v1.memory_management import MemoryFormat; \
@@ -679,7 +717,7 @@ RUN if [ -z "${ROCM_HOME}" ]; then \
       from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
       from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
       assert 'rocm' in torch.__version__, torch.__version__; \
-      assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+      assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
       assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
       assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
       assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \

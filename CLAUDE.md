@@ -48,13 +48,32 @@ Key entry points:
 - Ops: `atom/model_ops/` — AITER kernel wrappers (linear, attention, fused_moe)
 - Config: `atom/config.py` (Config, KVCacheConfig, CompilationConfig)
 - Env vars: `atom/utils/envs.py` (all `ATOM_*` variable definitions)
+- Mono decode (fused per-layer decode kernels): the shared mechanisms in `atom/mono/`
+  (`runtime/`: TP consensus and a runner's bind-then-agree construction
+  (`consensus.bind_agreed`), peer memory and its owned buffer (`lifecycle`),
+  the step's mailbox zeroing and peer fence, one FlyDSL launch
+  (`mailboxes.StepMailboxes.begin_step` -> `step_begin`), per-width builds (`widths`), the routing wrapper's
+  lazy runner (`route`), debug wait reports, kernel argument tables, compile-only
+  builds and their traced hand-offs (`compile.trace` / `compile.check_traced`),
+  the refusals every model shares (`deployment`), check-mode
+  comparison (`compare`); `plan/`: the execution model and task placement, build
+  keys, a TP rank's share of the widths (`shard`: a model's `Dims` and its TP
+  refusal), mailbox region layout (`layout`), int / traced arithmetic (`arith`)
+  and the hand-off contract a trace is held to (`check.check`); `device/`: the tagged
+  mailbox and its `publish`, the TP group's peer bases and all-reduce sum
+  (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
+  / math primitives), a model's
+  kernels in `atom/models/<model>/mono/` (MiniMax-M3; DeepSeek-V4.1, wrapped
+  after load through `model_runner.mono_decode_installers`; its per-step cell
+  decisions live in `deepseek_v41/mono/{index,attention,moe}_plan.py`, each
+  called by both the kernel and its CPU I3 test)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
 
 ## Critical Rules
 
-- **NEVER modify `@support_torch_compile` decorated model files** — breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`, `DSparkProposer.propose()`). `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
+- **Change `@support_torch_compile` decorated model files with care** — edits are allowed, but debug/instrumentation code inside traced functions breaks Dynamo tracing even with `--enforce-eager`. Instrument at call sites instead (e.g., `ModelRunner.run_model()`, `EagleProposer.propose()`, `DSparkProposer.propose()`), know which functions are traced before editing, and run the compiled path afterwards. `deepseek_v4_dspark.py` carries a COMPILE BOUNDARY block at the top naming exactly which functions are traced — read it before touching that file
 - **Multiprocessing must use `spawn`** — `fork` causes CUDA re-initialization crashes
 - **Set `AITER_LOG_LEVEL=WARNING` before starting server** — suppresses aiter kernel log flooding
 - **Clear compile cache before server restart:** `rm -rf /root/.cache/atom/*` — stale cache causes silent failures after code changes

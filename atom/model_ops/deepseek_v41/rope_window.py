@@ -32,8 +32,8 @@ def _rotate_head(query, token, slot, position, cos, sin, HEADS, D, ROPE):
     """One query head's RoPE tail, in place. GPT-J pairs, as V4 rotates."""
     half: tl.constexpr = ROPE // 2
     pair = tl.arange(0, half)
-    cosine = tl.load(cos + position * half + pair)
-    sine = tl.load(sin + position * half + pair)
+    cosine = tl.load(cos + position * half + pair).to(tl.float32)
+    sine = tl.load(sin + position * half + pair).to(tl.float32)
     head = query + (token * HEADS + slot) * D + (D - ROPE)
     tail = tl.arange(0, ROPE)
     even, odd = tl.split(tl.reshape(tl.load(head + tail).to(tl.float32), (half, 2)))
@@ -57,8 +57,10 @@ def _quantized_kv_row(kv, token, position, cos, sin, kv_stride, D, ROPE):
     phase = tl.arange(0, D // 2) - (D - ROPE) // 2
     # A NoPE pair reads no table entry, and `other=` leaves it alone: cos 1
     # with sin 0 is the identity rotation.
-    cosine = tl.load(cos + position * half + phase, phase >= 0, other=1.0)
-    sine = tl.load(sin + position * half + phase, phase >= 0, other=0.0)
+    cosine = tl.load(cos + position * half + phase, phase >= 0, other=1.0).to(
+        tl.float32
+    )
+    sine = tl.load(sin + position * half + phase, phase >= 0, other=0.0).to(tl.float32)
     # Back through the activation dtype first: the kernels this replaces each
     # returned BF16, so the amax has to see the rounded row.
     groups = (
@@ -185,8 +187,8 @@ def rope_quant_window(
 
     `qat` takes the dequantized BF16 row an extend pass attends to, `values`
     and `scales` the packed pair a later window write consumes, and `ring` the
-    `(pool, step, window, packed)` a decode stores straight into. At least one
-    has to be there; a caller asking for none has no reason to run the KV half.
+    `(pool, step, window, packed)` a decode stores straight into. With none of
+    them there is no KV half, and `kv` may be None.
 
     One address serves both ring layouts: `window_row` returns a byte offset
     under the packed geometry and a row index under the BF16 one, which is why
@@ -194,12 +196,11 @@ def rope_quant_window(
     two have to disagree about.
     """
     tokens, heads, dim = query.shape
-    if ring is None and qat is None and values is None:
-        raise ValueError("The KV row needs a destination")
+    kv_half = ring is not None or qat is not None or values is not None
     pool, step, window, packed = ring or (None, None, None, False)
-    _rope_window_kernel[(tokens, heads + 1)](
+    _rope_window_kernel[(tokens, heads + kv_half)](
         query,
-        kv,
+        kv if kv_half else query,
         cos,
         sin,
         positions,
@@ -211,7 +212,7 @@ def rope_quant_window(
         None if step is None else step.cu_seqlens_q,
         None if step is None else step.slots,
         0 if window is None else window.ring_start,
-        kv.stride(0),
+        kv.stride(0) if kv_half else 0,
         HEADS=heads,
         D=dim,
         ROPE=rope_dim,
