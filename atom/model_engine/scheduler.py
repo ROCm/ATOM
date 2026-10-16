@@ -2803,12 +2803,16 @@ class Scheduler:
                 seq.offload_loaded = False
                 seq.offload_loaded_tokens = seq.num_cached_tokens
                 seq.offload_load_start_tokens = None
-                seq.offload_load_failed = False
                 if seq.offload_joint.load_hash != -1:
                     # The hit's own state is a tier load. Stay parked for it;
                     # this failure was the joint, not that load.
+                    seq.offload_load_failed = False
                     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
                     return False
+                # The HBM hit's blocks are already in the table. Mark the
+                # load failed so admission resumes that prefill instead of
+                # calling allocate on a non-empty block table.
+                seq.offload_load_failed = True
                 return True
             disowned = self.block_manager.disown_claimed_prefix(seq)
             seq.num_cached_tokens = 0
