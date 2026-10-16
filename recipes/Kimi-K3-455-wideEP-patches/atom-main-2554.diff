@@ -1,8 +1,8 @@
 diff --git a/atom/model_ops/linear.py b/atom/model_ops/linear.py
-index 458f5db2..48eea834 100644
+index b4d611e..b1324fe 100644
 --- a/atom/model_ops/linear.py
 +++ b/atom/model_ops/linear.py
-@@ -663,6 +663,7 @@ class LinearBase(nn.Module):
+@@ -692,6 +692,7 @@ class LinearBase(nn.Module):
              and quant_config.blockscale_e8m0_scale
          )
          self.native_a8_group_rows = None
@@ -10,7 +10,7 @@ index 458f5db2..48eea834 100644
          source_block = layer_quant_config.weight_block_size
          native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
              (1, 32),
-@@ -1001,6 +1002,11 @@ class LinearBase(nn.Module):
+@@ -1030,6 +1031,11 @@ class LinearBase(nn.Module):
          )
          weight = self.weight.data
          weight_scale = getattr(self, "weight_scale", None)
@@ -22,7 +22,7 @@ index 458f5db2..48eea834 100644
          if (
              self.tp_size > 1
              and self.tp_dim is not None
-@@ -1089,7 +1095,10 @@ class LinearBase(nn.Module):
+@@ -1118,7 +1124,10 @@ class LinearBase(nn.Module):
                  self.output_partition_sizes,
              )
              q_weight, weight_scale = quant_weight_online(
@@ -34,7 +34,7 @@ index 458f5db2..48eea834 100644
              )
          if need_gather:
              q_weight, weight_scale = self._shard_quantized_weight(
-@@ -1107,6 +1116,8 @@ class LinearBase(nn.Module):
+@@ -1136,6 +1145,8 @@ class LinearBase(nn.Module):
          # Update quant state
          self.quant_type = online_quant_type
          self.params_dtype = online_quant_dtype
@@ -43,7 +43,7 @@ index 458f5db2..48eea834 100644
          self.layer_quant_config = online_layer_quant_config
          self._stream_online_quant = False
          self.quant_func = get_hip_quant(online_quant_type)
-@@ -1257,7 +1268,13 @@ class LinearBase(nn.Module):
+@@ -1286,7 +1297,13 @@ class LinearBase(nn.Module):
          # The other half of the shuffle decision `process_weights_after_loading`
          # takes, so it answers on the same terms `weight_is_stored_preshuffled`
          # does -- by value.
@@ -58,7 +58,7 @@ index 458f5db2..48eea834 100644
              self.quant_type.value == QuantType.per_Token.value
              and self.params_dtype == dtypes.fp8
          ):
-@@ -1282,9 +1299,10 @@ class LinearBase(nn.Module):
+@@ -1311,9 +1328,10 @@ class LinearBase(nn.Module):
              self.weight.data, (0, 0, 0, padding_size)
          )
          ws = self.weight_scale.data
@@ -72,7 +72,7 @@ index 458f5db2..48eea834 100644
          # Bias is also per-output-channel
          if self.bias is not None:
              b = self.bias.data
-@@ -1319,8 +1337,10 @@ class LinearBase(nn.Module):
+@@ -1348,8 +1366,10 @@ class LinearBase(nn.Module):
          Computed on access rather than cached at construction -- `quant_type` is
          rewritten when online quantisation is configured, well after __init__.
          """
@@ -85,7 +85,7 @@ index 458f5db2..48eea834 100644
          )
  
      @mark_trace
-@@ -1569,8 +1589,8 @@ class LinearBase(nn.Module):
+@@ -1598,8 +1618,8 @@ class LinearBase(nn.Module):
          view.output_size = length
          # `forward` trims padded rows via `_output_size_before_padding`. A row
          # view lives entirely inside the real rows, so it must not re-trim; the
@@ -97,7 +97,7 @@ index 458f5db2..48eea834 100644
              assert (
                  start + length <= self._output_size_before_padding
 diff --git a/atom/models/kimi_k3.py b/atom/models/kimi_k3.py
-index ba617e44..7f010923 100644
+index 9e5fcc4..f8e1de1 100644
 --- a/atom/models/kimi_k3.py
 +++ b/atom/models/kimi_k3.py
 @@ -177,6 +177,18 @@ def _effective_layer_quant(
@@ -119,7 +119,7 @@ index ba617e44..7f010923 100644
  class SituAndMul(nn.Module):
      def __init__(
          self,
-@@ -785,7 +797,10 @@ class KimiFullAttention(nn.Module):
+@@ -806,7 +818,10 @@ class KimiFullAttention(nn.Module):
          qknorm_type, qknorm_dtype = _effective_layer_quant(
              quant_config, f"{prefix}.q_b_proj"
          )
@@ -131,7 +131,7 @@ index ba617e44..7f010923 100644
          self.qknorm_dtype = qknorm_dtype if self.fuse_qknorm_quant else torch.bfloat16
          self.qknorm_quant_type_value = (
              qknorm_type.value if self.fuse_qknorm_quant else QuantType.No.value
-@@ -803,9 +818,10 @@ class KimiFullAttention(nn.Module):
+@@ -824,9 +839,10 @@ class KimiFullAttention(nn.Module):
          # when o_proj runs FP8 in a scheme the fused kernel emits: per-token
          # (ptpc_fp8) or per-1x128 block.
          o_type, o_dtype = _effective_layer_quant(quant_config, f"{prefix}.o_proj")
@@ -145,7 +145,7 @@ index ba617e44..7f010923 100644
          )
          # .value, like qknorm_quant_type_value above: comparing the pybind11
          # QuantType inside forward() graph-breaks Dynamo.
-@@ -1020,12 +1036,14 @@ class KimiKDAAttention(nn.Module):
+@@ -1041,12 +1057,14 @@ class KimiKDAAttention(nn.Module):
              quant_config=quant_config,
              prefix=f"{prefix}.f_b_proj",
          )
@@ -163,7 +163,7 @@ index ba617e44..7f010923 100644
          self.o_proj = RowParallelLinear(
              self.proj_size,
 diff --git a/atom/quantization/quark/utils.py b/atom/quantization/quark/utils.py
-index 37cf387e..21e01dc0 100644
+index 37cf387..21e01dc 100644
 --- a/atom/quantization/quark/utils.py
 +++ b/atom/quantization/quark/utils.py
 @@ -665,9 +665,12 @@ def quant_mxfp4_online_even(

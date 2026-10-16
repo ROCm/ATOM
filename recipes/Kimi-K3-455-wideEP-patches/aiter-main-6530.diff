@@ -1,6 +1,6 @@
 diff --git a/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv b/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv
 new file mode 100644
-index 000000000..1bced5ece
+index 0000000..1bced5e
 --- /dev/null
 +++ b/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_tuned_gemm.csv
 @@ -0,0 +1,121 @@
@@ -127,7 +127,7 @@ index 000000000..1bced5ece
 +gfx1250,256,16384,67584,7168,128x128,flydsl,1056,1,2590.2535,flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2,6128.43,1087.34,0.0
 diff --git a/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_untuned_gemm.csv b/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_untuned_gemm.csv
 new file mode 100644
-index 000000000..4c8313781
+index 0000000..4c83137
 --- /dev/null
 +++ b/aiter/configs/model_configs/kimik3_a8w8_blockscale_mxscale_bpreshuffle_untuned_gemm.csv
 @@ -0,0 +1,121 @@
@@ -253,7 +253,7 @@ index 000000000..4c8313781
 +8192,67584,7168,128x128,
 +16384,67584,7168,128x128,
 diff --git a/csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py b/csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py
-index b875b3c08..c1b11f985 100644
+index b875b3c..c1b11f9 100644
 --- a/csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py
 +++ b/csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py
 @@ -60,6 +60,21 @@ except ImportError as _flydsl_import_err:
