@@ -55,6 +55,7 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
         raise error
 
     monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", fail)
+    monkeypatch.setattr(blockscale, "_aiter_row_major_group32_supported", lambda: True)
     with pytest.raises(error_type) as raised:
         blockscale.native_quant_linear(
             torch.empty((3, 64), dtype=torch.float8_e4m3fn),
@@ -63,3 +64,19 @@ def test_aiter_execution_errors_are_not_hidden(monkeypatch, error_type):
             x_scale=torch.empty((3, 2), dtype=torch.float8_e8m0fnu),
         )
     assert raised.value is error
+
+
+@pytest.mark.parametrize(
+    "weight_preshuffled, row_major_supported, expected",
+    [(False, False, False), (False, True, True), (True, False, True)],
+)
+def test_fp8_backend_capability_gate(
+    monkeypatch, weight_preshuffled, row_major_supported, expected
+):
+    monkeypatch.setattr(blockscale, "_aiter_fp8_gemm", object())
+    monkeypatch.setattr(
+        blockscale,
+        "_aiter_row_major_group32_supported",
+        lambda: row_major_supported,
+    )
+    assert blockscale._use_aiter_fp8_gemm(weight_preshuffled) is expected
