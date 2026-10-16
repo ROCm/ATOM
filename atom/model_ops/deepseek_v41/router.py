@@ -23,6 +23,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -159,8 +160,11 @@ def _build(tokens: int):
 
 
 def router_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    # a gfx950 kernel (wave64, 16x16x32 bf16 MFMA), as is the mono MoE whose
+    # summation order it shares
     return (
-        x.dim() == 2
+        get_gfx() == "gfx950"
+        and x.dim() == 2
         and 1 <= x.shape[0] <= MAX_TOKENS
         and x.shape[1] == HIDDEN
         and x.dtype == torch.bfloat16

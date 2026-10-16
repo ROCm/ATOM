@@ -255,3 +255,14 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+@pytest.fixture(autouse=True)
+def mono_runs_on_gfx950(monkeypatch):
+    """Mono's deployment checks see gfx950, the only arch its kernels are built
+    for, so a refusal test asserts on its own condition on any runner (a CPU
+    one has no chip to ask). The arch check itself is tested by patching back.
+    """
+    from atom.mono.runtime import deployment
+
+    monkeypatch.setattr(deployment, "_gfx", lambda: "gfx950")

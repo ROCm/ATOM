@@ -3,8 +3,12 @@
 
 import torch
 from aiter.dist.parallel_state import get_tp_group
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.inverse_rope_group_quant import inverse_rope_group_quant
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+    gemm_a8w8_blockscale_group32,
+)
 from torch import nn
 
 from atom.model_ops.attentions.deepseek_v41.packed_attention import (
@@ -32,6 +36,11 @@ from atom.utils.forward_context import side_stream
 
 from .config import AttentionMode
 from .layers import native_quant_config
+
+# gfx1250 has no preshuffled MXFP8 BMM that reads wo_a's 32x32 weight scales
+# (only 128x128): there wo_a stays row-major and its groups run one at a time
+# through the group32 GEMM, which reads 32x32 scales on every arch.
+_WO_A_PER_GROUP = get_gfx() == "gfx1250"
 
 
 class Indexer(nn.Module):
@@ -255,7 +264,7 @@ class Attention(nn.Module):
             bias=False,
             quant_config=native_quant_config(),
         )
-        self.wo_a.needs_preshuffled_weight = True
+        self.wo_a.needs_preshuffled_weight = not _WO_A_PER_GROUP
         self.wo_b = RowParallelLinear(
             config.o_groups * self.o_rank,
             config.hidden_size,
@@ -318,6 +327,23 @@ class Attention(nn.Module):
             num_groups=self.groups,
             quant_group_size=32,
         )
+        if _WO_A_PER_GROUP:
+            weight = self.wo_a.weight.view(self.groups, self.o_rank, -1)
+            weight_scale = self.wo_a.weight_scale.view(
+                self.groups, self.o_rank // 32, -1
+            )
+            y = torch.empty(
+                rows, self.groups, self.o_rank, dtype=output.dtype, device=output.device
+            )
+            for g in range(self.groups):
+                y[:, g] = gemm_a8w8_blockscale_group32(
+                    x_fp8[:, g].contiguous(),
+                    weight[g],
+                    x_scale[:, g].contiguous(),
+                    weight_scale[g],
+                    dtype=output.dtype,
+                )
+            return self.wo_b(y.view(*output.shape[:-2], -1))
         y = batched_gemm_a8w8_mxscale_bpreshuffle(
             x_fp8,
             self.wo_a.weight.view(self.groups, self.o_rank, -1),
