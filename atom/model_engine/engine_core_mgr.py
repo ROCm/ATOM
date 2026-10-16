@@ -1204,7 +1204,7 @@ class CoreManager:
                     dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
                 )
                 added.append(f"rank{dp_rank}: {len(rank_seqs)} req")
-            except Exception as exc:  # noqa: BLE001 - re-queued, then re-raised
+            except Exception as exc:
                 logger.exception(
                     "%s: backpressure send to rank%d failed; re-queued %d seq(s)",
                     self.label,

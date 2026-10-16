@@ -191,7 +191,7 @@ def test_partial_send_failure_requeues_later_ranks_and_pauses():
     with pytest.raises(RuntimeError, match="send failed rank 1"):
         mgr.add_request(seqs)
     assert mgr._rank_reqs == [1, 0, 1]
-    assert [seq.id for seq in mgr._bp_pending][0] == seqs[1].id
+    assert next(seq.id for seq in mgr._bp_pending) == seqs[1].id
     sent, pending = _accounted(mgr)
     assert sent == [seqs[0].id, seqs[2].id]
     assert sorted(sent + pending) == sorted(seq.id for seq in seqs)
