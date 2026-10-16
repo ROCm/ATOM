@@ -33,6 +33,12 @@ if [[ -z "${atom_origin}" ]] \
   exit 1
 fi
 
+# Use the reviewed aiter fix directly from its pinned source tree.
+scatter_aiter_ref="${ATOMESH_ENV_ATOM_AITER_SCATTER_REF:-${ATOM_AITER_SCATTER_REF:-}}"
+if [[ -n "${scatter_aiter_ref}" ]]; then
+  source "${ATOMESH_SCRIPT_DIR}/prepare_scatter_aiter_source.sh" "${scatter_aiter_ref}"
+fi
+
 MODEL_NAME="${MODEL_NAME:?MODEL_NAME is required}"
 MODEL_PATH="${MODEL_PATH:?MODEL_PATH is required}"
 BACKEND="${BACKEND:-atom}"
@@ -1805,6 +1811,11 @@ start_prefill() {
     export HIP_VISIBLE_DEVICES="${visible_devices}"
   fi
   reset_lmcache_disk
+  if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" \
+    && "${ATOMESH_LMCACHE_HOST_PREPARED:-false}" != "true" ]]; then
+    echo "ERROR: LMCache memory must be prepared on the allocated host before container startup" >&2
+    return 2
+  fi
   start_mooncake_store
   # On the env command line, not exported: decode starts from this same shell.
   local -a prefill_offload_env=()
@@ -2600,14 +2611,14 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" <<'PY'
+    python3 - "${result_dir}" "${eval_conc}" "${EVAL_LIMIT}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 result_dir = Path(sys.argv[1])
 eval_conc = sys.argv[2]
-json_files = list(result_dir.rglob("*.json")) if result_dir.is_dir() else []
+json_files = list(result_dir.rglob("results*.json")) if result_dir.is_dir() else []
 if not json_files:
     print("[eval] ERROR: no result JSON found")
     raise SystemExit(1)
@@ -2623,6 +2634,14 @@ print("=========================================")
 print(f"[eval] concurrent={eval_conc} exact_match,flexible-extract = {score}")
 print("=========================================")
 print(json.dumps(data.get("results", {}), indent=2))
+import math
+if not isinstance(score, (int, float)) or not math.isfinite(score):
+    raise SystemExit("[eval] missing or invalid GSM8K score")
+if not sys.argv[3]:
+    samples = data.get("n-samples", {}).get("gsm8k", {})
+    if samples.get("original") != 1319 or samples.get("effective") != 1319:
+        raise SystemExit(f"[eval] expected all 1319 GSM8K test samples, got {samples}")
+    print("[eval] full GSM8K coverage verified: 1319/1319")
 PY
   done
 

@@ -13,6 +13,7 @@ if [[ -n "${ATOMESH_MESH_BINARY:-}" ]]; then
   exit 0
 fi
 if [[ "${ATOMESH_BUILD_MESH:-false}" != "true" ]]; then
+  echo "[setup] Using image Mesh binary; source build disabled" >&2
   printf '%s\n' /app/ATOM/atom/mesh/target/release/atomesh
   exit 0
 fi
