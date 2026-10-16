@@ -1537,6 +1537,47 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Set PA persistent worker buffers for this ubatch
             if self.block_size in (256, 1024):
                 self._set_ubatch_pa_buffers(running_bs, max_seqlen_q, ub_idx)
+            if self._has_sparse_attention:
+                # On the same terms as the PA buffers above: the TBO decode
+                # graph is captured around `build_ubatch_metadata`, so replay
+                # rebuilds no metadata and the scorer reads whatever these
+                # persistent buffers last held. Refilling here -- after this
+                # ubatch's lengths and block table are published -- is what
+                # keeps the dispatch map on this step's geometry, exactly as
+                # `prepare_decode` does for the non-TBO decode graph.
+                self._build_ubatch_sparse_metadata(ub_idx, running_bs, max_seqlen_q)
+
+    def _build_ubatch_sparse_metadata(self, ubatch_idx, running_bs, max_q_len):
+        """Fill one ubatch's persistent sparse decode buffers from its lengths.
+
+        The returned metadata only wraps those buffers, so a caller that wants
+        the refresh alone can discard it.
+        """
+        if max_q_len > 1:
+            raise NotImplementedError(
+                "MiniMax M3 sparse TBO decode with max_q_len > 1 is not implemented."
+            )
+        from atom.model_ops.minimax_m3.sparse_attn import make_sparse_decode_metadata
+
+        var = self.model_runner.forward_vars
+        p = f"ub{ubatch_idx}_"
+        context_lens = var[f"{p}context_lens"].gpu[:running_bs]
+        block_tables = var[f"{p}block_tables"].gpu[:running_bs]
+        return make_sparse_decode_metadata(
+            seq_lens=context_lens,
+            block_table=self._get_sparse_attention_block_tables(
+                block_tables, context_lens, running_bs
+            ),
+            slot_mapping=var[f"{p}slot_mapping"].gpu[: running_bs * max_q_len],
+            max_seq_len=self.model_runner.config.max_model_len,
+            num_idx_heads=self._num_idx_heads,
+            n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
+            index_score_work_map_out=self._index_score_work_map_buffer(p),
+            index_score_max_block=self._index_score_max_block,
+            index_score_num_idx_heads=self._index_score_num_idx_heads,
+            index_score_cp_world=self._index_score_cp_world,
+            index_score_cp_rank=self._index_score_cp_rank,
+        )
 
     def _set_ubatch_pa_buffers(self, running_bs, max_q_len, ubatch_idx):
         """Compute PA work buffers for a per-ubatch forward_vars set."""
@@ -1601,32 +1642,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
         if self._has_sparse_attention:
-            if max_q_len > 1:
-                raise NotImplementedError(
-                    "MiniMax M3 sparse TBO decode with max_q_len > 1 is not "
-                    "implemented."
-                )
-            from atom.model_ops.minimax_m3.sparse_attn import (
-                make_sparse_decode_metadata,
-            )
-
-            sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn.block_tables,
-                attn.context_lens,
-                running_bs,
-            )
-            attn.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn.context_lens,
-                block_table=sparse_block_tables,
-                slot_mapping=attn.slot_mapping,
-                max_seq_len=attn.max_seqlen_k,
-                num_idx_heads=self._num_idx_heads,
-                n_valid_column_per_row_out=self._n_valid_column_per_row_buffer(p),
-                index_score_work_map_out=self._index_score_work_map_buffer(p),
-                index_score_max_block=self._index_score_max_block,
-                index_score_num_idx_heads=self._index_score_num_idx_heads,
-                index_score_cp_world=self._index_score_cp_world,
-                index_score_cp_rank=self._index_score_cp_rank,
+            attn.sparse_attention_metadata = self._build_ubatch_sparse_metadata(
+                ubatch_idx, running_bs, max_q_len
             )
         return attn
 
