@@ -30,7 +30,10 @@ from atom.config import (
 )
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
-from atom.model_ops.eplb import eplb_map_and_record_fused
+from atom.model_ops.eplb import (
+    eplb_append_shared_and_map,
+    eplb_map_and_record_fused,
+)
 from atom.model_ops.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEConfig,
@@ -613,11 +616,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             routed_scaling_factor=layer.routed_scaling_factor,
         )
         if layer.expert_layout.shared_is_routed:
-            # EPLB places and records shared experts with routed experts.
-            topk_weights, topk_logical = layer.append_shared_logical_column(
-                topk_weights, topk_logical
-            )
-            return topk_weights, eplb_map_and_record_fused(layer, topk_logical)
+            return eplb_append_shared_and_map(layer, topk_weights, topk_logical)
         topk_physical = eplb_map_and_record_fused(layer, topk_logical)
         return layer.to_dispatch_space(topk_weights, topk_physical)
 

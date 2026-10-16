@@ -103,6 +103,36 @@ def test_from_trivial_invariants():
             )
 
 
+@pytest.mark.parametrize("ep_rank", range(4))
+def test_from_trivial_places_shared_expert_once_per_rank(ep_rank):
+    meta = ExpertLocationMetadata.from_trivial(
+        num_layers=2,
+        num_logical_experts=257,
+        num_physical_experts=260,
+        ep_size=4,
+        ep_rank=ep_rank,
+        shared_logical_expert=256,
+    )
+
+    expected = []
+    for rank in range(4):
+        expected.extend(range(rank * 64, (rank + 1) * 64))
+        expected.append(256)
+    assert meta.physical_to_logical_map[0].tolist() == expected
+    assert torch.equal(meta.physical_to_logical_map[0], meta.physical_to_logical_map[1])
+
+    counts = torch.bincount(meta.physical_to_logical_map[0].to(torch.int64))
+    assert counts[:256].tolist() == [1] * 256
+    assert int(counts[256]) == 4
+
+    shared_slots = meta.logical_to_physical_map[0, 256, :4]
+    assert shared_slots.tolist() == [64, 129, 194, 259]
+    assert int(meta.logical_replica_count[0, 256]) == 4
+    assert int(meta.logical_to_rank_dispatch_physical_map[0, 256]) == int(
+        shared_slots[ep_rank]
+    )
+
+
 def test_update_is_inplace_and_correct():
     live = ExpertLocationMetadata.from_trivial(
         num_layers=2,
