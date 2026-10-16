@@ -142,15 +142,53 @@ class K3MonoDecodeRunner:
         )
         first = next(p for p in self.plans if p.mono)
         self.device = first.kda.w_in.device
-        self.state_len = self._state_len(first)
+        self.state_len = self._state_len()
         self._allocate()
 
-    def _state_len(self, plan) -> int:
+    def _state_len(self) -> int:
         """The conv state's window, a build constant: ``CONV_WIDTH - 1`` plus the
-        verify window the KDA state pool was allocated for."""
-        state = self._conv_state(plan.layer_id)
-        self._recurrent_state(plan.layer_id)
-        return state.size(-1)
+        verify window the KDA state pool was allocated for.
+
+        Every mono layer is checked, not just the first. ``_conv_state`` and
+        ``_recurrent_state`` are the only validation the KDA state pools get,
+        and everything they refuse -- the channel axis, the conv dtype, the
+        recurrent dtype, the window -- is a static property of a pool, the
+        same on every step. So it belongs here, where an unsupported layer
+        refuses the WHOLE runner and ``LazyRunner`` serves the width on the
+        production path, with no mono kernel launched at all.
+
+        Neither way of catching it later works:
+
+        * Catching outside ``MonoDecodeModel.forward`` and replaying the step
+          on the production path double-advances state. ``_conv_state`` /
+          ``_recurrent_state`` hand back the KV cache itself
+          (``cache.k_cache`` / ``cache.v_cache``) and ``_k1`` steps the conv
+          window and the recurrence IN PLACE, so layers ``0 .. N-1`` have
+          already advanced when layer N raises. The replay steps them twice:
+          a crash traded for silent corruption.
+        * Falling back layer by layer deadlocks. These criteria are read
+          per-rank off that rank's own KV cache, and the kernels wait
+          in-kernel on every peer (``dispatch.py``'s module docstring), so one
+          rank dropping to production at layer N leaves its peers waiting on
+          it for ever -- a crash traded for a hang, which is worse to debug.
+          Making it safe would need a collective vote per layer per step,
+          which is the overhead mono exists to remove.
+
+        Build time has that vote for free: ``bind_agreed`` turns this rank's
+        ``MonoUnsupported`` into a ``tp_agree(False)`` every peer follows.
+        """
+        lens = set()
+        for plan in self.plans:
+            if not plan.mono:
+                continue
+            lens.add(self._conv_state(plan.layer_id).size(-1))
+            self._recurrent_state(plan.layer_id)
+        if len(lens) != 1:
+            raise MonoUnsupported(
+                f"mono layers disagree on the conv window: {sorted(lens)}; "
+                "`state_len` is one build constant for all of them"
+            )
+        return lens.pop()
 
     def _recurrent_state(self, layer_id: int) -> torch.Tensor:
         """The layer's KDA recurrent state, checked.
