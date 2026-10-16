@@ -782,7 +782,7 @@ class EngineArgs:
                 '  - "load_window_size": int, non-dummy forwards accumulated '
                 "for EPLB load stats.\n"
                 '  - "rebalance_interval": int, forward-pass interval for '
-                "EPLB rebalance gating.\n"
+                "prefill-side EPLB rebalance; 0 disables it.\n"
                 '  - "rebalance_layers_per_chunk": int, MoE layers migrated '
                 "per EPLB rebalance chunk.\n"
                 '  - "num_redundant_experts": int, extra physical expert '
@@ -796,6 +796,11 @@ class EngineArgs:
                 '  - "placement_policy": "naive"|"biased", how to spend the '
                 "redundant budget: 'naive' (spread) or 'biased' (fully "
                 "replicate top-K hottest experts to all GPUs).\n"
+                '  - "decode_rebalance_interval": int, pure-decode steps '
+                "between decode expert swaps; 0 (default) disables it. "
+                "Tuned by decode_max_swaps_per_layer, decode_min_swap_gain, "
+                "decode_min_layer_balancedness, decode_max_rebalances, "
+                "decode_swap_policy.\n"
                 "Example:\n"
                 """  '{"num_redundant_experts": 8, "placement_policy": """
                 """"biased"}'"""
