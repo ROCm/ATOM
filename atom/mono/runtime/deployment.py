@@ -58,8 +58,12 @@ def _takes_weight_updates(atom_config) -> bool:
 
 
 def common_refusals(
-    atom_config, dims, supported_tp, *, piecewise_cudagraph_required: bool = True,
-    allow_expert_parallel: bool = False
+    atom_config,
+    dims,
+    supported_tp,
+    *,
+    piecewise_cudagraph_required: bool = True,
+    allow_expert_parallel: bool = False,
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``;

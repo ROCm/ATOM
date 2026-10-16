@@ -31,6 +31,7 @@ from atom.utils.debug_helper.compare import (
 )
 from atom.utils.debug_helper.dump import (
     install_block_forward_hooks,
+    maybe_dump_forward_outputs,
     maybe_dump_weights_and_exit,
     maybe_log_topk,
 )
@@ -41,24 +42,22 @@ from atom.utils.debug_helper.ref_patch import (
 )
 
 __all__ = [
-    # dump
-    "install_block_forward_hooks",
-    "maybe_dump_weights_and_exit",
-    "maybe_log_topk",
-    # compare primitives
+    "COS_ALGO_DIFF",
+    "COS_BIT_EQUAL",
+    "COS_BUG",
+    "COS_NUM_DRIFT",
+    "byte_equal_pct",
+    "compare_slots",
     "cos_max",
     "flag_for",
-    "byte_equal_pct",
-    "slot_split",
-    "compare_slots",
+    "install_block_forward_hooks",
+    "maybe_dump_forward_outputs",
+    "maybe_dump_weights_and_exit",
+    "maybe_log_topk",
+    "patch_block_forward",
+    "patch_method",
+    "patch_module_dump",
     "pick_prefill_call",
     "schema_diff",
-    "COS_BIT_EQUAL",
-    "COS_NUM_DRIFT",
-    "COS_ALGO_DIFF",
-    "COS_BUG",
-    # ref patching
-    "patch_method",
-    "patch_block_forward",
-    "patch_module_dump",
+    "slot_split",
 ]
