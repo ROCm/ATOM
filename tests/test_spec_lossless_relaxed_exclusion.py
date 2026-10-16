@@ -15,6 +15,10 @@ worker, long after the server had booted and armed.
 
 import pytest
 
+# dspark_proposer imports triton at module scope, which the non-GPU CI job does
+# not install; without this the whole module is a collection ERROR there.
+pytest.importorskip("triton")
+
 from atom.spec_decode.dspark_proposer import DSparkProposer
 
 
