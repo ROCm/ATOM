@@ -954,6 +954,12 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
 
+        builder = getattr(self.runner, "attn_metadata_builder", None)
+        if getattr(builder, "use_shuffled_asm", False):
+            # Shuffled ASM consumes the token CSR already built above,
+            # including safe synthetic padding rows that read physical page 0.
+            return
+
         # Build persistent (ps=1) MLA-decode metadata
         from atom.model_ops.attentions.aiter_mla import get_mla_metadata_v1
 

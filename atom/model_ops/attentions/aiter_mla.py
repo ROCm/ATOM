@@ -48,6 +48,7 @@ from atom.model_ops.attention_mla import (
     MLAAttention,
     mla_dcp_kernel_num_heads,
     mla_dcp_sparse_prefill_num_heads,
+    shuffled_asm_supported,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -427,6 +428,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         self.dcp_world_size = get_dcp_world_size()
         self.dcp_rank = get_dcp_rank()
+        self.use_shuffled_asm = (
+            self.kv_shuffled
+            and not envs.ATOM_USE_TRITON_MLA
+            and not self.is_sparse
+            and self.dcp_world_size == 1
+            and shuffled_asm_supported(
+                self.padded_num_attention_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                config.torch_dtype,
+                hf_config.kv_lora_rank,
+                hf_config.qk_rope_head_dim,
+                model_runner.block_size,
+            )
+        )
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
         # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
@@ -2688,7 +2704,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 )
                 var["dcp_local_context_lens"].np[scheduled_tokens:running_tokens] = 0
             num_blocks_per_seq = cdiv(local_context_lens, self.block_size)
-        elif any(batch.is_first_decode_without_local_prefill):
+        elif self.block_size != 1 and any(batch.is_first_decode_without_local_prefill):
+            # A remote block table counts physical pages. Token-unit metadata
+            # must use the rejection-adjusted context lengths below instead.
             num_blocks_per_seq = [
                 (
                     len(batch.block_tables[i])
@@ -3040,6 +3058,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self, running_bs, max_q_len, ubatch_idx, is_cp_round_robin=False
     ):
         """Compute MLA work buffers for a per-ubatch forward_vars set."""
+        if self.kv_shuffled:
+            return
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
 
