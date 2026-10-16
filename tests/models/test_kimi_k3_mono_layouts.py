@@ -123,3 +123,20 @@ def test_shuffled_scale_is_still_inverse_permuted():
     )
     got = _mxfp4_to_bf16(module, "w_up", (GATE_ROWS, GATE_COLS))
     assert torch.equal(got, _reference(packed, scale))
+
+
+def test_a_bound_band_does_not_retain_the_whole_plane():
+    """A row `narrow` of a row-major tensor is already contiguous, so
+    `.contiguous()` returns the same view and the full dequantized plane stays
+    alive behind it. K3 binds one TP band per rank out of a 49 MiB temporary;
+    holding the temporary costs ~43 MiB a layer a rank, which runs the lazy
+    bind out of memory and silently drops mono back to the production path."""
+    plane = torch.arange(256 * 64, dtype=torch.bfloat16).reshape(256, 64)
+    band = plane.narrow(0, 64, 64)
+    assert band.is_contiguous() and band.contiguous() is band
+
+    bound = band.clone()
+    assert torch.equal(bound, band)
+    assert bound.is_contiguous()
+    assert bound.untyped_storage().nbytes() == band.numel() * band.element_size()
+    assert bound.untyped_storage().nbytes() < plane.untyped_storage().nbytes()

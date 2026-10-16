@@ -342,7 +342,14 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
     w13, s13, w2, s2 = _experts(moe, layer_id, dims)
     # the up-projection is replicated in the model; the kernel's stage computes
     # this rank's row band of it and the ranks' bands are summed into the
-    # layer's output, so only the band is bound
+    # layer's output, so only the band is bound.
+    #
+    # `.clone()`, not `.contiguous()`: a row `narrow` of a row-major tensor is
+    # already contiguous, so `contiguous()` hands back the SAME view and the
+    # whole dequantized 7168x3584 plane stays referenced by it -- 49 MiB held
+    # per layer per rank to keep the 6.1 MiB band, which is memory the lazy
+    # bind does not have and so turns mono off. `_mxfp4_to_bf16` returns a
+    # fresh contiguous tensor, so cloning the band copies once and frees it.
     w_up = _mxfp4_to_bf16(
         moe.routed_expert_up_proj, f"{name} routed_expert_up_proj", (HIDDEN, LATENT)
     )
@@ -360,7 +367,7 @@ def bind_moe(layer, layer_id: int, dims: Dims, rank: int) -> MoeLayer:
             (LATENT, HIDDEN),
         ),
         ln_w=_vec(moe.routed_expert_norm.weight, LATENT, f"{name} routed_expert_norm"),
-        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).contiguous(),
+        w_up=w_up.narrow(0, rank * dims.up_n, dims.up_n).clone(),
         w_sgu=_plain_bf16(
             moe.shared_experts.gate_up_proj,
             f"{name} shared gate_up_proj",
