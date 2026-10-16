@@ -461,8 +461,12 @@ EOF
   # unbounded container output on shared NFS, not in the scheduler response.
   echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
   set +e
-  docker "${docker_args[@]}" > "${rank_dir}/${container_log}" 2>&1
-  docker_rc=$?
+  docker "${docker_args[@]}" 2>&1 \
+    | python3 "${REPO_ROOT}/.github/scripts/atomesh/cap_log.py" \
+      "${rank_dir}/${container_log}" \
+      "${ATOMESH_CONTAINER_LOG_MAX_BYTES:-8589934592}" \
+      "${container}"
+  docker_rc="${PIPESTATUS[0]}"
   set -e
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
