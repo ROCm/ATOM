@@ -1,0 +1,166 @@
+diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 818d06a..26dba76 100644
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -127,6 +127,24 @@ def all_null_chunk_masks(
+     return masks
+ 
+ 
++def _completion_handle(event_backend: Any, event: Any, device: Any) -> bytes:
++    """Return the IPC handle a client waits on for this transfer.
++
++    On HIP the engine worker cannot reliably open the server's interprocess
++    event: on gfx1250 with ROCm 10.1, ``hipIpcOpenEventHandle`` in the worker
++    returned ``hipErrorInvalidValue`` or spun in its main thread. So the server
++    waits for its own transfer here and returns no event; the client then takes
++    the reply itself as the transfer's completion.
++    """
++    # Third Party
++    import torch
++
++    if getattr(torch.version, "hip", None):
++        event_backend.synchronize_event(event, device)
++        return b""
++    return event_backend.export_event(event, device)
++
++
+ @dataclass
+ class ContextEntry:
+     """Registered cache context metadata for a single worker instance.
+@@ -626,7 +644,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                     blocks_per_chunk,
+                 )
+                 event_backend.record_event(event, cache_context.stream)
+-                return event_backend.export_event(event, cache_context.device), False
++                return _completion_handle(event_backend, event, cache_context.device), False
+ 
+             # Chunks whose block ids are all the null block (e.g. align-mode
+             # Mamba chunks holding no real state) carry no valid KV and must not
+@@ -645,10 +663,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 cache_context, gpu_block_ids
+             )
+ 
+-            producer_event = event_backend.import_event(
+-                event_ipc_handle, cache_context.device
+-            )
+-            event_backend.wait_event(producer_event, cache_context.stream)
++            if event_ipc_handle:
++                producer_event = event_backend.import_event(
++                    event_ipc_handle, cache_context.device
++                )
++                event_backend.wait_event(producer_event, cache_context.stream)
+ 
+             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
+             # Must be published via publish() (not publish_on_stream) so the
+@@ -772,7 +791,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 ed - st,
+             )
+         return (
+-            event_backend.export_event(event, cache_context.device),
++            _completion_handle(event_backend, event, cache_context.device),
+             store_succeeded,
+         )
+ 
+@@ -906,16 +925,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                     blocks_per_chunk,
+                 )
+                 event_backend.record_event(event, cache_context.stream)
+-                return event_backend.export_event(event, cache_context.device), False
++                return _completion_handle(event_backend, event, cache_context.device), False
+ 
+             # Cut and stage all block_ids to GPU once before the transfer
+             block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                 cache_context, gpu_block_ids
+             )
+-            producer_event = event_backend.import_event(
+-                event_ipc_handle, cache_context.device
+-            )
+-            event_backend.wait_event(producer_event, cache_context.stream)
++            if event_ipc_handle:
++                producer_event = event_backend.import_event(
++                    event_ipc_handle, cache_context.device
++                )
++                event_backend.wait_event(producer_event, cache_context.stream)
+ 
+             # Per object group, the prefetch only locked the in-window suffix
+             # (the last ``num_chunks_in_sw`` chunks; the whole prefix for full
+@@ -1022,7 +1042,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             )
+ 
+         return (
+-            event_backend.export_event(event, cache_context.device),
++            _completion_handle(event_backend, event, cache_context.device),
+             retrieve_succeeded,
+         )
+ 
+diff --git a/lmcache/v1/multiprocess/transfer_context/worker_transfer.py b/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
+index 1033729..303b2e6 100644
+--- a/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
++++ b/lmcache/v1/multiprocess/transfer_context/worker_transfer.py
+@@ -206,6 +206,19 @@ def _get_kv_device(kv_caches: dict[str, torch.Tensor]) -> torch.device:
+     return get_device(next(iter(kv_caches.values())))
+ 
+ 
++def _producer_handle(event_backend: Any, event: Any, device: Any) -> bytes:
++    """IPC handle of the engine's producer event for the server to wait on.
++
++    On HIP an interprocess event cannot be relied on (``hipIpcOpenEventHandle``
++    failed or spun on gfx1250 with ROCm 10.1), so the worker waits for its
++    producer event here and sends none; the server then has nothing to wait on.
++    """
++    if getattr(torch.version, "hip", None):
++        event_backend.synchronize_event(event, device)
++        return b""
++    return event_backend.export_event(event, device)
++
++
+ class TransferContext(ABC):
+     """Abstract transport layer for worker-side KV transfer.
+ 
+@@ -641,7 +654,7 @@ class LMCacheDrivenTransferContext(TransferContext):
+             )
+         if event is None:
+             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
+-        event_ipc_handle = self._event_backend.export_event(event, self._device)
++        event_ipc_handle = _producer_handle(self._event_backend, event, self._device)
+         future = self._req_client.store(
+             key, self._instance_id, block_ids, event_ipc_handle
+         ).to_device_future(
+@@ -669,7 +682,7 @@ class LMCacheDrivenTransferContext(TransferContext):
+                 "LMCache-driven transfer context is not registered. "
+                 "Call register() before submit_q_store()."
+             )
+-        event_ipc_handle = self._event_backend.export_event(event, self._device)
++        event_ipc_handle = _producer_handle(self._event_backend, event, self._device)
+         return self._req_client.store_q(
+             key, self._instance_id, block_ids, event_ipc_handle
+         ).to_device_future(
+@@ -713,7 +726,7 @@ class LMCacheDrivenTransferContext(TransferContext):
+             )
+         if event is None:
+             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
+-        event_ipc_handle = self._event_backend.export_event(event, self._device)
++        event_ipc_handle = _producer_handle(self._event_backend, event, self._device)
+         return self._req_client.retrieve(
+             key,
+             self._instance_id,
+diff --git a/lmcache/v1/platform/devices/cuda/cache_context.py b/lmcache/v1/platform/devices/cuda/cache_context.py
+index ab5a348..3f47a07 100644
+--- a/lmcache/v1/platform/devices/cuda/cache_context.py
++++ b/lmcache/v1/platform/devices/cuda/cache_context.py
+@@ -411,10 +411,13 @@ class GPUCacheContext(BaseCacheContext):
+         if full_sw_kv:
+             kv_layer_groups_manager.enable_full_sw_kv()
+ 
+-        # Pre-allocated GPU buffer for block IDs (up to 1M elements).
++        # Pre-allocated GPU buffer for block IDs (up to 32M elements, 256 MiB).
+         # The caller copies block_ids into this buffer before launching the
+         # block-level kernel. Single-thread assumption: no lock needed.
+-        _MAX_BLOCK_IDS = 1 << 20
++        # A native-state transfer sends one ID per chunk for every group, and
++        # Kimi-K3 at block 16 has 2033 groups (PAGE plus one per unit of its
++        # 2032-unit KDA image): 1M covers only ~8k tokens at chunk 16.
++        _MAX_BLOCK_IDS = 1 << 25
+         block_ids_buffer = torch.empty(
+             _MAX_BLOCK_IDS, dtype=torch.long, device=self.device_
+         )

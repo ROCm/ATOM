@@ -26,6 +26,7 @@ figures are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`.
 | Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
+| KV offload (LMCache MP) | Built for gfx1250; stores and loads on both trays with the 20261016 image (2026-10-16). Concurrency 64 not measured yet. See [KV offload](#kv-offload-with-lmcache-mp) |
 
 Contents:
 
@@ -36,6 +37,7 @@ Contents:
 - [Launch](#launch-dp8ep8)
 - [Accuracy](#accuracy-gate-and-gsm8k)
 - [Agentic](#agentic-agentx)
+- [KV offload (LMCache MP)](#kv-offload-with-lmcache-mp)
 - [Known issues](#known-issues)
 
 ---
@@ -740,7 +742,8 @@ points, also below.
 **At 64 the KV pool is full** (92% on average, 98% at p90, on every rank) and 501 KDA state checkpoints were
 evicted in the 30 min, against 110 at 32 and 5 at 16. The prefix cache hit falls to 78.8% of the 95.3% the traces allow, so
 about 78% of the prefill was recomputing evicted prefixes, and throughput falls below concurrency 32's.
-`--state-checkpoint-interval-tokens -1` (now in the launch, not in these runs) targets the checkpoints.
+`--state-checkpoint-interval-tokens -1` (now in the launch, not in these runs) targets the checkpoints, and
+[LMCache MP](#kv-offload-with-lmcache-mp) adds a CPU tier for evicted prefixes.
 
 #### Reference: ATOM on MI355X, from InferenceX (2026-10-15)
 
@@ -804,6 +807,161 @@ Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`
 
 ---
 
+## KV offload with LMCache MP
+
+At concurrency 64 the KV pool is full and evicted prefixes are prefilled again
+([concurrency 64](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)). LMCache's multiprocess (MP) mode adds a
+CPU tier below the HBM prefix cache: an evicted prefix comes back from host memory instead of being recomputed.
+
+**Status, 2026-10-16:** it builds and runs on the 20261016 image, and both trays store and load (the functional check
+below, and under AgentX load). Concurrency 64 with and without it is **not measured yet**; see
+[Status at concurrency 64](#status-at-concurrency-64).
+
+- **One LMCache server per tray.** It owns the CPU pool (L1), and the four DP ranks
+  of its tray connect to it at `127.0.0.1:5555` through ATOM's `lmcache_mp`
+  connector. A rank registers its KV pool with the server through GPU IPC, and the
+  server copies between HBM and its pool itself (`lmcache_driven`).
+- **KV and KDA state move together.** K3 keeps its KDA checkpoint images in MLA
+  PAGE units, and the connector stores and restores the MLA KV of a prefix together
+  with the image at its end (`LMCache MP native state registered … images=True`).
+- **A prefix is reusable on the tray that stored it.** The two servers share
+  nothing. `ATOM_DP_SESSION_AFFINITY=1`, which AgentX mode sets, keeps every turn
+  of a session on its first DP rank, so the session finds its prefix there again.
+
+On top of the image this needs:
+
+| | what | why |
+|---|---|---|
+| LMCache | built from source at `f22dec28` (the commit ATOM `main` pins) for gfx1250, with [`lmcache-f22dec28-gfx1250.diff`](Kimi-K3-455-wideEP-patches/lmcache-f22dec28-gfx1250.diff) | ATOM's LMCache wheel is built for ROCm 7.2.4, torch 2.10 and gfx942/gfx950, and does not load in this image. See the patch notes below |
+| ATOM | [`atom-lmcache-mp-multinode.diff`](Kimi-K3-455-wideEP-patches/atom-lmcache-mp-multinode.diff), from branch [`zejun/lmcache-mp-multinode-dp`](https://github.com/ROCm/ATOM/tree/zejun/lmcache-mp-multinode-dp) | ATOM refuses `lmcache_mp` under multi-node DP (`lmcache_mp supports DP and DP-attention only within one host`). The patch accepts it when the server address is loopback, which means one server per tray |
+| `--block-size 128` | instead of 16 | MP stores and restores at chunk boundaries that hold a checkpoint, and AgentX turns resume at prompt-end checkpoints, which sit on the prefix hash block. So the chunk must equal the block. At block 16 a KDA image is 2032 units, and every transfer carries chunks × 2033 block IDs: stores ran at about 23k tokens/s, and prompts over about 264k tokens did not fit at all. At block 128 an image is 254 units, and a store runs at about 1M tokens/s |
+| `--gpu-memory-utilization 0.88` | instead of 0.90 | the server takes about 2 GB of each GPU after ATOM has sized its budget. At 0.90 a GPU reached 431 of 432 GB, and a Triton kernel then failed to load (`device kernel image is invalid`) |
+
+### Installing LMCache
+
+In each tray's container, with network access (validated in a fresh container of the image, 2026-10-16):
+
+```bash
+cd /tmp && git clone -q https://github.com/LMCache/LMCache.git && cd LMCache
+git checkout -q f22dec2832124ea4ffeb464553b819a6369d4a30
+B=https://raw.githubusercontent.com/ROCm/ATOM/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP-patches
+curl -sSfL $B/lmcache-f22dec28-gfx1250.diff | git apply
+# Build-only Python packages, kept out of the image's site-packages (the image has protobuf 7 and setuptools 84).
+python3 -m pip install -q --break-system-packages --no-deps --target /tmp/bdeps \
+  'grpcio-tools==1.78.0' 'grpcio==1.78.0' 'protobuf>=6.31.1,<7' 'setuptools>=77.0.3,<81' 'setuptools_scm>=8,<9' wheel
+# TheRock's _rocm_sdk_core (the image's ROCM_PATH) has no unversioned libamdhip64.so; _rocm_sdk_devel has it.
+R=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel
+PYTHONPATH=/tmp/bdeps ROCM_PATH=$R HIP_PATH=$R ROCM_HOME=$R PATH=$R/bin:$PATH \
+  BUILD_WITH_HIP=1 CXX=hipcc PYTORCH_ROCM_ARCH=gfx1250 MAX_JOBS=32 \
+  SETUPTOOLS_SCM_PRETEND_VERSION=0.5.6.dev139+gf22dec28.rocm10.1.torch2.11.gfx1250 \
+  python3 setup.py bdist_wheel --dist-dir=/tmp/lmcache-wheel        # about 35 s
+# Runtime packages the MP server and ATOM's adapter import; --no-deps keeps the image's torch and numpy.
+python3 -m pip install -q --break-system-packages --no-deps \
+  blake3 sortedcontainers aiofile caio cachetools py-cpuinfo fastrlock cupy-rocm-7-0 nvtx numba llvmlite \
+  cryptography cffi pycparser opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
+  opentelemetry-semantic-conventions==0.61b0 opentelemetry-exporter-prometheus==0.61b0
+python3 -m pip install -q --break-system-packages --no-deps /tmp/lmcache-wheel/lmcache-*.whl
+cd /app/ATOM && curl -sSfL $B/atom-lmcache-mp-multinode.diff | git apply
+cd /tmp && python3 -c "import lmcache.v1.multiprocess.server, lmcache.cuda_ops; from lmcache.integration.atom import AtomMPWorkerAdapter; print('ok')"
+```
+
+The wheel is not tied to a tray: build it once and install the same file on the other tray.
+
+The LMCache patch:
+
+- **No interprocess events on HIP, in either direction.** In `lmcache_driven` mode the
+  server returns a completion event, and the worker opens it with
+  `hipIpcOpenEventHandle` on its main thread. On gfx1250 that call returned
+  `hipErrorInvalidValue` or spun, and the DP rank it spun on held up the other seven
+  at their next all-gather: the whole server stopped. With the patch the server waits
+  for its own copy and replies without an event, and the worker waits for its
+  producer event before it submits and sends none. Both apply only when
+  `torch.version.hip` is set.
+- **A 32M-entry block-ID buffer** instead of 1M per GPU. Each transfer carries
+  chunks × (KDA image units + 1) block IDs, and the longest AgentX prompts (740k
+  tokens) need 1.5M at block 128.
+
+### Launch
+
+Start the server in each tray's container before ATOM, and leave it running across ATOM restarts:
+
+```bash
+python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port 5555 \
+  --chunk-size 128 --null-block-id -1 --separate-object-groups \
+  --supported-transfer-mode lmcache_driven --l1-size-gb 400 --l1-use-lazy \
+  --l1-read-ttl-seconds 900 --eviction-policy LRU --eviction-trigger-watermark 0.98 \
+  > /logs/lmcache_server.log 2>&1 &
+```
+
+- `--l1-size-gb` is pinned host memory, all of it: `--l1-use-lazy` pins 20 GB at start
+  and the rest in the background, at about 6 GB/s. A tray has 2015 GiB, and the
+  checkpoint takes 1454 GiB of page cache while ATOM loads. 400 GB leaves the
+  checkpoint cached; a larger pool works, but every restart then reads part of the
+  checkpoint from disk again.
+- The server's metrics are on `:9090/metrics` (`lmcache_mp_l1_memory_usage_bytes`,
+  `lmcache_mp_lookup_hit_tokens_total`).
+
+Then the AgentX launch with these differences:
+
+```bash
+export ATOM_KV_OFFLOAD=lmcache_mp
+export ATOM_KV_OFFLOAD_EXTRA_CONFIG='{"lmcache.mp.host": "tcp://127.0.0.1", "lmcache.mp.port": 5555}'
+export LMCACHE_CHUNK_SIZE=128          # must equal the server's --chunk-size
+# MODE_ARGS as in AgentX mode, with --block-size 128 and 0.88:
+# MODE_ARGS=(--max-num-batched-tokens 16384 --gpu-memory-utilization 0.88 --enable_prefix_caching \
+#            --state-checkpoint-interval-tokens -1 --block-size 128)
+```
+
+Check each tray's ATOM log for four lines like:
+
+```text
+LMCache MP native state registered rank=0 images=True native_image=449372160 units=254 groups=255 chunk=128
+```
+
+While it runs, `/metrics` on node0 counts both trays' transfers: `atom:lmcache_save_requests_total`,
+`atom:lmcache_saved_tokens_total`, `atom:lmcache_load_requests_total`, `atom:lmcache_loaded_tokens_total` and
+`atom:lmcache_load_failures_total`. Each server logs `Stored N tokens in T seconds` and `Retrieved N tokens in T
+seconds`, and each rank's `[Cache Tiers]` line splits its prefix reuse into HBM-served and LMCache-served.
+
+**Functional check, 2026-10-16, CT7 + CT15.** Two prompts of about 22k tokens, one per tray (the session IDs
+`lmc-func-0` and `lmc-func-4` land on DP ranks 0 and 4). Saved, then ATOM alone restarted (servers kept, HBM empty),
+then sent again:
+
+| | saves | loads | tokens | latency of the first prompt |
+|---|---|---|---|---|
+| first pass | 2 | 0 | 44,160 saved | 8.8 s, computed |
+| after the restart | 0 | 2 | 44,160 loaded | 2.3 s, loaded |
+
+Each server's L1 grew by the prompt's KV (13,824 bytes per token) plus one KDA image (about 449 MB). A store of
+21,504 tokens took 0.029 s, a load 0.013–0.027 s.
+
+### Status at concurrency 64
+
+No run has finished yet. The attempts on CT7 (node0) + CT15, with this launch plus `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`
+and `--max-num-seqs 16`, showed:
+
+- **Offload under load.** In the longest attempt the two servers stored 1,061 prefixes (29.2M tokens) in the first
+  31 min (26 min of warm-up, then profiling), and their pools reached 401 and 360 GB of 429 GB. A store ran at about
+  1M tokens/s.
+- **Loads once HBM fills.** With `--state-checkpoint-interval-tokens -1` the HBM pool fills slowly: the first loads
+  came 4 min into the profiling window, 6 loads of 295,424 tokens in all, 0 failures, the largest 117k tokens in 55 ms.
+- **Then the trays.** At 31 min a GPU on CT7 wedged (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE`), with NUMA
+  balancing on, as a plain driver load leaves it. The next two attempts, with it off, ended during the weight load,
+  when a tray went down with a host CPU fatal error.
+
+Next: concurrency 64 with LMCache against the [AgentX launch](#agentic-agentx) without it, on stable trays.
+
+### Notes
+
+- **Restarts.** Stop ATOM before the server. A server killed while a transfer is in flight holds that rank's
+  memory until it exits. When restarting the server, wait for the old process to free ports 5555 and 9090: a new
+  server that cannot bind 9090 exits at once.
+- **A rank stuck in a HIP IPC call.** Killing it wedged its GPU (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE`),
+  and every later start stopped at `load RCCL version` until the tray was rebooted. The LMCache patch removes the
+  call.
+
+---
+
 
 ## Known issues
 
@@ -832,5 +990,6 @@ Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`
 | perf_setup says mode D, but `mtype_local` / `noretry` read `-1` | `amdgpu` was loaded before it ran. Reboot, then perf_setup first |
 | Engines `<defunct>`, kfd list never drains, `MES … REMOVE_QUEUE` in dmesg | GPU wedged (`gpu_recovery=0` keeps it so). BMC `ForceRestart`, then perf_setup |
 | A tray drops out; next boot's BERT says `event severity: fatal`, `Perr: CPU0` | Host CPU fatal error, not the engine |
+| Killing the ranks left on the other tray logs `LSDMA PIO failed to copy memory` and `EXP-CLEANUP: NPA-REVOKE send failed to remote:N` | The driver cannot revoke its mappings on the tray that went down. Expected; the rack's mes-monitor raises an alert for these lines |
 | helicop FAILs `0x??` / `I2C read failed (bus 4, dev 0x20)` | Expected on this BMC firmware. Check Redfish `PowerState` and `boot_id` |
 | Log looks frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
