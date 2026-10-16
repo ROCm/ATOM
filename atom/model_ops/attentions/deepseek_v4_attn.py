@@ -3747,10 +3747,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ranges mean the same thing in each.
         """
         src = cast(AttentionMetaData_DSV4, attn_metadata)
-        assert src.prefill_attn_metadata is not None, (
-            "pure-prefill ubatch of a mixed batch needs the parent's prefill "
-            "segment metadata"
-        )
+        if src.prefill_attn_metadata is None:
+            raise RuntimeError(
+                "pure-prefill ubatch of a mixed batch needs the parent's "
+                "prefill segment metadata"
+            )
         from atom.utils.tbo.ubatch_splitting import UBatchSlice
 
         rs = ub_slice.request_slice
@@ -3818,18 +3819,24 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ub_dec_tokens = (ts.stop - ts.start) - ub_pref_tokens
         ub_dec_seqs = (rs.stop - rs.start) - ub_pref_seqs
 
-        assert (
-            src.prefill_attn_metadata is not None
-        ), "mixed ubatch rebuild needs the parent's prefill segment metadata"
-        assert (
-            src.decode_attn_metadata is not None
-        ), "mixed ubatch rebuild needs the parent's decode segment metadata"
+        # `raise`, not `assert`: these hold the ubatch's slices inside the
+        # parent's, and `python -O` would let a bad split truncate silently.
+        if src.prefill_attn_metadata is None or src.decode_attn_metadata is None:
+            raise RuntimeError(
+                "mixed ubatch rebuild needs the parent's prefill and decode "
+                "segment metadata"
+            )
         # The gate in split_mixed_token_midpoint should make both true.
-        assert ub_pref_tokens > 0 and ub_dec_tokens > 0, (
-            f"ubatch is not mixed: {ub_pref_tokens} prefill + {ub_dec_tokens} "
-            "decode tokens"
-        )
-        assert ts.stop <= src.num_prefill_tokens + src.num_decode_tokens
+        if ub_pref_tokens <= 0 or ub_dec_tokens <= 0:
+            raise RuntimeError(
+                f"ubatch is not mixed: {ub_pref_tokens} prefill + "
+                f"{ub_dec_tokens} decode tokens"
+            )
+        if ts.stop > src.num_prefill_tokens + src.num_decode_tokens:
+            raise RuntimeError(
+                f"ubatch token slice ends at {ts.stop}, past the parent's "
+                f"{src.num_prefill_tokens} + {src.num_decode_tokens} tokens"
+            )
 
         # ---- prefill tail, in the PARENT's prefill coordinates ----
         # Prefill rows lead in both the merged axis and the prefill-only axis,

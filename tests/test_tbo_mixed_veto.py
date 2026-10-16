@@ -20,6 +20,18 @@ import pytest
 from atom.utils.tbo.ubatching import local_tbo_precompute
 
 
+@pytest.fixture(autouse=True)
+def _veto_environment(monkeypatch):
+    """Pin the settings these cases assume instead of inheriting the caller's.
+
+    The veto is the ATOM_TBO_MIXED=0 contract -- with it on, a mixed batch goes
+    to the mixed split instead -- and the CI benchmark env sets it to 1. The
+    min-token bar is pinned at its default so `_PREFILL_TOKENS` clears it.
+    """
+    monkeypatch.setenv("ATOM_TBO_MIXED", "0")
+    monkeypatch.setenv("ATOM_TBO_PREFILL_MIN_TOKENS", "8192")
+
+
 class _Config:
     def __init__(self, enable_tbo=True, enable_tbo_decode=True):
         self.enable_tbo = enable_tbo
