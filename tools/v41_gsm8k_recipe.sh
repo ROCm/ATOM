@@ -12,7 +12,9 @@ TREE=${TREE:-/workspace/ATOM-dsv41-nolmc}
 MODEL=${MODEL:-/data/amd_int/models/DeepSeek-V4.1-Flash}
 NAME=DeepSeek-V4.1-Flash
 PORT=${PORT:-8011}
-OUT=${OUT:-$TREE/.gsm8k_$(date +%m%d_%H%M)}
+# Outside the tree by default. Writing run artefacts into $TREE is how two
+# `.gsm8k_*` fingerprint directories ended up committed.
+OUT=${OUT:-/tmp/v41_gsm8k_$(date +%m%d_%H%M)}
 mkdir -p "$OUT"
 
 # --- what is under test -------------------------------------------------
