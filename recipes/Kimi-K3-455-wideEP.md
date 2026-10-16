@@ -712,6 +712,12 @@ Neither is aiperf's own per-user p90.
 
 ### Results
 
+![Kimi-K3 AgentX throughput per GPU vs P90 interactivity: MI455 dp8ep8 on 2026-10-11 and 2026-10-16, ATOM on MI355X on 2026-10-15](Kimi-K3-455-wideEP-AgentX.png)
+
+P90 interactivity is 1 / p90(ITL); points are labelled with their concurrency. MI455: the 2026-10-16 points and the
+2026-10-11 sweep below (its concurrency 8 failed aiperf's coverage check and is left out). MI355X: ATOM's InferenceX
+points, also below.
+
 #### 2026-10-16: the 20261014 image, concurrency 16, 32 and 64
 
 - **Image:** the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`, plus K3's grouped-MoE tuning rows that
