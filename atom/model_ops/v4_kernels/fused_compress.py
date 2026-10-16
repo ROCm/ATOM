@@ -75,13 +75,6 @@ except Exception:  # noqa: BLE001 - an optional kernel probe, not an error path
     flydsl_fused_compress_attn = None
     flydsl_hca_compress_attn = None
 
-
-def _is_gfx1250() -> bool:
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime() == "gfx1250"
-
-
 # Supported (head_dim, rope_head_dim, ratio, overlap) tuples for the flydsl
 # kernel — matches V4-Pro Main (D=512) and Indexer-inner (D=128) compressors.
 # Extend as more configs are validated.
@@ -545,10 +538,9 @@ def fused_compress_attn(
         and not quant
         and _shape_key == (512, 64, 128, False)
     )
-    if _fp4 and _shape_key == (128, 64, 4, True) and _is_gfx1250():
-        # CSA Indexer FP4 on gfx1250: aiter's Gluon kernel (natural FP4 layout,
-        # e8m0 RoundUp scales). It has no latent echo, and the cache row is its
-        # only output, so a call with no cache bound (warmup) has nothing to do.
+    if _fp4 and _shape_key == (128, 64, 4, True) and envs.ATOM_V4_USE_GLUON:
+        # The Gluon kernel writes only the cache row. A warmup call has no cache,
+        # so skip it.
         assert latent_out is None and rotated_out is None and use_ue8m0
         if kv_cache is not None and block_tables is not None:
             from aiter.ops.triton.fusions.fused_compress_attn import (

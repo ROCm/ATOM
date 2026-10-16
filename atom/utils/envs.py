@@ -362,6 +362,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSED_COMPRESS_USE_FLYDSL": lambda: os.getenv(
         "ATOM_FUSED_COMPRESS_USE_FLYDSL", "auto"
     ).lower(),
+    # DeepSeek-V4: run the fp8 2buff qk_norm_rope and the CSA indexer FP4
+    # compressor on the aiter Gluon kernels. The kernels support only gfx1250.
+    "ATOM_V4_USE_GLUON": lambda: os.getenv("ATOM_V4_USE_GLUON", "0") == "1",
     # gather_kv_b_proj (the MLA cached-prefix expansion): swap the Triton op for
     # the flydsl a8w8 gather-GEMM. Added 2026-09-09.
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ": lambda: (

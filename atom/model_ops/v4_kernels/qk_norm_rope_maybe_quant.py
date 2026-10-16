@@ -36,6 +36,7 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.v4_kernels.state_writes import swa_scatter_rows
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 
 
@@ -655,24 +656,23 @@ def qk_norm_rope_maybe_quant(
     # consume directly. is_neox=False = GPT-J adjacent-pair RoPE; q_weight=None =
     # V4-Pro weightless Q. Decode fuses the paged SWA cache-write via the
     # swa_* buffers; prefill passes them None and scatters its tail post-attn.
-    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter import dtypes
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_norm_rope_group_quant,
+    )
 
     num_tokens = q.shape[0]
     # aiter derives rot_dim from cos_cache.shape[-1]*2, so it needs the 2D
     # [max_pos, rd//2] tables; the _V4RoPE caches are 4D [., rd//2, 1, 1].
     cos_2d = cos_cache.squeeze(-2).squeeze(-2)
     sin_2d = sin_cache.squeeze(-2).squeeze(-2)
-    q3 = q.view(num_tokens, n_local_heads, head_dim)
-    if get_gfx_runtime() == "gfx1250":
-        # gfx1250: aiter's Gluon kernel. The SWA write skips a token whose row
-        # or batch id is < 0 (CUDA-graph pad). It returns the K rows as [T, 512]
-        # and [T, 64]; the callers read them as [T, 1, .].
+    if envs.ATOM_V4_USE_GLUON:
         from aiter.ops.triton.fusions.fused_qk_norm_rope_group_quant import (
             fused_qk_norm_rope_group_quant as gluon_fused_qk_norm_rope_group_quant,
         )
 
         q_packed, q_rope, k_packed, k_rope = gluon_fused_qk_norm_rope_group_quant(
-            q3,
+            q.view(num_tokens, n_local_heads, head_dim),
             kv.reshape(num_tokens, kv.shape[-1]),
             kv_weight,
             positions,
@@ -684,20 +684,16 @@ def qk_norm_rope_maybe_quant(
             swa_rows=swa_dest_rows,
             batch_ids=batch_id_per_q_token,
         )
+        # The callers read K as [T, 1, .]. The Gluon kernel returns [T, .], so add
+        # the head dim.
         return QKNormRopeOut(
             q_packed=q_packed,
             q_rope=q_rope,
             k_packed=k_packed.unsqueeze(1),
             k_rope=k_rope.unsqueeze(1),
         )
-
-    from aiter import dtypes
-    from aiter.ops.fused_qk_norm_rope_cache_quant import (
-        fused_qk_norm_rope_group_quant,
-    )
-
     q_packed, q_rope, k_packed, k_rope = fused_qk_norm_rope_group_quant(
-        q3,
+        q.view(num_tokens, n_local_heads, head_dim),
         kv,
         kv_weight,
         positions,
