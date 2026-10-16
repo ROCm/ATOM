@@ -255,10 +255,14 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
 
     # Three rows per band, including a short last band. Verify through the
     # real quantized paged scorer and selector, not a mocked score function.
-    # `logits_rows` resolves `plane_rows` in the module that defines it, so
-    # the band has to be forced there rather than through the scorer.
+    # `logits_rows` resolves `plane_rows` in the module that defines it
+    # (`sparse_indexer_chunk`), so the band has to be forced there rather
+    # than through the scorer; the workspace reads its own import.
+    from atom.model_ops import sparse_indexer_chunk as chunk
+
     original_plane_rows = ws.plane_rows
     monkeypatch.setattr(ws, "plane_rows", lambda width: 3)
+    monkeypatch.setattr(chunk, "plane_rows", lambda width: 3)
     monkeypatch.setattr(scoring, "deepgemm_fp8_paged_mqa_logits", observe)
     actual, chosen = scoring.score_topk_paged(*args, **kwargs, candidate_count=16)
     actual_reindex, _ = scoring.score_topk_paged(
@@ -283,6 +287,7 @@ def test_banded_score_plane_preserves_full_and_reindex_selection(monkeypatch):
     # Compare the captured bands against an unbanded forward after live bounds
     # change. The empty row moves to the end and must not retain stale IDs.
     monkeypatch.setattr(ws, "plane_rows", original_plane_rows)
+    monkeypatch.setattr(chunk, "plane_rows", original_plane_rows)
     expected, expected_candidates = scoring.score_topk_paged(
         *args, **kwargs, candidate_count=16
     )
@@ -690,9 +695,11 @@ def test_score_workspace_holds_every_view_the_scorer_asks_for(max_tokens, column
 
 def test_score_workspace_band_stops_at_the_int32_reach(monkeypatch):
     """A long-context width bounds the band by `plane_rows`, not by the tokens."""
+    from atom.model_ops import sparse_indexer_chunk as chunk
     from atom.model_ops.deepseek_v41 import score_workspace as ws
 
     monkeypatch.setattr(ws, "plane_rows", lambda width: 2)
+    monkeypatch.setattr(chunk, "plane_rows", lambda width: 2)
     space = ws.ScoreWorkspace(_workspace_geometry(), 40, 3, "cpu")
     assert space.logits(2, 3 * 64).shape == (2, 3 * 64)
     with pytest.raises(ValueError):

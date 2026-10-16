@@ -133,6 +133,7 @@ cannot affect a server that does not use the feature.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| **ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB** | int | 2048 | Sparse (DSA) indexer dense fp32 logits budget, in MiB. Prefill scores query rows in chunks within it. It also sizes the decode logits workspace (`max_model_len` wide, allocated once and counted in the KV budget) and so how many bands a decode step is scored in: lowering it saves memory but adds launches. `0` keeps only aiter's hard 2 GiB buffer-descriptor cap. |
 | **ATOM_GLM5_KPOOL** | bool | 1 (true) | Enable the pooled sparse indexer. Setting `0` is an exact token-granular A/B only at or below `index_topk`; longer requests are refused. |
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
