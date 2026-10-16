@@ -7,7 +7,7 @@ with ATOM on 8×AMD MI355X GPUs. The validated configuration uses:
 - TP8; DCP=1 on CONC 1/2/4, DCP=8 on CONC ≥ 8
 - FP8 KV cache
 - native GPU prefix caching; LMCache CPU offload from CONC 8 up
-- DSpark speculative decoding on CONC ≤ 16, with synthetic acceptance
+- DSpark speculative decoding on every band, with synthetic acceptance
 - FlyDSL FP8 prefill attention on every band; the PrefillDelayer from CONC 16 up
 - the SemiAnalysis Weka AgentX workload
 
@@ -27,8 +27,8 @@ DSpark3, on-demand checkpoints, and a 128 GiB CPU state retention cap per rank).
 | Band | CONC | Serving defaults |
 |---|---|---|
 | Interactive | 1, 2, 4 | TP8, **DCP=1**, DSpark **7**, synthetic AL **3.84**, GPU prefix cache only (no LMCache). CUDA-graph capture grows with `2 * CONC * 8`. |
-| Mid | 8, 12, 14, 16 | TP8, **DCP=8**, DSpark **3**, synthetic AL **3.00**, LMCache **128 GiB**, `max-num-batched-tokens 8192`. |
-| Throughput | 32, 40, 48, 56, 64, 72, 80 | TP8, **DCP=8**, **no spec**, LMCache on. C32–C48 use 128 GiB; C56–C80 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
+| Mid | 8, 12, 14, 16 | TP8, **DCP=8**, DSpark **4**, synthetic AL **3.36**, LMCache **128 GiB**, `max-num-batched-tokens 8192`. |
+| Throughput | 32, 40, 48, 56, 64, 72, 80 | TP8, **DCP=8**, DSpark **4**, synthetic AL **3.36**, ReplaySSM on, LMCache on. C32–C48 use 128 GiB; C56–C80 use **192 GiB** and a larger `max-num-seqs` so the in-flight window can track `2 * CONC`. |
 
 The AgentX **client** is the same at every concurrency. Only `--concurrency`
 changes.
@@ -39,7 +39,7 @@ changes.
 |---|---|
 | Hardware | 8×MI355X (`gfx950`) |
 | Target | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) (MXFP4 MoE, KDA + MLA) |
-| Draft | [`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark) (used only in the interactive and mid bands) |
+| Draft | [`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark) (every band) |
 | Parallelism | TP8; DCP=1 (CONC 1/2/4) or DCP=8 (CONC ≥ 8) |
 | KV cache | FP8, `--block-size 128` |
 | Prefix cache | Enabled (required for AgentX multi-turn prefix hits) |
@@ -55,23 +55,25 @@ changes.
 
 `graph_max = 2 * CONC * (1 + spec)`. Capture sizes are the dense range
 `[1, 2, …, graph_max]`. `max-num-seqs` is **not** always `2 * CONC`.
+Capture sizes are batch sizes, so ATOM drops every entry its token budget
+cannot schedule — here `max-num-seqs` — and logs the ladder it kept.
 
 | CONC | DCP | spec | AL | LMCache | ReplaySSM | `max-num-seqs` | batched tokens | GPU util | `graph_max` |
 |---:|---:|---:|---:|---|---:|---:|---:|---:|---:|
 | 1 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 16 |
 | 2 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 32 |
 | 4 | 1 | 7 | 3.84 | off | 0 | 32 | 8192 | 0.90 | 64 |
-| 8 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 64 |
-| 12 | 8 | 3 | 3.00 | 128 GiB | 1 | 24 | 8192 | 0.90 | 96 |
-| 14 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 112 |
-| 16 | 8 | 3 | 3.00 | 128 GiB | 1 | 32 | 8192 | 0.90 | 128 |
-| 32 | 8 | 0 | — | 128 GiB | 0 | 64 | 8192 | 0.90 | 64 |
-| 40 | 8 | 0 | — | 128 GiB | 0 | 80 | 8192 | 0.90 | 80 |
-| 48 | 8 | 0 | — | 128 GiB | 0 | 96 | 8192 | 0.90 | 96 |
-| 56 | 8 | 0 | — | **192 GiB** | 0 | **112** | 8192 | 0.90 | 112 |
-| 64 | 8 | 0 | — | **192 GiB** | 0 | **128** | 8192 | 0.90 | 128 |
-| 72 | 8 | 0 | — | **192 GiB** | 0 | **144** | 8192 | 0.90 | 144 |
-| 80 | 8 | 0 | — | **192 GiB** | 0 | **160** | 8192 | 0.90 | 160 |
+| 8 | 8 | 4 | 3.36 | 128 GiB | 1 | 32 | 8192 | 0.90 | 80 |
+| 12 | 8 | 4 | 3.36 | 128 GiB | 1 | 24 | 8192 | 0.90 | 120 |
+| 14 | 8 | 4 | 3.36 | 128 GiB | 1 | 32 | 8192 | 0.90 | 140 |
+| 16 | 8 | 4 | 3.36 | 128 GiB | 1 | 32 | 8192 | 0.90 | 160 |
+| 32 | 8 | 4 | 3.36 | 128 GiB | 1 | 64 | 8192 | 0.90 | 320 |
+| 40 | 8 | 4 | 3.36 | 128 GiB | 1 | 80 | 8192 | 0.90 | 400 |
+| 48 | 8 | 4 | 3.36 | 128 GiB | 1 | 96 | 8192 | 0.90 | 480 |
+| 56 | 8 | 4 | 3.36 | **192 GiB** | 1 | **112** | 8192 | 0.90 | 560 |
+| 64 | 8 | 4 | 3.36 | **192 GiB** | 1 | **128** | 8192 | 0.90 | 640 |
+| 72 | 8 | 4 | 3.36 | **192 GiB** | 1 | **144** | 8192 | 0.90 | 720 |
+| 80 | 8 | 4 | 3.36 | **192 GiB** | 1 | **160** | 8192 | 0.90 | 800 |
 
 C8–C48 use 128 GiB LMCache; C56–C80 use **192 GiB**. LMCache CPU size is
 `LMCACHE_MAX_LOCAL_CPU_SIZE`; chunk size is 1024 tokens.
@@ -81,6 +83,13 @@ other band (C1…C48).
 
 `ATOM_PREFILL_DECODE_INTERVAL=4` and `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` on
 **C16 and up**; unset on C1…C14.
+
+The 4-token draft was measured at C14, C16, C48, C56 and C72; the other bands
+follow their band's setting. Running the draft at the throughput bands costs
+**25–29% of the KV block pool** — it adds 5 MLA rows per cache entry and a flat
+~2.2 GiB — which buys +41% / +36% / +21% output tokens per second at C48 / C56 /
+C72 for +55% / +97% / +220% TTFT. The gain shrinks as concurrency rises and the
+curve rolls over past C72.
 
 ## 0. Container prerequisites
 
@@ -155,31 +164,29 @@ MAX_NUM_BATCHED_TOKENS=8192
 GPU_MEMORY_UTILIZATION=0.90
 ENABLE_LMCACHE=1
 LMCACHE_MAX_LOCAL_CPU_SIZE=128
-ATOM_ENABLE_REPLAYSSM=0
-NUM_SPECULATIVE_TOKENS=0
-SPEC_DECODE_ACCEPTANCE_LENGTH=""
+ATOM_ENABLE_REPLAYSSM=1
+NUM_SPECULATIVE_TOKENS=4
+SPEC_DECODE_ACCEPTANCE_LENGTH=3.36
 
 case "${CONC}" in
   1|2|4)
     # Interactive: no DCP, no LMCache, the wide DSpark draft.
     DCP=1
     ENABLE_LMCACHE=0
+    ATOM_ENABLE_REPLAYSSM=0
     NUM_SPECULATIVE_TOKENS=7
     SPEC_DECODE_ACCEPTANCE_LENGTH=3.84
     ;;
   8|12|14|16)
-    # Mid: DCP=8 + LMCache 128 GiB + the narrow DSpark draft.
-    ATOM_ENABLE_REPLAYSSM=1
-    NUM_SPECULATIVE_TOKENS=3
-    SPEC_DECODE_ACCEPTANCE_LENGTH=3.00
+    # Mid: DCP=8 + LMCache 128 GiB.
     # C12 is the one band whose in-flight window is not the default 32.
     if [[ "${CONC}" == "12" ]]; then
       MAX_NUM_SEQS=24
     fi
     ;;
   32|40|48|56|64|72|80)
-    # Throughput: no spec, and max-num-seqs tracks 2*CONC so the in-flight
-    # window can keep up with the client.
+    # Throughput: max-num-seqs tracks 2*CONC so the in-flight window can keep
+    # up with the client.
     MAX_NUM_SEQS=$((2 * CONC))
     # The four largest bands need a bigger CPU tier to stay off the HBM cliff.
     if [[ "${CONC}" -ge 56 ]]; then
@@ -270,8 +277,7 @@ quality.
 | Band | Flag | Meaning |
 |---|---|---|
 | Interactive (spec=7) | `--spec-decode-acceptance-length 3.84` | Target committed tokens / forward ≈ 3.84 |
-| Mid (spec=3) | `--spec-decode-acceptance-length 3.00` | Target committed tokens / forward ≈ 3.00 |
-| Throughput | omit | No speculative decoding |
+| Mid and throughput (spec=4) | `--spec-decode-acceptance-length 3.36` | Target committed tokens / forward ≈ 3.36 |
 
 This mode is **performance-only**. Do not pass
 `--spec-decode-acceptance-length` for GSM8K, SWE-bench, or any correctness
@@ -284,7 +290,7 @@ acceptance flags; ATOM rejects that pair at startup. See [`DSpark.md`](DSpark.md
 
 Kimi-K3 KDA decode can rebuild SSM state from a checkpoint ring
 (`ATOM_ENABLE_REPLAYSSM=1`). The table above is the AgentX default: off for
-CONC 1/2/4, on for CONC 8/12/16, off from CONC 32 up. Override with
+CONC 1/2/4, on from CONC 8 up. Override with
 `ATOM_ENABLE_REPLAYSSM=0` or `1` when comparing the other setting.
 
 ### State checkpointing
