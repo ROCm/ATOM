@@ -427,7 +427,7 @@ prepare_lmcache_memory_on_host() {
   python3 "${scripts}/prepare_lmcache_host_memory.py" \
     --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
     --per-gpu-gib "${ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE}" \
-    --attempts 3 --timeout 300 --step-timeout 90 --reserve-gib 128 \
+    --attempts 3 --timeout 900 --step-timeout 120 --reserve-gib 128 \
     --output "${output}" "${cache_root_args[@]}" "${model_dirs[@]}" || return $?
   export ATOMESH_LMCACHE_HOST_PREPARED=true
 }

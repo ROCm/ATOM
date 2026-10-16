@@ -1352,7 +1352,7 @@ models:
               method: eagle3
               draft_model: ${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3
               num_speculative_tokens: 3
-              extra_args: --draft-prefill-kv-workspace-mb 8192 --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
+              extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
           prefill: &minimax_m3_workspace_service
             workers: 1
             tp: 4
@@ -1373,7 +1373,7 @@ models:
               ATOM_DRAFT_CUDAGRAPH: '1'
               ATOM_PREFIX_CACHE_POLICY: slru
               ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
-              ATOM_AITER_SCATTER_REF: 5eb866a95d66a38d64eecf151ac4ef3567a07ac5
+              ATOM_AITER_SCATTER_REF: 2c954755467419d466b55dd15659280420495fe1
             prefill:
               HIP_VISIBLE_DEVICES: 0,1,2,3
               LMCACHE_LOCAL_CPU: 'True'
@@ -1402,11 +1402,10 @@ models:
 
         - <<: *minimax_m3_workspace_c32
           name: minimax-m3-fp4-1p1d-tp4-eagle3-gsm8k-20shot-full-c32
-          # Smaller budget makes short GSM8K cached prompts exercise grouping.
           server:
             common_args:
               <<: *minimax_m3_workspace_args
-              extra_args: --draft-prefill-kv-workspace-mb 512 --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
+              extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
           run_eval: true
           eval_only: true
           eval_concurrency: [32]

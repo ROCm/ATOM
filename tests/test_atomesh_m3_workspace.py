@@ -59,7 +59,7 @@ class WorkspaceJobsTest(unittest.TestCase):
             self.assertEqual(accuracy["accuracy"]["fewshot"], 20)
             self.assertIsNone(accuracy["accuracy"]["limit"])
             self.assertEqual(accuracy["accuracy"]["concurrency"], [32])
-            for cell, budget in ((perf, 8192), (accuracy, 512)):
+            for cell in (perf, accuracy):
                 self.assertEqual(cell["runner"]["slurm_account"], "")
                 self.assertEqual(cell["runner"]["slurm_partition"], "amd-spur")
                 self.assertEqual(cell["runner"]["time_limit"], "08:00:00")
@@ -69,10 +69,7 @@ class WorkspaceJobsTest(unittest.TestCase):
                 self.assertEqual(cell["service"]["decode"]["tp"], 4)
                 self.assertEqual(cell["server_args"]["max_num_batched_tokens"], 32768)
                 self.assertTrue(cell["server_args"]["enable_prefix_caching"])
-                self.assertIn(
-                    f"--draft-prefill-kv-workspace-mb {budget}",
-                    cell["server_args"]["extra_args"],
-                )
+                self.assertNotIn("--draft-prefill", cell["server_args"]["extra_args"])
                 with tempfile.TemporaryDirectory() as output:
                     result = subprocess.run(
                         [

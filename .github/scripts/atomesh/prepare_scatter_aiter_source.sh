@@ -27,3 +27,7 @@ src = root / "csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh"
 assert "sorted_pos >= max_sorted" in src.read_text()
 print(f"[scatter-bounds] aiter_sha={sys.argv[2]} source={aiter.__file__}")
 PY
+
+# Check the exact pinned paged-attention kernels before spending time loading
+# two model replicas. This is a test process, not a server runtime overlay.
+python3 "${scatter_source}/op_tests/triton_tests/attention/test_unified_attention_scale_cache.py"
