@@ -59,19 +59,18 @@ run_cargo_build() {
 }
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
 if ! run_cargo_build; then
-  # Cargo never re-extracts a crate whose .cargo-ok marker exists, so an
-  # extraction cut short leaves registry/src broken for every later build on
-  # this host. registry/src is regenerated from the downloaded registry/cache.
+  # Shared host mesh caches go stale in two ways:
+  # 1) Cargo leaves .cargo-ok after a cut-short crate extract, so registry/src
+  #    stays broken forever (e.g. foreign-types with only Cargo.toml).
+  # 2) Incremental target/${profile}/build keeps build-script outputs that
+  #    no longer match the sources, so a second pass fails with missing
+  #    generated files (target-lexicon host.rs, serde_core private.rs).
+  # Wipe both and retry once from registry/cache + a clean target profile.
   registry_src="${CARGO_HOME:-${HOME}/.cargo}/registry/src"
-  if [[ -d "${registry_src}" ]] && grep -qF "${registry_src}/" "${log_dir}/mesh-build.log"; then
-    echo "[build] Cargo registry sources under ${registry_src} look corrupt; re-extracting and retrying" >&2
-    cp "${log_dir}/mesh-build.log" "${log_dir}/mesh-build.attempt1.log"
-    rm -rf "${registry_src}"
-    if run_cargo_build; then
-      build_ok=true
-    fi
-  fi
-  if [[ "${build_ok:-false}" != "true" ]]; then
+  echo "[build] First cargo build failed; clearing ${registry_src} and ${target_dir}/${profile}, then retrying" >&2
+  cp "${log_dir}/mesh-build.log" "${log_dir}/mesh-build.attempt1.log"
+  rm -rf "${registry_src}" "${target_dir}/${profile}"
+  if ! run_cargo_build; then
     cat "${log_dir}/mesh-build.log" >&2
     exit 1
   fi
