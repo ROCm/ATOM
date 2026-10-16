@@ -55,6 +55,10 @@ class SpurDispatchTest(unittest.TestCase):
             from pathlib import Path
 
             root = Path(os.environ["TEST_ROOT"])
+            if "--spur-preflight" in sys.argv:
+                with (root / "preflight.json").open("x") as stream:
+                    json.dump(sys.argv[1:], stream)
+                sys.exit(int(os.environ.get("PREFLIGHT_RC", "0")))
             # A recursive worker dispatch must fail, rather than fork forever.
             with (root / "dispatch.json").open("x") as stream:
                 json.dump(sys.argv[1:], stream)
@@ -218,6 +222,34 @@ class SpurDispatchTest(unittest.TestCase):
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")
         self.assertFalse((self.root / "docker-0.jsonl").exists())
+
+    def test_preflight_runs_on_every_node_before_dispatch(self):
+        self.run_job()
+        preflight = json.loads((self.root / "preflight.json").read_text())
+        for option in ("--nodes=2", "--ntasks=2", "--ntasks-per-node=1"):
+            self.assertIn(option, preflight)
+
+    def test_preflight_failure_stops_before_workers(self):
+        self.run_job(expected_rc=1, PREFLIGHT_RC="1")
+        self.assertFalse((self.root / "dispatch.json").exists())
+        self.assertFalse((self.root / "docker-0.jsonl").exists())
+        self.assertEqual(
+            (self.run_dir / ".spur-dispatch-test-submission/rc").read_text(), "1\n"
+        )
+
+    def test_preflight_records_busy_gpu_host(self):
+        self.write_tool(
+            "amd-smi",
+            """
+            print("GPU  XCP  VRAM_USED   VRAM_FREE  VRAM_TOTAL    VRAM%")
+            print("  0    0   84003 MB   210589 MB   294592 MB  28.52 %")
+            """,
+        )
+        result = self.run_job(
+            "--spur-preflight", expected_rc=1, ATOMESH_GPU_IDLE_WAIT_SECONDS="0"
+        )
+        self.assertIn("GPU 0 already uses 84003 MB VRAM", result.stderr)
+        self.assertEqual(len(list((self.run_dir / "gpu-busy").iterdir())), 1)
 
     def test_large_container_output_stays_in_shared_log(self):
         size = 33 * 1024 * 1024
