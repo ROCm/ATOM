@@ -333,8 +333,8 @@ def test_qwen35_prefix_prefill_separates_total_and_cached_lengths(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_qwen35_prefix_metadata_drives_native_kv_gather(monkeypatch):
-    """Gather both requests' cached and new tokens through the real kernel."""
+def test_qwen35_prefix_metadata_drives_native_paged_prefill(monkeypatch):
+    """Attend to both requests' cached and new tokens directly in the pool."""
     monkeypatch.setattr("atom.utils.envs.ATOM_USE_UNIFIED_ATTN", False)
     forward_batch = _forward_batch(decode=False, seq_lens=[5, 4], extend_lens=[2, 3])
     forward_batch.seq_lens = forward_batch.seq_lens.to("cuda")
@@ -349,19 +349,29 @@ def test_qwen35_prefix_metadata_drives_native_kv_gather(monkeypatch):
     )
     # NHD page-size-one cache: each physical slot has distinct K/V values.
     k_cache = (
-        torch.arange(10 * 2 * 64, device="cuda").to(torch.bfloat16).view(10, 1, 2, 64)
+        (torch.arange(10 * 2 * 64, device="cuda") / 128)
+        .to(torch.bfloat16)
+        .view(10, 1, 2, 64)
     )
     v_cache = -k_cache
-    q = torch.empty(5, 2, 64, device="cuda", dtype=torch.bfloat16)
-    impl = SimpleNamespace(kv_cache_dtype="bf16")
-
-    _, gathered_k, gathered_v, *_ = PagedAttentionImpl._gather_prefix_and_concat_kv(
-        impl, q, q, q, k_cache, v_cache, None, None, metadata
+    q = torch.zeros(5, 2, 64, device="cuda", dtype=torch.bfloat16)
+    impl = SimpleNamespace(
+        scale=0.125, sliding_window=-1, sinks=None, _logged_paged_prefill=True
     )
-
-    assert metadata.batch_id_per_k_token.device == q.device
-    torch.testing.assert_close(gathered_k, k_cache[:9, 0], rtol=0, atol=0)
-    torch.testing.assert_close(gathered_v, v_cache[:9, 0], rtol=0, atol=0)
+    context = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=True, is_draft=False, scheduled_bs=2),
+        attn_metadata=metadata,
+    )
+    output = PagedAttentionImpl.prefill_attention_paged(
+        impl, q, q, q, k_cache, v_cache, None, None, context
+    )
+    expected = torch.stack(
+        [
+            v_cache[start:end, 0].float().mean(0)
+            for start, end in [(0, 4), (0, 5), (5, 7), (5, 8), (5, 9)]
+        ]
+    ).bfloat16()
+    torch.testing.assert_close(output, expected, atol=0.05, rtol=0.02)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

@@ -136,50 +136,26 @@ The legacy draft's `config.json` has none of the new fields, so all `getattr`
 toggles fall through to their EAGLE 3 defaults. Behavior is byte-equivalent
 to pre-EAGLE-3.1 ATOM.
 
-## Limit the draft cached-prefill K/V workspace
+## Cached prefill reads the KV pool
 
-For EAGLE3 with an MHA/GQA draft and prefill context parallel size 1, add:
+MHA cached prefill, for both the target and EAGLE3 draft, uses paged unified
+attention directly. The existing block tables identify each request's full
+context; new KV has already been written to the pool by the RoPE/cache step.
+No dense cached K/V gather or request grouping is performed. There is no
+backend or workspace switch to enable this behavior.
 
-```bash
---draft-prefill-kv-workspace-mb 8192
-```
+Native SHUFFLE and legacy NHD V layouts, scalar FP8 scales and per-token FP8
+scale caches are supported. Per-token scales are read at the same physical
+page/head/token as their K/V inside AITER's Triton attention kernel. This
+requires AITER's scale-cache API (`k_scale_cache` / `v_scale_cache`). BF16 pools
+do not use quantization scales. Uncached prefill continues using current K/V;
+decode, sparse attention and MLA retain their existing dispatch.
 
-The default is `0` (disabled). The value is in MiB, so `8192` limits the
-materialized dense K+V tensors to **8 GiB per rank, per attention call**.
-It applies to draft cached prefill, including both `propose()` and the
-standalone `compute_draft_kv()` path. Target attention and draft decode
-keep their existing behavior. Paged attention backends that do not expand
-cached K/V into dense tensors do not need this grouping.
-
-Cached prefill ordinarily gathers every request's full context into dense
-K/V tensors before running variable-length attention. Long cached contexts
-can make these temporary tensors much larger than the new-token batch.
-With the limit enabled, contiguous whole requests are grouped in order,
-then the existing gather and attention run once per group on the same
-stream. Outputs are placed back in their original query-token positions;
-no request's context is split or truncated.
-
-The group limit in KV tokens is calculated from the actual dense tensor
-shape and dtype:
-
-```text
-max_group_kv_tokens = floor(workspace_bytes /
-    (2 * local_num_kv_heads * head_dim * dtype_bytes))
-```
-
-For 16 local KV heads, head dimension 128 and BF16, 8 GiB fits 1,048,576
-KV tokens. Both cached and newly added tokens count toward this limit.
-If one request alone exceeds the limit, the forward raises an error asking
-for a larger budget (or `0` to disable grouping); it does not silently
-exceed the configured limit. Grouping adds attention launches and an output
-copy, so choose a budget large enough for the desired maximum context.
-
-This setting bounds only the dense K/V materialization. It does not bound
-model-wide peak or allocator-reserved memory, persistent KV pools, Q/output
-tensors, cache-layout conversions, or attention-kernel scratch/conversions.
-It does not change allocator/IPC settings or perform LMCache host-memory
-cleanup. MLA drafts and PCP greater than 1 are rejected when the option is
-enabled.
+Only the query-shaped output and any attention split-K scratch are allocated;
+there is no temporary K/V allocation proportional to the full cached context.
+The first cached call per layer logs `[prefill-paged]` with pool shape and
+`materialized_kv_bytes=0`. Allocator/IPC setup and LMCache host preparation are
+separate from this attention path.
 
 ## Runtime acceptance stats
 

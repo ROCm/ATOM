@@ -202,7 +202,6 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
-            draft_prefill_kv_workspace_mb=0,
             synthetic_acceptance_rate=None,
             synthetic_acceptance_length=None,
         )
@@ -353,48 +352,3 @@ class TestKVOffloadEnv:
         )
         with pytest.raises(ValueError, match="ATOM_KV_OFFLOAD is off"):
             self._kv()
-
-
-class TestDraftPrefillWorkspaceCli:
-    def _parse(self, argv):
-        parser = FlexibleArgumentParser()
-        EngineArgs.add_cli_args(parser)
-        return EngineArgs.from_cli_args(parser.parse_args(argv))
-
-    def test_default_disabled(self):
-        args = self._parse([])
-        assert args.draft_prefill_kv_workspace_mb == 0
-        assert "draft_prefill_kv_workspace_mb" not in args._get_engine_kwargs()
-
-    def test_budget_reaches_speculative_config(self):
-        args = self._parse(
-            [
-                "--method",
-                "eagle3",
-                "--draft-model",
-                "test-draft",
-                "--num-speculative-tokens",
-                "3",
-                "--draft-prefill-kv-workspace-mb",
-                "8192",
-            ]
-        )
-        with patch("atom.model_engine.arg_utils.SpeculativeConfig") as spec:
-            kwargs = args._get_engine_kwargs()
-        assert kwargs["speculative_config"] is spec.return_value
-        assert spec.call_args.kwargs["draft_prefill_kv_workspace_mb"] == 8192
-        assert "draft_prefill_kv_workspace_mb" not in kwargs
-
-    @pytest.mark.parametrize("method,tokens", [(None, 1), ("mtp", 3), ("eagle3", 0)])
-    def test_requires_active_eagle3(self, method, tokens):
-        args = EngineArgs(
-            method=method,
-            num_speculative_tokens=tokens,
-            draft_prefill_kv_workspace_mb=8192,
-        )
-        with pytest.raises(ValueError, match="requires active --method eagle3"):
-            args._get_engine_kwargs()
-
-    def test_rejects_fractional_mib(self):
-        with pytest.raises(SystemExit):
-            self._parse(["--draft-prefill-kv-workspace-mb", "0.5"])

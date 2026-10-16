@@ -1307,9 +1307,6 @@ class SpeculativeConfig:
     # __post_init__. None => real draft/target rejection sampling.
     synthetic_acceptance_rates: list[float] | None = None
 
-    # Per-rank dense K+V workspace for EAGLE3 cached prefill; 0 disables grouping.
-    draft_prefill_kv_workspace_mb: int = field(default=0, kw_only=True)
-
     # model_type → mtp_model_type mapping
     _MTP_TYPE_MAP: ClassVar[dict[str, str]] = {
         "deepseek_v3": "deepseek_mtp",
@@ -1431,13 +1428,6 @@ class SpeculativeConfig:
         )
 
     def __post_init__(self):
-        budget = self.draft_prefill_kv_workspace_mb
-        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
-            raise ValueError(
-                "draft_prefill_kv_workspace_mb must be a non-negative integer"
-            )
-        if budget and self.method != "eagle3":
-            raise ValueError("draft_prefill_kv_workspace_mb requires method='eagle3'")
         self._resolve_synthetic_acceptance()
         if self.draft_model_hf_config is None:
             self.draft_model_hf_config = get_hf_config(
@@ -1447,12 +1437,6 @@ class SpeculativeConfig:
         if hasattr(self.draft_model_hf_config, "text_config"):
             self.draft_model_hf_config = self.draft_model_hf_config.text_config
         self.hf_config_override(self.draft_model_hf_config, self.model)
-        if budget and self.use_dspark():
-            raise ValueError("draft_prefill_kv_workspace_mb does not support DSpark")
-        if budget and getattr(self.draft_model_hf_config, "kv_lora_rank", None):
-            raise ValueError(
-                "draft_prefill_kv_workspace_mb requires an MHA draft, not MLA"
-            )
 
         if self.method == "eagle3":
             # MLA drafts (kv_lora_rank set) route to Eagle3DeepseekMLAModel
@@ -2176,12 +2160,6 @@ class Config:
         return list(sizes)
 
     def __post_init__(self):
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.draft_prefill_kv_workspace_mb
-            and self.prefill_context_parallel_size != 1
-        ):
-            raise ValueError("Draft prefill KV workspace grouping requires PCP=1")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )

@@ -96,9 +96,8 @@ class TestTheElementOrderABinderGets:
     field's shape.
 
     Not a formatting preference. The fused writer produces this order and
-    `cp_mha_gather_cache_kernel` reads it in place; declaring V the other way
-    round sends `_gather_prefix_and_concat_kv` down its densifying branch,
-    which relaid a 1.4 GiB draft pool once per chunked-prefill forward.
+    paged attention reads it in place. Declaring the wrong V order would
+    produce incorrect attention values despite identical allocation sizes.
 
     `blocks_per_entry` moves the block count and nothing else, which is the
     claim: an entry is an accounting unit and no shape is taken at it.

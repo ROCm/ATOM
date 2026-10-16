@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import logging
 from functools import cache
 
 import aiter
@@ -15,13 +16,12 @@ from torch import nn
 from atom.config import get_current_atom_config
 from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
-    cp_mha_gather_cache,
     dense_decode_splits,
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
 )
-from atom.model_ops.prefill_workspace import run_grouped_prefill
+from atom.model_ops.paged_prefill import run_paged_prefill
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -100,10 +100,7 @@ class PagedAttentionImpl(nn.Module):
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
-        spec = get_current_atom_config().speculative_config
-        self.draft_prefill_kv_workspace_bytes = (
-            spec.draft_prefill_kv_workspace_mb * (1 << 20) if spec is not None else 0
-        )
+        self._logged_paged_prefill = False
 
     def process_weights_after_loading(self):
         if (
@@ -147,12 +144,7 @@ class PagedAttentionImpl(nn.Module):
             return False
         if getattr(attn_metadata, "dropout_p", 0.0) != 0.0:
             return False
-        # Prefix-cache hit (has_cached) is supported: prefill_attention gathers
-        # the cached+new KV into a dense packed [total_kv, ...] tensor and the
-        # gfx1250 sink varlen ASM kernel handles bottom-right causal for
-        # sq != sk (chunked-prefill). cu_seqlens_q / cu_seqlens_k carry the
-        # per-request new-token vs cached+new lengths, so we no longer require
-        # max_seqlen_q == max_seqlen_k.
+        # Cached batches are dispatched to paged attention before this gate.
         return (
             attn_metadata.cu_seqlens_q is not None
             and attn_metadata.cu_seqlens_k is not None
@@ -385,7 +377,9 @@ class PagedAttentionImpl(nn.Module):
                 k_out=k,
                 output_zeros=False,
             )
-            self._cache_format = "NHD"
+            # The fused writer uses native SHUFFLE for 5-D V and NHD for
+            # legacy 4-D V. It does not convert or reallocate the KV pool.
+            self._cache_format = "SHUFFLE" if v_cache.dim() == 5 else "NHD"
         else:
             # for asm paged attention
             asm_layout = self._use_asm_cache_layout(
@@ -423,11 +417,8 @@ class PagedAttentionImpl(nn.Module):
                 )
             self._cache_format = "SHUFFLE" if asm_layout else "NHD"
 
-        # NOTE: on a prefix-cache hit the cached+new KV is gathered into a dense
-        # packed tensor inside prefill_attention (the ASM varlen path that needs
-        # it). The Triton path reads the paged KV cache directly, so it never
-        # gathers. Keeping the gather out of here also means dispatch_backend
-        # sees q/k with matching token counts (sq == sk).
+        # Cached prefill reads this pool directly; new KV is already visible
+        # on the same stream before the paged attention launch.
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
     def _gemma_norm_rope_then_cache(
@@ -479,96 +470,6 @@ class PagedAttentionImpl(nn.Module):
             asm_layout=True,
         )
         return q, k, v
-
-    def _gather_prefix_and_concat_kv(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        attn_metadata,
-    ):
-        """
-        When prefix cache hits, gather full KV (cached + new) from paged cache in
-        one pass. New tokens are already written by fused_qk_rope_reshape_and_cache.
-        Same flow as gather_kv_b_proj: write new first, then read cached+new together.
-        """
-        cu_seqlens_k = attn_metadata.cu_seqlens_k
-        total_tokens = attn_metadata.total_kv
-        num_kv_heads = k.shape[1]
-        head_dim = k.shape[2]
-
-        k_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
-        )
-        v_full = torch.empty(
-            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
-        )
-
-        # Convert cache for cp_mha_gather_cache
-        # The cache format depends on which rope_cache branch wrote the data:
-        # - SHUFFLE: fused_qk_norm_rope_cache_quant_shuffle or reshape_and_cache(asm_layout=True)
-        #   K [n, nh, hd//x, bs, x], V viewed as [n, nh, bs//x, hd, x]
-        # - NHD: fused_qk_rope_reshape_and_cache or reshape_and_cache(asm_layout=False)
-        #   K [n, nh, hd//x, bs, x] -> permute to [n, bs, nh, hd], V [n, nh, hd, bs] -> [n, bs, nh, hd]
-        use_shuffle = getattr(self, "_cache_format", "SHUFFLE") == "SHUFFLE"
-        if k_cache.dim() == 5:
-            x = 16 // k_cache.element_size()
-            n, nh, _, block_size, _ = k_cache.shape
-            if use_shuffle:
-                k_cache_gather = k_cache
-                v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
-            elif v_cache.dim() == 5:
-                # MiMo-V2-Flash per-layer allocator (aiter_attention.py:461) emits
-                # v_cache natively as 5D SHUFFLE [n, nh, bs//x, hd, x]; pass through.
-                use_shuffle = True
-                k_cache_gather = k_cache
-                v_cache_gather = v_cache
-            else:
-                # V is in ASM/NHD format [n, nh, hd, bs], convert to [n, bs, nh, hd]
-                k_cache_gather = (
-                    k_cache.permute(0, 3, 1, 2, 4)
-                    .contiguous()
-                    .view(n, block_size, nh, head_dim)
-                )
-                v_cache_gather = v_cache.permute(0, 3, 1, 2).contiguous()
-        else:
-            use_shuffle = False
-            k_cache_gather = k_cache
-            v_cache_gather = v_cache
-            block_size = k_cache.shape[1]
-
-        block_tables = attn_metadata.block_tables
-        per_token_quant = (
-            self.kv_cache_dtype.startswith("fp8")
-            and k_scale is not None
-            and v_scale is not None
-            and k_scale.numel() > 1
-            and v_scale.numel() > 1
-        )
-        cp_mha_gather_cache(
-            key_cache=k_cache_gather,
-            value_cache=v_cache_gather,
-            key=k_full,
-            value=v_full,
-            block_tables=block_tables,
-            k_scales=k_scale,
-            v_scales=v_scale,
-            cu_seqlens_kv=cu_seqlens_k,
-            # Built once per fwd by the prefill builder (same tensor for every
-            # layer); a ubatch gets its own by slicing in split_attn_metadata.
-            batch_id_per_k_token=attn_metadata.batch_id_per_k_token,
-            seq_starts=attn_metadata.seq_starts,
-            dequant=self.kv_cache_dtype.startswith("fp8"),
-            kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
-            total_tokens=total_tokens,
-            per_token_quant=per_token_quant,
-        )
-
-        return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
 
     def _view_v_cache_for_pa_decode_bf16_asm(
         self, v_cache: torch.Tensor, k_cache: torch.Tensor
@@ -851,9 +752,7 @@ class PagedAttentionImpl(nn.Module):
         fwd_ctx: ForwardContext,
     ) -> bool:
         attn_metadata = fwd_ctx.attn_metadata
-        # A prefix-cache hit is allowed: by now k/v hold the gathered cached+new
-        # rows, so k can be longer than q, and the asm kernel's bottom-right
-        # causal mask handles sq < sk through cu_seqlens_q / cu_seqlens_k.
+        # Uncached prefill consumes the current dense K/V.
         return (
             envs.ATOM_AITER_FP8_PREFILL_ATTN
             and get_gfx() == "gfx950"
@@ -871,42 +770,10 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-        if (
-            self.draft_prefill_kv_workspace_bytes
-            and fwd_ctx.context.is_draft
-            and fwd_ctx.attn_metadata.has_cached
-        ):
-            return run_grouped_prefill(
-                self._prefill_attention,
-                q,
-                k,
-                v,
-                k_cache,
-                v_cache,
-                k_scale,
-                v_scale,
-                fwd_ctx,
-                self.draft_prefill_kv_workspace_bytes,
-            )
-        return self._prefill_attention(
-            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
-        )
-
-    def _prefill_attention(
-        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
-    ):
-        # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
-        # Prefix-cache hit: gather cached+new KV from the paged cache into a
-        # dense packed [total_kv, ...] tensor (new tokens were already written
-        # during rope_cache). The varlen kernel below (FP8 asm or BF16) then
-        # attends over the full sequence; cu_seqlens_q / cu_seqlens_k carry the
-        # new vs cached+new lengths (sq < sk), handled via bottom-right causal.
         if attn_metadata.has_cached:
-            q, k, v, k_cache, v_cache, k_scale, v_scale = (
-                self._gather_prefix_and_concat_kv(
-                    q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
-                )
+            return self.prefill_attention_paged(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
             )
         if self._can_use_fp8_prefill_attention(q, k, v, fwd_ctx):
             output_dtype = q.dtype
@@ -963,6 +830,34 @@ class PagedAttentionImpl(nn.Module):
         )
         return o
 
+    def prefill_attention_paged(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        output = run_paged_prefill(
+            unified_attention,
+            q,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            fwd_ctx,
+            softmax_scale=self.scale,
+            sliding_window=self.sliding_window,
+            sinks=self.sinks,
+        )
+        if not self._logged_paged_prefill:
+            logging.getLogger("atom").info(
+                "[prefill-paged] reading KV pool directly: draft=%s "
+                "q=%s cache=%s dtype=%s total_kv=%d materialized_kv_bytes=0",
+                fwd_ctx.context.is_draft,
+                tuple(q.shape),
+                tuple(k_cache.shape),
+                k_cache.dtype,
+                fwd_ctx.attn_metadata.total_kv,
+            )
+            self._logged_paged_prefill = True
+        return output
+
     def prefill_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
@@ -981,6 +876,10 @@ class PagedAttentionImpl(nn.Module):
         # value:  [num_tokens, 1, num_kv_heads, head_size]
 
         attn_metadata = fwd_ctx.attn_metadata
+        if attn_metadata.has_cached:
+            return self.prefill_attention_paged(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+            )
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
@@ -1123,9 +1022,8 @@ class PagedAttentionImpl(nn.Module):
         v: torch.Tensor,
     ):
         if fwd_ctx.context.is_prefill:
-            # q/k/v here still hold only the new tokens (the prefix gather happens
-            # inside prefill_attention), so the q.shape[0] == k.shape[0] check in
-            # _can_use_prefill_sink_asm is valid.
+            if fwd_ctx.attn_metadata.has_cached:
+                return self.prefill_attention_paged
             if self._can_use_prefill_sink_asm(q, k, v, fwd_ctx):
                 return self.prefill_attention
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:

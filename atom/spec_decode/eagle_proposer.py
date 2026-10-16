@@ -16,7 +16,6 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_ops.attentions.backends import PAD_SLOT_ID
 from atom.model_ops.embed_head import empty_token_ids
-from atom.model_ops.prefill_workspace import PrefillRequestLengths
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
 from atom.spec_decode.draft_kv import draft_kv_builder
 from atom.spec_decode.drafter import Drafter
@@ -306,23 +305,6 @@ class EagleProposer(Drafter):
         # The pass below is propose's i==0 step: same rows, same anchors.
         return True
 
-    def _prepare_prefill_workspace(self, forward_context) -> None:
-        """Own the current host lengths for both draft prefill entry points."""
-        if not self.speculative_config.draft_prefill_kv_workspace_mb:
-            return
-        context = forward_context.context
-        if not context.is_prefill or context.is_dummy_run:
-            return
-        metadata = forward_context.attn_metadata
-        if not metadata.has_cached:
-            return
-        count = context.scheduled_bs + 1
-        var = self.runner.forward_vars
-        metadata.prefill_request_lengths = PrefillRequestLengths(
-            tuple(map(int, var["cu_seqlens_q"].np[:count])),
-            tuple(map(int, var["cu_seqlens_k"].np[:count])),
-        )
-
     def compute_draft_kv(
         self,
         positions: torch.Tensor,
@@ -391,7 +373,6 @@ class EagleProposer(Drafter):
                 d_input_ids, d_positions, d_hidden
             )
 
-        self._prepare_prefill_workspace(forward_context)
         was_draft = context.is_draft
         context.is_draft = True
         try:
@@ -682,7 +663,6 @@ class EagleProposer(Drafter):
         if envs.ATOM_DEBUG_FORCE_SKIP_DRAFT_MODEL:
             draft_token_ids.fill_(-1)
         var = self.runner.forward_vars
-        self._prepare_prefill_workspace(forward_context)
         # Eaale3 only support mha currently
         draft_uses_mha = hasattr(self.runner, "draft_kv_builder")
 
