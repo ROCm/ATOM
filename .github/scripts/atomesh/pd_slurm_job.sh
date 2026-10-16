@@ -515,6 +515,16 @@ if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NOD
   # Use an explicit worker argument because the batch shell also has rank 0
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
+  # Spur can start the batch script before the controller marks the job
+  # RUNNING (a peer node still releasing its previous job). srun then fails
+  # with "job is not running (state: Pending)", the batch exits, and the job
+  # later turns RUNNING with no batch left to drive it. Wait it out first.
+  for _ in $(seq 1 120); do
+    job_state="$(scontrol show job "${JOB_ID}" 2>/dev/null | grep -oE 'JobState=[A-Z_]+' | cut -d= -f2 || true)"
+    [[ "${job_state}" == PENDING || "${job_state}" == CONFIGURING ]] || break
+    echo "[spur] job ${JOB_ID} state=${job_state}; waiting for RUNNING before dispatch"
+    sleep 5
+  done
   echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
   exec srun \
     --nodes="${NUM_NODES}" \
