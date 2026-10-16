@@ -250,7 +250,22 @@ class RuntimeWatchTests(unittest.TestCase):
                 SCRIPTS.parents[2] / "atom/model_engine/model_runner.py"
             ).read_text()
             runner.write_text(original_runner)
-            watch.prepare(source, runtime, output)
+            proposer = source / "atom/spec_decode/eagle_proposer.py"
+            proposer.parent.mkdir()
+            original_proposer = (
+                SCRIPTS.parents[2] / "atom/spec_decode/eagle_proposer.py"
+            ).read_text()
+            proposer.write_text(original_proposer)
+            with patch.dict(
+                sys.modules, {"minimax_bounded_gather": load("minimax_bounded_gather")}
+            ):
+                watch.prepare(source, runtime, output)
+            self.assertEqual(proposer.read_text(), original_proposer)
+            compile(
+                (runtime / "atom/spec_decode/eagle_proposer.py").read_text(),
+                "eagle_proposer.py",
+                "exec",
+            )
             self.assertEqual(runner.read_text(), original_runner)
             instrumented_runner = (
                 runtime / "atom/model_engine/model_runner.py"

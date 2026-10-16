@@ -283,6 +283,11 @@ def prepare(source, runtime, output):
     )
     instrument_gather(runtime / "atom/model_ops/attention_mha.py")
     instrument_kv_pool(runtime / "atom/model_engine/model_runner.py")
+    from minimax_bounded_gather import instrument
+
+    bounded_source = Path(__file__).with_name("minimax_bounded_gather.py").read_text()
+    (runtime / "atom/_ci_bounded_gather.py").write_text(bounded_source)
+    instrument(runtime)
     output.mkdir(parents=True, exist_ok=True)
     (output / "runtime-watch-source.py").write_text(helper)
     (output / "runtime-overlay.json").write_text(
