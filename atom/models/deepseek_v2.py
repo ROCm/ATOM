@@ -2421,6 +2421,17 @@ class Indexer(nn.Module):
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
+    def uses_logits_workspace(self) -> bool:
+        """Whether `forward_impl` hands `indexer_logits_ws` to the native op.
+
+        Plugins swap in their own op, and subclasses may override
+        `forward_impl`; neither takes the workspace.
+        """
+        return (
+            type(self).forward_impl is Indexer.forward_impl
+            and self.sparse_attn_indexer_impl is torch.ops.aiter.sparse_attn_indexer
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2549,7 +2560,7 @@ class Indexer(nn.Module):
             rotary_emb.is_neox_style,
             not unfused_qk_rope,
             self.stable_topk,
-            self.indexer_logits_ws,
+            *((self.indexer_logits_ws,) if self.uses_logits_workspace() else ()),
         )
 
 
