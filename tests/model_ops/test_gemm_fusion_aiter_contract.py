@@ -255,24 +255,112 @@ def test_real_matcher_builds_a_new_plan_per_call_but_the_site_keeps_one(real_gf,
     a._bindings[("probe",)] = "bound by prepare"
     assert ("probe",) not in b._bindings
 
-    # through the real site.resolve, the real matcher and a real wrapper around the real
-    # FusionResources. The site calls match_prefix(spec, ctx): a thin shim supplies the
-    # profile name (the site itself relies on aiter's default profile selection).
-    shim = types.SimpleNamespace(**{k: getattr(real_gf, k) for k in ATOM_GF_NAMES})
-    shim.match_prefix = lambda sp, c: real_match(sp, c, "minimax_m3_sp4_gfx950_v1")
-    shim.FusionResources = real_gf.FusionResources
-    monkeypatch.setattr(stages, "_aiter_override", shim)
+    # through the REAL runtime path: hooks.init_gemm_fusion(config) -> site.resolve, on the real
+    # aiter package, with NO shim and the profile env var unset (so only the config can supply it)
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
     w = FusionResourcesWrapper(None, 4, rank=0, inner=_real_inner(real_gf, _FakeBackend()),
                                reduce_min=lambda v: list(v), arch="gfx950", cu=256)
-    hooks.reset_for_tests(w)
+    hooks.reset_for_tests()
+    hooks.init_gemm_fusion(_config("minimax_m3_sp4_gfx950_v1"), None, resources=w)
     hooks.set_phase("preparing")
-    impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
-    site = site_mod.GemmFusionSite("t.qkv", SimpleNamespace(output_size=9216, input_size=6144),
-                                   list(spec.stages), None, attn=SimpleNamespace(impl=impl),
-                                   q_size=2048, kv_size=128, register=False)
-    site.spec = spec
+    site = _dense_site(spec)
     eager = site.resolve(64, "eager")
     capture = site.resolve(64, "capture")
     hooks.reset_for_tests()
     assert eager.plan is not None and eager.n_fused == 2 and eager.reason == "profile_hit"
     assert eager.plan is capture.plan  # one instance => one set of bindings for eager+capture+replay
+
+
+def _config(profile):
+    """What ModelRunner hands init_gemm_fusion: only ``config.gemm_fusion.profile`` matters."""
+    return SimpleNamespace(gemm_fusion=SimpleNamespace(profile=profile, enabled=bool(profile)))
+
+
+def _dense_site(spec):
+    from atom.model_ops.gemm_fusion import site as site_mod
+
+    impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
+    site = site_mod.GemmFusionSite("t.qkv", SimpleNamespace(output_size=9216, input_size=6144),
+                                   list(spec.stages), None, attn=SimpleNamespace(impl=impl),
+                                   q_size=2048, kv_size=128, register=False)
+    site.spec = spec
+    return site
+
+
+def _wrapper(real_gf):
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    return FusionResourcesWrapper(None, 4, rank=0, inner=_real_inner(real_gf, _FakeBackend()),
+                                  reduce_min=lambda v: list(v), arch="gfx950", cu=256)
+
+
+def test_runtime_path_takes_the_profile_from_config_not_from_the_environment(real_gf, monkeypatch):
+    """E2 gate failure (job-e2_new_on01): bind_kv_cache -> prepare_buckets -> site.resolve ->
+    match_prefix raised ProfileError 'no profile given and AITER_GEMM_FUSION_PROFILE is unset'
+    although --gemm-fusion-profile had been passed. Reproduces that path on the REAL aiter
+    package with the env var unset: init stores the config profile, bind_kv_cache's
+    profile_tokens and every resolve use it."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    spec_mod = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.specs")
+    hooks.reset_for_tests()
+    hooks.init_gemm_fusion(_config("minimax_m3_sp4_gfx950_v1"), None, resources=_wrapper(real_gf))
+    try:
+        assert hooks.profile() == "minimax_m3_sp4_gfx950_v1"
+        toks = hooks.profile_tokens(4)  # what bind_kv_cache enumerates; used to read the env
+        assert toks and all(t % 4 == 0 for t in toks)
+        assert 64 in toks and 128 in toks  # the small-M golden cells
+        hooks.set_phase("preparing")
+        r = _dense_site(spec_mod.sp_qkv_spec("dense")).resolve(64, "eager")
+        assert (r.reason, r.n_fused) == ("profile_hit", 2)
+    except ImportError as e:
+        pytest.skip(f"variants need the native stack to import: {e}")
+    finally:
+        hooks.reset_for_tests()
+
+
+def test_init_fails_fast_when_the_configured_profile_cannot_load(real_gf, monkeypatch):
+    """A bad --gemm-fusion-profile must stop start-up inside init_gemm_fusion (aiter's
+    ProfileError), before any CCO resource is built and long before bind_kv_cache."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    hooks.reset_for_tests()
+    built = []
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            built.append(1)
+
+    import atom.model_ops.gemm_fusion.resources as R
+
+    monkeypatch.setattr(R, "FusionResourcesWrapper", _Boom)
+    with pytest.raises(real_gf.ProfileError):
+        hooks.init_gemm_fusion(_config("no_such_profile_xyz"), None)
+    assert built == [] and hooks.resources() is None  # no resource was created
+    with pytest.raises(RuntimeError, match="no profile configured"):
+        hooks.profile()  # and nothing was stored
+
+
+def test_env_var_does_not_substitute_for_the_config_profile(real_gf, monkeypatch):
+    """With the env var SET to a valid profile but no config profile, ATOM must not silently
+    use it: that would mask a broken CLI -> runtime path (the very bug above)."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+
+    monkeypatch.setenv("AITER_GEMM_FUSION_PROFILE", "minimax_m3_sp4_gfx950_v1")
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    hooks.reset_for_tests(_wrapper(real_gf))
+    hooks._PROFILE = ""  # resources exist but init never recorded a profile
+    hooks.set_phase("preparing")
+    spec_mod = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.specs")
+    try:
+        with pytest.raises(RuntimeError, match="no profile configured"):
+            _dense_site(spec_mod.sp_qkv_spec("dense")).resolve(64, "eager")
+        with pytest.raises(RuntimeError, match="no profile configured"):
+            hooks.profile_tokens(4)
+    finally:
+        hooks.reset_for_tests()

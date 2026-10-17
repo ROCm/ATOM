@@ -79,6 +79,22 @@ def resources():
     return _RES
 
 
+def profile() -> str:
+    """The profile name/path from ``config.gemm_fusion.profile``, set by init.
+
+    Every ATOM call into aiter (``load_profile``, ``match_prefix``) passes THIS value
+    explicitly. aiter's own fallback to the ``AITER_GEMM_FUSION_PROFILE`` environment variable
+    is never relied on: a spawned worker has the pickled Config, not the launcher's env, and
+    an env-only profile would hide a broken CLI -> runtime path. Raises if none is set.
+    """
+    if not _PROFILE:
+        raise RuntimeError(
+            "gemm_fusion: no profile configured (config.gemm_fusion.profile / "
+            "--gemm-fusion-profile); refusing to fall back to AITER_GEMM_FUSION_PROFILE"
+        )
+    return _PROFILE
+
+
 def phase() -> str:
     return _PHASE
 
@@ -126,8 +142,11 @@ def init_gemm_fusion(config, sp_group, resources=None) -> None:
     from .stages import aiter_gf, sp_world
 
     gf = aiter_gf()
-    _PROFILE = config.gemm_fusion.profile
-    gf.load_profile(_PROFILE)  # fail fast on a missing/invalid profile
+    name = config.gemm_fusion.profile
+    # Fail fast, BEFORE any CCO resource exists: a missing/invalid profile must stop start-up
+    # here with aiter's ProfileError, not surface later inside bind_kv_cache.
+    gf.load_profile(name)
+    _PROFILE = name
     _RES = resources or FusionResourcesWrapper(sp_group, sp_world())
     _PHASE = "pre"
     logger.info("gemm_fusion ON profile=%s world=%d", _PROFILE, _RES.world)
@@ -139,7 +158,7 @@ def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = N
     from .stages import aiter_gf
 
     gf = aiter_gf()
-    prof = gf.load_profile(_PROFILE) if _PROFILE else gf.load_profile()
+    prof = gf.load_profile(profile())
     toks = set()
     for row in prof.rows():
         if row.world != world:
@@ -336,14 +355,16 @@ def shutdown(timeout_s: Optional[float] = None) -> None:
     _PHASE = "pre"
 
 
-def reset_for_tests(res: Optional[object] = None) -> None:
+def reset_for_tests(res: Optional[object] = None, profile: str = "test-profile") -> None:
+    """Reset module state. ``profile`` is what ``hooks.profile()`` returns while ``res`` is set
+    (the harness passes the one it loaded; unit tests with fakes keep the default)."""
     global _RES, _PROFILE, _KV, _PHASE, _BROKEN
     _SITES.clear()
     _PLANS.clear()
     DECISIONS.clear()
     _KV = None
     _RES = res
-    _PROFILE = ""
+    _PROFILE = profile if res is not None else ""
     _PHASE = "ready" if res is not None else "pre"
     _BROKEN = None
     _reset_step()

@@ -67,7 +67,7 @@ class FakeResources:
 
 
 def _fake_gf(res):
-    def match_prefix(spec, ctx):
+    def match_prefix(spec, ctx, profile=None):
         if res.raise_contract:
             raise FakeContractError("covered but contract fails")
         return res.plan_n
@@ -653,7 +653,7 @@ class _SigMatcher:
         self.sigs, self.asked = set(sigs), []
 
     def module(self):
-        def match_prefix(spec, ctx):
+        def match_prefix(spec, ctx, profile=None):
             for n in range(len(spec.stages), 0, -1):
                 sub = spec.prefix(n)
                 self.asked.append((n, sub.signature()))
@@ -842,7 +842,7 @@ def _fresh_plan_matcher():
     """match_prefix returns a NEW plan object on every call, exactly like the real matcher."""
     made = []
 
-    def match_prefix(spec, ctx):
+    def match_prefix(spec, ctx, profile=None):
         p = _BindingPlan()
         made.append(p)
         return p, 2

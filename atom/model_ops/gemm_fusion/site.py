@@ -202,7 +202,11 @@ class GemmFusionSite:
         contract_err = getattr(gf, "ContractError", ())
         errored, plan, n, msg = False, None, 0, ""
         try:
-            plan, n = gf.match_prefix(self.spec, res.match_ctx(res.local_m(tokens), graph_mode))
+            # profile passed EXPLICITLY (config.gemm_fusion.profile via hooks), never left to
+            # aiter's AITER_GEMM_FUSION_PROFILE env fallback (absent in spawned workers)
+            plan, n = gf.match_prefix(
+                self.spec, res.match_ctx(res.local_m(tokens), graph_mode), hooks.profile()
+            )
         except contract_err as e:  # covered but contract fails
             errored, msg = True, str(e)
         unsupported = False
