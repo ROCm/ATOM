@@ -242,7 +242,17 @@ def parameters(ua, x, case):
 
 
 def candidate(
-    ua, p, block_m, warps, stages, splits, matrix_size=0, waves=2, *, gluon=False
+    ua,
+    p,
+    block_m,
+    warps,
+    stages,
+    splits,
+    matrix_size=0,
+    waves=2,
+    warps_n=1,
+    *,
+    gluon=False,
 ):
     import torch
 
@@ -253,6 +263,7 @@ def candidate(
             {
                 "NUM_BUFFERS": stages,
                 "MFMA_DIM": matrix_size or 32,
+                "WARPS_N": warps_n,
                 "waves_per_eu": waves,
             },
             BLOCK_M=block_m,
@@ -371,10 +382,9 @@ def measure(fn):
 def configurations(microarchitecture=False, gluon=False):
     if gluon:
         return [
-            (bm, nw, buffers, 1, 32, waves)
-            for bm, nw in ((128, 4), (256, 8))
+            (bm, nw, buffers, 1, 32, 1, wn)
+            for bm, nw, wn in ((64, 4, 2), (128, 4, 2), (128, 8, 2), (64, 4, 4))
             for buffers in (1, 2)
-            for waves in (1,)
         ]
     if microarchitecture:
         # Compile-time MFMA layout and occupancy candidates for large-Q 2D.
@@ -403,6 +413,8 @@ def configuration_name(config, gluon=False):
     name = f"m{bm}-w{nw}-s{ns}-kv{splits}"
     if extra:
         name += f"-mfma{extra[0]}-waves{extra[1]}"
+    if len(extra) == 3:
+        name += f"-wn{extra[2]}"
     return name + ("-gluon" if gluon else "")
 
 
@@ -569,9 +581,9 @@ def main():
     args = parser.parse_args()
     Path(args.output).mkdir(parents=True, exist_ok=True)
     if args.mode == "candidate" and (
-        args.config is None or len(args.config) not in (4, 6)
+        args.config is None or len(args.config) not in (4, 6, 7)
     ):
-        parser.error("candidate --config needs four or six integers")
+        parser.error("candidate --config needs four, six or seven integers")
     if args.mode:
         worker(args)
         return
