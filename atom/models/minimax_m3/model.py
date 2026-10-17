@@ -33,6 +33,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops import gemm_fusion as _gemm_fusion
 from atom.model_ops.minimax_m3 import attention_fp8 as _attention_fp8
 from atom.model_ops.minimax_m3 import tp_o_proj as _tp_o_proj
 from atom.model_ops.minimax_m3.input_norm_fp8 import (
@@ -445,6 +446,9 @@ class MiniMaxM3Attention(nn.Module):
                 self.q_size, tp_replicated_o_proj=self.attn._m3_tp_replicated_o_proj
             )
         )
+        # GEMM fusion (default OFF -> None -> forward below is unchanged).
+        self.attn.qkv_site = None
+        _gemm_fusion.declare_m3_qkv_site(self, prefix=prefix, sparse=False)
 
     def forward(
         self,
@@ -452,6 +456,13 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.attn.qkv_site is not None:
+            # GEMM-fusion ON: one opaque op owns qkv_proj..attention; the site
+            # falls back to the identical native path where no profile row fits.
+            output, scale = torch.ops.aiter.gemm_fusion_qkv_attention(
+                hidden_states, hidden_states_scale, positions, self.attn.layer_name
+            )
+            return self.o_proj(output, x_scale=scale)
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return _minimax_m3_attend_and_project(
@@ -603,6 +614,9 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.q_size, tp_replicated_o_proj=self.attn._m3_tp_replicated_o_proj
             )
         )
+        # GEMM fusion (default OFF -> None -> forward below is unchanged).
+        self.attn.qkv_site = None
+        _gemm_fusion.declare_m3_qkv_site(self, prefix=prefix, sparse=True)
 
     def forward(
         self,
@@ -610,6 +624,12 @@ class MiniMaxM3SparseAttention(nn.Module):
         hidden_states: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.attn.qkv_site is not None:
+            # GEMM-fusion ON (see MiniMaxM3Attention.forward).
+            output, scale = torch.ops.aiter.gemm_fusion_qkv_attention(
+                hidden_states, hidden_states_scale, positions, self.attn.layer_name
+            )
+            return self.o_proj(output, x_scale=scale)
         # Keep index Q/K packed with main QKV. Layers that reuse cached top-k skip
         # the indexer norm/rope/top-k path, but still compute the packed GEMM.
         qkv = self.qkv_proj(hidden_states, x_scale=hidden_states_scale)

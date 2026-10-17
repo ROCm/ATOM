@@ -338,25 +338,22 @@ def ulysses_attention(
             spec.append((index_q_start + index_q_width, idx_dim, _REPLICATE))
         packed = _exchange_columns(qkv, spec, attn)
 
-    # Global positions and attention metadata exclude the divisibility pad.
-    real_tokens = positions.shape[-1]
-    padded_tokens = packed.shape[0]
-    if real_tokens < padded_tokens:
-        packed = packed[:real_tokens]
-
-    # Attention accepts column views, so avoid another Q/K/V copy.
     q_width = query.shape[-1] // w
     kv_width = key.shape[-1] // kv_shards
-    out = attn.impl.forward(
-        query=packed[:, :q_width],
-        key=packed[:, q_width : q_width + kv_width],
-        value=packed[:, q_width + kv_width : q_width + 2 * kv_width],
-        position=positions,
-        q_scale=q_scale,
-        # Preserve the caller's choice of fused or separate Q/K/V kernels.
-        qkv=packed if qkv is not None else None,
+    return attend_packed(
+        attn,
+        packed,
+        positions,
+        q_scale,
+        q_width,
+        kv_width,
+        fused_qkv=qkv is not None,
+        output_transform=output_transform,
     )
 
+
+def finish_attention(out, padded_tokens, real_tokens, output_transform=None):
+    """Re-pad attention output to the SP-divisible row count, then gather heads."""
     if real_tokens < padded_tokens:
         out = torch.cat(
             [out, out.new_zeros(padded_tokens - real_tokens, *out.shape[1:])], dim=0
@@ -364,3 +361,38 @@ def ulysses_attention(
     if output_transform is not None:
         return output_transform(out)
     return ulysses_gather_heads(out)
+
+
+def attend_packed(
+    attn,
+    packed,
+    positions,
+    q_scale,
+    q_width,
+    kv_width,
+    *,
+    fused_qkv,
+    output_transform=None,
+):
+    """Attention over exchanged rows (``[T_padded, packed_cols]``), then gather.
+
+    The tail of :func:`ulysses_attention`, shared so a caller that obtained the
+    exchanged rows another way (fused GEMM+exchange) runs identical code.
+    """
+    # Global positions and attention metadata exclude the divisibility pad.
+    real_tokens = positions.shape[-1]
+    padded_tokens = packed.shape[0]
+    if real_tokens < padded_tokens:
+        packed = packed[:real_tokens]
+
+    # Attention accepts column views, so avoid another Q/K/V copy.
+    out = attn.impl.forward(
+        query=packed[:, :q_width],
+        key=packed[:, q_width : q_width + kv_width],
+        value=packed[:, q_width + kv_width : q_width + 2 * kv_width],
+        position=positions,
+        q_scale=q_scale,
+        # Preserve the caller's choice of fused or separate Q/K/V kernels.
+        qkv=packed if fused_qkv else None,
+    )
+    return finish_attention(out, padded_tokens, real_tokens, output_transform)

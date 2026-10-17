@@ -228,6 +228,77 @@ class PagedAttentionImpl(nn.Module):
 
         return o
 
+    def forward_after_prologue(
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        index_q=None,
+    ):
+        """``forward_impl`` after ``rope_cache``: the caller already wrote the
+        KV (and index) caches and produced the normed+roped ``q``.
+
+        Identical tail to ``forward_impl`` (dispatch_backend -> backend -> view)
+        so the fused GEMM prologue path cannot diverge from the native path.
+        ``index_q`` is only meaningful for the sparse impl.
+        """
+        q = q.view(-1, self.num_heads, self.head_dim)
+        if k is not None:
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+        if v is not None:
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+        attn_impl = self.dispatch_backend(fwd_ctx, q, k, v)
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+        return o.view(-1, self.num_heads * self.head_dim)
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext):
+        """Caches + metadata a fused GEMM prologue needs, mirroring what
+        ``rope_cache`` resolves on the Gemma/Triton norm-rope-cache path.
+
+        Returns ``None`` when this layer's native prologue is not the Triton
+        GemmaRMSNorm one (a fused prologue then has no equivalent semantics).
+        Also pins the same impl state ``rope_cache`` pins on that path.
+        """
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
+        if not (
+            not use_triton_attn
+            and self.rotary_emb is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+        ):
+            return None
+        self.use_triton_attn = use_triton_attn
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache = layer.k_cache, layer.v_cache
+        x = 16 // k_cache.element_size()
+        if k_cache.dim() == 5 and v_cache.dim() == 4:
+            n, nh, hd, bs = v_cache.shape
+            v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+        else:
+            v_cache_shuffle = v_cache
+        self._cache_format = "SHUFFLE"
+        return {
+            "k_cache": k_cache,
+            "v_cache": v_cache,  # what the backend receives (rope_cache returns it)
+            "v_cache_shuffle": v_cache_shuffle,  # what the prologue writes
+            "k_scale": layer.k_scale,
+            "v_scale": layer.v_scale,
+            "slot_mapping": fwd_ctx.attn_metadata.slot_mapping,
+            "norm_w": (self.q_norm.weight, self.k_norm.weight),
+            "cos_sin": self.rotary_emb.cos_sin_cache,
+        }
+
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         attn_metadata = fwd_ctx.attn_metadata
@@ -1286,6 +1357,80 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
             v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
         return k16, v16, k_scale, v_scale
+
+    def forward_after_prologue(
+        self,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        fwd_ctx: ForwardContext,
+        index_q=None,
+    ):
+        """Continue from ``rope_cache``'s result (caller wrote KV/index caches).
+
+        Restores the per-forward state ``rope_cache`` leaves for
+        ``dispatch_backend``: ``_index_q`` (``None`` on skip-index layers) and
+        ``_index_q_cache_key_info`` exactly as the corresponding rope_cache
+        branch sets them. ``k``/``v`` are unused by the sparse backends.
+        """
+        num_tokens = q.shape[0]
+        if self.skip_index_topk or index_q is None:
+            # Skip-index branch of rope_cache (qkv.dtype == q.dtype here).
+            self._index_q = None
+            self._index_q_cache_key_info = (
+                (num_tokens, self.num_idx_heads, self.index_head_dim),
+                q.dtype,
+                q.device,
+            )
+        else:
+            self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
+            self._index_q_cache_key_info = (
+                tuple(self._index_q.shape),
+                self._index_q.dtype,
+                self._index_q.device,
+            )
+        return super().forward_after_prologue(
+            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+        )
+
+    def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext):
+        """Caches + metadata for a fused prologue, as ``rope_cache`` resolves
+        them (page-16 SHUFFLE re-view, sparse slot mapping, M3 cos/sin)."""
+        layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+            layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
+        )
+        self.use_triton_attn = False
+        self._cache_format = "SHUFFLE"
+        attn_metadata = fwd_ctx.attn_metadata
+        sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
+        if sparse_metadata is None:
+            sparse_metadata = attn_metadata
+        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
+
+        is_fp8 = self.kv_cache_dtype == "fp8"
+        meta = {
+            "k_cache": k_cache,
+            "v_cache": v_cache,
+            "k_scale": k_scale if is_fp8 else None,
+            "v_scale": v_scale if is_fp8 else None,
+            "k_scale_view": k_scale,
+            "v_scale_view": v_scale,
+            "slot_mapping": sparse_metadata.slot_mapping,
+            "norm_w": (self.q_norm.weight, self.k_norm.weight),
+            "cos_sin": _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight),
+        }
+        if not self.skip_index_topk:
+            meta["index_cache"] = self.index_cache
+            meta["index_norm_w"] = (self.index_q_norm.weight, self.index_k_norm.weight)
+            meta["index_cache_dtype"] = (
+                self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
+            )
+        return meta
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):

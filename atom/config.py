@@ -1639,6 +1639,40 @@ class DSparkConfig:
 
 
 @dataclass
+class GemmFusionConfig:
+    """GEMM-fusion runtime switch (see ``atom/model_ops/gemm_fusion``).
+
+    ``profile`` names an immutable aiter fusion profile
+    (``aiter/configs/gemm_fusion/<profile>.json``). Empty (the default) means
+    OFF: no site is declared, no resource is allocated, and every model runs
+    the code it ran before this feature existed.
+    """
+
+    profile: str = ""
+
+    def __post_init__(self):
+        if not isinstance(self.profile, str):
+            raise ValueError("gemm_fusion.profile must be a string")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.profile)
+
+    @classmethod
+    def from_dict(cls, cfg: dict | None) -> "GemmFusionConfig":
+        """Build from the ``--gemm-fusion-config`` JSON dict; unknown keys raise."""
+        cfg = cfg or {}
+        allowed = {f.name for f in fields(cls)}
+        unknown = set(cfg) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown --gemm-fusion-config key(s): {sorted(unknown)}. "
+                f"Supported keys: {sorted(allowed)}"
+            )
+        return cls(**cfg)
+
+
+@dataclass
 class EPLBConfig:
     """EPLB sub-config (vLLM-style: enable + config object)."""
 
@@ -2076,6 +2110,8 @@ class Config:
     # EngineArgs) and pickled into every worker. Read sites use `config.dspark.*`
     # (no os.environ lookups). Defaults to all-off.
     dspark: DSparkConfig = field(default_factory=DSparkConfig)
+    # GEMM-fusion switch. Default OFF (empty profile): behavior is unchanged.
+    gemm_fusion: GemmFusionConfig = field(default_factory=GemmFusionConfig)
 
     enable_tbo: bool = False
     enable_tbo_decode: bool = False
@@ -2940,6 +2976,11 @@ class Config:
             # Automatic FP8 dispatch changes the attention output schema to
             # (activation, scale). Do not reuse graphs from older SP paths.
             factors.append("ulysses_sp_v2")
+        if self.gemm_fusion.enabled:
+            # An enabled profile moves the QKV GEMM inside the attention op
+            # and changes its schema; never share artifacts with the OFF path.
+            # Appended only when ON so OFF hashes stay byte-identical.
+            factors.append(("gemm_fusion", self.gemm_fusion.profile))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
