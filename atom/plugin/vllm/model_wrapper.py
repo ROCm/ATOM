@@ -374,13 +374,13 @@ def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
     take the adapter's block size, which is the grid vLLM's own validity test
     measures against.
     """
-    import os
-
-    if os.environ.get("ATOM_V41_STATE_CHECKPOINTS") not in ("1", "true", "True"):
-        return
     from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
         register_deepseek_v41_state_checkpoint_layers,
+        v41_state_checkpoints_requested,
     )
+
+    if not v41_state_checkpoints_requested():
+        return
 
     register_deepseek_v41_state_checkpoint_layers(vllm_config)
 

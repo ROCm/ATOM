@@ -235,10 +235,16 @@ def _v41_state_checkpoints_configured(vllm_config) -> bool:
     try:
         from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
             register_v41_state_checkpoint_adapter,
+            v41_state_checkpoints_requested,
         )
         from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
 
-        return bool(
+        # Both, not either. `state_checkpoints_on` is true for any V4.1 run
+        # with prefix caching, but the checkpoint layers are registered only
+        # when the switch asks for them; without it there are no checkpoint
+        # groups and nothing restores STATE, which is exactly the run this
+        # refusal exists to stop.
+        return v41_state_checkpoints_requested() and bool(
             state_checkpoints_on(register_v41_state_checkpoint_adapter(), vllm_config)
         )
     except Exception:  # noqa: BLE001 - absence means the mechanism is off

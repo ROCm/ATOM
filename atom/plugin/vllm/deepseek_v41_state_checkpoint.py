@@ -256,6 +256,20 @@ class AtomDeepseekV41StateCheckpointLayer(PagedStateCheckpointLayer):
         )
 
 
+def v41_state_checkpoints_requested() -> bool:
+    """Whether this run registers V4.1's state-checkpoint layers.
+
+    The one owner of `ATOM_V41_STATE_CHECKPOINTS`. Both the model wrapper,
+    which registers the layers, and the platform gate, which admits prefix
+    caching on the promise that they exist, read it here -- two readings of
+    one switch are two answers waiting to disagree, and the disagreement is a
+    platform that admits prefix caching for a pool with no checkpoint groups.
+    """
+    import os
+
+    return os.environ.get("ATOM_V41_STATE_CHECKPOINTS") in ("1", "true", "True")
+
+
 def register_deepseek_v41_state_checkpoint_layers(vllm_config) -> list[str]:
     return register_state_checkpoint_layers(
         register_v41_state_checkpoint_adapter(),
