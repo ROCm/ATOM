@@ -328,13 +328,36 @@ def measure(fn):
     return {"median_ms": statistics.median(results), "samples_ms": results}
 
 
+def configurations():
+    # Do not rerun the gfx950 4-warp split configurations already rejected by
+    # numerical checks or device faults. New candidates run in separate processes.
+    return [
+        (16, 2, 2, 1),
+        (32, 2, 1, 1),
+        (64, 4, 1, 1),
+        (128, 4, 1, 1),
+        (256, 8, 1, 1),
+        *[
+            (bm, 2, stages, split)
+            for bm, stages in ((16, 2), (32, 1), (64, 1), (128, 1))
+            for split in (4, 16)
+        ],
+    ]
+
+
+def configuration_name(config):
+    bm, nw, ns, splits = config
+    return f"m{bm}-w{nw}-s{ns}-kv{splits}"
+
+
 def worker(args):
     import torch
 
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     ua = importlib.import_module("aiter.ops.triton.attention.unified_attention")
-    result_path = Path(args.output) / f"{args.mode}-{args.shard}.jsonl"
+    variant = configuration_name(args.config) if args.mode == "candidate" else args.mode
+    result_path = Path(args.output) / f"{variant}-{args.shard}.jsonl"
 
     def record(row):
         with result_path.open("a") as f:
@@ -351,13 +374,20 @@ def worker(args):
     for idx, case in enumerate(cases()):
         if idx % args.shards != args.shard:
             continue
+        if (
+            args.mode == "candidate"
+            and max(case["q_lens"]) == 1
+            and args.config[0] > 16
+        ):
+            continue
         x = fixture(case)
         selected, reference = reference_rows(x, case)
         call = lambda x=x, case=case: public_call(ua, x, case)
         call()
         torch.testing.assert_close(x["out"][selected], reference, atol=0.003, rtol=0.03)
         expected = x["out"].clone()
-        record(dict(case=case, variant=args.mode, accuracy="passed", **measure(call)))
+        if args.mode != "candidate":
+            record(dict(case=case, variant=variant, accuracy="passed", **measure(call)))
         if args.mode == "new":
             gather = gather_call(x, case)
             gathered = gather()
@@ -374,76 +404,69 @@ def worker(args):
                 )
             )
             del gathered, gather
+        elif args.mode == "candidate":
             p = parameters(ua, x, case)
-            tiles = [
-                (16, 2, 2),
-                (32, 2, 1),
-                (64, 4, 1),
-                (64, 4, 2),
-                (128, 4, 1),
-                (128, 4, 2),
-                (128, 8, 2),
-                (256, 8, 1),
-            ]
-            for bm, nw, ns in tiles:
-                if max(case["q_lens"]) == 1 and bm > 16:
-                    continue
-                for splits in (1, 4, 16):
-                    fn = candidate(ua, p, bm, nw, ns, splits)
-                    try:
-                        fn()
-                    except Exception as exc:
-                        if type(exc).__name__ != "OutOfResources":
-                            raise
-                        record(
-                            {
-                                "case": case,
-                                "variant": f"m{bm}-w{nw}-s{ns}-kv{splits}",
-                                "skipped": "OutOfResources",
-                                "detail": str(exc),
-                            }
-                        )
-                        del fn
-                        continue
-                    try:
-                        torch.testing.assert_close(
-                            x["out"], expected, atol=0.003, rtol=0.03
-                        )
-                        torch.testing.assert_close(
-                            x["out"][selected], reference, atol=0.003, rtol=0.03
-                        )
-                    except AssertionError as exc:
-                        # A tuning candidate is not a production configuration.
-                        # Never time it or select it when any shape is wrong.
-                        record(
-                            dict(
-                                case=case,
-                                variant=f"m{bm}-w{nw}-s{ns}-kv{splits}",
-                                accuracy="failed",
-                                detail=str(exc),
-                            )
-                        )
-                        del fn
-                        continue
-                    record(
-                        dict(
-                            case=case,
-                            variant=f"m{bm}-w{nw}-s{ns}-kv{splits}",
-                            accuracy="passed",
-                            **measure(fn),
-                        )
+            fn = candidate(ua, p, *args.config)
+            record(dict(case=case, variant=variant, phase="candidate-start"))
+            try:
+                fn()
+            except Exception as exc:
+                if type(exc).__name__ != "OutOfResources":
+                    raise
+                record(
+                    dict(
+                        case=case,
+                        variant=variant,
+                        skipped="OutOfResources",
+                        detail=str(exc),
                     )
-                    del fn
-            del p
+                )
+                return
+            try:
+                torch.testing.assert_close(x["out"], expected, atol=0.003, rtol=0.03)
+                torch.testing.assert_close(
+                    x["out"][selected], reference, atol=0.003, rtol=0.03
+                )
+            except AssertionError as exc:
+                record(
+                    dict(case=case, variant=variant, accuracy="failed", detail=str(exc))
+                )
+                # End this isolated process; do not run another shape after a
+                # potentially corrupting candidate or reuse its CUDA context.
+                return
+            record(dict(case=case, variant=variant, accuracy="passed", **measure(fn)))
+            del fn, p
         del call, x, expected, reference
         torch.cuda.empty_cache()
+
+
+def write_sweep_summary(output, rejected):
+    """Keep all medians and correctness gates in a small API-readable snapshot."""
+    measurements = {}
+    for path in sorted(Path(output).glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            row = json.loads(line)
+            if "case" not in row:
+                continue
+            key = (row["case"]["id"], row["variant"])
+            measurements[key] = {
+                "case_id": key[0],
+                **{k: v for k, v in row.items() if k not in ("case", "samples_ms")},
+            }
+    summary = {
+        "cases": cases(),
+        "measurements": list(measurements.values()),
+        "rejected_configs": list(rejected),
+    }
+    Path(output, "sweep-summary.json").write_text(json.dumps(summary) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--baseline-source")
-    parser.add_argument("--mode", choices=["old", "new"])
+    parser.add_argument("--mode", choices=["old", "new", "candidate"])
+    parser.add_argument("--config", type=int, nargs=4)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=8)
     args = parser.parse_args()
@@ -459,7 +482,12 @@ def main():
         / "op_tests/triton_tests/attention/test_unified_attention_scale_cache.py"
     )
     subprocess.run([sys.executable, str(check)], check=True)
-    for mode in ["old", "new"]:
+    rejected = {}
+    plan = [("old", None), ("new", None)] + [
+        ("candidate", config) for config in configurations()
+    ]
+    for mode, config in plan:
+        variant = configuration_name(config) if config else mode
         with ExitStack() as logs:
             procs = []
             for shard in range(args.shards):
@@ -470,7 +498,7 @@ def main():
                         args.baseline_source + ":" + env.get("PYTHONPATH", "")
                     )
                 log = logs.enter_context(
-                    (Path(args.output) / f"{mode}-{shard}.log").open("w")
+                    (Path(args.output) / f"{variant}-{shard}.log").open("w")
                 )
                 command = [
                     sys.executable,
@@ -484,15 +512,37 @@ def main():
                     "--shards",
                     str(args.shards),
                 ]
+                if config:
+                    command += ["--config", *map(str, config)]
                 procs.append(
                     subprocess.Popen(
                         command, env=env, stdout=log, stderr=subprocess.STDOUT
                     )
                 )
             status = [p.wait() for p in procs]
-            if any(status):
+            write_sweep_summary(args.output, rejected)
+            if mode != "candidate" and any(status):
                 raise RuntimeError(f"{mode} workers failed: {status}; see per-GPU logs")
-    print("[paged-prefill-tune] all numerical checks and timings complete", flush=True)
+            if mode == "candidate":
+                reasons = []
+                if any(status):
+                    reasons.append({"worker_exit_codes": status})
+                for result in Path(args.output).glob(f"{variant}-*.jsonl"):
+                    for line in result.read_text().splitlines():
+                        row = json.loads(line)
+                        if row.get("accuracy") == "failed" or row.get("skipped"):
+                            reasons.append(row)
+                if reasons:
+                    rejected[variant] = reasons
+                    print(f"[paged-prefill-tune] rejected {variant}", flush=True)
+                (Path(args.output) / "rejected-configs.json").write_text(
+                    json.dumps(rejected, indent=2) + "\n"
+                )
+                write_sweep_summary(args.output, rejected)
+    print(
+        "[paged-prefill-tune] default/reference gates passed; isolated candidate sweep complete",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@ ROOTS = (
 PATTERNS = (
     "slurm_job-*/benchmark_results/paged-prefill-tuning/*.log",
     "slurm_job-*/benchmark_results/paged-prefill-tuning/*.jsonl",
+    "slurm_job-*/benchmark_results/paged-prefill-tuning/rejected-configs.json",
+    "slurm_job-*/benchmark_results/paged-prefill-tuning/sweep-summary.json",
     "slurm-*.out",
     "slurm-*.err",
     "slurm_job-*/rank-*/*.log",
@@ -155,7 +157,7 @@ def collect(target, output, *, roots=ROOTS):
                     ):
                         continue
                     seen.add(resolved)
-                    if used >= MAX_TOTAL_BYTES or len(manifest["files"]) >= 200:
+                    if used >= MAX_TOTAL_BYTES or len(manifest["files"]) >= 512:
                         manifest["limit_reached"] = True
                         break
                     relative = path.relative_to(source)
@@ -192,18 +194,35 @@ def collect(target, output, *, roots=ROOTS):
 
 def emit_log_annotations(output):
     """Provide a bounded API-readable fallback when blob downloads are unavailable."""
-    selected = [
-        path
-        for path in sorted(output.rglob("*"))
-        if path.is_file()
-        and (path.name == "container.log" or "paged-prefill-tuning" in path.parts)
-    ]
+    selected = []
+    for path in sorted(output.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name in ("container.log", "sweep-summary.json"):
+            selected.append(path)
+        elif "paged-prefill-tuning" in path.parts and path.suffix == ".log":
+            tail = path.read_text(errors="replace")[-16000:]
+            if any(
+                marker in tail
+                for marker in (
+                    "Traceback",
+                    "Memory access fault",
+                    '"accuracy": "failed"',
+                )
+            ):
+                selected.append(path)
+    selected.sort(
+        key=lambda path: (
+            path.name not in ("sweep-summary.json", "container.log"),
+            str(path),
+        )
+    )
     for log_limit, result_limit in ((16000, 80000), (4000, 16000), (1000, 4000)):
         files, tails = {}, []
         for path in selected[:40]:
             relative = str(path.relative_to(output))
             raw = path.read_text(errors="replace")
-            limit = result_limit if path.suffix == ".jsonl" else log_limit
+            limit = len(raw) if path.name == "sweep-summary.json" else log_limit
             files[relative] = raw[-limit:]
             if len(raw) > limit:
                 tails.append(relative)
