@@ -1,6 +1,7 @@
 """Read only this run's peer failure and cleanup acknowledgements."""
 
 import argparse
+import errno
 import json
 import sys
 from pathlib import Path
@@ -10,6 +11,18 @@ def load(path):
     try:
         return json.loads(path.read_text())
     except FileNotFoundError:
+        return None
+    except OSError as error:
+        if error.errno != errno.ESTALE:
+            raise
+        # NFS can briefly expose a stale handle while a peer replaces its
+        # acknowledgement. Leave the state unverified so the caller's bounded
+        # polling loop reopens the file and checks its run identity again.
+        print(
+            f"[pd.cleanup-state] transient ESTALE reading {path.name}; "
+            "acknowledgement remains unverified",
+            file=sys.stderr,
+        )
         return None
 
 
