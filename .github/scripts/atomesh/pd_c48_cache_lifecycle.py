@@ -354,6 +354,15 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
         finally:
             stream.close()
 
+    original_shutdown = scheduler.shutdown
+
+    def shutdown(*args, **kwargs):
+        try:
+            return original_shutdown(*args, **kwargs)
+        finally:
+            close()
+
+    scheduler.shutdown = shutdown
     atexit.register(close)
     scheduler._c48_cache_lifecycle = probes, close
     return scheduler._c48_cache_lifecycle
