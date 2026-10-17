@@ -1,0 +1,16 @@
+{
+  "name": "simple_cpu_offload_refresh_gpu_hit_attention_prefix",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "Eager mode: once per request, move CPU copies of every GPU-hit full-attention prefix block to the MRU end of the CPU LRU; Mamba states are not refreshed"
+  ],
+  "cases": ["V-QD-CPUREF2-LPT3072"],
+  "files": [
+    {
+      "relative_path": "v1/simple_kv_offload/manager.py",
+      "mount_source": "manager.py",
+      "base_sha256": "3d076547bc16729e1c91238315c384fcfddf9cfd1f1e418d430ae542b7b8e1e5",
+      "patched_sha256": "76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c"
+    }
+  ]
+}

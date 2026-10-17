@@ -25,11 +25,20 @@ c48_append_port_mount() {
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
-  [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == V-QD-CPUREF ]] || return 0
-  c48_fix_source="$1/.github/benchmark/c48-model-gap/cpu-lru-refresh/manager.py"
+  local c48_fix_dir c48_fix_sha
+  case "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" in
+    V-QD-CPUREF)
+      c48_fix_dir=cpu-lru-refresh
+      c48_fix_sha=7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea ;;
+    V-QD-CPUREF2-LPT3072)
+      c48_fix_dir=cpu-lru-refresh-v2
+      c48_fix_sha=76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c ;;
+    *) return 0 ;;
+  esac
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_fix_dir}/manager.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/v1/simple_kv_offload/manager.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "${c48_fix_sha}" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }

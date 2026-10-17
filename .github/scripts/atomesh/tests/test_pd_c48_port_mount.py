@@ -10,6 +10,7 @@ import unittest
 REPO = Path(__file__).resolve().parents[4]
 SCRIPT = REPO / ".github/scripts/atomesh/pd_c48_port_mount.sh"
 MANAGER = "/vllm/v1/simple_kv_offload/manager.py,readonly"
+CPUREF = {"V-QD-CPUREF": "cpu-lru-refresh", "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2"}
 
 
 def mounts(case, root=REPO):
@@ -27,19 +28,23 @@ class PortMountTest(unittest.TestCase):
         rc, base = mounts("V-QD")
         self.assertEqual((rc, len(base)), (0, 3))
         self.assertFalse(any(a.endswith(MANAGER) for a in base))
-        rc, cpuref = mounts("V-QD-CPUREF")
-        self.assertEqual(rc, 0)
-        self.assertEqual(cpuref[:3], base)
-        self.assertTrue(cpuref[3].endswith(MANAGER))
+        self.assertEqual(mounts("V-QD-LPT3072"), (0, base))
+        for case, fix_dir in CPUREF.items():
+            rc, cpuref = mounts(case)
+            self.assertEqual(rc, 0)
+            self.assertEqual(cpuref[:3], base)
+            self.assertTrue(cpuref[3].endswith(MANAGER))
+            self.assertIn(f"/c48-model-gap/{fix_dir}/manager.py,", cpuref[3])
 
     def test_cpuref_rejects_changed_manager(self):
-        with tempfile.TemporaryDirectory() as temp:
-            gap = Path(temp) / ".github/benchmark/c48-model-gap"
-            shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
-            with open(gap / "cpu-lru-refresh/manager.py", "a") as f:
-                f.write("\n")
-            self.assertEqual(mounts("V-QD", temp)[0], 0)
-            self.assertEqual(mounts("V-QD-CPUREF", temp)[0], 2)
+        for case, fix_dir in CPUREF.items():
+            with tempfile.TemporaryDirectory() as temp:
+                gap = Path(temp) / ".github/benchmark/c48-model-gap"
+                shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+                with open(gap / fix_dir / "manager.py", "a") as f:
+                    f.write("\n")
+                self.assertEqual(mounts("V-QD", temp)[0], 0)
+                self.assertEqual(mounts(case, temp)[0], 2)
 
 
 if __name__ == "__main__":
