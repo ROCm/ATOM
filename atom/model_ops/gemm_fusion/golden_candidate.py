@@ -123,6 +123,7 @@ def _site_for(case, comm):
             q_size=8192 // WORLD, kv_size=512 // WORLD,
             index_q_size=128 if sparse else 0, index_k_size=128 if sparse else 0,
             sparse=sparse, skip_index=(mode == "reuse"),
+            bind_mode="direct",  # case tensors are address-stable (refresh_input keeps them)
         )
         ent = _SITES[key] = (site, holder, attn)
     ent[1].case = case
@@ -149,12 +150,18 @@ def prepare_cases(cases, comm):
         site.resolve(c.spec.padded_tokens, graph_mode="eager")
     hooks.resources().finalize()
     for (site, _, _), c in zip(ents, cases):
-        if c.spec.padded_tokens == c.spec.tokens:
-            site.prepare_bucket(
-                c.spec.padded_tokens, c.x.device,
-                {"layer_0": SimpleNamespace(**{k: c.caches[k] for k in ("k_cache", "v_cache", "k_scale", "v_scale")})},
-                torch.bfloat16,
-            )
+        sp = c.spec
+        site.prepare_bucket(
+            sp.padded_tokens, c.x.device, None, torch.bfloat16,
+            pad_rows=sp.padded_tokens != sp.tokens,
+            # direct bind: the case's own tensors, no staging copies
+            direct={
+                "x_scale": c.x_scale,
+                "positions": c.positions,
+                "slot_mapping": c.slot_mapping,
+                "state": _caches_state(c, c.slot_mapping),
+            },
+        )
 
 
 def decisions():

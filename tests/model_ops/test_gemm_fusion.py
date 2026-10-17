@@ -217,6 +217,59 @@ def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
     assert s._fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
 
 
+def _direct_fixture(make_site):
+    import torch
+
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    s.bind_mode = "direct"
+    t = dict(
+        x=torch.zeros((16, 8), dtype=torch.float8_e4m3fn),
+        xs=torch.zeros((16, 1), dtype=torch.float32),
+        pos=torch.arange(64),
+        slot=torch.arange(64),
+        kc=torch.zeros(4), vc=torch.zeros(4), ks=torch.zeros(4), vs=torch.zeros(4),
+    )
+    state = {"slot_mapping": t["slot"], "k_cache": t["kc"], "v_cache": t["vc"],
+             "k_scale": t["ks"], "v_scale": t["vs"]}
+    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
+                          positions=t["pos"], prologue_state=lambda: state)
+    return s, t, state, ctx
+
+
+def test_direct_mode_unprepared_or_moved_pointer_is_rebind_needed(make_site):
+    import torch
+
+    s, t, state, ctx = _direct_fixture(make_site)
+    # never prepared -> never lazily bind, never stale
+    r, reason, _, _ = s._prepare(ctx, t["x"], t["xs"])
+    assert (r.plan, reason) == (None, "rebind_needed")
+    # prepared with these addresses -> fused, no staging copies
+    st = SimpleNamespace(prepared=True, ptrs=s._live_ptrs(t["xs"], t["pos"], state))
+    s._staging[64] = st
+    r, reason, _, got = s._prepare(ctx, t["x"], t["xs"])
+    assert r.plan is not None and got is st
+    # same shape, different address (e.g. refresh_input replaced the tensor)
+    moved = torch.zeros((16, 1), dtype=torch.float32)
+    r, reason, _, _ = s._prepare(ctx, t["x"], moved)
+    assert (r.plan, reason) == (None, "rebind_needed")
+    ctx.positions = torch.arange(64)
+    r, reason, _, _ = s._prepare(ctx, t["x"], t["xs"])
+    assert (r.plan, reason) == (None, "rebind_needed")
+
+
+def test_bind_mode_validated_and_recorded(make_site):
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    assert s.bind_mode == "staged"
+    with pytest.raises(ValueError):
+        site_mod.GemmFusionSite("x", SimpleNamespace(output_size=1, input_size=1), [], None,
+                                attn=SimpleNamespace(), q_size=1, kv_size=1, bind_mode="bogus")
+    ctx = SimpleNamespace(padded_tokens=64)
+    d = s._decision(ctx, site_mod.Resolution(FakePlan(), 2, "v", ""), "profile_hit", "fused")
+    assert d.bind_mode == "staged"
+    d1 = s._decision(ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused")
+    assert d1.bind_mode == "raw"
+
+
 def test_resolve_after_finalize_without_windows_is_native(make_site):
     res = FakeResources(plan_n=(FakePlan(), 2))
     res.can_ensure = lambda plan: False
