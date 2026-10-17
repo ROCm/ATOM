@@ -1124,3 +1124,35 @@ def test_stock_moe_forward_still_lacks_x_scale_so_the_dense_default_is_still_nee
     assert "x_scale" not in moe_cls
     mlp_cls = src.split("class MiniMaxM3MLP", 1)[1].split("class MiniMaxM3MoE", 1)[0]
     assert "x_scale: torch.Tensor | None = None" in mlp_cls  # the dense path accepts it
+
+def test_m3_smoke_serve_env_sets_the_flag_the_real_m3_recipes_require():
+    """E2 job-e2_new_on03: without ATOM_FORCE_ATTN_TRITON=1 stock decode runs the ASM paged-attention
+    kernel and aborts (no heuristic kernel for bf16 q / fp8 kv / gqa 16 / block 128). The smoke
+    launch must carry the flag, pinned to ATOM's own recipe text, and the coverage consequence
+    must stay visible."""
+    from pathlib import Path
+
+    m = _load_m3_smoke("m3_smoke_env")
+    assert m.serve_env()["ATOM_FORCE_ATTN_TRITON"] == "1"
+    assert m.serve_env({"X": "1"})["X"] == "1" and m.serve_env()["ATOM_FORCE_ATTN_TRITON"] == "1"
+    root = Path(__file__).resolve().parents[2]
+    recipe = (root / "recipes/MiniMax-M3-Agentic-InferenceX.md").read_text(encoding="utf-8")
+    assert "ATOM_FORCE_ATTN_TRITON=1" in recipe and "is not optional" in recipe
+    envs_src = (root / "atom/utils/envs.py").read_text(encoding="utf-8")
+    assert '"ATOM_FORCE_ATTN_TRITON"' in envs_src
+    assert "dense" in m.serve_env.__doc__ and "NOT fused" in m.serve_env.__doc__
+
+
+def test_force_attn_triton_makes_the_dense_prologue_ineligible_but_not_the_sparse_one():
+    """The coverage consequence of the env above, pinned to the real source: the dense impl's
+    eligibility reads ATOM_FORCE_ATTN_TRITON; the sparse override is unconditional. So under
+    the required M3 env only SPARSE layers can fuse in a real model run."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py").read_text(encoding="utf-8")
+    dense = src.split("def gemm_fusion_prologue_supported", 1)[1].split("def gemm_fusion_prologue_state", 1)[0]
+    assert "envs.ATOM_FORCE_ATTN_TRITON" in dense and "use_triton_attn" in dense
+    sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
+    body = sparse.split("def gemm_fusion_prologue_supported", 1)[1].split("def ", 1)[0]
+    assert "ATOM_FORCE_ATTN_TRITON" not in re.sub(r'""".*?"""', "", body, flags=re.S) and "return True" in body

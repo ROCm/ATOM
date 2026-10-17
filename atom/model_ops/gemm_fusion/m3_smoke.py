@@ -213,6 +213,29 @@ def serve_args(model_dir, *, level=3, profile="", enforce_eager=False, sp=4, ext
 FAULT_ENV = "ATOM_GEMM_FUSION_FAULT"  # see faults.py for kinds
 
 
+def serve_env(extra=None):
+    """Process environment the M3 launch needs, as ATOM's own M3 recipes set it.
+
+    ``ATOM_FORCE_ATTN_TRITON=1`` is REQUIRED for M3 decode (recipes/MiniMax-M3-Agentic-
+    InferenceX.md: "Without it decode routes to the ASM paged-attention kernel ... and the
+    server dies at startup"). E2 job-e2_new_on03 launched without it and aborted (exit -6) in
+    aiter asm_pa.cu:162 ``get_heuristic_kernel: cannot get heuristic kernel! q_type:bf16
+    kv_type:fp8 gqa:16 ... block_size:128`` during the bs=1 decode CUDA-graph capture. That is
+    the stock dense-layer decode, with gemm_fusion not involved. ``--enforce-eager`` would NOT
+    help: eager decode calls the same kernel.
+
+    CONSEQUENCE FOR COVERAGE: the dense attention layers' fused-prologue eligibility reads the
+    same flag (``PagedAttentionImpl.gemm_fusion_prologue_supported`` is False when
+    ATOM_FORCE_ATTN_TRITON is set), so under this env the dense layer(s) resolve to native with
+    reason ``prologue_unsupported`` and are NOT fused. The sparse layers (indexed and skip-index)
+    are unaffected. E-2 therefore covers the fused SPARSE path only; the fused DENSE path is
+    covered by the golden harness, not by this model run.
+    """
+    env = {"ATOM_FORCE_ATTN_TRITON": "1"}
+    env.update(extra or {})
+    return env
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
@@ -224,6 +247,7 @@ def main():
     make_model_dir(a.dir, layers=a.layers)
     print("argv:", " ".join(serve_args(a.dir, level=a.level, profile=a.profile,
                                        enforce_eager=a.enforce_eager)))
+    print("env:", " ".join(f"{k}={v}" for k, v in serve_env().items()))
     print("fault env:", FAULT_ENV, "(see atom/model_ops/gemm_fusion/faults.py)")
 
 
