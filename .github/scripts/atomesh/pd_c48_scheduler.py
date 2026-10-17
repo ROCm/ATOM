@@ -1,8 +1,11 @@
 """Record cache gates; optionally observe the unchanged scheduler methods."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
+
+from vllm.v1.simple_kv_offload import manager as simple_kv_offload_manager
 
 
 def create_scheduler(*args, **kwargs):
@@ -33,6 +36,9 @@ def create_scheduler(*args, **kwargs):
         "num_reprefillable_tokens": coordinator.num_reprefillable_tokens,
         "prefill_timeline_enabled": os.environ.get("C48_PREFILL_TIMELINE") == "1",
         "eagle_group_ids": sorted(coordinator.eagle_group_ids),
+        "simple_kv_offload_manager_sha256": hashlib.sha256(
+            Path(simple_kv_offload_manager.__file__).read_bytes()
+        ).hexdigest(),
         "groups": [
             {"manager": type(m).__name__, "block_size": m.block_size,
              "shared_prefix_checkpoint": m.shared_prefix_checkpoint}

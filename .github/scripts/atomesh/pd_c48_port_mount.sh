@@ -25,4 +25,11 @@ c48_append_port_mount() {
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == "V-QD" ]] || return 0
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/cpu-state-refresh/manager.py"
+  c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/v1/simple_kv_offload/manager.py"
+  [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+  c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+  [[ "${c48_fix_digest%% *}" == "eeca0f44b846ba5f72e1f44c9b4ab8e4025b2c2a2b73639bd42f8116d23ac8e6" ]] || return 2
+  docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }
