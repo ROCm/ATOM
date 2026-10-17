@@ -147,9 +147,14 @@ def init_gemm_fusion(config, sp_group, resources=None) -> None:
     # here with aiter's ProfileError, not surface later inside bind_kv_cache.
     gf.load_profile(name)
     _PROFILE = name
-    _RES = resources or FusionResourcesWrapper(sp_group, sp_world())
+    # the same profile feeds the resources (window budget / VMM heap), not only the matcher
+    _RES = resources or FusionResourcesWrapper(sp_group, sp_world(), profile=name)
     _PHASE = "pre"
-    logger.info("gemm_fusion ON profile=%s world=%d", _PROFILE, _RES.world)
+    inner = getattr(_RES, "inner", None)
+    logger.info(
+        "gemm_fusion ON profile=%s world=%d window_bytes=%s max_windows=%s",
+        _PROFILE, _RES.world, getattr(inner, "window_bytes", None), getattr(inner, "max_windows", None),
+    )
 
 
 def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = None):

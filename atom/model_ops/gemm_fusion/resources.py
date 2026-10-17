@@ -58,6 +58,7 @@ class FusionResourcesWrapper:
         device: Optional[int] = None,
         arch: Optional[str] = None,
         cu: Optional[int] = None,
+        profile: Optional[str] = None,
     ):
         self.group = sp_group
         self.world = world
@@ -75,8 +76,16 @@ class FusionResourcesWrapper:
 
             device = torch.cuda.current_device() if device is None else device
             caps = gf.detect_capabilities(sp_group)
+            # The uniform window size / count and the VMM heap come from the profile's
+            # window_budget. Pass the profile EXPLICITLY: aiter reads no environment variable to
+            # choose one, so omitting it leaves the budget unknown and the first (small, 4 MiB)
+            # request sizes every window (E2 new_on02: a later 40 MiB large-M plan is rejected).
+            if profile is None:
+                from . import hooks
+
+                profile = hooks.profile()
             inner = fusion_resources_cls(gf)(
-                rank=rank, world=world, group=pg, device=device, caps=caps
+                rank=rank, world=world, group=pg, device=device, caps=caps, profile=profile
             )
         self.inner = inner
         self.caps = frozenset(getattr(inner, "caps", ()))

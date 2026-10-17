@@ -56,7 +56,9 @@ def configure(profile, *, rank, world=WORLD, pg=None, resources=None):
     gf = S.aiter_gf()
     gf.load_profile(profile)
     hooks.reset_for_tests(
-        resources or FusionResourcesWrapper(None, world, rank=rank, pg=pg), profile=profile
+        # profile reaches FusionResources too (window budget / VMM heap), not only the matcher
+        resources or FusionResourcesWrapper(None, world, rank=rank, pg=pg, profile=profile),
+        profile=profile,
     )
     _SITES.clear()
 

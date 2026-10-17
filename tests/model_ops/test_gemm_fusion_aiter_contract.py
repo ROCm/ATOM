@@ -118,6 +118,107 @@ class _FakeBackend:
         pass
 
 
+def _fake_torch(monkeypatch):
+    """A minimal ``torch`` (+ ``torch.distributed``) so the real FusionResources, which does
+    ``import torch.distributed as dist`` when no dist is injected, can be built on a CPU box."""
+    dist = _FakeDist()
+    tmod = types.ModuleType("torch")
+    tmod.cuda = types.SimpleNamespace(current_device=lambda: 0)
+    tmod.distributed = dist
+    monkeypatch.setitem(sys.modules, "torch", tmod)
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+
+
+PROFILE_NAME = "minimax_m3_sp4_gfx950_v1"
+
+
+def _profile_budget(real_gf):
+    """window_budget as recorded IN the shipped profile (the source of truth for the asserts)."""
+    wb = dict(real_gf.load_profile(PROFILE_NAME).meta.get("window_budget") or {})
+    assert wb.get("window_bytes") and wb.get("max_windows"), "shipped profile has no window_budget"
+    return wb
+
+
+def _wrapper_via_real_constructor(real_gf, monkeypatch, backend, profile):
+    """ATOM's wrapper building the REAL FusionResources itself (no ``inner=`` injected), so the
+    constructor arguments ATOM passes are what is under test. Only the native backend and
+    torch.distributed are faked."""
+    from atom.model_ops.gemm_fusion import stages
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    res_mod = importlib.import_module("aiter.gemm_fusion.resources")
+    monkeypatch.setattr(res_mod, "CcoBackend", lambda *a, **k: backend)
+    _fake_torch(monkeypatch)
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    # a real FusionResources takes dist=None -> `import torch.distributed`: serve the fake
+    kwargs = dict(rank=0, reduce_min=lambda v: list(v), arch="gfx950", cu=256, device=0)
+    if profile is not None:
+        kwargs["profile"] = profile
+    return FusionResourcesWrapper(None, 4, **kwargs)
+
+
+def test_window_budget_comes_from_the_config_profile_with_the_env_unset(real_gf, monkeypatch):
+    """E2 new_on02: with AITER_GEMM_FUSION_PROFILE unset the resources' uniform window size was
+    unknown, so the first (4 MiB, small-M) request sized every window and the first large-M
+    plan (40 MiB) was rejected: 'window need 41943040 B exceeds the uniform window size 4194304 B'.
+    Through hooks.init_gemm_fusion(config) (no resources injected) the REAL FusionResources must
+    get its budget and VMM heap from config.gemm_fusion.profile."""
+    from atom.model_ops.gemm_fusion import hooks
+
+    for k in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB",
+              "AITER_GEMM_FUSION_WINDOW_POLICY"):
+        monkeypatch.delenv(k, raising=False)
+    wb = _profile_budget(real_gf)
+    backend = _FakeBackend()
+    res_mod = importlib.import_module("aiter.gemm_fusion.resources")
+    monkeypatch.setattr(res_mod, "CcoBackend", lambda *a, **k: backend)
+    _fake_torch(monkeypatch)
+    from atom.model_ops.gemm_fusion import resources as atom_res
+    from atom.model_ops.gemm_fusion import stages
+
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    monkeypatch.setattr(atom_res, "_device", lambda: 0)
+    # the wrapper builds a real min-reducer for world > 1; a single process uses identity
+    monkeypatch.setattr(atom_res.consensus, "torch_min_reducer", lambda *a, **k: (lambda v: list(v)))
+    hooks.reset_for_tests()
+    sp_group = types.SimpleNamespace(rank_in_group=0, cpu_group=None, device_group=None)
+    monkeypatch.setattr(stages, "sp_world", lambda: 4)
+    try:
+        hooks.init_gemm_fusion(_config(PROFILE_NAME), sp_group)  # NO resources= injected
+        inner = hooks.resources().inner
+        assert inner.window_bytes == wb["window_bytes"] == 171966464  # 164 MiB, from the profile
+        assert inner.max_windows == wb["max_windows"] == 39
+        assert inner._vmm >= inner.window_bytes * inner.max_windows  # heap sized for the budget
+        assert ("comm_create", 0) in backend.calls  # the real constructor ran its comm init
+    except ImportError as e:
+        pytest.skip(f"resources need the native stack to import: {e}")
+    finally:
+        hooks.reset_for_tests()
+
+
+def test_without_the_profile_the_real_resources_reject_the_large_plan(real_gf, monkeypatch):
+    """Control: the same real FusionResources built WITHOUT a profile reproduces the E2 failure
+    (uniform window sized by the first small request, then the large plan does not fit). Shows the
+    test above has power and that the failure is ATOM's omission, not aiter's."""
+    for k in ("AITER_GEMM_FUSION_PROFILE", "AITER_GEMM_FUSION_WINDOW_MIB"):
+        monkeypatch.delenv(k, raising=False)
+    res_mod = importlib.import_module("aiter.gemm_fusion.resources")
+    monkeypatch.setattr(res_mod, "CcoBackend", lambda *a, **k: _FakeBackend())
+    bare = real_gf.FusionResources(rank=0, world=4, group=None, dist=_FakeDist(), backend=_FakeBackend(),
+                                   device=0, caps=frozenset({"mori_cco"}))
+    assert bare.window_bytes in (None, 0)  # budget unknown without a profile
+    small = real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")
+    large = real_gf.WindowReq("o2/R", 40 << 20, "p2p_window")
+    bare.ensure("small", [small])
+    with pytest.raises(res_mod.ResourceError, match="exceeds the uniform window size"):
+        bare.ensure("large", [large])
+    # with the profile the same sequence is accepted
+    ok = real_gf.FusionResources(rank=0, world=4, group=None, dist=_FakeDist(), backend=_FakeBackend(),
+                                 device=0, caps=frozenset({"mori_cco"}), profile=PROFILE_NAME)
+    ok.ensure("small", [small])
+    ok.ensure("large", [large])
+
+
 def test_fake_backend_has_exactly_the_real_ccobackend_signatures(real_gf):
     """The fake stands in for aiter's native CcoBackend. It drifted once (comm_create gained a
     `device` argument and finalize started calling devcomm_info), which the real aiter caught
