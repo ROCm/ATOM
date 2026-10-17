@@ -377,6 +377,8 @@ def worker(args):
             p = parameters(ua, x, case)
             tiles = [
                 (16, 2, 2),
+                (32, 2, 1),
+                (64, 4, 1),
                 (64, 4, 2),
                 (128, 4, 1),
                 (128, 4, 2),
@@ -403,12 +405,26 @@ def worker(args):
                         )
                         del fn
                         continue
-                    torch.testing.assert_close(
-                        x["out"], expected, atol=0.003, rtol=0.03
-                    )
-                    torch.testing.assert_close(
-                        x["out"][selected], reference, atol=0.003, rtol=0.03
-                    )
+                    try:
+                        torch.testing.assert_close(
+                            x["out"], expected, atol=0.003, rtol=0.03
+                        )
+                        torch.testing.assert_close(
+                            x["out"][selected], reference, atol=0.003, rtol=0.03
+                        )
+                    except AssertionError as exc:
+                        # A tuning candidate is not a production configuration.
+                        # Never time it or select it when any shape is wrong.
+                        record(
+                            dict(
+                                case=case,
+                                variant=f"m{bm}-w{nw}-s{ns}-kv{splits}",
+                                accuracy="failed",
+                                detail=str(exc),
+                            )
+                        )
+                        del fn
+                        continue
                     record(
                         dict(
                             case=case,
