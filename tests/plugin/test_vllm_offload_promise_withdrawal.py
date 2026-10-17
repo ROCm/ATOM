@@ -39,8 +39,8 @@ def _meta(requests):
     return SimpleNamespace(requests=requests)
 
 
-def _promise(c, start, need):
-    c._promised_loads["7"] = [0, start, need]
+def _promise(c, start, need, parked=True):
+    c._promised_loads["7"] = [0, start, need, parked]
 
 
 def _run_steps(c, meta, n):
@@ -147,3 +147,26 @@ def test_worker_half_releases_the_park_and_reports_the_blocks():
     # Reported once: a second step must not re-truncate a live request.
     assert c.get_finished(set())[1] == set()
     assert c.get_block_ids_with_load_errors() == set()
+
+
+def test_an_unparked_promise_is_dropped_even_if_never_asked_again(caplog):
+    """A lookup's promise counts only once vLLM has parked the request.
+
+    vLLM parks a request in WAITING_FOR_REMOTE_KVS after `allocate_slots`
+    succeeds, and calls `update_state_after_alloc` for it; when allocation
+    fails the request just stays in `waiting`. The watchdog used to tell the
+    two apart by assuming a queued request is looked up -- and re-promised --
+    on every step. It is not: once the token budget is spent the scheduler
+    stops scanning `waiting`, and a request can go unasked for the whole grace
+    window. Its promise then aged out and was "withdrawn", which reports
+    `finished_recving` for a request vLLM never parked, and
+    `_update_from_kv_xfer_finished` asserts on that. Measured on the second
+    gsm8k pass of a DSpark run against a 950-block pool.
+    """
+    c = _scheduler_half(range(100, 116))
+    _promise(c, start=32, need=64, parked=False)
+    with caplog.at_level("ERROR", logger="atom"):
+        withdrawn = _run_steps(c, _meta([]), c._PROMISE_GRACE_STEPS + 5)
+    assert withdrawn == []
+    assert c._promised_loads == {}
+    assert "promised a load" not in caplog.text

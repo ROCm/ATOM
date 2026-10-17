@@ -87,7 +87,8 @@ def test_a_backed_cap_is_confirmed_and_the_request_parks():
     call, stub = _connector(planner, need=256, park=True)
     assert call(SimpleNamespace(request_id="r2"), 512) == (256, True)
     assert planner.confirmed == ["r2"] and planner.withdrawn == []
-    assert stub._promised_loads["r2"] == [0, 512, 256]
+    # Unparked until vLLM allocates: `update_state_after_alloc` confirms it.
+    assert stub._promised_loads["r2"] == [0, 512, 256, False]
 
 
 def test_a_request_that_never_capped_is_answered_zero_not_deferred():

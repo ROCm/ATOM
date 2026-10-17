@@ -49,6 +49,7 @@ RIDE_COUNTERS = (
     "ride_missing_boundary_past_hashes",
     "ride_missing_no_group_cached",
     "ride_missing_no_pool",
+    "ride_missing_load_unrecorded",
     "ride_pinned",
     "ride_unpinned",
 )
@@ -162,7 +163,23 @@ class PageRideMixin:
         end = int(end)
         by_boundary = self._ride_boundaries.get(str(req_id))
         recorded = None if by_boundary is None else by_boundary.get(end)
-        block_ids = recorded or (self.source_blocks_for(request, end) or None)
+        if operation is None:
+            # A load. Its destination is what vLLM allocated for this
+            # request's external hit, recorded at admission; if none was
+            # recorded, admission refused it and there is no correct place to
+            # put the state. `source_blocks_for` is the SAVE source -- blocks
+            # already committed under this hash, possibly another request's --
+            # and writing a load into them is how a refused request used to
+            # get a load dispatched anyway: it then completed, was reported a
+            # second time after the promise had already been withdrawn, and
+            # vLLM asserted on a RUNNING request. Returning None here makes the
+            # scheduler decline the load, and the connector withdraws the
+            # promise once, through `_check_promised_loads`.
+            block_ids = recorded
+            if not block_ids:
+                self._last_ride_gate = "load_unrecorded"
+        else:
+            block_ids = recorded or (self.source_blocks_for(request, end) or None)
         if not block_ids:
             self._counters["ride_missing"] += 1
             key = f"ride_missing_{getattr(self, '_last_ride_gate', None)}"

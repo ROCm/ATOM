@@ -358,11 +358,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
-    #: Request ids vLLM has reported finished. A transfer completion that
-    #: arrives after one of these is dropped; see `get_finished`'s report.
-    #: Class-level so every construction path has it -- `__init__` branches
-    #: on the role and the report is reachable without the branch it sat in.
-    _finished_seen: set = frozenset()
     #: Block size of the group this connector's codec owns, 0 when unknown.
     #: Distinct from the engine-wide `cache_config.block_size`, which is the
     #: smallest across groups once a second group exists.
@@ -2084,28 +2079,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # Single group: the block channel already carried them, and naming
             # them twice would discard prefixes the block channel only trims.
             failed = set()
-        # Not for requests vLLM has already finished. Its
-        # `_update_from_kv_xfer_finished` asserts `req_id in self.requests`
-        # for everything named here, so a completion that lands after the
-        # request is gone takes the engine down rather than being ignored --
-        # measured as a bare AssertionError on the second pass of a DSpark
-        # run, where a load outliving its request is the common case. vLLM
-        # frees a finished request's blocks itself, so the report had nothing
-        # left to achieve.
-        #
-        # Keyed off the ids vLLM names as finished rather than off the
-        # connector's own request map: a load can legitimately complete for a
-        # request this half never stored a `Request` for, and filtering on
-        # that map discards those too.
-        if not isinstance(self._finished_seen, set):
-            self._finished_seen = set()
-        self._finished_seen.update(str(r) for r in (finished_req_ids or ()))
-        gone = self._finished_seen
-        recving = {r for r in (recving or ()) if str(r) not in gone}
-        failed = {r for r in failed if str(r) not in gone}
         return KVConnectorTransferResults(
             finished_sending=set(sending or ()),
-            finished_recving=recving,
+            finished_recving=set(recving or ()),
             failed_recving=failed,
         )
 
@@ -2269,13 +2245,19 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
         if self._v41_planner is not None:
             self._v41_planner.confirm_local_cap(request)
-        # [steps_undispatched, first_token_of_promise, tokens_promised].
-        # The range is kept because a promise that is never honoured has to be
-        # withdrawn, and withdrawing it means naming the blocks it reserved.
+        # [steps_undispatched, first_token_of_promise, tokens_promised,
+        #  parked]. The range is kept because a promise that is never honoured
+        # has to be withdrawn, and withdrawing it means naming the blocks it
+        # reserved. `parked` starts False: this is the lookup, and vLLM has not
+        # yet decided it can allocate for the request. Only
+        # `update_state_after_alloc` -- which vLLM calls once it has, and
+        # which is followed by parking the request in WAITING_FOR_REMOTE_KVS --
+        # makes it True. See `_check_promised_loads` for why that matters.
         self._promised_loads[request.request_id] = [
             0,
             int(num_computed_tokens),
             int(need),
+            False,
         ]
         return need, True
 
@@ -2290,6 +2272,10 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         """
         seq = self._seqs.get_or_create(request)
         self._requests[str(request.request_id)] = request
+        if int(num_external_tokens) > 0:
+            promise = self._promised_loads.get(request.request_id)
+            if promise is not None:
+                promise[3] = True
         groups = _group_block_ids(blocks)
         # ATOM's byte codec addresses the attention group only; the recurrent
         # group is addressed by the boundary hand-off, never positionally.
@@ -2334,18 +2320,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 group_blocks=groups,
             ):
                 self._v41_planner.refuse_admission(request, attention_blocks)
-                if self._state_rides_mp:
-                    # Under a ride there is no state leg to fail the request
-                    # through: the checkpoint travels inside the PAGE object,
-                    # so `refuse_admission` queues nothing. The admission has
-                    # already happened, though, and a request left parked on a
-                    # prefix whose state nobody restored runs on whatever the
-                    # slot held -- measured as `needs state at 1280, found
-                    # -4643142014259413360`. Withdrawing the promise here is
-                    # the ride's equivalent: `get_finished` releases the park
-                    # and truncates to what HBM really holds, and the prefix
-                    # is recomputed.
-                    self._abandoned_loads.add(str(request.request_id))
 
     def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """Snapshot this step's transfers.
@@ -2784,10 +2758,22 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         withdrawn: list[tuple[str, list[int]]] = []
         for req_id in list(self._promised_loads):
             state = self._promised_loads[req_id]
+            if not state[3]:
+                # Promised at lookup, never parked: vLLM could not allocate
+                # for the request this step (or did not reach it), so it is
+                # still WAITING and will be looked up -- and promised -- again.
+                # Withdrawing it would report `finished_recving` for a request
+                # vLLM never parked, and `_update_from_kv_xfer_finished`
+                # asserts on exactly that. Measured on the second gsm8k pass of
+                # a DSpark run against a 950-block pool, where allocation after
+                # a tier hit is what fails: one withdrawal "(unknown)" after 50
+                # steps, four ranks reporting it, and the engine down.
+                self._promised_loads.pop(req_id)
+                continue
             state[0] += 1
             if state[0] <= self._PROMISE_GRACE_STEPS:
                 continue
-            _, start, need = self._promised_loads.pop(req_id)
+            _, start, need, _parked = self._promised_loads.pop(req_id)
             withdrawn.append((req_id, self._promised_block_ids(req_id, start, need)))
         if withdrawn:
             logger.error(

@@ -176,3 +176,101 @@ def test_v41_views_really_address_raw_slot_zero():
     dest.fill_(7)
     assert views._cache.state_bytes[0].tolist() == [7] * 32
     assert views._cache.state_bytes[1].tolist() == [0] * 32
+
+
+def _ride_connector(resolves: bool):
+    """A ride-mode connector whose planner accepts or refuses every boundary."""
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._is_deepseek_v41 = True
+    c._offload_backend = "mp"
+    c._state_transport = "mp"
+    c._v41_checkpoint_group_ids = (1,)
+    c._mamba_groups = ()
+    c._attn_group_id = 0
+    c._requests = {}
+    c._abandoned_loads = set()
+    c._promised_loads = {}
+    c._kda_planner = None
+    c._scheduler = SimpleNamespace(update_state_after_alloc=lambda seq: None)
+    seq = SimpleNamespace(num_cached_tokens=512, set_block_table=lambda ids: None)
+    c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
+    c._v41_planner = SimpleNamespace(
+        resolve_load=lambda *a, **k: resolves,
+        refuse_admission=Mock(),
+    )
+    return c
+
+
+def _blocks():
+    return SimpleNamespace(get_block_ids=lambda: ([3, 4], [7, 8]))
+
+
+@pytest.mark.parametrize("external", [0, 256])
+def test_a_refused_ride_withdraws_nothing_itself(external):
+    """`_abandoned_loads` is reported as `finished_recving`, once per id.
+
+    A refused ride used to withdraw its promise here as well. The scheduler
+    already declines the load when `take_ride_state` has no destination, and
+    `_check_promised_loads` withdraws the promise it leaves behind -- so the
+    request was released twice: once into RUNNING, and the second report hit
+    vLLM's `assert RequestStatus.is_finished(req.status)` in
+    `_update_from_kv_xfer_finished`. Measured as a bare AssertionError on the
+    second gsm8k pass of a DSpark run, with and without external tokens.
+    """
+    c = _ride_connector(resolves=False)
+    c.update_state_after_alloc(SimpleNamespace(request_id="r0"), _blocks(), external)
+    c._v41_planner.refuse_admission.assert_called_once()
+    assert c._abandoned_loads == set()
+
+
+def test_a_resolved_ride_withdraws_nothing():
+    c = _ride_connector(resolves=True)
+    c.update_state_after_alloc(SimpleNamespace(request_id="r0"), _blocks(), 256)
+    c._v41_planner.refuse_admission.assert_not_called()
+    assert c._abandoned_loads == set()
+
+
+def _ride_planner():
+    from atom.plugin.vllm.kv_transfer.page_ride import PageRideMixin
+
+    class _P(PageRideMixin):
+        hash_block_size = 256
+        ride_boundary_grid = 256
+        ride_group_ids = (1,)
+
+        def __init__(self):
+            self._counters = {}
+            self._init_page_ride()
+
+    p = _P()
+    block = SimpleNamespace(block_id=42)
+    p._pool = SimpleNamespace(
+        get_cached_block=lambda h, gids: [block],
+        touch=lambda blocks: None,
+        blocks={42: block},
+    )
+    return p
+
+
+def test_a_load_rides_only_on_its_recorded_destination():
+    """A load with nothing recorded has no correct destination.
+
+    The committed source blocks a save would carry belong to whoever stored
+    that prefix; loading into them is a write into somebody else's state, and
+    it also put a load in flight for a request whose admission was refused.
+    """
+    p = _ride_planner()
+    request = SimpleNamespace(block_hashes=tuple(range(1, 9)))
+    assert p.take_ride_state(request, "r0", 512, operation=None) is None
+    assert p._counters["ride_missing_load_unrecorded"] == 1
+    p._record_ride_boundary("r0", 512, (7,))
+    got = p.take_ride_state(request, "r0", 512, operation=None)
+    assert tuple(got.block_ids) == (7,)
+
+
+def test_a_save_still_rides_on_the_committed_source():
+    p = _ride_planner()
+    request = SimpleNamespace(block_hashes=tuple(range(1, 9)))
+    got = p.take_ride_state(request, "r0", 512, operation="save-op")
+    assert tuple(got.block_ids) == (42,)
+    assert p._counters["ride_pinned"] == 1

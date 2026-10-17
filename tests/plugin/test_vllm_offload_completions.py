@@ -470,6 +470,8 @@ def test_a_promise_that_never_dispatches_is_named(caplog):
     scheduler = _ParkScheduler(hit=10496, park=True)
     adapter = _lookup_adapter(scheduler)
     adapter.get_num_new_matched_tokens(_req("stuck"), 0)
+    # vLLM allocated and parked it: what `update_state_after_alloc` records.
+    adapter._promised_loads["stuck"][3] = True
 
     empty = SimpleNamespace(requests=[])
     with caplog.at_level("ERROR", logger="atom"):
