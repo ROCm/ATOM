@@ -95,6 +95,9 @@ def _site_for(case, comm):
             rotary_emb=case.rotary, q_norm=case.q_norm, k_norm=case.k_norm,
             kv_cache_dtype="fp8", layer_num=0,
             gemm_fusion_kv_page=case.spec.cache_page_size,
+            # the site's static eligibility check fails safe without this; the golden
+            # chain IS the Gemma/Triton (dense/reuse) or fused-indexer (indexer) prologue
+            gemm_fusion_prologue_supported=lambda: True,
             gemm_fusion_prologue_state=lambda fwd: _caches_state(
                 holder.case, fwd.attn_metadata.slot_mapping
             ),

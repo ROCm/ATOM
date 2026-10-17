@@ -541,3 +541,63 @@ def test_install_swaps_forward_only_when_site_declared(monkeypatch):
     assert calls == ["model.layers.0.self_attn"]
     monkeypatch.setattr(G, "declare_m3_qkv_site", lambda m, prefix, sparse: object())
     assert MA.install_m3_sites(model) == 1 and m.forward.__func__ is MA._fused_forward
+
+# ------------------------- golden adapter: the REAL _site_for, not a hand-built site
+def _golden_case(mode):
+    nk = (9216, 6144) if mode == "qkv_dense" else (9856, 6144)
+    norm = lambda: SimpleNamespace(weight=object(), variance_epsilon=1e-6)
+    return SimpleNamespace(
+        spec=SimpleNamespace(mode=mode, tokens=64, padded_tokens=64, cache_page_size=16, gemm_nk=nk),
+        rotary=SimpleNamespace(rotary_dim=64), q_norm=norm(), k_norm=norm(),
+        index_q_norm=norm(), index_k_norm=norm(), caches={"index_cache": object()},
+        weight=object(), weight_scale=object(),
+    )
+
+
+@pytest.mark.parametrize("mode,gm", [("qkv_dense", "dense"), ("qkv_indexer", "indexer"),
+                                      ("qkv_indexer_reuse", "reuse")])
+def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkeypatch):
+    """Regression: the fail-safe eligibility check made every harness site 'uncovered'
+    because the adapter's impl lacked gemm_fusion_prologue_supported. Builds the real
+    site via _site_for and compares its 2-stage signature with aiter's own spec builder
+    (and the shipped profile) when the aiter worktree is importable."""
+    import json
+    import sys
+    from pathlib import Path
+
+    from atom.model_ops.gemm_fusion import golden_candidate as GC
+
+    aiter_root = Path(__file__).resolve().parents[3] / "aiter-gemm-fusion"
+    spec_py = aiter_root / "aiter/gemm_fusion/spec.py"
+    specs_py = aiter_root / "aiter/ops/gemm_fusion/sp_qkv/specs.py"
+    if not (spec_py.exists() and specs_py.exists()):
+        pytest.skip("aiter worktree not available")
+    import importlib.util
+    import types
+
+    def load(name, path):
+        s = importlib.util.spec_from_file_location(name, path)
+        m = importlib.util.module_from_spec(s)
+        monkeypatch.setitem(sys.modules, name, m)
+        s.loader.exec_module(m)
+        return m
+
+    for n in ("aiter", "aiter.gemm_fusion", "aiter.ops", "aiter.ops.gemm_fusion", "aiter.ops.gemm_fusion.sp_qkv"):
+        monkeypatch.setitem(sys.modules, n, types.ModuleType(n))
+        sys.modules[n].__path__ = []
+    spec = load("aiter.gemm_fusion.spec", spec_py)
+    sys.modules["aiter.gemm_fusion"].__dict__.update(
+        {k: getattr(spec, k) for k in ("FusionSpec", "GemmSpec", "Field", "SPExchange", "HeadNormRopeCache")}
+    )
+    specs = load("aiter.ops.gemm_fusion.sp_qkv.specs", specs_py)
+    monkeypatch.setattr(stages, "_aiter_override", sys.modules["aiter.gemm_fusion"])
+    monkeypatch.setattr(stages, "_kv_block_size", lambda: 16)
+    hooks.reset_for_tests()
+    GC._SITES.clear()
+    site, _, _ = GC._site_for(_golden_case(mode), None)
+    assert site._static_prologue_ok() is True  # else every golden cell resolves 'uncovered'
+    sig = site.spec.prefix(2).signature()
+    assert sig == specs.sp_qkv_spec(gm).signature()
+    rows = json.loads((aiter_root / "aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json").read_text())["rows"]
+    assert sig in {r["sig"] for r in rows}
+    GC._SITES.clear()
