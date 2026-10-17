@@ -89,7 +89,7 @@ def make_site(monkeypatch):
         linear = SimpleNamespace(output_size=10240, input_size=3072)
         stg = [SimpleNamespace(kind="sp_exchange"), SimpleNamespace(kind="head_norm_rope_cache")]
         return site_mod.GemmFusionSite(
-            "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(impl=SimpleNamespace()),
+            "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)),
             q_size=8192, kv_size=128,
         )
 
@@ -387,6 +387,20 @@ def test_static_prologue_ineligible_is_native_on_agreement(make_site):
     s.attn.impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: False)
     r = s.resolve(64)
     assert (r.plan, r.reason) == (None, "uncovered")  # plan dropped before agree()
+
+
+def test_static_prologue_missing_impl_or_method_is_not_eligible(make_site):
+    """Fail safe: an attention without an impl / without the method resolves native."""
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    s = make_site(res)
+    s.attn = SimpleNamespace()  # no impl at all
+    assert s._static_prologue_ok() is False
+    s.attn = SimpleNamespace(impl=SimpleNamespace())  # impl without the method
+    assert s._static_prologue_ok() is False
+    r = s.resolve(64)
+    assert (r.plan, r.reason) == (None, "uncovered")
+    s.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True))
+    assert s._static_prologue_ok() is True
 
 
 def test_agree_prepared_downgrades_unprepared_bucket(make_site):

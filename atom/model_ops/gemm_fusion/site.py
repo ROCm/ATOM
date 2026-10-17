@@ -141,7 +141,9 @@ class GemmFusionSite:
         folded into the cross-rank agreement so it can never differ per call."""
         impl = getattr(self.attn, "impl", None)
         fn = getattr(impl, "gemm_fusion_prologue_supported", None)
-        return True if fn is None else bool(fn())
+        # Fail safe: an impl that cannot say it supports a fused prologue (no impl,
+        # or no method) is not eligible -> native on every rank (via the agreement).
+        return False if fn is None else bool(fn())
 
     def resolve(self, tokens: int, graph_mode: str = "eager") -> Resolution:
         """Resolve a bucket. Cache key is ``(tokens, graph_mode)`` (L-2).

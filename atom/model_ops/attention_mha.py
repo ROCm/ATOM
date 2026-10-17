@@ -1425,6 +1425,13 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             "slot_mapping": sparse_metadata.slot_mapping,
         }
 
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """The M3 sparse prologue (aiter fused qk/index norm+rope, or the Triton
+        norm-rope-cache on skip-index layers) has no GemmaRMSNorm/env gate of the
+        dense Triton path it inherits; always eligible. Explicit because the
+        site treats a missing method as NOT eligible."""
+        return True
+
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         """MiniMax-M3 fused qk-norm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
