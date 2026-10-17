@@ -207,6 +207,7 @@ def emit_log_annotations(output):
             continue
         if path.name in (
             "container.log",
+            "container-eval.log",
             "runtime-state.json",
             "sweep-summary.json",
             "profile_export_aiperf.json",
