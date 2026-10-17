@@ -13,6 +13,8 @@ import re
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -163,54 +165,68 @@ def summarize_eval_samples(path):
 
 
 def github_failure_log(target, output):
-    """Fetch submitter failures from inside CI, where artifact storage is reachable."""
-    if not os.environ.get("GH_TOKEN"):
+    """Fetch submitter failures inside CI without forwarding auth to blob storage."""
+    token = os.environ.get("GH_TOKEN")
+    if not token:
         return
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect)
+
+    def api(path):
+        request = urllib.request.Request(
+            "https://api.github.com/repos/ROCm/ATOM/" + path,
+            headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        try:
+            with opener.open(request, timeout=30) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 302:
+                raise
+            location = exc.headers["Location"]
+            if not location.startswith("https://"):
+                raise ValueError("non-HTTPS artifact redirect")
+            # A fresh request intentionally omits the GitHub Authorization header.
+            with urllib.request.urlopen(location, timeout=60) as response:
+                return response.read()
+
     result = {}
     try:
-        query = subprocess.run(
-            [
-                "gh",
-                "run",
-                "view",
-                target,
-                "--repo",
-                "ROCm/ATOM",
-                "--json",
-                "status,conclusion",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=True,
-        )
-        state = json.loads(query.stdout)
+        state = json.loads(api(f"actions/runs/{target}"))
         if state["status"] != "completed" or state["conclusion"] == "success":
             return
-        logs = subprocess.run(
-            ["gh", "run", "view", target, "--repo", "ROCm/ATOM", "--log-failed"],
-            capture_output=True,
-            text=True,
-            timeout=90,
-            check=False,
-        )
-        result["returncode"] = logs.returncode
-        lines = logs.stdout.splitlines()
-        markers = re.compile(
-            r"scancel|cancel.*Slurm|exiting rc|received TERM|Traceback|Error:|ERROR:|No such file|exit code|command not found|Permission denied|bad substitution",
-            re.IGNORECASE,
-        )
-        indices = set()
-        for i, line in enumerate(lines):
-            if "[spur:" not in line and markers.search(line):
-                indices.update(range(max(0, i - 5), min(len(lines), i + 6)))
-        result["excerpts"] = "\n".join(lines[i] for i in sorted(indices))[-48000:]
-        # Signed artifact URLs are not diagnostic evidence and must not be emitted.
-        result["stderr"] = re.sub(r"https?://[^\s\"]+", "[URL omitted]", logs.stderr)[
-            -1000:
-        ]
-    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        jobs = json.loads(api(f"actions/runs/{target}/jobs?per_page=100"))["jobs"]
+        for job in jobs:
+            if job["conclusion"] not in ("failure", "timed_out", "cancelled"):
+                continue
+            lines = (
+                api(f"actions/jobs/{job['id']}/logs")
+                .decode(errors="replace")
+                .splitlines()
+            )
+            markers = re.compile(
+                r"scancel|cancel.*Slurm|exiting rc|received TERM|Traceback|Error:|ERROR:|No such file|exit code|command not found|Permission denied|bad substitution",
+                re.IGNORECASE,
+            )
+            indices = set()
+            for i, line in enumerate(lines):
+                if "[spur:" not in line and markers.search(line):
+                    indices.update(range(max(0, i - 5), min(len(lines), i + 6)))
+            result[str(job["id"])] = {
+                "name": job["name"],
+                "excerpts": "\n".join(lines[i] for i in sorted(indices))[-48000:],
+            }
+    except (OSError, ValueError) as exc:
+        # Exception text may contain signed URLs; emit only the type/status.
         result["error"] = type(exc).__name__
+        result["http_status"] = getattr(exc, "code", None)
     (output / "workflow-failure.json").write_text(json.dumps(result) + "\n")
 
 
