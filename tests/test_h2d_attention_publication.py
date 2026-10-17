@@ -157,6 +157,36 @@ def assert_repeat_does_not_write(runner, call):
         assert torch.equal(runner.forward_vars[name].cpu, expected), name
 
 
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_mha_spec_decode_keeps_batch_lengths_and_zeroes_graph_padding(
+    monkeypatch, is_dummy
+):
+    q = 4
+    runner, builder = make_runner(monkeypatch, "mha", q=q, tbo=False)
+    batch = decode_batch(2, q)
+    batch.is_dummy_run = is_dummy
+    original_lens = batch.context_lens.copy()
+    rejected = np.asarray([3, 2], dtype=np.int32)
+    runner.tokenID_processor.num_rejected = rejected
+
+    start_decode(runner, builder, batch, q)
+    metadata, _ = builder.prepare_decode(
+        batch, running_bs=4, running_tokens=16, max_seqlen_q=q
+    )
+    torch.cuda.synchronize()
+
+    assert np.array_equal(batch.context_lens, original_lens)
+    effective_lens = original_lens if is_dummy else original_lens - rejected
+    assert metadata.context_lens.cpu().tolist() == [*effective_lens.tolist(), 0, 0]
+    expected_positions = [
+        pos
+        for seq_len in effective_lens
+        for pos in range(int(seq_len) - q, int(seq_len))
+    ]
+    assert runner.forward_vars["positions"].np[:8].tolist() == expected_positions
+    assert runner.forward_vars["positions"].np[8:16].tolist() == [0] * 8
+
+
 @pytest.mark.parametrize("transport", ["direct", "packed"])
 @pytest.mark.parametrize("pp", [1, 2])
 @pytest.mark.parametrize(

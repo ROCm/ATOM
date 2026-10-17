@@ -1181,10 +1181,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         dropout_p = 0.0
         min_seqlen_q = 0
 
-        context_lens = np.asarray(batch.context_lens, dtype=np.int32)
+        # This step rolls speculative rejects back in place below. Keep the
+        # batch immutable: a second metadata reader must still see scheduler
+        # lengths, and a repeated build must not subtract rejects twice.
+        context_lens = np.array(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
 
-        if max_seqlen_q > 1:
+        if not batch.is_dummy_run and max_seqlen_q > 1:
             num_rejected = self.model_runner.tokenID_processor.num_rejected
             if num_rejected is not None:
                 context_lens -= num_rejected
@@ -1218,6 +1221,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]
 
         var["positions"].np[:scheduled_tokens] = positions
+        var["positions"].np[scheduled_tokens:running_tokens] = 0
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:running_bs] = 0
 
@@ -1241,7 +1245,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         for name, count in vars_used:
             group.counts[group.indices[name]] = count
         group.counts[group.indices["positions"]] = (
-            None if self.model_runner.use_mrope else scheduled_tokens
+            None if self.model_runner.use_mrope else running_tokens
         )
         block_table_state(var["block_tables"]).publish(running_bs, group=group)
         ctx = {el: var[el].gpu[:num] for el, num in vars_used}
@@ -1280,9 +1284,9 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # the DECODE sparse path; the decode kernels handle q>1 per-token
             # causal internally via max_query_len.
             sparse_block_tables = self._get_sparse_attention_block_tables(
-                attn_metadata.block_tables[:scheduled_bs],
-                attn_metadata.context_lens[:scheduled_bs],
-                scheduled_bs,
+                attn_metadata.block_tables[:running_bs],
+                attn_metadata.context_lens[:running_bs],
+                running_bs,
             )
             # token -> request, -1 on the graph's pad tail: the mono kernels keep
             # a pad row out of every cross-row decision (``row_live``)
@@ -1291,7 +1295,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 pad_to=running_tokens,
             )
             attn_metadata.sparse_attention_metadata = make_sparse_decode_metadata(
-                seq_lens=attn_metadata.context_lens[:scheduled_bs],
+                seq_lens=attn_metadata.context_lens[:running_bs],
                 block_table=sparse_block_tables,
                 slot_mapping=attn_metadata.slot_mapping,
                 max_seq_len=int(max_seqlen_k),
