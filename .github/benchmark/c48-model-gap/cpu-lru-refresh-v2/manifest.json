@@ -4,7 +4,11 @@
   "changes": [
     "Eager mode: once per request, move CPU copies of every GPU-hit full-attention prefix block to the MRU end of the CPU LRU; Mamba states are not refreshed"
   ],
-  "cases": ["V-QD-CPUREF2-LPT3072"],
+  "cases": [
+    "V-QD-CPUREF2",
+    "V-QD-CPUREF2-LPT3072",
+    "V-QD-CPUREF2-LPT6144"
+  ],
   "files": [
     {
       "relative_path": "v1/simple_kv_offload/manager.py",

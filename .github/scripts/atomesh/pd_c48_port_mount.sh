@@ -30,7 +30,7 @@ c48_append_port_mount() {
     V-QD-CPUREF)
       c48_fix_dir=cpu-lru-refresh
       c48_fix_sha=7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea ;;
-    V-QD-CPUREF2-LPT3072)
+    V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144)
       c48_fix_dir=cpu-lru-refresh-v2
       c48_fix_sha=76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c ;;
     *) return 0 ;;

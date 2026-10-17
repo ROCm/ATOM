@@ -10,7 +10,12 @@ import unittest
 REPO = Path(__file__).resolve().parents[4]
 SCRIPT = REPO / ".github/scripts/atomesh/pd_c48_port_mount.sh"
 MANAGER = "/vllm/v1/simple_kv_offload/manager.py,readonly"
-CPUREF = {"V-QD-CPUREF": "cpu-lru-refresh", "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2"}
+CPUREF = {
+    "V-QD-CPUREF": "cpu-lru-refresh",
+    "V-QD-CPUREF2": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-LPT6144": "cpu-lru-refresh-v2",
+}
 
 
 def mounts(case, root=REPO):
