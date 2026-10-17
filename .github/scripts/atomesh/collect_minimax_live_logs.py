@@ -668,8 +668,26 @@ def emit_log_annotations(output):
     # Check annotations are truncated at 4 KiB by the API. Compress the
     # snapshot and keep each notice below that limit and the ten-notice quota.
     while len(encoded) > 35000:
-        longest = max(files, key=lambda name: len(files[name]))
-        files[longest] = files[longest][len(files[longest]) // 2 :]
+        reducible = [
+            name
+            for name in files
+            if Path(name).name
+            not in ("aiperf-tail-summary.json", "sweep-summary.json", "job-result.json")
+            and not Path(name).name.startswith(("pd-atom-", "results_"))
+            and len(files[name]) > 1000
+        ]
+        if not reducible:
+            raise RuntimeError("Required JSON summaries exceed annotation budget")
+        longest = max(reducible, key=lambda name: len(files[name]))
+        if longest.endswith(".json"):
+            files[longest] = json.dumps(
+                {
+                    "omitted_from_annotations": True,
+                    "original_chars": len(files[longest]),
+                }
+            )
+        else:
+            files[longest] = files[longest][len(files[longest]) // 2 :]
         if longest not in tails:
             tails.append(longest)
         payload = json.dumps(
