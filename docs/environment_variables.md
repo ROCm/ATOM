@@ -89,6 +89,7 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_MAX_QUEUE_MS** | float\|"" | "" (None) | After decode protection, release coalescing when the oldest schedulable waiting prefill reaches this age since arrival. Empty disables the age guard. Checkpoint dependency waits use `TTFT_MAX_TICKS`. This is not a hard TTFT limit. |
 | **ATOM_PREFILL_DECODE_INTERVAL** | int | 0 | Protect this many scheduler passes after an executed prefill. On DP=1, PP=1, a positive value also enables local coalescing when the master switch is on; `0` leaves TP scheduling unchanged. On DP>1, `0` disables only the interval. |
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
+| **ATOM_DP_PREFILL_SYNC** | bool | false | DP prefill-sync alignment. Hold a prefill wave until every DP rank has admittable prefill work, then release together, so the DP group transitions all-prefill → all unified graph-decode instead of a ragged 1-of-N release that drops the shared MoE/gather CUDA graph for every rank. Escapes (no decode anywhere, KV high, queue age, TTFT/partial tick bounds) still force release so one idle rank cannot stall TTFT. Only meaningful under DP attention (`dp_size > 1`). |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
 ## Dynamic chunking

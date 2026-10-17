@@ -101,6 +101,8 @@ from typing import NamedTuple
 
 import torch
 
+from atom.utils import envs
+
 logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("ATOM_PREFILL_DELAYER_DEBUG", "0").lower() in ("1", "true")
@@ -255,7 +257,7 @@ class PrefillDelayer:
         # clears ForwardMode.unified and forces every other rank's decode
         # off its CUDA graph. Read here so the flag does not need a new
         # constructor argument through EngineCore.
-        self.sync_prefill = os.environ.get("ATOM_DP_PREFILL_SYNC", "0") == "1"
+        self.sync_prefill = envs.ATOM_DP_PREFILL_SYNC
 
         # `_FIXED_SLOTS`-slot SUM-reduce buffer (gloo-safe). Encoding:
         #   slot 0 = prefillable        (SUM → n_prefillable)
