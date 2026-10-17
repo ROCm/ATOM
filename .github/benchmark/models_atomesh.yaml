@@ -1373,7 +1373,7 @@ models:
               ATOM_DRAFT_CUDAGRAPH: '1'
               ATOM_PREFIX_CACHE_POLICY: slru
               ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
-              ATOM_AITER_SCATTER_REF: b0f5e48c90f2959ef4b1379269e6f81725c2d9a6
+              ATOM_AITER_SCATTER_REF: 7695a0b5442b6072f64702bf817d3f5ece2d5f6e
             prefill:
               HIP_VISIBLE_DEVICES: 0,1,2,3
               LMCACHE_LOCAL_CPU: 'True'
