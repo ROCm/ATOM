@@ -30,8 +30,19 @@ import json
 import os
 
 
-def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
-    """HF-style config dict (no weights). Geometry matches the golden cases."""
+def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
+    """HF-style config dict (no weights). Geometry matches the golden cases.
+
+    ``moe=False`` (default): every FFN is the dense MLP (``moe_layer_freq`` all 0).
+    WHY: stock ATOM at the golden pin 8f9258a76 calls ``ffn(hidden_states,
+    x_scale=hidden_states_scale)`` for BOTH FFN kinds (model.py:776) but
+    ``MiniMaxM3MoE.forward(self, hidden_states)`` takes no ``x_scale``, so ANY MoE layer raises
+    ``TypeError`` at the first forward (E2 OFF arm, job-e2_off03, with no gemm_fusion involved).
+    The dense ``MiniMaxM3MLP.forward`` does accept ``x_scale``. The attention geometry and the
+    three attention layer types are unchanged, so E-2 still exercises the attention/compile path.
+    MoE layers are therefore NOT covered by this smoke config (``moe=True`` restores the old
+    layout and will hit that stock error until ATOM fixes it)."""
+    layer_ffn = [0] * layers if not moe else [0] + [1] * (layers - 1)
     return {
         "model_type": "minimax_m3",
         "architectures": ["MiniMaxM3SparseForCausalLM"],
@@ -51,8 +62,8 @@ def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
         "num_local_experts": experts,
         "num_experts_per_tok": 2,
         "n_shared_experts": 1,
-        # layer 0 dense MoE-free; layers alternate dense attn / sparse attn
-        "moe_layer_freq": [0] + [1] * (layers - 1),
+        # 0 = dense MLP, nonzero = MoE (see the docstring: MoE hits a stock x_scale TypeError)
+        "moe_layer_freq": layer_ffn,
         "index_topk_freq": index_topk_freq,
         "index_skip_topk_offset": 0,
         "sparse_attention_config": {
@@ -101,7 +112,7 @@ TEXT_MODEL_TYPE = "minimax_m3_text"  # nested text_config type (repo tests)
 VL_ARCH = "MiniMaxM3SparseForConditionalGeneration"  # what the recipes' VL checkpoint selects
 
 
-def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
+def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
     """The released checkpoint's LAYOUT: an outer ``minimax_m3_vl`` config whose text model
     is nested under ``text_config`` (``minimax_m3_text``). ATOM reads the text fields from
     ``text_config`` (``_get_text_config``) and copies the index-cache overrides across
@@ -109,7 +120,8 @@ def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
     ships NEXT TO config.json, which is how ATOM's own recipes load M3 (``--trust-remote-
     code``); ATOM's native path registers no class for it. Attention geometry is unchanged.
     """
-    text = m3_config(layers=layers, experts=experts, vocab=vocab, index_topk_freq=index_topk_freq)
+    text = m3_config(layers=layers, experts=experts, vocab=vocab, index_topk_freq=index_topk_freq,
+                     moe=moe)
     for k in ("architectures", "torch_dtype"):
         text.pop(k, None)
     text["model_type"] = TEXT_MODEL_TYPE

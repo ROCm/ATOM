@@ -1088,3 +1088,39 @@ def test_m3_smoke_serve_args_use_a_sparse_compatible_block_size():
     assert f"SPARSE_BLOCK_SIZE = {m.SPARSE_BLOCK_SIZE}" in src
     backends = (Path(__file__).resolve().parents[2] / "atom/model_ops/attentions/backends.py").read_text(encoding="utf-8")
     assert "model_runner.block_size % self.block_size == 0" in backends
+
+def test_m3_smoke_default_is_all_dense_ffn_but_keeps_all_three_attention_types():
+    """E2 OFF arm (job-e2_off03): any MoE layer raises a stock TypeError (x_scale). The smoke
+    config therefore uses dense MLPs only, and must still cover dense, sparse-indexed and
+    skip-index ATTENTION layers with the real attention geometry."""
+    m = _load_m3_smoke("m3_smoke_dense_ffn")
+    for cfg in (m.m3_config(layers=4), m.m3_vl_config(layers=4)["text_config"]):
+        assert cfg["moe_layer_freq"] == [0, 0, 0, 0]  # no MoE layer anywhere
+        assert cfg["sparse_attention_config"]["sparse_attention_freq"] == [0, 1, 1, 1]
+        assert cfg["num_attention_heads"] * cfg["head_dim"] == 8192 and cfg["hidden_size"] == 6144
+        assert cfg["dense_intermediate_size"] == 6144
+    # skip-index layers still arise: sparse ordinals 0,1,2 with index_topk_freq 2 -> [F, T, F]
+    outer = m.m3_vl_config(layers=4)
+    assert outer["index_topk_freq"] == 2
+    freq, off = outer["index_topk_freq"], outer["index_skip_topk_offset"]
+    skips = [max(o - off, 0) % freq != 0 for o in range(3)]  # the model's own formula (model.py:105)
+    assert skips == [False, True, False] and any(skips) and not all(skips)
+    # explicit opt-in restores the old MoE layout
+    assert m.m3_config(layers=4, moe=True)["moe_layer_freq"] == [0, 1, 1, 1]
+    assert m.m3_vl_config(layers=4, moe=True)["text_config"]["moe_layer_freq"] == [0, 1, 1, 1]
+    assert m.m3_vl_config(layers=3)["text_config"]["moe_layer_freq"] == [0, 0, 0]
+
+
+def test_stock_moe_forward_still_lacks_x_scale_so_the_dense_default_is_still_needed():
+    """Pins the reason for moe=False to the real source. When ATOM fixes MiniMaxM3MoE.forward to
+    take x_scale this test FAILS, which is the signal to revisit the default."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py").read_text(encoding="utf-8")
+    assert "hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)" in src
+    moe_cls = src.split("class MiniMaxM3MoE", 1)[1].split("class MiniMaxM3Attention", 1)[0]
+    assert re.search(r"def forward\(self, hidden_states: torch\.Tensor\) -> torch\.Tensor:", moe_cls)
+    assert "x_scale" not in moe_cls
+    mlp_cls = src.split("class MiniMaxM3MLP", 1)[1].split("class MiniMaxM3MoE", 1)[0]
+    assert "x_scale: torch.Tensor | None = None" in mlp_cls  # the dense path accepts it

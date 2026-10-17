@@ -80,14 +80,23 @@ class _FakeBackend:
     def uid(self, rank):
         return b"u" * 128
 
-    def comm_create(self, rank, world, uid, vmm):
-        self.calls.append("comm_create")
+    def comm_create(self, rank, world, uid, vmm_bytes, device=None):
+        # aiter now passes the HIP device explicitly (the SP rank is not a device index)
+        self.calls.append(("comm_create", device))
         return 1
+
+    def devcomm_info(self, comm, dev):
+        # read back by finalize(); keys as in aiter's CcoBackend.devcomm_info
+        return {"lsaSize": 4, "lsaRank": 0, "sdmaNumQueue": 1, "worldSize": 4, "commRank": 0,
+                "myNodeStart": 0, "sizeofDevComm": 0}
 
     def win_register(self, comm, nbytes):
         self._n += 1
         self.calls.append(("win", nbytes))
         return 100 + self._n, 1000 + self._n
+
+    def peer_ptr(self, comm, local, peer):
+        return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
     def zero(self, device, local, nbytes):
         pass
@@ -95,7 +104,7 @@ class _FakeBackend:
     def device_sync(self, device):
         pass
 
-    def devcomm_create(self, comm, queues):
+    def devcomm_create(self, comm, sdma_queues):
         self.calls.append("devcomm")
         return 7
 
@@ -107,6 +116,28 @@ class _FakeBackend:
 
     def comm_destroy(self, comm):
         pass
+
+
+def test_fake_backend_has_exactly_the_real_ccobackend_signatures(real_gf):
+    """The fake stands in for aiter's native CcoBackend. It drifted once (comm_create gained a
+    `device` argument and finalize started calling devcomm_info), which the real aiter caught
+    and the fake did not. Pin every public method name and parameter list to the real class so
+    the next drift fails HERE, with the method named, not as an opaque TypeError mid-test."""
+    import inspect
+
+    res_mod = importlib.import_module("aiter.gemm_fusion.resources")
+    real = res_mod.CcoBackend
+
+    def sig(cls, name):
+        return [p for p in inspect.signature(getattr(cls, name)).parameters if p != "self"]
+
+    public = [n for n, f in inspect.getmembers(real, inspect.isfunction)
+              if not n.startswith("_")]
+    assert public, "found no public CcoBackend methods (module layout changed?)"
+    missing = [n for n in public if not hasattr(_FakeBackend, n)]
+    assert not missing, f"_FakeBackend lacks CcoBackend methods: {missing}"
+    drift = {n: (sig(real, n), sig(_FakeBackend, n)) for n in public if sig(real, n) != sig(_FakeBackend, n)}
+    assert not drift, f"_FakeBackend signatures differ from CcoBackend (real, fake): {drift}"
 
 
 class _FakeDist:
