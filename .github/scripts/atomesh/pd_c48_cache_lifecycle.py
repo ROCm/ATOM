@@ -18,6 +18,7 @@ class CacheLifecycleProbe:
         *,
         min_prompt=200000,
         max_history=100000,
+        max_watched=4096,
         max_records=2048,
         cache_kind="cpu",
         result_summary=None,
@@ -27,11 +28,14 @@ class CacheLifecycleProbe:
         self.stream = stream
         self.min_prompt = min_prompt
         self.max_history = max_history
+        self.max_watched = max_watched
         self.max_records = max_records
         self.cache_kind = cache_kind
         self.result_summary = result_summary or (lambda result: result)
         self.history = OrderedDict()
         self.history_dropped = 0
+        self.watched = {}
+        self.watch_limit_misses = 0
         self.records = 0
         self.io_error = None
         self.context = None
@@ -43,14 +47,29 @@ class CacheLifecycleProbe:
         self.installed = False
 
     def _remember(self, key, event, block_id):
-        value = self.history.pop(key, {})
+        watched = self.watched.get(key)
+        value = self.history.pop(key, watched["events"] if watched else {})
         value[event] = {"unix_ns": time.time_ns(), "block_id": block_id}
         if event == "last_remove":
             value[event]["reason"] = self.removal_reason
         self.history[key] = value
+        if watched is not None:
+            watched["events"] = value
         if len(self.history) > self.max_history:
             self.history.popitem(last=False)
             self.history_dropped += 1
+
+    def _watch(self, key):
+        if key in self.watched:
+            return
+        if len(self.watched) >= self.max_watched:
+            self.watch_limit_misses += 1
+            return
+        self.watched[key] = {
+            "events": self.history.get(key, {}),
+            "complete_from_pool_start": self.history_started_empty
+            and self.history_dropped == 0,
+        }
 
     def _query(self, key, found):
         if self.context is None:
@@ -60,6 +79,10 @@ class CacheLifecycleProbe:
         summary = self.context["groups"].setdefault(
             group, {"queries": 0, "hits": 0, "misses": 0}
         )
+        if summary["queries"] == 0:
+            # Preserve the actual first queried key in each group across a
+            # long idle gap, even after the rolling history has turned over.
+            self._watch(key)
         summary["queries"] += 1
         if found is not None:
             summary["hits"] += 1
@@ -74,13 +97,18 @@ class CacheLifecycleProbe:
             index is not None
             and (previous["hash_index"] is None or index < previous["hash_index"])
         ):
-            history = self.history.get(key)
+            watched = self.watched.get(key)
+            history = watched["events"] if watched else self.history.get(key)
             summary["lowest_missing_hash"] = {
                 "hash_index": index,
                 "hash_with_group_hex": key.hex(),
-                "observed_history": dict(history) if history is not None else None,
-                "history_absence_is_conclusive": self.history_started_empty
-                and self.history_dropped == 0,
+                "observed_history": dict(history) if history else None,
+                "history_source": "watched_actual_query" if watched else "rolling",
+                "history_absence_is_conclusive": (
+                    watched["complete_from_pool_start"]
+                    if watched
+                    else self.history_started_empty and self.history_dropped == 0
+                ),
                 "note": "A map miss, not a tensor validity or token equality check.",
             }
 
@@ -156,6 +184,7 @@ class CacheLifecycleProbe:
             if result:
                 self.reset_count += 1
                 self.history.clear()
+                self.watched.clear()
                 self._install_map()
                 self._emit({"event": "cache_reset", "reset_count": self.reset_count})
             return result
@@ -205,6 +234,8 @@ class CacheLifecycleProbe:
                 lookup_host_ms=(time.monotonic_ns() - begin) / 1e6,
                 retained_history_keys=len(self.history),
                 history_dropped=self.history_dropped,
+                watched_keys=len(self.watched),
+                watch_limit_misses=self.watch_limit_misses,
                 map_publications=self.published,
                 map_removals=self.removed,
             )
@@ -221,6 +252,7 @@ class CacheLifecycleProbe:
                 "unix_ns": time.time_ns(),
                 "min_prompt": self.min_prompt,
                 "max_history": self.max_history,
+                "max_watched": self.max_watched,
                 "max_records": self.max_records,
                 "history_start": "Installation; not earlier cache events.",
                 "scope": "Host-side cache metadata; no GPU or tensor operations.",
@@ -296,6 +328,7 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "min_prompt": limits.get("min_prompt", 200000),
         "max_history_per_pool": limits.get("max_history", 100000),
+        "max_watched_keys_per_pool": limits.get("max_watched", 4096),
         "max_records_per_pool": limits.get("max_records", 2048),
         "lazy_offload": cpu._lazy_mode,
         "cpu_blocks": cpu.num_cpu_blocks,
@@ -342,6 +375,8 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
                             "record_limit_reached": probe.records >= probe.max_records,
                             "history_dropped": probe.history_dropped,
                             "retained_history_keys": len(probe.history),
+                            "watched_keys": len(probe.watched),
+                            "watch_limit_misses": probe.watch_limit_misses,
                             "map_publications": probe.published,
                             "map_removals": probe.removed,
                             "io_error": probe.io_error,
