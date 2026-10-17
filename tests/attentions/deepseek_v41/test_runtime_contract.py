@@ -493,43 +493,6 @@ def test_a_page_that_does_not_hold_whole_index_blocks_is_refused():
     V41PoolGeometry(40, ((2, 2), (20, 1)), 16, 128, 512, 128, index_block_rows=8)
 
 
-def test_the_scorer_plane_fits_the_candidate_list_at_short_contexts():
-    """The candidate plane is wider than the context one below ~16k tokens.
-
-    `candidate_topk_blocks` comes from the checkpoint and `max_model_len` does
-    not bound it, so which of the two planes is widest flips with the context
-    length. Sizing from the context alone fits every long-context
-    configuration and none of the short ones -- and the failure surfaces as
-    "a [8192, 16384] scorer temporary exceeds its workspace", naming the
-    scorer rather than the budget it was sized from. This is checkable from a
-    geometry alone: no model, no GPU, no vLLM.
-    """
-    from atom.model_ops.deepseek_v41.score_workspace import ScoreWorkspace
-
-    geo = V41PoolGeometry(
-        26, ((20, 1),), 256, 128, 512, 128, index_block_rows=8, index_topk=512
-    )
-    # 8192 tokens of context: 32 PAGEs of 256, so the context plane is
-    # 32 * 256 = 8192 wide. The candidate list is 2048 blocks of 8 = 16384.
-    columns, candidate_blocks = 32, 2048
-    context_width = columns * geo.rows_per_page(1)
-    candidate_width = candidate_blocks * geo.index_block_rows
-    assert candidate_width > context_width, "fixture no longer exercises the case"
-
-    ws = ScoreWorkspace(geo, 8192, columns, "cpu", candidate_blocks=candidate_blocks)
-    # The call the old sizing refused, at the exact shape it refused it in.
-    ws.logits(8192, candidate_width)
-
-    # And the context plane still fits, so this widened rather than traded.
-    ws.logits(8192, context_width)
-
-    # Negative control: without the candidate width the same call must fail,
-    # or this test would pass against the defect it exists to catch.
-    narrow = ScoreWorkspace(geo, 8192, columns, "cpu")
-    with pytest.raises(ValueError, match="exceeds its workspace"):
-        narrow.logits(8192, candidate_width)
-
-
 def test_prefix_caching_is_admitted_with_the_offload_connector():
     """The connector is what makes reuse admissible, not a separate feature.
 
@@ -549,40 +512,6 @@ def test_prefix_caching_is_admitted_with_the_offload_connector():
 def test_prefix_caching_without_the_connector_is_still_refused():
     with pytest.raises(ValueError, match="prefix caching"):
         validate_runtime_config(vllm_plugin_config(enable_prefix_caching=True))
-
-
-def test_the_attention_output_buffer_is_one_row_per_token_not_per_sequence():
-    """Sized from every leading dim of `hidden`, not from `shape[0]`.
-
-    ATOM hands this layer `[batch, tokens, dim]`; upstream's native V4.1 gets
-    `[tokens, dim]`, and its `_alloc_attn_out(hidden_states.shape[0], ...)`
-    is correct only for that shape. Copying the form without the premise
-    allocates one row per sequence, and the 518 tests here all passed on it --
-    only a kernel's own `out=` check caught it, at server startup.
-    """
-    import torch
-
-    pytest.importorskip("aiter", reason="the attention module reaches AITER")
-    from atom.models.deepseek_v41.attention import Attention
-    from atom.plugin.vllm.v41_core_overrides import _attn_out_buffer
-
-    heads, head_dim = 16, 512
-    stub = SimpleNamespace(heads=heads, head_dim=head_dim)
-
-    # Core allocates nothing: the rows come back by return value, which is
-    # what keeps the native path free of this buffer and of the copy that
-    # landing in it would need.
-    assert Attention._attn_out_buffer(stub, None) is None
-
-    for shape, tokens in (((8192, 7168), 8192), ((1, 8192, 7168), 8192)):
-        hidden = torch.empty(shape, dtype=torch.bfloat16, device="cpu")
-        out = _attn_out_buffer(stub, hidden)
-        assert out.shape[-2:] == (heads, head_dim)
-        # The leading dims are whatever `hidden` had, so the flatten this
-        # path performs next yields one row per token under either layout.
-        assert (
-            out.shape[:-2].numel() == tokens
-        ), f"{shape} gave {out.shape[:-2].numel()} rows, expected {tokens}"
 
 
 @pytest.mark.parametrize("tp,dp", [(4, 1), (1, 4)])

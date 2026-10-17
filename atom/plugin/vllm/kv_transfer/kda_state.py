@@ -331,10 +331,9 @@ class KdaLoad:
     at face value and caches the whole external prefix, serving an MLA prefix
     whose recurrent state was never restored.
 
-    Empty ``block_ids`` or an entry below the tier's ``min_load_destination``
-    means the destination could not be resolved. KDA block zero is NULL;
-    V4.1 state slots instead start at zero and use a negative refusal marker.
-    Invalid destinations fail without touching the device, just like a miss.
+    An empty ``block_ids``, or any entry ``<= NULL_BLOCK_ID``, means the
+    destination could not be resolved; the tier fails it without touching the
+    device, which is the same outcome as a miss.
     """
 
     req_id: str
@@ -376,15 +375,8 @@ class KdaStateTier:
     hold a second opinion about what is stored.
     """
 
-    def __init__(
-        self,
-        codec,
-        *,
-        thread_name_prefix: str = "atom-kda",
-        min_load_destination: int = NULL_BLOCK_ID + 1,
-    ) -> None:
+    def __init__(self, codec, *, thread_name_prefix: str = "atom-kda") -> None:
         self._codec = codec
-        self._min_load_destination = min_load_destination
         self._store_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=f"{thread_name_prefix}-store"
         )
@@ -464,30 +456,15 @@ class KdaStateTier:
     def _do_load(self, load: KdaLoad) -> None:
         ok = False
         try:
-            if load.block_ids and all(
-                b >= self._min_load_destination for b in load.block_ids
-            ):
+            if load.block_ids and all(b > NULL_BLOCK_ID for b in load.block_ids):
                 ok = bool(self._codec.get(int(load.prefix_hash), load.block_ids))
-                reason = "codec_returned_false" if not ok else None
-            else:
-                reason = "invalid_destination"
-            if not ok:
-                logger.warning(
-                    "State offload: load req=%s hash=%d destination=%s failed: %s",
-                    load.req_id,
-                    load.prefix_hash,
-                    load.block_ids,
-                    reason,
-                )
         except Exception:  # a failed load is a normal path
             # LMCache's LRU can drop bytes under a hash the index still
             # advertises. Retracting that claim is the scheduler's job; the
             # report below is what tells it to.
             logger.warning(
-                "State offload: load req=%s hash=%d destination=%s failed: exception",
-                load.req_id,
+                "KDA state offload: load of hash %d failed",
                 load.prefix_hash,
-                load.block_ids,
                 exc_info=True,
             )
         with self._lock:

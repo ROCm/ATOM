@@ -337,7 +337,6 @@ def _worker_adapter(worker):
     # No recurrent tier on this worker, as in a real non-hybrid construction.
     adapter._kv_cache_config = None
     adapter._kda_tier = None
-    adapter._v41_slots = None
     adapter._kda_error_blocks = set()
     adapter._kda_error_reqs = set()
     adapter._abandoned_loads = set()
@@ -350,7 +349,6 @@ def _worker_adapter(worker):
     adapter._worker_state_stored = {}
     adapter._worker_state_store_failed = {}
     adapter._worker_state_load_failed = {}
-    adapter._v41_refusals_to_report = {}
     return adapter
 
 

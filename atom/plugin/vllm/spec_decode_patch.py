@@ -168,7 +168,7 @@ def _split_v41_proxy_layers(kv_cache_spec):
     return proxy, rest
 
 
-def _is_v41_image_layer(name: str) -> bool:
+def _is_v41_checkpoint_layer(name: str) -> bool:
     """Whether a layer is one PAGE unit of a V4.1 checkpoint.
 
     Asks the adapter rather than matching a string here, so the suffix has one
@@ -212,7 +212,7 @@ def _build_v41_proxy_draft_groups(kv_cache_spec):
     # vLLM rejects as "All layers in the same KV cache group must be the
     # same" -- measured, engine down at startup with checkpoints on.
     checkpoints = {
-        name: spec for name, spec in rest.items() if _is_v41_image_layer(name)
+        name: spec for name, spec in rest.items() if _is_v41_checkpoint_layer(name)
     }
     rest = {name: spec for name, spec in rest.items() if name not in checkpoints}
     proxy_specs = list(proxy.values())
@@ -272,7 +272,7 @@ def _groups_have_v41_proxy(kv_cache_groups) -> bool:
         for name in group.layer_names:
             if name.endswith(ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME):
                 has_proxy = True
-            elif not _is_v41_image_layer(name):
+            elif not _is_v41_checkpoint_layer(name):
                 has_other_pool = True
     return has_proxy and has_other_pool
 
@@ -418,7 +418,7 @@ def _v41_overlay_split(kv_cache_groups):
         for layer_name, layer_spec in _iter_group_layer_specs(group):
             if layer_name.endswith(
                 ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
-            ) or _is_v41_image_layer(layer_name):
+            ) or _is_v41_checkpoint_layer(layer_name):
                 overlay_names.append(layer_name)
                 overlay_pages.add(int(layer_spec.page_size_bytes))
             else:

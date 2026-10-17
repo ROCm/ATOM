@@ -1,13 +1,8 @@
-"""How the connector picks an offload transport, and what ``mp`` demands first.
-
-The MP transport can publish recurrent state with the PAGE object. An
-explicit ``own-pool`` transport instead allocates a separate per-rank host
-pool and therefore requires an explicit size. Merely choosing MP must not
-force that second allocation.
+"""How the connector picks an offload transport, and what it refuses.
 
 Exercised unbound, off a stub, because everything either reads is the option
-bag and the mamba group list. Constructing a real connector would drag in a
-vLLM config, a model and a device for no added coverage.
+bag and the group lists. Constructing a real connector would drag in a vLLM
+config, a model and a device for no added coverage.
 """
 
 from __future__ import annotations
@@ -19,24 +14,18 @@ import pytest
 from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 
 _resolve_backend = AtomLMCacheOffloadConnector._resolve_offload_backend
-_resolve_state_size = AtomLMCacheOffloadConnector._resolve_state_cpu_size_gb
-_resolve_state_transport = AtomLMCacheOffloadConnector._resolve_state_transport
+_rides = AtomLMCacheOffloadConnector._state_rides_mp.fget
+_refuse_v41 = AtomLMCacheOffloadConnector._refuse_v41_without_ride
 
 
-def _stub(*, mamba_groups=(), **options):
+def _stub(*, mamba_groups=(), v41=False, checkpoint_groups=(), **options):
     stub = SimpleNamespace(
         _config=SimpleNamespace(kv_transfer_config=dict(options)),
         _mamba_groups=list(mamba_groups),
-        _state_cpu_size_gb=0.0,
+        _is_deepseek_v41=v41,
+        _v41_checkpoint_group_ids=tuple(checkpoint_groups),
     )
-    # Mirrors __init__'s order: the size is resolved first, and the transport
-    # refusal reads the resolved value. Tests that feed a bad size call the
-    # resolver directly, so a stub that cannot be built for them would hide
-    # the very error they assert on.
-    try:
-        stub._state_cpu_size_gb = _resolve_state_size(stub)
-    except ValueError:
-        pass
+    stub._offload_backend = _resolve_backend(stub)
     return stub
 
 
@@ -46,87 +35,57 @@ def test_backend_defaults_to_inproc():
 
 def test_unknown_backend_is_refused():
     with pytest.raises(ValueError, match="must be 'inproc' or 'mp'"):
-        _resolve_backend(_stub(**{"atom.offload.backend": "zmq"}))
+        _stub(**{"atom.offload.backend": "zmq"})
 
 
 def test_backend_is_case_and_space_insensitive():
     assert _resolve_backend(_stub(**{"atom.offload.backend": " MP "})) == "mp"
 
 
+@pytest.mark.parametrize(
+    "option",
+    [
+        "lmcache.mp.state_transport",
+        "lmcache.mp.state_cpu_size_gb",
+        "atom.offload.v41.state_interval",
+    ],
+)
+def test_a_retired_state_pool_option_is_refused_not_ignored(option):
+    with pytest.raises(ValueError, match="no longer"):
+        _stub(**{"atom.offload.backend": "mp", option: 1})
+
+
 def test_mp_is_allowed_for_a_model_with_no_recurrent_group():
-    assert _resolve_backend(_stub(**{"atom.offload.backend": "mp"})) == "mp"
+    stub = _stub(**{"atom.offload.backend": "mp"})
+    assert stub._offload_backend == "mp"
+    assert not _rides(stub)
 
 
-def test_inproc_hybrid_needs_no_state_pool_size():
-    # The in-process path shares the one pool, so there is no second
-    # allocation to declare.
-    stub = _stub(mamba_groups=[(1, object())])
-    assert _resolve_backend(stub) == "inproc"
+def test_inproc_hybrid_keeps_its_state_in_process():
+    assert not _rides(_stub(mamba_groups=[(1, object())]))
 
 
-def test_mp_hybrid_without_a_state_pool_uses_mp_state_transport():
+def test_mp_hybrid_rides_the_page_object():
     stub = _stub(mamba_groups=[(1, object())], **{"atom.offload.backend": "mp"})
-
-    assert _resolve_backend(stub) == "mp"
-    assert _resolve_state_transport(stub) == "mp"
+    assert _rides(stub)
 
 
-def test_explicit_own_pool_without_a_size_is_refused():
-    stub = _stub(
-        mamba_groups=[(1, object())],
-        **{"atom.offload.backend": "mp", "lmcache.mp.state_transport": "own-pool"},
-    )
-
-    with pytest.raises(ValueError, match="lmcache.mp.state_cpu_size_gb"):
-        _resolve_state_transport(stub)
+def test_v41_rides_its_checkpoint_groups():
+    stub = _stub(v41=True, checkpoint_groups=(1, 2), **{"atom.offload.backend": "mp"})
+    _refuse_v41(stub)
+    assert _rides(stub)
 
 
-def test_mp_hybrid_with_a_state_pool_size_is_allowed():
-    stub = _stub(
-        mamba_groups=[(1, object())],
-        **{"atom.offload.backend": "mp", "lmcache.mp.state_cpu_size_gb": 8},
-    )
-
-    assert _resolve_backend(stub) == "mp"
-    assert _resolve_state_transport(stub) == "own-pool"
+def test_v41_refuses_the_in_process_backend():
+    stub = _stub(v41=True, checkpoint_groups=(1, 2))
+    with pytest.raises(ValueError, match="LMCache MP server only"):
+        _refuse_v41(stub)
 
 
-def test_explicit_mp_transport_overrides_legacy_pool_size():
-    stub = _stub(
-        mamba_groups=[(1, object())],
-        **{
-            "atom.offload.backend": "mp",
-            "lmcache.mp.state_cpu_size_gb": 8,
-            "lmcache.mp.state_transport": "mp",
-        },
-    )
-
-    assert _resolve_state_transport(stub) == "mp"
-
-
-def test_state_pool_size_defaults_to_zero_meaning_unset():
-    assert _resolve_state_size(_stub()) == 0.0
-
-
-def test_state_pool_size_accepts_a_string_of_digits():
-    # Every option arrives through a CLI JSON blob, so a quoted number is the
-    # normal spelling, not an edge case.
-    stub = _stub(**{"lmcache.mp.state_cpu_size_gb": "12.5"})
-    assert _resolve_state_size(stub) == 12.5
-
-
-def test_non_numeric_state_pool_size_is_refused():
-    stub = _stub(**{"lmcache.mp.state_cpu_size_gb": "big"})
-
-    with pytest.raises(ValueError, match="must be a number of GiB"):
-        _resolve_state_size(stub)
-
-
-def test_negative_state_pool_size_is_refused():
-    stub = _stub(**{"lmcache.mp.state_cpu_size_gb": -1})
-
-    with pytest.raises(ValueError, match="must not be negative"):
-        _resolve_state_size(stub)
+def test_v41_refuses_mp_without_checkpoint_groups():
+    stub = _stub(v41=True, **{"atom.offload.backend": "mp"})
+    with pytest.raises(ValueError, match="state checkpoint groups"):
+        _refuse_v41(stub)
 
 
 _replication = AtomLMCacheOffloadConnector._page_tp_replication_factor

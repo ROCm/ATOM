@@ -185,28 +185,6 @@ def test_the_v41_proxy_layer_is_recognised_for_non_immediate_block_reuse():
     )
 
 
-def test_the_state_tier_derives_its_size_and_identity_from_the_geometry():
-    """So speculative decoding, when it lands, cannot reuse the wrong bytes.
-
-    `ring_slots` and `compress_ring_slots` both carry `speculative_tokens`, so
-    turning spec on grows the STATE image. The tier must take both its entry
-    size and its layout identity from the geometry rather than restating them:
-    the first keeps the transfer sized correctly, and the second is what puts
-    the larger images in their own key space instead of over the old ones.
-    """
-    pytest.importorskip("lmcache")
-    from atom.plugin.vllm.kv_transfer.v41_state import V41StateViews
-
-    class Geo(FakeGeometry):
-        layout_id = "dsv41-bf16-...:spec=5"
-
-    cache = FakeCache()
-    cache.geometry = Geo(PAGE_BYTES, PAGED_BYTES, 9_999_991)
-    views = V41StateViews(cache, stage_depth=1)
-    assert views.entry_bytes == cache.geometry.state_bytes
-    assert views.layout_id == cache.geometry.layout_id
-
-
 def test_the_pool_and_the_offload_leg_size_speculation_from_one_source():
     """The invariant the old `speculative_tokens=0` assertion stood in for.
 

@@ -81,8 +81,6 @@ def connector(page=None, tier=None, groups=2):
         "_worker_state_load_failed",
         "_kda_results",
         "_kda_join_waiting",
-        "_v41_refusal_counts",
-        "_v41_refusals_to_report",
         "_promised_loads",
         "_load_failure_reports",
         "_state_load_failure_reports",
@@ -92,8 +90,7 @@ def connector(page=None, tier=None, groups=2):
         setattr(c, name, {})
     c._pending_release_ids = []
     c._worker_completions = []
-    c._v41_refusals = []
-    c._v41_slots = c._v41_leg = c._v41_planner = c._kda_planner = None
+    c._v41_planner = c._kda_planner = None
     c._kda_flush_stores_in_get_finished = False
     c._gpu_block_pool = None
     c._world_size = 1

@@ -156,42 +156,16 @@ def test_mp_scheduler_is_not_a_dense_transport_scheduler():
     )
 
 
-def test_mp_config_rejects_engine_driven_transfer_when_state_rides_along(monkeypatch):
-    """Only the riding-along state blocks engine_driven.
-
-    LMCache's engine-driven transfer raises on more than one KV cache group
-    (`_single_group_block_ids`), and a recurrent group inside the PAGE object
-    is the only thing in this layout that makes a second one. `_config()`
-    omits the state pool size, which is the opt-in to riding along.
-    """
-
+def test_mp_config_rejects_engine_driven_transfer(monkeypatch):
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", " EnGiNe_DrIvEn ")
-    with pytest.raises(NotImplementedError, match="single KV cache group"):
+    with pytest.raises(NotImplementedError, match="multiple physical"):
         deployment._validate_mp_config(_config())
 
     monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", "auto")
-    with pytest.raises(NotImplementedError, match="single KV cache group"):
+    with pytest.raises(NotImplementedError, match="multiple physical"):
         deployment._validate_mp_config(
             _config(extra={"lmcache.mp.mp_transfer_mode": " EnGiNe_DrIvEn "})
         )
-
-
-@pytest.mark.parametrize(
-    "extra",
-    [
-        {"lmcache.mp.state_transport": "own-pool", "lmcache.mp.state_cpu_size_gb": 24},
-        {"lmcache.mp.state_cpu_size_gb": 24},
-    ],
-)
-def test_mp_config_allows_engine_driven_with_state_on_its_own_pool(monkeypatch, extra):
-    monkeypatch.setenv("LMCACHE_MP_TRANSFER_MODE", " EnGiNe_DrIvEn ")
-    deployment._validate_mp_config(_config(extra=dict(extra)))
-    assert (
-        deployment._transfer_mode(
-            _config(extra={**extra, "lmcache.mp.mp_transfer_mode": "engine_driven"})
-        )
-        == "engine_driven"
-    )
 
 
 @pytest.mark.parametrize(
@@ -359,36 +333,10 @@ def _kimi_k3_config(**kwargs):
     return k3
 
 
-def test_auto_rank_collapse_keeps_kimi_k3_per_rank_while_state_rides_along():
-    # K3's MLA KV is replicated, but the KDA checkpoint images ride in the same
-    # PAGE units and hold TP-sharded heads, so the unit as a whole is not.
+def test_auto_rank_collapse_keeps_kimi_k3_per_rank():
+    # K3's MLA KV is replicated, but the KDA checkpoints ride in the same PAGE
+    # units and hold TP-sharded heads, so the unit as a whole is not.
     assert deployment._tp_replication_factor(_kimi_k3_config()) == 1
-
-
-def test_auto_rank_collapse_collapses_kimi_k3_when_state_has_its_own_pool():
-    """Under `own-pool` the PAGE unit is pure MLA again, and MLA is replicated.
-
-    Reading the model name instead of the transport is what once cost the whole
-    tier: `own-pool` is what the throughput runs use, so the config that most
-    wants one copy per TP group was the one refused it.
-    """
-    assert (
-        deployment._tp_replication_factor(
-            _kimi_k3_config(extra={"lmcache.mp.state_cpu_size_gb": 24})
-        )
-        == 8
-    )
-    assert (
-        deployment._tp_replication_factor(
-            _kimi_k3_config(
-                extra={
-                    "lmcache.mp.state_cpu_size_gb": 24,
-                    "lmcache.mp.state_transport": "mp",
-                }
-            )
-        )
-        == 1
-    )
 
 
 def test_tp_rank_collapse_can_be_disabled_and_rejects_bad_values():
@@ -2300,6 +2248,55 @@ def test_each_recurrent_ordinal_gets_its_own_engine_group(
         (5,),
     ]
     assert worker._num_recurrent_groups == 2
+
+
+def _register_recurrent_with_chunk(monkeypatch, chunk):
+    aiter = types.ModuleType("aiter")
+    aiter.__path__ = []
+    dist = types.ModuleType("aiter.dist")
+    dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tp_group = lambda: SimpleNamespace(rank_in_group=0)
+    monkeypatch.setitem(sys.modules, "aiter", aiter)
+    monkeypatch.setitem(sys.modules, "aiter.dist", dist)
+    monkeypatch.setitem(sys.modules, "aiter.dist.parallel_state", parallel_state)
+
+    adapter = _WorkerAdapter()
+    adapter.lmcache_tokens_per_chunk = chunk
+    monkeypatch.setattr(
+        mp_worker, "_make_worker_adapter", lambda _config, _rank: adapter
+    )
+    worker = mp_worker.LMCacheMPConnector(_config(model_type="ordinary_mha"))
+    worker.register_kv_caches(
+        {},
+        transfer_tensors=_recurrent_transfer_tensors(),
+        num_blocks=2,
+    )
+    return adapter
+
+
+def test_a_recurrent_block_spans_one_chunk_however_wide_the_chunk(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    """A snapshot sits only on a chunk boundary, so it is one id per chunk.
+
+    Registered at its own 8-token block under a 16-token chunk, the server
+    would ask each recurrent group for two ids per chunk, find one, and skip
+    every store ("STORE block ID underflow") -- measured as a tier that never
+    hit at chunk 1024 over a 256-token V4.1 checkpoint.
+    """
+    adapter = _register_recurrent_with_chunk(monkeypatch, 16)
+    assert [group.tokens_per_block for group in adapter.groups] == [4, 4, 16, 16]
+    assert [group.sw_size_tokens for group in adapter.groups] == [-1, -1, 16, 16]
+
+
+def test_a_chunk_off_the_recurrent_block_grid_is_refused(
+    fake_lmcache_modules,
+    monkeypatch,
+):
+    with pytest.raises(ValueError, match="whole number of recurrent blocks"):
+        _register_recurrent_with_chunk(monkeypatch, 12)
 
 
 def test_save_nulls_every_recurrent_chunk_but_the_boundary(fake_lmcache_modules):

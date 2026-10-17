@@ -240,7 +240,7 @@ def build_v41_state_checkpoint_copier(vllm_config, max_batch: int = 64):
 class AtomDeepseekV41StateCheckpointBackend(PagedStateCheckpointBackend):
     @staticmethod
     def get_name() -> str:
-        return "ATOM_DEEPSEEK_V41_IMAGE"
+        return "ATOM_DEEPSEEK_V41_STATE_CHECKPOINT"
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None):

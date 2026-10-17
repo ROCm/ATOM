@@ -87,14 +87,14 @@ class _V2InputBatchView:
     The V2 runner keeps its block tables outside the batch, as
     ``StagedWriteTensor``s that have only a `.gpu` side -- there is no host
     mirror to read, so `batch.block_table[g].block_table.np` (what the shared
-    image mechanism uses to turn a (row, column) into a block id) has nothing
+    checkpoint mechanism uses to turn a (row, column) into a block id) has nothing
     to resolve against. ``prepare_attn`` is handed the same tables as device
     tensors, so copy the group's table down once per step, on first use, and
     cache it for the rest of that step. Readers of every other attribute get
     the real batch.
 
     The copy is a sync. It happens only when something actually asks for an
-    image unit id -- that is, on a step the scheduler planned a store or a
+    checkpoint unit id -- that is, on a step the scheduler planned a store or a
     restore for, not on every step.
     """
 

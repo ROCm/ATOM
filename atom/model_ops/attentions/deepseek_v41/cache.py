@@ -434,7 +434,7 @@ class PagedAttentionCache:
         )
 
     def _restore_stale_rows(self, cursors, starts, ids, fresh, step, count):
-        """Give a checkpoint-image restore a chance before the contract judges.
+        """Give a checkpoint restore a chance before the contract judges.
 
         The only point between a slot being assigned and its cursor being
         judged. Placed after the reset, a restore cannot be undone by it;
@@ -445,22 +445,22 @@ class PagedAttentionCache:
         answer.
 
         Only the rows that would otherwise raise are touched: restoring every
-        row every step overwrites live state with an image nothing has
+        row every step overwrites live state with a checkpoint nothing has
         written, measured as a prefill chunk arriving at `computed=4096` with
         `cursor=0`. The filter is `~fresh`, the same one the contract uses,
         so the two cannot drift apart.
         """
-        hook = _IMAGE_RESTORE_HOOK
+        hook = _CHECKPOINT_RESTORE_HOOK
         if hook is None:
             return cursors
         wrong = np.flatnonzero(~fresh & (cursors[:, 0] != starts))
         if not wrong.size:
             return cursors
-        # The third element is the request id, not the row index: the image
+        # The third element is the request id, not the row index: the checkpoint
         # block table is addressed in the batch's own row space, which is not
         # this step's. Handing over the step row read another request's block
         # ids (measured: a store wrote units 14..21 and the restore read
-        # 192..185 for what should have been the same image).
+        # 192..185 for what should have been the same checkpoint).
         rows = [
             (
                 int(step.requests[int(i)].slot),
@@ -472,7 +472,7 @@ class PagedAttentionCache:
         try:
             restored = int(hook(rows))
         except Exception:
-            logger.warning("DeepSeek-V4.1 image restore failed", exc_info=True)
+            logger.warning("DeepSeek-V4.1 checkpoint restore failed", exc_info=True)
             _RESTORE_FAILURES.append(1)
             return cursors
         if not restored:
@@ -499,7 +499,7 @@ class PagedAttentionCache:
             # vLLM's own synthetic warmup only. It runs a decode step at a
             # position no request ever reached, through slots nothing wrote,
             # and discards the output -- so the state it reads is not state
-            # anyone will see. This exemption appeared when the state-image
+            # anyone will see. This exemption appeared when the state-checkpoint
             # layers made the model hybrid: vLLM warms SSM groups with
             # `_warmup_N_` at position 2, and without it the engine dies
             # before serving its first request.
@@ -996,16 +996,16 @@ def _is_vllm_warmup_request(req_id) -> bool:
     return text.startswith("_warmup_") and text.endswith("_")
 
 
-#: Set by the state-image runtime. `rows` is `[(slot, start_token, row)]`
+#: Set by the state-checkpoint runtime. `rows` is `[(slot, start_token, row)]`
 #: for exactly the rows whose cursor is not where the scheduler wants it;
 #: the hook returns how many it restored.
-_IMAGE_RESTORE_HOOK = None
+_CHECKPOINT_RESTORE_HOOK = None
 _RESTORE_FAILURES: list = []
 
 
 def install_state_checkpoint_restore_hook(hook) -> None:
-    global _IMAGE_RESTORE_HOOK
-    _IMAGE_RESTORE_HOOK = hook
+    global _CHECKPOINT_RESTORE_HOOK
+    _CHECKPOINT_RESTORE_HOOK = hook
 
 
 def restore_failures() -> int:

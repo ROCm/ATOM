@@ -8,67 +8,75 @@ and floors to zero chunks at the caller. The hit it was capping was 1280,
 and the tier supplied nothing all run.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
-from atom.plugin.vllm.kv_transfer.v41_state import (
-    V41BoundaryPlanner,
-    boundary_prefix_hash,
-)
+from atom.plugin.vllm.kv_transfer import v41_state
+from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
 
 
-def _planner(hash_unit, grid, interval=4096):
-    p = V41BoundaryPlanner.__new__(V41BoundaryPlanner)
-    p.hash_block_size = hash_unit
-    p.boundary_grid = grid
-    p.state_interval = interval
-    return p
+def _planner(hash_unit=256, grid=256, *, keep_tail=False, can_serve=False):
+    return V41BoundaryPlanner(
+        hash_block_size=hash_unit,
+        boundary_grid=grid,
+        chunk_size=256,
+        state_checkpoints_can_serve=can_serve,
+        checkpoint_group_ids=(1,),
+        keep_a_prefill_tail=keep_tail,
+    )
 
 
-def test_the_anchor_lands_on_the_page_grid_not_the_hash_grid():
-    p = _planner(32, 256)
-
-    class _Req:
-        num_prompt_tokens = 1345
-
-    assert p._prompt_anchor(_Req()) == 1280  # was 1344 on the 32 grid
-
-
-def test_a_hash_is_indexed_in_vllms_unit():
-    """The other half: `boundary_hash` must keep using the hash unit, or it
-    reads the wrong entry of a list vLLM built."""
-    p = _planner(32, 256)
-    hashes = list(range(50))
-    # 1280 tokens is entry 39 at 32 tokens each. Compared against the hash
-    # of that entry rather than the index, because the key is derived.
-    assert p.boundary_hash(hashes, 1280) == boundary_prefix_hash(hashes[39])
-    # Off the hash grid there is no key at all.
-    assert p.boundary_hash(hashes, 1300) is None
+def _cap(planner, hit, *, num_tokens=4096, armed_for="r"):
+    request = SimpleNamespace(request_id=armed_for, num_tokens=num_tokens)
+    planner.begin_lookup(request)
+    try:
+        return planner.cap_hit(SimpleNamespace(id="r"), hit)
+    finally:
+        planner.end_lookup()
 
 
 def test_the_grid_must_be_a_multiple_of_the_hash_unit():
     """Otherwise a boundary on the grid could not be hashed -- the two halves
     would disagree about which positions exist."""
     with pytest.raises(ValueError, match="not a multiple of the hash block"):
-        V41BoundaryPlanner(
-            hash_block_size=256,
-            boundary_grid=96,
-            chunk_size=256,
-            state_interval=4096,
-            max_num_batched_tokens=8192,
-            world_size=1,
-        )
+        _planner(256, 96)
 
 
-def test_they_stay_equal_when_there_is_one_group():
-    """The single-group case must be untouched: grid defaults to the hash
-    unit, which is what every run without a draft model does."""
-    p = _planner(256, 256)
+def test_a_ride_needs_a_checkpoint_group_to_name():
+    with pytest.raises(ValueError, match="no checkpoint group"):
+        V41BoundaryPlanner(hash_block_size=256, chunk_size=256)
 
-    class _Req:
-        num_prompt_tokens = 1345
 
-    assert p._prompt_anchor(_Req()) == 1280
-    assert p.boundary_hash(list(range(10)), 1280) == boundary_prefix_hash(4)
+def test_a_hit_is_capped_to_the_page_grid_not_the_hash_unit():
+    """The DSpark case: hash unit 32, grid 256. 1300 is on neither, 1280 is a
+    PAGE edge, and 1312 would be a legal 32-grid point that is not one."""
+    p = _planner(32, 256)
+    assert _cap(p, 1300) == 1280
+    assert _cap(p, 1312) == 1280
+    assert p.counters()["cap_kept"] == 2
+
+
+def test_a_hit_below_one_page_is_declined():
+    p = _planner()
+    assert _cap(p, 200) == 0
+    assert p.counters()["cap_declined"] == 1
+
+
+def test_an_unarmed_cap_declines_the_hit():
+    """Fail closed: an unarmed hook used to serve the hit whole, restoring PAGE
+    to a position whose STATE was never written."""
+    p = _planner()
+    assert p.cap_hit(SimpleNamespace(id="r"), 1024) == 0
+    assert p.counters()["cap_unarmed"] == 1
+
+
+def test_an_unarmed_cap_leaves_a_zero_hit_alone():
+    assert _planner().cap_hit(SimpleNamespace(id="r"), 0) == 0
+
+
+def test_a_cap_armed_for_another_request_declines():
+    assert _cap(_planner(), 1024, armed_for="someone-else") == 0
 
 
 def test_the_prefill_clip_aligns_to_the_grid_not_the_hash_unit():
@@ -86,27 +94,8 @@ def test_the_prefill_clip_aligns_to_the_grid_not_the_hash_unit():
 
     src = inspect.getsource(sched.apply_vllm_v41_prefill_alignment_patch)
     assert (
-        "boundary_grid" in src
+        "planner.boundary_grid" in src
     ), "the prefill clip must align to the grid a boundary sits on"
-    # And the fallback keeps single-group runs working unchanged.
-    assert "planner.hash_block_size" in src
-
-
-def _ride_planner(keep_tail):
-    from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
-
-    p = V41BoundaryPlanner(
-        hash_block_size=256,
-        boundary_grid=256,
-        chunk_size=256,
-        state_interval=256,
-        max_num_batched_tokens=8192,
-        world_size=1,
-        checkpoint_group_ids=(1,),
-        rides_page=True,
-        keep_a_prefill_tail=keep_tail,
-    )
-    return p
 
 
 @pytest.mark.parametrize("keep_tail, expected", [(False, 1024), (True, 768)])
@@ -118,25 +107,50 @@ def test_a_speculative_ride_never_resumes_one_token_short(keep_tail, expected):
     before one. V4.1 refuses the mixed step: measured as `(1024, 6, 5)` beside
     `(768, 200, 0)`. Two or more tokens left is a plain prefill instead.
     """
-    from types import SimpleNamespace
-
-    p = _ride_planner(keep_tail)
-    request = SimpleNamespace(request_id="r", num_tokens=1025, block_hashes=())
-    p.begin_lookup(request)
-    try:
-        got = p.cap_hit(SimpleNamespace(id="r"), 1024)
-    finally:
-        p.end_lookup()
-    assert got == expected
+    p = _planner(keep_tail=keep_tail)
+    assert _cap(p, 1024, num_tokens=1025) == expected
+    assert p.counters()["cap_prefill_tail"] == int(keep_tail)
 
 
 def test_a_longer_tail_is_left_alone():
-    from types import SimpleNamespace
+    assert _cap(_planner(keep_tail=True), 1024, num_tokens=1100) == 1024
 
-    p = _ride_planner(True)
-    request = SimpleNamespace(request_id="r", num_tokens=1100, block_hashes=())
-    p.begin_lookup(request)
-    try:
-        assert p.cap_hit(SimpleNamespace(id="r"), 1024) == 1024
-    finally:
-        p.end_lookup()
+
+def test_a_local_hit_is_declined_unless_a_checkpoint_serves_it(monkeypatch):
+    """vLLM's own prefix hit never reaches the connector. Served without a
+    checkpoint behind it, the forward finds a state slot nothing wrote."""
+    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", True)
+    request = SimpleNamespace(request_id="r")
+    assert _planner(can_serve=False).cap_local_hit(request, 1280) == 0
+    p = _planner(can_serve=True)
+    assert p.cap_local_hit(request, 1280) == 1280
+    assert p.counters()["local_cap_checkpoint"] == 1
+
+
+def test_local_hits_stay_off_without_the_gate(monkeypatch):
+    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", False)
+    p = _planner(can_serve=True)
+    assert p.cap_local_hit(SimpleNamespace(request_id="r"), 1280) == 0
+    assert p.counters()["local_cap_declined"] == 1
+
+
+@pytest.mark.parametrize(
+    "computed, group_blocks, expected",
+    [
+        (512, ([3, 4], [7, 8]), True),  # row 1 of group 1 is block 8
+        (500, ([3, 4], [7, 8]), False),  # not a PAGE edge
+        (768, ([3, 4], [7, 8]), False),  # past the allocated rows
+        (512, ([3, 4], [7, 0]), False),  # NULL block: not a destination
+        (512, ([3, 4],), False),  # the checkpoint group is missing
+    ],
+)
+def test_a_load_names_its_checkpoint_blocks_or_nothing(
+    computed, group_blocks, expected
+):
+    p = _planner()
+    request = SimpleNamespace(request_id="r")
+    assert p.resolve_load(request, computed, group_blocks=group_blocks) is expected
+    recorded = p._ride_boundaries.get("r", {})
+    assert recorded == ({computed: (8,)} if expected else {})
+    p.forget_request("r")
+    assert "r" not in p._ride_boundaries

@@ -179,26 +179,18 @@ class _HybridKVLoadFailureMixin:
 
 
 def apply_vllm_v41_prefill_alignment_patch() -> None:
-    """End V4.1 prefill chunks on a state boundary. Idempotent, no-op elsewhere.
+    """End V4.1 prefill chunks on a PAGE edge. Idempotent, no-op elsewhere.
 
     A STATE checkpoint exists only where the frontier *lands*, and vLLM spends one
     token budget across the whole step: a prefill sharing a batch with six
     decodes is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
-    arbitrary offset and steps over the interval grid for the rest of the
-    prompt. Measured at concurrency 8: `boundary_passed` 1,315 against
-    `sweep_offered` 106, and seven hits in ten refused for want of a claimed
-    boundary.
+    arbitrary offset and every chunk boundary after it is one no checkpoint was
+    written at. A tier save ends on a chunk boundary and carries the checkpoint
+    there, so a frontier off the grid is a save with no state to ride with.
 
     This is the same invariant vLLM already enforces for Mamba in `align`
     mode (`_mamba_block_aligned_split`: "chunk ends must be block aligned"),
-    with the interval in place of the block. It is gated on `has_mamba_layers`
-    there, which V4.1 is not, so it needs its own.
-
-    **The token budget has to exceed the interval for this to do anything.**
-    Clipping cannot extend a chunk, so with `max-num-batched-tokens` at or
-    below `state_interval` the first boundary is already out of reach and the
-    clip is skipped rather than scheduling zero tokens. Give the budget room
-    for the interval plus the step's decodes.
+    with V4.1's PAGE block -- the checkpoint grid -- in place of the block.
     """
     from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -224,55 +216,25 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
         if planner is None or num_new_tokens <= 0:
             return num_new_tokens
 
-        interval = int(planner.state_interval)
         # The grid a STATE boundary sits on, not the unit vLLM hashes in.
         # Those were one number until a second kv cache group made the hash
         # unit engine-wide: with DSpark it is the draft's 32 against the
         # proxy's 256, and clipping to 32 lands the frontier somewhere that
         # is not a PAGE edge, which stores nothing.
-        block = int(getattr(planner, "boundary_grid", planner.hash_block_size))
+        block = int(planner.boundary_grid)
         start = int(num_computed_tokens)
         end = start + int(num_new_tokens)
         total = int(request.num_prompt_tokens)
         if end >= total:
-            # The last chunk. Without drafts, decode walks its frontier one
-            # token at a time, so every boundary ABOVE the prompt is reached
-            # anyway and clipping for those would only delay the prompt.
+            # The last chunk. Decode reaches every boundary above the prompt
+            # on its own, so clipping for those would only delay the prompt.
             #
-            # With drafts it advances by one to six and steps over them, so
-            # that sentence stops being true -- measured, a speculative arm
-            # stored nothing at all and supplied 0.0% against 95.2%. Those
-            # boundaries need the step itself clipped, which is not this
-            # hook; see `_refuse_v41_speculation_with_offload`.
-            #
-            # The one below it is different, and it is the valuable one:
-            # the prompt-end anchor is the last block-aligned point at or
-            # before `total`, and once the frontier is past it nothing returns
-            # to it. A prompt whose length is not a whole number of blocks
-            # reaches it only if a chunk ends there, which is this clip.
-            #
-            # Taken by default again. It was off because clipping splits a
-            # prompt that would otherwise run in one chunk, and the chunk
-            # after the split used to arrive with `starts` at the anchor and
-            # the slot holding something else -- "needs state at 1280, found
-            # 3". The cause was not the split: `resolve_load` tested the
-            # frontier against `state_interval`, and an anchor is block
-            # aligned without being a multiple of one, so the admission went
-            # through with no state load queued behind it. Testing the block
-            # grid instead is what fixes it, and refusing an admission whose
-            # load did not queue is what catches the rest.
-            #
-            # A 2x2 over those two changes, clip on throughout, short prompts
-            # (~2k, below one interval), 24 lanes:
-            #
-            #   interval test, no refusal -> dead, "needs state at 1792"
-            #   interval test, refusal    -> lives, tier supplies 44.0%
-            #   block grid,    no refusal -> lives, tier supplies 78.3%
-            #   block grid,    refusal    -> lives, tier supplies 78.3%
-            #
-            # The supply column is the point of the anchor: without it a
-            # prompt shorter than `state_interval` has no boundary and the
-            # tier stores nothing for it.
+            # The one below it is different, and it is the valuable one: the
+            # prompt-end anchor is the last PAGE edge at or before `total`,
+            # and once the frontier is past it nothing returns to it. A prompt
+            # whose length is not a whole number of blocks reaches it only if
+            # a chunk ends there, which is this clip -- without it a prompt
+            # shorter than one chunk of tier has no boundary to be reused at.
             #
             # ATOM_V41_PROMPT_ANCHOR_CLIP=0 turns it off, for bisecting a
             # prefill-shape problem against the old behaviour.
@@ -285,26 +247,16 @@ def apply_vllm_v41_prefill_alignment_patch() -> None:
                 if start < anchor < end:
                     return anchor - start
             return num_new_tokens
-        # Spacing, not a fixed ladder: the planner accepts any block-aligned
-        # frontier at least `interval` past the last one it stored, so aiming
-        # at the next multiple of the interval and settling for the next block
-        # boundary lands one either way.
-        aligned = (end // interval) * interval
-        if aligned <= start:
-            aligned = (end // block) * block
+        aligned = (end // block) * block
         if aligned <= start:
             # Even one block is past this chunk. Clipping would schedule
-            # nothing; let it cross and let `boundary_passed` record that the
-            # budget is too small to land.
+            # nothing; let it cross.
             return num_new_tokens
         return aligned - start
 
     _wrapped._atom_v41_prefill_aligned = True
     Scheduler._reserve_prefill_lookahead = _wrapped
     logger.info("ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary.")
-
-
-_CAP_LOG = [0]
 
 
 _CAP_LOG = [0]

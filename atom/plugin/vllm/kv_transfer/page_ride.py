@@ -27,8 +27,6 @@ The host planner must provide:
     The kv cache groups holding the boundary, in the order the transfer names
     them -- which is the order the worker registered them in, and therefore
     the key space.
-``self.boundary_hash(block_hashes, boundary_tokens)``
-    The prefix-hash key for a boundary.
 """
 
 from __future__ import annotations

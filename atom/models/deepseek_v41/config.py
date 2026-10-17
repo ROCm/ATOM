@@ -372,7 +372,7 @@ def _kv_transfer_unsupported(config, on_vllm_plugin: bool) -> bool:
 
 
 def _v41_state_checkpoints_own_state(config) -> bool:
-    """Whether PAGE-backed checkpoint images restore STATE for this run.
+    """Whether PAGE-backed checkpoints restore STATE for this run.
 
     Guarded: this module is imported on builds where the plugin mechanism is
     not available at all, and there the answer is no and the refusal stands.
@@ -392,7 +392,7 @@ def _v41_state_checkpoints_own_state(config) -> bool:
                 register_v41_state_checkpoint_adapter(), vllm_config
             )
         )
-    except Exception:  # noqa: BLE001 - absence means images are off
+    except Exception:  # noqa: BLE001 - absence means checkpoints are off
         return False
 
 
@@ -497,10 +497,10 @@ def validate_runtime_config(config):
             on_vllm_plugin
             and config.enable_prefix_caching
             and not _kv_connector_owns_v41_state(config)
-            # Checkpoint images are the other owner of that state, and they
-            # own it without a tier: vLLM holds the image in blocks it hashes
+            # Checkpoints are the other owner of that state, and they
+            # own it without a tier: vLLM holds the checkpoint in blocks it hashes
             # under the same prefix and reports a hit only when the pages and
-            # the image are both cached, so the hit is already a complete
+            # the checkpoint are both cached, so the hit is already a complete
             # resume. The sentence above -- "the STATE side is not replayed
             # by a block-table hit" -- is what stops being true.
             #

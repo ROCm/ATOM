@@ -210,10 +210,11 @@ def build_mp_recurrent_groups(
     within a group vLLM's canonical layer order. That order is the key space,
     same as for PAGE.
 
-    ``tokens_per_block`` is the mamba block size, which vLLM has already forced
-    to equal the attention block size and the LMCache chunk size. It is passed
-    rather than read off the tensors because a snapshot's row count says
-    nothing about how many tokens it covers.
+    ``tokens_per_block`` is the block a snapshot is addressed in: the mamba
+    block on Kimi-K3, the PAGE block on DeepSeek-V4.1. It is passed rather than
+    read off the tensors because a snapshot's row count says nothing about how
+    many tokens it covers. The MP worker registers each group one LMCache chunk
+    wide, which this has to divide.
     """
     if type(tokens_per_block) is not int or tokens_per_block <= 0:
         raise ValueError(

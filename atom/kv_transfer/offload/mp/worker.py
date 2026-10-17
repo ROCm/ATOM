@@ -364,9 +364,26 @@ class LMCacheMPConnector(KVConnectorBase):
         # numbered exactly as before; V4.1's PAGE unit is heterogeneous and
         # needs several. `_recurrent_splits` records how many each snapshot
         # became so `_recurrent_block_ids` can name the same block in each.
+        #
+        # And one block per CHUNK, whatever the snapshot's own block size: a
+        # snapshot exists only at a chunk boundary (see `_recurrent_block_ids`),
+        # so that is the span one recurrent block id stands for. Registered at
+        # its own block size, a chunk wider than the block makes the server ask
+        # every recurrent group for chunk/block ids per chunk, find one, and
+        # skip every store ("STORE block ID underflow") -- a tier that never
+        # hits, with nothing failing. The adapter learned the server's chunk
+        # when it connected, so this is the size the server will use.
+        snapshot_tokens = int(getattr(adapter, "lmcache_tokens_per_chunk", 0) or 0)
         next_group_id = 1
         self._recurrent_splits = []
         for recurrent in views.recurrent:
+            span = snapshot_tokens or int(recurrent.tokens_per_block)
+            if span % int(recurrent.tokens_per_block):
+                raise ValueError(
+                    f"LMCache MP chunk size {span} is not a whole number of "
+                    f"recurrent blocks ({recurrent.tokens_per_block} tokens); "
+                    "a snapshot could not sit on a chunk boundary"
+                )
             splits = recurrent.layout_splits or (recurrent.tensor_indices,)
             self._recurrent_splits.append(len(splits))
             for indices in splits:
@@ -374,8 +391,8 @@ class LMCacheMPConnector(KVConnectorBase):
                     EngineGroupInfo(
                         engine_group_id=next_group_id,
                         layer_indices=indices,
-                        tokens_per_block=recurrent.tokens_per_block,
-                        sw_size_tokens=recurrent.tokens_per_block,
+                        tokens_per_block=span,
+                        sw_size_tokens=span,
                         recurrent_state=True,
                     )
                 )

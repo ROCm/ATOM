@@ -117,7 +117,6 @@ def _worker_half():
     c._kda_error_reqs = set()
     c._kda_tier = None
     c._kda_planner = None
-    c._v41_slots = None
     c._pending_failed_recving = set()
     c._pending_release_ids = []
     c._worker_saved = {}

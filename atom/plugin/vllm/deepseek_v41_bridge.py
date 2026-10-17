@@ -1969,7 +1969,7 @@ def atom_deepseek_v41_forward_context(
 
 
 def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, prepared):
-    """This step's checkpoint-image work, through `paged_state_checkpoint`.
+    """This step's checkpoint work, through `paged_state_checkpoint`.
 
     Everything about placement, ordering and the store/restore contract lives
     in the mechanism (`run_state_checkpoint_step`): the stores the previous build left,
@@ -2057,11 +2057,11 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
 
 
 def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None:
-    """Stand up the image worker now the pool exists.
+    """Stand up the checkpoint worker now the pool exists.
 
     Here because this is the first moment both halves exist: the state arena
-    to copy out of, and the tensors vLLM gave the image layers. A failure is
-    loud rather than silent -- with images on, the pool was already sized for
+    to copy out of, and the tensors vLLM gave the checkpoint layers. A failure is
+    loud rather than silent -- with checkpoints on, the pool was already sized for
     them and prefix caching was admitted on the promise that something would
     fill them, so carrying on without a worker is the one outcome that must
     not happen quietly.
@@ -2087,7 +2087,7 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
     try:
         copier = build_v41_state_checkpoint_copier(vllm_config, max_batch=num_slots)
         # The ids come off the layers, not off `vllm_config`: the mechanism's
-        # runner hook writes `_atom_state_checkpoint_group_id` on each image layer in
+        # runner hook writes `_atom_state_checkpoint_group_id` on each checkpoint layer in
         # `initialize_kv_cache`, which is this worker's own view of the KV
         # cache config. A config attribute would have to survive the trip to
         # a spawned worker, and nothing sends it.
@@ -2100,7 +2100,7 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
         unbound = any(not isinstance(x, PagedStateCheckpointLayer) for x in layers)
         if unbound or any(gid is None for gid in groups):
             raise RuntimeError(
-                "this worker has no bound image groups for "
+                "this worker has no bound checkpoint groups for "
                 f"{names[:2]}...; vLLM built the KV cache config without the "
                 "mechanism's runner hook"
             )
@@ -2109,16 +2109,16 @@ def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None
         _v41_install_restore_hook(adapter, worker)
     except Exception as exc:
         raise RuntimeError(
-            "DeepSeek-V4.1 checkpoint images are on but their worker could "
+            "DeepSeek-V4.1 checkpoints are on but their worker could "
             f"not be built: {exc}. Prefix caching was admitted on the promise "
-            "that something fills the image blocks, and the pool was sized "
+            "that something fills the checkpoint blocks, and the pool was sized "
             "for them, so starting without it would serve hits from blocks "
             "nothing wrote."
         ) from exc
 
 
 def _v41_install_restore_hook(adapter, worker) -> None:
-    """Let `PagedAttentionCache.prepare_state` restore from an image.
+    """Let `PagedAttentionCache.prepare_state` restore from a checkpoint.
 
     `cache.py` has carried the call site all along (`_restore_stale_rows`,
     between the slot being assigned and its cursor being judged -- the only
@@ -2149,14 +2149,14 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
 
         # Same row space the store side uses: the position of the request id
-        # in the batch's own id list, which is what indexes the image block
+        # in the batch's own id list, which is what indexes the checkpoint block
         # table. The step's row index is a different space.
         row_of = {rid: i for i, rid in enumerate(get_current_req_ids() or [])}
         wanted = [(slot, pos, row_of.get(rid)) for slot, pos, rid in rows]
         missing = [rid for (_s, _p, rid), (_, _, r) in zip(rows, wanted) if r is None]
         if missing:
             logger.warning(
-                "DeepSeek-V4.1 image restore: %s not in this step's batch ids; "
+                "DeepSeek-V4.1 checkpoint restore: %s not in this step's batch ids; "
                 "leaving the contract to refuse the hit",
                 missing,
             )
@@ -2179,13 +2179,13 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         if _cache is not None:
             after = [int(_cache.cursor[s0, 0]) for s0 in slots]
         logger.info(
-            "ATOM DeepSeek-V4.1 image restore cursor: before=%s after=%s wanted=%s",
+            "ATOM DeepSeek-V4.1 checkpoint restore cursor: before=%s after=%s wanted=%s",
             before,
             after,
             [int(pos) for _, pos, _ in rows],
         )
         logger.info(
-            "ATOM DeepSeek-V4.1 image restore: rows=%s slots=%s wanted=%s "
+            "ATOM DeepSeek-V4.1 checkpoint restore: rows=%s slots=%s wanted=%s "
             "cols=%s units=%s",
             batch_rows,
             slots,
@@ -2196,9 +2196,7 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         return len(slots)
 
     install_state_checkpoint_restore_hook(restore)
-    logger.info(
-        "ATOM DeepSeek-V4.1: checkpoint image restores wired into prepare_state"
-    )
+    logger.info("ATOM DeepSeek-V4.1: checkpoint restores wired into prepare_state")
 
 
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:

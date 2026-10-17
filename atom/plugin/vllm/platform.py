@@ -225,7 +225,7 @@ def _refuse_v41_multi_axis_parallelism(vllm_config) -> None:
 
 
 def _v41_state_checkpoints_configured(vllm_config) -> bool:
-    """Whether PAGE-backed checkpoint images will restore STATE this run.
+    """Whether PAGE-backed checkpoints will restore STATE this run.
 
     They write and restore the window ring and the Engram cursor at the block
     boundaries vLLM's cache reports, which is the claim this refusal exists to

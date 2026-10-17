@@ -263,15 +263,14 @@ class StateByteCodec:
     def _allocate(self, nbytes: int) -> Any:
         from lmcache.v1.memory_management import MemoryFormat
 
-        # `fmt` is not inert: LMCache reads shape[2] for KV_2LTD token
-        # accounting, including during clear/close. One opaque snapshot is one
-        # synthetic token; singleton axes preserve the flat uint8 payload.
-        # `busy_loop=False` because this is a *store*: LMCache warns
+        # `fmt` is inert (shape/dtype force a flat blob); passed only because
+        # `MixedMemoryAllocator.allocate` rejects anything outside its tensor
+        # formats. `busy_loop=False` because this is a *store*: LMCache warns
         # busy_loop "should only be used for retrieve" (concurrent stores
         # deadlock), yet defaults it True -- under which a full pool spins
         # forever instead of returning the None this caller handles.
         return self._storage.allocate(
-            torch.Size([1, 1, 1, nbytes]),
+            torch.Size([nbytes]),
             torch.uint8,
             fmt=MemoryFormat.KV_2LTD,
             busy_loop=False,
