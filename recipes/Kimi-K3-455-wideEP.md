@@ -745,6 +745,29 @@ about 78% of the prefill was recomputing evicted prefixes, and throughput falls 
 `--state-checkpoint-interval-tokens -1` (now in the launch, not in these runs) targets the checkpoints, and
 [LMCache MP](#kv-offload-with-lmcache-mp) adds a CPU tier for evicted prefixes.
 
+#### 2026-10-17: concurrency 64 with LMCache MP, the 20261016 image
+
+- **Image:** `rocm/fw-bringup:gfx1250-atom-k3-20261016`, plus LMCache built for gfx1250 and ATOM's multi-node
+  `lmcache_mp` patch ([KV offload with LMCache MP](#kv-offload-with-lmcache-mp)).
+- **Server:** as on 2026-10-16 (AgentX mode, `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`, `--max-num-seqs 16`). On top:
+  one LMCache MP server per tray (400 GiB L1), `--block-size 128`, 0.88, and the launch's
+  `--state-checkpoint-interval-tokens -1`.
+- **Client:** as on 2026-10-16: 1800 s, 10 warm-up requests per lane.
+- **Trays:** CT7 (node0) + CT15, no perf_setup. NUMA balancing on while the weights load, off for the benchmark.
+
+| concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit (theoretical) | valid |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | **6.52** | **9.38** | **10,400** | 69.3 | 4.8 / 14.8 s | 63 / 107 ms | 1,604 | 95.1% (96.2%) | yes |
+
+This is 3.3× the 2026-10-16 concurrency 64 (3,165 tok/s per GPU) and above that day's concurrency 32 (5,575). The
+prefix cache hit is 95.1% of the 96.2% the traces allow:
+
+- the HBM cache served 93.5% of the prompt tokens and LMCache 1.5%;
+- 95 KDA checkpoints were evicted, against 501.
+
+Most of the gain is the `-1` ladder. The same launch without LMCache is still to run. Details are in
+[Results at concurrency 64](#results-at-concurrency-64). This point is not in the chart above.
+
 #### Reference: ATOM on MI355X, from InferenceX (2026-10-15)
 
 For Pareto charts against this page's points. Source: the
@@ -941,10 +964,10 @@ Each server's L1 grew by the prompt's KV (13,824 bytes per token) plus one KDA i
 `AIPERF_BENCHMARK_DURATION=1800`, this section's launch, `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` and
 `--max-num-seqs 16`. NUMA balancing was on while the weights loaded and off for the benchmark. The warm-up took 27 min.
 
-| | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit | valid |
+| | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit (theoretical) | valid |
 |---|---|---|---|---|---|---|---|---|---|
-| 2026-10-16: 20261014 image, block 16, 0.90, ladder 8192, no LMCache ([above](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)) | 0.90 | 1.28 | 3,165 | 17.3 | 7.7 / 79.8 s | 120 / 779 ms | 579 | 78.8% | yes |
-| **2026-10-17: LMCache MP**, block 128, 0.88, ladder `-1` | **6.52** | **9.38** | **10,400** | 69.3 | 4.8 / 14.8 s | 63 / 107 ms | 1,604 | 95.1% | yes |
+| 2026-10-16: 20261014 image, block 16, 0.90, ladder 8192, no LMCache ([above](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)) | 0.90 | 1.28 | 3,165 | 17.3 | 7.7 / 79.8 s | 120 / 779 ms | 579 | 78.8% (95.3%) | yes |
+| **2026-10-17: LMCache MP**, block 128, 0.88, ladder `-1` | **6.52** | **9.38** | **10,400** | 69.3 | 4.8 / 14.8 s | 63 / 107 ms | 1,604 | 95.1% (96.2%) | yes |
 
 The prefix cache over the profiling window, from node0's `/metrics` (all eight ranks):
 
