@@ -211,6 +211,7 @@ class CacheLifecycleProbe:
                 "unix_ns": time.time_ns(),
                 "request_id": request.request_id,
                 "prompt_tokens": request.num_prompt_tokens,
+                "arrival_time": request.arrival_time,
                 "local_tokens_presented_to_connector": num_computed_tokens,
                 "skip_reading_prefix_cache": request.skip_reading_prefix_cache,
                 "request_hash_count": len(hashes),
