@@ -26,8 +26,23 @@ logger = logging.getLogger("atom.gemm_fusion")
 
 
 def plan_owner(plan) -> str:
-    """Window-ownership key: aiter keys windows per plan instance build key."""
-    return getattr(plan, "build_key", None) or getattr(plan, "vid", "plan")
+    """Window-ownership key. aiter plans call ``res.ensure(self.owner, ...)`` and look
+    their windows up by ``self.owner + "/rx"`` etc., and (since aiter f8a8ebf7) expose the
+    same string as ``build_key`` for exactly this purpose, so ATOM must use that key.
+    ``vid`` alone is shared by every plan of a variant and would collide."""
+    return getattr(plan, "build_key", None) or getattr(plan, "owner", None) or getattr(plan, "vid", "plan")
+
+
+def fusion_resources_cls(gf):
+    """aiter's ``FusionResources`` class: the package export when present, else its
+    defining submodule (``aiter.gemm_fusion.resources``). Never a silent stub."""
+    cls = getattr(gf, "FusionResources", None)
+    if cls is not None:
+        return cls
+    import importlib
+
+    name = getattr(gf, "__name__", "aiter.gemm_fusion")
+    return importlib.import_module(name + ".resources").FusionResources
 
 
 class FusionResourcesWrapper:
@@ -60,7 +75,7 @@ class FusionResourcesWrapper:
 
             device = torch.cuda.current_device() if device is None else device
             caps = gf.detect_capabilities(sp_group)
-            inner = gf.FusionResources(
+            inner = fusion_resources_cls(gf)(
                 rank=rank, world=world, group=pg, device=device, caps=caps
             )
         self.inner = inner
