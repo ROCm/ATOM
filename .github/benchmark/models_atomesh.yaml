@@ -1391,7 +1391,7 @@ models:
               HIP_VISIBLE_DEVICES: 4,5,6,7
           runner:
             # Previously demonstrated host-preparation failures; all other nodes remain eligible.
-            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53]
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53, pit2-p03-g24]
             time_limit: '08:00:00'
           benchmark:
             <<: *agentic_1m_aiperf
