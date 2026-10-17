@@ -197,7 +197,7 @@ def parameters(ua, x, case):
     blocks = (
         len(case["q_lens"])
         if max(case["q_lens"]) == 1
-        else n // (16 // nq) + len(case["q_lens"])
+        else n // max(1, 16 // nq) + len(case["q_lens"])
     )
     return ua._UAParams(
         q=q,
@@ -374,7 +374,7 @@ def configurations(microarchitecture=False, gluon=False):
             (bm, nw, buffers, 1, 32, waves)
             for bm, nw in ((128, 4), (256, 8))
             for buffers in (1, 2)
-            for waves in (1, 2)
+            for waves in (1,)
         ]
     if microarchitecture:
         # Compile-time MFMA layout and occupancy candidates for large-Q 2D.
@@ -472,7 +472,25 @@ def worker(args):
             fn = candidate(ua, p, *args.config, gluon=args.gluon)
             record({"case": case, "variant": variant, "phase": "candidate-start"})
             try:
-                fn()
+                compiled = fn()
+                kernel_info = {}
+                if compiled is not None and args.gluon:
+                    kernel_info = {
+                        "registers": getattr(compiled, "n_regs", None),
+                        "spills": getattr(compiled, "n_spills", None),
+                        "shared_bytes": getattr(compiled.metadata, "shared", None),
+                    }
+                    assembly = compiled.asm.get("amdgcn", "")
+                    kernel_info["assembly_instruction_counts"] = {
+                        op: assembly.count(op)
+                        for op in (
+                            "scratch_load",
+                            "scratch_store",
+                            "ds_read",
+                            "ds_write",
+                            "v_mfma",
+                        )
+                    }
             except Exception as exc:
                 if type(exc).__name__ != "OutOfResources":
                     raise
@@ -502,7 +520,15 @@ def worker(args):
                 # End this isolated process; do not run another shape after a
                 # potentially corrupting candidate or reuse its CUDA context.
                 return
-            record(dict(case=case, variant=variant, accuracy="passed", **measure(fn)))
+            record(
+                dict(
+                    case=case,
+                    variant=variant,
+                    accuracy="passed",
+                    kernel=kernel_info,
+                    **measure(fn),
+                )
+            )
             del fn, p
         del call, x, expected, reference
         torch.cuda.empty_cache()
