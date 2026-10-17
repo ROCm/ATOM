@@ -28,6 +28,7 @@ This document describes the environment variables used in the ATOM project.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_PP_DECODE_MICROBATCHES** | int | 0 | Number of batches the PP head splits running decode sequences into, so that many decode batches occupy the pipeline at once. A batch holds at most `ceil(running decode / N)` sequences. `0` uses `pipeline_parallel_size`; `1` puts every ready decode sequence in one batch. Ignored when PP=1. |
+| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 
@@ -388,6 +389,7 @@ derive a bound.
 | **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`), for `lmcache_mp` `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`), and for `mooncake_store` the `mooncake_store.*` settings (e.g. `{"mooncake_store.master": "10.0.0.1:26051", "mooncake_store.metadata": "http://10.0.0.1:26080/metadata"}`; all of them are listed in `atom/kv_transfer/offload/README.md`). Requires `ATOM_KV_OFFLOAD`. |
 | **OFFLOAD_COPY_WORKERS** | int | 1 | Save executor threads per offload worker. Also scales the default `OFFLOAD_MAX_PENDING_SAVES`. |
 | **OFFLOAD_LOAD_WORKERS** | int | 1 | Load executor threads per offload worker. DSV4's in-process path ignores it (its SLOT load path needs a serial load executor). |
+| **OFFLOAD_STREAM_PRIORITY** | int | 0 | Priority of the offload workers' pack and copy streams. Lower is higher, as in `torch.cuda.Stream`, and out-of-range values clamp. A default-priority stream can share a hardware queue with the compute stream and wait behind a whole forward of queued kernels. |
 | **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. While both are unset, `mooncake_store` leaves its saves unbounded (one per request in flight at most). |
 | **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Smallest external-tier hit worth loading; shorter hits are recomputed. Negative values clamp to 0. |
 | **OFFLOAD_MIN_SAVE_TOKENS** | int | 8192 | Shortest prefix native `lmcache_mp` stores, as an absolute boundary for normal and late saves. With the default equal to `OFFLOAD_MIN_LOAD_TOKENS`, a shorter prefix could never be loaded back. Other connectors ignore it. |
