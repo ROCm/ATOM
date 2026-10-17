@@ -1245,8 +1245,13 @@ models:
         # The decode runs that recipe: TP8 with seven DSpark drafts at CONC 1/4,
         # TP8xDCP8 with four drafts and ReplaySSM from CONC 16, the drafter's
         # linears unquantized, max_num_seqs 2 * CONC, a 128 GiB per-rank CPU
-        # tier through CONC 48 and 192 GiB plus comm-group reuse from CONC 56.
-        # CONC 32 and 88 are not in the recipe and take the neighbouring band.
+        # tier through CONC 32 and comm-group reuse from CONC 56. CONC 32 and
+        # 88 are not in the recipe and take the neighbouring band.
+        # From CONC 48 the prefill's state cache is the PD recipe's
+        # (recipes/mesh/Agentic-Kimi-K3.md) instead of the recipe's 128 and
+        # 192 GiB tiers: on-demand KDA checkpoints at observed shared-prefix
+        # targets, and a 128 GiB state cap carved from a 224 GiB per-rank pool,
+        # which leaves paged KV 96 GiB per rank once state reaches its cap.
         # The recipe's PrefillDelayer settings pace prefill against decode on
         # one server, which neither P/D server does, so these cells leave them
         # unset as the TP8 1P1D cells above do.
@@ -1329,6 +1334,14 @@ models:
             common_args:
               <<: *kimi_k3_pp8_dspark4_args
               max_num_seqs: 96
+          env:
+            common: &kimi_k3_pp8_ondemand_env
+              <<: *kimi_k3_pp8_replay_env
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill: &kimi_k3_pp8_state128_prefill_env
+              <<: *kimi_k3_pp8_lmcache128_prefill_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
 
         - &kimi_k3_1p1d_pp8_dcp8_c56
           <<: *kimi_k3_1p1d_pp8_dcp8
@@ -1340,11 +1353,9 @@ models:
               max_num_seqs: 112
           env:
             common:
-              <<: *kimi_k3_pp8_replay_env
+              <<: *kimi_k3_pp8_ondemand_env
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-            prefill:
-              <<: *kimi_k3_pp8_lmcache128_prefill_env
-              LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+            prefill: *kimi_k3_pp8_state128_prefill_env
 
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72
