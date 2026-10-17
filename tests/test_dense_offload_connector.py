@@ -3,6 +3,7 @@
 
 import sys
 import threading
+import time
 from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 
@@ -448,6 +449,49 @@ def test_dense_save_passes_one_step_producer_event_to_every_store(monkeypatch):
             ("store", event),
             ("store", event),
         ]
+    finally:
+        worker.close()
+
+
+def test_dense_save_profile_separates_producer_wait_from_transfer(monkeypatch, caplog):
+    monkeypatch.setenv("OFFLOAD_PROFILE", "1")
+
+    class GpuConnector:
+        @staticmethod
+        def reset_transfer_stats():
+            pass
+
+        @staticmethod
+        def last_transfer_stats():
+            return {"host_ms": 1.5, "sync_ms": 2.5, "transfer_ms": 4.0}
+
+    class Producer:
+        @staticmethod
+        def synchronize():
+            time.sleep(0.02)
+
+    worker = DenseOffloadConnector(_config("kv_producer"))
+    worker.chunk_size = 8
+    worker._engine = SimpleNamespace(
+        gpu_connector=GpuConnector(), store=lambda _tokens, **_kwargs: None
+    )
+    request = LMCacheReqMeta(
+        req_id=51,
+        token_ids=list(range(8)),
+        block_ids=[1],
+        save_spec=SaveSpec(skip_leading_tokens=0),
+        save_operation=SaveOperationId(req_id=51, generation=0),
+    )
+    try:
+        with caplog.at_level("INFO", logger="atom"):
+            worker._do_save_req(request, producer_event=Producer())
+        line = next(
+            r.getMessage() for r in caplog.records if "OFFLOAD-SAVE-PROF" in r.msg
+        )
+        fields = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        assert float(fields["producer_wait_ms"]) >= 20.0
+        assert fields["host_ms"] == "1.50" and fields["sync_ms"] == "2.50"
+        assert float(fields["store_ms"]) >= float(fields["producer_wait_ms"])
     finally:
         worker.close()
 

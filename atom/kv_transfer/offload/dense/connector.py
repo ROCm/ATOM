@@ -362,7 +362,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 "max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d gpu_staging_buffer_chunks=%d "
                 "gpu_staging_buffer_bytes=%d total_bytes=%d "
-                "pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
+                "pack_ms=%.2f copy_ms=%.2f host_ms=%.2f sync_ms=%.2f "
                 "transfer_ms=%.2f effective_gbps=%.2f "
                 "retrieve_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
@@ -381,6 +381,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 int(transfer_stats.get("total_bytes", 0)),
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),
+                float(transfer_stats.get("host_ms", 0.0)),
                 float(transfer_stats.get("sync_ms", 0.0)),
                 float(transfer_stats.get("transfer_ms", 0.0)),
                 float(transfer_stats.get("effective_gbps", 0.0)),
@@ -411,6 +412,7 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
         synchronize = getattr(producer_event, "synchronize", None)
         if synchronize is not None:
             synchronize()
+        producer_wait_ms = (time.perf_counter() - t_store0) * 1000
         self._reset_gpu_connector_transfer_stats()
         gpu_connector = self._engine.gpu_connector
         track_source = getattr(gpu_connector, "track_save_source", None)
@@ -442,7 +444,8 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d "
                 "gpu_staging_buffer_chunks=%d gpu_staging_buffer_bytes=%d "
-                "total_bytes=%d producer_fenced=%d pack_ms=%.2f copy_ms=%.2f "
+                "total_bytes=%d producer_fenced=%d producer_wait_ms=%.2f "
+                "pack_ms=%.2f copy_ms=%.2f host_ms=%.2f "
                 "sync_ms=%.2f transfer_ms=%.2f effective_gbps=%.2f "
                 "store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
@@ -458,8 +461,10 @@ class DenseOffloadConnector(OffloadWorkerMixin, KVConnectorBase):
                 int(transfer_stats.get("gpu_staging_buffer_bytes", 0)),
                 int(transfer_stats.get("total_bytes", 0)),
                 int(transfer_stats.get("producer_fenced", 0)),
+                producer_wait_ms,
                 float(transfer_stats.get("pack_ms", 0.0)),
                 float(transfer_stats.get("copy_ms", 0.0)),
+                float(transfer_stats.get("host_ms", 0.0)),
                 float(transfer_stats.get("sync_ms", 0.0)),
                 float(transfer_stats.get("transfer_ms", 0.0)),
                 float(transfer_stats.get("effective_gbps", 0.0)),

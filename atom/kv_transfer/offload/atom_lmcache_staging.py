@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from atom.utils import envs
 
 
 def memory_object_as_uint8(memory_obj: Any, nbytes: int) -> torch.Tensor:
@@ -70,9 +73,10 @@ class _ThreadTransferState:
         self.pack_stream = None
         self.copy_stream = None
         if use_cuda:
+            priority = envs.OFFLOAD_STREAM_PRIORITY
             with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream()
-                self.copy_stream = torch.cuda.Stream()
+                self.pack_stream = torch.cuda.Stream(priority=priority)
+                self.copy_stream = torch.cuda.Stream(priority=priority)
         self.staging_buffer = _StagingBuffer(use_cuda)
 
     def stream_ctx(self, stream):
@@ -102,12 +106,17 @@ def run_staged_pipeline(
         Callable[[_StagingBuffer, _PipelineStage, _PipelineStage], bool] | None
     ) = None,
     stage_b_enqueued: Callable[[Any, Any], None] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> None:
     """Drive a two-stream staging pipeline with explicit recovery ownership.
 
     ``recover_buffer`` runs after any stage error and returns whether both
     streams were fenced successfully. An unfenced buffer is never released;
     the caller can quarantine it from the recovery callback.
+
+    ``timings``, when given, receives the ``time.perf_counter()`` readings
+    ``enqueued`` (every group queued, before the final fence) and ``synced``
+    (after it), so a caller can tell host-side work from the device wait.
     """
 
     staging_buffer = state.staging_buffer
@@ -145,7 +154,11 @@ def run_staged_pipeline(
                 staging_buffer.free_event_valid = True
             if stage_b_enqueued is not None:
                 stage_b_enqueued(group, stage_b.stream)
+        if timings is not None:
+            timings["enqueued"] = time.perf_counter()
         stage_b.stream.synchronize()
+        if timings is not None:
+            timings["synced"] = time.perf_counter()
     except Exception:
         buffer_safe_to_release = bool(
             recover_buffer is not None

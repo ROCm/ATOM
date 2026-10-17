@@ -361,9 +361,11 @@ class BlockGPUConnector:
     def last_transfer_stats(self) -> dict[str, int]:
         """Return counts and fast-path evidence for this thread's last transfer.
 
-        This intentionally contains no phase or GPU-event timings.  It exists
-        so serving logs and the hardware probe can distinguish a real zero-byte
-        operation from unavailable instrumentation and verify which path ran.
+        It exists so serving logs and the hardware probe can distinguish a real
+        zero-byte operation from unavailable instrumentation and verify which
+        path ran. A transfer that reached its final fence also carries host
+        clock phases (`_record_transfer_timings`); there are no GPU-event
+        timings.
         """
         stats = getattr(self._tls, "last_transfer_stats", None)
         return dict(stats) if stats is not None else self._unavailable_transfer_stats()
@@ -864,6 +866,7 @@ class BlockGPUConnector:
         stage_b: _PipelineStage,
         stage_b_enqueued: Callable[[_TransferGroup, Any], None] | None = None,
         block_id_owner: Any | None = None,
+        timings: dict[str, float] | None = None,
     ) -> None:
         """Drive an event-synced two-stage staging pipeline.
 
@@ -896,7 +899,29 @@ class BlockGPUConnector:
             release_buffer=self._release_staging_buffer_if_requested,
             recover_buffer=recover,
             stage_b_enqueued=stage_b_enqueued,
+            timings=timings,
         )
+
+    @staticmethod
+    def _record_transfer_timings(
+        stats: dict, t_start: float, timings: dict[str, float]
+    ) -> None:
+        """Host wall time to queue the transfer, the final fence's wait, and
+        their sum. Host clock readings only: a long ``host_ms`` is time this
+        thread spent off the device (Python, the GIL), a long ``sync_ms`` the
+        queued pack/copy waiting on the GPU."""
+        enqueued, synced = timings.get("enqueued"), timings.get("synced")
+        if enqueued is None or synced is None:
+            return
+        host_ms = (enqueued - t_start) * 1000
+        sync_ms = (synced - enqueued) * 1000
+        transfer_ms = host_ms + sync_ms
+        stats["host_ms"] = host_ms
+        stats["sync_ms"] = sync_ms
+        stats["transfer_ms"] = transfer_ms
+        total_bytes = stats.get("total_bytes", -1)
+        if transfer_ms > 0 and total_bytes > 0:
+            stats["effective_gbps"] = total_bytes / transfer_ms / 1e6
 
     def from_gpu(self, memory_obj: Any, start: int, end: int, **kwargs) -> None:
         self.batched_from_gpu([memory_obj], [start], [end], **kwargs)
@@ -922,6 +947,8 @@ class BlockGPUConnector:
         that passes extra positionals cannot bind one to it. ``stats``
         reports ``producer_fenced=1`` when the dependency was enqueued.
         """
+        t_start = time.perf_counter()
+        timings: dict[str, float] = {}
         with self._capture_transfer_stats() as stats:
             prepared = self._prepare_transfer(
                 memory_objs, starts, ends, tail_to_head=True, **kwargs
@@ -956,7 +983,9 @@ class BlockGPUConnector:
                 ),
                 stage_b_enqueued=self._queue_source_safe_group,
                 block_id_owner=block_id_owner,
+                timings=timings,
             )
+            self._record_transfer_timings(stats, t_start, timings)
 
     def batched_to_gpu(
         self,
@@ -966,6 +995,8 @@ class BlockGPUConnector:
         **kwargs,
     ) -> None:
         """Load LMCache MemoryObjs back into ATOM KV blocks via bounded staging."""
+        t_start = time.perf_counter()
+        timings: dict[str, float] = {}
         with self._capture_transfer_stats() as stats:
             prepared = self._prepare_transfer(memory_objs, starts, ends, **kwargs)
             if prepared is None:
@@ -992,4 +1023,6 @@ class BlockGPUConnector:
                 ),
                 stage_b=pack_stage,
                 block_id_owner=block_id_owner,
+                timings=timings,
             )
+            self._record_transfer_timings(stats, t_start, timings)

@@ -1131,6 +1131,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # OFFLOAD_LOAD_WORKERS: its SLOT load path needs a serial load executor.
     "OFFLOAD_COPY_WORKERS": lambda: _int_env("OFFLOAD_COPY_WORKERS", 1),
     "OFFLOAD_LOAD_WORKERS": lambda: _int_env("OFFLOAD_LOAD_WORKERS", 1),
+    # Priority of the offload workers' pack and copy streams; lower is higher,
+    # as in torch.cuda.Stream, and out-of-range values clamp. Their kernels are
+    # small, but a default-priority stream can share a hardware queue with the
+    # compute stream and wait behind a whole forward of queued kernels.
+    "OFFLOAD_STREAM_PRIORITY": lambda: _int_env("OFFLOAD_STREAM_PRIORITY", 0),
     # Running-plus-queued save bound. None means unset: the connector then
     # derives max(2, 2 * OFFLOAD_COPY_WORKERS) and the scheduler's state tier
     # uses 2. A kv_connector_extra_config "max_pending_saves" takes precedence.
