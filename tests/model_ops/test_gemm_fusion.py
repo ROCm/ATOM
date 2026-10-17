@@ -386,7 +386,7 @@ def test_static_prologue_ineligible_is_native_on_agreement(make_site):
     s = make_site(res)
     s.attn.impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: False)
     r = s.resolve(64)
-    assert (r.plan, r.reason) == (None, "uncovered")  # plan dropped before agree()
+    assert (r.plan, r.reason) == (None, "prologue_unsupported")  # row covered, prologue cannot fuse
 
 
 def test_static_prologue_missing_impl_or_method_is_not_eligible(make_site):
@@ -398,7 +398,7 @@ def test_static_prologue_missing_impl_or_method_is_not_eligible(make_site):
     s.attn = SimpleNamespace(impl=SimpleNamespace())  # impl without the method
     assert s._static_prologue_ok() is False
     r = s.resolve(64)
-    assert (r.plan, r.reason) == (None, "uncovered")
+    assert (r.plan, r.reason) == (None, "prologue_unsupported")
     s.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True))
     assert s._static_prologue_ok() is True
 
@@ -596,8 +596,132 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     GC._SITES.clear()
     site, _, _ = GC._site_for(_golden_case(mode), None)
     assert site._static_prologue_ok() is True  # else every golden cell resolves 'uncovered'
-    sig = site.spec.prefix(2).signature()
-    assert sig == specs.sp_qkv_spec(gm).signature()
     rows = json.loads((aiter_root / "aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json").read_text())["rows"]
-    assert sig in {r["sig"] for r in rows}
+    # small M: the full 2-stage chain (GEMM + SPExchange + HeadNormRopeCache)
+    sig2 = site.spec.prefix(2).signature()
+    assert sig2 == specs.sp_qkv_spec(gm).signature()
+    assert sig2 in {r["sig"] for r in rows if "small" in r["vid"]}
+    # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
+    # are keyed by this 1-stage signature, so the prefix fallback only works if it matches.
+    sig1 = site.spec.prefix(1).signature()
+    assert sig1 == specs.sp_qkv_spec(gm).prefix(1).signature()
+    large = {r["sig"] for r in rows if "large" in r["vid"]}
+    assert sig1 in large, f"{mode}: 1-stage sig {sig1} not among large rows {sorted(large)}"
+    assert sig1 != sig2
     GC._SITES.clear()
+
+class _SigMatcher:
+    """Fake aiter: returns a plan only when the spec prefix carries a registered signature,
+    like match_prefix against an exact-row profile. Records every spec it was asked about."""
+
+    class Plan:
+        vid = "sp_qkv.small.v1"
+        owner = "o"
+
+        def resources(self):
+            return []
+
+    def __init__(self, sigs):
+        self.sigs, self.asked = set(sigs), []
+
+    def module(self):
+        def match_prefix(spec, ctx):
+            for n in range(len(spec.stages), 0, -1):
+                sub = spec.prefix(n)
+                self.asked.append((n, sub.signature()))
+                if sub.signature() in self.sigs:
+                    return _SigMatcher.Plan(), n
+            return None, 0
+
+        return SimpleNamespace(match_prefix=match_prefix, ContractError=FakeContractError)
+
+
+def _fake_spec_module(matcher):
+    """Minimal stand-ins for the aiter spec classes with a stable, content-derived signature."""
+    import hashlib
+
+    class _S:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+        def key(self):
+            return repr(sorted((k, repr(v)) for k, v in self.__dict__.items()))
+
+    class _Spec:
+        def __init__(self, gemm, stages_):
+            self.gemm, self.stages = gemm, tuple(stages_)
+
+        def prefix(self, n):
+            return _Spec(self.gemm, self.stages[:n])
+
+        def signature(self):
+            blob = self.gemm.key() + "|" + "|".join(s.key() for s in self.stages)
+            return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    class _Stage(_S):
+        def __init__(self, kind, **kw):
+            super().__init__(kind=kind, **kw)
+
+    mod = matcher.module()
+    mod.GemmSpec = lambda **kw: _S(**kw)
+    mod.FusionSpec = _Spec
+    mod.Field = lambda *a: ("F",) + a
+    mod.SPExchange = lambda **kw: _Stage("sp_exchange", **kw)
+    mod.HeadNormRopeCache = lambda **kw: _Stage("head_norm_rope_cache", **kw)
+    return mod
+
+
+@pytest.mark.parametrize("mode", ["qkv_dense", "qkv_indexer", "qkv_indexer_reuse"])
+def test_golden_adapter_sites_resolve_to_a_plan_when_a_row_matches(mode, monkeypatch):
+    """The adapter's sites must be ELIGIBLE: resolve through the real site code to a plan
+    (2 fused stages) when the matcher has a row for the site's own signature, and must
+    carry no 'prologue_unsupported'. Uses only fakes; no aiter, no GPU."""
+    from atom.model_ops.gemm_fusion import golden_candidate as GC
+
+    matcher = _SigMatcher([])
+    gf = _fake_spec_module(matcher)
+    monkeypatch.setattr(stages, "_aiter_override", gf)
+    monkeypatch.setattr(stages, "_kv_block_size", lambda: 16)
+    res = FakeResources()
+    hooks.reset_for_tests(res)
+    hooks.set_phase("preparing")
+    GC._SITES.clear()
+    site, _, _ = GC._site_for(_golden_case(mode), None)
+    matcher.sigs.add(site.spec.signature())  # the "profile row" for this 2-stage spec
+    r = site.resolve(64, "eager")
+    assert r.reason == "profile_hit", r
+    assert (r.vid, r.n_fused) == ("sp_qkv.small.v1", 2)
+    # and with no row it is a plain profile miss, not an eligibility problem
+    matcher.sigs.clear()
+    site._by_tokens.clear()
+    assert site.resolve(64, "eager").reason == "uncovered"
+    GC._SITES.clear()
+
+
+def test_golden_dense_gate_honours_env_and_stays_in_sync_with_the_real_impl(monkeypatch):
+    """The stand-in dense gate mirrors PagedAttentionImpl.gemm_fusion_prologue_supported;
+    pin both the behaviour and the source conditions so they cannot drift apart."""
+    import re
+    from pathlib import Path
+
+    from atom.model_ops.gemm_fusion import golden_candidate as GC
+
+    impl = SimpleNamespace(head_dim=128, sliding_window=-1, rotary_emb=object(), q_norm=object(), k_norm=object())
+    monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON", raising=False)
+    assert GC._prologue_supported("dense", impl) is True
+    monkeypatch.setenv("ATOM_FORCE_ATTN_TRITON", "1")
+    assert GC._prologue_supported("dense", impl) is False
+    monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON")
+    for bad in (dict(head_dim=64), dict(sliding_window=128), dict(rotary_emb=None), dict(k_norm=None)):
+        assert GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **bad})) is False
+    # sparse modes: unconditional True, exactly like SparseMHAPagedAttentionImpl
+    assert GC._prologue_supported("indexer", SimpleNamespace()) is True
+    assert GC._prologue_supported("reuse", SimpleNamespace()) is True
+
+    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py").read_text(encoding="utf-8")
+    body = src.split("def gemm_fusion_prologue_supported", 1)[1].split("def gemm_fusion_prologue_state", 1)[0]
+    for needle in ("ATOM_FORCE_ATTN_TRITON", "self.sliding_window != -1", "self.head_dim != 128",
+                   "self.rotary_emb is not None", "isinstance(self.q_norm, GemmaRMSNorm)", "self.k_norm is not None"):
+        assert needle in body, needle
+    sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
+    assert re.search(r"def gemm_fusion_prologue_supported\(self\) -> bool:.*?return True", sparse, re.S)

@@ -176,15 +176,22 @@ class GemmFusionSite:
             plan, n = gf.match_prefix(self.spec, res.match_ctx(res.local_m(tokens), graph_mode))
         except contract_err as e:  # covered but contract fails
             errored, msg = True, str(e)
+        unsupported = False
         if plan is not None and n >= 2 and not self._static_prologue_ok():
-            plan, n = None, 0  # agreed below => native on every rank
+            plan, n, unsupported = None, 0, True  # agreed below => native on every rank
         outcome = res.agree(self.name, tokens, plan, n, errored=errored)
         if outcome == "error":
             r = GemmFusionContractError(msg or "contract error on all ranks")
             self._by_tokens[key] = r
             raise r
         if outcome == "disagree" or plan is None:
-            reason = "rank_disagree" if outcome == "disagree" else "uncovered"
+            if outcome == "disagree":
+                reason = "rank_disagree"
+            else:
+                # a profile row covered the spec but this layer's prologue cannot be
+                # fused (static eligibility, identical on every rank): say so, do not
+                # report it as a profile miss
+                reason = "prologue_unsupported" if unsupported else "uncovered"
             r = Resolution(None, 0, "native", reason)
         elif not res.can_ensure(plan):
             r = Resolution(None, 0, "native", "after_finalize")  # uniform: same order on all ranks

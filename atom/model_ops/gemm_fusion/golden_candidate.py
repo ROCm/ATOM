@@ -72,6 +72,32 @@ def _mode(case):
     return "dense" if m == "qkv_dense" else ("indexer" if m == "qkv_indexer" else "reuse")
 
 
+def _prologue_supported(mode, impl):
+    """The answer the REAL impl gives for this mode.
+
+    * indexer / reuse -> ``SparseMHAPagedAttentionImpl.gemm_fusion_prologue_supported``
+      is unconditionally True.
+    * dense -> ``PagedAttentionImpl.gemm_fusion_prologue_supported``: not forced to
+      Triton attention (env ATOM_FORCE_ATTN_TRITON), no sliding window, head_dim 128,
+      a rotary embedding and a Gemma-style q_norm/k_norm. The real method cannot be
+      called here (it imports the model stack, and its ``isinstance(q_norm,
+      GemmaRMSNorm)`` rejects the golden case's plain norm objects), so the same
+      conditions are evaluated on the stand-in; a test pins them to the source text.
+      The golden dense case is, by construction, the Gemma/Triton chain
+      (``triton_norm_rope_cache_v1``), so the norm-type condition holds.
+    """
+    if mode != "dense":
+        return True
+    return bool(
+        os.environ.get("ATOM_FORCE_ATTN_TRITON", "0") != "1"
+        and getattr(impl, "sliding_window", -1) == -1
+        and impl.head_dim == 128
+        and impl.rotary_emb is not None
+        and impl.q_norm is not None
+        and impl.k_norm is not None
+    )
+
+
 def _caches_state(case, slot_mapping):
     c = case.caches
     return {
@@ -95,13 +121,13 @@ def _site_for(case, comm):
             rotary_emb=case.rotary, q_norm=case.q_norm, k_norm=case.k_norm,
             kv_cache_dtype="fp8", layer_num=0,
             gemm_fusion_kv_page=case.spec.cache_page_size,
-            # the site's static eligibility check fails safe without this; the golden
-            # chain IS the Gemma/Triton (dense/reuse) or fused-indexer (indexer) prologue
-            gemm_fusion_prologue_supported=lambda: True,
+            sliding_window=-1,
             gemm_fusion_prologue_state=lambda fwd: _caches_state(
                 holder.case, fwd.attn_metadata.slot_mapping
             ),
         )
+        # the site's static eligibility check fails safe without this method
+        impl.gemm_fusion_prologue_supported = lambda: _prologue_supported(mode, impl)
         if sparse:
             impl.index_head_dim, impl.index_q_size = 128, 128
             impl.index_q_norm, impl.index_k_norm = case.index_q_norm, case.index_k_norm
