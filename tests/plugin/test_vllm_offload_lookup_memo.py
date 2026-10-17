@@ -70,7 +70,9 @@ def _adapter(monkeypatch, calls, *, min_load):
 
 
 def _request(req_id: str = "r0", ntok: int = 150_000):
-    return SimpleNamespace(request_id=req_id, prompt_token_ids=list(range(ntok)))
+    return SimpleNamespace(
+        request_id=req_id, prompt_token_ids=list(range(ntok)), num_tokens=ntok
+    )
 
 
 def _end_of_step(adapter):
