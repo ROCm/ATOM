@@ -226,10 +226,10 @@ def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
     assert s._fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
 
 
-def _direct_fixture(make_site):
+def _direct_fixture(make_site, res=None):
     import torch
 
-    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)))
     s.bind_mode = "direct"
     s.resolve(64, "eager")
     t = dict(
@@ -245,26 +245,6 @@ def _direct_fixture(make_site):
                           positions=t["pos"], prologue_state=lambda: state)
     return s, t, state, ctx
 
-
-def test_direct_mode_never_uses_stale_pointers_and_never_falls_back_per_rank(make_site):
-    """M-1: a moved x_scale/positions/slot is self-healed by copy (still fused, uniform);
-    an unprepared bucket or a moved KV cache raises -- no one-rank native fallback."""
-    import torch
-
-    s, t, state, ctx = _direct_fixture(make_site)
-    with pytest.raises(site_mod.GemmFusionBindError):  # never lazily bind
-        s._prepare(ctx, t["x"], t["xs"])
-    st = SimpleNamespace(prepared=True, rebound=False, ptrs=s._live_ptrs(t["xs"], t["pos"], state))
-    s._staging[64] = st
-    s._by_tokens[(64, "eager")] = site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit")
-    r, reason, _, got = s._prepare(ctx, t["x"], t["xs"])
-    assert r.plan is not None and got is st and st.rebound is False
-    moved = torch.zeros((16, 1), dtype=torch.float32)  # small per-call tensor moved
-    r, reason, _, got = s._prepare(ctx, t["x"], moved)
-    assert r.plan is not None and got.rebound is True  # fused + copy, not native
-    state["k_cache"] = torch.zeros(4)  # KV cache moved: fatal, not a fallback
-    with pytest.raises(site_mod.GemmFusionBindError):
-        s._prepare(ctx, t["x"], t["xs"])
 
 def test_bind_mode_validated_and_recorded(make_site):
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
@@ -898,18 +878,17 @@ def test_regression_without_sharing_capture_would_need_a_new_binding(make_site):
         p_capture.launch(in_capture=True)
 
 
-def test_execute_refuses_a_plan_other_than_the_prepared_one(make_site):
+def test_a_plan_other_than_the_prepared_one_is_downgraded_at_agree_not_raised_per_call(make_site):
     s = make_site(FakeResources())
     prepared = _BindingPlan()
     st = SimpleNamespace(prepared=True, plan=prepared, rebound=False, ptrs=(0,) * 7,
                          xs=None, pos=None, slot=None, outs={}, m=16)
-    other = site_mod.Resolution(_BindingPlan(), 2, "sp_qkv.small.v1", "profile_hit")
-    ctx = SimpleNamespace(padded_tokens=64, real_tokens=64)
-    s.bind_mode = "direct"
-    s.build_meta = lambda st, state: {}
-    with pytest.raises(site_mod.GemmFusionBindError, match="other than the one prepared"):
-        s._execute(other, None, None, ctx, {}, st, None)
-
+    s._staging[64] = st
+    s._by_tokens[(64, "eager")] = site_mod.Resolution(_BindingPlan(), 2, "sp_qkv.small.v1", "profile_hit")
+    s._by_tokens[(64, "capture")] = site_mod.Resolution(prepared, 2, "sp_qkv.small.v1", "profile_hit")
+    s.agree_prepared(64, True)
+    assert s._by_tokens[(64, "eager")].plan is None  # other instance: native (uniformly, via agree)
+    assert s._by_tokens[(64, "capture")].plan is prepared  # the prepared one stays fused
 
 def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
     class _T:
@@ -1266,3 +1245,210 @@ def test_native_rope_cache_writes_shuffle_in_the_gemma_branch_whatever_the_flag(
     elif_if = top_if.orelse[0]
     assert isinstance(elif_if, ast.If) and "use_triton_attn" in ast.get_source_segment(src, elif_if.test)
     assert 'self._cache_format = "NHD"' in ast.get_source_segment(src, elif_if)
+
+# ------------- E-3 / M-1: the per-call decision is a pure function of rank-uniform inputs
+def _decide_inputs(**over):
+    base = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+                is_dummy_run=False, real_tokens=64, padded_tokens=64,
+                x_dtype_is_fp8=True, x_scale_ok=True)
+    base.update(over)
+    return base
+
+
+@pytest.mark.parametrize("over,expect", [
+    ({}, ("fused", "profile_hit")),
+    ({"is_dummy_run": True}, ("native", "dummy_run")),
+    ({"real_tokens": 60}, ("native", "pad_rows")),
+    ({"x_dtype_is_fp8": False}, ("native", "unquantized_input")),
+    ({"x_scale_ok": False}, ("native", "xscale_layout")),
+    ({"resolution": site_mod.Resolution(None, 0, "native", "uncovered")}, ("native", "uncovered")),
+    # 1-stage large-M has no pad_rows constraint
+    ({"resolution": site_mod.Resolution(FakePlan(), 1, "fake.large", "profile_hit"), "real_tokens": 60},
+     ("fused", "profile_hit")),
+])
+def test_decide_path_is_the_documented_function_of_its_inputs(over, expect):
+    assert site_mod.GemmFusionSite.decide_path(**_decide_inputs(**over)) == expect
+
+
+def test_decide_path_reads_no_rank_env_device_or_fault_state():
+    """Pin purity to the source: the function may not look at hooks / faults / env / torch.cuda."""
+    import inspect
+    import re
+
+    body = inspect.getsource(site_mod.GemmFusionSite.decide_path)
+    code = re.sub(r'""".*?"""', "", body, flags=re.S)
+    for forbidden in ("hooks", "faults", "os.environ", "getenv", "torch", "sp_rank", "self."):
+        assert forbidden not in code, forbidden
+
+
+def test_prepare_has_no_rank_local_raise(make_site):
+    """The only raise sites left in the per-call path are the post-launch stream check and the
+    bind-time page check; _prepare itself must not raise (E-3)."""
+    import inspect
+    import re
+
+    code = re.sub(r'""".*?"""', "", inspect.getsource(site_mod.GemmFusionSite._prepare), flags=re.S)
+    assert "raise " not in code
+    assert "GemmFusionBindError" not in code
+
+
+# --- staged-mode KV pointer guard at bind time (collective, not per call)
+class _P:
+    def __init__(self, p):
+        self.p = p
+
+    def data_ptr(self):
+        return self.p
+
+
+def _kv_layer(base):
+    return {"layer_3": SimpleNamespace(k_cache=_P(base), v_cache=_P(base + 1),
+                                       k_scale=_P(base + 2), v_scale=_P(base + 3))}
+
+
+def _staged_prepared_site(make_site, res, base):
+    s = make_site(res)
+    s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3))
+    s._staging[64] = SimpleNamespace(prepared=True, kv_ptrs=s.kv_ptrs(_kv_layer(base)))
+    hooks._SITES[s.name] = s
+    return s
+
+
+class _T:
+    """Torch-free tensor stand-in: the attributes site.py reads (shape/dtype/dim/data_ptr)."""
+
+    _next = [10_000]
+
+    def __init__(self, shape=(1,), dtype="f32", ptr=None):
+        self.shape, self.dtype = tuple(shape), dtype
+        if ptr is None:
+            _T._next[0] += 64
+            ptr = _T._next[0]
+        self.p = ptr
+
+    def dim(self):
+        return len(self.shape)
+
+    def data_ptr(self):
+        return self.p
+
+
+def _fake_direct(make_site, res=None):
+    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)))
+    s.bind_mode = "direct"
+    s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True))
+    t = dict(x=_T((16, 8), "fp8"), xs=_T((16, 1), "f32"), pos=_T((64,), "i64"), slot=_T((64,), "i64"))
+    state = {"slot_mapping": t["slot"], "k_cache": _T(), "v_cache": _T(), "k_scale": _T(), "v_scale": _T()}
+    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
+                          positions=t["pos"], prologue_state=lambda: state)
+    return s, t, state, ctx
+
+
+def _seed_prepared(s, t, state):
+    st = SimpleNamespace(prepared=True, rebound=False, plan=None,
+                         ptrs=s._live_ptrs(t["xs"], t["pos"], state))
+    s._staging[64] = st
+    s._by_tokens[(64, "eager")] = site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit")
+    s._by_tokens[(64, "capture")] = site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit")
+    return st
+
+
+def test_direct_mode_per_call_path_never_raises_and_never_falls_back_per_rank(make_site):
+    """M-1 / E-3: the per-call path has no rank-local raise. A moved x_scale is self-healed by
+    copy (still fused, uniform). What used to raise per call is decided at prepare time and
+    agreed across ranks (agree_prepared -> native on ALL ranks)."""
+    s, t, state, ctx = _fake_direct(make_site)
+    st = _seed_prepared(s, t, state)
+    r, _, _, got = s._prepare(ctx, t["x"], t["xs"])
+    assert r.plan is not None and got is st and st.rebound is False
+    r, _, _, got = s._prepare(ctx, t["x"], _T((16, 1), "f32"))  # x_scale moved
+    assert r.plan is not None and got.rebound is True  # fused + copy, not native
+    state["k_cache"] = _T()  # KV cache moved AFTER prepare: no per-call raise any more
+    r, _, _, _ = s._prepare(ctx, t["x"], t["xs"])
+    assert r.plan is not None  # the guard is at prepare time (next test), not here
+
+
+def test_direct_prepare_reports_moved_kv_so_agree_downgrades_every_rank(make_site):
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    s, t, state, ctx = _fake_direct(make_site, res)
+    _seed_prepared(s, t, state)
+    direct = {"x_scale": t["xs"], "positions": t["pos"], "slot_mapping": t["slot"], "state": state}
+    assert s.prepare_bucket(64, None, {}, None, direct=direct) is True  # same addresses
+    moved = dict(state, k_cache=_T())  # the caller's KV cache moved
+    assert s.prepare_bucket(64, None, {}, None, direct={**direct, "state": moved}) is False
+    s.agree_prepared(64, False)  # what prepare_buckets does with that verdict
+    assert s._by_tokens[(64, "eager")].plan is None and s._by_tokens[(64, "eager")].reason == "unprepared"
+    assert s._by_tokens[(64, "capture")].plan is None
+
+
+def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monkeypatch):
+    """E-3: N simulated ranks, same inputs -> the same (path, reason, n_fused). Each 'rank' has
+    its own site and sp_rank and NO fault seam: nothing but the uniform tuple may vary the
+    outcome. Covers every fallback class."""
+    cases = [
+        dict(dummy=False, real=64, padded=64, dtype="fp8", scale=(16, 1)),
+        dict(dummy=True, real=64, padded=64, dtype="fp8", scale=(16, 1)),
+        dict(dummy=False, real=40, padded=64, dtype="fp8", scale=(16, 1)),
+        dict(dummy=False, real=64, padded=64, dtype="bf16", scale=(16, 1)),
+        dict(dummy=False, real=64, padded=64, dtype="fp8", scale=(16, 2)),
+    ]
+    expected = [True, False, False, False, False]  # fused only for the first
+    for c, want_fused in zip(cases, expected):
+        outcomes = set()
+        for rank in range(4):
+            monkeypatch.setattr(hooks, "sp_rank", lambda r=rank: r)
+            s, t, state, ctx = _fake_direct(make_site)
+            _seed_prepared(s, t, state)
+            ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = c["dummy"], c["real"], c["padded"]
+            r, reason, _, _ = s._prepare(ctx, _T((16, 8), c["dtype"]), _T(c["scale"], "f32"))
+            outcomes.add((r.plan is not None, r.n_fused, reason))
+        assert len(outcomes) == 1, (c, outcomes)  # every rank decided identically
+        assert next(iter(outcomes))[0] is want_fused, c
+
+
+def _no_prepare(monkeypatch):
+    monkeypatch.setattr(hooks, "prepare_buckets", lambda *a, **k: None)
+    monkeypatch.setattr(hooks, "profile_tokens", lambda *a, **k: [])
+
+
+def test_rebind_with_moved_kv_fails_before_state_changes(make_site, monkeypatch):
+    _no_prepare(monkeypatch)
+    res = FakeResources()
+    s = _staged_prepared_site(make_site, res, 1000)
+    hooks._KV = old = _kv_layer(1000)
+    hooks.bind_kv_cache(_kv_layer(1000))  # same addresses: fine
+    hooks._KV = old
+    with pytest.raises(site_mod.GemmFusionBindError, match="different addresses"):
+        hooks.bind_kv_cache(_kv_layer(2000))  # a re-allocated pool
+    assert hooks._KV is old  # nothing was rebound
+    assert s.kv_moved(_kv_layer(2000)) is True and s.kv_moved(_kv_layer(1000)) is False
+
+
+def test_rebind_guard_is_a_collective_so_one_ranks_move_fails_all_ranks(make_site, monkeypatch):
+    """Rank 0's pool did not move, rank 1's did. Both must raise (agreed via the reduce)."""
+    _no_prepare(monkeypatch)
+    outcomes = []
+    for local_moved, peer_moved in ((0, 1), (1, 0)):
+        res = FakeResources()
+        _staged_prepared_site(make_site, res, 1000)
+        hooks._KV = _kv_layer(1000)
+        res._reduce_min = lambda v, p=peer_moved: [min(v[0], -p), v[1], v[2]]  # MIN over ranks
+        try:
+            hooks.bind_kv_cache(_kv_layer(2000 if local_moved else 1000))
+            outcomes.append("ok")
+        except site_mod.GemmFusionBindError:
+            outcomes.append("raised")
+    assert outcomes == ["raised", "raised"]
+
+
+def test_first_bind_runs_no_collective(make_site, monkeypatch):
+    _no_prepare(monkeypatch)
+    res = FakeResources()
+    calls = []
+    res._reduce_min = lambda v: calls.append(v) or v
+    s = make_site(res)
+    s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3))
+    hooks._SITES[s.name] = s
+    hooks._KV = None
+    hooks.bind_kv_cache(_kv_layer(1000))  # first bind: nothing prepared, no agreement needed
+    assert calls == []

@@ -210,6 +210,21 @@ def prepare_buckets(tokens_list, device=None, out_dtype=None) -> None:
 def bind_kv_cache(kv_cache_data) -> None:
     """After KV allocation. Resolves/prepares every profile bucket (L-3)."""
     global _KV
+    if _KV is not None and _RES is not None:
+        # RE-bind. Staged plans hold raw pointers to the KV caches they were prepared on; a
+        # re-allocated pool would be silently ignored by them. Agree across ranks (this call is
+        # made on every rank, so the collective is uniform) and fail on ALL ranks before any
+        # state changes. Not a per-call check, and absent on the first bind.
+        moved = int(any(s.kv_moved(kv_cache_data) for s in _SITES.values()))
+        reduce = getattr(_RES, "_reduce_min", None)
+        any_moved = bool(moved) if reduce is None else reduce([-moved, 0, 0])[0] != 0
+        if any_moved:
+            from .site import GemmFusionBindError
+
+            raise GemmFusionBindError(
+                "gemm_fusion: bind_kv_cache called again with KV caches at different addresses "
+                "than the prepared buckets were bound to; re-binding a live pool is unsupported"
+            )
     _KV = kv_cache_data
     for s in _SITES.values():
         s.bind_caches(kv_cache_data)
@@ -252,8 +267,15 @@ def check_step() -> None:
     D2H per plan), and all-reduces ``[-poison, digest, -digest]`` (MIN) so all
     ranks agree on (a) any poison anywhere, (b) that every rank made identical
     fused/native decisions this step. On either, runs the collective recovery and
-    raises -- never returns silently wrong output. A step that made no fused call
-    and has no prepared plan does nothing (uniform across ranks).
+    raises. A step that made no fused call and has no prepared plan does nothing
+    (uniform across ranks).
+
+    LIMIT (E-3): this is a collective at the END of the step, so it only sees steps that
+    COMPLETE on every rank. A non-uniform decision whose collectives do not match (one rank in
+    the native RCCL all_to_all while its peers wait in the fused CCO kernel) blocks the step
+    mid-way and never reaches this call: that is FAIL-STOP at the process-group timeout, not a
+    recovered error. The digest only catches decision differences among ranks that still
+    finish the step (and device poison on completing ranks).
     """
     global _STEP_DIGEST, _STEP_CALLS
     if _RES is None or _PHASE != "ready":

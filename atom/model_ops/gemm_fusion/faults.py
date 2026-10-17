@@ -11,8 +11,13 @@ empty or ``*`` means every rank. Kinds:
                        real device poison needs a kernel-side forced-timeout build).
   op_raise[:r]         the fused op raises on rank r (E4: one-rank exception).
   rank_native[:r]      rank r takes a native decision where others fuse. This
-                       DELIBERATELY violates cross-rank uniformity so evidence can
-                       show the step-digest check catches it (E3).
+                       DELIBERATELY violates cross-rank uniformity (E3). Expected
+                       outcome: FAIL-STOP. Rank r enters the native RCCL all_to_all while
+                       its peers wait in the fused CCO kernel, so the step cannot complete
+                       and the step-end digest in check_step is never reached; the run ends
+                       at the process-group timeout. E-3 passes when the failure is bounded,
+                       every rank exits non-zero, and no wrong output is returned silently.
+                       (The digest only sees decision differences in steps that complete.)
   slow_remainder[:r:n] after the native remainder of a 1-stage (large-M) call,
                        rank r spins the GPU ~n microseconds (E5: WAR window).
   recover_skip[:r]     rank r skips recover() (exercises the recovery timeout).
