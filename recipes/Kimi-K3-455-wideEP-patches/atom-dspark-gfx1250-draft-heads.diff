@@ -1,0 +1,53 @@
+diff --git a/atom/model_ops/attention_mla.py b/atom/model_ops/attention_mla.py
+index 1eeb571..8349d56 100644
+--- a/atom/model_ops/attention_mla.py
++++ b/atom/model_ops/attention_mla.py
+@@ -34,6 +34,7 @@ except ImportError:
+     concat_and_cache_mla_seg = None
+     fused_qk_rope_concat_and_cache_mla_seg = None
+ from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
++from aiter.jit.utils.chip_info import get_gfx
+ from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+ from aiter.ops.triton.attention.mla import (
+     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+@@ -246,7 +247,7 @@ def check_kv_shuffled_supported(
+         )
+ 
+ 
+-def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
++def mla_min_query_heads(kv_cache_dtype: str, block_width: int, num_heads: int) -> int:
+     """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
+ 
+     aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
+@@ -260,7 +261,16 @@ def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
+     descriptors are sized from the block width, so a 2-wide plan driving a
+     4-wide kernel writes its partials past the reduce buffers (illegal access
+     at some batch sizes, a non-terminating kernel at others).
++
++    gfx1250 has none of those kernels: its page-size-1 fp8 decode is aiter's
++    FlyDSL PS1 kernel alone, and aiter routes a block wider than 1 to it only at
++    16 heads (up to 4 wide) or 96, causal or not. ``num_heads`` is the layer's
++    own count, which decides between the two.
+     """
++    if kv_cache_dtype.startswith("fp8") and get_gfx() == "gfx1250":
++        if block_width > 1 and (num_heads > _MLA_MIN_HEADS or block_width > 4):
++            return 96
++        return _MLA_MIN_HEADS
+     if block_width == 2 and kv_cache_dtype.startswith("fp8"):
+         return 32
+     return _MLA_MIN_HEADS
+diff --git a/atom/models/kimi_k3_dspark.py b/atom/models/kimi_k3_dspark.py
+index 3feeba4..a84e454 100644
+--- a/atom/models/kimi_k3_dspark.py
++++ b/atom/models/kimi_k3_dspark.py
+@@ -350,7 +350,9 @@ class K3DSparkMLAAttention(nn.Module):
+             # aiter kernels available for it; the draft's own block width picks
+             # the head padding that keeps one dispatchable.
+             min_query_heads=mla_min_query_heads(
+-                atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
++                atom_config.kv_cache_dtype,
++                _dspark_block_width(config, atom_config),
++                self.num_local_heads,
+             ),
+             layer_num=layer_num,
+             use_mla=True,

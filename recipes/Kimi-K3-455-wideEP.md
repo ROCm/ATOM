@@ -15,8 +15,9 @@ Full-size **Kimi-K3** on **two gfx1250 B0 trays, 4 GPUs each (432 GiB/GPU, SPX)*
   - The ROCm, torch and Triton stack comes from `rocm/fw-bringup-mlperf:gfx1250-atom-20261012`.
   - See [Container and patches](#container-and-patches).
 
-Validated on CT7 (node0) and CT15 of the HeliosM rack below, 2026-10-16, with full GSM8K. The throughput and AgentX
-figures are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`.
+Validated on CT7 (node0) and CT15 of the HeliosM rack below, 2026-10-16, with full GSM8K. The throughput figures and
+the 2026-10-16 AgentX points are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`; the LMCache MP
+and DSpark figures are from this one.
 
 | | |
 |---|---|
@@ -27,6 +28,7 @@ figures are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`.
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
 | KV offload (LMCache MP) | 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
+| Speculative decoding (DSpark) | 20261016 image plus one ATOM fix, 2026-10-17: GSM8K 0.9629; zero-shot GSM8K acceptance length 5.47 at K=7 (model card 5.64). AgentX concurrency 16 at InferenceX's fixed acceptance (K=4, 3.36): **1 / p90(ITL) 56.0 tok/s/user against 28.0 without it, 5,054 tok/s per GPU against 4,136**. See [DSpark](#speculative-decoding-dspark) |
 
 Contents:
 
@@ -38,6 +40,7 @@ Contents:
 - [Accuracy](#accuracy-gate-and-gsm8k)
 - [Agentic](#agentic-agentx)
 - [KV offload (LMCache MP)](#kv-offload-with-lmcache-mp)
+- [Speculative decoding (DSpark)](#speculative-decoding-dspark)
 - [Known issues](#known-issues)
 
 ---
@@ -500,7 +503,7 @@ for p in atom-main-2557 atom-main-2554 aiter-main-6525 aiter-main-6530; do
   d=/app/ATOM; [ "${p%%-*}" = aiter ] && d=/app/aiter
   curl -sSfL $B/$p.diff -o /tmp/$p.diff
   (cd $d && git apply /tmp/$p.diff && git apply --check -R /tmp/$p.diff) && echo "ok $p"; done
-rm -rf /root/.cache/atom/*                 # after any code change
+rm -rf /root/.cache/atom/* /tmp/torchinductor_root   # after any code change: both compile caches (Known issues)
 ```
 
 - `docker rm` discards changes made by hand. Those in the image stay.
@@ -714,11 +717,12 @@ Neither is aiperf's own per-user p90.
 
 ### Results
 
-![Kimi-K3 AgentX throughput per GPU vs P90 interactivity: MI455 dp8ep8 on 2026-10-11 and 2026-10-16, ATOM on MI355X on 2026-10-15](Kimi-K3-455-wideEP-AgentX.png)
+![Kimi-K3 AgentX throughput per GPU vs P90 interactivity: MI455 dp8ep8 on 2026-10-11 and 2026-10-16, MI455 with DSpark at concurrency 16, ATOM on MI355X on 2026-10-15](Kimi-K3-455-wideEP-AgentX.png)
 
 P90 interactivity is 1 / p90(ITL); points are labelled with their concurrency. MI455: the 2026-10-16 points and the
-2026-10-11 sweep below (its concurrency 8 failed aiperf's coverage check and is left out). MI355X: ATOM's InferenceX
-points, also below.
+2026-10-11 sweep below (its concurrency 8 failed aiperf's coverage check and is left out). MI455 + DSpark (the diamond):
+concurrency 16 with DSpark at K=4 and InferenceX's fixed acceptance length 3.36, the 20261016 image; see
+[DSpark](#agentx-at-concurrency-16). MI355X: ATOM's InferenceX points, also below.
 
 #### 2026-10-16: the 20261014 image, concurrency 16, 32 and 64
 
@@ -776,8 +780,10 @@ For Pareto charts against this page's points. Source: the
 
 - **Run:** 2026-10-15, [workflow 38676890603](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/38676890603),
   image `rocm/atom-dev:nightly_202610131505`, 3600 s per point.
-- **Setup:** one node of 8 MI355X; TP 8, no EP, no DP attention; FP4; **MTP speculative decoding on**;
-  InferenceX's agentic trace replay.
+- **Setup:** one node of 8 MI355X; TP 8, no EP, no DP attention; FP4; **speculative decoding on**: DSpark
+  (InferenceX files it under `mtp`) at InferenceX's fixed acceptance length. InferenceX's current recipe for it
+  runs K=4 (acceptance 3.36) from concurrency 14 up, with DCP 8 and LMCache offload; InferenceX's agentic trace
+  replay.
 - **P90 interactivity** is the dashboard's x axis, `p90_intvty` = 1 / p90(ITL). Compare it with this page's
   `1 / p90(ITL)` column, not with the E2E-normalized one.
 - **Throughput per GPU** is the dashboard's y axis, `tput_per_gpu`: input plus output tokens per second over the
@@ -791,7 +797,8 @@ For Pareto charts against this page's points. Source: the
 
 Not like for like:
 - MI355X, one node, TP 8 there, against MI455 (gfx1250), two trays, DP 8 / EP 8 here.
-- MTP is on there and off here. MTP shortens ITL, so it raises interactivity directly.
+- Speculative decoding is on there and off in the 2026-10-16 points here. It shortens ITL, so it raises
+  interactivity directly. The [DSpark point](#agentx-at-concurrency-16) runs it the same way.
 
 The same run also has concurrency 1, 4, 14 and 72.
 
@@ -1001,6 +1008,117 @@ Next: the same launch without LMCache, to measure its share of the throughput.
 
 ---
 
+## Speculative decoding (DSpark)
+
+[`Inferact/Kimi-K3-DSpark`](https://huggingface.co/Inferact/Kimi-K3-DSpark) is Kimi-K3's DSpark draft: five dense MLA
+layers, fed the target's hidden states from layers 2, 23, 47, 71 and 89, that draft a block of tokens in one non-causal
+pass. It is 7.1 GB in BF16 and keeps its KV in the target's MLA layout.
+
+**Status, 2026-10-17:** it runs on the 20261016 image with one ATOM fix. Its GSM8K score matches the server without it,
+and its acceptance length is close to the model card's. At AgentX concurrency 16 it doubles P90 interactivity and adds
+22% throughput per GPU. Measured on CT7 (node0) + CT15, no perf_setup.
+
+### What it needs
+
+| | what | why |
+|---|---|---|
+| ATOM | [`atom-dspark-gfx1250-draft-heads.diff`](Kimi-K3-455-wideEP-patches/atom-dspark-gfx1250-draft-heads.diff), from branch [`zejun/dspark-gfx1250-draft-heads`](https://github.com/ROCm/ATOM/tree/zejun/dspark-gfx1250-draft-heads). It applies on top of the image's ATOM | Without it the drafter's CUDA-graph warmup aborts with `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode`. On gfx1250 the page-size-1 fp8 MLA decode is aiter's FlyDSL PS1 kernel alone, which takes a block wider than one query row only at 16 heads (up to 4 wide) or 96. The target has 96 heads. The draft has 64 and decodes a K-wide non-causal block. The fix pads the draft's query heads to 96 |
+| the draft | `hf download Inferact/Kimi-K3-DSpark --local-dir <model-dir>/Kimi-K3-DSpark` on each tray. `model.safetensors` is 7,124,633,450 bytes, sha256 `f9972a636d92a11994cdcfc88fd4c5b5d50d6eb2a89af016031593b8c65c2053` | Pass ATOM the local path. Given the repo ID, every rank downloads the draft when it starts |
+| the online FP8 config | the draft's layers excluded (below) | Keeps the draft in BF16, as InferenceX's MI355X ATOM recipe does. Quantized to FP8 it accepted as many tokens on GSM8K, but it is not the model that was trained |
+
+In each tray's container:
+
+```bash
+B=https://raw.githubusercontent.com/ROCm/ATOM/recipe-k3-455-wideep/recipes/Kimi-K3-455-wideEP-patches
+cd /app/ATOM && curl -sSfL $B/atom-dspark-gfx1250-draft-heads.diff -o /tmp/dspark.diff
+git apply /tmp/dspark.diff && git apply --check -R /tmp/dspark.diff && echo ok
+rm -rf /root/.cache/atom/* /tmp/torchinductor_root   # both compile caches, see below
+```
+
+### Launch
+
+The [launch above](#launch-dp8ep8), with the draft's layers added to the online FP8 exclusions and three flags:
+
+```bash
+ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "layers.*.self_attn.fused_qkv_a_proj", "layers.*.self_attn.q_b_proj", "layers.*.self_attn.kv_b_proj", "layers.*.self_attn.o_proj", "layers.*.mlp.gate_up_proj", "layers.*.mlp.down_proj", "context_proj"]}'
+SPEC_ARGS=(--method dspark --draft-model /models/Kimi-K3-DSpark --num-speculative-tokens 4)
+# AgentX throughput the way InferenceX measures it: a fixed acceptance length (below)
+# SPEC_ARGS+=(--spec-decode-acceptance-length 3.36)
+exec python3 -m atom.entrypoints.openai_server ... \
+  --online_quant_config "$ONLINE_QUANT" "${MODE_ARGS[@]}" "${SPEC_ARGS[@]}" --disable_uvicorn_access_log
+```
+
+- **The exclusions touch only the draft.** Its layers are unprefixed (`layers.N.…`, `context_proj`); the target's are
+  `language_model.model.layers.N.…`.
+- **Expect on every rank:**
+  - `Detected MLA DSpark drafter with a separate draft model (markov_rank=256, target_layers=[2, 23, 47, 71, 89], …)`;
+  - `MLA query-head padding: 64 -> 96`;
+  - `607 layers online-quantized` for the target and `0 layers online-quantized` for the draft;
+  - `ReplaySSM enabled for linear attention (default, speculative decoding is on)`.
+- **Memory.** `available_for_kv` is about 96 GB per rank: the draft's weights and its KV take the rest.
+- **Acceptance.** `/debug/mtp_stats` on node0 sums the eight ranks. Its `average_tokens_per_forward` is the acceptance
+  length, 1 + accepted draft tokens / verify steps. For one run, read it before and after and take the difference.
+- **Clear both compile caches before a start whose graphs changed:** after a code change, another
+  `--num-speculative-tokens`, or DSpark turned on or off. Run `rm -rf /root/.cache/atom/* /tmp/torchinductor_root`. With
+  only ATOM's cache gone, every rank hung in its warmup forward; see [Known issues](#known-issues).
+
+### Accuracy and acceptance
+
+GSM8K as in [Accuracy](#accuracy-gate-and-gsm8k), K=7, greedy, 2026-10-17:
+
+| server | strict-match | flexible-extract | acceptance length, over the run |
+|---|---|---|---|
+| DSpark K=7, draft BF16 | **0.9629 ±0.0052** | 0.9621 ±0.0053 | 4.68 |
+| DSpark K=7, draft online FP8 | 0.9538 ±0.0058 | 0.9530 ±0.0058 | 4.67 |
+| no speculation (2026-10-16) | 0.9568 ±0.0056 | 0.9560 ±0.0056 | — |
+
+- **At temperature 0 speculation does not change what the target emits.** The spread between the three rows is
+  run-to-run noise.
+- **The model card's acceptance length** (5.64 on GSM8K at temperature 0, K=7) is for one question per conversation.
+  lm_eval's 5-shot chat puts five solved examples before every question, and acceptance falls to 4.68.
+- **Zero-shot: 5.47.** All 1319 questions, one per conversation, temperature 0, 32 at a time: 63.9% of the draft tokens
+  accepted, all seven in 39.4% of the steps. That is 3% below the card, which was measured with vLLM on GB300.
+
+### AgentX at concurrency 16
+
+**Fixed acceptance, as InferenceX does.** The trace replay's prompts are filler text of the traced lengths, and it
+ignores EOS, so a draft's real acceptance on it means nothing. InferenceX instead fixes every submission's acceptance to one golden curve per model,
+measured on SPEED-Bench's coding category
+([`golden_al_distribution`](https://github.com/SemiAnalysisAI/InferenceX/tree/main/inferencex-e2e/infx/golden_al_distribution)).
+For ATOM's DSpark its connector takes the probabilistic-sampling table:
+
+| K | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| acceptance length | 1.85 | 2.51 | 3.00 | 3.36 | 3.62 | 3.75 | 3.84 | 4.00 |
+
+- **ATOM's MI355X submission** runs K=4 from concurrency 14 up, and K=7 at 1 and 4.
+- **`--spec-decode-acceptance-length`** sets the fixed acceptance. It uses vLLM's minimum-variance schedule: at K=4 and
+  3.36, the first two draft tokens are always accepted and the third 36% of the time. The output text is then
+  meaningless.
+
+**Run, 2026-10-17, CT7 (node0) + CT15, no perf_setup, both runs back to back on the same image:**
+- **Client:** AgentX by the [method above](#agentic-agentx) with `AIPERF_BENCHMARK_DURATION=1800`.
+- **Server:** the AgentX launch with `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`, `--max-num-seqs 8` and the default
+  checkpoint ladder (8192, as on 2026-10-16). A fresh server for each run.
+
+| | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit (theoretical) | valid |
+|---|---|---|---|---|---|---|---|---|---|
+| no speculation | 10.28 | 28.01 | 4,136 | 31.5 | 7.0 / 15.0 s | 27 / 36 ms | 548 | 96.1% (96.5%) | yes |
+| **DSpark K=4, acceptance 3.36** | **11.48** | **55.98** | **5,054** | 41.0 | 6.5 / 14.8 s | 11 / 18 ms | 650 | 95.6% (96.5%) | yes |
+
+- **Interactivity doubles.** A decode step now yields 3.36 tokens per request (the server reported 3.364) and takes
+  about 37% longer: it verifies five rows and runs the draft. Decode steps fell by 58%.
+- **TTFT is unchanged.** Throughput rises 22% because requests finish sooner, so more of them fit in the window.
+- **E2E-normalized interactivity rises only 12%.** Prompts average 128k tokens, so TTFT is most of a request's latency.
+- **The no-speculation run matches** the 2026-10-16 concurrency 16 on the 20261014 image (27.77, 4,078).
+- **Against ATOM on MI355X** at concurrency 16 (57.01, 9,013, also DSpark K=4 at 3.36): interactivity is now level,
+  and throughput per GPU is 56% of it.
+
+Not measured yet: other K, concurrency 32 and 64 with DSpark, DSpark with `--state-checkpoint-interval-tokens -1`, and
+tuned trays.
+
+---
+
 
 ## Known issues
 
@@ -1010,7 +1128,9 @@ Next: the same launch without LMCache, to measure its share of the throughput.
 | All ranks of a tray exit with code 255 at startup, without a traceback; the log has `[AMD-SMI] missing symbol amdsmi_init` | mori's topology loader opens `libamd_smi.so`. TheRock's wheels ship only `libamd_smi.so.27`, so it falls through to `librocm_smi64`, finds no `amdsmi_init` and calls `exit(-1)`. Set `MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27` |
 | `[MegaMoEGfx1250] Created: … dispatch=mori … stage1_fused=False` | `ATOM_MEGA_STAGE1_FUSED=0`, or a bf16 dispatch wire: the compact plan needs `MEGA_DISPATCH_WIRE=fp4` (or fp8) |
 | `RuntimeError: ccoMemAlloc failed: -1` at MoE init, after `Out of heap memory! Requested: …` | The compact plan runs, but the cco arena was sized for the gather transport: aiter #6525 (`required_vmm_bytes`) is missing |
+| DSpark: `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode` in `warmup_draft_graphs` | The ATOM fix for the draft is missing; see [What it needs](#what-it-needs) |
 | All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: … Timed out waiting 1800000ms`; meanwhile `[aiter] No available shared memory broadcast block found` repeats | The allgather LM head's custom all-gather hung on one rank. rocgdb shows that rank in `aiter::ag_gfx1250_lastdim<bf16, 8>` and the others in `tdm_compact_plan`. Seen twice in a few hours of GSM8K, never in AgentX runs. Workaround: the replicated head. Watch the `Engine 00x: Avg` lines, not the log's mtime: they stop |
+| Every rank hangs in `warmup_model` after a code or configuration change. `py-spy` shows `torch.cuda.synchronize()` under inductor's `autotune_to_one_config`; the GPUs show 100% GFX and 0% memory activity; rocgdb shows no active dispatch | ATOM's compile cache was cleared but inductor's (`/tmp/torchinductor_root`) was not. Inductor then reuses its compiled graphs without their autotune results, autotunes in the middle of the first forward, and its `synchronize()` never returns: rocgdb shows a queue of the dual-stream MoE stopped at a packet that was never published. Clear both: `rm -rf /root/.cache/atom/* /tmp/torchinductor_root`. Seen twice with DSpark; a full compile has never hung |
 | `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at load | aiter's MegaMoE turns on mori's TokOffExt, whose IPC handles do not cross trays. `MORI_EP_TOKOFF_EXT=0` |
 | `assert not ca_comm.disabled` kills the ModelRunner while HTTP stays up | `ATOM_USE_CUSTOM_ALL_GATHER` and `AITER_CUSTOM_AR_USE_SYMM_MEM` are not set together, the symm_mem probe failed, or DP > 8. Use the replicated head otherwise |
 | LLVM `PHINode::setIncomingValue` assertion on a long prompt at concurrency | The fused Triton `gather_kv_b_proj` ran. Keep `--online_quant_config` as in the launch: it makes `kv_b_proj` ptpc FP8, which aiter's FlyDSL gather serves |
