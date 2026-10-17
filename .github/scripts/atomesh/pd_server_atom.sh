@@ -49,7 +49,7 @@ if [[ "${BENCHMARK_KIND:-}" == "paged_prefill_tuning" ]]; then
   git -C "${baseline_source}" checkout --detach FETCH_HEAD
   git -C "${baseline_source}" submodule update --init --recursive --depth=1
   exec python3 "${ATOMESH_SCRIPT_DIR}/paged_prefill_tune.py" \
-    --validate-only --baseline-source "${baseline_source}" \
+    --microarchitecture --baseline-source "${baseline_source}" \
     --output "${RUN_DIR}/benchmark_results/paged-prefill-tuning"
 fi
 

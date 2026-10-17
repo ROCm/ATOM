@@ -219,7 +219,7 @@ def parameters(ua, x, case):
     )
 
 
-def candidate(ua, p, block_m, warps, stages, splits):
+def candidate(ua, p, block_m, warps, stages, splits, matrix_size=0, waves=2):
     import torch
 
     cfg = {
@@ -227,8 +227,10 @@ def candidate(ua, p, block_m, warps, stages, splits):
         "BLOCK_Q": block_m // p.num_queries_per_kv,
         "num_warps": warps,
         "num_stages": stages,
-        "waves_per_eu": 2,
+        "waves_per_eu": waves,
     }
+    if matrix_size:
+        cfg["matrix_instr_nonkdim"] = matrix_size
     if splits == 1:
         cfg.update(TILE_SIZE=128, SPLIT_UNMASKED_LOOP=False)
         return lambda: ua._unified_attention_2d_triton(p, config=cfg)
@@ -328,7 +330,16 @@ def measure(fn):
     return {"median_ms": statistics.median(results), "samples_ms": results}
 
 
-def configurations():
+def configurations(microarchitecture=False):
+    if microarchitecture:
+        # Compile-time MFMA layout and occupancy candidates for large-Q 2D.
+        # Each runs the whole numerical population in isolated workers.
+        return [
+            (tile, warps, 1, 1, matrix, waves)
+            for tile, warps in ((128, 4), (256, 8))
+            for matrix in (16, 32)
+            for waves in (1, 2)
+        ]
     # Finalists from the broad sweep plus neighbouring split counts. The
     # production default is independently checked before these experiments.
     return [
@@ -339,8 +350,11 @@ def configurations():
 
 
 def configuration_name(config):
-    bm, nw, ns, splits = config
-    return f"m{bm}-w{nw}-s{ns}-kv{splits}"
+    bm, nw, ns, splits, *extra = config
+    name = f"m{bm}-w{nw}-s{ns}-kv{splits}"
+    if extra:
+        name += f"-mfma{extra[0]}-waves{extra[1]}"
+    return name
 
 
 def worker(args):
@@ -465,11 +479,16 @@ def main():
     parser.add_argument("--baseline-source")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--mode", choices=["old", "new", "candidate"])
-    parser.add_argument("--config", type=int, nargs=4)
+    parser.add_argument("--config", type=int, nargs="+")
+    parser.add_argument("--microarchitecture", action="store_true")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=8)
     args = parser.parse_args()
     Path(args.output).mkdir(parents=True, exist_ok=True)
+    if args.mode == "candidate" and (
+        args.config is None or len(args.config) not in (4, 6)
+    ):
+        parser.error("candidate --config needs four or six integers")
     if args.mode:
         worker(args)
         return
@@ -484,7 +503,9 @@ def main():
     rejected = {}
     plan = [("old", None), ("new", None)]
     if not args.validate_only:
-        plan += [("candidate", config) for config in configurations()]
+        plan += [
+            ("candidate", config) for config in configurations(args.microarchitecture)
+        ]
     for mode, config in plan:
         variant = configuration_name(config) if config else mode
         with ExitStack() as logs:
