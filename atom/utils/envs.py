@@ -1095,6 +1095,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Escapes (no decode anywhere, KV high, queue age, TTFT/partial bounds)
     # still force release so one idle rank cannot stall TTFT.
     "ATOM_DP_PREFILL_SYNC": lambda: _flag_env("ATOM_DP_PREFILL_SYNC", "0"),
+    # DP phase lockstep (default off). Under DP attention, when the group fires
+    # an aligned prefill (every rank prefills together), a rank with no prefill
+    # work runs a 1-token idle prefill instead of decoding, so it does not knock
+    # the group off its decode CUDA graph. Only helps when paired with the
+    # prefill delayer + ATOM_DP_PREFILL_SYNC (aligned fires); off by default
+    # because it is a net loss at low concurrency / rare prefills.
+    "ATOM_DP_PHASE_LOCKSTEP": lambda: _flag_env("ATOM_DP_PHASE_LOCKSTEP", "0"),
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
     # In (0, 1]; higher batches harder (fewer, larger prefills) at some TTFT

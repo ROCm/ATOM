@@ -175,9 +175,9 @@ class PrefillDelayer:
         "_stat_log_every",
         "cpu_group",
         "dp_size",
-        "last_n_prefillable",
         "kv_high_watermark",
         "last_fire_aligned",
+        "last_n_prefillable",
         "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
@@ -321,6 +321,10 @@ class PrefillDelayer:
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
         self.last_n_prefillable = 0
+        # True only on a tick where the group fired an *aligned* prefill (every
+        # rank admitted prefill together). Lockstep idles a non-prefilling rank
+        # solely on this signal; see Scheduler._phase_lockstep_idle_needed.
+        self.last_fire_aligned = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -497,6 +501,7 @@ class PrefillDelayer:
                 self._reset()
                 self.rank_prefill_costs = []
                 self.last_n_prefillable = 0
+                self.last_fire_aligned = False
                 return PrefillDecision(allow=True, prefillable_ranks=0)
 
         # One readback for all slots (a single .tolist() beats per-slot .item()
@@ -702,8 +707,8 @@ class PrefillDelayer:
         # reason ∈ {align, quorum, fill, stall, cost, ttft, kv, partial,
         # nodecode, queue_ms, vacuous}; each maps to a dedicated
         # _stat_fire_<reason> slot so the log shows what released.
-        # last_fire_aligned is the scheduler's one-sequence cap, not the
-        # lockstep idle gate.
+        # last_fire_aligned is the #2600 one-sequence cap, not the lockstep
+        # idle gate. Lockstep idles on last_n_prefillable.
         self.last_fire_aligned = reason == "align"
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)

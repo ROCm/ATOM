@@ -23,7 +23,6 @@ import enum
 import itertools
 import logging
 import math
-import os
 import struct
 import threading
 import time
@@ -632,7 +631,7 @@ class Scheduler:
         # prefills, a rank with no prefill work runs an idle prefill instead
         # of decode. Mixing the two clears ForwardMode.unified and
         # eager-decodes the whole group. Default off.
-        self.dp_phase_lockstep = os.environ.get("ATOM_DP_PHASE_LOCKSTEP", "0") == "1"
+        self.dp_phase_lockstep = envs.ATOM_DP_PHASE_LOCKSTEP
         self._phase_lockstep_seq: Sequence | None = None
         self._phase_lockstep_idles = 0
         if self.dp_phase_lockstep:
