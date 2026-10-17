@@ -387,6 +387,7 @@ class V41BoundaryPlanner(PageRideMixin):
         state_checkpoints_can_serve: bool = False,
         checkpoint_group_ids: tuple[int, ...] = (),
         rides_page: bool = False,
+        keep_a_prefill_tail: bool = False,
     ) -> None:
         self.hash_block_size = int(hash_block_size)
         # Two different things that used to be one.
@@ -417,6 +418,14 @@ class V41BoundaryPlanner(PageRideMixin):
         # *which* boundary each transfer rides with: there is no second tier
         # to drive, no blob to stage and no store or load job to queue.
         self.rides_page = bool(rides_page)
+        # With speculative decoding, a hit must not leave exactly one token to
+        # compute. vLLM admits such a request as a decode row and pads it to
+        # `1 + num_spec_tokens` with placeholder drafts (`pad_spec_decode`);
+        # its only guard is against padding *after* a prefill was scheduled,
+        # not against a prefill being admitted after it -- and V4.1 refuses a
+        # step that verifies and prefills. A tail of two or more is a plain
+        # prefill, which the scheduling patch keeps out of verification steps.
+        self.keep_a_prefill_tail = bool(keep_a_prefill_tail)
         # The groups holding the checkpoint, in the order the worker registered
         # them -- that order is the key space, so it is taken from the caller
         # rather than rebuilt here.
@@ -507,6 +516,9 @@ class V41BoundaryPlanner(PageRideMixin):
             "local_cap_kept": 0,
             "local_cap_withdrawn": 0,
             "admission_refused": 0,
+            # Ride hits pulled one grid back so a speculative run never
+            # resumes with a single token left; see `keep_a_prefill_tail`.
+            "cap_prefill_tail": 0,
         }
         # Seeds the `ride_*` counters too; see `page_ride.RIDE_COUNTERS`.
         self._init_page_ride()
@@ -601,6 +613,15 @@ class V41BoundaryPlanner(PageRideMixin):
             # -- a hit must end on a whole PAGE edge for there to be a stored
             # checkpoint at all -- and that is what this truncation is.
             boundary = (hit // self.boundary_grid) * self.boundary_grid
+            total = int(getattr(request, "num_tokens", 0) or 0)
+            if self.keep_a_prefill_tail and total and total - boundary < 2:
+                # Measured: a 1025-token prompt hit at 1024 came back padded to
+                # a `(1024, 6, 5)` verify row, beside a resumed `(768, 200, 0)`
+                # prefill, and the batch was refused. One grid back costs a
+                # PAGE of recompute for prompts that end one token past a
+                # boundary.
+                boundary -= self.boundary_grid
+                self._counters["cap_prefill_tail"] += 1
             if boundary <= 0:
                 self._counters["cap_declined"] += 1
                 return 0

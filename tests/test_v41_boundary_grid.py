@@ -90,3 +90,53 @@ def test_the_prefill_clip_aligns_to_the_grid_not_the_hash_unit():
     ), "the prefill clip must align to the grid a boundary sits on"
     # And the fallback keeps single-group runs working unchanged.
     assert "planner.hash_block_size" in src
+
+
+def _ride_planner(keep_tail):
+    from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
+
+    p = V41BoundaryPlanner(
+        hash_block_size=256,
+        boundary_grid=256,
+        chunk_size=256,
+        state_interval=256,
+        max_num_batched_tokens=8192,
+        world_size=1,
+        checkpoint_group_ids=(1,),
+        rides_page=True,
+        keep_a_prefill_tail=keep_tail,
+    )
+    return p
+
+
+@pytest.mark.parametrize("keep_tail, expected", [(False, 1024), (True, 768)])
+def test_a_speculative_ride_never_resumes_one_token_short(keep_tail, expected):
+    """vLLM pads a request admitted with one token left into a verify row.
+
+    `pad_spec_decode` turns it into `1 + num_spec_tokens` rows of placeholder
+    drafts, and only refuses to do so after a prefill was scheduled -- not
+    before one. V4.1 refuses the mixed step: measured as `(1024, 6, 5)` beside
+    `(768, 200, 0)`. Two or more tokens left is a plain prefill instead.
+    """
+    from types import SimpleNamespace
+
+    p = _ride_planner(keep_tail)
+    request = SimpleNamespace(request_id="r", num_tokens=1025, block_hashes=())
+    p.begin_lookup(request)
+    try:
+        got = p.cap_hit(SimpleNamespace(id="r"), 1024)
+    finally:
+        p.end_lookup()
+    assert got == expected
+
+
+def test_a_longer_tail_is_left_alone():
+    from types import SimpleNamespace
+
+    p = _ride_planner(True)
+    request = SimpleNamespace(request_id="r", num_tokens=1100, block_hashes=())
+    p.begin_lookup(request)
+    try:
+        assert p.cap_hit(SimpleNamespace(id="r"), 1024) == 1024
+    finally:
+        p.end_lookup()

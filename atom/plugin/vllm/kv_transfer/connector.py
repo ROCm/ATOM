@@ -915,6 +915,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             state_checkpoints_can_serve=_v41_state_checkpoints_can_serve(vllm_config),
             checkpoint_group_ids=self._v41_checkpoint_group_ids,
             rides_page=rides_page,
+            keep_a_prefill_tail=getattr(vllm_config, "speculative_config", None)
+            is not None,
         )
         self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
         if rides_page:
