@@ -301,11 +301,35 @@ def recover(timeout_s: Optional[float] = None) -> None:
         raise err[0]
 
 
-def shutdown() -> None:
+def shutdown(timeout_s: Optional[float] = None) -> None:
+    """Release the CCO resources, best effort and BOUNDED.
+
+    ``release()`` does a device sync and a barrier. At exit after a failed start-up (a peer
+    rank already dead, a HIP error, the runner never built) that barrier could block process
+    exit or raise and hide the original failure, so it runs in a daemon thread with a timeout
+    and never raises: problems are logged. Normal shutdown (all ranks alive) is unchanged.
+    """
     global _RES, _PHASE
-    if _RES is not None:
-        _RES.release()
-        _RES = None
+    res, _RES = _RES, None
+    if res is not None:
+        if timeout_s is None:
+            timeout_s = float(os.environ.get("ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S", "30"))
+        err = []
+
+        def _run():
+            try:
+                res.release()
+            except BaseException as e:  # noqa: BLE001
+                err.append(e)
+
+        t = threading.Thread(target=_run, name="gemm_fusion_release", daemon=True)
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            logger.error("gemm_fusion shutdown: release() did not finish in %.0fs (peer gone?); "
+                         "continuing", timeout_s)
+        elif err:
+            logger.error("gemm_fusion shutdown: release() failed: %r (continuing)", err[0])
     _PLANS.clear()
     _SITES.clear()
     DECISIONS.clear()

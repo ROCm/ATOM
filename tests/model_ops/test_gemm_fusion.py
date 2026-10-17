@@ -1032,3 +1032,42 @@ def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(tmp_path_f
     assert "--trust-remote-code" not in m.serve_args("D", trust_remote_code=False)
     # flat layout is still available for the register_hf_config() route
     assert m.m3_config()["model_type"] == "minimax_m3"
+
+# ----------------------------------------------- shutdown must never hang or mask an earlier failure
+def test_shutdown_is_bounded_when_release_hangs():
+    import threading
+    import time
+
+    res = FakeResources()
+    gate = threading.Event()
+    res.release = lambda: gate.wait()  # a peer never arrives: the barrier would block forever
+    hooks.reset_for_tests(res)
+    t0 = time.monotonic()
+    hooks.shutdown(timeout_s=0.2)  # must return, not raise
+    assert time.monotonic() - t0 < 5
+    assert hooks.resources() is None and hooks.phase() == "pre"
+    gate.set()
+
+
+def test_shutdown_swallows_release_errors_and_still_clears_state():
+    res = FakeResources()
+
+    def boom():
+        raise RuntimeError("HIP error: operation not supported")
+
+    res.release = boom
+    hooks.reset_for_tests(res)
+    hooks.register_plan(FakePlan())
+    hooks.shutdown(timeout_s=2)  # does not raise: it would mask the real start-up failure
+    assert hooks.resources() is None and not hooks._PLANS
+
+
+def test_shutdown_normal_path_still_releases_once():
+    res = FakeResources()
+    calls = []
+    res.release = lambda: calls.append(1)
+    hooks.reset_for_tests(res)
+    hooks.shutdown()
+    assert calls == [1]
+    hooks.shutdown()  # idempotent
+    assert calls == [1]
