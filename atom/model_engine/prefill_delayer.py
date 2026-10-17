@@ -124,8 +124,9 @@ class PrefillDelayer:
         "_stat_log_every",
         "cpu_group",
         "dp_size",
-        "last_n_prefillable",
         "kv_high_watermark",
+        "last_fire_aligned",
+        "last_n_prefillable",
         "max_num_batched_tokens",
         "max_queue_ms",
         "partial_max_ticks",
@@ -243,6 +244,10 @@ class PrefillDelayer:
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
         self.last_n_prefillable = 0
+        # True only on a tick where the group fired an *aligned* prefill (every
+        # rank admitted prefill together). Lockstep idles a non-prefilling rank
+        # solely on this signal; see Scheduler._phase_lockstep_idle_needed.
+        self.last_fire_aligned = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
         # is counted separately so the log shows WHICH reason released prefill —
@@ -386,6 +391,7 @@ class PrefillDelayer:
                 self._reset()
                 self.rank_prefill_costs = []
                 self.last_n_prefillable = 0
+                self.last_fire_aligned = False
                 return True
 
         # One readback for all slots (a single .tolist() beats per-slot .item()
@@ -402,6 +408,8 @@ class PrefillDelayer:
             prefill_ran_n,
         ) = reduced[:8]
         self.last_n_prefillable = int(n_prefillable)
+        # Reset each tick after the reduce; only an aligned _fire() re-arms it.
+        self.last_fire_aligned = False
         self.rank_prefill_costs = [float(c) for c in reduced[8:]]
         # This local execution report has now participated in the global
         # decision. A later successful prefill forward sets it again.
@@ -508,8 +516,10 @@ class PrefillDelayer:
         return self._hold(g_pending)
 
     def _fire(self, reason: str, g_pending: int) -> bool:
-        # reason ∈ {align, fill, stall, ttft, kv, partial, nodecode, vacuous}; each maps
-        # to a dedicated _stat_fire_<reason> slot so the log shows what released.
+        # reason ∈ {align, fill, stall, ttft, kv, partial, nodecode, queue_ms,
+        # vacuous}; each maps to a dedicated _stat_fire_<reason> slot so the log
+        # shows what released. Only the aligned fire arms lockstep idling.
+        self.last_fire_aligned = reason == "align"
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)
         if _DEBUG:

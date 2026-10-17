@@ -23,7 +23,6 @@ import enum
 import itertools
 import logging
 import math
-import os
 import struct
 import threading
 import time
@@ -589,7 +588,7 @@ class Scheduler:
         # prefills, a rank with no prefill work runs an idle prefill instead
         # of decode. Mixing the two clears ForwardMode.unified and
         # eager-decodes the whole group. Default off.
-        self.dp_phase_lockstep = os.environ.get("ATOM_DP_PHASE_LOCKSTEP", "0") == "1"
+        self.dp_phase_lockstep = envs.ATOM_DP_PHASE_LOCKSTEP
         self._phase_lockstep_seq: Sequence | None = None
         self._phase_lockstep_idles = 0
         if self.dp_phase_lockstep:
@@ -1853,13 +1852,22 @@ class Scheduler:
             )
 
     def _phase_lockstep_idle_needed(self, delayer_allows: bool) -> bool:
-        """True when some rank will prefill and this rank must not decode."""
+        """True when the group fires an aligned prefill and this rank must idle.
+
+        Gated on the delayer's *aligned* fire (every rank admitted a prefill on
+        this tick), not on ``last_n_prefillable > 0``. A rank reporting
+        prefillable work can still fail admission (KV / state-slot room) and
+        decode, and must-fire escapes release unaligned; in both cases the step
+        is ragged regardless, so idling a decode-capable rank only loses it a
+        token. We idle solely on the aligned fire, where decoding here would be
+        the lone straggler that knocks the group off its decode CUDA graph.
+        """
         if not self.dp_phase_lockstep or not delayer_allows:
             return False
         delayer = self.prefill_delayer
         if delayer is None or delayer.dp_size <= 1:
             return False
-        return delayer.last_n_prefillable > 0
+        return delayer.last_fire_aligned
 
     def _phase_lockstep_idle_batch(
         self,
