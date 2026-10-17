@@ -326,56 +326,103 @@ def candidate(
     return run
 
 
+def gather_groups(case, budget=8 << 30):
+    """Match the successful reference's whole-request K+V workspace limit."""
+    bytes_per_token = 2 * case["kv_heads"] * 128 * 2  # K+V, BF16
+    groups, start, used = [], 0, 0
+    for index, length in enumerate(case["k_lens"]):
+        size = length * bytes_per_token
+        if size > budget:
+            raise ValueError(
+                "One request exceeds the gather reference workspace budget"
+            )
+        if used and used + size > budget:
+            groups.append((start, index))
+            start, used = index, 0
+        used += size
+    groups.append((start, len(case["k_lens"])))
+    return groups
+
+
 def gather_call(x, case):
+    from itertools import accumulate
+
     import aiter
     import torch
 
     from atom.model_ops.base_attention import cp_mha_gather_cache
 
-    kl = case["k_lens"]
-    cu_k = torch.tensor(
-        [0] + list(__import__("itertools").accumulate(kl)),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    batch_ids = torch.repeat_interleave(
-        torch.arange(len(kl), device="cuda", dtype=torch.int32), x["used"].long()
-    )
-    starts = torch.zeros(len(kl), dtype=torch.int32, device="cuda")
+    kl, ql = case["k_lens"], case["q_lens"]
+    cu_q = [0, *accumulate(ql)]
+    plan = []
+    for begin, end in gather_groups(case):
+        lengths = kl[begin:end]
+        cu_k = torch.tensor([0, *accumulate(lengths)], dtype=torch.int32, device="cuda")
+        batch_ids = torch.repeat_interleave(
+            torch.arange(end - begin, device="cuda", dtype=torch.int32),
+            x["used"][begin:end].long(),
+        )
+        starts = torch.zeros(end - begin, dtype=torch.int32, device="cuda")
+        qs, qe = cu_q[begin], cu_q[end]
+        plan.append(
+            (begin, end, qs, qe, cu_k, batch_ids, starts, x["cu"][begin : end + 1] - qs)
+        )
 
-    def run():
-        k = torch.empty(
-            sum(kl), case["kv_heads"], 128, dtype=torch.bfloat16, device="cuda"
-        )
-        v = torch.empty_like(k)
-        cp_mha_gather_cache(
-            x["k"],
-            x["v"],
-            k,
-            v,
-            x["table"],
-            x["ks"],
-            x["vs"],
-            cu_k,
-            batch_ids,
-            starts,
-            True,
-            "SHUFFLE",
-            sum(kl),
-            True,
-        )
-        return aiter.flash_attn_varlen_func(
-            x["q"],
-            k,
-            v,
-            x["cu"],
-            cu_k,
-            max(case["q_lens"]),
-            max(kl),
-            min_seqlen_q=min(case["q_lens"]),
-            softmax_scale=128**-0.5,
-            causal=True,
-        )
+    def run(validate_stages=False):
+        # Preserve the old single-group timing; only multi-group references
+        # need an output assembly buffer, as in the successful model baseline.
+        output = torch.empty_like(x["q"]) if len(plan) > 1 else None
+        for begin, end, qs, qe, cu_k, batch_ids, starts, group_cu_q in plan:
+            total_k = sum(kl[begin:end])
+            k = torch.empty(
+                total_k, case["kv_heads"], 128, dtype=torch.bfloat16, device="cuda"
+            )
+            v = torch.empty_like(k)
+            cp_mha_gather_cache(
+                x["k"],
+                x["v"],
+                k,
+                v,
+                x["table"][begin:end],
+                x["ks"],
+                x["vs"],
+                cu_k,
+                batch_ids,
+                starts,
+                True,
+                "SHUFFLE",
+                total_k,
+                True,
+            )
+            if validate_stages:
+                torch.cuda.synchronize()
+                print(
+                    f"[gather-reference] {case['id']} requests={begin}:{end} gather passed",
+                    flush=True,
+                )
+            part = aiter.flash_attn_varlen_func(
+                x["q"][qs:qe],
+                k,
+                v,
+                group_cu_q,
+                cu_k,
+                max(ql[begin:end]),
+                max(kl[begin:end]),
+                min_seqlen_q=min(ql[begin:end]),
+                softmax_scale=128**-0.5,
+                causal=True,
+            )
+            if validate_stages:
+                torch.cuda.synchronize()
+                print(
+                    f"[gather-reference] {case['id']} requests={begin}:{end} FMHA passed",
+                    flush=True,
+                )
+            if output is None:
+                return part
+            output[qs:qe].copy_(part)
+            del k, v, part
+        return output
 
     return run
 
@@ -490,7 +537,7 @@ def worker(args):
             record(dict(case=case, variant=variant, accuracy="passed", **measure(call)))
         if args.mode == "new":
             gather = gather_call(x, case)
-            gathered = gather()
+            gathered = gather(validate_stages=True)
             torch.testing.assert_close(
                 gathered[selected], reference, atol=0.003, rtol=0.03
             )
@@ -500,6 +547,8 @@ def worker(args):
                     case=case,
                     variant="gather-fmha",
                     accuracy="passed",
+                    gather_groups=len(gather_groups(case)),
+                    gather_workspace_limit_bytes=8 << 30,
                     **measure(gather),
                 )
             )
