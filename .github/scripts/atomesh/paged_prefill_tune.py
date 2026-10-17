@@ -33,6 +33,25 @@ def cases():
         # Held-out lengths; no exact-shape production lookup is introduced.
         ([513], [77777]),
         ([1536], [333337]),
+        # Lengths observed in the complete C32 prefill scheduler log.
+        # They are stress validation, not exact-shape dispatch keys.
+        ([23878, 456, 2162, 6272], [645446, 671944, 692210, 627840]),
+        (
+            [7984, 2177, 128, 2031, 1742, 7215, 6257, 2428, 539, 526, 1664],
+            [
+                704560,
+                333441,
+                701440,
+                518511,
+                690254,
+                455343,
+                64241,
+                63612,
+                23579,
+                100750,
+                105088,
+            ],
+        ),
     ]
     return [
         {
@@ -41,6 +60,7 @@ def cases():
             "q_lens": q,
             "k_lens": k,
             "held_out": i >= 11,
+            "stress": i >= 13,
         }
         for role, kh in [("target", 1), ("draft", 16)]
         for i, (q, k) in enumerate(lengths)
