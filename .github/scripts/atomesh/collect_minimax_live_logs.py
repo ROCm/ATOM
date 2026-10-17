@@ -13,6 +13,7 @@ import re
 import socket
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 
 CASE = "minimax-m3-mxfp4-minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32-workspace_validation"
@@ -158,6 +159,95 @@ def summarize_eval_samples(path):
     }
 
 
+def summarize_prefill_shapes(path):
+    """Summarize scheduler metadata from the complete log, not the copied tail.
+
+    These are scheduled target batches; they are not kernel timings or an
+    assertion that every draft invocation uses exactly the same query shape.
+    """
+    pattern = re.compile(
+        r"Scheduled prefill batch: (\d+) reqs, (\d+) new tokens "
+        r"\(done: (\[[0-9, ]*\]), new: (\[[0-9, ]*\])\)"
+    )
+    batches, shapes = [], Counter()
+    first, last, malformed = None, None, 0
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            if "Scheduled prefill batch:" not in line:
+                continue
+            match = pattern.search(line)
+            if match is None:
+                malformed += 1
+                continue
+            count, total = map(int, match.group(1, 2))
+            cached, new = map(json.loads, match.group(3, 4))
+            if len(cached) != count or len(new) != count or sum(new) != total:
+                malformed += 1
+                continue
+            timestamp = line[: match.start()].strip()
+            first = first or timestamp
+            last = timestamp
+            contexts = [c + q for c, q in zip(cached, new)]
+            batches.append(
+                (count, total, max(contexts), sum(contexts), bool(sum(cached)))
+            )
+            shapes[tuple(zip(new, contexts))] += 1
+
+    def quantiles(values):
+        if not values:
+            return {}
+        values = sorted(values)
+        return {
+            label: values[round((len(values) - 1) * percentile)]
+            for label, percentile in (
+                ("p50", 0.5),
+                ("p90", 0.9),
+                ("p99", 0.99),
+                ("max", 1),
+            )
+        }
+
+    def describe(shape, count):
+        return {
+            "q_lens": [v[0] for v in shape],
+            "kv_lens": [v[1] for v in shape],
+            "count": count,
+        }
+
+    return {
+        "source": str(path),
+        "first": first,
+        "last": last,
+        "scope": "complete available scheduler log; may include warmup",
+        "batches": len(batches),
+        "malformed_lines": malformed,
+        "cached_batches": sum(row[4] for row in batches),
+        "batch_size": quantiles([row[0] for row in batches]),
+        "query_tokens": quantiles([row[1] for row in batches]),
+        "max_context": quantiles([row[2] for row in batches]),
+        "sum_context": quantiles([row[3] for row in batches]),
+        "frequent_shapes": [
+            describe(shape, count) for shape, count in shapes.most_common(12)
+        ],
+        "largest_query_batches": [
+            describe(shape, count)
+            for shape, count in sorted(
+                shapes.items(),
+                key=lambda item: sum(v[0] for v in item[0]),
+                reverse=True,
+            )[:12]
+        ],
+        "largest_context_batches": [
+            describe(shape, count)
+            for shape, count in sorted(
+                shapes.items(),
+                key=lambda item: sum(v[1] for v in item[0]),
+                reverse=True,
+            )[:12]
+        ],
+    }
+
+
 def collect(target, output, *, roots=ROOTS):
     run_id(target)
     output.mkdir(parents=True, exist_ok=True)
@@ -182,6 +272,18 @@ def collect(target, output, *, roots=ROOTS):
             if not source.is_relative_to(root.resolve()) or not source.is_dir():
                 continue
             row["runs"].append(str(source))
+            for prefill in source.glob("slurm_job-*/logs/prefill-rank-0.log"):
+                if not prefill.resolve().is_relative_to(source):
+                    continue
+                try:
+                    shapes = summarize_prefill_shapes(prefill)
+                    destination = (
+                        output / source.name / prefill.relative_to(source)
+                    ).with_name("prefill-shapes.json")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(shapes) + "\n")
+                except (OSError, ValueError) as exc:
+                    manifest["errors"].append({"path": str(prefill), "error": str(exc)})
             for sample in source.glob(
                 "slurm_job-*/eval_results/*/*/samples_gsm8k_*.jsonl"
             ):
@@ -262,6 +364,7 @@ def emit_log_annotations(output):
                 "container.log",
                 "container-eval.log",
                 "runtime-state.json",
+                "prefill-shapes.json",
                 "sweep-summary.json",
                 "profile_export_aiperf.json",
                 "prefill-rank-0.log",
