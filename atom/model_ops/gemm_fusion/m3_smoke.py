@@ -96,20 +96,91 @@ def register_hf_config(model_type="minimax_m3"):
     return cls
 
 
-def make_model_dir(path, **kw):
+VL_MODEL_TYPE = "minimax_m3_vl"  # outer type of the released checkpoint (repo tests + vLLM shim)
+TEXT_MODEL_TYPE = "minimax_m3_text"  # nested text_config type (repo tests)
+VL_ARCH = "MiniMaxM3SparseForConditionalGeneration"  # what the recipes' VL checkpoint selects
+
+
+def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
+    """The released checkpoint's LAYOUT: an outer ``minimax_m3_vl`` config whose text model
+    is nested under ``text_config`` (``minimax_m3_text``). ATOM reads the text fields from
+    ``text_config`` (``_get_text_config``) and copies the index-cache overrides across
+    (``_normalize_minimax_m3_text_config``). ``auto_map`` points at a config class that
+    ships NEXT TO config.json, which is how ATOM's own recipes load M3 (``--trust-remote-
+    code``); ATOM's native path registers no class for it. Attention geometry is unchanged.
+    """
+    text = m3_config(layers=layers, experts=experts, vocab=vocab, index_topk_freq=index_topk_freq)
+    for k in ("architectures", "torch_dtype"):
+        text.pop(k, None)
+    text["model_type"] = TEXT_MODEL_TYPE
+    # The index-cache controls live on the OUTER config (the recipes set them with
+    # --hf-overrides, which updates the outer config) and ATOM copies them DOWN into
+    # text_config (_normalize_minimax_m3_text_config). Keep them out of text_config here so
+    # the run exercises that same copy, which is what decides skip-index layers.
+    outer_index = {k: text.pop(k) for k in ("index_topk_freq", "index_skip_topk_offset") if k in text}
+    return {
+        "model_type": VL_MODEL_TYPE,
+        "architectures": [VL_ARCH],
+        "auto_map": {"AutoConfig": "configuration_minimax_m3.MiniMaxM3Config"},
+        **outer_index,
+        "text_config": text,
+        # vision tower is never built on the text-only native path (model.py skips
+        # vision_tower./multi_modal_projector./patch_merge_mlp. weights); kept minimal
+        "vision_config": {"model_type": "minimax_m3_vision"},
+        "torch_dtype": "bfloat16",
+    }
+
+
+# Shipped next to config.json. A bare PretrainedConfig keeps every field as an attribute
+# (nested dicts become sub-configs), mirroring atom/plugin/vllm/register.py MiniMaxM3Config.
+CONFIGURATION_PY = '''\
+from transformers import PretrainedConfig
+
+
+class MiniMaxM3TextConfig(PretrainedConfig):
+    model_type = "minimax_m3_text"
+
+
+class MiniMaxM3Config(PretrainedConfig):
+    model_type = "minimax_m3_vl"
+    sub_configs = {"text_config": MiniMaxM3TextConfig}
+
+    def __init__(self, text_config=None, vision_config=None, **kwargs):
+        if isinstance(text_config, dict):
+            text_config = MiniMaxM3TextConfig(**text_config)
+        self.text_config = text_config
+        self.vision_config = vision_config
+        self.hidden_size = getattr(text_config, "hidden_size", None)
+        super().__init__(**kwargs)
+'''
+
+
+def make_model_dir(path, *, layout="vl", **kw):
+    """Write config.json (+ configuration_minimax_m3.py for the ``vl`` layout).
+
+    layout="vl"   (default) the released checkpoint's layout; load with --trust-remote-code.
+    layout="flat" the old single-level ``minimax_m3`` config; needs ``register_hf_config()``.
+    """
     os.makedirs(path, exist_ok=True)
+    cfg = m3_vl_config(**kw) if layout == "vl" else m3_config(**kw)
     with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(m3_config(**kw), f, indent=2)
+        json.dump(cfg, f, indent=2)
+    if layout == "vl":
+        with open(os.path.join(path, "configuration_minimax_m3.py"), "w", encoding="utf-8") as f:
+            f.write(CONFIGURATION_PY)
     return path
 
 
-def serve_args(model_dir, *, level=3, profile="", enforce_eager=False, sp=4, extra=()):
+def serve_args(model_dir, *, level=3, profile="", enforce_eager=False, sp=4, extra=(),
+               trust_remote_code=True):
     argv = [
         # xavier: finite, roughly real-scale random weights (arg_utils --load_dummy)
         "--model", model_dir, "--load_dummy", "xavier",
         "-tp", "1", "-sp", str(sp), "--kv-cache-dtype", "fp8",
         "--level", str(level),
     ]
+    if trust_remote_code:  # the vl layout resolves its config class through auto_map
+        argv.append("--trust-remote-code")
     if enforce_eager:
         argv.append("--enforce-eager")
     if profile:

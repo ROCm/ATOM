@@ -954,3 +954,81 @@ def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monke
     _Auto.register = staticmethod(lambda mt, c: (_ for _ in ()).throw(ValueError("something else")))
     with pytest.raises(ValueError, match="something else"):
         m.register_hf_config("other_type")
+
+def _load_m3_smoke(name="m3_smoke_vl_under_test"):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion/m3_smoke.py"
+    s = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
+
+
+def test_m3_smoke_vl_layout_follows_the_released_checkpoint_and_keeps_geometry():
+    m = _load_m3_smoke()
+    c = m.m3_vl_config(layers=4)
+    # outer / nested model types and the entry class the recipes' VL checkpoint selects
+    assert (c["model_type"], c["text_config"]["model_type"]) == ("minimax_m3_vl", "minimax_m3_text")
+    assert c["architectures"] == ["MiniMaxM3SparseForConditionalGeneration"]
+    assert c["auto_map"] == {"AutoConfig": "configuration_minimax_m3.MiniMaxM3Config"}
+    t = c["text_config"]
+    # attention geometry unchanged (the fused site needs q width 8192 on SP4)
+    assert t["num_attention_heads"] * t["head_dim"] == 8192 and t["hidden_size"] == 6144
+    assert t["num_key_value_heads"] == 4 and t["head_dim"] == 128
+    # index-cache controls sit on the OUTER config (ATOM copies them down), not in text_config
+    assert c["index_topk_freq"] == 2 and "index_topk_freq" not in t
+    assert "index_skip_topk_offset" in c and "index_skip_topk_offset" not in t
+    # the three layer types the site declares are present
+    assert t["sparse_attention_config"]["sparse_attention_freq"] == [0, 1, 1, 1]
+    assert t["moe_layer_freq"][0] == 0
+
+
+def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(tmp_path_factory=None):
+    import os
+    import sys
+    import types as _t
+    import uuid
+    from pathlib import Path
+
+    m = _load_m3_smoke("m3_smoke_vl_dir")
+    d = Path(__file__).resolve().parents[2] / f"_tmp_m3_{uuid.uuid4().hex[:8]}"  # workspace scratch
+    try:
+        m.make_model_dir(str(d))
+        assert sorted(os.listdir(d)) == ["config.json", "configuration_minimax_m3.py"]
+        cfg_py = (d / "configuration_minimax_m3.py").read_text(encoding="utf-8")
+        assert "class MiniMaxM3Config" in cfg_py and 'model_type = "minimax_m3_vl"' in cfg_py
+        # the shipped module must execute and nest text_config as a sub-config
+        class _P:
+            def __init__(self, **kw):
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        fake = _t.ModuleType("transformers")
+        fake.PretrainedConfig = _P
+        saved = sys.modules.get("transformers")
+        sys.modules["transformers"] = fake
+        try:
+            ns = {}
+            exec(cfg_py, ns)
+            import json
+
+            raw = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            obj = ns["MiniMaxM3Config"](**{k: v for k, v in raw.items() if k != "auto_map"})
+        finally:
+            if saved is None:
+                sys.modules.pop("transformers", None)
+            else:
+                sys.modules["transformers"] = saved
+        assert type(obj.text_config).__name__ == "MiniMaxM3TextConfig" and obj.hidden_size == 6144
+        assert obj.architectures == ["MiniMaxM3SparseForConditionalGeneration"]
+    finally:
+        import shutil
+
+        shutil.rmtree(d, ignore_errors=True)
+    argv = m.serve_args("D", level=2, profile="p")
+    assert "--trust-remote-code" in argv and argv[argv.index("--gemm-fusion-profile") + 1] == "p"
+    assert "--trust-remote-code" not in m.serve_args("D", trust_remote_code=False)
+    # flat layout is still available for the register_hf_config() route
+    assert m.m3_config()["model_type"] == "minimax_m3"
