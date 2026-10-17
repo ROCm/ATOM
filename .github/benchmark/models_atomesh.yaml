@@ -1303,6 +1303,43 @@ models:
               <<: *kimi_k3_pp8_dspark4_args
               max_num_seqs: 176
 
+        # The PD recipe's state cache (recipes/mesh/Agentic-Kimi-K3.md) on the
+        # PP8 cells from CONC 56, to compare against the recipe-aligned cells
+        # above: on-demand KDA checkpoints at observed shared-prefix targets, and
+        # a 128 GiB state cap carved from a 224 GiB per-rank LMCache pool, which
+        # leaves paged KV 96 GiB per rank once state reaches its cap. Decode,
+        # drafts and acceptance length are unchanged.
+        - &kimi_k3_1p1d_pp8_dcp8_c56_ondemand
+          <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c56-ondemand
+          env:
+            common:
+              <<: *kimi_k3_pp8_replay_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_STATE_CHECKPOINT_DEMAND: "1"
+            prefill:
+              <<: *kimi_k3_pp8_lmcache128_prefill_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
+              OFFLOAD_STATE_CPU_SIZE: "128"
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56_ondemand
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-ondemand
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 144
+          run_eval: true
+          eval_concurrency: [72]
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56_ondemand
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-ondemand
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
