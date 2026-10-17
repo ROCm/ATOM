@@ -919,3 +919,38 @@ def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
                    "out_q": 5, "out_k": 6, "rows": 16}
     st.outs["q"] = _T(55)  # a per-call output buffer would show up as a differing key
     assert s.binding_key(st, {}) != key
+
+def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monkeypatch):
+    """Logic only, against a stand-in transformers (the real 5.16.1 is not installed here):
+    registers a PretrainedConfig subclass for the model_type once, tolerates a second call,
+    and re-raises unrelated registration errors."""
+    import importlib.util
+    import sys
+    import types as _t
+    from pathlib import Path
+
+    registry = {}
+
+    class _Pre:
+        model_type = ""
+
+    class _Auto:
+        @staticmethod
+        def register(mt, cls):
+            if mt in registry:
+                raise ValueError(f"'{mt}' is already used by a Transformers config")
+            registry[mt] = cls
+
+    fake = _t.ModuleType("transformers")
+    fake.AutoConfig, fake.PretrainedConfig = _Auto, _Pre
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+    path = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion/m3_smoke.py"
+    s = importlib.util.spec_from_file_location("m3_smoke_under_test", path)
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    cls = m.register_hf_config()
+    assert registry["minimax_m3"] is cls and cls.model_type == "minimax_m3" and issubclass(cls, _Pre)
+    m.register_hf_config()  # second call: already registered -> no error
+    _Auto.register = staticmethod(lambda mt, c: (_ for _ in ()).throw(ValueError("something else")))
+    with pytest.raises(ValueError, match="something else"):
+        m.register_hf_config("other_type")

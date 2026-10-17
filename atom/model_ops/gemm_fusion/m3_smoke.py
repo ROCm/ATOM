@@ -70,6 +70,32 @@ def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2):
     }
 
 
+def register_hf_config(model_type="minimax_m3"):
+    """Make ``AutoConfig.from_pretrained`` accept this model_type WITHOUT a transformers
+    upgrade or trust_remote_code. Call it in the process that builds ``Config`` (the one
+    that calls ``atom.config.get_hf_config``) BEFORE ``create_engine``.
+
+    Why it is needed: ATOM's native path registers no config class for minimax_m3 /
+    minimax_m3_vl (only the vLLM plugin does, via the same kind of shim), so
+    ``get_hf_config`` falls through to ``AutoConfig.from_pretrained`` and raises for a
+    model_type the installed transformers does not know. The shim is a bare
+    ``PretrainedConfig``: it keeps every field of the (flat, text-only) config.json as an
+    attribute, and ``architectures`` still selects ``MiniMaxM3SparseForCausalLM``.
+
+    UNVERIFIED against real transformers 5.16.1 (not installed on the authoring host).
+    Idempotent: a model_type transformers already knows is left alone.
+    """
+    from transformers import AutoConfig, PretrainedConfig
+
+    cls = type("MiniMaxM3SmokeConfig", (PretrainedConfig,), {"model_type": model_type})
+    try:
+        AutoConfig.register(model_type, cls)
+    except ValueError as exc:  # already registered (by transformers or an earlier call)
+        if "already" not in str(exc):
+            raise
+    return cls
+
+
 def make_model_dir(path, **kw):
     os.makedirs(path, exist_ok=True)
     with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as f:
