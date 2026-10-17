@@ -1413,6 +1413,25 @@ models:
             prefill:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
+        # Test only. The C88 on-demand PP8 cell with the same 30 s window.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-torch-profile
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOMESH_TORCH_PROFILE_START: "900"
+              ATOMESH_TORCH_PROFILE_DURATION: "30"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill,decode
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
 
     accuracy:
       task: gsm8k
