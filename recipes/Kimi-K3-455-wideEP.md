@@ -27,7 +27,7 @@ and DSpark figures are from this one.
 | Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
-| KV offload (LMCache MP) | 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
+| KV offload (LMCache MP) | ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621). 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
 | Speculative decoding (DSpark) | 20261016 image plus one ATOM fix, 2026-10-17: GSM8K 0.9629; zero-shot GSM8K acceptance length 5.47 at K=7 (model card 5.64). AgentX concurrency 16 at InferenceX's fixed acceptance (K=4, 3.36): **1 / p90(ITL) 56.0 tok/s/user against 28.0 without it, 5,054 tok/s per GPU against 4,136**. See [DSpark](#speculative-decoding-dspark) |
 
 Contents:
@@ -839,6 +839,10 @@ Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`
 
 ## KV offload with LMCache MP
 
+**ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621) enables LMCache MP mode for this deployment:** multi-node DP with one LMCache server per tray. Until
+it is in the image, apply it as [`atom-lmcache-mp-multinode.diff`](Kimi-K3-455-wideEP-patches/atom-lmcache-mp-multinode.diff).
+Install LMCache for gfx1250 as in [Installing LMCache](#installing-lmcache), then start as in [Launch](#launch).
+
 At concurrency 64 the KV pool is full and evicted prefixes are prefilled again
 ([concurrency 64](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)). LMCache's multiprocess (MP) mode adds a
 CPU tier below the HBM prefix cache: an evicted prefix comes back from host memory instead of being recomputed.
@@ -863,7 +867,7 @@ On top of the image this needs:
 | | what | why |
 |---|---|---|
 | LMCache | built from source at `f22dec28` (the commit ATOM `main` pins) for gfx1250, with [`lmcache-f22dec28-gfx1250.diff`](Kimi-K3-455-wideEP-patches/lmcache-f22dec28-gfx1250.diff) | ATOM's LMCache wheel is built for ROCm 7.2.4, torch 2.10 and gfx942/gfx950, and does not load in this image. See the patch notes below |
-| ATOM | [`atom-lmcache-mp-multinode.diff`](Kimi-K3-455-wideEP-patches/atom-lmcache-mp-multinode.diff), from branch [`zejun/lmcache-mp-multinode-dp`](https://github.com/ROCm/ATOM/tree/zejun/lmcache-mp-multinode-dp) | ATOM refuses `lmcache_mp` under multi-node DP (`lmcache_mp supports DP and DP-attention only within one host`). The patch accepts it when the server address is loopback, which means one server per tray |
+| ATOM | PR [#2621](https://github.com/ROCm/ATOM/pull/2621), as [`atom-lmcache-mp-multinode.diff`](Kimi-K3-455-wideEP-patches/atom-lmcache-mp-multinode.diff) | ATOM refuses `lmcache_mp` under multi-node DP (`lmcache_mp supports DP and DP-attention only within one host`). The patch accepts it when the server address is loopback, which means one server per tray |
 | `--block-size 128` | instead of 16 | MP stores and restores at chunk boundaries that hold a checkpoint, and AgentX turns resume at prompt-end checkpoints, which sit on the prefix hash block. So the chunk must equal the block. At block 16 a KDA image is 2032 units, and every transfer carries chunks × 2033 block IDs: stores ran at about 23k tokens/s, and prompts over about 264k tokens did not fit at all. At block 128 an image is 254 units, and a store runs at about 1M tokens/s |
 | `--gpu-memory-utilization 0.88` | instead of 0.90 | the server takes about 2 GB of each GPU after ATOM has sized its budget. At 0.90 a GPU reached 431 of 432 GB, and a Triton kernel then failed to load (`device kernel image is invalid`) |
 
@@ -891,7 +895,7 @@ python3 -m pip install -q --break-system-packages --no-deps \
   cryptography cffi pycparser opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
   opentelemetry-semantic-conventions==0.61b0 opentelemetry-exporter-prometheus==0.61b0
 python3 -m pip install -q --break-system-packages --no-deps /tmp/lmcache-wheel/lmcache-*.whl
-cd /app/ATOM && curl -sSfL $B/atom-lmcache-mp-multinode.diff | git apply
+cd /app/ATOM && curl -sSfL $B/atom-lmcache-mp-multinode.diff | git apply   # ATOM PR #2621
 cd /tmp && python3 -c "import lmcache.v1.multiprocess.server, lmcache.cuda_ops; from lmcache.integration.atom import AtomMPWorkerAdapter; print('ok')"
 ```
 
