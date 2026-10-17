@@ -68,6 +68,101 @@ def command(args, timeout=10):
     return proc.stdout
 
 
+def remaining_process_owners(pids, *, seconds=10, max_containers=64):
+    """Inspect host Docker membership; never interpret job-local /proc PIDs."""
+    result = {
+        "gpu_pids": sorted(set(pids)),
+        "matches": [],
+        "errors": [],
+        "containers_checked": 0,
+        "limited": False,
+        "basis": "Host Docker top PID membership with stable container init identity",
+        "scope": "Read-only diagnostic snapshot, not cleanup authorization",
+    }
+    deadline = time.monotonic() + seconds
+
+    def read(args):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Ownership diagnostic time budget reached")
+        return command(args, timeout=min(3, remaining))
+
+    def inspect(cid):
+        return json.loads(
+            read(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    (
+                        "[{{json .Name}},{{json .Config.User}},{{json .State.Pid}},"
+                        "{{json .State.StartedAt}}]"
+                    ),
+                    cid,
+                ]
+            )
+        )
+
+    unmatched = set(pids)
+    try:
+        containers = read(["docker", "ps", "--no-trunc", "--format", "{{.ID}}"]).split()
+        result["limited"] = len(containers) > max_containers
+        for cid in containers[:max_containers]:
+            if not unmatched:
+                break
+            if not re.fullmatch(r"[0-9a-f]{64}", cid):
+                raise ValueError("Invalid Docker container ID")
+            try:
+                identity = inspect(cid)
+                name, owner, init_pid, started_at = identity
+                output = read(["docker", "top", cid, "-eo", "pid,ppid,uid,gid"])
+                rows = output.splitlines()
+                if not rows or rows[0].split() != ["PID", "PPID", "UID", "GID"]:
+                    raise ValueError("Unexpected Docker top numeric columns")
+                if len(rows) > 4097:
+                    result["limited"] = True
+                processes = [list(map(int, row.split())) for row in rows[1:4097]]
+                if any(len(row) != 4 for row in processes):
+                    raise ValueError("Malformed Docker top row")
+                result["containers_checked"] += 1
+                # A host init PID anchors the namespace; restarts invalidate it.
+                if not init_pid or init_pid not in {row[0] for row in processes}:
+                    raise ValueError("Docker top does not contain the host init PID")
+                if inspect(cid) != identity:
+                    raise ValueError("Container identity changed during observation")
+                matches = [row for row in processes if row[0] in unmatched]
+                if matches:
+                    result["matches"].append(
+                        {
+                            "container": cid,
+                            "name": name,
+                            "configured_user": owner,
+                            "host_init_pid": init_pid,
+                            "started_at": started_at,
+                            "processes": [
+                                dict(zip(("pid", "ppid", "uid", "gid"), row))
+                                for row in matches
+                            ],
+                        }
+                    )
+                    unmatched.difference_update(row[0] for row in matches)
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                subprocess.TimeoutExpired,
+            ) as error:
+                result["errors"].append({"container": cid, "error": str(error)[:500]})
+                if time.monotonic() >= deadline:
+                    result["limited"] = True
+                    break
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+        result["errors"].append({"error": str(error)[:500]})
+        result["limited"] = True
+    result["unmatched_pids"] = sorted(unmatched)
+    return result
+
+
 class Cleanup:
     def __init__(self, args):
         self.args = args
@@ -237,6 +332,18 @@ class Cleanup:
                 self.event("complete")
                 return
             if time.monotonic() >= deadline:
+                if current["processes"]:
+                    try:
+                        ownership = remaining_process_owners(current["processes"])
+                    except (
+                        OSError,
+                        RuntimeError,
+                        TypeError,
+                        ValueError,
+                        subprocess.TimeoutExpired,
+                    ) as error:
+                        ownership = {"diagnostic_error": type(error).__name__}
+                    self.event("remaining_gpu_process_owners", **ownership)
                 raise RuntimeError(
                     "GPU processes or insufficient free VRAM remain after cleanup"
                 )

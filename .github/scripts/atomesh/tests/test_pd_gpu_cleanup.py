@@ -4,9 +4,9 @@ import argparse
 import importlib.util
 import itertools
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
@@ -203,6 +203,76 @@ class CleanupTest(unittest.TestCase):
         self.assertFalse(instance.report["passed"])
         self.assertIn(unknown, self.containers)
         self.assertFalse(any(c[:2] == ["docker", "stop"] for c in self.calls))
+
+
+class OwnershipDiagnosticTest(unittest.TestCase):
+    def observe(self, top, *, restart=False):
+        calls = []
+        identities = iter(
+            [
+                ["/unlisted-container", "100:200", 123, "start-a"],
+                ["/unlisted-container", "100:200", 124 if restart else 123, "start-a"],
+            ]
+        )
+        cid = "a" * 64
+
+        def command(args, timeout=10):
+            calls.append(args)
+            self.assertLessEqual(timeout, 3)
+            if args[:2] == ["docker", "ps"]:
+                return cid
+            if args[:2] == ["docker", "inspect"]:
+                return json.dumps(next(identities))
+            if args[:2] == ["docker", "top"]:
+                self.assertEqual(args[3:], ["-eo", "pid,ppid,uid,gid"])
+                return top
+            raise AssertionError("Diagnostic attempted a non-read operation")
+
+        with patch.object(cleanup, "command", side_effect=command):
+            result = cleanup.remaining_process_owners([456, 789])
+        return result, calls
+
+    def test_matches_host_gpu_pid_to_stable_container_without_process_args(self):
+        result, calls = self.observe(
+            "PID PPID UID GID\n123 1 100 200\n456 123 100 200\n"
+        )
+        self.assertEqual(result["unmatched_pids"], [789])
+        self.assertEqual(
+            result["matches"][0]["processes"],
+            [{"pid": 456, "ppid": 123, "uid": 100, "gid": 200}],
+        )
+        self.assertEqual(result["matches"][0]["configured_user"], "100:200")
+        self.assertEqual({call[1] for call in calls}, {"ps", "inspect", "top"})
+
+    def test_rejects_job_namespace_pid_table(self):
+        result, _ = self.observe("PID PPID UID GID\n1 0 100 200\n456 1 100 200\n")
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["unmatched_pids"], [456, 789])
+        self.assertIn("host init PID", result["errors"][0]["error"])
+
+    def test_restart_invalidates_pid_membership(self):
+        result, _ = self.observe(
+            "PID PPID UID GID\n123 1 100 200\n456 123 100 200\n", restart=True
+        )
+        self.assertEqual(result["matches"], [])
+        self.assertIn("identity changed", result["errors"][0]["error"])
+
+    def test_unavailable_daemon_does_not_establish_pid_ownership(self):
+        with patch.object(cleanup, "command", side_effect=RuntimeError("unavailable")):
+            result = cleanup.remaining_process_owners([456])
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["unmatched_pids"], [456])
+        self.assertTrue(result["limited"])
+
+    def test_time_budget_stops_further_queries(self):
+        with (
+            patch.object(cleanup.time, "monotonic", side_effect=[0, 11]),
+            patch.object(cleanup, "command") as command,
+        ):
+            result = cleanup.remaining_process_owners([456], seconds=10)
+        command.assert_not_called()
+        self.assertTrue(result["limited"])
+        self.assertEqual(result["matches"], [])
 
 
 if __name__ == "__main__":
