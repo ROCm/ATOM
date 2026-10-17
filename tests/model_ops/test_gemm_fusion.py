@@ -1071,3 +1071,20 @@ def test_shutdown_normal_path_still_releases_once():
     assert calls == [1]
     hooks.shutdown()  # idempotent
     assert calls == [1]
+
+def test_m3_smoke_serve_args_use_a_sparse_compatible_block_size():
+    """E2 OFF arm: the CLI default --block-size 16 fails the sparse backend's
+    `model_runner.block_size % self.block_size == 0` (block 128). serve_args must pass 128."""
+    m = _load_m3_smoke("m3_smoke_blocksize")
+    argv = m.serve_args("D")
+    assert argv[argv.index("--block-size") + 1] == "128"
+    assert m.serve_args("D", block_size=256)[m.serve_args("D", block_size=256).index("--block-size") + 1] == "256"
+    with pytest.raises(ValueError, match="multiple of 128"):
+        m.serve_args("D", block_size=16)
+    # the sparse constant is pinned to the real one in the source
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/minimax_m3/sparse_attn.py").read_text(encoding="utf-8")
+    assert f"SPARSE_BLOCK_SIZE = {m.SPARSE_BLOCK_SIZE}" in src
+    backends = (Path(__file__).resolve().parents[2] / "atom/model_ops/attentions/backends.py").read_text(encoding="utf-8")
+    assert "model_runner.block_size % self.block_size == 0" in backends

@@ -171,13 +171,23 @@ def make_model_dir(path, *, layout="vl", **kw):
     return path
 
 
+SPARSE_BLOCK_SIZE = 128  # atom.model_ops.minimax_m3.sparse_attn.SPARSE_BLOCK_SIZE
+
+
 def serve_args(model_dir, *, level=3, profile="", enforce_eager=False, sp=4, extra=(),
-               trust_remote_code=True):
+               trust_remote_code=True, block_size=SPARSE_BLOCK_SIZE):
+    """ATOM CLI argv. ``--block-size`` must be a multiple of the sparse block (128):
+    the attention metadata builder asserts ``model_runner.block_size % self.block_size == 0``
+    (attentions/backends.py:511) and ATOM's CLI default of 16 fails it for M3's sparse layers
+    (found by the E2 OFF arm, job-e2_off01). The same value also fixes the KV page size the
+    dense layers' fusion signature derives from ``config.kv_cache_block_size``."""
+    if block_size % SPARSE_BLOCK_SIZE:
+        raise ValueError(f"block_size must be a multiple of {SPARSE_BLOCK_SIZE}, got {block_size}")
     argv = [
         # xavier: finite, roughly real-scale random weights (arg_utils --load_dummy)
         "--model", model_dir, "--load_dummy", "xavier",
         "-tp", "1", "-sp", str(sp), "--kv-cache-dtype", "fp8",
-        "--level", str(level),
+        "--level", str(level), "--block-size", str(block_size),
     ]
     if trust_remote_code:  # the vl layout resolves its config class through auto_map
         argv.append("--trust-remote-code")
