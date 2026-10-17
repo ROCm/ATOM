@@ -1,0 +1,16 @@
+{
+  "name": "simple_cpu_offload_refresh_gpu_hit_prefix",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "Eager mode: move CPU copies of a GPU-hit prefix to the MRU end of the CPU LRU once per request"
+  ],
+  "cases": ["V-QD-CPUREF"],
+  "files": [
+    {
+      "relative_path": "v1/simple_kv_offload/manager.py",
+      "mount_source": "manager.py",
+      "base_sha256": "3d076547bc16729e1c91238315c384fcfddf9cfd1f1e418d430ae542b7b8e1e5",
+      "patched_sha256": "7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea"
+    }
+  ]
+}
