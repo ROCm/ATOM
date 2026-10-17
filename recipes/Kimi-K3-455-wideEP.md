@@ -26,7 +26,7 @@ figures are from the previous image, `rocm/fw-bringup:gfx1250-atom-k3-20261014`.
 | Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
-| KV offload (LMCache MP) | Built for gfx1250; stores and loads on both trays with the 20261016 image (2026-10-16). Concurrency 64 not measured yet. See [KV offload](#kv-offload-with-lmcache-mp) |
+| KV offload (LMCache MP) | 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
 
 Contents:
 
@@ -813,9 +813,9 @@ At concurrency 64 the KV pool is full and evicted prefixes are prefilled again
 ([concurrency 64](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)). LMCache's multiprocess (MP) mode adds a
 CPU tier below the HBM prefix cache: an evicted prefix comes back from host memory instead of being recomputed.
 
-**Status, 2026-10-16:** it builds and runs on the 20261016 image, and both trays store and load (the functional check
-below, and under AgentX load). Concurrency 64 with and without it is **not measured yet**; see
-[Status at concurrency 64](#status-at-concurrency-64).
+**Status, 2026-10-17:** it builds and runs on the 20261016 image. At AgentX concurrency 64 both trays store and load,
+with no failures, and the point is far above the 2026-10-16 one: see [Results at concurrency 64](#results-at-concurrency-64).
+The same launch without LMCache, which separates LMCache's share from that of the checkpoint ladder, is still to run.
 
 - **One LMCache server per tray.** It owns the CPU pool (L1), and the four DP ranks
   of its tray connect to it at `127.0.0.1:5555` through ATOM's `lmcache_mp`
@@ -935,21 +935,37 @@ then sent again:
 Each server's L1 grew by the prompt's KV (13,824 bytes per token) plus one KDA image (about 449 MB). A store of
 21,504 tokens took 0.029 s, a load 0.013–0.027 s.
 
-### Status at concurrency 64
+### Results at concurrency 64
 
-No run has finished yet. The attempts on CT7 (node0) + CT15, with this launch plus `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000`
-and `--max-num-seqs 16`, showed:
+**2026-10-17, CT7 (node0) + CT15, the 20261016 image, no perf_setup.** AgentX by the [method above](#agentic-agentx) with
+`AIPERF_BENCHMARK_DURATION=1800`, this section's launch, `ATOM_PREFILL_DELAYER_MAX_QUEUE_MS=5000` and
+`--max-num-seqs 16`. NUMA balancing was on while the weights loaded and off for the benchmark. The warm-up took 27 min.
 
-- **Offload under load.** In the longest attempt the two servers stored 1,061 prefixes (29.2M tokens) in the first
-  31 min (26 min of warm-up, then profiling), and their pools reached 401 and 360 GB of 429 GB. A store ran at about
-  1M tokens/s.
-- **Loads once HBM fills.** With `--state-checkpoint-interval-tokens -1` the HBM pool fills slowly: the first loads
-  came 4 min into the profiling window, 6 loads of 295,424 tokens in all, 0 failures, the largest 117k tokens in 55 ms.
-- **Then the trays.** At 31 min a GPU on CT7 wedged (`MES(0, 0) failed to respond to msg=REMOVE_QUEUE`), with NUMA
-  balancing on, as a plain driver load leaves it. The next two attempts, with it off, ended during the weight load,
-  when a tray went down with a host CPU fatal error.
+| | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit | valid |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-10-16: 20261014 image, block 16, 0.90, ladder 8192, no LMCache ([above](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)) | 0.90 | 1.28 | 3,165 | 17.3 | 7.7 / 79.8 s | 120 / 779 ms | 579 | 78.8% | yes |
+| **2026-10-17: LMCache MP**, block 128, 0.88, ladder `-1` | **6.52** | **9.38** | **10,400** | 69.3 | 4.8 / 14.8 s | 63 / 107 ms | 1,604 | 95.1% | yes |
 
-Next: concurrency 64 with LMCache against the [AgentX launch](#agentic-agentx) without it, on stable trays.
+The prefix cache over the profiling window, from node0's `/metrics` (all eight ranks):
+
+| | prompt tokens | served from HBM | served from LMCache | prefilled again | KDA checkpoints evicted | KV pool used, average / p90 |
+|---|---|---|---|---|---|---|
+| 2026-10-16 | 59.6M | 79.4% | — | 20.6% | 501 | 91.9% / 98.2% |
+| 2026-10-17, LMCache MP | 182.4M | 93.5% | 1.5% | 5.0% | 95 | 82.7% / 94.4% |
+
+- **Offload and load.** Over the run (warm-up included) the two servers stored 2,360 prefixes (37.6M tokens) at
+  about 0.6M tokens/s. They loaded 38 (5.2M tokens) at about 2.3M tokens/s, the largest 750,336 tokens. No load failed.
+  Both pools reached their eviction watermark (98% of 400 GiB) and evicted least recently used prefixes.
+- **Loads start once HBM fills.** The first load came 4 min into the profiling window, with the ranks' KV pools at
+  70–90%; by the end of the window they were at 90–99%.
+- **Most of the gain is the checkpoint ladder, not LMCache.** With `--state-checkpoint-interval-tokens -1` the HBM prefix
+  cache alone serves 93.5% of the prompt tokens, against 79.4% with the 8192 ladder, and 95 KDA checkpoints are evicted
+  instead of 501. LMCache adds 1.5% (2.8M tokens) that would otherwise be prefilled again, about a quarter of what would
+  be recomputed without it.
+- **Requests are longer than in the 2026-10-16 run.** Mean ISL is 109.7k and OSL 736, against 92.6k and 510: more
+  sessions get further into their traces.
+
+Next: the same launch without LMCache, to measure its share of the throughput.
 
 ### Notes
 
