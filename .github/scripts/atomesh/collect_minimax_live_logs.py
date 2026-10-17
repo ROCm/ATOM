@@ -52,6 +52,7 @@ PATTERNS = (
     "slurm_job-*/cell-metadata.json",
     "slurm_job-*/metadata-rank-*.json",
     "slurm_job-*/rank-rc-*",
+    "slurm_job-*/rank-workload-*",
 )
 MAX_FILE_BYTES = 8 << 20
 MAX_TOTAL_BYTES = 64 << 20
@@ -354,7 +355,21 @@ def emit_log_annotations(output):
     manifest = output / "snapshot.json"
     if manifest.is_file():
         state = json.loads(manifest.read_text())
-        state.pop("files", None)
+        state["log_sizes"] = [
+            {
+                key: item[key]
+                for key in ("artifact", "original_bytes", "copied_bytes", "tail_only")
+            }
+            for item in state.pop("files", [])
+            if Path(item["artifact"]).name
+            in (
+                "container.log",
+                "prefill-rank-0.log",
+                "decode-rank-0.log",
+                "router.log",
+                "aiperf.log",
+            )
+        ]
         (output / "runtime-state.json").write_text(json.dumps(state) + "\n")
     selected = []
     for path in sorted(output.rglob("*")):
@@ -381,6 +396,7 @@ def emit_log_annotations(output):
                 path.suffix == ".json"
                 and path.name.startswith(("pd-atom-", "results_", "samples_gsm8k_"))
             )
+            or path.name.startswith(("rank-rc-", "rank-workload-"))
             or (path.name.startswith("slurm-") and path.suffix in (".out", ".err"))
             or (
                 "lmcache-host-memory" in path.parts and path.suffix in (".log", ".json")
