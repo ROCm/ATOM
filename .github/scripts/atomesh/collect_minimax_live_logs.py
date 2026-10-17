@@ -4,6 +4,8 @@
 """Read an existing TW MiniMax C32 run from a CI submitter; never submit work."""
 
 import argparse
+import base64
+import gzip
 import json
 import os
 import re
@@ -210,7 +212,10 @@ def emit_log_annotations(output):
         )
         if len(payload) <= 400000:
             break
-    while len(payload) > 400000:
+    encoded = base64.b64encode(gzip.compress(payload.encode(), mtime=0)).decode()
+    # Check annotations are truncated at 4 KiB by the API. Compress the
+    # snapshot and keep each notice below that limit and the ten-notice quota.
+    while len(encoded) > 35000:
         longest = max(files, key=lambda name: len(files[name]))
         files[longest] = files[longest][len(files[longest]) // 2 :]
         if longest not in tails:
@@ -218,7 +223,8 @@ def emit_log_annotations(output):
         payload = json.dumps(
             {"format": "atomesh-log-snapshot-v1", "files": files, "tail_only": tails}
         )
-    parts = [payload[i : i + 40000] for i in range(0, len(payload), 40000)]
+        encoded = base64.b64encode(gzip.compress(payload.encode(), mtime=0)).decode()
+    parts = [encoded[i : i + 3500] for i in range(0, len(encoded), 3500)]
     for index, part in enumerate(parts):
         escaped = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print(
