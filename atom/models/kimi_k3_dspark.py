@@ -350,7 +350,9 @@ class K3DSparkMLAAttention(nn.Module):
             # aiter kernels available for it; the draft's own block width picks
             # the head padding that keeps one dispatchable.
             min_query_heads=mla_min_query_heads(
-                atom_config.kv_cache_dtype, _dspark_block_width(config, atom_config)
+                atom_config.kv_cache_dtype,
+                _dspark_block_width(config, atom_config),
+                self.num_local_heads,
             ),
             layer_num=layer_num,
             use_mla=True,
