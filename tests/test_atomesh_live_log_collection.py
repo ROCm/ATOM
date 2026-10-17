@@ -72,6 +72,36 @@ class LiveLogsTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][0], "squeue")
         self.assertEqual(run.call_args.kwargs["timeout"], 20)
 
+    def test_tail_windows_keep_untimestamped_compiler_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "prefill.log"
+            log.write_text(
+                "[atom 00:00:02] Scheduled prefill batch: 1 reqs, 3 new tokens "
+                "(done: [5], new: [3]), req_ids: (1,)\n"
+                "warning: failed to meet occupancy target in kernel_gemm_0\n"
+                "[atom 00:00:20] Request 2 arrived\n"
+                "warning: failed to meet occupancy target in kernel_gemm_1\n"
+            )
+            summary = LIVE.summarize_prefill_tail_windows(
+                log,
+                {
+                    "top": [
+                        {
+                            "request_start_ns": 86402_000_000_000,
+                            "ttft_ms": 2000,
+                            "x_request_id": "a",
+                        }
+                    ]
+                },
+            )
+        self.assertEqual(summary["compilation_log_matches"], 1)
+        event = summary["compilation_events"][0]
+        self.assertFalse(event["has_own_timestamp"])
+        self.assertEqual(event["preceding_log_clock"], "00:00:02")
+        self.assertEqual(
+            summary["scheduler_by_second"]["00:00:02"]["causal_qk_pairs"], 21
+        )
+
     def test_diagnostic_workflow_does_not_submit_a_model(self):
         import yaml
 

@@ -395,19 +395,32 @@ def summarize_prefill_tail_windows(path, requests):
     )
     timeline = {}
     compile_events, compile_count = [], 0
+    second, preceding_clock = None, None
     with path.open(errors="replace") as stream:
         for line in stream:
             stamp = clock.search(line)
-            if stamp is None:
-                continue
-            h, m, sec = map(int, stamp.groups())
-            second = 3600 * h + 60 * m + sec
+            if stamp is not None:
+                h, m, sec = map(int, stamp.groups())
+                second = 3600 * h + 60 * m + sec
+                preceding_clock = f"{h:02}:{m:02}:{sec:02}"
             if second not in seconds:
                 continue
-            if re.search(r"compil|\bJIT\b", line, re.IGNORECASE):
+            # LLVM diagnostics have no logger timestamp. Preserve their nearest
+            # preceding timestamp, explicitly labeled as approximate context.
+            if re.search(
+                r"compil|\bJIT\b|failed to meet occupancy|amdgpu-waves-per-eu",
+                line,
+                re.IGNORECASE,
+            ):
                 compile_count += 1
                 if len(compile_events) < 30:
-                    compile_events.append(line.rstrip()[:500])
+                    compile_events.append(
+                        {
+                            "preceding_log_clock": preceding_clock,
+                            "has_own_timestamp": stamp is not None,
+                            "line": line.rstrip()[:500],
+                        }
+                    )
             match = shape.search(line)
             if match is None:
                 continue
