@@ -27,6 +27,7 @@ vLLM says as much in its own warning.  ``select_scheduler_cls`` therefore picks
 the subclass matching the already-resolved ``async_scheduling`` value.
 """
 
+import functools
 import inspect
 import logging
 
@@ -174,6 +175,147 @@ class _HybridKVLoadFailureMixin:
                 affected_req_ids.add(req_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+
+def apply_vllm_v41_prefill_alignment_patch() -> None:
+    """End V4.1 prefill chunks on a PAGE edge. Idempotent, no-op elsewhere.
+
+    A STATE checkpoint exists only where the frontier *lands*, and vLLM spends one
+    token budget across the whole step: a prefill sharing a batch with six
+    decodes is scheduled 4,090 tokens, not 4,096, so the frontier lands at an
+    arbitrary offset and every chunk boundary after it is one no checkpoint was
+    written at. A tier save ends on a chunk boundary and carries the checkpoint
+    there, so a frontier off the grid is a save with no state to ride with.
+
+    This is the same invariant vLLM already enforces for Mamba in `align`
+    mode (`_mamba_block_aligned_split`: "chunk ends must be block aligned"),
+    with V4.1's PAGE block -- the checkpoint grid -- in place of the block.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    # Private vLLM methods, so absence is a version difference rather than a
+    # bug. This runs from `register_model`, the plugin entry point for EVERY
+    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
+    # feature none of them use.
+    original = getattr(Scheduler, "_reserve_prefill_lookahead", None)
+    if original is None:
+        logger.warning(
+            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._reserve_prefill_lookahead; "
+            "skipping this patch. V4.1 offload needs it -- that model will "
+            "refuse at startup rather than run uncapped."
+        )
+        return
+    if getattr(original, "_atom_v41_prefill_aligned", False):
+        return
+
+    @functools.wraps(original)
+    def _wrapped(self, request, num_computed_tokens, num_new_tokens):
+        num_new_tokens = original(self, request, num_computed_tokens, num_new_tokens)
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        if planner is None or num_new_tokens <= 0:
+            return num_new_tokens
+
+        # The grid a STATE boundary sits on, not the unit vLLM hashes in.
+        # Those were one number until a second kv cache group made the hash
+        # unit engine-wide: with DSpark it is the draft's 32 against the
+        # proxy's 256, and clipping to 32 lands the frontier somewhere that
+        # is not a PAGE edge, which stores nothing.
+        block = int(planner.boundary_grid)
+        start = int(num_computed_tokens)
+        end = start + int(num_new_tokens)
+        total = int(request.num_prompt_tokens)
+        if end >= total:
+            # The last chunk. Decode reaches every boundary above the prompt
+            # on its own, so clipping for those would only delay the prompt.
+            #
+            # The one below it is different, and it is the valuable one: the
+            # prompt-end anchor is the last PAGE edge at or before `total`,
+            # and once the frontier is past it nothing returns to it. A prompt
+            # whose length is not a whole number of blocks reaches it only if
+            # a chunk ends there, which is this clip -- without it a prompt
+            # shorter than one chunk of tier has no boundary to be reused at.
+            anchor = (total // block) * block
+            if start < anchor < end:
+                return anchor - start
+            return num_new_tokens
+        aligned = (end // block) * block
+        if aligned <= start:
+            # Even one block is past this chunk. Clipping would schedule
+            # nothing; let it cross.
+            return num_new_tokens
+        return aligned - start
+
+    _wrapped._atom_v41_prefill_aligned = True
+    Scheduler._reserve_prefill_lookahead = _wrapped
+    logger.info("ATOM DeepSeek-V4.1: prefill chunks will end on a CSA2 state boundary.")
+
+
+def apply_vllm_v41_local_hit_cap_patch() -> None:
+    """Wrap vLLM's local prefix-cache hit so V4.1's is capped. Idempotent.
+
+    Installed from ``register_model`` rather than from the platform hook:
+    vLLM does not always activate ``ATOMPlatform`` -- measured, it ran zero
+    times on a V4.1 serve while the model wrapper's own hook ran four -- so a
+    scheduler chosen there is a scheduler never chosen. The same reason the
+    STATE-tail reserve is installed from there.
+
+    A no-op for every model: the wrapper returns vLLM's own answer unless the
+    scheduler's connector carries a V4.1 planner.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    # Private vLLM methods, so absence is a version difference rather than a
+    # bug. This runs from `register_model`, the plugin entry point for EVERY
+    # model, so raising here would stop GLM, M3 and K3 loading over a V4.1
+    # feature none of them use.
+    original = getattr(Scheduler, "_get_local_prefix_cache_hit", None)
+    if original is None:
+        logger.warning(
+            "ATOM DeepSeek-V4.1: vLLM has no Scheduler._get_local_prefix_cache_hit; "
+            "skipping this patch. V4.1 offload needs it -- that model will "
+            "refuse at startup rather than run uncapped."
+        )
+        return
+    if getattr(original, "_atom_v41_hit_cap_patched", False):
+        return
+
+    @functools.wraps(original)
+    def _wrapped(self, request):
+        blocks, num_local, boundary, divergent = original(self, request)
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        # No connector: vLLM has already reduced the hit to a boundary the
+        # checkpoint group holds (its coordinator takes the minimum across
+        # groups), so the hit stands as it is.
+        if num_local <= 0 or planner is None:
+            return blocks, num_local, boundary, divergent
+        capped = int(planner.cap_local_hit(request, int(num_local)))
+        if capped >= num_local:
+            return blocks, num_local, boundary, divergent
+        block_size = int(self.cache_config.block_size)
+        # Whole blocks only: vLLM's hit is block-aligned, and the pair
+        # (blocks, num_computed) has to stay consistent or the request reads
+        # KV from blocks it was not told it has.
+        drop = -(-(int(num_local) - capped) // block_size)
+        from atom.plugin.vllm.deepseek_v4_prefix_patch import _drop_swa_warmup_blocks
+
+        return (
+            *_drop_swa_warmup_blocks(
+                self.kv_cache_manager,
+                blocks,
+                int(num_local),
+                boundary,
+                warmup_blocks=drop,
+                block_size=block_size,
+            ),
+            divergent,
+        )
+
+    _wrapped._atom_v41_hit_cap_patched = True
+    Scheduler._get_local_prefix_cache_hit = _wrapped
+    logger.info(
+        "ATOM DeepSeek-V4.1: local prefix-cache hits will be capped to a "
+        "boundary whose CSA2 state was stored."
+    )
 
 
 class VllmAtomScheduler(_HybridKVLoadFailureMixin, Scheduler):
