@@ -515,7 +515,7 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
     --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
-    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
+    --scheduler-state "${SLURM_STATE}" "--scheduler-exit-code=${SLURM_EXIT_CODE}" \
     --scheduler-rc "${SLURM_JOB_RC}" --spur 1
   SBATCH_RC=$?
   set -e

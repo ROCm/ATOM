@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,37 @@ class JobResultTest(unittest.TestCase):
     def test_empty_submission_token_or_rank_set_is_not_proof(self):
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "", 2))
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "this-run", 0))
+
+    def test_submitter_preserves_negative_spur_exit_code(self):
+        # Exercise the actual shell invocation: '-1:0' as a separate argv item
+        # used to be parsed as a flag, suppressing job-result.json entirely.
+        source = SCRIPT.with_name("pd_submit.sh").read_text()
+        start = source.index(
+            '  python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve'
+        )
+        command = source[start : source.index("  SBATCH_RC=$?", start)]
+        process = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                **os.environ,
+                "REPO_ROOT": str(SCRIPT.parents[3]),
+                "SLURM_STATUS_DIR": str(self.root),
+                "JOB_ID": "3619",
+                "ATOMESH_RUN_TOKEN": "this-run",
+                "NUM_NODES": "2",
+                "SLURM_STATE": "CANCELLED",
+                "SLURM_EXIT_CODE": "-1:0",
+                "SLURM_JOB_RC": "1",
+            },
+        )
+        self.assertEqual(process.returncode, 1, process.stderr)
+        saved = json.loads((self.root / "job-result.json").read_text())
+        self.assertEqual(saved["scheduler"]["exit_code"], "-1:0")
+        self.assertEqual(saved["result"]["state"], "CANCELLED")
+        self.assertEqual(saved["result"]["return_code"], 1)
 
     def test_cli_exits_with_effective_result_and_retains_raw_failure(self):
         args = [

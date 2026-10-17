@@ -221,7 +221,9 @@ def github_failure_log(target, output):
                     indices.update(range(max(0, i - 5), min(len(lines), i + 6)))
             result[str(job["id"])] = {
                 "name": job["name"],
-                "excerpts": "\n".join(lines[i] for i in sorted(indices))[-48000:],
+                "excerpts": "\n".join(lines[i][:1200] for i in sorted(indices))[
+                    -24000:
+                ],
             }
     except (OSError, ValueError) as exc:
         # Exception text may contain signed URLs; emit only the type/status.
