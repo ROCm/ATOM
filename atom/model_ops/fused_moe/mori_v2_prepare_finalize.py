@@ -556,6 +556,12 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
     def output_is_reduced(self) -> bool:
         return True
 
+    def needs_dispatch_output_trim(self) -> bool:
+        # dispatch_combine_v2 returns a fixed arena plus an exact device-side
+        # live-row count. Its row multiplicity is a transport contract; do not
+        # reuse the v1 host dedup bound to slice a v2 buffer.
+        return False
+
     def num_dispatchers(self) -> int:
         return self.num_dispatchers_
 
@@ -608,27 +614,13 @@ class MoriV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         dispatch_ids = recv_idx
         dispatch_weights = recv_w
 
-        # The received-row count, for whoever needs it as a row mask.
-        #
-        # flydsl fused_moe does NOT: the grouped a8w4 path derives per-expert
-        # routing from the (already trimmed) global ids + expert_mask, and its
-        # kernels skip the tail past the device-side count on their own -- which
-        # is the whole correctness argument in _recv_bound. So it stays
-        # None there, exactly as before.
-        #
-        # The Triton/gluon EP experts DO: ep_sort_routing hands this straight to
-        # _ep_gate_prep_scan_kernel, whose row mask is skipped entirely when it
-        # is None. The mori buffer always has M > R, so without it the garbage
-        # rows in [R, M) fold into the histogram as LIVE gates (on the rank
-        # owning global expert 0, a zeroed/stale id maps to local expert 0) and,
-        # under the scatter-fused combine, get delivered into staging slots
-        # belonging to real tokens. Silently wrong rather than an error.
-        #
-        # Capture-safe: a (1,) int32 device scalar, allocated once by the
-        # transport and re-zeroed per dispatch, so the pointer is stable across
-        # cudagraph capture/replay and nothing is read on the host.
+        # The exact received-row count is capture-safe: a stable (1,) int32
+        # device scalar owned and re-zeroed by the transport. Every expert
+        # backend needs it. Without the mask, stale rows in the fixed arena are
+        # interpreted as live routes; replacing it with a host bound assumes v1
+        # destination dedup semantics that dispatch_combine_v2 does not promise.
         expert_tokens_meta = mk.ExpertTokensMetadata(
-            expert_num_tokens=(_total_recv_t if envs.ATOM_USE_TRITON_MOE else None),
+            expert_num_tokens=_total_recv_t,
             expert_num_tokens_cpu=None,
         )
         return (
@@ -759,7 +751,7 @@ class MoriV2ModularKernel(mk.FusedMoEModularKernel):
             arena_rows = (
                 self.prepare_finalize.num_dispatchers() * mega.max_tokens_per_rank
             )
-            bound = self._recv_bound(topk_ids, arena_rows)
+            bound = self._recv_bound(arena_rows)
             # The "Direction-3" shrink, reproduced from the base-class walk: the
             # bound leaves graph_bs*topk*dp rows, but mori de-duplicates per
             # destination rank, so at most graph_bs*max_seqlen_q*dp can be live.

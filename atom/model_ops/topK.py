@@ -30,7 +30,10 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     # Only the selected MoRI transport needs this switch; the TP fusion is a
     # different mechanism, and an explicitly selected RCCL/none backend must
     # not be inferred from the mere presence of the ``mori`` Python package.
-    # EPLB always fuses, otherwise the env decides.
+    # V2's gather transport does not implement LOCAL_REPLICA shared-expert
+    # routing correctly yet, so keep the shared MLP separate there. EPLB uses
+    # ordinary routed shared experts and is unaffected. V1 retains the opt-in
+    # switch because its local-replica contract is established.
     requested_all2all = getattr(config, "moe_all2all_backend", "auto")
     mori_selected = (
         requested_all2all in {"auto", "mori"}
@@ -41,7 +44,8 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         dp_size > 1
         and mori_selected
         and config.enable_dp_attention
-        and not (getattr(config, "eplb_enable", False) or envs.ATOM_FUSE_SHARED_EXPERT)
+        and not getattr(config, "eplb_enable", False)
+        and (envs.ATOM_MORI_V2 or not envs.ATOM_FUSE_SHARED_EXPERT)
     ):
         return False
 
