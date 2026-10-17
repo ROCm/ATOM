@@ -158,10 +158,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if offcfg._is_minimax_m3(hf_config):
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
-    # Kimi-K3's MLA KV is replicated, but its KDA checkpoint images -- stored
-    # in those same PAGE units -- hold TP-sharded heads, so every rank keeps
-    # its own copy.
-    if getattr(hf_config, "model_type", None) == "kimi_linear":
+    # A state-owning layout's recurrent checkpoints ride inside the PAGE unit.
+    # Kimi-K3's hold TP-sharded heads, so the unit as a whole is not replicated
+    # even though the MLA KV in it is; the others are left one copy per rank
+    # until their backend declares otherwise.
+    if offcfg.select_offload_layout(config) in offcfg._STATE_OWNING_LAYOUTS:
         return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
 
@@ -321,6 +322,16 @@ def _make_scheduler_adapter(
     from lmcache.integration.atom import AtomMPSchedulerAdapter
 
     num_kv_readers = _tp_replication_factor(config)
+    scheduler_namespace = _model_namespace(
+        config, checkpoint_spec=checkpoint_spec, images=images
+    )
+    scheduler_strategy = _parallel_strategy(config, 0)
+    # The pair the lookup is keyed by; see the worker half's note.
+    logger.info(
+        "LMCache MP scheduler adapter: namespace=%s world=%s",
+        scheduler_namespace,
+        getattr(scheduler_strategy, "world_size", None),
+    )
 
     class _ReaderAwareSchedulerAdapter(AtomMPSchedulerAdapter):
         """Reserve one LMCache read lock for every collapsed TP consumer."""
@@ -333,11 +344,9 @@ def _make_scheduler_adapter(
     return _ReaderAwareSchedulerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(
-            config, checkpoint_spec=checkpoint_spec, images=images
-        ),
+        model_name=scheduler_namespace,
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, 0),
+        parallel_config=scheduler_strategy,
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
     )
 
@@ -349,14 +358,25 @@ def _make_worker_adapter(
     from lmcache.integration.atom import AtomMPWorkerAdapter
 
     extra = _extra_config(config)
+    namespace = _model_namespace(config, checkpoint_spec=checkpoint_spec, images=images)
+    strategy = _parallel_strategy(config, rank)
+    # The key the server files this registration under. The scheduler's
+    # lookup has to produce the same pair or the server answers "No GPU
+    # context found" -- which reads like a missing registration and is
+    # actually a namespace that does not match. Logged on both halves so
+    # the two strings can be compared instead of derived twice by hand.
+    logger.info(
+        "LMCache MP worker adapter: namespace=%s world=%s worker=%s",
+        namespace,
+        getattr(strategy, "world_size", None),
+        getattr(strategy, "worker_id", None),
+    )
     return AtomMPWorkerAdapter(
         server_url=_server_urls(config)[0],
         context=zmq.Context.instance(),
-        model_name=_model_namespace(
-            config, checkpoint_spec=checkpoint_spec, images=images
-        ),
+        model_name=namespace,
         block_size=int(config.kv_cache_block_size),
-        parallel_config=_parallel_strategy(config, rank),
+        parallel_config=strategy,
         mq_timeout=float(extra.get("lmcache.mp.mq_timeout", 300.0)),
         heartbeat_interval=float(extra.get("lmcache.mp.heartbeat_interval", 10.0)),
         transfer_mode=_transfer_mode(config),

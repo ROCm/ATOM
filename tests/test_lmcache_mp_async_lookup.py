@@ -270,3 +270,37 @@ def test_failed_lookup_warns_its_locks_are_left_to_the_ttl(caplog):
 
     assert not client.is_pending("req")
     assert "read TTL" in caplog.text and "phase status" in caplog.text
+
+
+class _SubmitOnlyClient:
+    """LMCache 0.5.5's MQ client: no named calls, only `submit_request`."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.requests = []
+
+    def submit_request(self, kind, payload, response_class):
+        self.requests.append((kind.name, payload))
+        return _Future(None if kind.name == "LOOKUP" else self.chunks)
+
+
+def test_a_client_without_named_calls_is_driven_through_submit_request(monkeypatch):
+    """Calling `client.lookup` there raised AttributeError inside schedule()."""
+    import pytest
+
+    pytest.importorskip("lmcache")
+    monkeypatch.setattr(transfer.time, "sleep", lambda _s: None)
+    fake = _SubmitOnlyClient(chunks=2)
+    adapter = _Adapter(fake)
+    client = _client(adapter)
+
+    assert client.supports_async()
+    assert client.submit(list(range(10)), "req")
+    client.pump()
+    assert client.lookup(list(range(10)), "req") == 2 * CHUNK
+    assert [name for name, _ in fake.requests] == ["LOOKUP", "QUERY_PREFETCH_STATUS"]
+
+
+def test_a_client_that_can_send_nothing_stays_synchronous():
+    adapter = _Adapter(SimpleNamespace())
+    assert not _client(adapter).supports_async()

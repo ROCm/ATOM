@@ -55,6 +55,68 @@ def _compress_plan_buffer_names(ratio):
     }
 
 
+def _staging_advances(staged) -> bool:
+    """Whether this step's Engram staging will advance the cursor itself.
+
+    `EngramStaging._advance_cursor` does it on the way past, and stands down on
+    a step carrying candidate cursors -- a verify step's cursor is the accepted
+    prefix's, which only the sampler knows. The advance has to happen exactly
+    once, down one path or the other.
+    """
+    if staged is None:
+        return False
+    return staged.candidates is None
+
+
+def build_v41_pool_geometry(
+    hf_config,
+    block_size: int,
+    *,
+    packed: bool,
+    speculative_tokens: int = 0,
+    index_fp4: bool = False,
+) -> V41PoolGeometry:
+    """The pool geometry a CSA2 configuration runs, from its text config alone.
+
+    The single authority for it. The pool is declared twice -- once by the
+    scheduler that sizes it and once by whoever hands the runtime its backing
+    store -- and the two only describe the same bytes if they derive the shape
+    the same way. The vLLM plugin sizes a proxy KV pool from here and the
+    native builder below builds its cache from here, so a change to the
+    topology reaches both or neither.
+
+    ``packed`` is the main pool's FP4 layout (native's ``kv_cache_dtype ==
+    "fp4"``), and ``speculative_tokens`` the draft width a verify step retains;
+    both move the geometry, so neither has a default that guesses.
+    """
+    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
+    return V41PoolGeometry(
+        len(topology)
+        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
+        tuple(
+            (spec.layer_id, spec.ratio)
+            for spec in topology
+            if spec.mode == AttentionMode.FULL
+        ),
+        block_size,
+        hf_config.sliding_window,
+        hf_config.head_dim,
+        hf_config.index_head_dim,
+        hf_config.engram_max_ngram_size - 1,
+        packed=packed,
+        speculative_tokens=speculative_tokens,
+        # Only the ratios the built layers run: a configuration with no
+        # window-only layer gets no buffer for one.
+        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
+        index_topk=hf_config.index_topk,
+        # Paged at the length candidates are picked in, which is what lets
+        # a candidate list be a block table. A GPU that cannot page that
+        # short refuses when asked, so there is nothing to pre-empt here.
+        index_block_rows=hf_config.candidate_block_size,
+        index_fp4=index_fp4,
+    )
+
+
 class DeepseekV41Backend(AttentionBackend):
     @staticmethod
     def get_name():
@@ -120,9 +182,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         for name in ("positions", "batch_id_per_q_token"):
             model_runner.forward_vars[name].publication_group = "v41_step"
         self.config = model_runner.config.hf_config
-        topology = build_attention_topology(self.config)[
-            : self.config.num_hidden_layers
-        ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         from atom.models.deepseek_v41.bounded_replay import (
@@ -138,28 +197,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "enable_decoder_swa_bounded_replay", False)
             and decoder_replay_unsupported(self.config) is None
         )
-        self.geometry = V41PoolGeometry(
-            len(topology) + (self.config.num_nextn_predict_layers if num_drafts else 0),
-            tuple(
-                (spec.layer_id, spec.ratio)
-                for spec in topology
-                if spec.mode == AttentionMode.FULL
-            ),
+        self.geometry = build_v41_pool_geometry(
+            self.config,
             self.block_size,
-            self.config.sliding_window,
-            self.config.head_dim,
-            self.config.index_head_dim,
-            self.config.engram_max_ngram_size - 1,
             packed=model_runner.config.kv_cache_dtype == "fp4",
             speculative_tokens=num_drafts,
-            # Only the ratios the built layers run: a configuration with no
-            # window-only layer gets no buffer for one.
-            layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-            index_topk=self.config.index_topk,
-            # Paged at the length candidates are picked in, which is what lets
-            # a candidate list be a block table. A GPU that cannot page that
-            # short refuses when asked, so there is nothing to pre-empt here.
-            index_block_rows=self.config.candidate_block_size,
             index_fp4=model_runner.config.index_cache_dtype == "fp4",
         )
         model_runner.forward_vars.update(
@@ -1145,7 +1187,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the forward advances it, after its snapshot).
         if batch is not None:
             self._write_engram_cursor(step, cache, batch)
-        elif staged is None and not metadata.dummy and not step.tentative:
+        elif (
+            not metadata.dummy and not step.tentative and not _staging_advances(staged)
+        ):
+            # Testing `staged is None` instead left a step whose staging stood
+            # down advancing nothing: the request stays one behind its own
+            # position ("needs state at 828, found 818" under
+            # FULL_AND_PIECEWISE at 64 concurrent requests).
             cache.advance_cursor(step, histories)
         if on_device and step.tentative:
             cache.pending.staged_on_device = True

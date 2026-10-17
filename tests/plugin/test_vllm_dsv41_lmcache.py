@@ -1,0 +1,381 @@
+# SPDX-License-Identifier: MIT
+"""DeepSeek-V4.1 LMCache offload on the vLLM plugin: the MP ride and its guards.
+
+V4.1's state checkpoints ride the PAGE object as recurrent engine groups. These
+pin the decisions that keep a restored prefix and its state at one boundary,
+and the scheduler/connector fixes that a two-pass DSpark run depends on.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+
+from atom.plugin.vllm.kv_transfer import v41_state
+from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
+from atom.plugin.vllm.kv_transfer.page_ride import PageRideMixin
+from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
+
+# -- planner -----------------------------------------------------------------
+
+
+def _planner(hash_unit=256, grid=256, *, keep_tail=False, can_serve=False):
+    return V41BoundaryPlanner(
+        hash_block_size=hash_unit,
+        boundary_grid=grid,
+        chunk_size=256,
+        state_checkpoints_can_serve=can_serve,
+        checkpoint_group_ids=(1,),
+        keep_a_prefill_tail=keep_tail,
+    )
+
+
+def _cap(planner, hit, *, num_tokens=4096, armed_for="r"):
+    request = SimpleNamespace(request_id=armed_for, num_tokens=num_tokens)
+    planner.begin_lookup(request)
+    try:
+        return planner.cap_hit(SimpleNamespace(id="r"), hit)
+    finally:
+        planner.end_lookup()
+
+
+def test_a_hit_is_capped_to_the_page_grid_not_the_hash_unit():
+    """With DSpark the hash unit is 32 and the PAGE edge 256."""
+    p = _planner(32, 256)
+    assert _cap(p, 1312) == 1280
+    assert _cap(p, 200) == 0
+
+
+def test_a_cap_outside_its_lookup_declines():
+    """Serving an untested hit restores PAGE with no state behind it."""
+    p = _planner()
+    assert p.cap_hit(SimpleNamespace(id="r"), 1024) == 0
+    assert _cap(p, 1024, armed_for="someone-else") == 0
+
+
+@pytest.mark.parametrize("keep_tail, expected", [(False, 1024), (True, 768)])
+def test_a_speculative_ride_never_resumes_one_token_short(keep_tail, expected):
+    """vLLM pads a one-token resume into a verify row; V4.1 refuses the step."""
+    assert _cap(_planner(keep_tail=keep_tail), 1024, num_tokens=1025) == expected
+
+
+def test_a_local_hit_needs_both_a_checkpoint_and_the_gate(monkeypatch):
+    request = SimpleNamespace(request_id="r")
+    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", True)
+    assert _planner(can_serve=False).cap_local_hit(request, 1280) == 0
+    assert _planner(can_serve=True).cap_local_hit(request, 1280) == 1280
+    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", False)
+    assert _planner(can_serve=True).cap_local_hit(request, 1280) == 0
+
+
+@pytest.mark.parametrize(
+    "computed, group_blocks, expected",
+    [
+        (512, ([3, 4], [7, 8]), (8,)),
+        (500, ([3, 4], [7, 8]), None),  # not a PAGE edge
+        (768, ([3, 4], [7, 8]), None),  # past the allocated rows
+        (512, ([3, 4], [7, 0]), None),  # the null block is no destination
+    ],
+)
+def test_a_load_names_its_checkpoint_blocks_or_nothing(
+    computed, group_blocks, expected
+):
+    p = _planner()
+    ok = p.resolve_load(
+        SimpleNamespace(request_id="r"), computed, group_blocks=group_blocks
+    )
+    assert ok is (expected is not None)
+    assert p._ride_boundaries.get("r", {}).get(computed) == expected
+
+
+# -- the ride itself ---------------------------------------------------------
+
+
+def _ride():
+    class _P(PageRideMixin):
+        hash_block_size = 256
+        ride_boundary_grid = 256
+        ride_group_ids = (1,)
+
+        def __init__(self):
+            self._counters = {}
+            self._init_page_ride()
+
+    p = _P()
+    block = SimpleNamespace(block_id=42)
+    p._pool = SimpleNamespace(
+        get_cached_block=lambda h, gids: [block],
+        touch=lambda blocks: None,
+        blocks={42: block},
+    )
+    return p, SimpleNamespace(block_hashes=tuple(range(1, 9)))
+
+
+def test_a_load_rides_only_on_its_recorded_destination():
+    """The committed source of a save is somebody else's state."""
+    p, request = _ride()
+    assert p.take_ride_state(request, "r0", 512, operation=None) is None
+    p._record_ride_boundary("r0", 512, (7,))
+    assert p.take_ride_state(request, "r0", 512, operation=None).block_ids == (7,)
+
+
+def test_a_save_rides_on_the_committed_source_and_pins_it():
+    p, request = _ride()
+    assert p.take_ride_state(request, "r0", 512, operation="op").block_ids == (42,)
+    assert p.take_ride_state(request, "r0", 500, operation="op2") is None
+    assert p._counters["ride_pinned"] == 1
+
+
+# -- connector ---------------------------------------------------------------
+
+
+def _options_stub(*, v41=True, groups=(1,), mamba=(), **options):
+    stub = SimpleNamespace(
+        _config=SimpleNamespace(kv_transfer_config=dict(options)),
+        _is_deepseek_v41=v41,
+        _v41_checkpoint_group_ids=tuple(groups),
+        _mamba_groups=list(mamba),
+    )
+    stub._offload_backend = AtomLMCacheOffloadConnector._resolve_offload_backend(stub)
+    return stub
+
+
+@pytest.mark.parametrize(
+    "options, groups, match",
+    [
+        ({}, (1,), "MP server only"),
+        ({"atom.offload.backend": "mp"}, (), "checkpoint groups"),
+        (
+            {"atom.offload.backend": "mp", "lmcache.mp.state_transport": "mp"},
+            (1,),
+            "no longer",
+        ),
+    ],
+)
+def test_v41_offload_refusals(options, groups, match):
+    with pytest.raises(ValueError, match=match):
+        stub = _options_stub(groups=groups, **options)
+        AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
+
+
+def test_v41_rides_its_checkpoint_groups_on_mp():
+    stub = _options_stub(**{"atom.offload.backend": "mp"})
+    AtomLMCacheOffloadConnector._refuse_v41_without_ride(stub)
+    assert AtomLMCacheOffloadConnector._state_rides_mp.fget(stub)
+
+
+def _alloc_connector():
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._attn_group_id = 0
+    c._requests = {}
+    c._abandoned_loads = set()
+    c._promised_loads = {}
+    c._kda_planner = None
+    c._scheduler = SimpleNamespace(update_state_after_alloc=lambda seq: None)
+    seq = SimpleNamespace(num_cached_tokens=0, set_block_table=lambda ids: None)
+    c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
+    c._v41_planner = SimpleNamespace(resolve_load=Mock(return_value=False))
+    return c
+
+
+def test_an_unresolved_ride_does_not_release_the_request_itself():
+    """`_check_promised_loads` withdraws it once; a second report asserts in vLLM."""
+    c = _alloc_connector()
+    blocks = SimpleNamespace(get_block_ids=lambda: ([3, 4], [7, 8]))
+    c.update_state_after_alloc(SimpleNamespace(request_id="r0"), blocks, 512)
+    assert c._v41_planner.resolve_load.call_args.kwargs["group_blocks"] == (
+        [3, 4],
+        [7, 8],
+    )
+    assert c._abandoned_loads == set()
+
+
+def _promising_connector(parked):
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._promised_loads = {"7": [0, 32, 64, parked]}
+    c._config = SimpleNamespace(kv_cache_block_size=16)
+    c._seqs = {"7": SimpleNamespace(block_table=list(range(100, 116)))}
+    c._scheduler = SimpleNamespace(last_load_skip_reason=lambda _rid: "declined")
+    return c
+
+
+@pytest.mark.parametrize("parked", [True, False])
+def test_an_undispatched_promise_is_withdrawn_only_if_vllm_parked_it(parked):
+    """An unparked request reported as received trips vLLM's assertion."""
+    c = _promising_connector(parked)
+    out = []
+    for _ in range(c._PROMISE_GRACE_STEPS + 2):
+        out.extend(c._check_promised_loads(SimpleNamespace(requests=[])))
+    assert out == ([("7", [102, 103, 104, 105])] if parked else [])
+    assert c._promised_loads == {}
+
+
+def _lookup_connector(*, pending, detachable):
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    seq = SimpleNamespace(set_num_cached_tokens=Mock())
+    c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
+    c._requests, c._promised_loads = {}, {}
+    c._kda_planner = c._v41_planner = None
+    c._scheduler = SimpleNamespace(
+        get_num_new_matched_tokens=Mock(return_value=(512, True)),
+        should_park_for_load_after_alloc=Mock(return_value=True),
+        prefetch_lookups=Mock(),
+        lookup_pending=Mock(return_value=pending),
+        can_detach_lookup=Mock(return_value=detachable),
+        detach_lookup=Mock(return_value=True),
+    )
+    return c
+
+
+@pytest.mark.parametrize(
+    "pending, detachable, expected",
+    [
+        (True, False, (None, False)),
+        (False, False, (512, True)),
+        (True, True, (0, False)),
+    ],
+)
+def test_a_tier_lookup_never_blocks_schedule(pending, detachable, expected):
+    """In flight: ask again next step. Ruled out by the local hit: don't wait."""
+    c = _lookup_connector(pending=pending, detachable=detachable)
+    assert c.get_num_new_matched_tokens(SimpleNamespace(request_id="r"), 0) == expected
+
+
+def test_a_multi_group_failure_travels_by_request_and_stays_received():
+    """0.31 refuses block ids on more than one group and needs the receive quorum."""
+    c = object.__new__(AtomLMCacheOffloadConnector)
+    c._worker = SimpleNamespace(
+        take_load_error_blocks=lambda: {5}, take_load_error_reqs=lambda: {"r0"}
+    )
+    c._kv_cache_config = SimpleNamespace(kv_cache_groups=(object(), object()))
+    c._kda_error_blocks, c._kda_error_reqs = set(), set()
+    c._abandoned_error_blocks, c._abandoned_loads = set(), set()
+    c._pending_failed_recving = set()
+    c.get_finished = lambda ids: ((), {"r0", "r1"})
+    assert c.get_block_ids_with_load_errors() == set()
+    res = c.get_transfer_results(set())
+    assert res.failed_recving == {"r0"}
+    assert res.finished_recving == {"r0", "r1"}
+
+
+# -- vLLM scheduler patches --------------------------------------------------
+
+
+def _clip():
+    pytest.importorskip("vllm")
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from atom.plugin.vllm.scheduler import apply_vllm_v41_prefill_alignment_patch
+
+    original = Scheduler._reserve_prefill_lookahead
+    Scheduler._reserve_prefill_lookahead = lambda self, r, computed, new: new
+    try:
+        apply_vllm_v41_prefill_alignment_patch()
+        return Scheduler._reserve_prefill_lookahead
+    finally:
+        Scheduler._reserve_prefill_lookahead = original
+
+
+@pytest.mark.parametrize(
+    "prompt, start, budget, expected",
+    [
+        (65536, 0, 4090, 3840),  # mid-prompt: back to a PAGE edge
+        (5000, 4096, 904, 768),  # last chunk: stop at the prompt-end anchor
+        (65536, 0, 200, 200),  # never clipped to nothing
+    ],
+)
+def test_prefill_chunks_end_where_a_checkpoint_can_sit(prompt, start, budget, expected):
+    sched = SimpleNamespace(
+        connector=SimpleNamespace(_v41_planner=SimpleNamespace(boundary_grid=256))
+    )
+    request = SimpleNamespace(num_prompt_tokens=prompt, num_tokens=prompt)
+    assert _clip()(sched, request, start, budget) == expected
+
+
+def test_a_landed_load_in_kv_holding_waiting_clears_the_drafts():
+    """vLLM drains `kv_holding_waiting` first; checking `waiting` alone missed it."""
+    pytest.importorskip("vllm")
+    from vllm.v1.request import RequestStatus
+
+    from atom.plugin.vllm.v41_speculative import _kv_holding_request_will_prefill
+
+    parked = SimpleNamespace(
+        request_id="r1", status=RequestStatus.WAITING_FOR_REMOTE_KVS
+    )
+    sched = SimpleNamespace(
+        kv_holding_waiting=[parked], finished_recving_kv_req_ids={"r1"}
+    )
+    assert _kv_holding_request_will_prefill(sched)
+    sched.finished_recving_kv_req_ids = set()
+    assert not _kv_holding_request_will_prefill(sched)
+
+
+# -- state-checkpoint adapter ------------------------------------------------
+
+
+def test_the_checkpoint_spec_matches_the_pool_geometry():
+    """`StateCopies` refuses a spec that disagrees with the allocated cache."""
+    geo_mod = pytest.importorskip(
+        "atom.model_ops.attentions.pool_layout.v41_pool_geometry"
+    )
+    from atom.plugin.vllm import deepseek_v41_state_checkpoint as adapter
+
+    geo = geo_mod.V41PoolGeometry(
+        layers=40,
+        owners=((2, 2), (8, 2), (14, 2), (20, 2)),
+        block_size=256,
+        window_size=128,
+        head_dim=512,
+        index_dim=128,
+        history_size=3,
+        packed=False,
+        speculative_tokens=5,
+        layer_ratios=tuple([0, 0] + [2] * 18 + [1] * 20),
+        index_topk=512,
+    )
+    sizing = adapter._with_geometry(
+        adapter.V41StateCheckpointSizing(
+            num_slots=64,
+            max_num_seqs=64,
+            page_unit_bytes=int(geo.paged_bytes),
+            page_bytes=-(-int(geo.paged_bytes) // 256) * 256,
+            slot_bytes=int(geo.state_bytes),
+            image_bytes=int(geo.checkpoint_image_bytes),
+            layout_id=str(geo.layout_id),
+        ),
+        geo,
+    )
+    assert sizing.spec.page_unit_bytes == int(geo.paged_bytes)
+    assert sizing.spec.slot_bytes == int(geo.state_bytes)
+    assert 0 < sizing.image_bytes < sizing.slot_bytes
+    assert sizing.k == -(-sizing.image_bytes // sizing.page_unit_bytes)
+
+
+@pytest.mark.parametrize(
+    "overrides, refused",
+    [
+        ({}, None),
+        ({"mamba_cache_mode": "none"}, "mamba_cache_mode"),
+        ({"prefix_match_unit": 32}, "prefix_match_unit"),
+        ({"enable_mamba_shared_prefix_checkpoint": True}, "shared_prefix_checkpoint"),
+    ],
+)
+def test_unsupported_vllm_cache_settings_are_refused(overrides, refused):
+    from atom.plugin.vllm import deepseek_v41_state_checkpoint as adapter
+
+    cache = {
+        "mamba_cache_mode": "align",
+        "prefix_match_unit": None,
+        "prefix_cache_retention_interval": 0,
+        "enable_mamba_shared_prefix_checkpoint": False,
+        **overrides,
+    }
+    check = (
+        adapter.register_v41_state_checkpoint_adapter().check_state_checkpoints_supported
+    )
+    config = SimpleNamespace(cache_config=SimpleNamespace(**cache))
+    if refused is None:
+        check(config)
+    else:
+        with pytest.raises(ValueError, match=refused):
+            check(config)

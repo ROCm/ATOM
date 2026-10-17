@@ -24,7 +24,15 @@ def apply_vllm_cudagraph_memory_profiler_patch() -> None:
     from vLLM's KV budget, and the K3 cell's `--gpu-memory-utilization 0.91`
     was derived with that reservation in place.
 
-    Until then the gap is logged rather than left silent.
+    Until then the gap is logged rather than left silent -- except for
+    DeepSeek-V4.1, which cannot run at all with it. V4.1 is outside
+    `ROCM_DEFAULT_MRV1_ARCHITECTURES`, so it runs V2, and V2's profiling
+    capture happens inside `determine_available_memory`, before the KV cache
+    exists. The V4.1 proxy bind then meets the profiling stub and refuses
+    ("pool is too small: 47,349,760 bytes ... short by 337,707,008"), so the
+    engine never starts. `_skip_v2_for_deepseek_v41` covers exactly that model
+    and leaves every other V2 model's budget where the accuracy cells measured
+    it.
     """
     from vllm.platforms import current_platform
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -47,6 +55,47 @@ def apply_vllm_cudagraph_memory_profiler_patch() -> None:
 
     wrapped._atom_skip_rocm_profile = True
     GPUModelRunner.profile_cudagraph_memory = wrapped
+    _skip_v2_for_deepseek_v41()
+
+
+_V41_ARCHES = ("DeepseekV41ForCausalLM",)
+
+
+def _skip_v2_for_deepseek_v41() -> None:
+    """Skip the V2 profiling capture for DeepSeek-V4.1 and nothing else.
+
+    Narrow on purpose: other V2 models' accuracy cells were tuned with the
+    cudagraph reservation in vLLM's KV budget. The model is read from the
+    runner at call time, since the patch is installed once per process.
+    """
+    from vllm.platforms import current_platform
+
+    try:
+        from vllm.v1.worker.gpu.model_runner import (
+            GPUModelRunner as V2GPUModelRunner,
+        )
+    except ImportError:
+        return  # pre-0.31; the V1 patch is the whole story there
+
+    original = V2GPUModelRunner.profile_cudagraph_memory
+    if getattr(original, "_atom_skip_rocm_profile_v41", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        arches = getattr(getattr(self, "model_config", None), "architectures", ()) or ()
+        if current_platform.is_rocm() and any(a in _V41_ARCHES for a in arches):
+            logger.info(
+                "ATOM plugin: skipping the V2 CUDA graph memory profiling "
+                "capture for %s; it runs before the KV cache exists and the "
+                "V4.1 proxy bind cannot meet the profiling stub",
+                arches,
+            )
+            return 0
+        return original(self, *args, **kwargs)
+
+    wrapped._atom_skip_rocm_profile_v41 = True
+    V2GPUModelRunner.profile_cudagraph_memory = wrapped
 
 
 def _warn_if_v2_runner_unpatched() -> None:

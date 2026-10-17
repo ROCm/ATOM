@@ -144,46 +144,27 @@ def _build_v41_pool_geometry(
     speculative_tokens: int = 0,
     index_fp4: bool = False,
 ):
-    """The CSA2 pool geometry, derived here rather than asked of core.
+    """The CSA2 pool geometry, from core's single authority.
 
-    A copy of the arithmetic `DeepseekV41MetadataBuilder.__init__` runs. The
-    duplication is deliberate -- core carries no seam for this path -- but it
-    is the one copy in this PR whose halves have to agree *numerically*: the
-    pool is declared twice, once by the scheduler that sizes the proxy
-    allocation and once by the runtime that addresses it, and if the two
-    derive different shapes vLLM allocates N bytes while the kernels read M.
-    That is pool corruption, not an exception.
-
-    `tests/plugin/test_vllm_deepseek_v41_geometry_parity.py` is what keeps
-    them honest: it builds both and compares every field, so a change to
-    either side fails there rather than in a served request.
+    This was a copy of the arithmetic core runs inside
+    `DeepseekV41MetadataBuilder.__init__`, because core carried no seam to
+    call. This branch adds one (`build_v41_pool_geometry`) and calls it, which
+    is worth doing precisely here: the pool is declared twice, once by the
+    scheduler that sizes the proxy allocation and once by the runtime that
+    addresses it, and two different shapes mean vLLM allocates N bytes while
+    the kernels read M -- pool corruption, not an exception. Every other
+    duplication on this path fails loudly when it drifts; this one would not,
+    so it gets a seam instead of a test comparing the two copies.
     """
-    from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
-    from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        build_v41_pool_geometry,
+    )
 
-    topology = build_attention_topology(hf_config)[: hf_config.num_hidden_layers]
-    return V41PoolGeometry(
-        len(topology)
-        + (hf_config.num_nextn_predict_layers if speculative_tokens else 0),
-        tuple(
-            (spec.layer_id, spec.ratio)
-            for spec in topology
-            if spec.mode == AttentionMode.FULL
-        ),
+    return build_v41_pool_geometry(
+        hf_config,
         block_size,
-        hf_config.sliding_window,
-        hf_config.head_dim,
-        hf_config.index_head_dim,
-        hf_config.engram_max_ngram_size - 1,
         packed=packed,
         speculative_tokens=speculative_tokens,
-        # Only the ratios the built layers run: a configuration with no
-        # window-only layer gets no buffer for one.
-        layer_ratios=tuple(sorted({spec.ratio for spec in topology})),
-        index_topk=hf_config.index_topk,
-        # Paged at the length candidates are picked in, which is what lets a
-        # candidate list be a block table.
-        index_block_rows=hf_config.candidate_block_size,
         index_fp4=index_fp4,
     )
 
@@ -670,6 +651,16 @@ def _v41_stage_outside_forward(
         running_bs=running_bs,
         running_tokens=running_tokens,
         capturing=synthetic,
+        # The slots this step committed, carried out for the state
+        # checkpoints. They belong to `batch`, not to this object, and the
+        # checkpoint path reads them off `prepared`: without this field
+        # `_v41_state_checkpoints_around_forward` returns at its own gate on
+        # every step, so no checkpoint is ever planned, the blocks a save
+        # ships stay the zeros they were allocated as, and the first hit that
+        # resumes from one reports `needs state at N, found 0`. Nothing in
+        # between logs a thing -- the save rides, the tier stores and the load
+        # restores, all faithfully carrying zeros.
+        state_slots_committed=list(batch.state_slots_committed),
     )
 
 
@@ -824,6 +815,14 @@ class AtomDeepseekV41ProxyMetadataBuilder(AttentionMetadataBuilder):
         )
         if prepared is not None:
             common_attn_metadata.atom_v41_prepared = prepared
+        if not capturing:
+            # State checkpoints, both directions, around the forward this
+            # builder is staging for. Here because this runs once per step,
+            # before `set_forward_context` and outside anything a graph
+            # captures -- the same reason the rest of the staging is here.
+            _v41_state_checkpoints_around_forward(
+                self.vllm_config, common_attn_metadata, prepared
+            )
         return common_attn_metadata
 
 
@@ -1255,6 +1254,17 @@ def bind_deepseek_v41_proxy_cache(
         workspace=builder.score_workspace,
         backing=raw,
     )
+    from atom.plugin.vllm.state_slot_allocator import StateSlotAllocator
+
+    if not hasattr(model, "_atom_v41_slot_allocator"):
+        # The STATE slots this pool's requests draw from. Attached to the
+        # model because that is the one object every reader of it can reach:
+        # the metadata builder stages against it each step, and the offload
+        # connector reserves one for a tier load before the request is ever
+        # scheduled.
+        model._atom_v41_slot_allocator = StateSlotAllocator(
+            v41_scheduler_state_slots(vllm_config)
+        )
     model._atom_v41_proxy_cache_ptr = ptr
     logger.info(
         "ATOM DeepSeek-V4.1: bound proxy pool -- %d PAGEs x %d B + %d STATE slots "
@@ -1266,6 +1276,7 @@ def bind_deepseek_v41_proxy_cache(
         raw.numel(),
         v41_kv_cache_dtype(vllm_config),
     )
+    _v41_install_state_checkpoint_runtime(vllm_config, builder.cache, num_slots)
     return True
 
 
@@ -1348,7 +1359,19 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
     So it is checked here, where the row can still be named, rather than left
     to surface as a cursor that is off by the gap between two requests.
     """
-    # KNOWN DEAD on the V2 path, which is the only one real V4.1 serving takes:
+    if getattr(input_batch, "atom_row_order_unverifiable", False):
+        # The V2 runner keeps no second count ordered independently of the
+        # step: `_V2InputBatchView` answers `num_computed_tokens_cpu` from the
+        # batch's own `num_computed_tokens_np`, which disagrees with
+        # `seq_lens - query_lens` on batches whose row order is fine. A check
+        # fed a number that is not independent either fires on nothing (noise)
+        # or proves nothing (tautology), so it is skipped here and named,
+        # rather than left looking like it ran. Without this the first decode
+        # dies with "the persistent batch and this step's attention metadata
+        # disagree at row 0" -- which is the crash the note below predicts.
+        return
+    # Was KNOWN DEAD on the V2 path while nothing supplied the V1 field, and
+    # the note is kept because the reasoning still governs the branch above:
     # this names the V1 runner's field, and V2's `InputBatch` carries
     # `num_computed_tokens_np` instead, so this returns before comparing
     # anything. Reading the V2 field is not the fix, and that is worth writing
@@ -1943,3 +1966,271 @@ def atom_deepseek_v41_forward_context(
         yield step_positions
     finally:
         reset_forward_context()
+
+
+def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, prepared):
+    """This step's checkpoint work, through `paged_state_checkpoint`.
+
+    Everything about placement, ordering and the store/restore contract lives
+    in the mechanism (`run_state_checkpoint_step`): the stores the previous build left,
+    this step's plan, resets for recycled slots, restores for prefix hits,
+    and the stores registered for after the forward. This function only hands
+    it the row data the V4.1 bridge owns.
+
+    Speculation needs no special case here. A speculative step's own ends are
+    the drafted ends, and the mechanism already defers on that through
+    `StateCheckpointWorker.decode_candidates` -- every boundary the step could commit
+    to is recorded, and the next build stores the one it did. An earlier
+    version of this file deferred by hand against `cache.cursor`; carrying
+    that across would have been a second answer to a question the mechanism
+    already answers.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        current_state_checkpoint_worker,
+        register_v41_state_checkpoint_adapter,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        plan_state_checkpoint_ops,
+        run_state_checkpoint_step,
+        state_checkpoints_on,
+    )
+
+    adapter = register_v41_state_checkpoint_adapter()
+    _on = state_checkpoints_on(adapter, vllm_config)
+    if not _on or prepared is None:
+        return
+    snapshot = getattr(common_attn_metadata, "atom_v41_snapshot", None)
+    slots = getattr(prepared, "state_slots_committed", None)
+    if snapshot is None or slots is None:
+        return
+    worker = current_state_checkpoint_worker(adapter)
+    rows = len(slots)
+    # The step staged just above is already marked tentative --
+    # `PagedAttentionCache.prepare_state` sets `pending` while the builder
+    # runs, which is before this. Every copy below then meets
+    # `StateCopies._validate` -> `cache.require_committed()` and raises
+    # "Commit the accepted prefix before reusing or checkpointing state",
+    # for the restores as well as the stores.
+    #
+    # The guard is right and it is early here: it protects the slots from
+    # being read or written while a tentative step's result is outstanding,
+    # and this step's forward has not run. The slots still hold the previous
+    # step's committed state, which is exactly what a decode keep stores and
+    # what a prefix hit must overwrite before the forward reads it -- the
+    # mechanism's own order puts both before the forward by design.
+    #
+    # So the handle is taken aside for the duration and put back. Nothing in
+    # between can advance it: `run_state_checkpoint_step` issues copies and
+    # returns, and the sampler that commits this step cannot run until after
+    # the forward.
+    cache = getattr(getattr(worker.copier, "_copies", None), "cache", None)
+    _pending = getattr(cache, "pending", None) if cache is not None else None
+    if _pending is not None:
+        cache.pending = None
+    try:
+        run_state_checkpoint_step(
+            worker,
+            common_attn_metadata,
+            capturing=bool(getattr(prepared, "capturing", False)),
+            plan=lambda: plan_state_checkpoint_ops(
+                worker,
+                common_attn_metadata,
+                rows=rows,
+                slots=list(slots),
+                # ndarray, not list: `plan_state_checkpoint_ops` does `chunk_start[:rows]
+                # .astype(np.int64)` to pair every row's end with the plan. A list
+                # got that far only once the store plan actually reached the
+                # worker, so the wrong type sat here unexercised.
+                chunk_start=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
+                lens=np.asarray(snapshot.query_lens[:rows], dtype=np.int64),
+                fresh_rows=getattr(prepared, "reset_rows", ()) or (),
+                block=int(adapter.block_size),
+                is_target=True,
+                name=adapter.name,
+            ),
+            reset_fn=lambda slot_ids: None,
+            name=adapter.name,
+        )
+    finally:
+        if _pending is not None:
+            cache.pending = _pending
+
+
+def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None:
+    """Stand up the checkpoint worker now the pool exists.
+
+    Here because this is the first moment both halves exist: the state arena
+    to copy out of, and the tensors vLLM gave the checkpoint layers. A failure is
+    loud rather than silent -- with checkpoints on, the pool was already sized for
+    them and prefix caching was admitted on the promise that something would
+    fill them, so carrying on without a worker is the one outcome that must
+    not happen quietly.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        build_v41_state_checkpoint_copier,
+        current_state_checkpoint_worker,
+        register_v41_state_checkpoint_adapter,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        PagedStateCheckpointLayer,
+        StateCheckpointWorker,
+        register_state_checkpoint_worker,
+        state_checkpoints_on,
+    )
+
+    adapter = register_v41_state_checkpoint_adapter()
+    if (
+        not state_checkpoints_on(adapter, vllm_config)
+        or current_state_checkpoint_worker(adapter) is not None
+    ):
+        return
+    try:
+        copier = build_v41_state_checkpoint_copier(vllm_config, max_batch=num_slots)
+        # The ids come off the layers, not off `vllm_config`: the mechanism's
+        # runner hook writes `_atom_state_checkpoint_group_id` on each checkpoint layer in
+        # `initialize_kv_cache`, which is this worker's own view of the KV
+        # cache config. A config attribute would have to survive the trip to
+        # a spawned worker, and nothing sends it.
+        sfc = vllm_config.compilation_config.static_forward_context
+        names = adapter.state_checkpoint_layer_names(adapter.sizing(vllm_config).k)
+        layers = [sfc.get(name) for name in names]
+        groups = [
+            getattr(layer, "_atom_state_checkpoint_group_id", None) for layer in layers
+        ]
+        unbound = any(not isinstance(x, PagedStateCheckpointLayer) for x in layers)
+        if unbound or any(gid is None for gid in groups):
+            raise RuntimeError(
+                "this worker has no bound checkpoint groups for "
+                f"{names[:2]}...; vLLM built the KV cache config without the "
+                "mechanism's runner hook"
+            )
+        worker = StateCheckpointWorker(adapter, copier, groups)
+        register_state_checkpoint_worker(worker)
+        _v41_install_restore_hook(adapter, worker)
+    except Exception as exc:
+        raise RuntimeError(
+            "DeepSeek-V4.1 checkpoints are on but their worker could "
+            f"not be built: {exc}. Prefix caching was admitted on the promise "
+            "that something fills the checkpoint blocks, and the pool was sized "
+            "for them, so starting without it would serve hits from blocks "
+            "nothing wrote."
+        ) from exc
+
+
+def _v41_install_restore_hook(adapter, worker) -> None:
+    """Let `PagedAttentionCache.prepare_state` restore from a checkpoint.
+
+    `cache.py` has carried the call site all along (`_restore_stale_rows`,
+    between the slot being assigned and its cursor being judged -- the only
+    place a restore is neither undone by the reset nor unchecked by the
+    contract), but nothing ever called `install_state_checkpoint_restore_hook`, so every
+    cross-request hit died in `_report_stale_state` with `needs state at N,
+    found <whatever the slot's last tenant left>`.
+
+    The hook gets `(slot, wanted_position, batch_row)` for exactly the rows
+    the contract is about to reject, and returns how many it restored; the
+    caller re-reads the cursors so the contract judges the restore. A wrong
+    unit therefore still dies loudly rather than answering from someone
+    else's state.
+    """
+    from atom.model_ops.attentions.deepseek_v41.cache import (
+        install_state_checkpoint_restore_hook,
+    )
+    from atom.plugin.vllm.paged_state_checkpoint import (
+        execute_state_checkpoint_restores,
+        state_checkpoint_unit_ids,
+    )
+
+    block = int(adapter.block_size)
+
+    def restore(rows) -> int:
+        if not rows:
+            return 0
+        from atom.plugin.vllm.req_id_passthrough_patch import get_current_req_ids
+
+        # Same row space the store side uses: the position of the request id
+        # in the batch's own id list, which is what indexes the checkpoint block
+        # table. The step's row index is a different space.
+        row_of = {rid: i for i, rid in enumerate(get_current_req_ids() or [])}
+        wanted = [(slot, pos, row_of.get(rid)) for slot, pos, rid in rows]
+        missing = [rid for (_s, _p, rid), (_, _, r) in zip(rows, wanted) if r is None]
+        if missing:
+            logger.warning(
+                "DeepSeek-V4.1 checkpoint restore: %s not in this step's batch ids; "
+                "leaving the contract to refuse the hit",
+                missing,
+            )
+            return 0
+        slots = [int(slot) for slot, _, _ in wanted]
+        batch_rows = [int(row) for _, _, row in wanted]
+        cols = [int(pos) // block - 1 for _, pos, _ in wanted]
+        if any(c < 0 for c in cols):
+            return 0
+        units = state_checkpoint_unit_ids(
+            worker.group_ids, batch_rows, cols, adapter.name
+        )
+        execute_state_checkpoint_restores(worker.copier, slots, units)
+        return len(slots)
+
+    install_state_checkpoint_restore_hook(restore)
+    logger.info("ATOM DeepSeek-V4.1: checkpoint restores wired into prepare_state")
+
+
+def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
+    """The PAGE-indexed planes of a bound V4.1 pool, in key-space order.
+
+    One main page plus that page's rows in each index plane -- the same
+    decomposition, in the same order, that ``PagedAttentionCache.unit_regions``
+    reports and that the native backend publishes to ``lmcache_mp``. The order
+    *is* the key space: an object stored under one plane order is unreadable
+    under another, so it is derived here from ``index_planes`` rather than
+    rebuilt by any caller.
+
+    The STATE region is not here and must never be: ``page_bytes`` and the
+    index planes are views of the arena's head, while the per-request state is
+    a disjoint view of its tail. STATE is addressed by request slot, not by
+    page, so a positional mover would hand one request another's rings.
+    """
+    names = [name for name, _ in cache.geometry.index_planes]
+    return [("dsv41.page", cache.page_bytes)] + [
+        (f"dsv41.{name}_plane.{owner}", plane)
+        for owner, owned in cache.index_planes.items()
+        for name, plane in zip(names, owned)
+    ]
+
+
+def ensure_v41_proxy_bound(
+    vllm_config,
+    layer_name: str = ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+):
+    """Bind the proxy pool from outside a forward, and return `(cache, slots)`.
+
+    ``bind_deepseek_v41_proxy_cache`` normally runs on the first real forward.
+    The KV-transfer connector needs the carved planes earlier than that --
+    ``register_kv_caches`` runs during ``initialize_kv_cache`` -- and a
+    connector that registered nothing on the first request would silently
+    offload nothing until the second. Binding is idempotent (it compares the
+    proxy storage pointer), so the forward re-enters it as a no-op.
+
+    Raises rather than returning None: by this point vLLM has decided a block
+    count and allocated the proxy tensor, so a failure here is a wiring fault
+    -- the wrong model, or the state-reserve patch never installed -- and
+    returning "not yet" would turn it into an offload that quietly does
+    nothing.
+    """
+    sfc = vllm_config.compilation_config.static_forward_context
+    proxy = sfc.get(layer_name)
+    owner = getattr(proxy, "atom_v41_owner", None)
+    if owner is None:
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy layer has no model wrapper attached; the KV "
+            "transfer connector cannot reach the carved pool. The wrapper sets "
+            "`proxy.atom_v41_owner` when it registers the layer."
+        )
+    builder = owner._deepseek_v41_builder
+    if not bind_deepseek_v41_proxy_cache(owner.model, builder, vllm_config, layer_name):
+        raise RuntimeError(
+            "DeepSeek-V4.1 proxy pool is not allocated yet; the KV transfer "
+            "connector must register after vLLM has sized the KV cache."
+        )
+    return builder.cache, owner.model._atom_v41_slot_allocator
