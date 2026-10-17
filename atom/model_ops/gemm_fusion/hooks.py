@@ -67,18 +67,46 @@ def init_gemm_fusion(config, sp_group, resources=None) -> None:
     logger.info("gemm_fusion ON profile=%s world=%d", _PROFILE, _RES.world)
 
 
+_KV = None  # bound kv_cache_data, needed to prepare plans before capture
+
+
 def bind_kv_cache(kv_cache_data) -> None:
+    global _KV
+    _KV = kv_cache_data
     for s in _SITES.values():
         s.bind_caches(kv_cache_data)
 
 
-def before_graph_capture(buckets) -> None:
-    """Resolve every bucket on every rank BEFORE capture, then clean epoch."""
+def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
+    """Outside capture, on every rank, in this order:
+    resolve every bucket (windows ``ensure``d, consensus) -> ``finalize`` ->
+    ``plan.prepare`` for buckets the kernel can take -> clean epoch.
+
+    ``buckets``: padded token counts, or ``(padded, real)`` pairs. The small-M
+    kernel needs every row live, so only ``padded == real`` buckets are
+    prepared; others still resolve (rank-uniform) and fall back at run time
+    with reason ``pad_rows``.
+    """
     if _RES is None:
         return
+    pairs = [b if isinstance(b, tuple) else (b, b) for b in buckets]
     for s in _SITES.values():
-        for t in buckets:
-            s.resolve(t, graph_mode="capture")
+        for padded, _ in pairs:
+            s.resolve(padded, graph_mode="capture")
+    _RES.finalize()
+    if _KV is not None:
+        if device is None:
+            import torch
+
+            device = torch.device("cuda", torch.cuda.current_device())
+        if out_dtype is None:
+            from atom.config import get_current_atom_config
+
+            out_dtype = get_current_atom_config().torch_dtype
+        for s in _SITES.values():
+            for padded, real in pairs:
+                if padded == real:
+                    s.prepare_bucket(padded, device, _KV, out_dtype)
     _RES.quiesce_and_reset()
 
 
@@ -103,8 +131,9 @@ def shutdown() -> None:
 
 
 def reset_for_tests(res: Optional[object] = None) -> None:
-    global _RES, _PROFILE
+    global _RES, _PROFILE, _KV
     _SITES.clear()
     DECISIONS.clear()
+    _KV = None
     _RES = res
     _PROFILE = ""

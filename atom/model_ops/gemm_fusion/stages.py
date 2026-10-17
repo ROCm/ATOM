@@ -64,6 +64,15 @@ def sp_exchange(fields, drop=(), world: Optional[int] = None):
     )
 
 
+def _kv_block_size() -> int:
+    try:
+        from atom.config import get_current_atom_config
+
+        return int(get_current_atom_config().kv_cache_block_size)
+    except Exception:
+        return 16
+
+
 def head_norm_rope_cache_from_attention(attn, index: Optional[str] = None):
     """``HeadNormRopeCache`` describing what ``attn.impl.rope_cache`` computes.
 
@@ -76,7 +85,9 @@ def head_norm_rope_cache_from_attention(attn, index: Optional[str] = None):
     kv_dtype = getattr(impl, "kv_cache_dtype", "bf16")
     # Sparse impl views the page-128 pool as page-16 SHUFFLE; dense keeps its own
     # page. Both paths are SHUFFLE layout with per-token fp8 scales.
-    page = 16 if hasattr(impl, "index_head_dim") else getattr(attn, "block_size", 16)
+    page = getattr(impl, "gemm_fusion_kv_page", None) or (
+        16 if hasattr(impl, "index_head_dim") else _kv_block_size()
+    )
     return gf.HeadNormRopeCache(
         head_dim=impl.head_dim,
         q_heads=impl.num_heads,

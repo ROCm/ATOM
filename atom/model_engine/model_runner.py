@@ -4218,11 +4218,12 @@ class ModelRunner:
             gemm_fusion.before_graph_capture(
                 sorted(
                     {
-                        sp_pad_len(bs * q_len)
+                        (sp_pad_len(bs * q_len), bs * q_len)
                         for q_len in q_buckets
                         for bs in self.capture_sizes
                     }
-                )
+                ),
+                device=self.device,
             )
 
         with (

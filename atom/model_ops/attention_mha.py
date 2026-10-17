@@ -295,8 +295,6 @@ class PagedAttentionImpl(nn.Module):
             "k_scale": layer.k_scale,
             "v_scale": layer.v_scale,
             "slot_mapping": fwd_ctx.attn_metadata.slot_mapping,
-            "norm_w": (self.q_norm.weight, self.k_norm.weight),
-            "cos_sin": self.rotary_emb.cos_sin_cache,
         }
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
@@ -1410,10 +1408,8 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
         if sparse_metadata is None:
             sparse_metadata = attn_metadata
-        from atom.models.minimax_m3.model import _minimax_m3_cos_sin_cache
-
         is_fp8 = self.kv_cache_dtype == "fp8"
-        meta = {
+        return {
             "k_cache": k_cache,
             "v_cache": v_cache,
             "k_scale": k_scale if is_fp8 else None,
@@ -1421,16 +1417,7 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             "k_scale_view": k_scale,
             "v_scale_view": v_scale,
             "slot_mapping": sparse_metadata.slot_mapping,
-            "norm_w": (self.q_norm.weight, self.k_norm.weight),
-            "cos_sin": _minimax_m3_cos_sin_cache(self.rotary_emb, self.q_norm.weight),
         }
-        if not self.skip_index_topk:
-            meta["index_cache"] = self.index_cache
-            meta["index_norm_w"] = (self.index_q_norm.weight, self.index_k_norm.weight)
-            meta["index_cache_dtype"] = (
-                self.index_cache_dtype if self.index_cache_dtype == "fp8" else "auto"
-            )
-        return meta
 
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):

@@ -40,8 +40,16 @@ class FakeResources:
         self.agree_calls += 1
         return "error" if errored else self.outcome
 
-    def ensure(self, reqs):
+    finalized = False
+
+    def can_ensure(self, plan):
+        return True
+
+    def ensure(self, plan):
         pass
+
+    def finalize(self):
+        self.finalized = True
 
     def quiesce_and_reset(self):
         self.resets += 1
@@ -179,6 +187,30 @@ def test_resolve_profile_off_is_native_without_aiter(make_site, monkeypatch):
     monkeypatch.setattr(stages, "_aiter_override", None)  # aiter must not be needed
     r = s.resolve(64)
     assert (r.plan, r.n_fused, r.reason) == (None, 0, "profile_off")
+
+
+def test_fallback_reasons_pad_rows_and_input_layout(make_site):
+    import torch
+
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
+    x = torch.zeros((16, 8), dtype=torch.float8_e4m3fn)
+    xs = torch.zeros((16, 1), dtype=torch.float32)
+    assert s._fallback_reason(ctx, x, xs) == "pad_rows"
+    ctx.real_tokens = 64
+    assert s._fallback_reason(ctx, x, xs) is None
+    assert s._fallback_reason(ctx, x, None) == "unquantized_input"
+    assert s._fallback_reason(ctx, x.to(torch.bfloat16), xs) == "unquantized_input"
+    assert s._fallback_reason(ctx, x, xs.view(1, 16)) == "xscale_layout"
+    ctx.is_dummy_run = True
+    assert s._fallback_reason(ctx, x, xs) == "dummy_run"
+
+
+def test_resolve_after_finalize_without_windows_is_native(make_site):
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    res.can_ensure = lambda plan: False
+    r = make_site(res).resolve(64)
+    assert (r.plan, r.reason) == (None, "after_finalize")
 
 
 # ---------------------------------------------------------- hooks / config
