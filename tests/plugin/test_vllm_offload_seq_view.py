@@ -332,3 +332,32 @@ def test_view_takes_every_attribute_the_scheduler_the_plugin_builds_writes():
         "SeqView.__slots__; do not delete the assignment -- the native path "
         "reads it back."
     )
+
+
+def test_view_answers_every_attribute_the_chunked_scheduler_reads():
+    """A plain `seq.<name>` the view lacks is an AttributeError inside vLLM's
+    schedule(). `num_tokens` was missing, read only on the detached-lookup
+    path, and the first local-hit request killed the engine."""
+    import ast
+    import inspect
+
+    from atom.kv_transfer.offload import chunked_scheduler
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    tree = ast.parse(inspect.getsource(chunked_scheduler))
+    read = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "seq"
+    }
+    have = set(dir(SeqView)) | set(SeqView.__slots__)
+    assert read - have == set()
+
+
+def test_num_tokens_counts_output_as_atom_does():
+    from atom.plugin.vllm.kv_transfer.seq_view import SeqView
+
+    view = SeqView(SimpleNamespace(prompt_token_ids=[1] * 10, num_tokens=13))
+    assert view.num_tokens == 13

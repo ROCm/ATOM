@@ -87,6 +87,13 @@ class SeqView:
         return len(self._request.prompt_token_ids)
 
     @property
+    def num_tokens(self) -> int:
+        # Prompt plus output, as on ATOM's Sequence. Read when deciding that a
+        # local hit leaves too little for any load (`_load_ruled_out`); missing
+        # here, that check raised AttributeError inside vLLM's schedule().
+        return int(self._request.num_tokens)
+
+    @property
     def num_cached_tokens(self) -> int:
         """The scheduler's computed frontier for this request.
 
