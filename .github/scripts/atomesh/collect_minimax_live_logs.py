@@ -34,6 +34,8 @@ PATTERNS = (
     "slurm_job-*/rank-*/*.log",
     "slurm_job-*/logs/*.log",
     "slurm_job-*/logs/*/*.log",
+    "slurm_job-*/benchmark_results/pd-atom-*.json",
+    "slurm_job-*/benchmark_results/*/profile_export_aiperf.json",
     "slurm_job-*/benchmark_results/*/aiperf.log",
     "slurm_job-*/benchmark_results/*/*/aiperf.log",
     "slurm_job-*/benchmark_results/lmcache-host-memory/*.log",
@@ -198,7 +200,16 @@ def emit_log_annotations(output):
     for path in sorted(output.rglob("*")):
         if not path.is_file():
             continue
-        if path.name in ("container.log", "sweep-summary.json"):
+        if path.name in (
+            "container.log",
+            "sweep-summary.json",
+            "profile_export_aiperf.json",
+            "prefill-rank-0.log",
+            "decode-rank-0.log",
+            "aiperf.log",
+        ) or (
+            path.suffix == ".json" and path.name.startswith(("pd-atom-", "results_"))
+        ):
             selected.append(path)
         elif "paged-prefill-tuning" in path.parts and path.suffix == ".log":
             tail = path.read_text(errors="replace")[-16000:]
@@ -217,12 +228,12 @@ def emit_log_annotations(output):
             str(path),
         )
     )
-    for log_limit, result_limit in ((16000, 80000), (4000, 16000), (1000, 4000)):
+    for log_limit in (16000, 4000, 1000):
         files, tails = {}, []
         for path in selected[:40]:
             relative = str(path.relative_to(output))
             raw = path.read_text(errors="replace")
-            limit = len(raw) if path.name == "sweep-summary.json" else log_limit
+            limit = len(raw) if path.suffix == ".json" else log_limit
             files[relative] = raw[-limit:]
             if len(raw) > limit:
                 tails.append(relative)
