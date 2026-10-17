@@ -28,7 +28,7 @@ and DSpark figures are from this one.
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
 | KV offload (LMCache MP) | ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621). 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
-| Speculative decoding (DSpark) | 20261016 image plus one ATOM fix, 2026-10-17: GSM8K 0.9629; zero-shot GSM8K acceptance length 5.47 at K=7 (model card 5.64). AgentX concurrency 16 at InferenceX's fixed acceptance (K=4, 3.36): **1 / p90(ITL) 56.0 tok/s/user against 28.0 without it, 5,054 tok/s per GPU against 4,136**. See [DSpark](#speculative-decoding-dspark) |
+| Speculative decoding (DSpark) | 20261016 image plus [ATOM #2620](https://github.com/ROCm/ATOM/pull/2620), 2026-10-17: GSM8K 0.9629; zero-shot GSM8K acceptance length 5.47 at K=7 (model card 5.64). AgentX concurrency 16 at InferenceX's fixed acceptance (K=4, 3.36): **1 / p90(ITL) 56.0 tok/s/user against 28.0 without it, 5,054 tok/s per GPU against 4,136**. See [DSpark](#speculative-decoding-dspark) |
 
 Contents:
 
@@ -717,12 +717,13 @@ Neither is aiperf's own per-user p90.
 
 ### Results
 
-![Kimi-K3 AgentX throughput per GPU vs P90 interactivity: MI455 dp8ep8 on 2026-10-11 and 2026-10-16, MI455 with DSpark at concurrency 16, ATOM on MI355X on 2026-10-15](Kimi-K3-455-wideEP-AgentX.png)
+![Kimi-K3 AgentX throughput per GPU vs P90 interactivity: MI455 dp8ep8 on 2026-10-11 and 2026-10-16, MI455 on the 20261016 image with DSpark at concurrency 16 and LMCache MP at concurrency 64, ATOM on MI355X on 2026-10-15](Kimi-K3-455-wideEP-AgentX.png)
 
 P90 interactivity is 1 / p90(ITL); points are labelled with their concurrency. MI455: the 2026-10-16 points and the
-2026-10-11 sweep below (its concurrency 8 failed aiperf's coverage check and is left out). MI455 + DSpark (the diamond):
-concurrency 16 with DSpark at K=4 and InferenceX's fixed acceptance length 3.36, the 20261016 image; see
-[DSpark](#agentx-at-concurrency-16). MI355X: ATOM's InferenceX points, also below.
+2026-10-11 sweep below (its concurrency 8 failed aiperf's coverage check and is left out). MI455 + DSpark / LMCache (the
+diamonds): the 20261016 image, concurrency 16 with DSpark at K=4 and InferenceX's fixed acceptance length 3.36
+([DSpark](#agentx-at-concurrency-16)) and concurrency 64 with LMCache MP ([LMCache](#results-at-concurrency-64)).
+MI355X: ATOM's InferenceX points, also below.
 
 #### 2026-10-16: the 20261014 image, concurrency 16, 32 and 64
 
@@ -1018,15 +1019,16 @@ Next: the same launch without LMCache, to measure its share of the throughput.
 layers, fed the target's hidden states from layers 2, 23, 47, 71 and 89, that draft a block of tokens in one non-causal
 pass. It is 7.1 GB in BF16 and keeps its KV in the target's MLA layout.
 
-**Status, 2026-10-17:** it runs on the 20261016 image with one ATOM fix. Its GSM8K score matches the server without it,
-and its acceptance length is close to the model card's. At AgentX concurrency 16 it doubles P90 interactivity and adds
-22% throughput per GPU. Measured on CT7 (node0) + CT15, no perf_setup.
+**Status, 2026-10-17:** it runs on the 20261016 image with one ATOM fix,
+[ATOM #2620](https://github.com/ROCm/ATOM/pull/2620) (open). Its GSM8K score matches the server without it, and its
+acceptance length is close to the model card's. At AgentX concurrency 16 it doubles P90 interactivity and adds 22%
+throughput per GPU. Measured on CT7 (node0) + CT15, no perf_setup.
 
 ### What it needs
 
 | | what | why |
 |---|---|---|
-| ATOM | [`atom-dspark-gfx1250-draft-heads.diff`](Kimi-K3-455-wideEP-patches/atom-dspark-gfx1250-draft-heads.diff), from branch [`zejun/dspark-gfx1250-draft-heads`](https://github.com/ROCm/ATOM/tree/zejun/dspark-gfx1250-draft-heads). It applies on top of the image's ATOM | Without it the drafter's CUDA-graph warmup aborts with `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode`. On gfx1250 the page-size-1 fp8 MLA decode is aiter's FlyDSL PS1 kernel alone, which takes a block wider than one query row only at 16 heads (up to 4 wide) or 96. The target has 96 heads. The draft has 64 and decodes a K-wide non-causal block. The fix pads the draft's query heads to 96 |
+| ATOM | [ATOM #2620](https://github.com/ROCm/ATOM/pull/2620), as [`atom-dspark-gfx1250-draft-heads.diff`](Kimi-K3-455-wideEP-patches/atom-dspark-gfx1250-draft-heads.diff) (its commit `c3472059`, without the test). It applies on top of the image's ATOM | Without it the drafter's CUDA-graph warmup aborts with `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode`. On gfx1250 the page-size-1 fp8 MLA decode is aiter's FlyDSL PS1 kernel alone, which takes a block wider than one query row only at 16 heads (up to 4 wide) or 96. The target has 96 heads. The draft has 64 and decodes a K-wide non-causal block. The fix pads the draft's query heads to 96 |
 | the draft | `hf download Inferact/Kimi-K3-DSpark --local-dir <model-dir>/Kimi-K3-DSpark` on each tray. `model.safetensors` is 7,124,633,450 bytes, sha256 `f9972a636d92a11994cdcfc88fd4c5b5d50d6eb2a89af016031593b8c65c2053` | Pass ATOM the local path. Given the repo ID, every rank downloads the draft when it starts |
 | the online FP8 config | the draft's layers excluded (below) | Keeps the draft in BF16, as InferenceX's MI355X ATOM recipe does. Quantized to FP8 it accepted as many tokens on GSM8K, but it is not the model that was trained |
 
@@ -1132,7 +1134,7 @@ tuned trays.
 | All ranks of a tray exit with code 255 at startup, without a traceback; the log has `[AMD-SMI] missing symbol amdsmi_init` | mori's topology loader opens `libamd_smi.so`. TheRock's wheels ship only `libamd_smi.so.27`, so it falls through to `librocm_smi64`, finds no `amdsmi_init` and calls `exit(-1)`. Set `MORI_AMD_SMI_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/libamd_smi.so.27` |
 | `[MegaMoEGfx1250] Created: … dispatch=mori … stage1_fused=False` | `ATOM_MEGA_STAGE1_FUSED=0`, or a bf16 dispatch wire: the compact plan needs `MEGA_DISPATCH_WIRE=fp4` (or fp8) |
 | `RuntimeError: ccoMemAlloc failed: -1` at MoE init, after `Out of heap memory! Requested: …` | The compact plan runs, but the cco arena was sized for the gather transport: aiter #6525 (`required_vmm_bytes`) is missing |
-| DSpark: `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode` in `warmup_draft_graphs` | The ATOM fix for the draft is missing; see [What it needs](#what-it-needs) |
+| DSpark: `mla_decode_gfx1250_dispatch: gfx1250 MLA minimal smoke only supports non-persistent decode` in `warmup_draft_graphs` | [ATOM #2620](https://github.com/ROCm/ATOM/pull/2620) is missing; see [What it needs](#what-it-needs) |
 | All DP ranks stop logging at once, mid-run, with no error. 30 min later all but one log `_sync_dp_state failed: … Timed out waiting 1800000ms`; meanwhile `[aiter] No available shared memory broadcast block found` repeats | The allgather LM head's custom all-gather hung on one rank. rocgdb shows that rank in `aiter::ag_gfx1250_lastdim<bf16, 8>` and the others in `tdm_compact_plan`. Seen twice in a few hours of GSM8K, never in AgentX runs. Workaround: the replicated head. Watch the `Engine 00x: Avg` lines, not the log's mtime: they stop |
 | Every rank hangs in `warmup_model` after a code or configuration change. `py-spy` shows `torch.cuda.synchronize()` under inductor's `autotune_to_one_config`; the GPUs show 100% GFX and 0% memory activity; rocgdb shows no active dispatch | ATOM's compile cache was cleared but inductor's (`/tmp/torchinductor_root`) was not. Inductor then reuses its compiled graphs without their autotune results, autotunes in the middle of the first forward, and its `synchronize()` never returns: rocgdb shows a queue of the dual-stream MoE stopped at a packet that was never published. Clear both: `rm -rf /root/.cache/atom/* /tmp/torchinductor_root`. Seen twice with DSpark; a full compile has never hung |
 | `RuntimeError: MORI_EP_TOKOFF_EXT: hipIpcOpenMemHandle(pe N) returned hipError 17` at load | aiter's MegaMoE turns on mori's TokOffExt, whose IPC handles do not cross trays. `MORI_EP_TOKOFF_EXT=0` |
