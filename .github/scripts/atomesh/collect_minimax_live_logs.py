@@ -256,22 +256,26 @@ def emit_log_annotations(output):
     for path in sorted(output.rglob("*")):
         if not path.is_file():
             continue
-        if path.name in (
-            "container.log",
-            "container-eval.log",
-            "runtime-state.json",
-            "sweep-summary.json",
-            "profile_export_aiperf.json",
-            "prefill-rank-0.log",
-            "decode-rank-0.log",
-            "aiperf.log",
-        ) or (
-            path.suffix == ".json"
-            and path.name.startswith(("pd-atom-", "results_", "samples_gsm8k_"))
-        ):
-            selected.append(path)
-        elif (path.name.startswith("slurm-") and path.suffix in (".out", ".err")) or (
-            "lmcache-host-memory" in path.parts and path.suffix in (".log", ".json")
+        if (
+            path.name
+            in (
+                "container.log",
+                "container-eval.log",
+                "runtime-state.json",
+                "sweep-summary.json",
+                "profile_export_aiperf.json",
+                "prefill-rank-0.log",
+                "decode-rank-0.log",
+                "aiperf.log",
+            )
+            or (
+                path.suffix == ".json"
+                and path.name.startswith(("pd-atom-", "results_", "samples_gsm8k_"))
+            )
+            or (path.name.startswith("slurm-") and path.suffix in (".out", ".err"))
+            or (
+                "lmcache-host-memory" in path.parts and path.suffix in (".log", ".json")
+            )
         ):
             selected.append(path)
         elif "paged-prefill-tuning" in path.parts and path.suffix == ".log":
