@@ -792,6 +792,13 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        if config.gemm_fusion.enabled:
+            # Call-site install (model.py is @support_torch_compile and untouched):
+            # swap eligible M3 attention forwards BEFORE any wrap/compile/trace.
+            from atom.model_ops.gemm_fusion.model_adapters import install_m3_sites
+
+            n_fused_layers = install_m3_sites(self.model)
+            logger.info("gemm_fusion: installed fused QKV+attention on %d layers", n_fused_layers)
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -3585,6 +3592,7 @@ class ModelRunner:
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             self._record_kv_cache_ready(batch)
+            self._gemm_fusion_check_step()
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3607,7 +3615,21 @@ class ModelRunner:
         reset_forward_context()
         self._record_forward_vars_event()
         self._record_kv_cache_ready(batch)
+        self._gemm_fusion_check_step()
         return fwd_output
+
+    def _gemm_fusion_check_step(self) -> None:
+        """S-B2: per-step poison + decision-uniformity check, outside capture.
+
+        Runs on every rank at the end of every step (after postprocess, which has
+        already synchronised on the sampled tokens). On device poison or a
+        cross-rank decision mismatch it recovers collectively and raises, so the
+        step's output is never returned as if valid. No-op unless gemm_fusion ON.
+        """
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.check_step()
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:

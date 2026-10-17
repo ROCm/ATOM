@@ -256,6 +256,24 @@ class PagedAttentionImpl(nn.Module):
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
         return o.view(-1, self.num_heads * self.head_dim)
 
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """Static (config/env, no forward context) eligibility of a fused
+        prologue: this layer's native prologue is the Triton GemmaRMSNorm
+        norm-rope-cache one. Agreed across ranks at resolve time."""
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
+        use_triton_attn = (
+            envs.ATOM_FORCE_ATTN_TRITON
+            or self.sliding_window != -1
+            or self.head_dim != 128
+        )
+        return bool(
+            not use_triton_attn
+            and self.rotary_emb is not None
+            and isinstance(self.q_norm, GemmaRMSNorm)
+            and self.k_norm is not None
+        )
+
     def gemm_fusion_prologue_state(self, fwd_ctx: ForwardContext):
         """Caches + metadata a fused GEMM prologue needs, mirroring what
         ``rope_cache`` resolves on the Gemma/Triton norm-rope-cache path.
@@ -264,21 +282,9 @@ class PagedAttentionImpl(nn.Module):
         GemmaRMSNorm one (a fused prologue then has no equivalent semantics).
         Also pins the same impl state ``rope_cache`` pins on that path.
         """
-        from atom.model_ops.layernorm import GemmaRMSNorm
-
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
-        if not (
-            not use_triton_attn
-            and self.rotary_emb is not None
-            and isinstance(self.q_norm, GemmaRMSNorm)
-            and self.k_norm is not None
-        ):
+        if not self.gemm_fusion_prologue_supported():
             return None
-        self.use_triton_attn = use_triton_attn
+        self.use_triton_attn = False
         layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         k_cache, v_cache = layer.k_cache, layer.v_cache
         x = 16 // k_cache.element_size()

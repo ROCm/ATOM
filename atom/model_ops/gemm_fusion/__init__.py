@@ -8,16 +8,25 @@ custom op lives in ``ops`` and is imported only by a model that adopts a site.
 
 from .consensus import RankDisagreement, agree, decision_key  # noqa: F401
 from .hooks import (  # noqa: F401
+    GemmFusionPoisonError,
+    GemmFusionRecoveryTimeout,
     after_graph_capture,
     before_graph_capture,
     bind_kv_cache,
+    check_step,
     init_gemm_fusion,
     profile_enabled,
     recover,
     register_site,
     shutdown,
 )
-from .site import Decision, GemmFusionContractError, GemmFusionSite, Resolution  # noqa: F401
+from .site import (  # noqa: F401
+    Decision,
+    GemmFusionBindError,
+    GemmFusionContractError,
+    GemmFusionSite,
+    Resolution,
+)
 
 
 def declare_m3_qkv_site(attn_module, *, prefix: str, sparse: bool):

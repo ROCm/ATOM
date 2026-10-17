@@ -12,7 +12,7 @@ import torch
 from atom.config import get_current_atom_config
 from atom.utils import mark_spliting_op
 
-from . import hooks
+from . import faults, hooks
 from .context import AttnFusionCtx
 
 
@@ -35,8 +35,14 @@ def run_qkv_attention(attn, x, x_scale, positions):
         attn, positions, x.shape[0], get_sp_world_size()
     )
     try:
+        if faults.active("op_raise", hooks.sp_rank()) is not None:
+            raise RuntimeError("gemm_fusion fault seam: op_raise")  # E4 test seam
         return site.run(x, x_scale, ctx)
     except Exception:
+        # A host exception on THIS rank is a one-rank event while recover() is
+        # collective. It is bounded: peers that do not arrive make this call raise
+        # GemmFusionRecoveryTimeout (chained to the original error) instead of
+        # hanging. The engine must treat the worker as failed either way.
         hooks.recover()
         raise
 

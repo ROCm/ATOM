@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from . import hooks
+from . import faults, hooks
 from .stages import aiter_gf
 
 logger = logging.getLogger("atom.gemm_fusion")
@@ -24,6 +24,11 @@ logger = logging.getLogger("atom.gemm_fusion")
 
 class GemmFusionContractError(RuntimeError):
     """A profile row covers the spec but its contract fails (all ranks)."""
+
+
+class GemmFusionBindError(RuntimeError):
+    """An invariant the fused path relies on was violated (unprepared bucket,
+    moved KV cache, wrong stream). Never downgraded to a one-rank fallback."""
 
 
 @dataclass(frozen=True)
@@ -131,41 +136,78 @@ class GemmFusionSite:
             raise KeyError(f"gemm_fusion site {self.name}: no KV cache entry {key}")
 
     # -- resolution ------------------------------------------------------
+    def _static_prologue_ok(self) -> bool:
+        """Static (config/env) eligibility of the fused norm/rope/cache stage,
+        folded into the cross-rank agreement so it can never differ per call."""
+        fn = getattr(self.attn.impl, "gemm_fusion_prologue_supported", None)
+        return True if fn is None else bool(fn())
+
     def resolve(self, tokens: int, graph_mode: str = "eager") -> Resolution:
-        r = self._by_tokens.get(tokens)
+        """Resolve a bucket. Cache key is ``(tokens, graph_mode)`` (L-2).
+
+        Only the collective ``preparing`` phase runs match/consensus/ensure. Before
+        it every call is native (``not_prepared``); after it a bucket that was not
+        resolved is native (``late_bucket``) -- both decided identically on every
+        rank without a collective inside the forward (L-3, M-1).
+        """
+        key = (tokens, graph_mode)
+        r = self._by_tokens.get(key)
         if r is not None:
             if isinstance(r, Exception):
                 raise r
             return r
         res = hooks.resources()
+        phase = hooks.phase()
         if res is None:
-            r = Resolution(None, 0, "native", "profile_off")
+            return Resolution(None, 0, "native", "profile_off")
+        if phase == "pre":
+            return Resolution(None, 0, "native", "not_prepared")  # not cached
+        if phase == "ready":
+            r = Resolution(None, 0, "native", "late_bucket")
+            self._by_tokens[key] = r
+            return r
+        gf = aiter_gf()
+        contract_err = getattr(gf, "ContractError", ())
+        errored, plan, n, msg = False, None, 0, ""
+        try:
+            plan, n = gf.match_prefix(self.spec, res.match_ctx(res.local_m(tokens), graph_mode))
+        except contract_err as e:  # covered but contract fails
+            errored, msg = True, str(e)
+        if plan is not None and n >= 2 and not self._static_prologue_ok():
+            plan, n = None, 0  # agreed below => native on every rank
+        outcome = res.agree(self.name, tokens, plan, n, errored=errored)
+        if outcome == "error":
+            r = GemmFusionContractError(msg or "contract error on all ranks")
+            self._by_tokens[key] = r
+            raise r
+        if outcome == "disagree" or plan is None:
+            reason = "rank_disagree" if outcome == "disagree" else "uncovered"
+            r = Resolution(None, 0, "native", reason)
+        elif not res.can_ensure(plan):
+            r = Resolution(None, 0, "native", "after_finalize")  # uniform: same order on all ranks
         else:
-            gf = aiter_gf()
-            contract_err = getattr(gf, "ContractError", ())
-            errored, plan, n, msg = False, None, 0, ""
-            try:
-                plan, n = gf.match_prefix(
-                    self.spec, res.match_ctx(res.local_m(tokens), graph_mode)
-                )
-            except contract_err as e:  # covered but contract fails
-                errored, msg = True, str(e)
-            outcome = res.agree(self.name, tokens, plan, n, errored=errored)
-            if outcome == "error":
-                r = GemmFusionContractError(msg or "contract error on all ranks")
-                self._by_tokens[tokens] = r
-                raise r
-            if outcome == "disagree" or plan is None:
-                reason = "rank_disagree" if outcome == "disagree" else "uncovered"
-                r = Resolution(None, 0, "native", reason)
-            elif not res.can_ensure(plan):
-                # windows are frozen (finalize ran); rank-uniform by construction
-                r = Resolution(None, 0, "native", "after_finalize")
-            else:
-                res.ensure(plan)
-                r = Resolution(plan, n, _plan_vid(plan), "profile_hit")
-        self._by_tokens[tokens] = r
+            res.ensure(plan)
+            hooks.register_plan(plan)
+            r = Resolution(plan, n, _plan_vid(plan), "profile_hit")
+        self._by_tokens[key] = r
         return r
+
+    def _runtime_mode(self) -> str:
+        return "capture" if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing() else "eager"
+
+    def agree_prepared(self, tokens: int, prepared: bool) -> None:
+        """Collective: every rank must have prepared (or not) the same buckets.
+        A mismatch downgrades the bucket to native on ALL ranks."""
+        res = hooks.resources()
+        for mode in ("eager", "capture"):
+            r = self._by_tokens.get((tokens, mode))
+            if r is None or isinstance(r, Exception) or r.plan is None:
+                continue
+            outcome = res.agree(self.name + "#prepared", tokens, None, int(bool(prepared)))
+            if outcome != "agree" or not prepared:
+                self._by_tokens[(tokens, mode)] = Resolution(
+                    None, 0, "native", "prepare_disagree" if outcome != "agree" else "unprepared"
+                )
 
     # -- persistent staging (aiter binds raw pointers once per tensor set) ------
     def _stage(self, tokens, device, dtype):
@@ -196,6 +238,7 @@ class GemmFusionSite:
                 pos=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
                 slot=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
                 prepared=False,
+                rebound=False,
                 ptrs=None,
                 m=m,
             )
@@ -257,7 +300,7 @@ class GemmFusionSite:
         ``{"x_scale","positions","slot_mapping","state"}`` -- the caller's stable
         tensors, bound as-is.
         """
-        r = self.resolve(tokens)
+        r = self.resolve(tokens, "eager")
         if r.plan is None:
             return False
         if r.n_fused < 2:
@@ -277,7 +320,7 @@ class GemmFusionSite:
             if direct is None and self.direct_provider is not None:
                 direct = self.direct_provider(tokens)
             if direct is None:
-                return False  # no stable tensors to bind; run time says rebind_needed
+                return False  # no stable tensors to bind; agree_prepared() downgrades uniformly
             state = direct["state"]
             st.xs, st.pos, st.slot = direct["x_scale"], direct["positions"], direct["slot_mapping"]
             st.ptrs = self._live_ptrs(st.xs, st.pos, state)
@@ -314,32 +357,54 @@ class GemmFusionSite:
         return None
 
     def _prepare(self, ctx, x, x_scale):
-        """-> (Resolution, reason, state, staging)."""
-        r = self.resolve(ctx.padded_tokens)
+        """-> (Resolution, reason, state, staging).
+
+        Rank-uniformity of every fallback decided here (M-1). A one-rank-only
+        fallback would hang or poison the flag chain, so each is either uniform by
+        construction or impossible:
+          dummy_run   : ``batch.is_dummy_run`` comes from ONE pickled batch that
+                        ``AsyncIOProcManager.call_func`` broadcasts to every worker
+                        of the engine core (rpc_broadcast_mq.enqueue); SP ranks share
+                        that engine core. Uniform.
+          pad_rows    : ``real_tokens`` = positions.shape[-1] (global, positions stay
+                        whole under SP) and ``padded_tokens`` = local rows * world with
+                        equal local rows on every rank. Uniform.
+          unquantized_input / xscale_layout: x dtype and [M,1] shape follow from the
+                        model (SPMD) and equal local rows. Uniform.
+          prologue support: static impl/env eligibility, agreed at resolve time.
+          prepared/bound : agreed collectively at prepare (``agree_prepared``).
+        ``check_step`` additionally all-reduces a digest of every decision made in a
+        step, turning any violation into a recovered, raised error (not a hang).
+        """
+        r = self.resolve(ctx.padded_tokens, self._runtime_mode())
         reason = r.reason
         if r.plan is None:
             return r, reason, None, None
+        if faults.active("rank_native", hooks.sp_rank()) is not None:
+            # TEST SEAM: deliberately non-uniform; the step digest must catch it
+            return Resolution(None, 0, "native", "fault_rank_native"), "fault_rank_native", None, None
         bad = self._fallback_reason(ctx, x, x_scale, r.n_fused)
-        state = None
-        if bad is None and r.n_fused >= 2:
-            state = ctx.prologue_state()
-            if state is None:
-                bad = "prologue_unsupported"
-        st = None
-        if bad is None and r.n_fused >= 2:
-            if self.bind_mode == "direct":
-                st = self._staging.get(ctx.padded_tokens)
-                # never bind lazily (maybe in capture) and never use stale pointers
-                if (
-                    st is None
-                    or not st.prepared
-                    or st.ptrs != self._live_ptrs(x_scale, ctx.positions, state)
-                ):
-                    bad = "rebind_needed"
-            else:
-                st = self._stage(ctx.padded_tokens, x.device, _out_dtype_from(ctx))
         if bad is not None:
             return Resolution(None, 0, "native", bad), bad, None, None
+        if r.n_fused < 2:
+            return r, reason, None, None
+        state = ctx.prologue_state()
+        if state is None:  # static eligibility was agreed at resolve: this is a bug
+            raise GemmFusionBindError(f"{self.name}: prologue state unavailable after agreed resolve")
+        st = self._staging.get(ctx.padded_tokens)
+        if self.bind_mode == "staged":
+            if st is None or not st.prepared:
+                raise GemmFusionBindError(f"{self.name}: bucket {ctx.padded_tokens} not prepared")
+            return r, reason, state, st
+        # direct: bound at prepare to the caller's tensors
+        if st is None or not st.prepared:
+            raise GemmFusionBindError(f"{self.name}: direct bucket {ctx.padded_tokens} not prepared")
+        live = self._live_ptrs(x_scale, ctx.positions, state)
+        if live[3:] != st.ptrs[3:]:
+            # KV cache / scale addresses are fixed at KV allocation; a change means
+            # bind_kv_cache must run again. Never launch against stale pointers.
+            raise GemmFusionBindError(f"{self.name}: KV cache address changed after prepare")
+        st.rebound = live[:3] != st.ptrs[:3]
         return r, reason, state, st
 
     def _execute(self, r, x, x_scale, ctx, state, st, out_dtype):
@@ -347,13 +412,15 @@ class GemmFusionSite:
         res = hooks.resources()
         res.finalize()  # collective + idempotent; before any plan executes
         if r.n_fused >= 2:
-            if self.bind_mode == "staged":
+            if self.bind_mode == "staged" or getattr(st, "rebound", False):
+                # staged: always. direct: only when x_scale/positions/slot_mapping
+                # moved since prepare -- the plan is bound to the held buffers, so
+                # refresh them in place (self-heal) rather than fall back on one rank.
                 n = ctx.real_tokens
                 st.xs.copy_(x_scale)
                 st.pos[:n].copy_(ctx.positions[:n])
                 st.slot[:n].copy_(state["slot_mapping"][:n])
-            # direct: st.xs/pos/slot ARE the caller's tensors (address verified in
-            # _prepare); no copies
+            # direct, unmoved: st.xs/pos/slot ARE the caller's tensors; no copies
             outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
@@ -376,11 +443,26 @@ class GemmFusionSite:
             outs = {"packed": view}
         return outs
 
-    def _decision(self, ctx, r, reason, path):
+    def _decision(self, ctx, r, reason, path, st=None):
         bm = "raw" if (path == "fused" and r.n_fused < 2) else self.bind_mode
+        if path == "fused" and st is not None and getattr(st, "rebound", False):
+            bm += "+copy"  # direct bind refreshed by copy (rank-local, not in the digest)
         d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason, bm)
         hooks.record_decision(d)
         return d
+
+    def _remainder_after_exchange(self, r, outs, ctx, consumer):
+        """Run the native remainder on a large-M recv_view. L-4: the view is only
+        valid on the launching stream until this rank's next epoch of the plan, so
+        the launch and every consumer must be on ``torch.cuda.current_stream()``."""
+        s0 = torch.cuda.current_stream()
+        out = consumer(outs["packed"])
+        if torch.cuda.current_stream() != s0:
+            raise GemmFusionBindError("recv_view consumer ran on a different stream")
+        delay = faults.active("slow_remainder", hooks.sp_rank())
+        if delay is not None:  # TEST SEAM (E5): widen the WAR window on this rank
+            _spin_gpu_us(int(delay or "2000"))
+        return out
 
     def run(self, x, x_scale, ctx):
         """Full QKV+attention. -> ((output, scale), Decision)."""
@@ -392,8 +474,10 @@ class GemmFusionSite:
         if r.n_fused >= 2:
             out = self.native.after_prologue(self, outs, state, ctx)
         else:
-            out = self.native.after_exchange(self, outs["packed"], ctx)
-        return out, self._decision(ctx, r, reason, "fused")
+            out = self._remainder_after_exchange(
+                r, outs, ctx, lambda packed: self.native.after_exchange(self, packed, ctx)
+            )
+        return out, self._decision(ctx, r, reason, "fused", st)
 
     def run_prologue(self, x, x_scale, ctx, native_full, native_after_exchange, out_dtype):
         """GEMM + exchange + norm/rope/cache only (no attention).
@@ -407,8 +491,9 @@ class GemmFusionSite:
             return "native", native_full(x, x_scale), self._decision(ctx, r, reason, "native")
         outs = self._execute(r, x, x_scale, ctx, state, st, out_dtype)
         if r.n_fused >= 2:
-            return "outs", outs, self._decision(ctx, r, reason, "fused")
-        return "native", native_after_exchange(outs["packed"]), self._decision(ctx, r, reason, "fused")
+            return "outs", outs, self._decision(ctx, r, reason, "fused", st)
+        out = self._remainder_after_exchange(r, outs, ctx, native_after_exchange)
+        return "native", out, self._decision(ctx, r, reason, "fused", st)
 
 
 class _ShimFwdCtx:
@@ -428,3 +513,11 @@ def _out_dtype():
 
 def _out_dtype_from(ctx):
     return _out_dtype()
+
+
+def _spin_gpu_us(us: int) -> None:
+    """Test seam: keep the current stream busy ~``us`` microseconds (E5)."""
+    try:
+        torch.cuda._sleep(int(us * 1000))  # cycles; order-of-magnitude is enough
+    except Exception:
+        torch.cuda.synchronize()

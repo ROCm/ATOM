@@ -2,22 +2,59 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Model-runner entry points for GEMM fusion. Default OFF.
 
-Called from ``ModelRunner`` (never from model files). With no profile set every
-function is a no-op, so OFF behavior is unchanged.
+Called from ``ModelRunner`` (never from model files). With no profile set the
+runner calls none of them, so OFF behavior is unchanged.
+
+Lifecycle (every step is collective and runs identically on every SP rank):
+  init_gemm_fusion   -> distributed up, before model build. phase "pre".
+  install (adapters) -> after model build, before compile/trace.
+  bind_kv_cache      -> after KV allocation: resolve every profile bucket
+                        (match + consensus + window ensure), finalize, prepare
+                        plans, quiesce. phase "ready".
+  before/after_graph_capture -> coverage log + clean epoch (no new resolution).
+  check_step         -> end of every model step, outside capture (S-B2).
+  recover / shutdown.
+
+Phases make every per-call decision rank-uniform without a hot-path collective:
+  "pre"   (before bind_kv_cache): every call is native, reason ``not_prepared``.
+  "ready" (after prepare):        a bucket not resolved during prepare is native,
+                                  reason ``late_bucket`` -- by construction it is not
+                                  in the exact-row profile, so this equals ``uncovered``
+                                  without running a collective inside the forward.
 """
 
+import hashlib
 import logging
+import os
+import threading
 from typing import Optional
+
+from . import faults
 
 logger = logging.getLogger("atom.gemm_fusion")
 
 _SITES: dict = {}
 _RES = None  # FusionResourcesWrapper | None
 _PROFILE: str = ""
+_KV = None  # bound kv_cache_data
+_PHASE = "pre"  # "pre" | "preparing" | "ready"
+_BROKEN = None  # reason string once recovery failed; fused path must not be used
+_PLANS: dict = {}  # owner -> plan (chosen by consensus => identical on all ranks)
 DECISIONS: list = []  # bounded dispatch evidence, newest last
 _MAX_DECISIONS = 4096
+_STEP_DIGEST = hashlib.blake2b(digest_size=4)
+_STEP_CALLS = 0
 
 
+class GemmFusionPoisonError(RuntimeError):
+    """A fused plan reported device poison (or ranks disagreed) during a step."""
+
+
+class GemmFusionRecoveryTimeout(RuntimeError):
+    """recover() did not complete in time (a peer rank never arrived)."""
+
+
+# --------------------------------------------------------------------- state
 def profile_enabled(config=None) -> bool:
     if config is None:
         try:
@@ -42,19 +79,47 @@ def resources():
     return _RES
 
 
+def phase() -> str:
+    return _PHASE
+
+
+def set_phase(p: str) -> None:
+    global _PHASE
+    _PHASE = p
+
+
 def world_or_1() -> int:
     return _RES.world if _RES is not None else 1
 
 
+def sp_rank() -> int:
+    return getattr(_RES, "rank", 0) if _RES is not None else 0
+
+
+def register_plan(plan) -> None:
+    owner = getattr(plan, "owner", None) or getattr(plan, "vid", "plan")
+    _PLANS[owner] = plan
+
+
 def record_decision(d) -> None:
+    """Log a decision and fold the rank-uniform part into the step digest.
+
+    Digest = (site, tokens, vid, n_fused, path) and, for native paths, the
+    reason. ``bind_mode``/``rebound`` notes are rank-local and excluded.
+    """
+    global _STEP_CALLS
     DECISIONS.append(d)
     if len(DECISIONS) > _MAX_DECISIONS:
         del DECISIONS[: len(DECISIONS) - _MAX_DECISIONS]
+    reason = d.reason if d.path == "native" else ""
+    _STEP_DIGEST.update(f"{d.site}|{d.tokens}|{d.vid}|{d.n_fused}|{d.path}|{reason};".encode())
+    _STEP_CALLS += 1
 
 
+# ----------------------------------------------------------------- lifecycle
 def init_gemm_fusion(config, sp_group, resources=None) -> None:
     """After distributed + SP group init, before model construction/KV alloc."""
-    global _RES, _PROFILE
+    global _RES, _PROFILE, _PHASE
     if not profile_enabled(config):
         return
     from .resources import FusionResourcesWrapper
@@ -64,35 +129,42 @@ def init_gemm_fusion(config, sp_group, resources=None) -> None:
     _PROFILE = config.gemm_fusion.profile
     gf.load_profile(_PROFILE)  # fail fast on a missing/invalid profile
     _RES = resources or FusionResourcesWrapper(sp_group, sp_world())
+    _PHASE = "pre"
     logger.info("gemm_fusion ON profile=%s world=%d", _PROFILE, _RES.world)
 
 
-_KV = None  # bound kv_cache_data, needed to prepare plans before capture
+def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = None):
+    """Padded token counts (m * world) of every exact profile row for this
+    world/arch/cu. These are the only buckets the profile can ever fuse."""
+    from .stages import aiter_gf
+
+    gf = aiter_gf()
+    prof = gf.load_profile(_PROFILE) if _PROFILE else gf.load_profile()
+    toks = set()
+    for row in prof.rows():
+        if row.world != world:
+            continue
+        if arch is not None and row.arch != arch:
+            continue
+        if cu is not None and row.cu != cu:
+            continue
+        toks.add(int(row.m) * world)
+    return sorted(toks)
 
 
-def bind_kv_cache(kv_cache_data) -> None:
-    global _KV
-    _KV = kv_cache_data
-    for s in _SITES.values():
-        s.bind_caches(kv_cache_data)
-
-
-def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
-    """Outside capture, on every rank, in this order:
-    resolve every bucket (windows ``ensure``d, consensus) -> ``finalize`` ->
-    ``plan.prepare`` for buckets the kernel can take -> clean epoch.
-
-    ``buckets``: padded token counts, or ``(padded, real)`` pairs. The small-M
-    kernel needs every row live, so only ``padded == real`` buckets are
-    prepared; others still resolve (rank-uniform) and fall back at run time
-    with reason ``pad_rows``.
+def prepare_buckets(tokens_list, device=None, out_dtype=None) -> None:
+    """Collective, outside capture, on every rank in the same order:
+    resolve (match + consensus + ensure) every (site, bucket, mode) ->
+    ``finalize`` -> ``plan.prepare`` -> ``quiesce_and_reset`` -> phase "ready".
     """
+    global _PHASE
     if _RES is None:
         return
-    pairs = [b if isinstance(b, tuple) else (b, b) for b in buckets]
+    _PHASE = "preparing"
     for s in _SITES.values():
-        for padded, _ in pairs:
-            s.resolve(padded, graph_mode="capture")
+        for t in tokens_list:
+            for mode in ("eager", "capture"):
+                s.resolve(t, graph_mode=mode)
     _RES.finalize()
     if _KV is not None:
         if device is None:
@@ -104,10 +176,35 @@ def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
 
             out_dtype = get_current_atom_config().torch_dtype
         for s in _SITES.values():
-            for padded, real in pairs:
-                # 2-stage (small-M) plans need padded == real (else pad_rows at
-                # run time); 1-stage (large-M) plans are prepared regardless.
-                s.prepare_bucket(padded, device, _KV, out_dtype, pad_rows=padded != real)
+            for t in tokens_list:
+                prepared = s.prepare_bucket(t, device, _KV, out_dtype)
+                s.agree_prepared(t, prepared)  # collective: uniform prepared state
+    _RES.quiesce_and_reset()
+    _PHASE = "ready"
+
+
+def bind_kv_cache(kv_cache_data) -> None:
+    """After KV allocation. Resolves/prepares every profile bucket (L-3)."""
+    global _KV
+    _KV = kv_cache_data
+    for s in _SITES.values():
+        s.bind_caches(kv_cache_data)
+    if _RES is not None:
+        prepare_buckets(profile_tokens(_RES.world))
+
+
+def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
+    """Coverage log + clean epoch. Everything the profile can fuse was resolved
+    and prepared in ``bind_kv_cache``; a capture bucket outside it is native
+    (``late_bucket``) on every rank, decided without a collective.
+    ``buckets``: padded token counts or ``(padded, real)`` pairs."""
+    if _RES is None:
+        return
+    pairs = [b if isinstance(b, tuple) else (b, b) for b in buckets]
+    for s in _SITES.values():
+        for padded, _real in pairs:
+            r = s.resolve(padded, graph_mode="capture")
+            logger.debug("gemm_fusion capture bucket %s %d -> %s/%s", s.name, padded, r.vid, r.reason)
     _RES.quiesce_and_reset()
 
 
@@ -116,25 +213,114 @@ def after_graph_capture() -> None:
         _RES.quiesce_and_reset()
 
 
-def recover() -> None:
-    """After a poison/error raised by a fused op."""
-    if _RES is not None:
-        _RES.quiesce_and_reset()
+# ------------------------------------------------------------------ S-B2
+def _poison_local() -> int:
+    if faults.active("poison_rank", sp_rank()) is not None:
+        return 1
+    return int(_RES.inner.poison_local())
+
+
+def check_step() -> None:
+    """Per-step host poison + uniformity check. Call at the END of every model
+    step, outside capture, after the step's sync point, on EVERY rank.
+
+    Reads every fused plan's device poison word (aiter ``poison_local``: 4-byte
+    D2H per plan), and all-reduces ``[-poison, digest, -digest]`` (MIN) so all
+    ranks agree on (a) any poison anywhere, (b) that every rank made identical
+    fused/native decisions this step. On either, runs the collective recovery and
+    raises -- never returns silently wrong output. A step that made no fused call
+    and has no prepared plan does nothing (uniform across ranks).
+    """
+    global _STEP_DIGEST, _STEP_CALLS
+    if _RES is None or _PHASE != "ready":
+        return
+    if _BROKEN is not None:
+        raise GemmFusionPoisonError(f"gemm_fusion disabled after failed recovery: {_BROKEN}")
+    if faults.active("no_poison_check", sp_rank()) is not None:
+        _reset_step()
+        return
+    if not _PLANS and _STEP_CALLS == 0:
+        return
+    p = _poison_local()
+    digest = int.from_bytes(_STEP_DIGEST.digest(), "little") & 0x7FFFFFFF
+    reduce = getattr(_RES, "_reduce_min", None)
+    if reduce is None:  # single rank
+        any_poison, uniform = p != 0, True
+    else:
+        out = reduce([-int(p != 0), digest, -digest])
+        any_poison, uniform = out[0] != 0, out[1] == -out[2]
+    _reset_step()
+    if any_poison or not uniform:
+        what = "device poison" if any_poison else "cross-rank decision mismatch"
+        logger.error("gemm_fusion check_step: %s (local poison=%d) -> recover", what, p)
+        recover()
+        raise GemmFusionPoisonError(
+            f"gemm_fusion {what}; outputs of this step are invalid; plans re-initialised"
+        )
+
+
+def _reset_step() -> None:
+    global _STEP_DIGEST, _STEP_CALLS
+    _STEP_DIGEST = hashlib.blake2b(digest_size=4)
+    _STEP_CALLS = 0
+
+
+# ------------------------------------------------------------------ L-1
+def recover(timeout_s: Optional[float] = None) -> None:
+    """Collective recovery: device sync -> drain -> barrier -> re-init -> barrier.
+
+    EVERY SP rank must call it (``check_step`` makes the decision collective).
+    A rank that never arrives would block the others in the barrier, so the call
+    is bounded: after ``timeout_s`` (env ``ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S``,
+    default 120) it marks the fused path broken and raises
+    ``GemmFusionRecoveryTimeout``; the worker must then be treated as failed.
+    """
+    global _BROKEN
+    if _RES is None:
+        return
+    if faults.active("recover_skip", sp_rank()) is not None:
+        return
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S", "120"))
+    err = []
+
+    def _run():
+        try:
+            _RES.quiesce_and_reset()
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+
+    t = threading.Thread(target=_run, name="gemm_fusion_recover", daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        _BROKEN = f"recover timeout after {timeout_s}s"
+        raise GemmFusionRecoveryTimeout(_BROKEN)
+    if err:
+        _BROKEN = f"recover failed: {err[0]!r}"
+        raise err[0]
 
 
 def shutdown() -> None:
-    global _RES
+    global _RES, _PHASE
     if _RES is not None:
         _RES.release()
         _RES = None
+    _PLANS.clear()
     _SITES.clear()
     DECISIONS.clear()
+    _PHASE = "pre"
 
 
 def reset_for_tests(res: Optional[object] = None) -> None:
-    global _RES, _PROFILE, _KV
+    global _RES, _PROFILE, _KV, _PHASE, _BROKEN
     _SITES.clear()
+    _PLANS.clear()
     DECISIONS.clear()
     _KV = None
     _RES = res
     _PROFILE = ""
+    _PHASE = "ready" if res is not None else "pre"
+    _BROKEN = None
+    _reset_step()
+    faults.reload()

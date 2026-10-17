@@ -146,22 +146,38 @@ def prepare_cases(cases, comm):
     if hooks.resources() is None:
         return
     ents = [_site_for(c, comm) for c in cases]
-    for (site, _, _), c in zip(ents, cases):
-        site.resolve(c.spec.padded_tokens, graph_mode="eager")
-    hooks.resources().finalize()
-    for (site, _, _), c in zip(ents, cases):
-        sp = c.spec
-        site.prepare_bucket(
-            sp.padded_tokens, c.x.device, None, torch.bfloat16,
-            pad_rows=sp.padded_tokens != sp.tokens,
-            # direct bind: the case's own tensors, no staging copies
-            direct={
-                "x_scale": c.x_scale,
-                "positions": c.positions,
-                "slot_mapping": c.slot_mapping,
-                "state": _caches_state(c, c.slot_mapping),
-            },
-        )
+    prev = hooks.phase()
+    hooks.set_phase("preparing")  # resolve (match + consensus + ensure) is allowed now
+    try:
+        for (site, _, _), c in zip(ents, cases):
+            for mode in ("eager", "capture"):
+                site.resolve(c.spec.padded_tokens, graph_mode=mode)
+        hooks.resources().finalize()
+        for (site, _, _), c in zip(ents, cases):
+            sp = c.spec
+            prepared = site.prepare_bucket(
+                sp.padded_tokens, c.x.device, None, torch.bfloat16,
+                pad_rows=sp.padded_tokens != sp.tokens,
+                # direct bind: the case's own tensors, no staging copies
+                direct={
+                    "x_scale": c.x_scale,
+                    "positions": c.positions,
+                    "slot_mapping": c.slot_mapping,
+                    "state": _caches_state(c, c.slot_mapping),
+                },
+            )
+            site.agree_prepared(sp.padded_tokens, prepared)  # collective, uniform
+        hooks.resources().quiesce_and_reset()
+    finally:
+        hooks.set_phase("ready" if prev != "pre" or hooks.resources() else prev)
+
+
+def check_poison():
+    """Per-sample host check for the harness: read every plan's device poison
+    word and agree across ranks, plus the cross-rank decision digest. On poison
+    or mismatch: collective recovery, then raises ``GemmFusionPoisonError``.
+    Call after every measured/checked sample, on every rank (S-B2)."""
+    hooks.check_step()
 
 
 def decisions():
@@ -203,4 +219,4 @@ def quant_all2all_o_proj(case, comm, o_path="current"):
     return operators.quant_all2all_o_proj(case, comm, o_path)
 
 
-__all__ = ["qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj"]
+__all__ = ["qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj", "check_poison"]
