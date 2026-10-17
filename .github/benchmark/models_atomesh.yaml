@@ -1339,7 +1339,7 @@ models:
             common:
               <<: *kimi_k3_pp8_ondemand_env
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-            prefill:
+            prefill: &kimi_k3_pp8_p0_prefill_env
               <<: *kimi_k3_pp8_state128_prefill_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
               OFFLOAD_STATE_CPU_SIZE: "160"
@@ -1355,6 +1355,18 @@ models:
               max_num_seqs: 144
           run_eval: true
           eval_concurrency: [72]
+
+        # Test only. The c88 P0 cell with the offload pack and copy streams at
+        # high priority, so they stop queueing behind the prefill forward.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_p0
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-p1
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_pp8_p0_prefill_env
+              OFFLOAD_STREAM_PRIORITY: "-1"
 
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
