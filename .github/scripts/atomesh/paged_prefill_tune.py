@@ -335,10 +335,14 @@ def configurations(microarchitecture=False):
         # Compile-time MFMA layout and occupancy candidates for large-Q 2D.
         # Each runs the whole numerical population in isolated workers.
         return [
-            (tile, warps, 1, 1, matrix, waves)
-            for tile, warps in ((128, 4), (256, 8))
-            for matrix in (16, 32)
-            for waves in (1, 2)
+            (128, 4, 1, 1, 32, 2),  # production 2D control
+            (256, 8, 1, 1, 32, 1),  # previous large-query winner
+            (128, 2, 1, 1, 32, 1),
+            (128, 2, 2, 1, 32, 1),
+            (128, 4, 2, 1, 32, 1),
+            (256, 4, 1, 1, 32, 1),
+            (256, 4, 2, 1, 32, 1),
+            (256, 8, 2, 1, 32, 1),
         ]
     # Finalists from the broad sweep plus neighbouring split counts. The
     # production default is independently checked before these experiments.
