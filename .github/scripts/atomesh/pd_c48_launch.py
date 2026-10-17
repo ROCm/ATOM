@@ -7,10 +7,10 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 def draft_path(model: str) -> Path:
@@ -18,7 +18,7 @@ def draft_path(model: str) -> Path:
 
 
 def render(config: dict, role: str, model: str, host: str, proxy: str,
-           port: int, discovery: int) -> tuple[list[str], dict[str, str]]:
+           port: int, discovery: int, trace_dir: str | None = None) -> tuple[list[str], dict[str, str]]:
     args = copy.deepcopy(config["roles"][role]["args"])
     args["speculative-config"]["model"] = str(draft_path(model))
     transfer = args["kv-transfer-config"]
@@ -30,6 +30,10 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
             connector["kv_connector_extra_config"].update(
                 proxy_ip=proxy, proxy_ping_port=discovery, http_port=port)
     args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
+    if "profiler-config" in args:
+        if not trace_dir or role != "prefill":
+            raise ValueError("C48 profiler requires an explicit Prefill trace directory")
+        args["profiler-config"]["torch_profiler_dir"] = trace_dir
     argv = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", model]
     for key, value in args.items():
         if isinstance(value, bool):
@@ -66,11 +70,16 @@ def main() -> None:
     options = parser.parse_args()
     config = json.loads(options.config.read_text())
     argv, additions = render(config, options.role, options.model, options.host,
-                             options.proxy, options.port, options.discovery)
+                             options.proxy, options.port, options.discovery,
+                             str(options.output.parent.parent / "traces" / options.role))
     additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
     record = {"config": str(options.config), "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
               "role": options.role, "argv": argv, "environment_overrides": additions,
               "diagnostic": "Preserve explicit synthetic AL; verify the recorded read-only RDMA startup source mount"}
+    record["observation_module_sha256"] = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in Path(__file__).parent.glob("pd_c48_*.py")
+    }
     options.output.parent.mkdir(parents=True, exist_ok=True)
     if options.execute:
         import vllm
@@ -92,7 +101,7 @@ def main() -> None:
         if command:
             try:
                 result = subprocess.run([command, "--showmeminfo", "vram", "--showpids", "--json"],
-                                        text=True, capture_output=True, timeout=20)
+                                        text=True, capture_output=True, timeout=20, check=False)
                 record["gpu_state_before_worker_start"] = {"returncode": result.returncode,
                     "stdout": result.stdout[:65536], "stderr": result.stderr[:4096]}
             except subprocess.TimeoutExpired:

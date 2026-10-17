@@ -1,7 +1,9 @@
-"""One-time model-load evidence. No forward, scheduling, or sampling overrides."""
+"""Model evidence, bounded startup stacks and optional Prefill trace labels."""
 import json
 import math
 import os
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 
 from vllm.v1.worker.gpu_worker import Worker
@@ -46,6 +48,28 @@ def inspect_speculative(spec, expected_drafts, expected_al):
 
 
 class ManifestWorker(Worker):
+    def initialize_from_config(self, kv_cache_config):
+        from pd_c48_timeline import startup_stage
+        with startup_stage(self, "initialize_from_config"):
+            return super().initialize_from_config(kv_cache_config)
+
+    def annotate_profile(self, scheduler_output):
+        original = super().annotate_profile(scheduler_output)
+        if (os.environ.get("C48_PREFILL_TIMELINE") != "1"
+                or os.environ["C48_DIAG_ROLE"] != "prefill"
+                or not self.profiler or not self.profiler.should_annotate):
+            return original
+        import torch
+        from pd_c48_timeline import batch_key
+
+        @contextmanager
+        def annotated():
+            with original, torch.profiler.record_function(
+                "C48-PREFILL-BATCH:" + batch_key(scheduler_output)
+            ):
+                yield
+        return annotated()
+
     def load_model(self, *, load_dummy_weights=False):
         from pd_c48_memory import LoadingMemoryProbe
         with LoadingMemoryProbe(self):
@@ -58,6 +82,7 @@ class ManifestWorker(Worker):
         spec = self.vllm_config.speculative_config
         data = {"role": os.environ["C48_DIAG_ROLE"], "rank": self.rank,
                 "target": target, "draft": draft, "ptpc_counts": counts,
+                "profiler_config": asdict(self.vllm_config.profiler_config),
                 "speculative": inspect_speculative(spec,
                     int(os.environ["C48_DIAG_DRAFT_TOKENS"]),
                     float(os.environ["C48_DIAG_AL"]))}

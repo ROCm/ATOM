@@ -20,9 +20,20 @@ run_aiperf_agentic_benchmark() {
   git -C "${AIPERF_DIR}" rev-parse HEAD > "${out_dir}/aiperf-commit.txt"
   "${AIPERF_VENV}/bin/python" -m pip freeze > "${out_dir}/client-packages.txt"
   snapshot_eval_metrics "${out_dir}" before
+  local -a profile_wrapper=()
+  if [[ "${ATOMESH_C48_PREFILL_PROFILE:-0}" == "1" ]]; then
+    profile_wrapper=("${AIPERF_VENV}/bin/python" "${ATOMESH_SCRIPT_DIR}/pd_c48_profile.py"
+      --prefill "http://${prefill_ips[0]}:${prefill_ports[0]}"
+      --output "${out_dir}/prefill-profile" --traces "${RUN_DIR}/traces"
+      --timeline "${RUNTIME_LOG_DIR}/prefill-timeline"
+      --aiperf-log "${out_dir}/logs/aiperf.log"
+      --seconds 10 --offsets 600 1500 3000 --ranks 8
+      --phase-timeout 7200 --finish-timeout 5400 --)
+  fi
   # Match the historical InferenceX agentx invocation and pinned scenario defaults.
   # Paths and addresses follow this allocation; no template or context override.
-  "${AIPERF_VENV}/bin/aiperf" profile \
+  local benchmark_rc=0
+  "${profile_wrapper[@]}" "${AIPERF_VENV}/bin/aiperf" profile \
     --scenario agentx --url "http://127.0.0.1:${ROUTER_PORT}" \
     --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
     --concurrency 48 --benchmark-duration 3600 --tokenizer-trust-remote-code \
@@ -30,9 +41,10 @@ run_aiperf_agentic_benchmark() {
                      "http://${decode_ips[0]}:${decode_ports[0]}/metrics" \
     --output-artifact-dir "${out_dir}" \
     --public-dataset semianalysis_cc_traces_weka_062126 \
-    2>&1 | tee "${out_dir}/aiperf.log"
+    2>&1 | tee "${out_dir}/aiperf.log" || benchmark_rc=$?
   snapshot_eval_metrics "${out_dir}" after
   test -s "${out_dir}/profile_export_aiperf.json"
   write_aiperf_dashboard_json "${out_dir}/profile_export_aiperf.json" \
     "${RUN_DIR}/benchmark_results/pd-vllm-c48-${ATOMESH_C48_CASE}.json" 48
+  return "${benchmark_rc}"
 }
