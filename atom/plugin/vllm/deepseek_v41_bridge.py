@@ -2005,29 +2005,55 @@ def _v41_state_checkpoints_around_forward(vllm_config, common_attn_metadata, pre
         return
     worker = current_state_checkpoint_worker(adapter)
     rows = len(slots)
-    run_state_checkpoint_step(
-        worker,
-        common_attn_metadata,
-        capturing=bool(getattr(prepared, "capturing", False)),
-        plan=lambda: plan_state_checkpoint_ops(
+    # The step staged just above is already marked tentative --
+    # `PagedAttentionCache.prepare_state` sets `pending` while the builder
+    # runs, which is before this. Every copy below then meets
+    # `StateCopies._validate` -> `cache.require_committed()` and raises
+    # "Commit the accepted prefix before reusing or checkpointing state",
+    # for the restores as well as the stores.
+    #
+    # The guard is right and it is early here: it protects the slots from
+    # being read or written while a tentative step's result is outstanding,
+    # and this step's forward has not run. The slots still hold the previous
+    # step's committed state, which is exactly what a decode keep stores and
+    # what a prefix hit must overwrite before the forward reads it -- the
+    # mechanism's own order puts both before the forward by design.
+    #
+    # So the handle is taken aside for the duration and put back. Nothing in
+    # between can advance it: `run_state_checkpoint_step` issues copies and
+    # returns, and the sampler that commits this step cannot run until after
+    # the forward.
+    cache = getattr(getattr(worker.copier, "_copies", None), "cache", None)
+    _pending = getattr(cache, "pending", None) if cache is not None else None
+    if _pending is not None:
+        cache.pending = None
+    try:
+        run_state_checkpoint_step(
             worker,
             common_attn_metadata,
-            rows=rows,
-            slots=list(slots),
-            # ndarray, not list: `plan_state_checkpoint_ops` does `chunk_start[:rows]
-            # .astype(np.int64)` to pair every row's end with the plan. A list
-            # got that far only once the store plan actually reached the
-            # worker, so the wrong type sat here unexercised.
-            chunk_start=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
-            lens=np.asarray(snapshot.query_lens[:rows], dtype=np.int64),
-            fresh_rows=getattr(prepared, "reset_rows", ()) or (),
-            block=int(adapter.block_size),
-            is_target=True,
+            capturing=bool(getattr(prepared, "capturing", False)),
+            plan=lambda: plan_state_checkpoint_ops(
+                worker,
+                common_attn_metadata,
+                rows=rows,
+                slots=list(slots),
+                # ndarray, not list: `plan_state_checkpoint_ops` does `chunk_start[:rows]
+                # .astype(np.int64)` to pair every row's end with the plan. A list
+                # got that far only once the store plan actually reached the
+                # worker, so the wrong type sat here unexercised.
+                chunk_start=np.asarray(snapshot.num_computed[:rows], dtype=np.int64),
+                lens=np.asarray(snapshot.query_lens[:rows], dtype=np.int64),
+                fresh_rows=getattr(prepared, "reset_rows", ()) or (),
+                block=int(adapter.block_size),
+                is_target=True,
+                name=adapter.name,
+            ),
+            reset_fn=lambda slot_ids: None,
             name=adapter.name,
-        ),
-        reset_fn=lambda slot_ids: None,
-        name=adapter.name,
-    )
+        )
+    finally:
+        if _pending is not None:
+            cache.pending = _pending
 
 
 def _v41_install_state_checkpoint_runtime(vllm_config, cache, num_slots) -> None:
