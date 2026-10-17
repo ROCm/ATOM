@@ -364,6 +364,103 @@ def summarize_prefill_shapes(path):
     }
 
 
+def summarize_aiperf_tail(path):
+    """Stream completed profiling requests into compact tail-latency evidence."""
+
+    def metric(record, name):
+        value = record.get("metrics", {}).get(name)
+        if isinstance(value, dict):
+            value = value.get("value")
+        return value if isinstance(value, (int, float)) else None
+
+    def percentile(values, p):
+        values = sorted(values)
+        if not values:
+            return None
+        rank = (len(values) - 1) * p / 100
+        low = int(rank)
+        high = min(low + 1, len(values) - 1)
+        return values[low] + (values[high] - values[low]) * (rank - low)
+
+    rows, errors, malformed, cancelled = [], 0, 0, 0
+    with path.open() as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                malformed += 1
+                continue
+            metadata = record.get("metadata", {})
+            if metadata.get("benchmark_phase") != "profiling":
+                continue
+            if record.get("error"):
+                errors += 1
+                continue
+            if metadata.get("was_cancelled"):
+                cancelled += 1
+                continue
+            ttft = metric(record, "time_to_first_token")
+            if ttft is None:
+                continue
+            row = {
+                key: metadata.get(key)
+                for key in (
+                    "x_request_id",
+                    "source_trace_id",
+                    "source_outer_idx",
+                    "turn_index",
+                    "source_kind",
+                    "request_start_ns",
+                    "request_end_ns",
+                )
+            }
+            row.update(
+                ttft_ms=ttft,
+                isl=metric(record, "input_sequence_length"),
+                cached=metric(record, "usage_prompt_cache_read_tokens"),
+                osl=metric(record, "output_sequence_length"),
+                latency_ms=metric(record, "request_latency"),
+            )
+            row["uncached"] = (
+                row["isl"] - row["cached"]
+                if row["isl"] is not None and row["cached"] is not None
+                else None
+            )
+            rows.append(row)
+    groups = []
+    for field in ("isl", "uncached"):
+        low = 0
+        for high in (1024, 8192, 32768, 131072, 524288, 1048577):
+            population = [
+                r["ttft_ms"]
+                for r in rows
+                if r[field] is not None and low <= r[field] < high
+            ]
+            groups.append(
+                {
+                    "field": field,
+                    "low": low,
+                    "high": high,
+                    "count": len(population),
+                    "p50_ms": percentile(population, 50),
+                    "p90_ms": percentile(population, 90),
+                    "p99_ms": percentile(population, 99),
+                }
+            )
+            low = high
+    return {
+        "successful": len(rows),
+        "errors": errors,
+        "malformed": malformed,
+        "cancelled": cancelled,
+        "buckets": groups,
+        "ttft_ms": {
+            str(p): percentile([r["ttft_ms"] for r in rows], p) for p in (50, 90, 99)
+        },
+        "top": sorted(rows, key=lambda r: r["ttft_ms"], reverse=True)[:100],
+    }
+
+
 def collect(target, output, *, roots=ROOTS):
     run_id(target)
     output.mkdir(parents=True, exist_ok=True)
@@ -417,6 +514,20 @@ def collect(target, output, *, roots=ROOTS):
                     destination.write_text(json.dumps(scores) + "\n")
                 except (OSError, ValueError, KeyError) as exc:
                     manifest["errors"].append({"path": str(sample), "error": str(exc)})
+            for records in source.glob(
+                "slurm_job-*/benchmark_results/*/profile_export.jsonl"
+            ):
+                if not records.resolve().is_relative_to(source):
+                    continue
+                try:
+                    summary = summarize_aiperf_tail(records)
+                    destination = (
+                        output / source.name / records.relative_to(source)
+                    ).with_name("aiperf-tail-summary.json")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(summary) + "\n")
+                except (OSError, ValueError) as exc:
+                    manifest["errors"].append({"path": str(records), "error": str(exc)})
             for pattern in PATTERNS:
                 # Rotated history must not crowd out another rank's live evidence.
                 for path in sorted(
@@ -504,6 +615,7 @@ def emit_log_annotations(output):
                 "metadata-rank-0.json",
                 "runtime-state.json",
                 "prefill-shapes.json",
+                "aiperf-tail-summary.json",
                 "sweep-summary.json",
                 "profile_export_aiperf.json",
                 "prefill-rank-0.log",
