@@ -42,6 +42,7 @@ class Decision:
     n_fused: int
     path: str  # "native" | "fused"
     reason: str = ""
+    bind_mode: str = ""  # "direct" | "staged" | "raw" (1-stage plans take raw pointers)
 
 
 def _plan_vid(plan) -> str:
@@ -71,8 +72,20 @@ class GemmFusionSite:
         sparse=False,
         skip_index=False,
         register=True,
+        bind_mode="staged",
+        direct_provider=None,
     ):
         gf = aiter_gf()
+        if bind_mode not in ("direct", "staged"):
+            raise ValueError(f"bind_mode must be 'direct' or 'staged', got {bind_mode!r}")
+        # 'staged': per-call copies into site-owned buffers (eager, unstable
+        # addresses). 'direct': plans bind the caller's own x_scale/positions/
+        # slot_mapping/cache tensors at prepare time, no per-call copies; the
+        # caller guarantees stable addresses (graph static buffers, harness
+        # cases). A changed address is never used silently: reason 'rebind_needed'.
+        self.bind_mode = bind_mode
+        # optional callable(tokens) -> {"x_scale","positions","slot_mapping","state"}
+        self.direct_provider = direct_provider
         self.name = name
         self.linear = linear
         self.stages = tuple(stages)
@@ -175,12 +188,16 @@ class GemmFusionSite:
                 kv = (tokens, impl.num_kv_heads, impl.head_dim)
                 outs["k"] = torch.empty(kv, dtype=dtype, device=device)
                 outs["v"] = torch.empty(kv, dtype=dtype, device=device)
+            staged = self.bind_mode == "staged"
             st = SimpleNamespace(
                 outs=outs,
-                xs=torch.empty((m, 1), dtype=torch.float32, device=device),
-                pos=torch.empty((tokens,), dtype=torch.int64, device=device),
-                slot=torch.empty((tokens,), dtype=torch.int64, device=device),
+                # direct mode: xs/pos/slot are the caller's tensors, set at prepare
+                xs=torch.empty((m, 1), dtype=torch.float32, device=device) if staged else None,
+                pos=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
+                slot=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
                 prepared=False,
+                ptrs=None,
+                m=m,
             )
             self._staging[tokens] = st
         return st
@@ -216,10 +233,29 @@ class GemmFusionSite:
             meta["index_k_norm_w"] = self._f32("ikw", impl.index_k_norm.weight)
         return meta
 
-    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, pad_rows=False):
+    @staticmethod
+    def _ptr(t):
+        return 0 if t is None else t.data_ptr()
+
+    def _live_ptrs(self, x_scale, positions, state):
+        """Addresses the plan binds (small-M); compared at run time in direct mode."""
+        return (
+            self._ptr(x_scale),
+            self._ptr(positions),
+            self._ptr(state["slot_mapping"]),
+            self._ptr(state["k_cache"]),
+            self._ptr(state.get("v_cache_shuffle", state["v_cache"])),
+            self._ptr(state.get("k_scale_view", state.get("k_scale"))),
+            self._ptr(state.get("v_scale_view", state.get("v_scale"))),
+        )
+
+    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, pad_rows=False, direct=None):
         """Bind the plan for one (padded == real) bucket OUTSIDE graph capture.
 
         Called after ``bind_kv_cache`` and the bucket's resolution, before capture.
+        ``direct`` (direct mode only; else ``direct_provider(tokens)``):
+        ``{"x_scale","positions","slot_mapping","state"}`` -- the caller's stable
+        tensors, bound as-is.
         """
         r = self.resolve(tokens)
         if r.plan is None:
@@ -237,10 +273,21 @@ class GemmFusionSite:
         st = self._stage(tokens, device, out_dtype)
         if st.prepared:
             return True
-        state = self.attn.impl.gemm_fusion_prologue_state(_ShimFwdCtx(kv_cache_data, st.slot, self.attn.impl))
-        if state is None:
-            return False
-        x = torch.zeros((st.xs.shape[0], self.linear.input_size), dtype=torch.float8_e4m3fn, device=device)
+        if self.bind_mode == "direct":
+            if direct is None and self.direct_provider is not None:
+                direct = self.direct_provider(tokens)
+            if direct is None:
+                return False  # no stable tensors to bind; run time says rebind_needed
+            state = direct["state"]
+            st.xs, st.pos, st.slot = direct["x_scale"], direct["positions"], direct["slot_mapping"]
+            st.ptrs = self._live_ptrs(st.xs, st.pos, state)
+        else:
+            state = self.attn.impl.gemm_fusion_prologue_state(
+                _ShimFwdCtx(kv_cache_data, st.slot, self.attn.impl)
+            )
+            if state is None:
+                return False
+        x = torch.zeros((st.m, self.linear.input_size), dtype=torch.float8_e4m3fn, device=device)
         res = hooks.resources()
         res.finalize()
         prep = getattr(r.plan, "prepare", None)
@@ -273,26 +320,40 @@ class GemmFusionSite:
         if r.plan is None:
             return r, reason, None, None
         bad = self._fallback_reason(ctx, x, x_scale, r.n_fused)
+        state = None
         if bad is None and r.n_fused >= 2:
             state = ctx.prologue_state()
             if state is None:
                 bad = "prologue_unsupported"
+        st = None
+        if bad is None and r.n_fused >= 2:
+            if self.bind_mode == "direct":
+                st = self._staging.get(ctx.padded_tokens)
+                # never bind lazily (maybe in capture) and never use stale pointers
+                if (
+                    st is None
+                    or not st.prepared
+                    or st.ptrs != self._live_ptrs(x_scale, ctx.positions, state)
+                ):
+                    bad = "rebind_needed"
+            else:
+                st = self._stage(ctx.padded_tokens, x.device, _out_dtype_from(ctx))
         if bad is not None:
             return Resolution(None, 0, "native", bad), bad, None, None
-        st = None
-        if r.n_fused >= 2:
-            st = self._stage(ctx.padded_tokens, x.device, _out_dtype_from(ctx))
-        return r, reason, (state if r.n_fused >= 2 else None), st
+        return r, reason, state, st
 
     def _execute(self, r, x, x_scale, ctx, state, st, out_dtype):
         """Run the fused prefix; return its ``outs`` dict."""
         res = hooks.resources()
         res.finalize()  # collective + idempotent; before any plan executes
         if r.n_fused >= 2:
-            n = ctx.real_tokens
-            st.xs.copy_(x_scale)
-            st.pos[:n].copy_(ctx.positions[:n])
-            st.slot[:n].copy_(state["slot_mapping"][:n])
+            if self.bind_mode == "staged":
+                n = ctx.real_tokens
+                st.xs.copy_(x_scale)
+                st.pos[:n].copy_(ctx.positions[:n])
+                st.slot[:n].copy_(state["slot_mapping"][:n])
+            # direct: st.xs/pos/slot ARE the caller's tensors (address verified in
+            # _prepare); no copies
             outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
@@ -316,7 +377,8 @@ class GemmFusionSite:
         return outs
 
     def _decision(self, ctx, r, reason, path):
-        d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason)
+        bm = "raw" if (path == "fused" and r.n_fused < 2) else self.bind_mode
+        d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason, bm)
         hooks.record_decision(d)
         return d
 
