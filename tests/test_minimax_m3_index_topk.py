@@ -248,6 +248,55 @@ class TestForcedSelection:
         )  # fmt: skip
         self._check(idx, sctx, causal)
 
+    def test_decode_padding_rows_have_zero_context(self):
+        from atom.model_ops.minimax_m3.index_topk import minimax_m3_index_topk_decode
+
+        batch, q_per_req, heads, ctx = 2, 4, 1, 1677
+        nblk = -(-ctx // SPARSE_BLOCK_SIZE)
+        g = torch.Generator(device="cuda").manual_seed(0)
+        q = torch.randn(
+            batch * q_per_req,
+            heads,
+            HEAD_DIM,
+            generator=g,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        cache = torch.randn(
+            batch * nblk,
+            SPARSE_BLOCK_SIZE,
+            HEAD_DIM,
+            generator=g,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        block_table = torch.arange(batch * nblk, dtype=torch.int32, device="cuda").view(
+            batch, nblk
+        )
+        seq_lens = torch.tensor([0, ctx], dtype=torch.int32, device="cuda")
+
+        idx, _, sparse_ctx = minimax_m3_index_topk_decode(
+            q,
+            cache,
+            block_table,
+            seq_lens,
+            ctx,
+            TOPK,
+            INIT,
+            LOCAL,
+            heads,
+            HEAD_DIM**-0.5,
+            emit_sparse_block_table=True,
+            max_query_len=q_per_req,
+        )
+
+        assert torch.equal(
+            sparse_ctx[:q_per_req],
+            torch.zeros(q_per_req, dtype=torch.int32, device="cuda"),
+        )
+        assert torch.all(sparse_ctx >= 0)
+        assert torch.all(idx[:, :q_per_req] == -1)
+
     @staticmethod
     def _check(idx, sctx, causal):
         idx = idx.reshape(-1, idx.shape[-1]).cpu()

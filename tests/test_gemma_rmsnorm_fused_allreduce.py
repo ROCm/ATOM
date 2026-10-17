@@ -159,3 +159,90 @@ def test_support_is_read_off_the_group_method(monkeypatch):
         probe.cache_clear()
         assert probe() is has_flag
     probe.cache_clear()
+
+
+def test_gfx1250_m3_uses_unfused_allreduce_before_gemma_norm(monkeypatch):
+    seen = {}
+    hidden = torch.randn(3, HIDDEN)
+    residual = torch.randn_like(hidden)
+    reduced = hidden + 7
+
+    class Norm:
+        def __call__(self, value, residual_value):
+            seen["norm"] = (value, residual_value)
+            return value + 1, residual_value + 1
+
+    monkeypatch.setattr(
+        layernorm_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(layernorm_module, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(
+        layernorm_module,
+        "tensor_model_parallel_all_reduce",
+        lambda value: reduced,
+    )
+    monkeypatch.setattr(
+        layernorm_module,
+        "tensor_model_parallel_fused_allreduce_rmsnorm",
+        lambda *args, **kwargs: pytest.fail("gfx1250 must avoid fused AR RMSNorm"),
+    )
+
+    output, residual_out = layernorm_module.fused_allreduce_gemma_rms_norm(
+        hidden, residual, Norm()
+    )
+    assert seen["norm"] == (reduced, residual)
+    assert torch.equal(output, reduced + 1)
+    assert torch.equal(residual_out, residual + 1)
+
+
+def test_gfx1250_m3_quantizes_after_unfused_allreduce_norm(monkeypatch):
+    import aiter
+
+    hidden = torch.randn(3, HIDDEN)
+    residual = torch.randn_like(hidden)
+    reduced = hidden + 5
+    normed = hidden + 3
+    residual_out = residual + 3
+    fp8_output = torch.empty_like(hidden)
+    scale = torch.empty((hidden.shape[0], 1), dtype=torch.float32)
+
+    class Norm:
+        def __call__(self, value, residual_value):
+            assert value is reduced
+            assert residual_value is residual
+            return normed, residual_out
+
+    def fake_get_quant(quant_type):
+        assert quant_type == QuantType.per_Token
+
+        def quant(value, *, quant_dtype):
+            assert value is normed
+            assert quant_dtype is not None
+            return fp8_output, scale
+
+        return quant
+
+    monkeypatch.setattr(
+        layernorm_module, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(layernorm_module, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(
+        layernorm_module,
+        "tensor_model_parallel_all_reduce",
+        lambda value: reduced,
+    )
+    monkeypatch.setattr(aiter, "get_hip_quant", fake_get_quant)
+    monkeypatch.setattr(
+        layernorm_module,
+        "tensor_model_parallel_fused_allreduce_rmsnorm_quant",
+        lambda *args, **kwargs: pytest.fail(
+            "gfx1250 must avoid fused AR RMSNorm quant"
+        ),
+    )
+
+    output, scale_out, residual_result = (
+        layernorm_module.fused_allreduce_gemma_rms_norm_quant(hidden, residual, Norm())
+    )
+    assert output is fp8_output
+    assert scale_out is scale
+    assert residual_result is residual_out

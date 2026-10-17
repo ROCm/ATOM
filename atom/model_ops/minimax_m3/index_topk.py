@@ -157,7 +157,10 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
-    tl.store(sctx_ptr, bt_ctx)
+    # CUDA-graph padding rows have seq_len == 0. Under multi-token verify their
+    # synthetic prefix is negative; attention must see an empty row, never a
+    # negative context length.
+    tl.store(sctx_ptr, tl.maximum(bt_ctx, 0))
 
 
 # ---------------------------------------------------------------------------
