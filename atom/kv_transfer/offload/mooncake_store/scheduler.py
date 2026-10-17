@@ -656,8 +656,22 @@ class MooncakeStoreOffloadScheduler(ChunkedOffloadSchedulerBase):
         load_spec: LoadSpec,
         load_operation: LoadOperationId,
         transfer_end: int,
+        recurrent: Any = None,
     ) -> LMCacheReqMeta:
-        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``."""
+        """Load ``[hbm, transfer_end)``: the digests of ``[0, transfer_end)``.
+
+        ``recurrent`` is the base signature's: a snapshot riding the PAGE
+        object, which this transport has no object to carry. Refused rather
+        than dropped -- a load that silently loses the recurrent half restores
+        a prefix whose state is someone else's, which is the failure the whole
+        hand-off exists to prevent.
+        """
+        if recurrent is not None:
+            raise ValueError(
+                "mooncake_store carries no recurrent state: a load for "
+                f"{getattr(seq, 'id', seq)} named one, and this transport has "
+                "no object to put it in"
+            )
         hashes = prompt_chunk_hashes(seq, self.chunk_size)
         return LMCacheReqMeta(
             req_id=seq.id,

@@ -108,9 +108,24 @@ class OffloadConfigShim:
         kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         role = getattr(kv_transfer_config, "kv_role", None) or "kv_both"
         extra = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+        extra = dict(extra) if isinstance(extra, dict) else {}
+        # Published in BOTH spellings on purpose. ATOM's offload readers
+        # disagree about where the option bag lives, and the disagreement is
+        # silent in one direction: ``offload/config.py`` reads
+        # ``kvc.get("kv_connector_extra_config", kvc)`` and so tolerates the
+        # flattened form, but ``offload/mp/deployment.py`` reads
+        # ``kvc.get("kv_connector_extra_config", {})`` with no such fallback.
+        # Publishing only the flattened form would hand the MP path an empty
+        # bag, and every option there has a default -- server host and port
+        # included -- so nothing would raise: the worker would quietly dial
+        # tcp://localhost:5555 instead of the configured server. ``kv_role``
+        # stays out of the nested copy, which is forwarded to LMCache's own
+        # storage-option parser once the ``lmcache.mp.*`` keys are stripped;
+        # it is a transfer role, not a storage option.
         self.kv_transfer_config = {
             "kv_role": role,
-            **(dict(extra) if isinstance(extra, dict) else {}),
+            **extra,
+            "kv_connector_extra_config": extra,
         }
 
         outer_hf = getattr(model_config, "hf_config", None)
@@ -131,6 +146,29 @@ class OffloadConfigShim:
         self.decode_context_parallel_size = int(
             getattr(parallel_config, "decode_context_parallel_size", 1) or 1
         )
+        # The multiprocess offload path reads its deployment geometry off the
+        # config object directly rather than off ``parallel_config``, and every
+        # read has a ``getattr(..., 1)`` default. A missing field therefore does
+        # not raise: it silently describes a TP8 deployment as TP1, which makes
+        # the LMCache side size one rank's key space for the whole world and
+        # lets eight ranks write the same keys with different bytes. Project
+        # them explicitly so the default never applies.
+        self.tensor_parallel_size = int(
+            getattr(parallel_config, "tensor_parallel_size", 1) or 1
+        )
+        self.data_parallel_size = int(
+            getattr(parallel_config, "data_parallel_size", 1) or 1
+        )
+        self.prefill_context_parallel_size = int(
+            getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+        )
+        # Part of the LMCache model namespace: two revisions of one model name
+        # have different weights and must not share a key space.
+        self.revision = getattr(model_config, "revision", None)
+        # Read only to be rejected -- the MP path refuses to run under
+        # speculative decoding. Forwarded so that refusal happens here rather
+        # than after a draft model has already been offloaded against.
+        self.speculative_config = getattr(vllm_config, "speculative_config", None)
         # Feeds the LMCache page namespace, so two different models never share
         # a key space. vLLM's served name is the closest analogue of ATOM's
         # model_tag.
@@ -142,7 +180,8 @@ class OffloadConfigShim:
             f"OffloadConfigShim(block_size={self.kv_cache_block_size}, "
             f"kv_dtype={self.kv_cache_dtype!r}, role="
             f"{self.kv_transfer_config.get('kv_role')!r}, pp="
-            f"{self.pipeline_parallel_size}, dcp={self.decode_context_parallel_size})"
+            f"{self.pipeline_parallel_size}, tp={self.tensor_parallel_size}, "
+            f"dcp={self.decode_context_parallel_size})"
         )
 
 

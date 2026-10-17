@@ -35,7 +35,12 @@ CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
 # sha256 of core's `Attention.forward`, comments and blank lines stripped.
-CORE_PREPARE_DIGEST = "4f502d41815e8e82"
+# Refreshed on this branch: `_prepare` now builds its throwaway cache through
+# `_dummy_cache` instead of inline, which is the seam the plugin copy needs
+# to hand a captured dummy batch one reused scratch cache
+# (`_capture_dummy_cache`). Audited against the copy: that is the only
+# change inside the pinned method, and the copy already calls its own.
+CORE_PREPARE_DIGEST = "8d80b01398838ee7"
 CORE_FORWARD_DIGEST = "3a7ee084e43a1498"
 
 

@@ -224,6 +224,44 @@ def _refuse_v41_multi_axis_parallelism(vllm_config) -> None:
     raise ValueError(msg)
 
 
+def _v41_state_checkpoints_configured(vllm_config) -> bool:
+    """Whether PAGE-backed checkpoints will restore STATE this run.
+
+    They write and restore the window ring and the Engram cursor at the block
+    boundaries vLLM's cache reports, which is the claim this refusal exists to
+    protect. Guarded: on a build where the mechanism is not importable the
+    answer is simply no, and the refusal stands.
+    """
+    try:
+        from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+            register_v41_state_checkpoint_adapter,
+            v41_state_checkpoints_requested,
+        )
+        from atom.plugin.vllm.paged_state_checkpoint import state_checkpoints_on
+
+        # Both, not either. `state_checkpoints_on` is true for any V4.1 run
+        # with prefix caching, but the checkpoint layers are registered only
+        # when the switch asks for them; without it there are no checkpoint
+        # groups and nothing restores STATE, which is exactly the run this
+        # refusal exists to stop.
+        return v41_state_checkpoints_requested() and bool(
+            state_checkpoints_on(register_v41_state_checkpoint_adapter(), vllm_config)
+        )
+    except Exception:  # noqa: BLE001 - absence means the mechanism is off
+        return False
+
+
+def _v41_state_tier_configured(vllm_config) -> bool:
+    """Whether this run has a connector that owns V4.1's per-request state."""
+    kv = getattr(vllm_config, "kv_transfer_config", None)
+    if kv is None:
+        return False
+    name = getattr(kv, "kv_connector", None)
+    if name is None and isinstance(kv, dict):
+        name = kv.get("kv_connector")
+    return name == "AtomLMCacheOffloadConnector"
+
+
 def _refuse_v41_kv_transfer(vllm_config) -> None:
     """Refuse every KV connector on this path, including `lmcache_mp`.
 
@@ -244,17 +282,19 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
     for vLLM's own `NixlConnector` / `OffloadingConnector` / `MooncakeConnector`
     -- an error about ATOM's registry, in answer to a question about V4.1.
 
-    ATOM's own `AtomLMCacheOffloadConnector` is refused on this branch for the
-    same reason and not for the alias one: it is selected by explicit
-    `kv_connector_module_path`, so it never goes through that name resolution,
-    but the version here knows nothing about V4.1 -- it carries the recurrent
-    mamba state, and `connector.py` has no V4.1 path at all. A V4.1 hit through
-    it would restore PAGEs and no STATE.
+    ATOM's own `AtomLMCacheOffloadConnector` used to be refused here too, for
+    a reason rather than for the alias: it is selected by explicit
+    `kv_connector_module_path` and never goes through that name resolution,
+    but the version that existed then knew nothing about V4.1 -- it carried
+    the recurrent mamba state and `connector.py` had no V4.1 path at all, so a
+    hit through it would have restored PAGEs and no STATE.
 
-    This is the condition to relax when that changes: a connector that writes
-    and restores V4.1's STATE entries belongs in an allow-list here, added in
-    the same change that teaches it to -- not before, since the failure it
-    would admit is a silently wrong continuation rather than an error.
+    It has one now: it stores a whole state checkpoint at PAGE boundaries and
+    caps every hit, local or external, to a boundary it holds. So it is the
+    allow-list this paragraph asked for, and `_v41_state_tier_configured` is
+    the test that tells it from the names still refused below. Nothing else
+    joins it without the same two properties, since the failure a wrong
+    admission buys is a silently wrong continuation rather than an error.
     """
     transfer = getattr(vllm_config, "kv_transfer_config", None)
     if transfer is None:
@@ -263,6 +303,13 @@ def _refuse_v41_kv_transfer(vllm_config) -> None:
         transfer.get("kv_connector") if isinstance(transfer, dict) else None
     )
     if not connector:
+        return
+    if _v41_state_tier_configured(vllm_config):
+        # The allow-list this function's docstring asks for. ATOM's offload
+        # connector now writes and restores V4.1's STATE: it stores a whole
+        # checkpoint at PAGE boundaries and caps every hit, local or
+        # external, to a boundary it holds. `_v41_state_tier_configured` is
+        # what distinguishes that connector from the names refused below.
         return
     msg = (
         f"DeepSeek-V4.1 on the vLLM plugin does not support KV transfer "
@@ -415,16 +462,22 @@ def enforce_deepseek_v41_constraints(vllm_config) -> None:
         return
 
     cache_config = getattr(vllm_config, "cache_config", None)
-    if cache_config is not None and getattr(
-        cache_config, "enable_prefix_caching", False
+    if (
+        cache_config is not None
+        and getattr(cache_config, "enable_prefix_caching", False)
+        and not _v41_state_tier_configured(vllm_config)
+        and not _v41_state_checkpoints_configured(vllm_config)
     ):
         msg = (
-            "DeepSeek-V4.1 on the vLLM plugin does not support prefix caching: a "
-            "block-table hit restores the compressed pages but not the "
-            "per-request window ring, compressor rings or Engram cursor that "
-            "CSA2 attention reads alongside them, and a V4.1 forward cannot "
-            "leave them at the interior block boundary vLLM's cache assumes. "
-            "Pass --no-enable-prefix-caching."
+            "DeepSeek-V4.1 on the vLLM plugin supports prefix caching only "
+            "alongside AtomLMCacheOffloadConnector. A block-table hit "
+            "restores the compressed pages but not the per-request window "
+            "ring, compressor rings or Engram cursor that CSA2 attention "
+            "reads alongside them, and a V4.1 forward cannot leave them at "
+            "the interior block boundary vLLM's cache assumes. The connector "
+            "owns a tier for exactly that state and caps every hit, local or "
+            "external, to a boundary whose state it stored. Pass "
+            "--no-enable-prefix-caching, or configure the connector."
         )
         logger.error(msg)
         raise ValueError(msg)

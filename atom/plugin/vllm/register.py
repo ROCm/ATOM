@@ -457,6 +457,27 @@ def register_model() -> None:
 
     apply_vllm_v41_state_reserve_patch()
 
+    # Same install site and the same reason as the state-reserve patch above:
+    # the platform hook these would naturally live in is not always activated
+    # for V4.1.
+    #
+    # The alignment patch is what aims a prefill chunk to END on a checkpoint
+    # grid point, and it is the only writer of `request._atom_img_step`.
+    # Without it the placement scheduler's `_decide` reads `kind=None` on
+    # every request, plans no checkpoint at all, and the blocks a save ships
+    # to the tier are the zeros they were allocated as -- which comes back as
+    # `needs state at N, found 0` on the first hit that tries to resume from
+    # one. Nothing in between reports a problem: the save rides, the tier
+    # stores its chunks and the load restores them, all faithfully carrying
+    # zeros.
+    from atom.plugin.vllm.scheduler import (
+        apply_vllm_v41_local_hit_cap_patch,
+        apply_vllm_v41_prefill_alignment_patch,
+    )
+
+    apply_vllm_v41_local_hit_cap_patch()
+    apply_vllm_v41_prefill_alignment_patch()
+
     # vLLM auto-enables the breakable cudagraph for V4 while building
     # VllmConfig, which happens after this hook in every process.
     from atom.plugin.vllm.deepseek_v4_cudagraph_patch import (
@@ -480,6 +501,22 @@ def register_model() -> None:
     )
 
     apply_vllm_v4_prefix_install()
+
+    # Register the V4.1 adapter for the PAGE-backed checkpoint mechanism and
+    # install its hooks. Same install site and the same reason as above, plus
+    # one of its own: EngineCore sizes the pool through the mechanism's
+    # `get_kv_cache_configs` hook, so the adapter has to exist there as well
+    # as in the workers that carve.
+    #
+    # Inert for every other model (the adapter's `matches` is V4.1's config
+    # test) and for V4.1 itself until prefix caching is on
+    # (`state_checkpoints_on`). The reserve patch above defers to it when it
+    # is, so the STATE tail is withheld exactly once.
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        apply_vllm_v41_prefix_install,
+    )
+
+    apply_vllm_v41_prefix_install()
 
     from atom.plugin.vllm.gdn_backend import register_gdn_attention_backend
 

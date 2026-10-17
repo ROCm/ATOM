@@ -79,12 +79,9 @@ import torch
 
 from atom.model_engine.state_offload import StateOffloadIndex
 
-logger = logging.getLogger("atom")
+from .page_ride import NULL_BLOCK_ID, PageRideMixin
 
-#: vLLM's placeholder block. ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``
-#: is the authority; it is mirrored rather than imported so this module stays
-#: importable in a unit test that has no vLLM.
-NULL_BLOCK_ID = 0
+logger = logging.getLogger("atom")
 
 #: How many chunk-sized steps :meth:`KdaBoundaryPlanner.cap_hit` will walk back
 #: looking for a boundary the index still claims. Stores are emitted for every
@@ -222,6 +219,11 @@ class KdaPageViews:
         self._groups = groups
         self.layout_id = layout_id
         self.num_groups = len(groups)
+        # Every mamba layer of every group lives on this worker's one device,
+        # so the first tensor answers for all of them. Exposed because the
+        # staging buffer has to be allocated on it, and under the multiprocess
+        # backend there is no GPU connector around to ask.
+        self.device = groups[0][0].device
         self.num_blocks: list[int] = []
         for tensors in groups:
             counts = sorted({int(t.shape[0]) for t in tensors})
@@ -238,6 +240,16 @@ class KdaPageViews:
             for tensors in groups
             for t in tensors
         )
+
+    @property
+    def groups(self) -> list[list[torch.Tensor]]:
+        """Each mamba group's layer tensors, in the order streams are gathered.
+
+        Public because the MP recurrent layout is built from exactly these
+        tensors in exactly this order: registering a different order would
+        publish a key space the codec does not read back in.
+        """
+        return self._groups
 
     def _views(self, block_ids) -> list[torch.Tensor]:
         ids = [int(b) for b in block_ids]
@@ -495,7 +507,7 @@ class KdaStateTier:
         self._load_executor.shutdown(wait=True)
 
 
-class KdaBoundaryPlanner:
+class KdaBoundaryPlanner(PageRideMixin):
     """Scheduler half: what to store, what to load, and how far a hit is valid.
 
     Owns the index of boundaries believed present, the block-pool pins that keep
@@ -513,6 +525,7 @@ class KdaBoundaryPlanner:
         world_size: int,
         can_store: bool = True,
         can_load: bool = True,
+        rides_page: bool = False,
     ) -> None:
         self.group_ids = tuple(int(g) for g in group_ids)
         if not self.group_ids:
@@ -522,7 +535,22 @@ class KdaBoundaryPlanner:
         self.chunk_size = int(chunk_size)
         self._world_size = max(1, int(world_size))
         self._index = StateOffloadIndex(can_store=can_store, can_load=can_load)
-        self._pool = None
+        # True when the recurrent state travels inside the PAGE transfer
+        # object rather than on a leg of its own. Then this planner still
+        # decides *which* boundary block each transfer carries, but issues no
+        # store or load jobs: there is no second tier to drive, and the
+        # object the PAGE save commits already holds the state.
+        self.rides_page = bool(rides_page)
+        # The ride state -- which boundary block each transfer carries, and
+        # the refcount shares that keep a save's source alive across its
+        # asynchronous copy -- lives in `PageRideMixin`, which the V4.1
+        # planner shares. Without the retire half a share is permanent: a ride
+        # issues no store, so `absorb_reports` -- which is what unpins a
+        # hand-off store -- never sees the operation at all, and the pool
+        # loses one block per mamba group per ride until it has none left.
+        self.ride_group_ids = tuple(self.group_ids)
+        # KDA's boundary grid is its hash unit: one kv cache group, one unit.
+        self.ride_boundary_grid = self.hash_block_size
         self._next_op_id = 0
         self._pending_stores: dict[int, _PendingStore] = {}
         self._stores: list[KdaStore] = []
@@ -553,6 +581,8 @@ class KdaBoundaryPlanner:
             "cap_kept": 0,
             "cap_declined": 0,
         }
+        # Seeds the `ride_*` counters too; see `page_ride.RIDE_COUNTERS`.
+        self._init_page_ride()
         self._last_stats_log = 0.0
         if self.chunk_size % self.mamba_block_size != 0:
             raise ValueError(
@@ -563,8 +593,6 @@ class KdaBoundaryPlanner:
             )
 
     # -- block pool ------------------------------------------------------
-    def bind_gpu_block_pool(self, pool) -> None:
-        self._pool = pool
 
     # -- lookup ----------------------------------------------------------
     def begin_lookup(self, request) -> None:
@@ -602,8 +630,19 @@ class KdaBoundaryPlanner:
                 seq.id,
             )
             return 0
-        block_hashes = getattr(request, "block_hashes", None) or ()
         boundary = (hit // self.chunk_size) * self.chunk_size
+        if self.rides_page:
+            # No index to probe: KV and the state that continues it are one
+            # object, so whatever the dense lookup reported present is
+            # present with its state. What still has to hold is the *shape*
+            # -- a hit must end on a chunk boundary for there to be a stored
+            # snapshot row at all -- and that is what this truncation is.
+            if boundary <= 0:
+                self._counters["cap_declined"] += 1
+                return 0
+            self._counters["cap_kept"] += 1
+            return min(hit, boundary)
+        block_hashes = getattr(request, "block_hashes", None) or ()
         for _ in range(_MAX_CAP_DESCENT):
             if boundary <= 0:
                 self._counters["cap_declined"] += 1
@@ -697,6 +736,12 @@ class KdaBoundaryPlanner:
             )
             self._loads.append(KdaLoad(req_id, int(h or 0), (), error_blocks))
             return
+        if self.rides_page:
+            # The PAGE load restores these same blocks as part of its own
+            # object, so there is no job to queue -- only the destination to
+            # name, which is what the transfer spec carries.
+            self._record_ride_boundary(req_id, num_total_computed, block_ids)
+            return
         self._index.request_load(req_id, h)
         self._loads.append(KdaLoad(req_id, h, block_ids, error_blocks))
 
@@ -779,6 +824,7 @@ class KdaBoundaryPlanner:
 
     def forget_pending(self, req_id: str) -> None:
         self._index.abandon_load(req_id)
+        self._ride_boundaries.pop(str(req_id), None)
 
     # -- store -----------------------------------------------------------
     def collect_stores(
@@ -808,6 +854,12 @@ class KdaBoundaryPlanner:
           :meth:`cap_hit` would then accept.
         """
         accepted: list[KdaStore] = []
+        if self.rides_page:
+            # Nothing to drive: the PAGE save commits the state with the KV,
+            # and its source block is resolved at build time by
+            # `source_blocks_for`, from the same hash-keyed pool lookup the
+            # sweep below uses.
+            return accepted
         for req_id, entries in (offloads or {}).items():
             req_id = str(req_id)
             if req_id in skip_req_ids:
@@ -854,6 +906,8 @@ class KdaBoundaryPlanner:
                 accepted.append(self._issue_store(h, block_ids, req_id=req_id))
                 self._counters["handoff_stores"] += 1
         return accepted
+
+    # -- riding the PAGE object -------------------------------------------
 
     def _issue_store(
         self, prefix_hash: int, block_ids: tuple[int, ...], req_id: str | None = None
@@ -907,7 +961,7 @@ class KdaBoundaryPlanner:
         also when vLLM has had a chance to register it.
         """
         accepted: list[KdaStore] = []
-        if self._pool is None or not self._index.can_store:
+        if self.rides_page or self._pool is None or not self._index.can_store:
             return accepted
         for req_id, frontier in (frontiers or {}).items():
             req_id = str(req_id)
@@ -991,6 +1045,7 @@ class KdaBoundaryPlanner:
         """
         req_id = str(req_id)
         self._swept.pop(req_id, None)
+        self._ride_boundaries.pop(req_id, None)
         # The in-flight pin stays until quorum -- those blocks may still be
         # mid-copy. Dropping the request id is what lets the recomputed life
         # offer the boundary again instead of treating the old pin as "known".
@@ -1036,8 +1091,11 @@ class KdaBoundaryPlanner:
         Store completions only reach this process as worker metadata on a step.
         An engine that went idle with a pin outstanding would hold that block
         out of the pool forever -- KV capacity lost with nothing to point at.
+        A ride's pin counts the same way: it is released by a reconciliation
+        that only runs on a step, so the last step must not be the one that
+        retires the save.
         """
-        return bool(self._pending_stores)
+        return bool(self._pending_stores) or bool(self._ride_pins)
 
     def stats(self) -> dict[str, int]:
         out = dict(self._index.stats())

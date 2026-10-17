@@ -65,6 +65,112 @@ def get_current_cudagraph_mode():
     return getattr(_req_id_local, "cudagraph_mode", None)
 
 
+class _HostMirror:
+    __slots__ = ("np",)
+
+    def __init__(self, array):
+        self.np = array
+
+
+class _BlockTableGroupView:
+    """`batch.block_table[g]` for a runner that keeps no host mirror."""
+
+    __slots__ = ("block_table",)
+
+    def __init__(self, host_mirror):
+        self.block_table = host_mirror
+
+
+class _V2InputBatchView:
+    """The V2 ``InputBatch`` plus the ``block_table`` the V1 one carries.
+
+    The V2 runner keeps its block tables outside the batch, as
+    ``StagedWriteTensor``s that have only a `.gpu` side -- there is no host
+    mirror to read, so `batch.block_table[g].block_table.np` (what the shared
+    checkpoint mechanism uses to turn a (row, column) into a block id) has nothing
+    to resolve against. ``prepare_attn`` is handed the same tables as device
+    tensors, so copy the group's table down once per step, on first use, and
+    cache it for the rest of that step. Readers of every other attribute get
+    the real batch.
+
+    The copy is a sync. It happens only when something actually asks for an
+    checkpoint unit id -- that is, on a step the scheduler planned a store or a
+    restore for, not on every step.
+    """
+
+    __slots__ = ("_batch", "_cache", "_computed", "_tables")
+
+    def __init__(self, batch, tables):
+        self._batch = batch
+        self._tables = tables
+        self._cache = {}
+        self._computed = None
+
+    def __getattr__(self, name):
+        return getattr(self._batch, name)
+
+    #: This runner carries no second, independently ordered count to check
+    #: the step's row order against -- see `num_computed_tokens_cpu`.
+    atom_row_order_unverifiable = True
+
+    @property
+    def num_computed_tokens_cpu(self):
+        """V1's name for the per-row computed counts; V2 calls it `_np`.
+
+        Batch-row order, NOT the block table's order. On V2 this is the
+        batch's own count and is NOT independent of the step: measured, it
+        disagrees with `seq_lens - query_lens` on some batches (13 vs 9) and
+        agrees on others, and no field of the V2 batch reproduces the step's
+        number (`num_draft_tokens_per_req` corrects one case and breaks the
+        other). So it is offered for arithmetic (`_exact_starts`) but the
+        class declares `atom_row_order_unverifiable`, and the row-order
+        cross-check skips rather than fire on a difference that says nothing
+        about row order. A decode keep built on a wrong start is still caught
+        downstream, by the state cursor the restore is judged against. The two index spaces are
+        the same object on V1's persistent batch and different on V2, so this
+        one is left in row order deliberately: its readers are row-order
+        readers -- `_check_row_alignment` compares it against the step's own
+        per-row counts (and says so loudly if they diverge), and
+        `_exact_starts` pairs it with `req_ids`. Scattering it into slot order
+        to match the block table made that check fail at row 0 immediately.
+        """
+        if self._computed is None:
+            import numpy as np
+
+            batch = self._batch
+            n = int(batch.num_reqs)
+            out = np.asarray(batch.num_computed_tokens_np[:n], dtype=np.int64)
+            self._computed = out
+        return self._computed
+
+    @property
+    def block_table(self):
+        return self
+
+    def __getitem__(self, group_id):
+        view = self._cache.get(group_id)
+        if view is None:
+            table = self._tables[group_id]
+            # Rows are request-state slots, not batch positions: the table is
+            # handed over as the runner keeps it, and the callers address it
+            # in that same space (their rows index `state_slots_committed`).
+            #
+            # Gathering it into batch order with `idx_mapping_np` looks right
+            # -- vLLM documents that array as `batch_idx -> req_state_idx` --
+            # and is measured wrong: with it, a concurrent restore asked for
+            # (row 4, col 2) while the blocks sat at (row 6, col 2), and the
+            # mechanism refused every such hit with null unit ids. Without it
+            # that refusal does not occur at all.
+            view = _BlockTableGroupView(_HostMirror(table.cpu().numpy()))
+            self._cache[group_id] = view
+        return view
+
+
+def get_current_block_tables():
+    """This step's per-group block tables as the runner passed them, or None."""
+    return getattr(_req_id_local, "block_tables", None)
+
+
 def get_current_input_batch():
     """Return the current step's vLLM ``InputBatch``, or None.
 
@@ -79,7 +185,17 @@ def get_current_input_batch():
     Callers must treat None as "fall back to the device-side tensors", and must
     not hold the reference past the call that exposed it.
     """
-    return getattr(_req_id_local, "input_batch", None)
+    batch = getattr(_req_id_local, "input_batch", None)
+    if batch is None or hasattr(batch, "block_table"):
+        return batch
+    tables = getattr(_req_id_local, "block_tables", None)
+    if tables is None:
+        return batch
+    view = getattr(_req_id_local, "input_batch_view", None)
+    if view is None or view._batch is not batch or view._tables is not tables:
+        view = _V2InputBatchView(batch, tables)
+        _req_id_local.input_batch_view = view
+    return view
 
 
 def get_current_req_ids() -> list[str] | None:
@@ -120,6 +236,16 @@ def _wrap_with_req_id_snapshot(cls, method_name: str, batch_from_arg=False) -> b
             args[0] if (batch_from_arg and args) else getattr(self, "input_batch", None)
         )
         _req_id_local.input_batch = batch
+        # V2 `prepare_attn(input_batch, cudagraph_mode, block_tables, ...)`.
+        # The V1 runner carries these inside the batch, so there is nothing to
+        # take from the arguments there. Without them `get_current_input_batch`
+        # hands back the raw V2 batch, which has no `block_table` at all, and
+        # the first state-checkpoint restore dies on the attribute.
+        prev_tables = getattr(_req_id_local, "block_tables", None)
+        _req_id_local.block_tables = (
+            args[2] if (batch_from_arg and len(args) > 2) else None
+        )
+        _req_id_local.input_batch_view = None
         prev_mode = getattr(_req_id_local, "cudagraph_mode", None)
         # `prepare_attn` is handed the mode it is preparing for. A model whose
         # step work runs out here needs to know which one, because a FULL
@@ -145,6 +271,8 @@ def _wrap_with_req_id_snapshot(cls, method_name: str, batch_from_arg=False) -> b
         finally:
             _req_id_local.req_ids = prev
             _req_id_local.input_batch = prev_batch
+            _req_id_local.block_tables = prev_tables
+            _req_id_local.input_batch_view = None
             _req_id_local.cudagraph_mode = prev_mode
 
     wrapped._atom_req_id_passthrough_patched = True  # type: ignore[attr-defined]

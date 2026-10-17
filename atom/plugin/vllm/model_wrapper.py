@@ -360,6 +360,31 @@ def _patch_required_act_dtype_post_load_hooks(
     return patched
 
 
+def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
+    """Register the V4.1 checkpoint-checkpoint layers, behind a switch, off by default.
+
+    Off until the binding question is settled by measurement rather than by a
+    model of it: the layers change how vLLM sizes and splits the pool, so a
+    run with them registered is not the run every other measurement on this
+    branch was taken on. `ATOM_V41_STATE_CHECKPOINTS=1` turns them on.
+
+    The layers themselves, their count and their spec all come from
+    `paged_state_checkpoint` through the V4.1 adapter -- there is no second sizing
+    here any more. The alignment knob is gone with it: the mechanism's layers
+    take the adapter's block size, which is the grid vLLM's own validity test
+    measures against.
+    """
+    from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
+        register_deepseek_v41_state_checkpoint_layers,
+        v41_state_checkpoints_requested,
+    )
+
+    if not v41_state_checkpoints_requested():
+        return
+
+    register_deepseek_v41_state_checkpoint_layers(vllm_config)
+
+
 class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
     # forced_model_arch: str | None = None
 
@@ -749,6 +774,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # capture and the first forward.
             enforce_deepseek_v41_constraints(vllm_config)
             register_deepseek_v41_proxy_layer(vllm_config)
+            # After the proxy, before the builder: the checkpoint layers are
+            # what make the pool hybrid, and both the group split and the
+            # builder's sizing read them.
+            _maybe_register_v41_state_checkpoints(vllm_config)
             self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
                 self.atom_config,
                 vllm_config,
@@ -769,6 +798,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             if proxy is not None:
                 proxy._atom_v41_model = self.model
                 proxy._atom_v41_builder = self._deepseek_v41_builder
+                # The KV-transfer connector's only handle on this wrapper. The
+                # builder handle above is what the metadata builder needs; the
+                # connector needs the wrapper itself, at `register_kv_caches`
+                # time, which is before any forward has run. See
+                # `ensure_v41_proxy_bound`.
+                proxy.atom_v41_owner = self
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
