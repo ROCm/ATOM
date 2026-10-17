@@ -206,6 +206,17 @@ def test_fallback_reasons_pad_rows_and_input_layout(make_site):
     assert s._fallback_reason(ctx, x, xs) == "dummy_run"
 
 
+def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
+    import torch
+
+    s = make_site(FakeResources(plan_n=(FakePlan(), 1)))
+    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
+    x = torch.zeros((512, 8), dtype=torch.float8_e4m3fn)
+    xs = torch.zeros((512, 1), dtype=torch.float32)
+    assert s._fallback_reason(ctx, x, xs, n_fused=1) is None
+    assert s._fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
+
+
 def test_resolve_after_finalize_without_windows_is_native(make_site):
     res = FakeResources(plan_n=(FakePlan(), 2))
     res.can_ensure = lambda plan: False

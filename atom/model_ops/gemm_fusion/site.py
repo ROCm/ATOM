@@ -216,14 +216,24 @@ class GemmFusionSite:
             meta["index_k_norm_w"] = self._f32("ikw", impl.index_k_norm.weight)
         return meta
 
-    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype):
+    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, pad_rows=False):
         """Bind the plan for one (padded == real) bucket OUTSIDE graph capture.
 
         Called after ``bind_kv_cache`` and the bucket's resolution, before capture.
         """
         r = self.resolve(tokens)
-        if r.plan is None or r.n_fused < 2:
+        if r.plan is None:
             return False
+        if r.n_fused < 2:
+            # 1-stage prefix (large M): the plan takes raw per-launch pointers, no
+            # staging; just attach + init control after finalize, before capture.
+            hooks.resources().finalize()
+            prep = getattr(r.plan, "prepare", None)
+            if prep is not None:
+                prep(res=hooks.resources().bound)
+            return True
+        if pad_rows:
+            return False  # run time falls back (pad_rows); nothing to bind
         st = self._stage(tokens, device, out_dtype)
         if st.prepared:
             return True
@@ -241,12 +251,15 @@ class GemmFusionSite:
         return True
 
     # -- execution -------------------------------------------------------
-    def _fallback_reason(self, ctx, x, x_scale):
+    def _fallback_reason(self, ctx, x, x_scale, n_fused=2):
         """Why the fused prefix cannot run for this call (None = it can)."""
         if ctx.is_dummy_run:
             return "dummy_run"
-        if ctx.real_tokens != ctx.padded_tokens:
-            return "pad_rows"  # small-M kernel needs T == 4*M with every row live
+        if n_fused >= 2 and ctx.real_tokens != ctx.padded_tokens:
+            # small-M kernel needs T == 4*M with every row live. The 1-stage large-M
+            # exchange moves padded rows too and the native remainder drops them
+            # (attend_packed slices [:real]), so it has no such constraint.
+            return "pad_rows"
         if x_scale is None or x.dtype != torch.float8_e4m3fn:
             return "unquantized_input"
         if x_scale.dim() != 2 or x_scale.shape != (x.shape[0], 1) or x_scale.dtype != torch.float32:
@@ -259,7 +272,7 @@ class GemmFusionSite:
         reason = r.reason
         if r.plan is None:
             return r, reason, None, None
-        bad = self._fallback_reason(ctx, x, x_scale)
+        bad = self._fallback_reason(ctx, x, x_scale, r.n_fused)
         if bad is None and r.n_fused >= 2:
             state = ctx.prologue_state()
             if state is None:
@@ -282,13 +295,24 @@ class GemmFusionSite:
             st.slot[:n].copy_(state["slot_mapping"][:n])
             outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
         else:
-            outs = {"packed": torch.empty((ctx.padded_tokens, self.packed_width(self.attn.impl)),
-                                          dtype=out_dtype, device=x.device)}
-            meta, xs = {}, x_scale
+            outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
         r.plan.run(
             x=x, x_scale=xs, w=self.linear.weight, w_scale=self.linear.weight_scale,
             outs=outs, meta=meta, res=res.bound, stream=torch.cuda.current_stream(),
         )
+        if r.n_fused < 2:
+            # Zero-copy view of the plan's receive window; valid until this rank
+            # launches the next epoch of the SAME plan, i.e. past the native
+            # remainder that consumes it (same stream, in order). Reuse layers get
+            # the [T,2560] row-stride-2304 view: the IQ|IK columns alias the next
+            # row and are never read (skip branch), and rope_cache's
+            # qkv.contiguous() copies the view with those semantics intact.
+            plan = r.plan
+            if getattr(plan, "mode", None) == "reuse" and hasattr(plan, "reuse_view"):
+                view = plan.reuse_view(res.bound)
+            else:
+                view = plan.recv_view(res.bound)
+            outs = {"packed": view}
         return outs
 
     def _decision(self, ctx, r, reason, path):

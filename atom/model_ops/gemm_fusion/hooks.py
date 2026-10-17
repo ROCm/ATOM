@@ -105,8 +105,9 @@ def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
             out_dtype = get_current_atom_config().torch_dtype
         for s in _SITES.values():
             for padded, real in pairs:
-                if padded == real:
-                    s.prepare_bucket(padded, device, _KV, out_dtype)
+                # 2-stage (small-M) plans need padded == real (else pad_rows at
+                # run time); 1-stage (large-M) plans are prepared regardless.
+                s.prepare_bucket(padded, device, _KV, out_dtype, pad_rows=padded != real)
     _RES.quiesce_and_reset()
 
 
