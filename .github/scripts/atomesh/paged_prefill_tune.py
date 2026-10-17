@@ -329,19 +329,12 @@ def measure(fn):
 
 
 def configurations():
-    # Do not rerun the gfx950 4-warp split configurations already rejected by
-    # numerical checks or device faults. New candidates run in separate processes.
+    # Finalists from the broad sweep plus neighbouring split counts. The
+    # production default is independently checked before these experiments.
     return [
-        (16, 2, 2, 1),
-        (32, 2, 1, 1),
-        (64, 4, 1, 1),
         (128, 4, 1, 1),
         (256, 8, 1, 1),
-        *[
-            (bm, 2, stages, split)
-            for bm, stages in ((16, 2), (32, 1), (64, 1), (128, 1))
-            for split in (4, 16)
-        ],
+        *[(64, 2, 1, split) for split in (8, 16, 32, 64)],
     ]
 
 
@@ -407,19 +400,19 @@ def worker(args):
         elif args.mode == "candidate":
             p = parameters(ua, x, case)
             fn = candidate(ua, p, *args.config)
-            record(dict(case=case, variant=variant, phase="candidate-start"))
+            record({"case": case, "variant": variant, "phase": "candidate-start"})
             try:
                 fn()
             except Exception as exc:
                 if type(exc).__name__ != "OutOfResources":
                     raise
                 record(
-                    dict(
-                        case=case,
-                        variant=variant,
-                        skipped="OutOfResources",
-                        detail=str(exc),
-                    )
+                    {
+                        "case": case,
+                        "variant": variant,
+                        "skipped": "OutOfResources",
+                        "detail": str(exc),
+                    }
                 )
                 return
             try:
@@ -429,7 +422,12 @@ def worker(args):
                 )
             except AssertionError as exc:
                 record(
-                    dict(case=case, variant=variant, accuracy="failed", detail=str(exc))
+                    {
+                        "case": case,
+                        "variant": variant,
+                        "accuracy": "failed",
+                        "detail": str(exc),
+                    }
                 )
                 # End this isolated process; do not run another shape after a
                 # potentially corrupting candidate or reuse its CUDA context.
