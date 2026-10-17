@@ -25,6 +25,44 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+def _save_target_attention_state(attn_metadata, context) -> dict:
+    """Snapshot target-owned metadata that Eagle draft steps rewrite in place."""
+    sparse_metadata = getattr(attn_metadata, "sparse_attention_metadata", None)
+    flydsl_plan = getattr(attn_metadata, "flydsl_work_plan", None)
+    return {
+        "context_lens_ref": attn_metadata.context_lens,
+        "context_lens": attn_metadata.context_lens.clone(),
+        "slot_mapping_ref": attn_metadata.slot_mapping,
+        "slot_mapping": attn_metadata.slot_mapping.clone(),
+        "cu_seqlens_q_ref": attn_metadata.cu_seqlens_q,
+        "cu_seqlens_q": attn_metadata.cu_seqlens_q.clone(),
+        "block_tables": attn_metadata.block_tables,
+        "sparse_attention_metadata": sparse_metadata,
+        "flydsl_work_plan": flydsl_plan,
+        "max_seqlen_q": attn_metadata.max_seqlen_q,
+        "max_seqlen_k": attn_metadata.max_seqlen_k,
+        "is_prefill": context.is_prefill,
+    }
+
+
+def _restore_target_attention_state(attn_metadata, context, state: dict) -> None:
+    """Restore both stable buffer contents and the target's original views."""
+    for name in ("context_lens", "slot_mapping", "cu_seqlens_q"):
+        ref = state[f"{name}_ref"]
+        ref.copy_(state[name])
+        setattr(attn_metadata, name, ref)
+    for name in (
+        "block_tables",
+        "sparse_attention_metadata",
+        "flydsl_work_plan",
+        "max_seqlen_q",
+        "max_seqlen_k",
+    ):
+        setattr(attn_metadata, name, state[name])
+    context.is_prefill = state["is_prefill"]
+    context.is_draft = False
+
+
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
     # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
     from atom.models.deepseek_v2 import _pcp_active
@@ -631,6 +669,7 @@ class EagleProposer(Drafter):
         # recording; without one it just hands the variable-length MoE gather
         # padded rows it is contracted not to receive.
         running_bs = context.running_bs if self.step is not None else scheduled_bs
+        target_state = _save_target_attention_state(attn_metadata, context)
         context.is_draft = True
 
         assert self.runner is not None
@@ -873,4 +912,5 @@ class EagleProposer(Drafter):
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
+        _restore_target_attention_state(attn_metadata, context, target_state)
         return draft_token_ids.t().contiguous()
