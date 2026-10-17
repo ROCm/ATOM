@@ -6,6 +6,7 @@
 import argparse
 import base64
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -121,6 +122,42 @@ def scheduler_state(target):
         return {"error": str(exc)}
 
 
+def summarize_eval_samples(path):
+    """Compact per-question evidence without exporting repeated few-shot prompts."""
+    filters, inputs = {}, {}
+    with path.open() as stream:
+        for line in stream:
+            row = json.loads(line)
+            doc_id = row["doc_id"]
+            score = row["exact_match"]
+            values = filters.setdefault(row["filter"], {})
+            if doc_id in values:
+                raise ValueError(f"duplicate evaluation sample {doc_id}")
+            values[doc_id] = {
+                "score": score,
+                "answer": str(row.get("filtered_resps", ""))[:200],
+                "target": str(row["doc"]["answer"]).rsplit("####", 1)[-1].strip(),
+            }
+            inputs[doc_id] = [row["doc_hash"], row["prompt_hash"], row["target_hash"]]
+    return {
+        "input_digest": hashlib.sha256(
+            json.dumps(sorted(inputs.items()), ensure_ascii=True).encode()
+        ).hexdigest(),
+        "filters": {
+            name: {
+                "samples": len(rows),
+                "correct": sum(row["score"] for row in rows.values()),
+                "wrong": {
+                    str(doc_id): row
+                    for doc_id, row in rows.items()
+                    if row["score"] != 1
+                },
+            }
+            for name, rows in filters.items()
+        },
+    }
+
+
 def collect(target, output, *, roots=ROOTS):
     run_id(target)
     output.mkdir(parents=True, exist_ok=True)
@@ -145,6 +182,20 @@ def collect(target, output, *, roots=ROOTS):
             if not source.is_relative_to(root.resolve()) or not source.is_dir():
                 continue
             row["runs"].append(str(source))
+            for sample in source.glob(
+                "slurm_job-*/eval_results/*/*/samples_gsm8k_*.jsonl"
+            ):
+                if not sample.resolve().is_relative_to(source):
+                    continue
+                try:
+                    scores = summarize_eval_samples(sample)
+                    destination = (
+                        output / source.name / sample.relative_to(source)
+                    ).with_suffix(".scores.json")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(scores) + "\n")
+                except (OSError, ValueError, KeyError) as exc:
+                    manifest["errors"].append({"path": str(sample), "error": str(exc)})
             for pattern in PATTERNS:
                 # Rotated history must not crowd out another rank's live evidence.
                 for path in sorted(
@@ -215,7 +266,8 @@ def emit_log_annotations(output):
             "decode-rank-0.log",
             "aiperf.log",
         ) or (
-            path.suffix == ".json" and path.name.startswith(("pd-atom-", "results_"))
+            path.suffix == ".json"
+            and path.name.startswith(("pd-atom-", "results_", "samples_gsm8k_"))
         ):
             selected.append(path)
         elif "paged-prefill-tuning" in path.parts and path.suffix == ".log":
