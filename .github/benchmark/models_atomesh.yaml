@@ -1314,6 +1314,48 @@ models:
               <<: *kimi_k3_pp8_dspark4_args
               max_num_seqs: 176
 
+        # Test only. The prefill-saturated cells with a 16K prefill token
+        # budget whose long prompts take at most 8K of it, two save and two
+        # load threads per rank, and 32 GiB more of the CPU tier, all of it for
+        # state (paged KV keeps its 96 GiB).
+        - &kimi_k3_1p1d_pp8_dcp8_p0
+          <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-p0
+          concurrency: [88]
+          prefill:
+            workers: 1
+            tp: 1
+            extra_args: >-
+              --pipeline-parallel-size 8
+              --enforce-eager
+              --max-num-batched-tokens 16384
+              --long-prefill-token-threshold 8192
+              --online_quant_config {"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*self_attn.f_b_proj","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj"]}
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              LMCACHE_MAX_LOCAL_CPU_SIZE: "256"
+              OFFLOAD_STATE_CPU_SIZE: "160"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_p0
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72-p0
+          concurrency: [72]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 144
+          run_eval: true
+          eval_concurrency: [72]
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
