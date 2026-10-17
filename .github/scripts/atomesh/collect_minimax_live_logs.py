@@ -162,6 +162,49 @@ def summarize_eval_samples(path):
     }
 
 
+def job_diagnostics(source):
+    """Read final scheduler accounting and small lifecycle files, without execution."""
+    result = {"files": {}, "scheduler": {}}
+    for job in source.glob("slurm_job-*"):
+        job_id = job.name.removeprefix("slurm_job-")
+        if not re.fullmatch(r"[0-9]+", job_id):
+            continue
+        for path in sorted(job.glob("*")):
+            if path.is_file():
+                result["files"][str(path.relative_to(source))] = {
+                    "bytes": path.stat().st_size,
+                    "body": (
+                        path.read_text(errors="replace")
+                        if path.name.startswith(
+                            ("rank-rc-", "rank-status-", "workload-status-")
+                        )
+                        and path.stat().st_size < 4096
+                        else None
+                    ),
+                }
+        command = ["scontrol"]
+        if os.environ.get("USES_SPUR_CONTROLLER") == "1" and os.environ.get(
+            "SPUR_CONTROLLER_ADDR"
+        ):
+            command += ["--controller", os.environ["SPUR_CONTROLLER_ADDR"]]
+        try:
+            query = subprocess.run(
+                command + ["show", "job", job_id],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            result["scheduler"][job_id] = {
+                "returncode": query.returncode,
+                "stdout": query.stdout[-16000:],
+                "stderr": query.stderr[-2000:],
+            }
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            result["scheduler"][job_id] = {"error": str(exc)}
+    return result
+
+
 def summarize_prefill_shapes(path):
     """Summarize scheduler metadata from the complete log, not the copied tail.
 
@@ -275,6 +318,9 @@ def collect(target, output, *, roots=ROOTS):
             if not source.is_relative_to(root.resolve()) or not source.is_dir():
                 continue
             row["runs"].append(str(source))
+            diagnostics = output / source.name / "job-diagnostics.json"
+            diagnostics.parent.mkdir(parents=True, exist_ok=True)
+            diagnostics.write_text(json.dumps(job_diagnostics(source)) + "\n")
             for prefill in source.glob("slurm_job-*/logs/prefill-rank-0.log"):
                 if not prefill.resolve().is_relative_to(source):
                     continue
@@ -382,6 +428,7 @@ def emit_log_annotations(output):
                 "container-eval.log",
                 "router.log",
                 "job-result.json",
+                "job-diagnostics.json",
                 "cell-metadata.json",
                 "metadata-rank-0.json",
                 "runtime-state.json",
