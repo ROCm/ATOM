@@ -405,6 +405,32 @@ class GemmFusionSite:
             return "native", "xscale_layout"
         return "fused", resolution.reason
 
+    @staticmethod
+    def input_facts(x, x_scale):
+        """The two rank-uniform input facts ``decide_path`` needs, read from the tensors:
+        (x is fp8 e4m3 with a scale, x_scale is a [rows, 1] float32 column)."""
+        fp8 = x_scale is not None and x.dtype == torch.float8_e4m3fn
+        ok = (
+            x_scale is not None
+            and x_scale.dim() == 2
+            and tuple(x_scale.shape) == (x.shape[0], 1)
+            and x_scale.dtype == torch.float32
+        )
+        return fp8, ok
+
+    def fallback_reason(self, ctx, x, x_scale, n_fused=2):
+        """Why the fused prefix cannot run for this call (None = it can). A view of
+        ``decide_path`` over the call's tensors; ``_prepare`` uses the same function."""
+        fp8, ok = self.input_facts(x, x_scale)
+        path, why = self.decide_path(
+            resolution=Resolution(object(), n_fused, "", ""),
+            is_dummy_run=ctx.is_dummy_run,
+            real_tokens=ctx.real_tokens,
+            padded_tokens=ctx.padded_tokens,
+            x_dtype_is_fp8=fp8,
+            x_scale_ok=ok,
+        )
+        return None if path == "fused" else why
     def binding_key(self, st, state, x_scale=None) -> dict:
         """Named data_ptr of every tensor aiter's small plan keys its binding on
         (variants.py ``_binding``: x_scale, w_scale, norms, cos/sin, positions,
@@ -541,18 +567,14 @@ class GemmFusionSite:
             # TEST SEAM: deliberately non-uniform. Fail-stop by design (E-3): the peers block in
             # their fused kernels, so the step-end digest is not reached.
             return Resolution(None, 0, "native", "fault_rank_native"), "fault_rank_native", None, None
+        fp8, scale_ok = self.input_facts(x, x_scale)
         path, why = self.decide_path(
             resolution=r,
             is_dummy_run=ctx.is_dummy_run,
             real_tokens=ctx.real_tokens,
             padded_tokens=ctx.padded_tokens,
-            x_dtype_is_fp8=(x_scale is not None and x.dtype == torch.float8_e4m3fn),
-            x_scale_ok=(
-                x_scale is not None
-                and x_scale.dim() == 2
-                and tuple(x_scale.shape) == (x.shape[0], 1)
-                and x_scale.dtype == torch.float32
-            ),
+            x_dtype_is_fp8=fp8,
+            x_scale_ok=scale_ok,
         )
         if path == "native":
             return Resolution(None, 0, "native", why), why, None, None

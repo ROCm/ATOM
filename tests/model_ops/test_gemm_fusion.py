@@ -205,14 +205,14 @@ def test_fallback_reasons_pad_rows_and_input_layout(make_site):
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
     x = torch.zeros((16, 8), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((16, 1), dtype=torch.float32)
-    assert s._fallback_reason(ctx, x, xs) == "pad_rows"
+    assert s.fallback_reason(ctx, x, xs) == "pad_rows"
     ctx.real_tokens = 64
-    assert s._fallback_reason(ctx, x, xs) is None
-    assert s._fallback_reason(ctx, x, None) == "unquantized_input"
-    assert s._fallback_reason(ctx, x.to(torch.bfloat16), xs) == "unquantized_input"
-    assert s._fallback_reason(ctx, x, xs.view(1, 16)) == "xscale_layout"
+    assert s.fallback_reason(ctx, x, xs) is None
+    assert s.fallback_reason(ctx, x, None) == "unquantized_input"
+    assert s.fallback_reason(ctx, x.to(torch.bfloat16), xs) == "unquantized_input"
+    assert s.fallback_reason(ctx, x, xs.view(1, 16)) == "xscale_layout"
     ctx.is_dummy_run = True
-    assert s._fallback_reason(ctx, x, xs) == "dummy_run"
+    assert s.fallback_reason(ctx, x, xs) == "dummy_run"
 
 
 def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
@@ -222,8 +222,8 @@ def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
     x = torch.zeros((512, 8), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((512, 1), dtype=torch.float32)
-    assert s._fallback_reason(ctx, x, xs, n_fused=1) is None
-    assert s._fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
+    assert s.fallback_reason(ctx, x, xs, n_fused=1) is None
+    assert s.fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
 
 
 def _direct_fixture(make_site, res=None):
@@ -1319,8 +1319,9 @@ class _T:
 
     _next = [10_000]
 
-    def __init__(self, shape=(1,), dtype="f32", ptr=None):
-        self.shape, self.dtype = tuple(shape), dtype
+    def __init__(self, shape=(1,), dtype=None, ptr=None):
+        import torch as _torch
+        self.shape, self.dtype = tuple(shape), (dtype if dtype is not None else _torch.float32)
         if ptr is None:
             _T._next[0] += 64
             ptr = _T._next[0]
@@ -1337,7 +1338,9 @@ def _fake_direct(make_site, res=None):
     s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)))
     s.bind_mode = "direct"
     s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True))
-    t = dict(x=_T((16, 8), "fp8"), xs=_T((16, 1), "f32"), pos=_T((64,), "i64"), slot=_T((64,), "i64"))
+    import torch as _torch
+    t = dict(x=_T((16, 8), _torch.float8_e4m3fn), xs=_T((16, 1), _torch.float32),
+             pos=_T((64,), _torch.int64), slot=_T((64,), _torch.int64))
     state = {"slot_mapping": t["slot"], "k_cache": _T(), "v_cache": _T(), "k_scale": _T(), "v_scale": _T()}
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
                           positions=t["pos"], prologue_state=lambda: state)
@@ -1361,7 +1364,7 @@ def test_direct_mode_per_call_path_never_raises_and_never_falls_back_per_rank(ma
     st = _seed_prepared(s, t, state)
     r, _, _, got = s._prepare(ctx, t["x"], t["xs"])
     assert r.plan is not None and got is st and st.rebound is False
-    r, _, _, got = s._prepare(ctx, t["x"], _T((16, 1), "f32"))  # x_scale moved
+    r, _, _, got = s._prepare(ctx, t["x"], _T((16, 1)))  # x_scale moved
     assert r.plan is not None and got.rebound is True  # fused + copy, not native
     state["k_cache"] = _T()  # KV cache moved AFTER prepare: no per-call raise any more
     r, _, _, _ = s._prepare(ctx, t["x"], t["xs"])
@@ -1385,12 +1388,15 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
     """E-3: N simulated ranks, same inputs -> the same (path, reason, n_fused). Each 'rank' has
     its own site and sp_rank and NO fault seam: nothing but the uniform tuple may vary the
     outcome. Covers every fallback class."""
+    import torch as _torch
+
+    fp8, bf16 = _torch.float8_e4m3fn, _torch.bfloat16
     cases = [
-        dict(dummy=False, real=64, padded=64, dtype="fp8", scale=(16, 1)),
-        dict(dummy=True, real=64, padded=64, dtype="fp8", scale=(16, 1)),
-        dict(dummy=False, real=40, padded=64, dtype="fp8", scale=(16, 1)),
-        dict(dummy=False, real=64, padded=64, dtype="bf16", scale=(16, 1)),
-        dict(dummy=False, real=64, padded=64, dtype="fp8", scale=(16, 2)),
+        dict(dummy=False, real=64, padded=64, dtype=fp8, scale=(16, 1)),
+        dict(dummy=True, real=64, padded=64, dtype=fp8, scale=(16, 1)),
+        dict(dummy=False, real=40, padded=64, dtype=fp8, scale=(16, 1)),
+        dict(dummy=False, real=64, padded=64, dtype=bf16, scale=(16, 1)),
+        dict(dummy=False, real=64, padded=64, dtype=fp8, scale=(16, 2)),
     ]
     expected = [True, False, False, False, False]  # fused only for the first
     for c, want_fused in zip(cases, expected):
@@ -1400,7 +1406,7 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
             s, t, state, ctx = _fake_direct(make_site)
             _seed_prepared(s, t, state)
             ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = c["dummy"], c["real"], c["padded"]
-            r, reason, _, _ = s._prepare(ctx, _T((16, 8), c["dtype"]), _T(c["scale"], "f32"))
+            r, reason, _, _ = s._prepare(ctx, _T((16, 8), c["dtype"]), _T(c["scale"]))
             outcomes.add((r.plan is not None, r.n_fused, reason))
         assert len(outcomes) == 1, (c, outcomes)  # every rank decided identically
         assert next(iter(outcomes))[0] is want_fused, c
