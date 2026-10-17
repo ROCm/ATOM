@@ -1,4 +1,4 @@
-"""Bounded GPU/CPU cache metadata probe, prepared locally and not yet deployed.
+"""Candidate v2 metadata probe; local only, not deployed to the active run.
 
 Observe actual map queries and publication/removal events without additional
 cache lookups, token payloads, tensors, GPU calls, or changes to LRU order.
@@ -19,7 +19,9 @@ class CacheLifecycleProbe:
         min_prompt=200000,
         max_history=100000,
         max_watched=4096,
-        max_records=2048,
+        max_records=16384,
+        max_positive_miss_examples=8,
+        watch_published_group_ids=None,
         cache_kind="cpu",
         result_summary=None,
     ):
@@ -30,6 +32,11 @@ class CacheLifecycleProbe:
         self.max_history = max_history
         self.max_watched = max_watched
         self.max_records = max_records
+        self.max_positive_miss_examples = max_positive_miss_examples
+        if watch_published_group_ids is None:
+            coordinator = getattr(offload, "cpu_coordinator", None)
+            watch_published_group_ids = _mamba_group_ids(coordinator)
+        self.watch_published_group_ids = set(watch_published_group_ids)
         self.cache_kind = cache_kind
         self.result_summary = result_summary or (lambda result: result)
         self.history = OrderedDict()
@@ -58,14 +65,20 @@ class CacheLifecycleProbe:
         if len(self.history) > self.max_history:
             self.history.popitem(last=False)
             self.history_dropped += 1
+        if (
+            event == "last_publish"
+            and int.from_bytes(key[-4:], "big") in self.watch_published_group_ids
+        ):
+            self._watch(key, reason="state_publication")
 
-    def _watch(self, key):
+    def _watch(self, key, *, reason="actual_query"):
         if key in self.watched:
             return
         if len(self.watched) >= self.max_watched:
             self.watch_limit_misses += 1
             return
         self.watched[key] = {
+            "reason": reason,
             "events": self.history.get(key, {}),
             "complete_from_pool_start": self.history_started_empty
             and self.history_dropped == 0,
@@ -92,18 +105,17 @@ class CacheLifecycleProbe:
                 )
             return
         summary["misses"] += 1
-        previous = summary.get("lowest_missing_hash")
-        if previous is None or (
-            index is not None
-            and (previous["hash_index"] is None or index < previous["hash_index"])
-        ):
-            watched = self.watched.get(key)
-            history = watched["events"] if watched else self.history.get(key)
-            summary["lowest_missing_hash"] = {
+        watched = self.watched.get(key)
+        history = watched["events"] if watched else self.history.get(key)
+
+        def describe_missing():
+            return {
                 "hash_index": index,
                 "hash_with_group_hex": key.hex(),
                 "observed_history": dict(history) if history else None,
-                "history_source": "watched_actual_query" if watched else "rolling",
+                "history_source": "watched_" + watched["reason"]
+                if watched
+                else "rolling",
                 "history_absence_is_conclusive": (
                     watched["complete_from_pool_start"]
                     if watched
@@ -111,6 +123,27 @@ class CacheLifecycleProbe:
                 ),
                 "note": "A map miss, not a tensor validity or token equality check.",
             }
+
+        # Backward state scans can pass an evicted checkpoint and end at an
+        # earlier never-published hash. Keep bounded positive evidence apart
+        # from the lowest miss, using only history of actual map queries.
+        if history:
+            summary["positive_history_miss_queries"] = (
+                summary.get("positive_history_miss_queries", 0) + 1
+            )
+            examples = summary.setdefault("positive_miss_examples", [])
+            if len(examples) < self.max_positive_miss_examples:
+                examples.append(describe_missing())
+            else:
+                summary["positive_miss_examples_dropped"] = (
+                    summary.get("positive_miss_examples_dropped", 0) + 1
+                )
+        previous = summary.get("lowest_missing_hash")
+        if previous is None or (
+            index is not None
+            and (previous["hash_index"] is None or index < previous["hash_index"])
+        ):
+            summary["lowest_missing_hash"] = describe_missing()
 
     def _install_map(self):
         mapping = self.pool.cached_block_hash_to_block
@@ -255,11 +288,27 @@ class CacheLifecycleProbe:
                 "max_history": self.max_history,
                 "max_watched": self.max_watched,
                 "max_records": self.max_records,
+                "max_positive_miss_examples_per_group": self.max_positive_miss_examples,
+                "watch_published_group_ids": sorted(self.watch_published_group_ids),
                 "history_start": "Installation; not earlier cache events.",
                 "scope": "Host-side cache metadata; no GPU or tensor operations.",
             }
         )
         return self
+
+
+def _mamba_group_ids(coordinator):
+    if coordinator is None:
+        return []
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    return [
+        group_id
+        for group_id, manager in enumerate(
+            getattr(coordinator, "single_type_managers", ())
+        )
+        if isinstance(manager, MambaManager)
+    ]
 
 
 def install_gpu_cache_probe(scheduler, stream, **limits):
@@ -269,6 +318,7 @@ def install_gpu_cache_probe(scheduler, stream, **limits):
     original = scheduler._get_local_prefix_cache_hit
     adapter = SimpleNamespace(
         cpu_block_pool=scheduler.kv_cache_manager.coordinator.block_pool,
+        cpu_coordinator=scheduler.kv_cache_manager.coordinator,
         get_num_new_matched_tokens=lambda request, unused_local: original(request),
     )
     probe = CacheLifecycleProbe(
@@ -286,6 +336,18 @@ def install_gpu_cache_probe(scheduler, stream, **limits):
         adapter.get_num_new_matched_tokens(request, None)
     )
     return probe
+
+
+def install_engine_shutdown_flush(engine_core_class, scheduler, close):
+    """Persist this scheduler's metadata before executor resource teardown."""
+    original = engine_core_class.shutdown
+
+    def shutdown(engine, *args, **kwargs):
+        if getattr(engine, "scheduler", None) is scheduler:
+            close()
+        return original(engine, *args, **kwargs)
+
+    engine_core_class.shutdown = shutdown
 
 
 def install_prefill_cache_probes(scheduler, directory, **limits):
@@ -325,12 +387,16 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
     stream = (directory / f"{prefix}.jsonl").open("w", buffering=65536)
     gpu = scheduler.kv_cache_manager.coordinator
     manifest = {
+        "probe_schema_version": 2,
         "pid": os.getpid(),
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "min_prompt": limits.get("min_prompt", 200000),
         "max_history_per_pool": limits.get("max_history", 100000),
         "max_watched_keys_per_pool": limits.get("max_watched", 4096),
-        "max_records_per_pool": limits.get("max_records", 2048),
+        "max_records_per_pool": limits.get("max_records", 16384),
+        "max_positive_miss_examples_per_group": limits.get(
+            "max_positive_miss_examples", 8
+        ),
         "lazy_offload": cpu._lazy_mode,
         "cpu_blocks": cpu.num_cpu_blocks,
         "gpu_blocks": len(gpu.block_pool.blocks),
@@ -399,6 +465,12 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
             close()
 
     scheduler.shutdown = shutdown
+    # EngineCore tears down the executor before invoking scheduler.shutdown.
+    # Flush at its entry so slow/interrupted executor teardown does not lose
+    # the observer's final coverage counters. The original teardown is intact.
+    from vllm.v1.engine.core import EngineCore
+
+    install_engine_shutdown_flush(EngineCore, scheduler, close)
     atexit.register(close)
     scheduler._c48_cache_lifecycle = probes, close
     return scheduler._c48_cache_lifecycle
