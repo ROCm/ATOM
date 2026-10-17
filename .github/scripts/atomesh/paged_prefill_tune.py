@@ -619,6 +619,10 @@ def main():
                     json.dumps(rejected, indent=2) + "\n"
                 )
                 write_sweep_summary(args.output, rejected)
+    if not args.validate_only and len(rejected) == len(plan) - 2:
+        raise RuntimeError(
+            "All candidate configurations were rejected; see sweep-summary.json"
+        )
     print(
         "[paged-prefill-tune] default/reference gates passed; isolated candidate sweep complete",
         flush=True,
