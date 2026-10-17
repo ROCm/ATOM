@@ -219,17 +219,22 @@ def _atom_config(*, eplb: bool, backend: str = "auto") -> SimpleNamespace:
 
 
 @pytest.mark.parametrize(
-    "eplb, switch, expected",
+    "eplb, switch, mori_v2, expected",
     [
-        (False, False, False),
-        (False, True, True),
-        (True, False, True),
-        (True, True, True),
+        (False, False, False, False),
+        (False, True, False, True),
+        (True, False, False, True),
+        (True, True, False, True),
+        (False, False, True, False),
+        (False, True, True, False),
+        (True, False, True, True),
+        (True, True, True, True),
     ],
 )
-def test_eplb_overrides_the_local_replica_switch(monkeypatch, eplb, switch, expected):
+def test_mori_shared_expert_fusion_policy(monkeypatch, eplb, switch, mori_v2, expected):
     monkeypatch.setattr(topK_module.envs, "ATOM_FUSE_SHARED_EXPERT", switch)
     monkeypatch.setattr(topK_module.envs, "ATOM_DISABLE_MORI_EP", False)
+    monkeypatch.setattr(topK_module.envs, "ATOM_MORI_V2", mori_v2)
     # Stated, not inherited: the gate asks whether MoRI is importable, so
     # without this the truth table below holds only on a box that has it.
     monkeypatch.setattr(topK_module, "_has_module", lambda name: True)
