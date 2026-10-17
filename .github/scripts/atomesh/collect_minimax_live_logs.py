@@ -188,12 +188,54 @@ def collect(target, output, *, roots=ROOTS):
     return manifest
 
 
+def emit_log_annotations(output):
+    """Provide a bounded API-readable fallback when blob downloads are unavailable."""
+    selected = [
+        path
+        for path in sorted(output.rglob("*"))
+        if path.is_file()
+        and (path.name == "container.log" or "paged-prefill-tuning" in path.parts)
+    ]
+    for log_limit, result_limit in ((16000, 80000), (4000, 16000), (1000, 4000)):
+        files, tails = {}, []
+        for path in selected[:40]:
+            relative = str(path.relative_to(output))
+            raw = path.read_text(errors="replace")
+            limit = result_limit if path.suffix == ".jsonl" else log_limit
+            files[relative] = raw[-limit:]
+            if len(raw) > limit:
+                tails.append(relative)
+        payload = json.dumps(
+            {"format": "atomesh-log-snapshot-v1", "files": files, "tail_only": tails}
+        )
+        if len(payload) <= 400000:
+            break
+    while len(payload) > 400000:
+        longest = max(files, key=lambda name: len(files[name]))
+        files[longest] = files[longest][len(files[longest]) // 2 :]
+        if longest not in tails:
+            tails.append(longest)
+        payload = json.dumps(
+            {"format": "atomesh-log-snapshot-v1", "files": files, "tail_only": tails}
+        )
+    parts = [payload[i : i + 40000] for i in range(0, len(payload), 40000)]
+    for index, part in enumerate(parts):
+        escaped = part.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(
+            f"::notice title=ATOMESH log snapshot {index + 1}/{len(parts)}::{escaped}",
+            flush=True,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_id", type=run_id)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--github-annotations", action="store_true")
     args = parser.parse_args()
     collect(args.run_id, args.output)
+    if args.github_annotations:
+        emit_log_annotations(args.output)
 
 
 if __name__ == "__main__":

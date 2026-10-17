@@ -1596,7 +1596,7 @@ jobs:
           detect_slurm_backend
           export USES_SPUR_CONTROLLER SPUR_CONTROLLER_ADDR
           python3 .github/scripts/atomesh/collect_minimax_live_logs.py \
-            "$TARGET_RUN_ID" --output minimax-live-logs
+            "$TARGET_RUN_ID" --output minimax-live-logs --github-annotations
       - name: Upload existing run snapshot
         if: always()
         uses: actions/upload-artifact@v4
