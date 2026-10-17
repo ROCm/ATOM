@@ -543,16 +543,34 @@ def test_install_swaps_forward_only_when_site_declared(monkeypatch):
     assert MA.install_m3_sites(model) == 1 and m.forward.__func__ is MA._fused_forward
 
 # ------------------------- golden adapter: the REAL _site_for, not a hand-built site
-def _golden_case(mode):
-    nk = (9216, 6144) if mode == "qkv_dense" else (9856, 6144)
+def _golden_case(mode, tokens=64):
+    """A case whose ``spec`` is the REAL golden ``CaseSpec`` (page size, gemm_nk, padded
+    tokens come from it, never hand-typed). Falls back to the documented values only when
+    the golden tree is not on disk, and says so via ``case.spec_is_real``."""
+    import importlib.util
+    from pathlib import Path
+
     norm = lambda: SimpleNamespace(weight=object(), variance_epsilon=1e-6)
+    gold = Path(__file__).resolve().parents[3] / "sp4-attention-fusion-cases-20261009" / "case_config.py"
+    if gold.exists():
+        s = importlib.util.spec_from_file_location("golden_case_config", gold)
+        m = importlib.util.module_from_spec(s)
+        s.loader.exec_module(m)
+        spec, real = m.CaseSpec(mode, tokens), True
+    else:  # documented golden values (case_config.py: dense page 128, indexer/reuse 16)
+        has_idx = mode != "qkv_dense"
+        spec = SimpleNamespace(
+            mode=mode, tokens=tokens, padded_tokens=(tokens + 3) // 4 * 4,
+            cache_page_size=16 if has_idx else 128,
+            gemm_nk=((9856 if has_idx else 9216), 6144),
+        )
+        real = False
     return SimpleNamespace(
-        spec=SimpleNamespace(mode=mode, tokens=64, padded_tokens=64, cache_page_size=16, gemm_nk=nk),
+        spec=spec, spec_is_real=real,
         rotary=SimpleNamespace(rotary_dim=64), q_norm=norm(), k_norm=norm(),
         index_q_norm=norm(), index_k_norm=norm(), caches={"index_cache": object()},
         weight=object(), weight_scale=object(),
     )
-
 
 @pytest.mark.parametrize("mode,gm", [("qkv_dense", "dense"), ("qkv_indexer", "indexer"),
                                       ("qkv_indexer_reuse", "reuse")])
@@ -596,11 +614,32 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     GC._SITES.clear()
     site, _, _ = GC._site_for(_golden_case(mode), None)
     assert site._static_prologue_ok() is True  # else every golden cell resolves 'uncovered'
-    rows = json.loads((aiter_root / "aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json").read_text())["rows"]
-    # small M: the full 2-stage chain (GEMM + SPExchange + HeadNormRopeCache)
+    prof_path = aiter_root / "aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json"
+    try:
+        rows = json.loads(prof_path.read_text())["rows"]
+    except (ValueError, OSError):  # aiter worktree mid-regeneration (empty/partial file)
+        pytest.skip("aiter profile not readable (being regenerated)")
+    # small M: the full 2-stage chain (GEMM + SPExchange + HeadNormRopeCache). The kv_cache
+    # string carries the page size, and the REAL golden dense case uses page 128 while
+    # aiter's spec builder / profile hardcode page 16 for every mode. Indexer/reuse are 16
+    # in both, so they must match; dense is a real, currently-open mismatch, asserted as
+    # such (xfail-style) instead of being hidden by a page-16 fixture.
+    page = _golden_case(mode).spec.cache_page_size
     sig2 = site.spec.prefix(2).signature()
-    assert sig2 == specs.sp_qkv_spec(gm).signature()
-    assert sig2 in {r["sig"] for r in rows if "small" in r["vid"]}
+    small = {r["sig"] for r in rows if "small" in r["vid"]}
+    if page == 16:
+        assert sig2 == specs.sp_qkv_spec(gm).signature()
+        assert sig2 in small
+    else:
+        assert f"_page{page}_" in site.spec.stages[1].kv_cache
+        if sig2 in small:  # aiter fixed its spec/profile for page 128: nothing left to flag
+            assert sig2 == specs.sp_qkv_spec(gm).signature()
+        else:
+            pytest.xfail(
+                f"{mode}: golden cache page {page} -> small-M 2-stage sig {sig2} is not in the "
+                f"profile (aiter hardcodes shuffle_page16); dense small-M would resolve to the "
+                f"large-M prefix or native"
+            )
     # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
     # are keyed by this 1-stage signature, so the prefix fallback only works if it matches.
     sig1 = site.spec.prefix(1).signature()
