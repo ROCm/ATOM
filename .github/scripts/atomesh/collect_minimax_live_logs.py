@@ -364,6 +364,78 @@ def summarize_prefill_shapes(path):
     }
 
 
+def summarize_prefill_tail_windows(path, requests):
+    """Read scheduler activity around the 20 slowest requests, without GPU work.
+
+    Log clocks are interpreted as UTC, matching the benchmark containers.
+    Scheduled QK pairs describe workload, not kernel duration or queue time.
+    """
+    seconds = set()
+    windows = []
+    for request in requests.get("top", [])[:20]:
+        start_ns = request.get("request_start_ns")
+        ttft = request.get("ttft_ms")
+        if start_ns is None or ttft is None:
+            continue
+        start = int(start_ns // 1_000_000_000)
+        # Bound malformed records rather than scanning an unbounded time span.
+        duration = min(600, max(0, int(ttft / 1000) + 1))
+        seconds.update(s % 86400 for s in range(start - 1, start + duration + 2))
+        windows.append(
+            {
+                "request_id": request.get("x_request_id"),
+                "start_ns": start_ns,
+                "ttft_ms": ttft,
+            }
+        )
+    clock = re.compile(r"\[atom (\d{2}):(\d{2}):(\d{2})\]")
+    shape = re.compile(
+        r"Scheduled prefill batch: (\d+) reqs, (\d+) new tokens "
+        r"\(done: (\[[0-9, ]*\]), new: (\[[0-9, ]*\])\)"
+    )
+    timeline = {}
+    compile_events, compile_count = [], 0
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            stamp = clock.search(line)
+            if stamp is None:
+                continue
+            h, m, sec = map(int, stamp.groups())
+            second = 3600 * h + 60 * m + sec
+            if second not in seconds:
+                continue
+            if re.search(r"compil|\bJIT\b", line, re.IGNORECASE):
+                compile_count += 1
+                if len(compile_events) < 30:
+                    compile_events.append(line.rstrip()[:500])
+            match = shape.search(line)
+            if match is None:
+                continue
+            count, total = map(int, match.group(1, 2))
+            cached, new = map(json.loads, match.group(3, 4))
+            if len(cached) != count or len(new) != count or sum(new) != total:
+                continue
+            key = f"{h:02}:{m:02}:{sec:02}"
+            row = timeline.setdefault(
+                key, {"batches": 0, "queries": 0, "causal_qk_pairs": 0, "max_kv": 0}
+            )
+            row["batches"] += 1
+            row["queries"] += total
+            row["causal_qk_pairs"] += sum(
+                c * q + q * (q + 1) // 2 for c, q in zip(cached, new)
+            )
+            row["max_kv"] = max(row["max_kv"], max(c + q for c, q in zip(cached, new)))
+    return {
+        "clock": "UTC assumed for server log",
+        "scope": "20 slowest TTFT windows, at most 600 seconds each",
+        "windows": windows,
+        "scheduler_by_second": timeline,
+        "compilation_log_matches": compile_count,
+        "compilation_events": compile_events,
+        "limitation": "Scheduler activity is not per-kernel timing; absent compilation messages do not rule out JIT.",
+    }
+
+
 def summarize_aiperf_tail(path):
     """Stream completed profiling requests into compact tail-latency evidence."""
     from interactivity import agentic_throughput
@@ -528,6 +600,12 @@ def collect(target, output, *, roots=ROOTS):
                     ).with_name("aiperf-tail-summary.json")
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_text(json.dumps(summary) + "\n")
+                    prefill = records.parents[2] / "logs/prefill-rank-0.log"
+                    if prefill.is_file() and prefill.resolve().is_relative_to(source):
+                        windows = summarize_prefill_tail_windows(prefill, summary)
+                        destination.with_name("prefill-tail-windows.json").write_text(
+                            json.dumps(windows) + "\n"
+                        )
                 except (OSError, ValueError) as exc:
                     manifest["errors"].append({"path": str(records), "error": str(exc)})
             for pattern in PATTERNS:
@@ -617,6 +695,7 @@ def emit_log_annotations(output):
                 "metadata-rank-0.json",
                 "runtime-state.json",
                 "prefill-shapes.json",
+                "prefill-tail-windows.json",
                 "aiperf-tail-summary.json",
                 "sweep-summary.json",
                 "profile_export_aiperf.json",
@@ -674,7 +753,12 @@ def emit_log_annotations(output):
             name
             for name in files
             if Path(name).name
-            not in ("aiperf-tail-summary.json", "sweep-summary.json", "job-result.json")
+            not in (
+                "aiperf-tail-summary.json",
+                "prefill-tail-windows.json",
+                "sweep-summary.json",
+                "job-result.json",
+            )
             and not Path(name).name.startswith(("pd-atom-", "results_"))
             and len(files[name]) > 1000
         ]
