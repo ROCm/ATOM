@@ -52,4 +52,11 @@ def create_scheduler(*args, **kwargs):
         scheduler._c48_timeline = Timeline(
             scheduler, Path(os.environ["C48_DIAG_DIR"]).parent / "prefill-timeline"
         ).install()
+    if os.environ.get("C48_CACHE_LIFECYCLE") == "1":
+        if record["role"] != "prefill":
+            raise ValueError("C48 cache lifecycle evidence is Prefill-only")
+        from pd_c48_cache_lifecycle import install_prefill_cache_probes
+        install_prefill_cache_probes(
+            scheduler, Path(os.environ["C48_DIAG_DIR"]).parent / "cache-lifecycle"
+        )
     return scheduler

@@ -82,6 +82,19 @@ def main() -> None:
     }
     options.output.parent.mkdir(parents=True, exist_ok=True)
     if options.execute:
+        from pd_c48_host_memory import inspect_host_capacity
+        host_capacity = inspect_host_capacity(config, options.role)
+        record["host_offload_capacity"] = host_capacity
+        options.output.with_suffix(".host-memory.json").write_text(
+            json.dumps(host_capacity, indent=2) + "\n"
+        )
+        print("[C48-HOSTMEM] " + json.dumps(host_capacity), flush=True)
+        if host_capacity["impossible_capacity"]:
+            raise RuntimeError(
+                "C48 CPU offload exceeds ordinary physical RAM after HugeTLB reservation: "
+                f"requested={host_capacity['requested_cpu_cache_bytes_node']} "
+                f"ordinary={host_capacity['ordinary_physical_bytes']} bytes"
+            )
         import vllm
         from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__

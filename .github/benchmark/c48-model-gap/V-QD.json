@@ -170,7 +170,8 @@
         "MORI_IO_QP_MAX_CQE": "32768",
         "MORI_IO_QP_MAX_SGE": "2",
         "MORI_IO_TC_DISABLE": "0",
-        "HSA_NO_SCRATCH_RECLAIM": "0"
+        "HSA_NO_SCRATCH_RECLAIM": "0",
+        "C48_CACHE_LIFECYCLE": "1"
       }
     },
     "decode": {
