@@ -139,7 +139,8 @@ class GemmFusionSite:
     def _static_prologue_ok(self) -> bool:
         """Static (config/env) eligibility of the fused norm/rope/cache stage,
         folded into the cross-rank agreement so it can never differ per call."""
-        fn = getattr(self.attn.impl, "gemm_fusion_prologue_supported", None)
+        impl = getattr(self.attn, "impl", None)
+        fn = getattr(impl, "gemm_fusion_prologue_supported", None)
         return True if fn is None else bool(fn())
 
     def resolve(self, tokens: int, graph_mode: str = "eager") -> Resolution:

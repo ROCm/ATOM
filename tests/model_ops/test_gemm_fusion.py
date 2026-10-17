@@ -89,7 +89,7 @@ def make_site(monkeypatch):
         linear = SimpleNamespace(output_size=10240, input_size=3072)
         stg = [SimpleNamespace(kind="sp_exchange"), SimpleNamespace(kind="head_norm_rope_cache")]
         return site_mod.GemmFusionSite(
-            "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(),
+            "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(impl=SimpleNamespace()),
             q_size=8192, kv_size=128,
         )
 
@@ -499,25 +499,29 @@ def test_model_py_has_no_gemm_fusion_reference_and_runner_gates_install():
 
 
 def test_install_swaps_forward_only_when_site_declared(monkeypatch):
+    import sys
+    import types as _types
+
     from atom.model_ops.gemm_fusion import model_adapters as MA
+    import atom.model_ops.gemm_fusion as G
 
-    calls = []
-
-    class FakeAttn:  # stands in for both M3 classes
+    class FakeDense:  # stands in for MiniMaxM3Attention
         def __init__(self):
             self.attn = SimpleNamespace(layer_name="model.layers.0.self_attn.attn", qkv_site=None)
 
         def forward(self):
             return "native"
 
-    import atom.models.minimax_m3.model as M
+    # The real model module needs the native aiter build; inject a stand-in so the
+    # adapter's `from atom.models.minimax_m3.model import ...` never touches it.
+    fake = _types.ModuleType("atom.models.minimax_m3.model")
+    fake.MiniMaxM3Attention = FakeDense
+    fake.MiniMaxM3SparseAttention = type("FakeSparse", (), {})
+    monkeypatch.setitem(sys.modules, "atom.models.minimax_m3.model", fake)
 
-    monkeypatch.setattr(M, "MiniMaxM3Attention", FakeAttn)
-    monkeypatch.setattr(M, "MiniMaxM3SparseAttention", type("S", (), {}))
-    import atom.model_ops.gemm_fusion as G
-
+    calls = []
     monkeypatch.setattr(G, "declare_m3_qkv_site", lambda m, prefix, sparse: calls.append(prefix) or None)
-    m = FakeAttn()
+    m = FakeDense()
     model = SimpleNamespace(modules=lambda: [m])
     assert MA.install_m3_sites(model) == 0 and m.forward() == "native"  # ineligible: untouched
     assert calls == ["model.layers.0.self_attn"]
