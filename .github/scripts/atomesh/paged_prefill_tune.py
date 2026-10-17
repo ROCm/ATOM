@@ -463,6 +463,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True)
     parser.add_argument("--baseline-source")
+    parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--mode", choices=["old", "new", "candidate"])
     parser.add_argument("--config", type=int, nargs=4)
     parser.add_argument("--shard", type=int, default=0)
@@ -481,9 +482,9 @@ def main():
     )
     subprocess.run([sys.executable, str(check)], check=True)
     rejected = {}
-    plan = [("old", None), ("new", None)] + [
-        ("candidate", config) for config in configurations()
-    ]
+    plan = [("old", None), ("new", None)]
+    if not args.validate_only:
+        plan += [("candidate", config) for config in configurations()]
     for mode, config in plan:
         variant = configuration_name(config) if config else mode
         with ExitStack() as logs:
