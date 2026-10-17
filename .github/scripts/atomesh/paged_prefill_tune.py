@@ -219,8 +219,24 @@ def parameters(ua, x, case):
     )
 
 
-def candidate(ua, p, block_m, warps, stages, splits, matrix_size=0, waves=2):
+def candidate(
+    ua, p, block_m, warps, stages, splits, matrix_size=0, waves=2, *, gluon=False
+):
     import torch
+
+    if gluon:
+        assert splits == 1
+        return lambda: ua._unified_attention_gfx950(
+            p,
+            {
+                "NUM_BUFFERS": stages,
+                "MFMA_DIM": matrix_size or 32,
+                "waves_per_eu": waves,
+            },
+            BLOCK_M=block_m,
+            TILE_SIZE=128,
+            num_warps=warps,
+        )
 
     cfg = {
         "BLOCK_M": block_m,
@@ -330,7 +346,14 @@ def measure(fn):
     return {"median_ms": statistics.median(results), "samples_ms": results}
 
 
-def configurations(microarchitecture=False):
+def configurations(microarchitecture=False, gluon=False):
+    if gluon:
+        return [
+            (bm, nw, buffers, 1, 32, waves)
+            for bm, nw in ((128, 4), (256, 8))
+            for buffers in (1, 2)
+            for waves in (1, 2)
+        ]
     if microarchitecture:
         # Compile-time MFMA layout and occupancy candidates for large-Q 2D.
         # Each runs the whole numerical population in isolated workers.
@@ -353,12 +376,12 @@ def configurations(microarchitecture=False):
     ]
 
 
-def configuration_name(config):
+def configuration_name(config, gluon=False):
     bm, nw, ns, splits, *extra = config
     name = f"m{bm}-w{nw}-s{ns}-kv{splits}"
     if extra:
         name += f"-mfma{extra[0]}-waves{extra[1]}"
-    return name
+    return name + ("-gluon" if gluon else "")
 
 
 def worker(args):
@@ -367,7 +390,11 @@ def worker(args):
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     ua = importlib.import_module("aiter.ops.triton.attention.unified_attention")
-    variant = configuration_name(args.config) if args.mode == "candidate" else args.mode
+    variant = (
+        configuration_name(args.config, args.gluon)
+        if args.mode == "candidate"
+        else args.mode
+    )
     result_path = Path(args.output) / f"{variant}-{args.shard}.jsonl"
 
     def record(row):
@@ -417,7 +444,7 @@ def worker(args):
             del gathered, gather
         elif args.mode == "candidate":
             p = parameters(ua, x, case)
-            fn = candidate(ua, p, *args.config)
+            fn = candidate(ua, p, *args.config, gluon=args.gluon)
             record({"case": case, "variant": variant, "phase": "candidate-start"})
             try:
                 fn()
@@ -485,6 +512,7 @@ def main():
     parser.add_argument("--mode", choices=["old", "new", "candidate"])
     parser.add_argument("--config", type=int, nargs="+")
     parser.add_argument("--microarchitecture", action="store_true")
+    parser.add_argument("--gluon", action="store_true")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=8)
     args = parser.parse_args()
@@ -508,10 +536,11 @@ def main():
     plan = [("old", None), ("new", None)]
     if not args.validate_only:
         plan += [
-            ("candidate", config) for config in configurations(args.microarchitecture)
+            ("candidate", config)
+            for config in configurations(args.microarchitecture, args.gluon)
         ]
     for mode, config in plan:
-        variant = configuration_name(config) if config else mode
+        variant = configuration_name(config, args.gluon) if config else mode
         with ExitStack() as logs:
             procs = []
             for shard in range(args.shards):
@@ -538,6 +567,8 @@ def main():
                 ]
                 if config:
                     command += ["--config", *map(str, config)]
+                    if args.gluon:
+                        command += ["--gluon"]
                 procs.append(
                     subprocess.Popen(
                         command, env=env, stdout=log, stderr=subprocess.STDOUT

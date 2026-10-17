@@ -1360,7 +1360,7 @@ models:
             cudagraph: '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64]'
           decode: *minimax_m3_workspace_service
           env:
-            common:
+            common: &minimax_m3_workspace_env
               PYTHONNOUSERSITE: '1'
               PYTHONHASHSEED: '0'
               MC_DISABLE_HIP: '1'
@@ -1403,6 +1403,10 @@ models:
         - <<: *minimax_m3_workspace_c32
           name: minimax-m3-paged-prefill-kernel-tuning
           concurrency: [1]
+          env:
+            common:
+              <<: *minimax_m3_workspace_env
+              ATOM_AITER_SCATTER_REF: 358ab43dcadc39d167d0e19495aad8c188657a7b
           benchmark:
             kind: paged_prefill_tuning
             prepare_lmcache_host_memory: false
