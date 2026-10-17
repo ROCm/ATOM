@@ -358,6 +358,11 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     # -- takes the non-V4.1 path rather than raising AttributeError from a
     # branch that has nothing to do with what is under test.
     _is_deepseek_v41 = False
+    #: Request ids vLLM has reported finished. A transfer completion that
+    #: arrives after one of these is dropped; see `get_finished`'s report.
+    #: Class-level so every construction path has it -- `__init__` branches
+    #: on the role and the report is reachable without the branch it sat in.
+    _finished_seen: set = frozenset()
     #: Block size of the group this connector's codec owns, 0 when unknown.
     #: Distinct from the engine-wide `cache_config.block_size`, which is the
     #: smallest across groups once a second group exists.
@@ -2079,9 +2084,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             # Single group: the block channel already carried them, and naming
             # them twice would discard prefixes the block channel only trims.
             failed = set()
+        # Not for requests vLLM has already finished. Its
+        # `_update_from_kv_xfer_finished` asserts `req_id in self.requests`
+        # for everything named here, so a completion that lands after the
+        # request is gone takes the engine down rather than being ignored --
+        # measured as a bare AssertionError on the second pass of a DSpark
+        # run, where a load outliving its request is the common case. vLLM
+        # frees a finished request's blocks itself, so the report had nothing
+        # left to achieve.
+        #
+        # Keyed off the ids vLLM names as finished rather than off the
+        # connector's own request map: a load can legitimately complete for a
+        # request this half never stored a `Request` for, and filtering on
+        # that map discards those too.
+        if not isinstance(self._finished_seen, set):
+            self._finished_seen = set()
+        self._finished_seen.update(str(r) for r in (finished_req_ids or ()))
+        gone = self._finished_seen
+        recving = {r for r in (recving or ()) if str(r) not in gone}
+        failed = {r for r in failed if str(r) not in gone}
         return KVConnectorTransferResults(
             finished_sending=set(sending or ()),
-            finished_recving=set(recving or ()),
+            finished_recving=recving,
             failed_recving=failed,
         )
 
