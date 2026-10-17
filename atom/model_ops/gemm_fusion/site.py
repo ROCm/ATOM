@@ -11,6 +11,7 @@ entry the golden-harness candidate adapter uses.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -130,10 +131,34 @@ class GemmFusionSite:
             w += impl.index_q_size + impl.index_head_dim
         return w
 
+    def declared_page(self):
+        """KV page size encoded in the site's HeadNormRopeCache.kv_cache string
+        (``shuffle_page{N}_{dtype}_ptok``); aiter reads the page only from there."""
+        for st in self.stages:
+            kv = getattr(st, "kv_cache", None)
+            if kv:
+                m = re.search(r"_page(\d+)_", kv)
+                return int(m.group(1)) if m else None
+        return None
+
     def bind_caches(self, kv_cache_data) -> None:
         key = f"layer_{self.attn.impl.layer_num}"
         if key not in kv_cache_data:
             raise KeyError(f"gemm_fusion site {self.name}: no KV cache entry {key}")
+        # The page in the signature must be the page of the cache aiter will write.
+        # K shuffle layout: [blocks, kv_heads, head_dim//x, page, x] -> page = shape[3].
+        # Sparse layers re-view the pool as page-16 (any multiple of 16 is fine);
+        # dense layers use the pool's own page.
+        declared = self.declared_page()
+        k = getattr(kv_cache_data[key], "k_cache", None)
+        if declared is not None and k is not None and k.dim() == 5:
+            pool_page = int(k.shape[3])
+            ok = (pool_page % declared == 0) if self.sparse else (pool_page == declared)
+            if not ok:
+                raise GemmFusionBindError(
+                    f"{self.name}: signature declares KV page {declared} but the bound cache "
+                    f"has page {pool_page} ({'sparse' if self.sparse else 'dense'} layer)"
+                )
 
     # -- resolution ------------------------------------------------------
     def _static_prologue_ok(self) -> bool:

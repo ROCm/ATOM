@@ -620,27 +620,16 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     except (ValueError, OSError):  # aiter worktree mid-regeneration (empty/partial file)
         pytest.skip("aiter profile not readable (being regenerated)")
     # small M: the full 2-stage chain (GEMM + SPExchange + HeadNormRopeCache). The kv_cache
-    # string carries the page size, and the REAL golden dense case uses page 128 while
-    # aiter's spec builder / profile hardcode page 16 for every mode. Indexer/reuse are 16
-    # in both, so they must match; dense is a real, currently-open mismatch, asserted as
-    # such (xfail-style) instead of being hidden by a page-16 fixture.
+    # string carries the page size, which comes from the REAL golden CaseSpec (dense 128,
+    # indexer/reuse 16). aiter >= 27479d5f builds its spec/profile from the same table, so
+    # the signatures must be EQUAL and present in the profile for every mode -- strictly.
     page = _golden_case(mode).spec.cache_page_size
+    assert page == (128 if gm == "dense" else 16)
+    assert f"_page{page}_" in site.spec.stages[1].kv_cache
+    assert site.declared_page() == page
     sig2 = site.spec.prefix(2).signature()
-    small = {r["sig"] for r in rows if "small" in r["vid"]}
-    if page == 16:
-        assert sig2 == specs.sp_qkv_spec(gm).signature()
-        assert sig2 in small
-    else:
-        assert f"_page{page}_" in site.spec.stages[1].kv_cache
-        if sig2 in small:  # aiter fixed its spec/profile for page 128: nothing left to flag
-            assert sig2 == specs.sp_qkv_spec(gm).signature()
-        else:
-            pytest.xfail(
-                f"{mode}: golden cache page {page} -> small-M 2-stage sig {sig2} is not in the "
-                f"profile (aiter hardcodes shuffle_page16); dense small-M would resolve to the "
-                f"large-M prefix or native"
-            )
-    # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
+    assert sig2 == specs.sp_qkv_spec(gm).signature(), f"{mode}: page-{page} signature differs from aiter's"
+    assert sig2 in {r["sig"] for r in rows if "small" in r["vid"]}    # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
     # are keyed by this 1-stage signature, so the prefix fallback only works if it matches.
     sig1 = site.spec.prefix(1).signature()
     assert sig1 == specs.sp_qkv_spec(gm).prefix(1).signature()
@@ -764,3 +753,63 @@ def test_golden_dense_gate_honours_env_and_stays_in_sync_with_the_real_impl(monk
         assert needle in body, needle
     sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
     assert re.search(r"def gemm_fusion_prologue_supported\(self\) -> bool:.*?return True", sparse, re.S)
+
+# ---------------------- KV page: derived from the real cache, verified at bind time
+class _FakeK:
+    """Shape-only stand-in for a K cache tensor [blocks, kv_heads, head_dim//x, page, x]."""
+
+    def __init__(self, page):
+        self.shape = (4, 1, 8, page, 16)
+
+    def dim(self):
+        return 5
+
+
+def _page_site(make_site, declared_page, sparse):
+    s = make_site(FakeResources())
+    s.sparse = sparse
+    s.stages = (SimpleNamespace(kind="sp_exchange"),
+                SimpleNamespace(kind="head_norm_rope_cache", kv_cache=f"shuffle_page{declared_page}_fp8_ptok"))
+    s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3))
+    return s
+
+
+def _kv(page):
+    return {"layer_3": SimpleNamespace(k_cache=_FakeK(page))}
+
+
+def test_declared_page_is_read_from_the_signature_string(make_site):
+    assert _page_site(make_site, 128, False).declared_page() == 128
+    assert _page_site(make_site, 16, True).declared_page() == 16
+
+
+def test_bind_caches_dense_page_must_equal_the_pool_page(make_site):
+    s = _page_site(make_site, 128, sparse=False)
+    s.bind_caches(_kv(128))  # matches
+    with pytest.raises(site_mod.GemmFusionBindError, match="declares KV page 128"):
+        s.bind_caches(_kv(16))  # e.g. a hardcoded-16 signature against a page-128 pool
+    s16 = _page_site(make_site, 16, sparse=False)
+    with pytest.raises(site_mod.GemmFusionBindError):
+        s16.bind_caches(_kv(128))  # the opposite mistake
+
+
+def test_bind_caches_sparse_reviews_the_pool_as_page16(make_site):
+    s = _page_site(make_site, 16, sparse=True)
+    s.bind_caches(_kv(128))  # page-128 pool re-viewed as 8 x page-16: fine
+    s.bind_caches(_kv(16))
+    with pytest.raises(site_mod.GemmFusionBindError):
+        _page_site(make_site, 128, sparse=True).bind_caches(_kv(16))  # cannot be coarser than the pool
+
+
+def test_kv_block_size_has_no_silent_default(monkeypatch):
+    """A guessed page would silently miss (or wrongly match) a profile row."""
+    import sys
+    import types as _t
+
+    cfg = _t.ModuleType("atom.config")
+    cfg.get_current_atom_config = lambda: (_ for _ in ()).throw(RuntimeError("no config"))
+    monkeypatch.setitem(sys.modules, "atom.config", cfg)
+    with pytest.raises(RuntimeError):
+        stages._kv_block_size()
+    cfg.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=128)
+    assert stages._kv_block_size() == 128

@@ -65,12 +65,14 @@ def sp_exchange(fields, drop=(), world: Optional[int] = None):
 
 
 def _kv_block_size() -> int:
-    try:
-        from atom.config import get_current_atom_config
+    """The dense layers' real KV page size (config.kv_cache_block_size).
 
-        return int(get_current_atom_config().kv_cache_block_size)
-    except Exception:
-        return 16
+    No silent default: the page is part of the fusion signature, so a guessed value
+    would either miss the profile or, worse, match a row for a different layout.
+    """
+    from atom.config import get_current_atom_config
+
+    return int(get_current_atom_config().kv_cache_block_size)
 
 
 def head_norm_rope_cache_from_attention(attn, index: Optional[str] = None):
