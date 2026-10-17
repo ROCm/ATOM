@@ -841,7 +841,7 @@ Concurrency 8 did not pass aiperf's coverage check (`ProfileMetricCoverageError`
 
 **ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621) enables LMCache MP mode for this deployment:** multi-node DP with one LMCache server per tray. Until
 it is in the image, apply it as [`atom-lmcache-mp-multinode.diff`](Kimi-K3-455-wideEP-patches/atom-lmcache-mp-multinode.diff).
-Install LMCache for gfx1250 as in [Installing LMCache](#installing-lmcache), then start as in [Launch](#launch).
+Install LMCache for gfx1250 as in [Installing LMCache](#installing-lmcache), then start as in [Launch with LMCache](#launch-with-lmcache).
 
 At concurrency 64 the KV pool is full and evicted prefixes are prefilled again
 ([concurrency 64](#2026-10-16-the-20261014-image-concurrency-16-32-and-64)). LMCache's multiprocess (MP) mode adds a
@@ -915,7 +915,7 @@ The LMCache patch:
   chunks × (KDA image units + 1) block IDs, and the longest AgentX prompts (740k
   tokens) need 1.5M at block 128.
 
-### Launch
+### Launch with LMCache
 
 Start the server in each tray's container before ATOM, and leave it running across ATOM restarts:
 
