@@ -366,6 +366,7 @@ def summarize_prefill_shapes(path):
 
 def summarize_aiperf_tail(path):
     """Stream completed profiling requests into compact tail-latency evidence."""
+    from interactivity import agentic_throughput
 
     def metric(record, name):
         value = record.get("metrics", {}).get(name)
@@ -449,6 +450,7 @@ def summarize_aiperf_tail(path):
             )
             low = high
     return {
+        "throughput": agentic_throughput(path) if rows else None,
         "successful": len(rows),
         "errors": errors,
         "malformed": malformed,
