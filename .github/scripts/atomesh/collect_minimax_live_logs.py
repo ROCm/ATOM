@@ -162,6 +162,58 @@ def summarize_eval_samples(path):
     }
 
 
+def github_failure_log(target, output):
+    """Fetch submitter failures from inside CI, where artifact storage is reachable."""
+    if not os.environ.get("GH_TOKEN"):
+        return
+    result = {}
+    try:
+        query = subprocess.run(
+            [
+                "gh",
+                "run",
+                "view",
+                target,
+                "--repo",
+                "ROCm/ATOM",
+                "--json",
+                "status,conclusion",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        state = json.loads(query.stdout)
+        if state["status"] != "completed" or state["conclusion"] == "success":
+            return
+        logs = subprocess.run(
+            ["gh", "run", "view", target, "--repo", "ROCm/ATOM", "--log-failed"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            check=False,
+        )
+        result["returncode"] = logs.returncode
+        lines = logs.stdout.splitlines()
+        markers = re.compile(
+            r"scancel|cancel.*Slurm|exiting rc|received TERM|Traceback|Error:|ERROR:|No such file|exit code|command not found|Permission denied|bad substitution",
+            re.IGNORECASE,
+        )
+        indices = set()
+        for i, line in enumerate(lines):
+            if "[spur:" not in line and markers.search(line):
+                indices.update(range(max(0, i - 5), min(len(lines), i + 6)))
+        result["excerpts"] = "\n".join(lines[i] for i in sorted(indices))[-48000:]
+        # Signed artifact URLs are not diagnostic evidence and must not be emitted.
+        result["stderr"] = re.sub(r"https?://[^\s\"]+", "[URL omitted]", logs.stderr)[
+            -1000:
+        ]
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        result["error"] = type(exc).__name__
+    (output / "workflow-failure.json").write_text(json.dumps(result) + "\n")
+
+
 def job_diagnostics(source):
     """Read final scheduler accounting and small lifecycle files, without execution."""
     result = {"files": {}, "scheduler": {}}
@@ -429,6 +481,7 @@ def emit_log_annotations(output):
                 "router.log",
                 "job-result.json",
                 "job-diagnostics.json",
+                "workflow-failure.json",
                 "cell-metadata.json",
                 "metadata-rank-0.json",
                 "runtime-state.json",
@@ -509,6 +562,7 @@ def main():
     parser.add_argument("--github-annotations", action="store_true")
     args = parser.parse_args()
     collect(args.run_id, args.output)
+    github_failure_log(args.run_id, args.output)
     if args.github_annotations:
         emit_log_annotations(args.output)
 

@@ -1589,6 +1589,7 @@ jobs:
       - name: Read scheduler state and existing shared logs
         env:
           TARGET_RUN_ID: ${{ inputs.collect_minimax_run }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export PATH="/usr/local/slurm-24.05.5.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
