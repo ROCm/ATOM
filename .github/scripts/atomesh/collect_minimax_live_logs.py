@@ -196,12 +196,18 @@ def collect(target, output, *, roots=ROOTS):
 
 def emit_log_annotations(output):
     """Provide a bounded API-readable fallback when blob downloads are unavailable."""
+    manifest = output / "snapshot.json"
+    if manifest.is_file():
+        state = json.loads(manifest.read_text())
+        state.pop("files", None)
+        (output / "runtime-state.json").write_text(json.dumps(state) + "\n")
     selected = []
     for path in sorted(output.rglob("*")):
         if not path.is_file():
             continue
         if path.name in (
             "container.log",
+            "runtime-state.json",
             "sweep-summary.json",
             "profile_export_aiperf.json",
             "prefill-rank-0.log",
