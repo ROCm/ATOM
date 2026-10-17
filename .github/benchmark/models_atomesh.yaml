@@ -1406,7 +1406,7 @@ models:
           env:
             common:
               <<: *minimax_m3_workspace_env
-              ATOM_AITER_SCATTER_REF: be0f4c12434e94f7759c129db36783fdee4bcad1
+              ATOM_AITER_SCATTER_REF: 8b130a56a3729d27802625617392467a5e30dd15
           benchmark:
             kind: paged_prefill_tuning
             prepare_lmcache_host_memory: false

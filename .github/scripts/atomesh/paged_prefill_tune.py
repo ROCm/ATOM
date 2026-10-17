@@ -251,6 +251,7 @@ def candidate(
     matrix_size=0,
     waves=2,
     warps_n=1,
+    tile_size=128,
     *,
     gluon=False,
 ):
@@ -267,7 +268,7 @@ def candidate(
                 "waves_per_eu": waves,
             },
             BLOCK_M=block_m,
-            TILE_SIZE=128,
+            TILE_SIZE=tile_size,
             num_warps=warps,
         )
 
@@ -382,8 +383,8 @@ def measure(fn):
 def configurations(microarchitecture=False, gluon=False):
     if gluon:
         return [
-            (bm, nw, buffers, 1, 32, 1, wn)
-            for bm, nw, wn in ((64, 4, 2), (128, 4, 2), (128, 8, 2), (64, 4, 4))
+            (bm, nw, buffers, 1, 32, 1, wn, 64)
+            for bm, nw, wn in ((128, 4, 1), (128, 4, 2), (256, 8, 1), (128, 8, 2))
             for buffers in (1, 2)
         ]
     if microarchitecture:
@@ -413,8 +414,10 @@ def configuration_name(config, gluon=False):
     name = f"m{bm}-w{nw}-s{ns}-kv{splits}"
     if extra:
         name += f"-mfma{extra[0]}-waves{extra[1]}"
-    if len(extra) == 3:
+    if len(extra) >= 3:
         name += f"-wn{extra[2]}"
+    if len(extra) >= 4:
+        name += f"-n{extra[3]}"
     return name + ("-gluon" if gluon else "")
 
 
@@ -581,9 +584,9 @@ def main():
     args = parser.parse_args()
     Path(args.output).mkdir(parents=True, exist_ok=True)
     if args.mode == "candidate" and (
-        args.config is None or len(args.config) not in (4, 6, 7)
+        args.config is None or len(args.config) not in (4, 6, 7, 8)
     ):
-        parser.error("candidate --config needs four, six or seven integers")
+        parser.error("candidate --config needs four, six, seven or eight integers")
     if args.mode:
         worker(args)
         return
