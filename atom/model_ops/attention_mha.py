@@ -256,20 +256,32 @@ class PagedAttentionImpl(nn.Module):
         o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
         return o.view(-1, self.num_heads * self.head_dim)
 
-    def gemm_fusion_prologue_supported(self) -> bool:
-        """Static (config/env, no forward context) eligibility of a fused
-        prologue: this layer's native prologue is the Triton GemmaRMSNorm
-        norm-rope-cache one. Agreed across ranks at resolve time."""
-        from atom.model_ops.layernorm import GemmaRMSNorm
-
-        use_triton_attn = (
+    def _native_use_triton_attn(self) -> bool:
+        """The decode-backend choice ``rope_cache`` records (read later by
+        ``_dispatch_decode``). Single definition, shared with the fused-prologue path so
+        the two cannot disagree."""
+        return bool(
             envs.ATOM_FORCE_ATTN_TRITON
             or self.sliding_window != -1
             or self.head_dim != 128
         )
+
+    def gemm_fusion_prologue_supported(self) -> bool:
+        """Static (config only, no forward context) eligibility of a fused prologue: this
+        layer's native prologue is the GemmaRMSNorm norm-rope-cache one
+        (``triton_fused_norm_rope_cache``), the branch ``rope_cache`` takes whenever rotary,
+        q_norm and k_norm exist and q_norm is a GemmaRMSNorm. Agreed across ranks at resolve.
+
+        Deliberately NOT a function of ``ATOM_FORCE_ATTN_TRITON`` / sliding window /
+        head_dim: those only choose the DECODE kernel that later reads the cache
+        (``use_triton_attn``). The Gemma branch writes the same SHUFFLE cache with the same
+        per-token scales either way (the NHD ``fused_qk_rope_reshape_and_cache`` branch is
+        reached only when norms are absent), so the fused prologue's job (write q and the cache
+        exactly as native would) does not depend on which decode kernel follows."""
+        from atom.model_ops.layernorm import GemmaRMSNorm
+
         return bool(
-            not use_triton_attn
-            and self.rotary_emb is not None
+            self.rotary_emb is not None
             and isinstance(self.q_norm, GemmaRMSNorm)
             and self.k_norm is not None
         )
@@ -280,11 +292,13 @@ class PagedAttentionImpl(nn.Module):
 
         Returns ``None`` when this layer's native prologue is not the Triton
         GemmaRMSNorm one (a fused prologue then has no equivalent semantics).
-        Also pins the same impl state ``rope_cache`` pins on that path.
+        Also pins the same impl state ``rope_cache`` pins on that path: ``use_triton_attn``
+        EXACTLY as native computes it (so the decode kernel, Triton under
+        ATOM_FORCE_ATTN_TRITON, reads the fused-written cache) and the SHUFFLE format.
         """
         if not self.gemm_fusion_prologue_supported():
             return None
-        self.use_triton_attn = False
+        self.use_triton_attn = self._native_use_triton_attn()
         layer = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
         k_cache, v_cache = layer.k_cache, layer.v_cache
         x = 16 // k_cache.element_size()
@@ -314,11 +328,7 @@ class PagedAttentionImpl(nn.Module):
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
 
         # Fall back to Triton/Gluon for layouts unsupported by AITer PA ASM.
-        use_triton_attn = (
-            envs.ATOM_FORCE_ATTN_TRITON
-            or self.sliding_window != -1
-            or self.head_dim != 128
-        )
+        use_triton_attn = self._native_use_triton_attn()
         self.use_triton_attn = use_triton_attn
 
         if (

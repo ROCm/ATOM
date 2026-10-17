@@ -79,22 +79,20 @@ def _prologue_supported(mode, impl):
 
     * indexer / reuse -> ``SparseMHAPagedAttentionImpl.gemm_fusion_prologue_supported``
       is unconditionally True.
-    * dense -> ``PagedAttentionImpl.gemm_fusion_prologue_supported``: not forced to
-      Triton attention (env ATOM_FORCE_ATTN_TRITON), no sliding window, head_dim 128,
-      a rotary embedding and a Gemma-style q_norm/k_norm. The real method cannot be
-      called here (it imports the model stack, and its ``isinstance(q_norm,
-      GemmaRMSNorm)`` rejects the golden case's plain norm objects), so the same
-      conditions are evaluated on the stand-in; a test pins them to the source text.
+    * dense -> ``PagedAttentionImpl.gemm_fusion_prologue_supported``: a rotary embedding and
+      a Gemma-style q_norm / a k_norm, and nothing else. It does NOT read
+      ``ATOM_FORCE_ATTN_TRITON`` / sliding window / head_dim: those only pick the decode
+      kernel that follows, and the Gemma norm-rope-cache branch writes the same SHUFFLE cache
+      either way. The real method cannot be called here (it imports the model stack, and its
+      ``isinstance(q_norm, GemmaRMSNorm)`` rejects the golden case's plain norm objects), so the
+      same conditions are evaluated on the stand-in; a test pins them to the source text.
       The golden dense case is, by construction, the Gemma/Triton chain
       (``triton_norm_rope_cache_v1``), so the norm-type condition holds.
     """
     if mode != "dense":
         return True
     return bool(
-        os.environ.get("ATOM_FORCE_ATTN_TRITON", "0") != "1"
-        and getattr(impl, "sliding_window", -1) == -1
-        and impl.head_dim == 128
-        and impl.rotary_emb is not None
+        impl.rotary_emb is not None
         and impl.q_norm is not None
         and impl.k_norm is not None
     )

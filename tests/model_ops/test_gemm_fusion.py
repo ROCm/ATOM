@@ -726,21 +726,28 @@ def test_golden_adapter_sites_resolve_to_a_plan_when_a_row_matches(mode, monkeyp
     GC._SITES.clear()
 
 
-def test_golden_dense_gate_honours_env_and_stays_in_sync_with_the_real_impl(monkeypatch):
-    """The stand-in dense gate mirrors PagedAttentionImpl.gemm_fusion_prologue_supported;
-    pin both the behaviour and the source conditions so they cannot drift apart."""
+def test_golden_dense_gate_is_independent_of_the_decode_flag_and_pinned_to_the_real_impl(monkeypatch):
+    """The stand-in dense gate mirrors PagedAttentionImpl.gemm_fusion_prologue_supported: rotary +
+    Gemma q_norm + k_norm, and NOTHING about the decode kernel choice (ATOM_FORCE_ATTN_TRITON,
+    sliding window, head_dim). Pin both the behaviour and the source so they cannot drift."""
     import re
     from pathlib import Path
 
     from atom.model_ops.gemm_fusion import golden_candidate as GC
 
     impl = SimpleNamespace(head_dim=128, sliding_window=-1, rotary_emb=object(), q_norm=object(), k_norm=object())
+    for env in (None, "0", "1"):  # the production M3 env sets it to 1: eligibility must not change
+        if env is None:
+            monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON", raising=False)
+        else:
+            monkeypatch.setenv("ATOM_FORCE_ATTN_TRITON", env)
+        assert GC._prologue_supported("dense", impl) is True
     monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON", raising=False)
-    assert GC._prologue_supported("dense", impl) is True
-    monkeypatch.setenv("ATOM_FORCE_ATTN_TRITON", "1")
-    assert GC._prologue_supported("dense", impl) is False
-    monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON")
-    for bad in (dict(head_dim=64), dict(sliding_window=128), dict(rotary_emb=None), dict(k_norm=None)):
+    # decode-kernel inputs do not matter either
+    for ok in (dict(head_dim=64), dict(sliding_window=128)):
+        assert GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **ok})) is True
+    # what DOES matter: the prologue's own inputs
+    for bad in (dict(rotary_emb=None), dict(q_norm=None), dict(k_norm=None)):
         assert GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **bad})) is False
     # sparse modes: unconditional True, exactly like SparseMHAPagedAttentionImpl
     assert GC._prologue_supported("indexer", SimpleNamespace()) is True
@@ -748,9 +755,11 @@ def test_golden_dense_gate_honours_env_and_stays_in_sync_with_the_real_impl(monk
 
     src = (Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py").read_text(encoding="utf-8")
     body = src.split("def gemm_fusion_prologue_supported", 1)[1].split("def gemm_fusion_prologue_state", 1)[0]
-    for needle in ("ATOM_FORCE_ATTN_TRITON", "self.sliding_window != -1", "self.head_dim != 128",
-                   "self.rotary_emb is not None", "isinstance(self.q_norm, GemmaRMSNorm)", "self.k_norm is not None"):
-        assert needle in body, needle
+    code = re.sub(r'""".*?"""', "", body, flags=re.S)
+    for needle in ("self.rotary_emb is not None", "isinstance(self.q_norm, GemmaRMSNorm)", "self.k_norm is not None"):
+        assert needle in code, needle
+    for gone in ("ATOM_FORCE_ATTN_TRITON", "sliding_window", "head_dim", "use_triton_attn"):
+        assert gone not in code, f"eligibility must not read {gone}"
     sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
     assert re.search(r"def gemm_fusion_prologue_supported\(self\) -> bool:.*?return True", sparse, re.S)
 
@@ -1140,19 +1149,120 @@ def test_m3_smoke_serve_env_sets_the_flag_the_real_m3_recipes_require():
     assert "ATOM_FORCE_ATTN_TRITON=1" in recipe and "is not optional" in recipe
     envs_src = (root / "atom/utils/envs.py").read_text(encoding="utf-8")
     assert '"ATOM_FORCE_ATTN_TRITON"' in envs_src
-    assert "dense" in m.serve_env.__doc__ and "NOT fused" in m.serve_env.__doc__
+    doc = m.serve_env.__doc__
+    assert "dense layers ARE eligible" in doc and "NOT fused" not in doc
 
-
-def test_force_attn_triton_makes_the_dense_prologue_ineligible_but_not_the_sparse_one():
-    """The coverage consequence of the env above, pinned to the real source: the dense impl's
-    eligibility reads ATOM_FORCE_ATTN_TRITON; the sparse override is unconditional. So under
-    the required M3 env only SPARSE layers can fuse in a real model run."""
-    import re
+# ------------- dense fusion under ATOM_FORCE_ATTN_TRITON: behaviour of the REAL dense methods
+def _real_dense_impl(monkeypatch, flag, **attrs):
+    """Instantiate a stand-in carrying the REAL ``PagedAttentionImpl`` methods (their source,
+    extracted from attention_mha.py) so the eligibility / dispatch-state logic is exercised as
+    written, without importing the model stack. ``flag`` is ATOM_FORCE_ATTN_TRITON."""
+    import ast
+    import sys
+    import types as _t
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py").read_text(encoding="utf-8")
-    dense = src.split("def gemm_fusion_prologue_supported", 1)[1].split("def gemm_fusion_prologue_state", 1)[0]
-    assert "envs.ATOM_FORCE_ATTN_TRITON" in dense and "use_triton_attn" in dense
-    sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
-    body = sparse.split("def gemm_fusion_prologue_supported", 1)[1].split("def ", 1)[0]
-    assert "ATOM_FORCE_ATTN_TRITON" not in re.sub(r'""".*?"""', "", body, flags=re.S) and "return True" in body
+    path = Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py"
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl")
+    wanted = ("_native_use_triton_attn", "gemm_fusion_prologue_supported", "gemm_fusion_prologue_state")
+    # ast.get_source_segment returns each method with its first line un-indented and the rest at
+    # class-body indent, so prefixing 4 spaces re-creates a valid class body.
+    methods = ["    " + ast.get_source_segment(src, fn) for fn in cls.body
+               if isinstance(fn, ast.FunctionDef) and fn.name in wanted]
+    assert len(methods) == len(wanted), "dense impl no longer defines all of " + repr(wanted)
+    code = "class Real:\n" + "\n\n".join(methods) + "\n"
+    class _Gemma:  # the isinstance target the real method imports
+        pass
+
+    fake_ln = _t.ModuleType("atom.model_ops.layernorm")
+    fake_ln.GemmaRMSNorm = _Gemma
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", fake_ln)
+    env = SimpleNamespace(ATOM_FORCE_ATTN_TRITON=flag)
+    ns = {"envs": env, "ForwardContext": object}
+    exec(compile(code, "attention_mha_extracted", "exec"), ns)
+    impl = ns["Real"]()
+    impl.__dict__.update(dict(sliding_window=-1, head_dim=128, rotary_emb=object(),
+                              q_norm=_Gemma(), k_norm=object(), layer_num=0, use_triton_attn=None,
+                              _cache_format=None), **attrs)
+    return impl, _Gemma
+
+
+class _FakeCache:
+    def __init__(self, shape, esize=1):
+        self.shape, self._e = shape, esize
+
+    def dim(self):
+        return len(self.shape)
+
+    def element_size(self):
+        return self._e
+
+    def view(self, *shape):
+        return ("view", shape)
+
+
+def _fwd_ctx():
+    layer = SimpleNamespace(k_cache=_FakeCache((4, 1, 8, 128, 16)), v_cache=_FakeCache((4, 1, 128, 128)),
+                            k_scale="ks", v_scale="vs")
+    return SimpleNamespace(kv_cache_data={"layer_0": layer}, attn_metadata=SimpleNamespace(slot_mapping="sm"))
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_dense_fusion_eligibility_does_not_depend_on_the_decode_flag(monkeypatch, flag):
+    impl, _ = _real_dense_impl(monkeypatch, flag)
+    assert impl.gemm_fusion_prologue_supported() is True  # M3 production sets the flag: still eligible
+    # the prologue's own prerequisites still gate it
+    for bad in (dict(rotary_emb=None), dict(k_norm=None), dict(q_norm=object())):
+        i2, _ = _real_dense_impl(monkeypatch, flag, **bad)
+        assert i2.gemm_fusion_prologue_supported() is False
+
+
+@pytest.mark.parametrize("flag,sliding,hd,expect_triton", [
+    (False, -1, 128, False),   # plain ASM-decode configuration
+    (True, -1, 128, True),     # production M3: ATOM_FORCE_ATTN_TRITON=1 -> Triton decode
+    (False, 4096, 128, True),  # sliding window forces Triton too
+    (False, -1, 64, True),     # head_dim != 128 forces Triton too
+])
+def test_fused_prologue_sets_use_triton_attn_exactly_as_native_and_writes_shuffle(
+        monkeypatch, flag, sliding, hd, expect_triton):
+    """The fused path must leave the decode dispatch where native rope_cache leaves it: the
+    Triton decode runs on the fused-written SHUFFLE cache under the flag, ASM otherwise."""
+    impl, _ = _real_dense_impl(monkeypatch, flag, sliding_window=sliding, head_dim=hd)
+    state = impl.gemm_fusion_prologue_state(_fwd_ctx())
+    assert state is not None
+    assert impl.use_triton_attn is expect_triton is impl._native_use_triton_attn()
+    assert impl._cache_format == "SHUFFLE"  # same layout native's Gemma branch writes in BOTH modes
+    assert state["v_cache_shuffle"] == ("view", (4, 1, 128 // 16, 128, 16))  # SHUFFLE V view
+    assert state["k_cache"].shape == (4, 1, 8, 128, 16) and state["slot_mapping"] == "sm"
+
+
+def test_native_rope_cache_writes_shuffle_in_the_gemma_branch_whatever_the_flag():
+    """Layout evidence, from the real source: in rope_cache the GemmaRMSNorm branch (the one the
+    fused prologue replaces) never reads use_triton_attn, calls triton_fused_norm_rope_cache on
+    the SHUFFLE V view, and sets _cache_format = 'SHUFFLE'. The NHD branch is the ELIF taken only
+    when rotary/q_norm/k_norm are absent, which M3 dense layers never are."""
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py"
+    src = path.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl")
+    rope = next(f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "rope_cache")
+    top_if = next(n for n in rope.body if isinstance(n, ast.If))
+    cond = ast.get_source_segment(src, top_if.test)
+    assert "self.rotary_emb is not None" in cond and "self.q_norm is not None" in cond \
+        and "self.k_norm is not None" in cond and "use_triton_attn" not in cond  # norms present => this branch
+    gemma_if = next(n for n in top_if.body if isinstance(n, ast.If))
+    assert "isinstance(self.q_norm, GemmaRMSNorm)" in ast.get_source_segment(src, gemma_if.test)
+    gemma_src = "\n".join(ast.get_source_segment(src, n) for n in gemma_if.body)
+    assert "triton_fused_norm_rope_cache" in gemma_src and "use_triton_attn" not in gemma_src
+    assert "v_cache_shuffle" in gemma_src
+    assert any(isinstance(n, ast.Assign) and ast.get_source_segment(src, n) == 'self._cache_format = "SHUFFLE"'
+               for n in top_if.body)
+    # the NHD layout belongs to the elif branch: a different condition entirely
+    elif_if = top_if.orelse[0]
+    assert isinstance(elif_if, ast.If) and "use_triton_attn" in ast.get_source_segment(src, elif_if.test)
+    assert 'self._cache_format = "NHD"' in ast.get_source_segment(src, elif_if)

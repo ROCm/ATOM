@@ -224,12 +224,15 @@ def serve_env(extra=None):
     the stock dense-layer decode, with gemm_fusion not involved. ``--enforce-eager`` would NOT
     help: eager decode calls the same kernel.
 
-    CONSEQUENCE FOR COVERAGE: the dense attention layers' fused-prologue eligibility reads the
-    same flag (``PagedAttentionImpl.gemm_fusion_prologue_supported`` is False when
-    ATOM_FORCE_ATTN_TRITON is set), so under this env the dense layer(s) resolve to native with
-    reason ``prologue_unsupported`` and are NOT fused. The sparse layers (indexed and skip-index)
-    are unaffected. E-2 therefore covers the fused SPARSE path only; the fused DENSE path is
-    covered by the golden harness, not by this model run.
+    COVERAGE: dense layers ARE eligible to fuse under this flag. The flag only selects the
+    DECODE kernel (Triton) that reads the cache later; the dense native ``rope_cache`` takes
+    its GemmaRMSNorm norm-rope-cache branch and writes the same SHUFFLE fp8 per-token cache
+    whatever the flag says, so ``PagedAttentionImpl.gemm_fusion_prologue_supported`` does not
+    read it, and the fused prologue sets ``use_triton_attn`` exactly as native does
+    (``_native_use_triton_attn``) so Triton decode runs on the fused-written cache. (An earlier
+    revision made dense layers ineligible under the flag; that was wrong and is reverted.)
+    Whether a dense layer actually HITS a profile row then depends on the cache page in its
+    signature (``kv_cache``) matching a row; the check is in ``Decision`` / the install log.
     """
     env = {"ATOM_FORCE_ATTN_TRITON": "1"}
     env.update(extra or {})
