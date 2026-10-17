@@ -47,12 +47,29 @@ def cases():
     ]
 
 
+def generality_cases():
+    """Short independent cases for GQA, strided scales and query/page tails."""
+    return [
+        {
+            "id": f"generality-gqa{64 // kh}",
+            "kv_heads": kh,
+            "q_heads": 64,
+            "q_lens": [1, 3, 19, 129],
+            "k_lens": [1, 127, 257, 1037],
+            "scale_stride": 2,
+            "held_out": True,
+            "generality": True,
+        }
+        for kh in (1, 2, 4, 8, 16, 32, 64)
+    ]
+
+
 def fixture(case):
     import torch
     from aiter.ops.triton.utils.types import e4m3_dtype
 
     torch.manual_seed(20261016)
-    page, d, h, kh = 128, 128, 16, case["kv_heads"]
+    page, d, h, kh = 128, 128, case.get("q_heads", 16), case["kv_heads"]
     ql, kl = case["q_lens"], case["k_lens"]
     counts = [math.ceil(k / page) for k in kl]
     npages = sum(counts) + 1
@@ -63,16 +80,20 @@ def fixture(case):
     v = torch.randn(npages, page, kh, d, dtype=torch.bfloat16, device="cuda").to(
         e4m3_dtype
     )
-    ks = torch.rand(npages, kh, page, device="cuda") + 0.1
-    vs = torch.rand(npages, kh, page, device="cuda") + 0.2
+    stride = case.get("scale_stride", 1)
+    ks = (torch.rand(npages, kh, page * stride, device="cuda") + 0.1)[..., ::stride]
+    vs = (torch.rand(npages, kh, page * stride, device="cuda") + 0.2)[..., ::stride]
     table = torch.zeros(len(ql), max(counts), dtype=torch.int32, device="cuda")
     perm = torch.randperm(npages, device="cuda")
     begin = 0
     for i, count in enumerate(counts):
         table[i, :count] = perm[begin : begin + count]
         begin += count
-    if len(ql) > 1:
-        table[1:, 0] = table[0, 0]
+    # Share only complete prefix pages. Poisoning an unused tail of a short
+    # request must not overwrite a valid slot in another request's prefix.
+    shared = [i for i, length in enumerate(kl) if length >= page]
+    for i in shared[1:]:
+        table[i, 0] = table[shared[0], 0]
     for i, length in enumerate(kl):
         if length % page:
             v[table[i, counts[i] - 1].long(), length % page :] = float("nan")
@@ -104,15 +125,16 @@ def reference_rows(x, case):
     """Independent FP32 online softmax, bounded memory even at 1M context."""
     import torch
 
+    heads = x["q"].shape[1]
     selected, outputs = [], []
     begin = 0
     for i, (ql, kl) in enumerate(zip(case["q_lens"], case["k_lens"])):
         positions = sorted({0, ql // 2, ql - 1})
         selected.extend(begin + p for p in positions)
         query = x["q"][[begin + p for p in positions]].float().transpose(0, 1)
-        m = torch.full((16, len(positions)), -float("inf"), device="cuda")
+        m = torch.full((heads, len(positions)), -float("inf"), device="cuda")
         denom = torch.zeros_like(m)
-        acc = torch.zeros(16, len(positions), 128, device="cuda")
+        acc = torch.zeros(heads, len(positions), 128, device="cuda")
         for start in range(0, kl, 8192):
             pos = torch.arange(start, min(start + 8192, kl), device="cuda")
             pages, slots = x["table"][i, pos // 128].long(), pos % 128
@@ -121,8 +143,8 @@ def reference_rows(x, case):
             v = x["plain_v"].view(torch.uint8)[pages, slots].view(x["v"].dtype).float()
             k = (k * x["ks"][pages, :, slots, None]).bfloat16().float()
             v = (v * x["vs"][pages, :, slots, None]).bfloat16().float()
-            k = k.repeat_interleave(16 // case["kv_heads"], dim=1)
-            v = v.repeat_interleave(16 // case["kv_heads"], dim=1)
+            k = k.repeat_interleave(heads // case["kv_heads"], dim=1)
+            v = v.repeat_interleave(heads // case["kv_heads"], dim=1)
             scores = query @ k.permute(1, 2, 0) / math.sqrt(128)
             mask = (
                 pos[None, :]
@@ -409,7 +431,10 @@ def worker(args):
             "shard": args.shard,
         }
     )
-    for idx, case in enumerate(cases()):
+    population = cases()
+    if args.gluon and args.mode == "candidate":
+        population += generality_cases()
+    for idx, case in enumerate(population):
         if idx % args.shards != args.shard:
             continue
         if (
@@ -497,7 +522,7 @@ def write_sweep_summary(output, rejected):
                 **{k: v for k, v in row.items() if k not in ("case", "samples_ms")},
             }
     summary = {
-        "cases": cases(),
+        "cases": cases() + generality_cases(),
         "measurements": list(measurements.values()),
         "rejected_configs": list(rejected),
     }
