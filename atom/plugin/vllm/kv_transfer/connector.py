@@ -1786,6 +1786,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
         self._requests[str(request.request_id)] = request
+        if self._lookup_detached(seq, num_computed_tokens):
+            return 0, False
         if self._lookup_in_flight(seq):
             return None, False
         if self._kda_planner is not None:
@@ -1821,6 +1823,28 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             False,
         ]
         return need, True
+
+    def _lookup_detached(self, seq, num_computed_tokens: int) -> bool:
+        """Admit `seq` without its lookup when no answer could make it load.
+
+        vLLM's local hit leaves less than the minimum load uncached, so the
+        tier cannot be asked for anything -- but the lookup is still sent, for
+        its L1 recency and for the save floor it corrects afterwards
+        (`reconcile_detached_lookups`, run from `build_connector_meta`).
+        Skipping it outright would have every such request re-save its whole
+        prompt. Waiting for it instead cost local-hit runs 14% of their
+        throughput: each request was held a step for an answer it could not
+        use.
+
+        Safe to decide here, before vLLM allocates: unlike ATOM's own
+        allocator, vLLM never keeps less of the local hit than it offered.
+        """
+        can_detach = getattr(self._scheduler, "can_detach_lookup", None)
+        detach = getattr(self._scheduler, "detach_lookup", None)
+        if can_detach is None or detach is None:
+            return False
+        hbm = int(num_computed_tokens)
+        return bool(can_detach(seq, hbm)) and bool(detach(seq, hbm))
 
     def _lookup_in_flight(self, seq) -> bool:
         """Send `seq`'s tier lookup without waiting; True while it is out.

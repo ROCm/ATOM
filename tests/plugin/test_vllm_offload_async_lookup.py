@@ -7,7 +7,7 @@ from unittest.mock import Mock
 from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 
 
-def _connector(*, pending: bool, async_capable: bool = True):
+def _connector(*, pending: bool, async_capable: bool = True, detachable=False):
     c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
     seq = SimpleNamespace(set_num_cached_tokens=Mock())
     c._seqs = SimpleNamespace(get_or_create=lambda request: seq)
@@ -22,6 +22,8 @@ def _connector(*, pending: bool, async_capable: bool = True):
     if async_capable:
         scheduler.prefetch_lookups = Mock()
         scheduler.lookup_pending = Mock(return_value=pending)
+        scheduler.can_detach_lookup = Mock(return_value=detachable)
+        scheduler.detach_lookup = Mock(return_value=True)
     c._scheduler = scheduler
     return c, seq
 
@@ -54,3 +56,16 @@ def test_a_scheduler_without_async_lookups_stays_synchronous():
         512,
         True,
     )
+
+
+def test_a_load_ruled_out_by_the_local_hit_is_admitted_without_waiting():
+    """The lookup still goes out -- for recency and the save floor -- but
+    nothing waits on it: no answer could make this request load."""
+    c, seq = _connector(pending=True, detachable=True)
+    assert c.get_num_new_matched_tokens(SimpleNamespace(request_id="r"), 6912) == (
+        0,
+        False,
+    )
+    c._scheduler.detach_lookup.assert_called_once_with(seq, 6912)
+    c._scheduler.prefetch_lookups.assert_not_called()
+    c._scheduler.get_num_new_matched_tokens.assert_not_called()
