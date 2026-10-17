@@ -813,3 +813,109 @@ def test_kv_block_size_has_no_silent_default(monkeypatch):
         stages._kv_block_size()
     cfg.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=128)
     assert stages._kv_block_size() == 128
+
+# ----------------- gate04: eager-prepared plan must be THE plan capture/replay launches
+class _BindingPlan:
+    """Like aiter's SpQkvSmall: pointer bindings live in a per-INSTANCE dict, and a launch
+    that needs a binding it does not have raises (the 'new binding required during capture')."""
+
+    vid = "sp_qkv.small.v1"
+
+    def __init__(self):
+        self.owner = "sp_qkv.small/dense/x"
+        self._bindings = {}
+
+    def resources(self):
+        return []
+
+    def prepare(self, **kw):
+        self._bindings[("k",)] = True
+
+    def launch(self, in_capture):
+        if ("k",) not in self._bindings:
+            if in_capture:
+                raise RuntimeError("sp_qkv.small: new binding required during graph capture")
+            self._bindings[("k",)] = True
+
+
+def _fresh_plan_matcher():
+    """match_prefix returns a NEW plan object on every call, exactly like the real matcher."""
+    made = []
+
+    def match_prefix(spec, ctx):
+        p = _BindingPlan()
+        made.append(p)
+        return p, 2
+
+    return match_prefix, made
+
+
+def test_resolve_shares_one_plan_instance_between_eager_and_capture(make_site, monkeypatch):
+    res = FakeResources()
+    s = make_site(res)
+    match_prefix, made = _fresh_plan_matcher()
+    stages._aiter_override.match_prefix = match_prefix
+    eager = s.resolve(64, "eager")
+    capture = s.resolve(64, "capture")
+    assert len(made) == 2  # the matcher really did build two objects...
+    assert eager.plan is capture.plan  # ...but the site keeps ONE
+    assert eager.plan is made[0]
+    # order does not matter
+    s2 = make_site(FakeResources())
+    stages._aiter_override.match_prefix = match_prefix
+    c2 = s2.resolve(128, "capture")
+    e2 = s2.resolve(128, "eager")
+    assert c2.plan is e2.plan
+
+
+def test_prepare_then_capture_launch_never_needs_a_new_binding(make_site):
+    """The gate04 failure, reproduced: prepare binds the eager plan; capture used to get a
+    different, unbound plan. Now the capture-mode resolution IS the prepared plan."""
+    s = make_site(FakeResources())
+    match_prefix, _ = _fresh_plan_matcher()
+    stages._aiter_override.match_prefix = match_prefix
+    eager = s.resolve(64, "eager")
+    capture = s.resolve(64, "capture")
+    eager.plan.prepare()  # what prepare_bucket does, once
+    capture.plan.launch(in_capture=True)  # must not raise
+
+
+def test_regression_without_sharing_capture_would_need_a_new_binding(make_site):
+    """Control: with distinct instances (the old behaviour) the same sequence fails, so the
+    test above has power."""
+    p_eager, p_capture = _BindingPlan(), _BindingPlan()
+    p_eager.prepare()
+    with pytest.raises(RuntimeError, match="new binding required"):
+        p_capture.launch(in_capture=True)
+
+
+def test_execute_refuses_a_plan_other_than_the_prepared_one(make_site):
+    s = make_site(FakeResources())
+    prepared = _BindingPlan()
+    st = SimpleNamespace(prepared=True, plan=prepared, rebound=False, ptrs=(0,) * 7,
+                         xs=None, pos=None, slot=None, outs={}, m=16)
+    other = site_mod.Resolution(_BindingPlan(), 2, "sp_qkv.small.v1", "profile_hit")
+    ctx = SimpleNamespace(padded_tokens=64, real_tokens=64)
+    s.bind_mode = "direct"
+    s.build_meta = lambda st, state: {}
+    with pytest.raises(site_mod.GemmFusionBindError, match="other than the one prepared"):
+        s._execute(other, None, None, ctx, {}, st, None)
+
+
+def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
+    class _T:
+        def __init__(self, p):
+            self.p = p
+
+        def data_ptr(self):
+            return self.p
+
+    s = make_site(FakeResources())
+    s.linear.weight_scale = _T(1)
+    s.build_meta = lambda st, state: {"q_norm_w": _T(2), "positions": _T(3), "k_cache": _T(4)}
+    st = SimpleNamespace(xs=_T(9), outs={"q": _T(5), "k": _T(6)}, m=16)
+    key = s.binding_key(st, {})
+    assert key == {"x_scale": 9, "w_scale": 1, "q_norm_w": 2, "positions": 3, "k_cache": 4,
+                   "out_q": 5, "out_k": 6, "rows": 16}
+    st.outs["q"] = _T(55)  # a per-call output buffer would show up as a differing key
+    assert s.binding_key(st, {}) != key

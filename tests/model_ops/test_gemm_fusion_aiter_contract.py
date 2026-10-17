@@ -200,3 +200,48 @@ def test_atom_only_calls_plan_methods_that_exist(real_gf):
     called = set(re.findall(r"\b(?:r\.)?plan\.(\w+)\(", src))
     allowed = {"resources", "prepare", "run", "recv_view", "reuse_view", "poison"}
     assert called <= allowed, f"ATOM calls plan methods aiter does not define: {sorted(called - allowed)}"
+
+
+def test_real_matcher_builds_a_new_plan_per_call_but_the_site_keeps_one(real_gf, monkeypatch):
+    """gate04 root cause, on the REAL aiter classes: ``match_prefix`` returns a distinct plan
+    (with its own pointer-binding dict) on every call, so a plan prepared for 'eager' is not
+    the plan a 'capture' lookup would get. The site must hand back ONE instance."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+    from atom.model_ops.gemm_fusion import site as site_mod
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    spec_mod = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.specs")
+    spec = spec_mod.sp_qkv_spec("dense")
+    ctx = real_gf.MatchCtx(arch="gfx950", cu=256, world=4, m=16,
+                           available=frozenset({"mori_cco", "gfx950_sc_bypass"}), graph_mode="eager")
+    real_match = real_gf.match_prefix
+    try:
+        a, _ = real_match(spec, ctx, "minimax_m3_sp4_gfx950_v1")
+        b, _ = real_match(spec, ctx, "minimax_m3_sp4_gfx950_v1")
+    except ImportError as e:
+        pytest.skip(f"variants need the native stack to import: {e}")
+    assert a is not b and a._bindings is not b._bindings  # the hazard is real
+    a._bindings[("probe",)] = "bound by prepare"
+    assert ("probe",) not in b._bindings
+
+    # through the real site.resolve, the real matcher and a real wrapper around the real
+    # FusionResources. The site calls match_prefix(spec, ctx): a thin shim supplies the
+    # profile name (the site itself relies on aiter's default profile selection).
+    shim = types.SimpleNamespace(**{k: getattr(real_gf, k) for k in ATOM_GF_NAMES})
+    shim.match_prefix = lambda sp, c: real_match(sp, c, "minimax_m3_sp4_gfx950_v1")
+    shim.FusionResources = real_gf.FusionResources
+    monkeypatch.setattr(stages, "_aiter_override", shim)
+    w = FusionResourcesWrapper(None, 4, rank=0, inner=_real_inner(real_gf, _FakeBackend()),
+                               reduce_min=lambda v: list(v), arch="gfx950", cu=256)
+    hooks.reset_for_tests(w)
+    hooks.set_phase("preparing")
+    impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
+    site = site_mod.GemmFusionSite("t.qkv", SimpleNamespace(output_size=9216, input_size=6144),
+                                   list(spec.stages), None, attn=SimpleNamespace(impl=impl),
+                                   q_size=2048, kv_size=128, register=False)
+    site.spec = spec
+    eager = site.resolve(64, "eager")
+    capture = site.resolve(64, "capture")
+    hooks.reset_for_tests()
+    assert eager.plan is not None and eager.n_fused == 2 and eager.reason == "profile_hit"
+    assert eager.plan is capture.plan  # one instance => one set of bindings for eager+capture+replay

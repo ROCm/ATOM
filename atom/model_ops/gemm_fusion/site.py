@@ -17,7 +17,10 @@ from types import SimpleNamespace
 
 import torch
 
+import os
+
 from . import faults, hooks
+from .resources import plan_owner
 from .stages import aiter_gf
 
 logger = logging.getLogger("atom.gemm_fusion")
@@ -109,6 +112,7 @@ class GemmFusionSite:
         self._by_tokens: dict = {}
         self._wcache: dict = {}
         self._staging: dict = {}
+        self._bind_dump: dict = {}  # tokens -> (where, binding_key) from the first dump
         if register:
             hooks.register_site(self)
 
@@ -221,6 +225,22 @@ class GemmFusionSite:
         elif not res.can_ensure(plan):
             r = Resolution(None, 0, "native", "after_finalize")  # uniform: same order on all ranks
         else:
+            # ONE plan object per (site, bucket), shared by the eager and capture keys.
+            # match_prefix builds a NEW plan each call and a small-M plan keeps its
+            # pointer bindings in a per-INSTANCE dict, so a plan prepared for "eager"
+            # would be a different, unbound object when the capture/replay path asks
+            # for "capture" ("new binding required during capture"). The profile row
+            # does not depend on graph_mode, so the first match is the one to keep.
+            other = self._by_tokens.get((tokens, "capture" if graph_mode == "eager" else "eager"))
+            if (
+                other is not None
+                and not isinstance(other, Exception)
+                and other.plan is not None
+                and other.n_fused == n
+                and _plan_vid(other.plan) == _plan_vid(plan)
+                and plan_owner(other.plan) == plan_owner(plan)
+            ):
+                plan = other.plan
             res.ensure(plan)
             hooks.register_plan(plan)
             r = Resolution(plan, n, _plan_vid(plan), "profile_hit")
@@ -315,6 +335,37 @@ class GemmFusionSite:
     def _ptr(t):
         return 0 if t is None else t.data_ptr()
 
+    def binding_key(self, st, state, x_scale=None) -> dict:
+        """Named data_ptr of every tensor aiter's small plan keys its binding on
+        (variants.py ``_binding``: x_scale, w_scale, norms, cos/sin, positions,
+        slot_mapping, q out, caches, k/v/index_q outs, index_cache) plus the row count.
+        Used by the debug dump below: diffing the dump at prepare against the dump at
+        run/capture names the tensor whose address moved."""
+        meta = self.build_meta(st, state)
+        d = {"x_scale": self._ptr(x_scale if x_scale is not None else st.xs),
+             "w_scale": self._ptr(self.linear.weight_scale)}
+        for k in ("q_norm_w", "k_norm_w", "index_q_norm_w", "index_k_norm_w", "cos_cache", "sin_cache",
+                  "positions", "slot_mapping", "k_cache", "v_cache", "k_scale", "v_scale", "index_cache"):
+            if k in meta:
+                d[k] = self._ptr(meta[k])
+        for k, v in st.outs.items():
+            d["out_" + k] = self._ptr(v)
+        d["rows"] = st.m
+        return d
+
+    def _dump_binding(self, where, tokens, st, state, x_scale=None):
+        """``ATOM_GEMM_FUSION_DEBUG_BIND=1``: log the binding key at prepare vs run."""
+        if os.environ.get("ATOM_GEMM_FUSION_DEBUG_BIND") != "1":
+            return
+        key = self.binding_key(st, state, x_scale)
+        first = self._bind_dump.setdefault(tokens, (where, key))
+        diff = {k: (first[1].get(k), v) for k, v in key.items() if first[1].get(k) != v}
+        logger.warning(
+            "gemm_fusion bind[%s] %s tokens=%d plan=%s mode=%s %s",
+            where, self.name, tokens, id(st), self._runtime_mode(),
+            "SAME as " + first[0] if not diff else "DIFFERS from " + first[0] + ": " + repr(diff),
+        )
+
     def _live_ptrs(self, x_scale, positions, state):
         """Addresses the plan binds (small-M); compared at run time in direct mode."""
         return (
@@ -373,6 +424,8 @@ class GemmFusionSite:
             prep(x=x, x_scale=st.xs, w_scale=self.linear.weight_scale, outs=st.outs,
                  meta=self.build_meta(st, state), res=res.bound)
         st.prepared = True
+        st.plan = r.plan  # the exact plan instance whose binding was just created
+        self._dump_binding("prepare", tokens, st, state)
         return True
 
     # -- execution -------------------------------------------------------
@@ -457,6 +510,17 @@ class GemmFusionSite:
                 st.slot[:n].copy_(state["slot_mapping"][:n])
             # direct, unmoved: st.xs/pos/slot ARE the caller's tensors; no copies
             outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
+            # the plan keeps its pointer bindings per INSTANCE: launching a different
+            # instance than the one prepared would create a binding here (in capture:
+            # "new binding required"). Resolve shares one plan across graph modes; this
+            # turns any regression of that into a clear error instead of a capture failure.
+            prepared_plan = getattr(st, "plan", None)
+            if prepared_plan is not None and prepared_plan is not r.plan:
+                raise GemmFusionBindError(
+                    f"{self.name}: bucket {ctx.padded_tokens} resolves to a plan instance other "
+                    f"than the one prepared (mode {self._runtime_mode()})"
+                )
+            self._dump_binding("run", ctx.padded_tokens, st, state, xs)
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
         r.plan.run(
