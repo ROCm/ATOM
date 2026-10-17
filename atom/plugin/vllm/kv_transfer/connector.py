@@ -1786,6 +1786,8 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         seq = self._seqs.get_or_create(request)
         seq.set_num_cached_tokens(num_computed_tokens)
         self._requests[str(request.request_id)] = request
+        if self._lookup_in_flight(seq):
+            return None, False
         if self._kda_planner is not None:
             # ATOM's scheduler hands the cap hook a SeqView, which carries no
             # block hashes; this is how the hook reaches the vLLM Request whose
@@ -1819,6 +1821,29 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             False,
         ]
         return need, True
+
+    def _lookup_in_flight(self, seq) -> bool:
+        """Send `seq`'s tier lookup without waiting; True while it is out.
+
+        A synchronous lookup is a round trip in which the server hashes the
+        whole prompt, and vLLM runs this hook inside `schedule()`, so no
+        forward starts until it returns. Measured on DeepSeek-V4.1 with
+        7k-token prompts: 17.6 ms p50 and 43 ms p90 per new request, which put
+        `schedule()` at 14 ms p90 against 0.5 ms with the tier idle.
+
+        Returning None makes vLLM pass over the request and ask again next
+        step, and the answer is then consumed from the client without a second
+        round trip -- the prefetch ATOM's own scheduler already does, with the
+        same bounds: `OFFLOAD_ASYNC_LOOKUP_DEPTH=0` keeps lookups synchronous,
+        and past `OFFLOAD_LOOKUP_DEFER_S` the lookup is waited for as before.
+        A client that cannot look up asynchronously never reports one pending.
+        """
+        prefetch = getattr(self._scheduler, "prefetch_lookups", None)
+        pending = getattr(self._scheduler, "lookup_pending", None)
+        if prefetch is None or pending is None:
+            return False
+        prefetch([seq])
+        return bool(pending(seq))
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         """Record the allocation, and queue the recurrent half of any hit.
