@@ -139,3 +139,43 @@ def test_an_unknown_cap_keeps_the_old_conservative_answer():
     sched = SimpleNamespace(running=[_request(spec=True)], waiting=["queued"])
     assert _admission_is_possible(sched)
     assert _would_mix_prefill_with_drafts(sched)
+
+
+def _parked(req_id, status):
+    return SimpleNamespace(request_id=req_id, status=status)
+
+
+def _sched_with_holding(holding, done=()):
+    sched = _scheduler([_request(spec=True)], [], cap=8)
+    sched.kv_holding_waiting = holding
+    sched.finished_recving_kv_req_ids = set(done)
+    return sched
+
+
+def test_a_parked_request_whose_load_landed_clears_them():
+    """It prefills its tail this step, from `kv_holding_waiting`, not `waiting`.
+
+    vLLM drains `kv_holding_waiting` first and promotes a finished load inside
+    `schedule`; a check of `waiting` alone missed it, and the step reached the
+    model as `(768, 171, 0)` beside `(1024, 6, 5)`.
+    """
+    from vllm.v1.request import RequestStatus
+
+    parked = _parked("r1", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    assert _would_mix_prefill_with_drafts(_sched_with_holding([parked], done={"r1"}))
+
+
+def test_a_request_still_loading_keeps_them():
+    """Clearing for every load in flight would forfeit speculation for its
+    whole duration; the request does not run this step."""
+    from vllm.v1.request import RequestStatus
+
+    parked = _parked("r1", RequestStatus.WAITING_FOR_REMOTE_KVS)
+    assert not _would_mix_prefill_with_drafts(_sched_with_holding([parked]))
+
+
+def test_a_block_holding_resume_clears_them():
+    from vllm.v1.request import RequestStatus
+
+    resumed = _parked("r2", RequestStatus.PREEMPTED)
+    assert _would_mix_prefill_with_drafts(_sched_with_holding([resumed]))
