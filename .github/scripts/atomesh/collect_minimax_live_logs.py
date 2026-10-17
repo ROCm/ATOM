@@ -534,7 +534,30 @@ def summarize_aiperf_tail(path):
                 }
             )
             low = high
+    starts = [r["request_start_ns"] for r in rows if r["request_start_ns"] is not None]
+    origin = min(starts) if starts else 0
+    diagnostic_windows = []
+    for low, high in [(0, 60), (60, None), (0, 300), (300, None)]:
+        values = [
+            r["ttft_ms"]
+            for r in rows
+            if r["request_start_ns"] is not None
+            and (r["request_start_ns"] - origin) / 1e9 >= low
+            and (high is None or (r["request_start_ns"] - origin) / 1e9 < high)
+        ]
+        diagnostic_windows.append(
+            {
+                "start_s": low,
+                "end_s": high,
+                "count": len(values),
+                "p50_ms": percentile(values, 50),
+                "p90_ms": percentile(values, 90),
+                "p99_ms": percentile(values, 99),
+            }
+        )
     return {
+        "diagnostic_window_origin_ns": origin,
+        "diagnostic_ttft_windows": diagnostic_windows,
         "throughput": agentic_throughput(path) if rows else None,
         "successful": len(rows),
         "errors": errors,
