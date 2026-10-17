@@ -49,6 +49,8 @@ PATTERNS = (
     "slurm_job-*/eval_results/*/results*.json",
     "slurm_job-*/eval_results/*/*/results*.json",
     "slurm_job-*/job-result.json",
+    "slurm_job-*/cell-metadata.json",
+    "slurm_job-*/metadata-rank-*.json",
     "slurm_job-*/rank-rc-*",
 )
 MAX_FILE_BYTES = 8 << 20
@@ -363,6 +365,10 @@ def emit_log_annotations(output):
             in (
                 "container.log",
                 "container-eval.log",
+                "router.log",
+                "job-result.json",
+                "cell-metadata.json",
+                "metadata-rank-0.json",
                 "runtime-state.json",
                 "prefill-shapes.json",
                 "sweep-summary.json",
