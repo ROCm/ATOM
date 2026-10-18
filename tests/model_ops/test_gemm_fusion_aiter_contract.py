@@ -75,7 +75,7 @@ class _FakeBackend:
     """The native CCO layer only; everything above it is the real aiter code."""
 
     def __init__(self):
-        self.calls, self._n = [], 0
+        self.calls, self._n, self._views = [], 0, {}
 
     def uid(self, rank):
         return b"u" * 128
@@ -98,6 +98,14 @@ class _FakeBackend:
     def peer_ptr(self, comm, local, peer):
         return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
+    def abi_check(self):
+        # aiter b22268c3 (arena review A-1): (ok, reason) of the MORI library/header hash pin and
+        # the compiled ccoWindowDevice layout. The fake has neither, so it reports "ok": the arena
+        # policies (now the DEFAULT) are then not refused by the ABI pin. FusionResources calls it
+        # only through getattr(backend, "abi_check", None).
+        self.calls.append("abi_check")
+        return True, "ok"
+
     def win_free(self, comm, local):
         # aiter c05f49b6: MORI's teardown contract, WindowDeregister -> ccoMemFree(local) before
         # ccoCommDestroy. Recorded so a test can assert the order.
@@ -105,19 +113,26 @@ class _FakeBackend:
 
     def win_view(self, comm, arena_win, offset):
         # aiter 7648ac09 (arena policies): a VIEW struct over one registered arena window at
-        # `offset`. A distinct fake handle per view; nothing native is touched.
+        # `offset`. The fake remembers (arena handle, offset) so win_info can read it back
+        # coherently, exactly what aiter's view self-test (A-1) checks.
         self._n += 1
+        h = 5000 + self._n
+        self._views[h] = (arena_win, offset)
         self.calls.append(("win_view", offset))
-        return 5000 + self._n
+        return h
 
     def win_view_free(self, comm, view):
+        self._views.pop(view, None)
         self.calls.append(("win_view_free", view))
 
     def win_info(self, comm, win):
-        # (local_va, bytes, granule)-shaped triple of a registered window; aiter's Python layer
-        # does not call it, so only the shape matters here.
-        return (0x7000_0000_0000, 4 << 20, 4 << 20)
-
+        # (winBase, stride4G, lsaRank) of a window or view. A view reads back its arena's base +
+        # offset with the arena's stride/lsaRank (the property the self-test proves).
+        if win in self._views:
+            arena, off = self._views[win]
+            base, stride, lsa = self.win_info(comm, arena)
+            return (base + off, stride, lsa)
+        return (0x7000_0000_0000 + 0x1_0000_0000 * (win % 64), 1 << 32, 0)
     def va_info(self, comm):
         # aiter a2dee878: (slot_base_va, per_rank_size, granule) of this rank's slot, where the
         # first-fit allocator starts. 2 MiB-aligned base, 4 GiB slot, 4 MiB granule: values the
@@ -220,7 +235,13 @@ def test_window_budget_comes_from_the_config_profile_with_the_env_unset(real_gf,
         inner = hooks.resources().inner
         assert inner.window_bytes == wb["window_bytes"] == 171966464  # 164 MiB, from the profile
         assert inner.max_windows == wb["max_windows"] == 39
-        assert inner._vmm >= inner.window_bytes * inner.max_windows  # heap sized for the budget
+        # heap sized for the budget under the CURRENT default policy. aiter b22268c3 made `arena`
+        # the default: ONE registered window of (shared S/R/C + small windows) bytes, and a heap of
+        # roundup_4GiB(arena + 256 MiB slack), not the old uniform window_bytes * max_windows.
+        assert inner.policy == "arena" and inner.policy_fallback_reason is None
+        arena = inner._arena_size_from_budget()
+        assert arena == wb["shared_large_total_bytes"] == 398458880  # the profile's own total
+        assert inner._vmm >= arena + (256 << 20) and inner._vmm % (4 << 30) == 0
         assert ("comm_create", 0) in backend.calls  # the real constructor ran its comm init
     except ImportError as e:
         pytest.skip(f"resources need the native stack to import: {e}")
@@ -276,6 +297,11 @@ def test_fake_backend_has_exactly_the_real_ccobackend_signatures(real_gf):
 class _FakeDist:
     def barrier(self, group=None):
         pass
+
+    def all_gather_object(self, out, obj, group=None):
+        # single process standing in for ranks that all agree: every slot gets the local value
+        for i in range(len(out)):
+            out[i] = obj
 
     def broadcast_object_list(self, obj, src=0, group=None):
         pass
@@ -560,7 +586,7 @@ def test_release_frees_every_window_after_its_deregister_and_before_comm_destroy
     res.ensure("small", [real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")])
     res.ensure("large", [real_gf.WindowReq("o2/R", 40 << 20, "p2p_window")])
     registered = [w for w in res._regs]
-    assert len(registered) >= 2
+    assert len(registered) >= 1  # arena (default): ONE window; per-owner policies: several
     res.release()
     calls = be.calls
     dest = calls.index("comm_destroy")
@@ -604,3 +630,33 @@ def test_atom_shutdown_releases_the_comm_and_is_what_the_old_harnesses_never_cal
     assert hooks.resources() is None
     hooks.shutdown()  # idempotent
     assert be.calls.count("comm_destroy") == 1
+
+def test_explicit_uniform_policy_keeps_the_phase1_heap_for_the_profile_budget(real_gf, monkeypatch):
+    """The pre-arena behaviour stays selectable (AITER_GEMM_FUSION_WINDOW_POLICY=uniform): the heap
+    is sized for window_bytes * max_windows from the profile budget, with no env var carrying the
+    profile."""
+    monkeypatch.delenv("AITER_GEMM_FUSION_PROFILE", raising=False)
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "uniform")
+    wb = _profile_budget(real_gf)
+    res = _built_resources(real_gf, _FakeBackend())
+    assert res.policy == "uniform" and res.policy_source == "explicit"
+    assert res.window_bytes == wb["window_bytes"] and res.max_windows == wb["max_windows"]
+    assert res._vmm >= res.window_bytes * res.max_windows
+
+def test_release_order_holds_for_a_multi_window_policy_too(real_gf, monkeypatch):
+    """Same teardown contract with several registered windows (explicit per_owner policy), so the
+    one-window arena default does not hide a per-window ordering bug."""
+    monkeypatch.setenv("AITER_GEMM_FUSION_WINDOW_POLICY", "uniform")
+    monkeypatch.delenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", raising=False)
+    be = _FakeBackend()
+    res = _built_resources(real_gf, be)
+    res.ensure("small", [real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")])
+    res.ensure("large", [real_gf.WindowReq("o2/R", 40 << 20, "p2p_window")])
+    registered = list(res._regs)
+    assert len(registered) >= 2
+    res.release()
+    calls = be.calls
+    dest = calls.index("comm_destroy")
+    for w in registered:
+        assert calls.index(("win_deregister", w.handle)) < calls.index(("win_free", w.local)) < dest
+    assert sum(1 for c in calls if isinstance(c, tuple) and c[0] == "win_free") == len(registered)
