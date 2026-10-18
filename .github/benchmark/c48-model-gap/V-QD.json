@@ -138,7 +138,8 @@
             "none"
           ]
         },
-        "scheduler-cls": "pd_c48_scheduler.create_scheduler"
+        "scheduler-cls": "pd_c48_scheduler.create_scheduler",
+        "long-prefill-token-threshold": 6144
       },
       "env": {
         "NCCL_IB_HCA": "rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7",
