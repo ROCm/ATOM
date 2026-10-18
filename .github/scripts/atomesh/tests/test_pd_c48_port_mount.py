@@ -18,6 +18,7 @@ CPUREF = {
     "V-QD-CPUREF2-FP8ATTN": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-PROFILE": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-FQ": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-FP8ATTN-FQ2": "cpu-lru-refresh-v2",
 }
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 

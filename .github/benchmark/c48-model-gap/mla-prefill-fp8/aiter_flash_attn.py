@@ -45,9 +45,10 @@ def _quant_fp8_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # Two-pass K/V per-tensor FP8 quant ported from ATOM
 # atom/model_ops/triton_fused_qkv_quant.py
 # (MIT, Copyright (C) 2026, Advanced Micro Devices, Inc.).
+# Sizes and worker counts are runtime args: as constexprs every new prefill
+# length cost a ~0.3 s JIT compile on the host.
 @triton.jit
-def _kv_amax(K, V, Partial, NK: tl.constexpr, NV: tl.constexpr,
-             PARTS: tl.constexpr, BLOCK: tl.constexpr):
+def _kv_amax(K, V, Partial, NK, NV, PARTS: tl.constexpr, BLOCK: tl.constexpr):
     part = tl.program_id(0)
     kind = tl.program_id(1)
     X = K if kind == 0 else V
@@ -62,9 +63,8 @@ def _kv_amax(K, V, Partial, NK: tl.constexpr, NV: tl.constexpr,
 
 
 @triton.jit
-def _kv_quant(K, V, K8, V8, Partial, Scales, NK: tl.constexpr, NV: tl.constexpr,
-              PARTS: tl.constexpr, BLOCK: tl.constexpr, WORKERS: tl.constexpr,
-              SINGLE_PASS: tl.constexpr):
+def _kv_quant(K, V, K8, V8, Partial, Scales, NK, NV, WORKERS,
+              PARTS: tl.constexpr, BLOCK: tl.constexpr, SINGLE_PASS: tl.constexpr):
     worker = tl.program_id(0)
     kind = tl.program_id(1)
     X = K if kind == 0 else V
@@ -108,6 +108,7 @@ def _quant_fp8_kv_per_tensor(k: torch.Tensor, v: torch.Tensor):
     k, v = k.contiguous(), v.contiguous()
     nk, nv = k.numel(), v.numel()
     n = max(nk, nv)
+    assert n < 2**31, "int32 element offsets"
     parts, block, workers, warps = _kv_config(n)
     k8 = torch.empty(k.shape, dtype=torch.float8_e4m3fn, device=k.device)
     v8 = torch.empty(v.shape, dtype=torch.float8_e4m3fn, device=v.device)
@@ -116,8 +117,8 @@ def _quant_fp8_kv_per_tensor(k: torch.Tensor, v: torch.Tensor):
     single = n <= 8192
     if not single:
         _kv_amax[(parts, 2)](k, v, partial, nk, nv, parts, block, num_warps=warps)
-    _kv_quant[(workers, 2)](k, v, k8, v8, partial, scales, nk, nv, parts, block,
-                            workers, single, num_warps=warps)
+    _kv_quant[(workers, 2)](k, v, k8, v8, partial, scales, nk, nv, workers, parts,
+                            block, single, num_warps=warps)
     return k8, v8, scales[:1], scales[1:]
 
 
