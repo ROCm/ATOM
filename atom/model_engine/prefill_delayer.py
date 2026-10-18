@@ -321,9 +321,9 @@ class PrefillDelayer:
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
         self.last_n_prefillable = 0
-        # True only on a tick where the group fired an *aligned* prefill (every
-        # rank admitted prefill together). Lockstep idles a non-prefilling rank
-        # solely on this signal; see Scheduler._phase_lockstep_idle_needed.
+        # True only on a tick where the group fired an aligned prefill. The
+        # lockstep idle gate does not use this; it idles on last_n_prefillable.
+        # See Scheduler._phase_lockstep_idle_needed.
         self.last_fire_aligned = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
