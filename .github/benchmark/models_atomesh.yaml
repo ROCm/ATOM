@@ -906,6 +906,21 @@ models:
               OFFLOAD_LOAD_WORKERS: "2"
             decode: *glm52_cpp4_dcp4_decode_env
 
+        # The InferenceX path with the KV cache of InferenceX's g14/g18, whose
+        # GPUs hold 5-7 GB that is not this job's: 545.6K prefill blocks
+        # (0.85 - 7.36 GiB / 287.98 GiB) and 188.7K decode blocks (0.94 -
+        # 5.34 GiB / 287.98 GiB).
+        - <<: *glm52_agentic_mcstore_c112_infxnet
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112-infxnet-kv
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-INFXNET-KV
+          server:
+            common_args:
+              <<: *glm52_agentic_lmcache_cpp4_dcp4_args
+              gpu_memory_utilization: 0.8244
+          decode:
+            <<: *glm52_agentic_cpp4_dcp4_decode
+            extra_args: "--decode-context-parallel-size 4 --cudagraph-mode FULL --gpu-memory-utilization 0.9215 --max-num-batched-tokens 2048 --timeout-keep-alive 900"
+
         # The InferenceX path with at most 8 requests parked on a Store load:
         # past that a request whose hit HBM does not cover waits unallocated,
         # so queued loads stop evicting the retained prefix cache.
