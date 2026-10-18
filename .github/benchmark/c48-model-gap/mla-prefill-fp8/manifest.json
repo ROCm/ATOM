@@ -2,17 +2,18 @@
   "name": "mla_prefill_flydsl_fp8_attention",
   "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
   "changes": [
-    "With VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8=1 (Prefill only), ROCM_AITER_FA MLA prefill quantizes Q/K/V to FP8 per tensor (dynamic) and runs AITER FlyDSL flydsl_flash_attn_fp8_func for new tokens (causal) and context chunks (cross, LSE); BF16 fallback when unsupported. Same kernel ATOM 6611 uses via ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1"
+    "With VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8=1 (Prefill only), ROCM_AITER_FA MLA prefill quantizes Q/K/V to FP8 per tensor (dynamic) and runs AITER FlyDSL flydsl_flash_attn_fp8_func for new tokens (causal) and context chunks (cross, LSE); BF16 fallback when unsupported. Same kernel ATOM 6611 uses via ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1",
+    "Per-tensor quant at memory bandwidth: K/V use ATOM's two-pass Triton fused_kv_per_tensor_quant (no atomics); Q uses scaled_fp8_quant on <=256 rows. One row per token-head made scaled_fp8_quant's absmax take 61% of Prefill GPU time in job 9043 (0.10 vs 2.3 TB/s-equivalent on gfx950)"
   ],
   "cases": [
-    "V-QD-CPUREF2-FP8ATTN"
+    "V-QD-CPUREF2-FP8ATTN-FQ"
   ],
   "files": [
     {
       "relative_path": "v1/attention/backends/mla/prefill/aiter_flash_attn.py",
       "mount_source": "aiter_flash_attn.py",
       "base_sha256": "4d0e68067d369f6ffd0902d6c046ecdf8bb698a7c31b3a01783f9f84c2d0c44f",
-      "patched_sha256": "621739f0164c3ceba1790e7977f2d5362658b0969733269833d65b44fcf02a36"
+      "patched_sha256": "6b6f73f5f49c96de0bb30dad261c622f43949d8a7cf7c029011d3f4691d0ad57"
     }
   ]
 }
