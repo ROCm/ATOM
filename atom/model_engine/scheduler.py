@@ -661,6 +661,8 @@ class Scheduler:
         self._num_parked_remote_kv: int = 0
         # Most offload loads parked at once; 0 parks every one admission meets.
         self._max_parked_loads: int = envs.OFFLOAD_MAX_PARKED_LOADS
+        # Experiment: when the next [PD-HOLD] line is due (every 10 s).
+        self._next_hold_log_at: float = 0.0
 
         # Under PP the head keeps pp_size batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
@@ -2206,6 +2208,31 @@ class Scheduler:
             # Keep deferred requests in arrival order while bounded lookahead
             # admits independent work without extending their deadlines.
             self.waiting.extendleft(reversed(prefix_waiters))
+
+        now = time.monotonic()
+        if now >= self._next_hold_log_at:
+            # Experiment: who holds the KV blocks -- prefills, requests parked
+            # on an offload load, and finished prefills whose KV the decode has
+            # not pulled yet. Shared prefix blocks count once per holder.
+            self._next_hold_log_at = now + 10.0
+            parked = [
+                s
+                for s in self.waiting
+                if s.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+            ]
+            pending = list(self.deferred_free_blocks.values())
+            logger.info(
+                "[PD-HOLD] running=%d/%d parked=%d/%d pd_pending=%d/%d "
+                "waiting=%d used=%d",
+                len(self.running),
+                sum(len(s.block_table) for s in self.running),
+                len(parked),
+                sum(len(s.block_table) for s in parked),
+                len(pending),
+                sum(len(s.block_table) for s in pending),
+                len(self.waiting) - len(parked),
+                self.block_manager.kv.num_used,
+            )
 
         if self._num_parked_remote_kv > 0 and self._schedule_tick % 1000 == 0:
             logger.info(
