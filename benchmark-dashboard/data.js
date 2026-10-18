@@ -1,36 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792353793961,
+  "lastUpdate": 1792361174228,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Jasen2201",
-            "username": "Jasen2201",
-            "email": "yajizhan@amd.com"
-          },
-          "committer": {
-            "name": "Mengqing Cao",
-            "username": "MengqingCao",
-            "email": "cmq0113@gmail.com"
-          },
-          "id": "a25d4758975a96d0c1d35d3f62560503928da7ba",
-          "message": "fix(kv-transfer): preserve incremental offload through producer completion\n\nReport send and save progress independently. Retain producer blocks until the\nsend finishes and offload no longer needs them, including undispatched suffix\nsaves. Dispatch remaining PP offload work after the last forward batch.\n\nUpdate lifecycle documentation and reuse existing regression fixtures for\ncompletion ordering, pending suffixes, PP idle dispatch, and save timeouts.\nKeep save-completion documentation with main's shared offload scheduler.\n\nAdd g47-first and g43-first ATOMesh 1P1D node pairs and use Triton KV gather\nfor GLM-5.2's 192/256 head dimensions.",
-          "timestamp": "2026-09-14T13:47:48Z",
-          "url": "https://github.com/ROCm/ATOM/commit/a25d4758975a96d0c1d35d3f62560503928da7ba"
-        },
-        "date": 1789457379347,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4 1048576/1024 c=48 perf point",
-            "value": 166.9583,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34933434901 | docker_image=rocm/atom-dev:nightly_202609141448 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9708%2C%22cache_hit_tokens%22%3A726127200%2C%22cache_total_tokens%22%3A747935223%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A5186%2C%22concurrency%22%3A48%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3619.8051%2C%22e2el_ms%22%3A16903.7978%2C%22e2el_p90%22%3A38439.0794%2C%22e2el_p99%22%3A126133.2192%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609141448%22%2C%22input_tput%22%3A190314.2433%2C%22input_tput_per_gpu%22%3A23789.2804%2C%22interactivity%22%3A31.0998%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A5185%2C%22interactivity_p90_itl%22%3A61.3769%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A14.8297%2C%22itl_p90%22%3A16.2928%2C%22median_e2el_ms%22%3A8137.8425%2C%22median_itl_ms%22%3A14.6982%2C%22median_tpot_ms%22%3A14.6982%2C%22median_ttft_ms%22%3A1203.4673%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A1335.6662%2C%22output_tput_per_gpu%22%3A166.9583%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.3196%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc48-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F34933434901%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A191649.9095%2C%22tpot_ms%22%3A14.8297%2C%22tpot_p90%22%3A16.2928%2C%22tpot_p99%22%3A28.6881%2C%22tput_per_gpu%22%3A23956.2387%2C%22ttft_ms%22%3A1828.8666%2C%22ttft_p90%22%3A3385.6826%2C%22ttft_p99%22%3A12406.2886%7D"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -278259,6 +278231,34 @@ window.BENCHMARK_DATA = {
             "value": 368.3216,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39145059580 | docker_image=rocm/atom-dev:nightly_202610131249 | precision=MXFP4 | display_topology=1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-INFXNET-HIPRIO | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9464%2C%22cache_hit_tokens%22%3A1192608704%2C%22cache_total_tokens%22%3A1260098847%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A10975%2C%22concurrency%22%3A112%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_cpp4_dcp4_tp1_tp4_mcstore_infxnet_hiprio%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3628.1518%2C%22e2el_ms%22%3A29891.463%2C%22e2el_p90%22%3A58582.8056%2C%22e2el_p99%22%3A198396.2532%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610131249%22%2C%22input_tput%22%3A347311.4917%2C%22input_tput_per_gpu%22%3A43413.9365%2C%22interactivity%22%3A9.3944%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A10970%2C%22interactivity_p90_itl%22%3A39.4878%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A21.1886%2C%22itl_p90%22%3A25.3243%2C%22median_e2el_ms%22%3A18827.8242%2C%22median_itl_ms%22%3A21.7954%2C%22median_tpot_ms%22%3A21.7954%2C%22median_ttft_ms%22%3A6439.5949%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2946.5729%2C%22output_tput_per_gpu%22%3A368.3216%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A1%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.7926%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d_cpp4_dcp4-isl1048576-osl1024-conc112-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39145059580%22%2C%22scenario%22%3A%22agentx%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A350258.0645%2C%22tpot_ms%22%3A21.1886%2C%22tpot_p90%22%3A25.3243%2C%22tpot_p99%22%3A29.2731%2C%22tput_per_gpu%22%3A43782.2581%2C%22ttft_ms%22%3A9248.1608%2C%22ttft_p90%22%3A20494.6641%2C%22ttft_p99%22%3A46444.281%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "id": "c127b008b2e429bf2334084e57ba1600c04d70b6",
+          "message": "ci(atomesh): sweep-only, re-extract crate sources when the node cache lost files\n\nOn g25 an extracted crate kept its .cargo-ok marker after its Cargo.toml\nwas removed from /tmp, so cargo failed with \"unable to get packages from\nsource\" and never re-extracted it. Drop registry/src and retry once.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-18T12:52:05Z",
+          "url": "https://github.com/ROCm/ATOM/commit/c127b008b2e429bf2334084e57ba1600c04d70b6"
+        },
+        "date": 1792361173291,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::Kimi-K3-MXFP4 mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark4 1048576/1024 c=48 perf point",
+            "value": 69.6656,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39129295866 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P2D-TP8-DCP8-DSPARK4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9683%2C%22cache_hit_tokens%22%3A871042048%2C%22cache_total_tokens%22%3A899511904%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A5924%2C%22concurrency%22%3A48%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p2d_tp8_dcp8_dspark4%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A2%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3621.1888%2C%22e2el_ms%22%3A12556.8716%2C%22e2el_p90%22%3A26344.8826%2C%22e2el_p99%22%3A86125.6155%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A248402.365%2C%22input_tput_per_gpu%22%3A10350.0985%2C%22interactivity%22%3A27.9722%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A5923%2C%22interactivity_p90_itl%22%3A86.4157%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A9.4255%2C%22itl_p90%22%3A11.572%2C%22median_e2el_ms%22%3A7110.5935%2C%22median_itl_ms%22%3A9.3647%2C%22median_tpot_ms%22%3A9.3647%2C%22median_ttft_ms%22%3A1553.5965%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A16%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A1671.9749%2C%22output_tput_per_gpu%22%3A69.6656%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.5074%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p2d-isl1048576-osl1024-conc48-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39129295866%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-4%22%2C%22total_gpu%22%3A24%2C%22total_tput%22%3A250074.3398%2C%22tpot_ms%22%3A9.4255%2C%22tpot_p90%22%3A11.572%2C%22tpot_p99%22%3A13.5002%2C%22tput_per_gpu%22%3A10419.7642%2C%22ttft_ms%22%3A2817.7716%2C%22ttft_p90%22%3A6411.6105%2C%22ttft_p99%22%3A17373.8944%7D"
           }
         ]
       }
