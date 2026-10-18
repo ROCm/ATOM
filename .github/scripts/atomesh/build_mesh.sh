@@ -60,12 +60,24 @@ if [[ -f "${build_dir}/source/Cargo.lock" ]]; then
   lock_args+=(--locked)
 fi
 echo "[build] Mesh commit=${source_commit} profile=${profile}" >&2
-if ! cargo build --profile "${profile}" --bin atomesh \
-  "${lock_args[@]}" \
-  --manifest-path "${build_dir}/source/Cargo.toml" \
-  --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1; then
-  cat "${log_dir}/mesh-build.log" >&2
-  exit 1
+cargo_build() {
+  cargo build --profile "${profile}" --bin atomesh \
+    "${lock_args[@]}" \
+    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
+}
+if ! cargo_build; then
+  # Extracted crate sources in the node-local cache can lose files while
+  # their .cargo-ok marker stays, so cargo never re-extracts them. Drop the
+  # extracted tree (cargo rebuilds it from the .crate archives) and retry.
+  if grep -q "registry/src/.*No such file or directory\|unable to get packages from source" "${log_dir}/mesh-build.log"; then
+    echo "[build] crate source cache is incomplete; re-extracting and retrying" >&2
+    rm -rf "${CARGO_HOME:-${HOME}/.cargo}/registry/src"
+    cargo_build || { cat "${log_dir}/mesh-build.log" >&2; exit 1; }
+  else
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
