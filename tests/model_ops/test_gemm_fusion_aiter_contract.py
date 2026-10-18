@@ -471,3 +471,49 @@ def test_env_var_does_not_substitute_for_the_config_profile(real_gf, monkeypatch
             hooks.profile_tokens(4)
     finally:
         hooks.reset_for_tests()
+
+class _Tens:
+    """Tensor-like with exactly what aiter's alias walker reads (data_ptr/shape/stride/element_size)."""
+
+    def __init__(self, ptr, n):
+        self._p, self.shape, self._n = ptr, (n,), n
+
+    def data_ptr(self):
+        return self._p
+
+    def stride(self):
+        return (1,)
+
+    def element_size(self):
+        return 1
+
+
+def test_check_no_window_alias_drives_the_real_aiter_helper_on_real_windows(real_gf, monkeypatch):
+    """C-S4 against aiter 7c857474's REAL FusionResources.assert_no_window_alias and window
+    registry: a tensor inside a registered shared window is rejected, outside is accepted, and the
+    verdict comes from aiter's walker (force=True), not from ATOM's fallback."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+    from atom.model_ops.gemm_fusion import site as site_mod
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_DEBUG_ALIAS", raising=False)  # ATOM must force, not rely on env
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    inner = _real_inner(real_gf, _FakeBackend())
+    if not hasattr(inner, "assert_no_window_alias"):
+        pytest.skip("installed aiter predates assert_no_window_alias (7c857474)")
+    w = FusionResourcesWrapper(None, 4, rank=0, inner=inner, reduce_min=lambda v: list(v), arch="gfx950", cu=256)
+    hooks.reset_for_tests(w)
+    try:
+        # register one SHARED window through aiter's own bookkeeping
+        base, size = 0x7000_0000, 1 << 20
+        inner._regs.append(real_gf.resources.Window("<shared>", "R", "p2p_window", size, 1, base, shared=True)) \
+            if hasattr(real_gf, "resources") else inner._regs.append(
+                importlib.import_module("aiter.gemm_fusion.resources").Window(
+                    "<shared>", "R", "p2p_window", size, 1, base, shared=True))
+        hooks.check_no_window_alias([("out", _Tens(base + size + 4096, 64)), ("scale", _Tens(0x1000, 8))])
+        with pytest.raises(site_mod.GemmFusionBindError, match="points into a CCO window"):
+            hooks.check_no_window_alias([("out", _Tens(base + 4096, 64))])
+        with pytest.raises(site_mod.GemmFusionBindError, match="impl._index_q"):
+            hooks.check_no_window_alias([("impl._index_q", _Tens(base - 16, 64))])  # straddles the start
+    finally:
+        hooks.reset_for_tests()

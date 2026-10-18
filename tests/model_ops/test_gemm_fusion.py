@@ -1557,21 +1557,36 @@ def test_alias_check_ignores_unshared_windows_and_is_a_noop_without_any(make_sit
     hooks.check_no_window_alias([("output", _Span(0x10000, 0x100))])
 
 
-def test_alias_check_prefers_aiters_helper_when_it_exists(make_site):
+def test_alias_check_calls_aiters_helper_with_its_real_signature(make_site):
+    """aiter 7c857474: FusionResources.assert_no_window_alias(obj, what=<str>, force=<bool>). ATOM
+    passes a dict keyed by label and force=True (the check only runs under
+    ATOM_GEMM_FUSION_CHECK_ALIAS=1); aiter's WindowAliasError is re-raised as GemmFusionBindError."""
     make_site(FakeResources())
-    calls = []
+    seen = {}
     res = _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True))
-    res.inner.assert_no_window_alias = lambda ts: calls.append(len(ts))
-    hooks.check_no_window_alias([("output", _Span(0x10800, 0x100))])  # would alias, but aiter decides
-    assert calls == [1]
 
-    def boom(ts):
-        raise AssertionError("aliases R")
+    def helper(obj, what="gemm_fusion output", force=False):
+        seen.update(obj=obj, what=what, force=force)
 
-    res.inner.assert_no_window_alias = boom
-    with pytest.raises(site_mod.GemmFusionBindError, match="aliases R"):
-        hooks.check_no_window_alias([("output", _Span(0x40000, 0x100))])
+    res.inner.assert_no_window_alias = helper
+    t_out, t_scale, t_iq = _Span(0x40000, 0x100), _Span(0x41000, 0x10), _Span(0x42000, 0x20)
+    hooks.check_no_window_alias(
+        [("out", t_out), ("scale", t_scale), ("impl._index_q", t_iq), ("skipped", None)]
+    )  # would alias nothing here, and aiter (not the local check) decides
+    assert seen["force"] is True and isinstance(seen["what"], str)
+    assert seen["obj"] == {"out": t_out, "scale": t_scale, "impl._index_q": t_iq}  # None entries dropped
+    res.inner.assert_no_window_alias = lambda obj, what="", force=False: (_ for _ in ()).throw(
+        RuntimeError("out points into a CCO window")
+    )
+    with pytest.raises(site_mod.GemmFusionBindError, match="out points into a CCO window"):
+        hooks.check_no_window_alias([("out", _Span(0x10800, 0x100))])
 
+
+def test_alias_check_falls_back_to_the_local_range_check_for_an_older_aiter(make_site):
+    make_site(FakeResources())
+    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True))  # no assert_no_window_alias attribute
+    with pytest.raises(site_mod.GemmFusionBindError, match="aliases shared window 'R'"):
+        hooks.check_no_window_alias([("out", _Span(0x10800, 0x100))])
 
 def test_alias_check_is_opt_in(monkeypatch):
     monkeypatch.delenv(hooks.ALIAS_CHECK_ENV, raising=False)

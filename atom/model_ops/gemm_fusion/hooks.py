@@ -156,18 +156,22 @@ def check_no_window_alias(named_tensors) -> None:
     ``shared_large``).
 
     ``named_tensors``: iterable of ``(label, tensor-or-None)``. Pure host address arithmetic: no
-    collective, no sync. It is deterministic in the (uniform) code path, so every rank that
-    reaches it reaches the same verdict. Prefers aiter's own assertion helper when the installed
-    aiter provides one; otherwise uses the range check above. Raises ``GemmFusionBindError``.
+    collective, no sync, deterministic in the (uniform) code path.
+
+    aiter (>= 7c857474) provides ``FusionResources.assert_no_window_alias(obj, what=, force=)``: it
+    walks nested dicts/lists/tuples, honours strides, and raises ``WindowAliasError``. It is used,
+    with ``force=True`` (this function only runs when ``ATOM_GEMM_FUSION_CHECK_ALIAS=1``), on a
+    dict keyed by label. For an older aiter without it, the local range check below is the
+    fallback. Either way a failure is raised as ``GemmFusionBindError``.
     """
     from .site import GemmFusionBindError
 
     items = [(n, t) for n, t in named_tensors if t is not None and hasattr(t, "data_ptr")]
     helper = getattr(getattr(_RES, "inner", None), "assert_no_window_alias", None)
-    if helper is not None:  # aiter's helper (C-S4), when present, is authoritative
+    if helper is not None:
         try:
-            helper([t for _, t in items])
-        except Exception as e:  # noqa: BLE001 - re-raised as our bind error with the label set
+            helper({n: t for n, t in items}, what="gemm_fusion_qkv_attention", force=True)
+        except Exception as e:  # noqa: BLE001 - aiter's WindowAliasError (a ResourceError)
             raise GemmFusionBindError(f"gemm_fusion: tensor aliases a shared window: {e}") from e
         return
     windows = shared_window_ranges()

@@ -44,8 +44,8 @@ def run_qkv_attention(attn, x, x_scale, positions):
             (out, out_scale), _decision = result
             hooks.check_no_window_alias(
                 [
-                    ("output", out),
-                    ("output_scale", out_scale),
+                    ("out", out),
+                    ("scale", out_scale),
                     ("impl._index_q", getattr(attn.impl, "_index_q", None)),
                 ]
             )
