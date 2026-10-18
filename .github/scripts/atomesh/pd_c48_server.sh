@@ -27,7 +27,7 @@ run_aiperf_agentic_benchmark() {
       --output "${out_dir}/prefill-profile" --traces "${RUN_DIR}/traces"
       --timeline "${RUNTIME_LOG_DIR}/prefill-timeline"
       --aiperf-log "${out_dir}/logs/aiperf.log"
-      --seconds 10 --offsets 600 1500 3000 --ranks 8
+      --seconds 20 --offsets 1320 1360 1400 --ranks 8
       --phase-timeout 7200 --finish-timeout 5400 --)
   fi
   # Match the historical InferenceX agentx invocation and pinned scenario defaults.

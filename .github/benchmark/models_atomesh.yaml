@@ -1804,8 +1804,10 @@ models:
             ATOMESH_C48_CASE: V-QD
             ATOMESH_PRE_CLEAN_GPU: '1'
             ATOMESH_AGENTIC_TORCH_PROFILE: '0'
+            ATOMESH_C48_PREFILL_PROFILE: '1'
           prefill:
             C48_CACHE_LIFECYCLE: '1'
+            C48_PREFILL_TIMELINE: '1'
             VLLM_ROCM_USE_AITER: '1'
             AITER_BF16_FP8_MOE_BOUND: '0'
             AITER_FLYDSL_STAGE2_FP8: '1'
@@ -1873,6 +1875,7 @@ models:
             --speculative-config '{"model":"/models/Inferact-Kimi-K3-DSpark","method":"dspark","num_speculative_tokens":4,"attention_backend":"ROCM_AITER_MLA","kv_cache_dtype":"fp8","draft_sample_method":"probabilistic","rejection_sample_method":"synthetic","synthetic_acceptance_length":3.36}'
             --kv-transfer-config '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"connectors":[{"kv_connector":"MoRIIOConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail","kv_connector_extra_config":{"backend":"rdma","read_mode":true}},{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":1799000000000,"lazy_offload":false}}]}}'
             --max-num-seqs 96 --max-num-batched-tokens 8192 --compilation-config '{"mode":3,"cudagraph_mode":"NONE","max_cudagraph_capture_size":0,"custom_ops":["+fused_rms_norm_gated","+quant_fp8","+grouped_topk","+sparse_attn_indexer","none"]}'
+            --profiler-config '{"profiler":"torch","torch_profiler_dir":"/runtime-traces/prefill","torch_profiler_with_stack":false,"torch_profiler_record_shapes":false,"torch_profiler_with_memory":false,"torch_profiler_use_gzip":true,"torch_profiler_dump_cuda_time_total":false,"ignore_frontend":true,"detailed_trace_annotation":true,"max_iterations":32}'
             --scheduler-cls pd_c48_scheduler.create_scheduler
         decode:
           workers: 1

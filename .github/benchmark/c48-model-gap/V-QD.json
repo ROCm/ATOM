@@ -138,7 +138,19 @@
             "none"
           ]
         },
-        "scheduler-cls": "pd_c48_scheduler.create_scheduler"
+        "scheduler-cls": "pd_c48_scheduler.create_scheduler",
+        "profiler-config": {
+          "profiler": "torch",
+          "torch_profiler_dir": "/runtime-traces/prefill",
+          "torch_profiler_with_stack": false,
+          "torch_profiler_record_shapes": false,
+          "torch_profiler_with_memory": false,
+          "torch_profiler_use_gzip": true,
+          "torch_profiler_dump_cuda_time_total": false,
+          "ignore_frontend": true,
+          "detailed_trace_annotation": true,
+          "max_iterations": 32
+        }
       },
       "env": {
         "NCCL_IB_HCA": "rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7",
@@ -171,7 +183,8 @@
         "MORI_IO_QP_MAX_SGE": "2",
         "MORI_IO_TC_DISABLE": "0",
         "HSA_NO_SCRATCH_RECLAIM": "0",
-        "C48_CACHE_LIFECYCLE": "1"
+        "C48_CACHE_LIFECYCLE": "1",
+        "C48_PREFILL_TIMELINE": "1"
       }
     },
     "decode": {
