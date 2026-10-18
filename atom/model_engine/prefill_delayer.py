@@ -244,9 +244,9 @@ class PrefillDelayer:
         self._decode_interval_remaining = 0
         self._prefill_executed_since_last_decision = False
         self.last_n_prefillable = 0
-        # True only on a tick where the group fired an *aligned* prefill (every
-        # rank admitted prefill together). Lockstep idles a non-prefilling rank
-        # solely on this signal; see Scheduler._phase_lockstep_idle_needed.
+        # True only on a tick where the group fired an aligned prefill. The
+        # lockstep idle gate does not use this; it idles on last_n_prefillable.
+        # See Scheduler._phase_lockstep_idle_needed.
         self.last_fire_aligned = False
 
         # Per-exit fire counters + hold counter for periodic logging. Each exit
@@ -518,7 +518,8 @@ class PrefillDelayer:
     def _fire(self, reason: str, g_pending: int) -> bool:
         # reason ∈ {align, fill, stall, ttft, kv, partial, nodecode, queue_ms,
         # vacuous}; each maps to a dedicated _stat_fire_<reason> slot so the log
-        # shows what released. Only the aligned fire arms lockstep idling.
+        # shows what released. Lockstep idling keys off last_n_prefillable,
+        # not this aligned-fire bit.
         self.last_fire_aligned = reason == "align"
         attr = f"_stat_fire_{reason}"
         setattr(self, attr, getattr(self, attr) + 1)

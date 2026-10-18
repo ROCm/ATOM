@@ -1852,22 +1852,19 @@ class Scheduler:
             )
 
     def _phase_lockstep_idle_needed(self, delayer_allows: bool) -> bool:
-        """True when the group fires an aligned prefill and this rank must idle.
+        """True when some rank can prefill and this rank must not decode.
 
-        Gated on the delayer's *aligned* fire (every rank admitted a prefill on
-        this tick), not on ``last_n_prefillable > 0``. A rank reporting
-        prefillable work can still fail admission (KV / state-slot room) and
-        decode, and must-fire escapes release unaligned; in both cases the step
-        is ragged regardless, so idling a decode-capable rank only loses it a
-        token. We idle solely on the aligned fire, where decoding here would be
-        the lone straggler that knocks the group off its decode CUDA graph.
+        Idle on ``last_n_prefillable > 0``, not only on an aligned fire. An
+        unaligned escape (TTFT ticks, queue age) still prefills one rank. Peers
+        that decode on that tick take the group off its decode CUDA graph, so
+        a decode-capable rank idles whenever any rank has prefillable work.
         """
         if not self.dp_phase_lockstep or not delayer_allows:
             return False
         delayer = self.prefill_delayer
         if delayer is None or delayer.dp_size <= 1:
             return False
-        return delayer.last_fire_aligned
+        return delayer.last_n_prefillable > 0
 
     def _phase_lockstep_idle_batch(
         self,
@@ -2657,9 +2654,9 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
-        # A peer is prefilling this tick. Decode here would make the group
-        # ragged and force every rank off its CUDA graph. Idle in the prefill
-        # phase instead; the next aligned decode tick replays the graph.
+        # Some rank has prefillable work. Decoding beside that prefill runs
+        # this rank eager and keeps later decode steps off the CUDA graph.
+        # Idle in the prefill phase so the next all-decode tick can replay.
         if self._phase_lockstep_idle_needed(delayer_allows):
             return self._phase_lockstep_idle_batch()
 
