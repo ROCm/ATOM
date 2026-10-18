@@ -659,6 +659,8 @@ class Scheduler:
         self._schedule_tick: int = 0
 
         self._num_parked_remote_kv: int = 0
+        # Most offload loads parked at once; 0 parks every one admission meets.
+        self._max_parked_loads: int = envs.OFFLOAD_MAX_PARKED_LOADS
 
         # Under PP the head keeps pp_size batches in flight, so schedule() must
         # advance chunked-prefill progress itself rather than defer it to
@@ -2019,6 +2021,18 @@ class Scheduler:
             # below itself (`BlockManager.replay_start`), and its budget counts
             # the rows it recomputes.
             resume = num_cached_blocks * self.block_manager.hash_block_size
+            if (
+                needs_remote_load
+                and self._max_parked_loads
+                and self._num_parked_remote_kv >= self._max_parked_loads
+                and seq.offload_joint.kv_prefix_tokens > resume
+            ):
+                # Its load would only queue behind the parked ones, each stage's
+                # load threads take them in turn, while its blocks came out of
+                # the retained prefix cache: wait unallocated, in arrival order,
+                # and admit what HBM already covers.
+                prefix_waiters.append(seq)
+                continue
             start = self.block_manager.replay_start(seq, resume, hit=True)
             num_new_tokens = self._new_prefill_tokens(seq, start, resume)
             if (

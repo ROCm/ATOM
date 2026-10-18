@@ -1063,6 +1063,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
+    # Most requests parked on an offload load at once; past it a request whose
+    # tier hit HBM does not cover waits unallocated, so queued loads do not
+    # take blocks from the retained prefix cache. 0 (default): no limit.
+    "OFFLOAD_MAX_PARKED_LOADS": lambda: _nonnegative_int_env(
+        "OFFLOAD_MAX_PARKED_LOADS", 0
+    ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.

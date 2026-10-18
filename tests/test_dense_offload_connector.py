@@ -769,6 +769,42 @@ def test_pending_load_keeps_pin_until_cancelled(monkeypatch):
     assert scheduler.build_connector_meta().lookup_requests_in_step == []
 
 
+@pytest.mark.parametrize("parked", [0, 1])
+def test_parked_load_cap_keeps_a_load_unallocated_and_admits_hbm_work(
+    monkeypatch, scheduler, seq_factory, parked
+):
+    connector = _scheduler(monkeypatch, "kv_consumer")
+    connector._min_load_tokens = 0
+    load_seq = seq_factory(list(range(24)))
+    fresh_seq = seq_factory(list(range(100, 124)))
+    hits = {str(load_seq.id): 16}
+    connector._lookup_client = SimpleNamespace(
+        lookup=lambda _tokens, lookup_id: hits.get(lookup_id, 0),
+        clear_lookup_status=lambda _sid: None,
+    )
+    scheduler.kv_connector = connector
+    scheduler._max_parked_loads = 1
+    scheduler._num_parked_remote_kv = parked
+    scheduler.add(load_seq)
+    scheduler.add(fresh_seq)
+
+    _, scheduled = scheduler.schedule()
+
+    if parked:
+        # The cap is reached: the load waits unallocated, at the head, and the
+        # request HBM can serve is admitted past it.
+        assert fresh_seq.id in scheduled
+        assert list(scheduler.waiting) == [load_seq]
+        assert len(load_seq.block_table) == 0
+        assert load_seq.status == SequenceStatus.WAITING
+        assert scheduler._num_parked_remote_kv == 1
+    else:
+        # Below it the load parks with its blocks.
+        assert load_seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS
+        assert len(load_seq.block_table) > 0
+        assert scheduler._num_parked_remote_kv == 1
+
+
 def test_scheduler_abort_before_allocation_releases_lookup_pin(
     monkeypatch, scheduler, seq_factory
 ):
