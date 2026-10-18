@@ -218,7 +218,13 @@ def last_decision():
 
 
 def qkv_proj_all2all_norm_rope_cache(case, comm):
-    """Golden candidate entry: FP8 QKV GEMM -> exchange -> norm/RoPE/cache."""
+    """Golden candidate entry: FP8 QKV GEMM -> exchange -> norm/RoPE/cache.
+
+    RESULT CONTRACT (lead decision): the result is returned as the consumer produced it, with no
+    copy, matching the golden harness's native behaviour and timing. On a 1-stage large-M call a
+    returned tensor may therefore be a BORROWED view of the shared R window, valid only until the
+    next large launch of ANY plan on this rank. Compare or clone each large-M result before the
+    next large launch. The model path's C-S4 aliasing check does not apply here."""
     global _LAST
     import operators  # golden module (on sys.path under run_cases)
 
