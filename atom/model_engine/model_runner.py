@@ -756,6 +756,7 @@ class ModelRunner:
 
         self.attn_backend = get_attn_backend(self.attn_family)
         self._setup_device_and_distributed(rank, config)
+        self.compute_stream = self._enter_compute_stream()
 
         self.capture_sizes = [0]  # for eager fallback
         # The same ladder as an ASCENDING int32 array, which is what
@@ -980,6 +981,25 @@ class ModelRunner:
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
         return 0
+
+    def _enter_compute_stream(self) -> torch.cuda.Stream | None:
+        """Make a High-priority stream this thread's current stream.
+
+        HIP pools hardware queues per priority and a graph's parallel streams
+        are always Normal, so a Normal launch stream can share their queue and
+        run the graph's side branch (the dual-stream shared experts) behind its
+        main branch instead of beside it. Only the stream a graph is launched
+        from matters, not the one it was captured on, so making this the runner
+        thread's current stream covers FULL, PIECEWISE, draft and TBO alike.
+        """
+        if not envs.ATOM_HIGH_PRIORITY_COMPUTE_STREAM:
+            return None
+        _, high = torch.cuda.Stream.priority_range()
+        stream = torch.cuda.Stream(self.device, priority=high)
+        # Torch streams do not sync with the default stream; drain it first.
+        torch.cuda.synchronize(self.device)
+        torch.cuda.set_stream(stream)
+        return stream
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -4857,7 +4877,11 @@ class RapidServeModelRunner(ModelRunner):
                 mask = self._cu_mask_for_fraction(f, upper=True)
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
-        self._decode_streams[None] = torch.cuda.Stream()
+        self._decode_streams[None] = (
+            torch.cuda.Stream(priority=self.compute_stream.priority)
+            if self.compute_stream is not None
+            else torch.cuda.Stream()
+        )
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
         logger.info(
