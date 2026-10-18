@@ -45,6 +45,7 @@ _ATOM_ENV_VARS = [
     "ATOM_ENABLE_RELAXED_MTP",
     "ATOM_USE_FLYDSL_GATHER_KV_B_PROJ",
     "ATOM_USE_FLYDSL_FP8_PREFILL_ATTN",
+    "ATOM_HIGH_PRIORITY_COMPUTE_STREAM",
 ]
 
 _PROFILER_DETAIL_VARS = [
@@ -333,6 +334,31 @@ def test_mla_fp8_prefill_flag(monkeypatch):
     for value, expected in [("0", False), ("1", True), ("true", False)]:
         monkeypatch.setenv(name, value)
         assert getattr(_get_envs(), name) is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("1", True),
+        ("true", True),
+        ("True", True),
+        ("on", True),
+        (" 1 ", True),
+        ("0", False),
+        ("false", False),
+        ("off", False),
+        # `VAR=` is how a launch script clears a flag inline; it reads as off.
+        ("", False),
+    ],
+)
+def test_high_priority_compute_stream_flag(monkeypatch, value, expected):
+    name = "ATOM_HIGH_PRIORITY_COMPUTE_STREAM"
+    monkeypatch.setenv(name, value)
+    assert getattr(_get_envs(), name) is expected
+
+
+def test_high_priority_compute_stream_defaults_off():
+    assert _get_envs().ATOM_HIGH_PRIORITY_COMPUTE_STREAM is False
 
 
 def test_offload_env_vars_are_documented():
