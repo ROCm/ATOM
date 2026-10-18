@@ -1087,12 +1087,7 @@ def test_m3_smoke_default_is_all_dense_ffn_but_keeps_all_three_attention_types()
         assert cfg["sparse_attention_config"]["sparse_attention_freq"] == [0, 1, 1, 1]
         assert cfg["num_attention_heads"] * cfg["head_dim"] == 8192 and cfg["hidden_size"] == 6144
         assert cfg["dense_intermediate_size"] == 6144
-    # skip-index layers still arise: sparse ordinals 0,1,2 with index_topk_freq 2 -> [F, T, F]
-    outer = m.m3_vl_config(layers=4)
-    assert outer["index_topk_freq"] == 2
-    freq, off = outer["index_topk_freq"], outer["index_skip_topk_offset"]
-    skips = [max(o - off, 0) % freq != 0 for o in range(3)]  # the model's own formula (model.py:105)
-    assert skips == [False, True, False] and any(skips) and not all(skips)
+    # skip-index layers: decided by ATOM's REAL function, not a copy of its formula (see the test below)
     # explicit opt-in restores the old MoE layout
     assert m.m3_config(layers=4, moe=True)["moe_layer_freq"] == [0, 1, 1, 1]
     assert m.m3_vl_config(layers=4, moe=True)["text_config"]["moe_layer_freq"] == [0, 1, 1, 1]
@@ -1593,3 +1588,74 @@ def test_alias_check_is_opt_in(monkeypatch):
     assert hooks.alias_check_enabled() is False
     monkeypatch.setenv(hooks.ALIAS_CHECK_ENV, "1")
     assert hooks.alias_check_enabled() is True
+
+# ------------- skip-index layers in the smoke config, decided by ATOM's REAL functions
+def _real_skip_functions():
+    """Extract ATOM's own skip-index functions from model.py (ast) and run them in pure Python. They
+    only read attributes of a config object, so no torch/transformers is needed."""
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py").read_text(encoding="utf-8")
+    want = {"_sparse_attention_layer_ids", "_sparse_attention_layer_ordinals", "_should_skip_minimax_m3_index_topk"}
+    code = "\n\n".join(ast.get_source_segment(src, n) for n in ast.parse(src).body
+                         if isinstance(n, ast.FunctionDef) and n.name in want)
+    assert code.count("def ") == 3, "model.py no longer defines the three skip functions"
+    ns = {"PretrainedConfig": object}
+    exec(compile(code, "model_extracted", "exec"), ns)
+    return ns["_should_skip_minimax_m3_index_topk"]
+
+
+def _skip_flags(cfg_text, outer=None):
+    """Per-layer skip flags after the SAME outer -> text copy-down ATOM's
+    _normalize_minimax_m3_text_config performs (model.py/config.py)."""
+    from types import SimpleNamespace as NS
+
+    should_skip = _real_skip_functions()
+    text = NS(**cfg_text)
+    for a in ("use_index_cache", "index_topk_freq", "index_topk_pattern", "index_skip_topk_offset"):
+        v = (outer or {}).get(a)
+        if v is not None:
+            setattr(text, a, v)
+    return [should_skip(text, i)[0] for i in range(cfg_text["num_hidden_layers"])]
+
+
+def test_smoke_config_has_a_skip_index_sparse_layer_under_atoms_real_function():
+    """A-4 level 0 found NO skip-index site: the real function returns 'no skip' for every layer
+    unless use_index_cache is true (model.py:88). The smoke config must produce at least one skip
+    layer, with dense, indexed and skip layers all present, through the real released layout's
+    outer->text copy-down."""
+    m = _load_m3_smoke("m3_smoke_skip")
+    vl = m.m3_vl_config(layers=4)
+    outer = {k: vl[k] for k in ("use_index_cache", "index_topk_freq", "index_skip_topk_offset") if k in vl}
+    assert vl["use_index_cache"] is True and "use_index_cache" not in vl["text_config"]  # outer, as the recipes set it
+    flags = _skip_flags(vl["text_config"], outer)
+    sparse = vl["text_config"]["sparse_attention_config"]["sparse_attention_freq"]
+    assert flags == [False, False, True, False]  # layer 0 dense; 1 indexed; 2 SKIP; 3 indexed
+    kinds = ["dense" if not sparse[i] else ("skip" if flags[i] else "indexed") for i in range(4)]
+    assert set(kinds) == {"dense", "indexed", "skip"}
+    # the flat layout carries the flag on the one config object
+    flat = m.m3_config(layers=4)
+    assert flat["use_index_cache"] is True and _skip_flags(flat) == flags
+
+
+def test_without_use_index_cache_no_layer_skips_which_is_the_bug_this_fixes():
+    """Control: the earlier smoke config (use_index_cache absent) gives all False under the REAL
+    function even with index_topk_freq 2, so a test on a formula copy could not see the bug."""
+    m = _load_m3_smoke("m3_smoke_skip_control")
+    vl = m.m3_vl_config(layers=4)
+    outer = {k: vl[k] for k in ("index_topk_freq", "index_skip_topk_offset")}  # use_index_cache missing
+    assert _skip_flags(vl["text_config"], outer) == [False, False, False, False]
+    # and a freq of 1 means "never share", even with the cache on
+    flat = m.m3_config(layers=4, index_topk_freq=1)
+    assert _skip_flags(flat) == [False, False, False, False]
+
+
+def test_skip_layers_scale_with_depth_and_frequency_in_the_smoke_config():
+    m = _load_m3_smoke("m3_smoke_skip_scale")
+    flat = m.m3_config(layers=8, index_topk_freq=2)
+    assert _skip_flags(flat) == [False, False, True, False, True, False, True, False]  # ordinals 1,3,5 skip
+    # freq 4 (the recipes' value) over sparse ordinals 0,1,2: only ordinal 0 recomputes its indexer,
+    # ordinals 1 and 2 share it. I first expected NO skip here; the real function says otherwise
+    # (max(ordinal - offset, 0) % freq != 0), which is why these tests run it instead of a formula copy.
+    assert _skip_flags(m.m3_config(layers=4, index_topk_freq=4)) == [False, False, True, True]

@@ -64,6 +64,11 @@ def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
         "n_shared_experts": 1,
         # 0 = dense MLP, nonzero = MoE (see the docstring: MoE hits a stock x_scale TypeError)
         "moe_layer_freq": layer_ffn,
+        # ATOM's _should_skip_minimax_m3_index_topk returns "no skip" for EVERY layer unless
+        # use_index_cache is true (model.py:88), whatever index_topk_freq says. The recipes turn it
+        # on with --hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'. Without this
+        # line the earlier smoke config had NO skip-index layer at all (found by E-2/A-4 level 0).
+        "use_index_cache": True,
         "index_topk_freq": index_topk_freq,
         "index_skip_topk_offset": 0,
         "sparse_attention_config": {
@@ -129,7 +134,11 @@ def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False)
     # --hf-overrides, which updates the outer config) and ATOM copies them DOWN into
     # text_config (_normalize_minimax_m3_text_config). Keep them out of text_config here so
     # the run exercises that same copy, which is what decides skip-index layers.
-    outer_index = {k: text.pop(k) for k in ("index_topk_freq", "index_skip_topk_offset") if k in text}
+    outer_index = {
+        k: text.pop(k)
+        for k in ("use_index_cache", "index_topk_freq", "index_skip_topk_offset")
+        if k in text
+    }
     return {
         "model_type": VL_MODEL_TYPE,
         "architectures": [VL_ARCH],
