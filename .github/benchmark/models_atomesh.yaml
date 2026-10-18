@@ -880,16 +880,30 @@ models:
         # InferenceX's whole network path: the Store loopback above, P->D on
         # each decode GPU's rail (ATOM_MOONCAKE_MATCHED_RAILS), and the
         # recipe's IPC and RCCL settings.
-        - <<: *glm52_agentic_mcstore_c112_loopstore
+        - &glm52_agentic_mcstore_c112_infxnet
+          <<: *glm52_agentic_mcstore_c112_loopstore
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112-infxnet
           display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-INFXNET
           env:
-            common:
+            common: &glm52_agentic_mcstore_c112_infxnet_env_common
               <<: *glm52_agentic_lmcache_cpp4_dcp4_env_common
               ATOM_MOONCAKE_MATCHED_RAILS: "auto"
               HSA_ENABLE_IPC_MODE_LEGACY: "1"
               NCCL_IB_DISABLE: "1"
             prefill: *glm52_agentic_mcstore_c112_loopstore_env_prefill
+            decode: *glm52_cpp4_dcp4_decode_env
+
+        # The InferenceX path with two load threads per stage: a load's get
+        # (RDMA) runs while the other's unpack waits for the stage's GPU,
+        # instead of one thread doing both in turn.
+        - <<: *glm52_agentic_mcstore_c112_infxnet
+          name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-mcstore-1m-c112-infxnet-lw2
+          display_topology: 1P1D-CPP4-DCP4-TP1-TP4-MCSTORE-INFXNET-LW2
+          env:
+            common: *glm52_agentic_mcstore_c112_infxnet_env_common
+            prefill:
+              <<: *glm52_agentic_mcstore_c112_loopstore_env_prefill
+              OFFLOAD_LOAD_WORKERS: "2"
             decode: *glm52_cpp4_dcp4_decode_env
 
         - <<: *glm52_agentic_mcstore_cpp4_dcp4
