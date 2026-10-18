@@ -862,12 +862,18 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
                 self._record_load_error_blocks(req)
 
     # -- in-place copies ---------------------------------------------------
-    def _in_place_stream(self) -> torch.cuda.Stream:
-        """This copy thread's stream for in-place packs and unpacks."""
-        stream = getattr(self._in_place_tls, "stream", None)
+    def _in_place_stream(self, *, unpack: bool = False) -> torch.cuda.Stream:
+        """This copy thread's stream for in-place packs, or for unpacks.
+
+        Unpacks run at OFFLOAD_UNPACK_STREAM_PRIORITY: a load's request waits
+        parked, holding its blocks, until the last window is scattered.
+        """
+        name = "unpack_stream" if unpack else "stream"
+        stream = getattr(self._in_place_tls, name, None)
         if stream is None:
-            stream = torch.cuda.Stream(device=self._codec.device)
-            self._in_place_tls.stream = stream
+            priority = envs.OFFLOAD_UNPACK_STREAM_PRIORITY if unpack else 0
+            stream = torch.cuda.Stream(device=self._codec.device, priority=priority)
+            setattr(self._in_place_tls, name, stream)
         return stream
 
     def _copy_in_place(
@@ -887,7 +893,7 @@ class MooncakeStoreOffloadConnector(DenseOffloadConnector):
         """
         codec = self._codec
         chunk = self.chunk_size
-        stream = self._in_place_stream()
+        stream = self._in_place_stream(unpack=not pack)
         if producer_event is not None:
             stream.wait_event(producer_event)
         # Only the window's part of the block table, with token offsets from

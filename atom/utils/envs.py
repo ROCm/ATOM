@@ -1071,6 +1071,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Experimental: run the staging pack and copy legs on one stream.
     "OFFLOAD_SINGLE_STREAM": lambda: _flag_env("OFFLOAD_SINGLE_STREAM"),
+    # Priority of the stream a Mooncake Store load unpacks into the KV blocks
+    # on (torch.cuda.Stream priority: lower runs first, -1 is high). 0, the
+    # default, is the compute streams' own; a load then waits behind prefill
+    # kernels for CUs to scatter its window.
+    "OFFLOAD_UNPACK_STREAM_PRIORITY": lambda: _int_env(
+        "OFFLOAD_UNPACK_STREAM_PRIORITY", 0
+    ),
     # GPU staging buffer size in LMCache chunks, and an upper bound in bytes.
     # Unset derives the size from the KV geometry.
     "OFFLOAD_GPU_STAGING_CHUNKS": lambda: _optional_int_env(

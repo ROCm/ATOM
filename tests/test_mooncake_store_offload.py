@@ -3521,7 +3521,7 @@ def make_in_place_worker(cluster, monkeypatch):
         worker._rank, worker._world = 0, 1
         worker._chunk_bytes = PAGE_CHUNK_BYTES
         worker._in_place = True
-        monkeypatch.setattr(worker, "_in_place_stream", lambda: stream)
+        monkeypatch.setattr(worker, "_in_place_stream", lambda *, unpack=False: stream)
         built.append(worker)
         return worker, gpu, codec, stream
 
