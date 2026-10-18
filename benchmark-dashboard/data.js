@@ -1,64 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792334067671,
+  "lastUpdate": 1792334460788,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Lingpeng Jin",
-            "username": "valarLip",
-            "email": "103567126+valarLip@users.noreply.github.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "c74e8ce72aa686a09ac549a2a483c292eca0db71",
-          "message": "perf(minimax-m3): route wide index rows to aiter's selector (#2227)\n\n* perf(minimax-m3): route wide index rows to aiter's selector\n\nThe lightning indexer's per-row top-k has a second implementation in aiter\n(`topk_per_row_small_k`), which narrows in one pass where the Triton kernel\nfolds `tl.topk` over `ceil(max_block / BLOCK_SIZE_K)` tiles. It pulls ahead as\nthe row widens -- 7us against 36us at a 1M context -- but it only selects,\nwhere the Triton kernel also emits the page-16 sparse block table, and it wants\neach row's causal bound as a tensor where the Triton one holds it in registers.\n\nBoth costs are paid once, not per layer:\n\n- The bound is layer-invariant, so the attention metadata builds it and\n  publishes `MiniMaxM3SparseMetadata.n_valid_column_per_row`, the way\n  `deepseek_v4_attn.csa_n_committed_per_token` does for the sibling indexer.\n  Decode fills a persistent buffer, since a captured replay reads the pointer\n  baked in at capture. The plugins, whose metadata is framework code with no\n  field to publish into, hoist onto their per-forward batch object instead.\n- Emission becomes `_emit_sparse_block_table_kernel`, which calls the same\n  compaction helper as the fused path so the two cannot drift.\n\nWhich selector serves is decided by row width, measured (device us, MI355X,\ntopk=16, rows 1..512, triton/aiter):\n\n    width        64     512    1024    2048    8192\n    emit=True   0.6x    0.7x    1.0x    1.4x    3.7x\n    emit=False  0.8x    ~1.0x   1.25x   2.0x    4.8x\n\nso aiter from 2048 columns when the call emits and 1024 when it does not.\nBelow that the fused kernel is cheaper and nothing changes. aiter's support\npredicate costs 11.4us of Python against 7-10us of device time, so its answer\nis memoized per shape.\n\naiter is an optional import: without it, or under the thresholds, the Triton\nselector runs exactly as before.\n\n* fix(minimax-m3): bound the row-bounds buffer, and stop building it on one CU\n\nTwo things were wrong with the same small launch.\n\n`build_n_valid_column_per_row` slices the caller's persistent buffer to\n`rows`, and a slice shorter than that is simply shorter -- while the kernel\nstill writes `rows` of them off the raw pointer. Measured: asking 8 rows of a\n7-row buffer returned 7 and wrote 8, with nothing said. The check is on\n`numel()`, so it is a host-side compare and no sync.\n\nThe grid was `(batch,)` with the query axis folded into a loop, so a single\nlong request was served by one compute unit. The same 32768 tokens cost 23.4us\nas one request and 10.6us split over four -- the gap was parallelism, not\nwork. Query tiles become the grid's second dimension, which puts one request\nat 11.5us and leaves every other shape on the ~11.5us launch floor. The tile\nwidth is named now, since the grid and `BLOCK_Q` have to be the same number.\n\n* perf(minimax-m3): launch the standalone emission at one warp\n\nThe compaction's widest tensor is `topk x pages_per_block` -- 16x8 -- so\ntriton's default four warps is more lanes than there is work, and the row\nhelper's cumsum crosses warp boundaries to reach them. The fused kernel\nalready arrives at one warp from the other side (`PREFILL_TOPK_NUM_WARPS`);\n`DECODE_TOPK_NUM_WARPS` is 8 for the scoring this kernel does not do.\n\nDevice time, `aiter.test_common.perftest`, `sparse_bt`/`sparse_ctx` bit-equal\nat every shape measured:\n\n    prefill 4x2048   8.03us -> 4.66us\n    prefill 1x4096   5.22us -> 3.48us\n    decode bs=256    2.63us -> 2.50us\n\nThat is the floor. A bare `fill_` over exactly the bytes this kernel writes\ncosts 4.01us at 256 rows and 4.44us at 8192, against its 2.50 and 4.66 -- the\ncompaction is already down at the cost of touching the memory once.\n\nThe docstring's `26us a call` was wall time, and is corrected: the device half\nis 2.5-4.7us and the other ~14us is the python launch, which a captured replay\ndoes not pay. Re-measured through `_launch_select` at decode bs=256,\ntriton/aiter with emission on, that leaves `_AITER_MIN_WIDTH_WITH_EMIT` room\nto come down -- 0.98x at 1024 columns, 1.26x at 1536, 1.60x at 2048 -- but\nmoving it changes what ships rather than what it costs, so it stays at 2048.\n\n* fix(minimax-m3): take the index head count's world size from the caller\n\nCI's ruff flags the blind `except Exception` this added, and narrowing it\nturns up what the catch was hiding. The fallback inside it was `tp_size = 1`,\nso an sglang whose dp-attention module is not importable did not degrade --\nit returned the full 8 heads on a tp8 rank. The row bounds then come out 8x\ntoo long, aiter's predicate declines them for the length mismatch, and the\nTriton selector serves every call at full correctness. The dispatch this PR\nexists for would have been inert, and nothing would have said so.\n\nSo the caller passes its own world size, and only the import stays guarded.\nThe call itself is safe to let raise here: this runs inside a forward, where\nthe attention group is up. `_local_kv_heads` answers the same question while\nthe memory pools are still being sized, which is why that one keeps its\nbroader catch.\n\n* style(minimax-m3): let ruff rewrite a constant-name setattr\n\nUntouched by hand -- the repo's PostToolUse `ruff --fix` applied B010 while\nthe file was open for the change above. Kept in its own commit so that one\nstays the size of its argument.",
-          "timestamp": "2026-09-14T15:20:12Z",
-          "url": "https://github.com/ROCm/ATOM/commit/c74e8ce72aa686a09ac549a2a483c292eca0db71"
-        },
-        "date": 1789404114994,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 throughput (tok/s)",
-            "value": 1627.04,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34868332192 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609141448"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 Total Tput (tok/s)",
-            "value": 14625.24,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34868332192 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609141448"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TTFT (ms)",
-            "value": 557.38,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34868332192 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609141448"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TPOT (ms)",
-            "value": 18.55,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/34868332192 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:nightly_202609141448"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 _gpu_count",
-            "value": 4,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 _tp",
-            "value": 4,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -278952,6 +278896,34 @@ window.BENCHMARK_DATA = {
             "value": 125.9934,
             "unit": "point",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39126771292 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP8-DCP8-DSPARK4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9577%2C%22cache_hit_tokens%22%3A866192384%2C%22cache_total_tokens%22%3A904462593%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A7607%2C%22concurrency%22%3A72%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp8_dcp8_dspark4%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3628.6558%2C%22e2el_ms%22%3A27182.5868%2C%22e2el_p90%22%3A55507.6114%2C%22e2el_p99%22%3A167531.2107%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A249255.5408%2C%22input_tput_per_gpu%22%3A15578.4713%2C%22interactivity%22%3A10.8213%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A7606%2C%22interactivity_p90_itl%22%3A40.0729%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A19.9354%2C%22itl_p90%22%3A24.9545%2C%22median_e2el_ms%22%3A17378.9752%2C%22median_itl_ms%22%3A20.4167%2C%22median_tpot_ms%22%3A20.4167%2C%22median_ttft_ms%22%3A5114.3591%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2015.8949%2C%22output_tput_per_gpu%22%3A125.9934%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A1.9356%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p1d-isl1048576-osl1024-conc72-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39126771292%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-4%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A251271.4357%2C%22tpot_ms%22%3A19.9354%2C%22tpot_p90%22%3A24.9545%2C%22tpot_p99%22%3A27.9767%2C%22tput_per_gpu%22%3A15704.4647%2C%22ttft_ms%22%3A7967.7753%2C%22ttft_p90%22%3A16930.6017%2C%22ttft_p99%22%3A56905.3646%7D"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "jasen",
+            "username": "Jasen2201",
+            "email": "38908462+Jasen2201@users.noreply.github.com"
+          },
+          "id": "c127b008b2e429bf2334084e57ba1600c04d70b6",
+          "message": "ci(atomesh): sweep-only, re-extract crate sources when the node cache lost files\n\nOn g25 an extracted crate kept its .cargo-ok marker after its Cargo.toml\nwas removed from /tmp, so cargo failed with \"unable to get packages from\nsource\" and never re-extracted it. Drop registry/src and retry once.\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+          "timestamp": "2026-10-18T12:52:05Z",
+          "url": "https://github.com/ROCm/ATOM/commit/c127b008b2e429bf2334084e57ba1600c04d70b6"
+        },
+        "date": 1792334459804,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "Atomesh::Kimi-K3-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_tp8_dcp8_dspark4 1048576/1024 c=88 perf point",
+            "value": 141.327,
+            "unit": "point",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39126761639 | docker_image=rocm/atom-dev:nightly_202610151507 | precision=MXFP4 | display_topology=1P1D-TP8-DCP8-DSPARK4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9516%2C%22cache_hit_tokens%22%3A887750656%2C%22cache_total_tokens%22%3A932935795%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A8479%2C%22concurrency%22%3A88%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp8_dcp8_dspark4%22%2C%22decode_dcp%22%3A8%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A8%2C%22decode_workers%22%3A1%2C%22disaggregated%22%3Atrue%2C%22duration%22%3A3629.5788%2C%22e2el_ms%22%3A36613.7435%2C%22e2el_p90%22%3A66312.6105%2C%22e2el_p99%22%3A180023.3453%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202610151507%22%2C%22input_tput%22%3A257036.9281%2C%22input_tput_per_gpu%22%3A16064.808%2C%22interactivity%22%3A6.3082%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A8477%2C%22interactivity_p90_itl%22%3A38.0407%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A21.4051%2C%22itl_p90%22%3A26.2876%2C%22median_e2el_ms%22%3A27463.7144%2C%22median_itl_ms%22%3A22.2583%2C%22median_tpot_ms%22%3A22.2583%2C%22median_ttft_ms%22%3A13322.015%2C%22model%22%3A%22Kimi-K3-MXFP4%22%2C%22num_decode_gpu%22%3A8%2C%22num_prefill_gpu%22%3A8%2C%22num_speculative_tokens%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A2261.2326%2C%22output_tput_per_gpu%22%3A141.327%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A8%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A8%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A2.1575%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-Kimi-K3-MXFP4-1p1d-isl1048576-osl1024-conc88-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F39126761639%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22speculative_method%22%3A%22dspark-4%22%2C%22total_gpu%22%3A16%2C%22total_tput%22%3A259298.1607%2C%22tpot_ms%22%3A21.4051%2C%22tpot_p90%22%3A26.2876%2C%22tpot_p99%22%3A28.1912%2C%22tput_per_gpu%22%3A16206.135%2C%22ttft_ms%22%3A15750.2826%2C%22ttft_p90%22%3A31180.5533%2C%22ttft_p99%22%3A56400.6067%7D"
           }
         ]
       }
