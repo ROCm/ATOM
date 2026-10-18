@@ -1393,6 +1393,25 @@ models:
               OFFLOAD_LOAD_WORKERS: "2"
               ATOM_PP_MAX_INFLIGHT: "16"
 
+        # Test only. The c88-inflight16 cell on the branch that floors demand
+        # checkpoints onto the LMCache chunk grid; the config is unchanged.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-demandgrid
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+              ATOM_PP_MAX_INFLIGHT: "16"
+
         # Test only. The c88 P0 cell with the offload pack and copy streams at
         # high priority, so they stop queueing behind the prefill forward.
         - <<: *kimi_k3_1p1d_pp8_dcp8_p0
