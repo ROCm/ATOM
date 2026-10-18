@@ -37,6 +37,6 @@ c48_append_port_mount() {
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "6b6f73f5f49c96de0bb30dad261c622f43949d8a7cf7c029011d3f4691d0ad57" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "5012ac98ac714a9d28743345250bb587925b6e411b8756eb99f514d9706f26ae" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }

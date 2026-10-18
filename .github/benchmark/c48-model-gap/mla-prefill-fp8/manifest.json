@@ -3,15 +3,15 @@
   "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
   "changes": [
     "With VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8=1 (Prefill only), ROCM_AITER_FA MLA prefill quantizes Q/K/V to FP8 per tensor (dynamic) and runs AITER FlyDSL flydsl_flash_attn_fp8_func for new tokens (causal) and context chunks (cross, LSE); BF16 fallback when unsupported. Same kernel ATOM 6611 uses via ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1",
-    "K/V use two-pass Triton fused_kv_per_tensor_quant without a per-row atomic reduction; Q uses scaled_fp8_quant on at most 256 rows. Backend source is identical to complete unprofiled Slurm 9070."
+    "K/V use two-pass Triton fused_kv_per_tensor_quant without a per-row atomic reduction. NK/NV/WORKERS are runtime arguments; PARTS/BLOCK/SINGLE_PASS remain compile-time variants. Backend source is identical to complete unprofiled Slurm 9091."
   ],
   "cases": [
     "V-QD"
   ],
   "source_reference": {
-    "harness_sha": "939f0f80dacd2e1c6126cc9f7919dc5caac25584",
-    "run_id": 39127851669,
-    "slurm_id": 9070,
+    "harness_sha": "77c6c4d178f3244f9fe96490ad4585522252588c",
+    "run_id": 39140308384,
+    "slurm_id": 9091,
     "composition": "CPUFA manager d3e3dd53 is retained; the FQ reference used CPUREF2 manager 76e038dc. Combined performance is untested."
   },
   "files": [
@@ -19,7 +19,7 @@
       "relative_path": "v1/attention/backends/mla/prefill/aiter_flash_attn.py",
       "mount_source": "aiter_flash_attn.py",
       "base_sha256": "4d0e68067d369f6ffd0902d6c046ecdf8bb698a7c31b3a01783f9f84c2d0c44f",
-      "patched_sha256": "6b6f73f5f49c96de0bb30dad261c622f43949d8a7cf7c029011d3f4691d0ad57"
+      "patched_sha256": "5012ac98ac714a9d28743345250bb587925b6e411b8756eb99f514d9706f26ae"
     }
   ]
 }
