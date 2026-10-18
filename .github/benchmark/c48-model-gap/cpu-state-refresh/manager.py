@@ -403,8 +403,8 @@ class SimpleCPUOffloadScheduler:
 
         Eager stores skip blocks that are already cached on CPU, so without
         this a prefix that keeps hitting on GPU ages out of CPU by its first
-        store time. Older Mamba checkpoints also remain useful when a later
-        request branches before the newest checkpoint.
+        store time. Older Mamba checkpoints and partial attention tails remain
+        useful when a later request branches before a newer cached boundary.
         """
         blocks: list[KVCacheBlock] = []
         seen: set[int] = set()
@@ -414,10 +414,7 @@ class SimpleCPUOffloadScheduler:
             ):
                 continue
             group_size = self.group_block_sizes[g]
-            if (
-                isinstance(group.kv_cache_spec, MambaSpec)
-                and self.cpu_coordinator.enable_partial_hash_hits
-            ):
+            if self.cpu_coordinator.enable_partial_hash_hits:
                 group_size = self.hash_block_size
             hashes = resolve_block_hashes(
                 request.block_hashes, self.hash_block_size, group_size
