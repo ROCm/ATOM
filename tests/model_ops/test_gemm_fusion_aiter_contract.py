@@ -98,6 +98,12 @@ class _FakeBackend:
     def peer_ptr(self, comm, local, peer):
         return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
+    def va_info(self, comm):
+        # aiter a2dee878: (slot_base_va, per_rank_size, granule) of this rank's slot, where the
+        # first-fit allocator starts. 2 MiB-aligned base, 4 GiB slot, 4 MiB granule: values the
+        # abs-aligned policies can plan against without any real comm.
+        return (0x7000_0000_0000, 4 << 30, 4 << 20)
+
     def set_zero_mode(self, mode):
         self.zero_mode = mode  # aiter D14: selects how windows are zeroed; nothing native here
 
