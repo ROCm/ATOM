@@ -916,6 +916,9 @@ models:
             benchmark:
               <<: *agentic_1m_aiperf
               aiperf_commit: 754356e9a39acc6cc6afb242d123bb57c3fb6f75
+              # Sweep-only: a K3 weight load from NFS took 68 min when many
+              # cells started together (10-16 C72), past the 4500 s default.
+              wait_server_timeout: 9000
             run_eval: false
           name: kimi-k3-mxfp4-1p1d-tp8-dspark7-agentic-1m-c1
           concurrency: [1]

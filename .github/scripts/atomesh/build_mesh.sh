@@ -33,6 +33,14 @@ if ! cargo --version >/dev/null 2>&1; then
   export RUSTUP_HOME="${target_dir}/rustup-home"
   export PATH="${CARGO_HOME}/bin:${PATH}"
   export RUSTUP_TOOLCHAIN="${ATOMESH_MESH_RUST_TOOLCHAIN:-1.94.0}"
+  # A job cancelled mid-install leaves the toolchain without its manifest;
+  # rustup-init then treats it as installed and cargo fails with "missing
+  # manifest in toolchain". Drop the remnant so rustup-init reinstalls it.
+  toolchain_dir="${RUSTUP_HOME}/toolchains/${RUSTUP_TOOLCHAIN}-$(uname -m)-unknown-linux-gnu"
+  if [[ -d "${toolchain_dir}" && ! -f "${toolchain_dir}/lib/rustlib/multirust-channel-manifest.toml" ]]; then
+    echo "[build] removing interrupted Rust toolchain install ${toolchain_dir}" >&2
+    rm -rf "${toolchain_dir}"
+  fi
   if ! cargo --version >/dev/null 2>&1; then
     rust_arch="$(uname -m)"
     case "${rust_arch}" in
