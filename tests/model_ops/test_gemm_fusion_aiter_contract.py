@@ -98,6 +98,11 @@ class _FakeBackend:
     def peer_ptr(self, comm, local, peer):
         return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
+    def win_free(self, comm, local):
+        # aiter c05f49b6: MORI's teardown contract, WindowDeregister -> ccoMemFree(local) before
+        # ccoCommDestroy. Recorded so a test can assert the order.
+        self.calls.append(("win_free", local))
+
     def win_view(self, comm, arena_win, offset):
         # aiter 7648ac09 (arena policies): a VIEW struct over one registered arena window at
         # `offset`. A distinct fake handle per view; nothing native is touched.
@@ -139,10 +144,10 @@ class _FakeBackend:
         pass
 
     def win_deregister(self, comm, win):
-        pass
+        self.calls.append(("win_deregister", win))
 
     def comm_destroy(self, comm):
-        pass
+        self.calls.append("comm_destroy")
 
 
 def _fake_torch(monkeypatch):
@@ -538,3 +543,64 @@ def test_check_no_window_alias_drives_the_real_aiter_helper_on_real_windows(real
             hooks.check_no_window_alias([("impl._index_q", _Tens(base - 16, 64))])  # straddles the start
     finally:
         hooks.reset_for_tests()
+
+def _built_resources(real_gf, backend, **kw):
+    return real_gf.FusionResources(rank=0, world=4, group=None, dist=_FakeDist(), backend=backend,
+                                   device=0, caps=frozenset({"mori_cco"}), profile=PROFILE_NAME, **kw)
+
+
+def test_release_frees_every_window_after_its_deregister_and_before_comm_destroy(real_gf, monkeypatch):
+    """aiter c05f49b6 (MORI's teardown contract): WindowDeregister -> ccoMemFree(local) for EVERY
+    registered window, all before ccoCommDestroy. Drives the REAL FusionResources.release() with
+    the strict fake backend and reads the call order back; this is also the behaviour Evidence's
+    MemFree-before-CommDestroy A/B exercises on the GPU."""
+    monkeypatch.delenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", raising=False)  # default ON
+    be = _FakeBackend()
+    res = _built_resources(real_gf, be)
+    res.ensure("small", [real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")])
+    res.ensure("large", [real_gf.WindowReq("o2/R", 40 << 20, "p2p_window")])
+    registered = [w for w in res._regs]
+    assert len(registered) >= 2
+    res.release()
+    calls = be.calls
+    dest = calls.index("comm_destroy")
+    assert dest == len(calls) - 1  # comm_destroy is last
+    for w in registered:
+        d = calls.index(("win_deregister", w.handle))
+        f = calls.index(("win_free", w.local))
+        assert d < f < dest, (w.name, d, f, dest)  # deregister, then free, then destroy
+    assert sum(1 for c in calls if isinstance(c, tuple) and c[0] == "win_free") == len(registered)  # once each
+    res.release()  # idempotent: no second free, no second destroy
+    assert be.calls == calls
+
+
+def test_release_skips_win_free_when_the_ab_flag_turns_it_off(real_gf, monkeypatch):
+    monkeypatch.setenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", "0")  # the old behaviour (A/B arm)
+    be = _FakeBackend()
+    res = _built_resources(real_gf, be)
+    res.ensure("small", [real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")])
+    res.release()
+    assert not any(isinstance(c, tuple) and c[0] == "win_free" for c in be.calls)
+    assert "comm_destroy" in be.calls
+
+
+def test_atom_shutdown_releases_the_comm_and_is_what_the_old_harnesses_never_called(real_gf, monkeypatch):
+    """Evidence observed that the old uniform-gate / formal harnesses never called
+    hooks.shutdown()/release, so no native comm destroy ran at exit. ATOM's runner calls
+    gemm_fusion.shutdown() from ModelRunner.exit; this shows shutdown() reaches the real release()
+    and therefore the free-before-destroy sequence, and that it does so once."""
+    from atom.model_ops.gemm_fusion import hooks, stages
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    monkeypatch.delenv("AITER_GEMM_FUSION_FREE_BEFORE_DESTROY", raising=False)
+    monkeypatch.setattr(stages, "_aiter_override", real_gf)
+    be = _FakeBackend()
+    inner = _built_resources(real_gf, be)
+    inner.ensure("small", [real_gf.WindowReq("o/rx", 4 << 20, "p2p_window")])
+    w = FusionResourcesWrapper(None, 4, rank=0, inner=inner, reduce_min=lambda v: list(v), arch="gfx950", cu=256)
+    hooks.reset_for_tests(w)
+    hooks.shutdown()
+    assert be.calls.count("comm_destroy") == 1 and any(c[0] == "win_free" for c in be.calls if isinstance(c, tuple))
+    assert hooks.resources() is None
+    hooks.shutdown()  # idempotent
+    assert be.calls.count("comm_destroy") == 1
