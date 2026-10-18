@@ -1,15 +1,66 @@
 # shellcheck shell=bash
 # Isolated C48 model-setting experiment; reuse topology/lifecycle only.
+
+# Prebuilt LMCache ROCm wheels target torch 2.11 and fail to load cuda_ops on
+# this image's torch 2.13, so the pinned source is built against the image.
+c48_start_lmcache() {
+  local config="$1" build="/tmp/atomesh-c48-lmcache-build"
+  eval "$(python3 - "${config}" <<'PY'
+import json
+import shlex
+import sys
+
+c = json.load(open(sys.argv[1]))["lmcache"]
+env = {
+    "C48_LMCACHE_BASE_PORT": int(c["port"]), "C48_LMCACHE_BASE_HTTP_PORT": int(c["http_port"]),
+    "C48_LMCACHE_REPO": c["repo"], "C48_LMCACHE_COMMIT": c["commit"],
+    "C48_LMCACHE_VERSION": c["version"], "C48_LMCACHE_ARCH": c["rocm_arch"],
+    "C48_LMCACHE_BUILD_TOOLS": " ".join(c["build_tools"]),
+    "ATOMESH_VLLM_LMCACHE_PACKAGES": " ".join(c["packages"]),
+    "ATOMESH_VLLM_LMCACHE_NATIVE_DEBS": " ".join(c["native_debs"]),
+    "ATOMESH_VLLM_LMCACHE_PATCHES": " ".join(c["patches"]),
+    "ATOMESH_VLLM_LMCACHE_L1_SIZE_GB": c["l1_size_gb"],
+    "ATOMESH_VLLM_LMCACHE_SERVER_ARGS": c["server_args"],
+}
+for key, value in env.items():
+    print(f"export {key}={shlex.quote(str(value))}")
+PY
+)"
+  local -a tools=()
+  read -r -a tools <<< "${C48_LMCACHE_BUILD_TOOLS}"
+  rm -rf "${build}"
+  python3 -m pip install --quiet --no-cache-dir --target "${build}/tools" "${tools[@]}"
+  git init -q "${build}/src"
+  git -C "${build}/src" fetch -q --depth 1 "${C48_LMCACHE_REPO}" "${C48_LMCACHE_COMMIT}"
+  git -C "${build}/src" checkout -q FETCH_HEAD
+  echo "[lmcache] building ${C48_LMCACHE_REPO}@$(git -C "${build}/src" rev-parse HEAD) for ${C48_LMCACHE_ARCH}"
+  (cd "${build}/src" && env PYTHONPATH="${build}/tools" PATH="${build}/tools/bin:${PATH}" \
+    BUILD_WITH_HIP=1 CXX="${ROCM_PATH:-/opt/rocm}/bin/hipcc" PYTORCH_ROCM_ARCH="${C48_LMCACHE_ARCH}" \
+    MAX_JOBS="$(nproc)" SETUPTOOLS_SCM_PRETEND_VERSION="${C48_LMCACHE_VERSION}" \
+    python3 setup.py bdist_wheel --dist-dir "${build}/dist") > "${RUNTIME_LOG_DIR}/lmcache-build.log" 2>&1
+  local -a wheels=("${build}"/dist/*.whl)
+  [[ ${#wheels[@]} -eq 1 && -f "${wheels[0]}" ]] || return 2
+  export ATOMESH_VLLM_LMCACHE_WHEEL="${wheels[0]}"
+  C48_LMCACHE_PORT=$((C48_LMCACHE_BASE_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+  start_lmcache "${C48_LMCACHE_PORT}" $((C48_LMCACHE_BASE_HTTP_PORT + ATOMESH_SERVICE_PORT_OFFSET))
+  env "${lmcache_env[@]}" python3 -c 'import lmcache.cuda_ops'
+}
+
 start_vllm_server() {
   local role="$1" log_name="$2" port="$3"
-  local -a cache_env=()
+  local config="${ATOMESH_SCRIPT_DIR}/../../benchmark/c48-model-gap/${ATOMESH_C48_CASE}.json"
+  local -a cache_env=() lmcache_args=()
   build_server_cache_env "${role}" "${port}" cache_env
+  if [[ "${role}" == "prefill" ]] && python3 -c 'import json, sys; sys.exit("lmcache" not in json.load(open(sys.argv[1])))' "${config}"; then
+    c48_start_lmcache "${config}"
+    lmcache_args=(--lmcache-port "${C48_LMCACHE_PORT}")
+  fi
   start_logged_process server_pid "${RUNTIME_LOG_DIR}/${log_name}.log" \
-    env "${cache_env[@]}" python3 "${ATOMESH_SCRIPT_DIR}/pd_c48_launch.py" \
-    --config "${ATOMESH_SCRIPT_DIR}/../../benchmark/c48-model-gap/${ATOMESH_C48_CASE}.json" \
+    env "${cache_env[@]}" "${lmcache_env[@]}" python3 "${ATOMESH_SCRIPT_DIR}/pd_c48_launch.py" \
+    --config "${config}" \
     --role "${role}" --model "${MODEL_PATH}" --host "${host_ip}" \
     --proxy "${NODE0_ADDR}" --port "${port}" --discovery "${VLLM_DISCOVERY_PORT}" \
-    --output "${RUNTIME_LOG_DIR}/${log_name}.launch.json" --execute
+    --output "${RUNTIME_LOG_DIR}/${log_name}.launch.json" "${lmcache_args[@]}" --execute
 }
 
 run_aiperf_agentic_benchmark() {

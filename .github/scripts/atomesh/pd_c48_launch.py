@@ -18,7 +18,8 @@ def draft_path(model: str) -> Path:
 
 
 def render(config: dict, role: str, model: str, host: str, proxy: str,
-           port: int, discovery: int, trace_dir: str | None = None) -> tuple[list[str], dict[str, str]]:
+           port: int, discovery: int, trace_dir: str | None = None,
+           lmcache_port: int | None = None) -> tuple[list[str], dict[str, str]]:
     args = copy.deepcopy(config["roles"][role]["args"])
     args["speculative-config"]["model"] = str(draft_path(model))
     transfer = args["kv-transfer-config"]
@@ -29,6 +30,10 @@ def render(config: dict, role: str, model: str, host: str, proxy: str,
                 raise ValueError("C48 Kimi-K3 requires explicit MoRIIO read_mode=true")
             connector["kv_connector_extra_config"].update(
                 proxy_ip=proxy, proxy_ping_port=discovery, http_port=port)
+        elif connector["kv_connector"] == "LMCacheMPConnector":
+            if lmcache_port is None:
+                raise ValueError("C48 LMCacheMPConnector requires the sidecar --lmcache-port")
+            connector["kv_connector_extra_config"]["lmcache.mp.port"] = lmcache_port
     args.update(host="0.0.0.0", port=port, **{"worker-cls": "pd_c48_worker.ManifestWorker"})
     if "profiler-config" in args:
         if not trace_dir or role != "prefill":
@@ -66,12 +71,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--discovery", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--lmcache-port", type=int)
     parser.add_argument("--execute", action="store_true")
     options = parser.parse_args()
     config = json.loads(options.config.read_text())
     argv, additions = render(config, options.role, options.model, options.host,
                              options.proxy, options.port, options.discovery,
-                             str(options.output.parent.parent / "traces" / options.role))
+                             str(options.output.parent.parent / "traces" / options.role),
+                             options.lmcache_port)
     additions["C48_DIAG_DIR"] = str(options.output.parent / "model-manifests")
     record = {"config": str(options.config), "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
               "role": options.role, "argv": argv, "environment_overrides": additions,
@@ -86,7 +93,7 @@ def main() -> None:
         from pd_c48_port_patch import verify_port_patch
         record["vllm_file"] = vllm.__file__
         record["versions"] = {}
-        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors"):
+        for name in ("vllm", "torch", "triton", "aiter", "mori", "amd-aiter", "amd_mori", "fastsafetensors", "lmcache"):
             try:
                 record["versions"][name] = importlib.metadata.version(name)
             except importlib.metadata.PackageNotFoundError:

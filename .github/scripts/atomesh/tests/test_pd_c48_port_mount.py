@@ -36,6 +36,7 @@ class PortMountTest(unittest.TestCase):
         self.assertEqual((rc, len(base)), (0, 3))
         self.assertFalse(any(a.endswith(MANAGER) for a in base))
         self.assertEqual(mounts("V-QD-LPT3072"), (0, base))
+        self.assertEqual(mounts("V-QD-LMC"), (0, base))
         for case, fix_dir in CPUREF.items():
             rc, cpuref = mounts(case)
             self.assertEqual(rc, 0)
