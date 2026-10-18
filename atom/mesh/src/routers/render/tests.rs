@@ -3654,3 +3654,53 @@ mod e2_generate_streaming_branches {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 }
+
+#[cfg(test)]
+mod prompt_opened_reasoning {
+    use super::test_support::chat_ctx;
+    use crate::{
+        reasoning_parser::ParserFactory,
+        routers::prepare::{chat_template::ProcessedMessages, response_context::REASONING_OPEN},
+    };
+
+    fn prompted(text: &str) -> bool {
+        let mut ctx = chat_ctx();
+        ctx.processed_messages = Some(ProcessedMessages {
+            text: text.into(),
+            stop_sequences: None,
+        });
+        ctx.starts_in_reasoning()
+    }
+
+    #[test]
+    fn only_a_prompt_ending_in_an_open_block_starts_in_reasoning() {
+        assert!(prompted("<|assistant|><think>\n"));
+        assert!(!prompted("<|assistant|><think></think>"));
+        assert!(!prompted("<|assistant|>"));
+        assert!(!chat_ctx().starts_in_reasoning());
+    }
+
+    /// The output of such a prompt: reasoning, then `</think>`, then the answer.
+    #[test]
+    fn a_primed_parser_splits_an_output_with_no_open_tag() {
+        let factory = ParserFactory::new();
+        let mut parser = factory.create("qwen3").unwrap();
+        let primed = format!("{REASONING_OPEN}17 * 3 = 51</think>51");
+        let whole = parser.detect_and_parse_reasoning(&primed).unwrap();
+        assert_eq!(
+            (whole.reasoning_text.as_str(), whole.normal_text.as_str()),
+            ("17 * 3 = 51", "51")
+        );
+
+        let mut parser = factory.create("qwen3").unwrap();
+        let _ = parser.parse_reasoning_streaming_incremental(REASONING_OPEN);
+        let (mut reasoning, mut normal) = (String::new(), String::new());
+        // `</think>` is one special token, so a delta carries it whole.
+        for delta in ["17 * 3", " = 51", "</think>5", "1"] {
+            let r = parser.parse_reasoning_streaming_incremental(delta).unwrap();
+            reasoning.push_str(&r.reasoning_text);
+            normal.push_str(&r.normal_text);
+        }
+        assert_eq!((reasoning.as_str(), normal.as_str()), ("17 * 3 = 51", "51"));
+    }
+}

@@ -14,11 +14,18 @@ esac
 source_commit="${ATOMESH_MESH_SOURCE_COMMIT:-$(git -C "${source_dir}" rev-parse HEAD)}"
 
 # The checkout is mounted read-only. Cargo may need to create a lockfile.
+# build.rs reads the engine wire protocol from ../model_engine/protocol, so the
+# spec goes to the same place relative to the copy.
 python3 - "${source_dir}" "${build_dir}/source" <<'PY'
+import pathlib
 import shutil
 import sys
 
-shutil.copytree(sys.argv[1], sys.argv[2], ignore=shutil.ignore_patterns("target", ".git"))
+source, copy = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+shutil.copytree(source, copy, ignore=shutil.ignore_patterns("target", ".git"))
+proto = pathlib.Path("model_engine/protocol/engine_v1.proto")
+(copy.parent / proto).parent.mkdir(parents=True)
+shutil.copy2(source.parent / proto, copy.parent / proto)
 PY
 
 target_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"

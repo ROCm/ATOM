@@ -840,6 +840,10 @@ class EngineArgs:
 
         return kwargs
 
-    def create_engine(self, tokenizer=None) -> LLMEngine:
-        """Create and return an LLMEngine instance with the configured parameters."""
-        return LLMEngine(self.model, tokenizer=tokenizer, **self._get_engine_kwargs())
+    def create_engine(self, tokenizer=None, **config_overrides) -> LLMEngine:
+        """Create and return an LLMEngine instance with the configured parameters.
+
+        `config_overrides` are Config fields the CLI does not expose.
+        """
+        kwargs = {**self._get_engine_kwargs(), **config_overrides}
+        return LLMEngine(self.model, tokenizer=tokenizer, **kwargs)

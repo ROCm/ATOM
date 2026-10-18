@@ -312,6 +312,11 @@ class CoreManager:
                 "the engine index space folds PP stages into DP ranks, and the "
                 "two mappings have not been reconciled across nodes."
             )
+        if config.external_engine_client and (multinode or pp_size > 1):
+            raise ValueError(
+                "An external engine client supports neither multi-node data "
+                "parallelism nor pipeline parallelism yet."
+            )
 
         rank_assignments = iter_dp_rank_assignments(config)
         if config.enable_dp_attention:
@@ -444,6 +449,26 @@ class CoreManager:
                     )
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
+
+                if config.external_engine_client:
+                    # The Cores' client is another process (atom/mesh's
+                    # atom_engine): it binds these addresses and serves them.
+                    # This manager only reaps the processes, in close().
+                    self.engine_endpoints = [
+                        {
+                            "dp_rank": info["dp_rank"],
+                            "pid": info["process"].pid,
+                            "input": info["addresses"]["input_address"],
+                            "control": info["addresses"]["control_address"],
+                            "output": info["addresses"]["output_address"],
+                        }
+                        for info in processes_info
+                    ]
+                    self._finalizer = weakref.finalize(self, self.close)
+                    self.async_output_queue = None
+                    self._output_handler_task = None
+                    self._asyncio_mode = False
+                    return
 
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
@@ -1534,6 +1559,10 @@ class DisaggCoreManager(CoreManager):
 
         import torch
 
+        if config.external_engine_client:
+            raise ValueError(
+                "An external engine client does not support rapidserve yet."
+            )
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
             torch.multiprocessing.set_start_method("spawn", force=False)
 

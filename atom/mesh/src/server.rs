@@ -23,6 +23,7 @@ use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
+    atom_engine::AtomEngine,
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -41,7 +42,6 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
-        atom_standalone::AtomStandaloneRuntime,
         comm::{conversations, parse, tokenize},
         ingress::EndpointSpec,
         router_manager::RouterManager,
@@ -354,7 +354,8 @@ pub struct ServerConfig {
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
     pub tls: Option<ServerTlsConfig>,
-    pub atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
+    /// The started ATOM engine, in ATOM standalone mode.
+    pub atom_engine: Option<Arc<AtomEngine>>,
 }
 
 pub fn build_app(
@@ -549,7 +550,7 @@ async fn serve_with_prepare_pool(
         )
         .await?
         .prepare_pool(prepare_pool)
-        .atom_standalone_runtime(config.atom_standalone_runtime.clone())
+        .atom_engine(config.atom_engine.clone())
         .build()
         .map_err(|e| e.to_string())?,
     );

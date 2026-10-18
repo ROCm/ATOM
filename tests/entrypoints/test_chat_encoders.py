@@ -8,7 +8,6 @@ import pathlib
 import pytest
 from jinja2 import TemplateError
 
-from atom.entrypoints.atomesh import atom_standalone_service
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.chat_encoder_adapters import (
     build_message_encoder_adapter,
@@ -201,15 +200,14 @@ class TestChatTemplateSource:
         adapter = build_message_encoder_adapter("x", lambda m, **k: "")
         assert chat_template_source(self.Tok(None), adapter) == ""
 
-    def test_the_startup_callers_use_it(self):
-        """Both entry points asked `getattr(tokenizer, "chat_template", None)`
+    def test_the_startup_caller_uses_it(self):
+        """The entry point asked `getattr(tokenizer, "chat_template", None)`
         directly, which is the shape that answers False for a whole class of
-        model. Neither body is reachable from a unit test."""
-        for module in (api_server, atom_standalone_service):
-            src = pathlib.Path(module.__file__).read_text()
-            assert "template_opens_reasoning_implicitly(" in src
-            assert "chat_template_source(" in src, f"{module.__name__} reads it raw"
-            assert 'getattr(tokenizer, "chat_template", None)' not in src
+        model. Its body is not reachable from a unit test."""
+        src = pathlib.Path(api_server.__file__).read_text()
+        assert "template_opens_reasoning_implicitly(" in src
+        assert "chat_template_source(" in src, "api_server reads it raw"
+        assert 'getattr(tokenizer, "chat_template", None)' not in src
 
 
 class TestResolveReasoningToggle:
