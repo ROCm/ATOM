@@ -2,7 +2,7 @@
 import json
 import math
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from pathlib import Path
 
@@ -54,7 +54,17 @@ class ManifestWorker(Worker):
             return super().initialize_from_config(kv_cache_config)
 
     def annotate_profile(self, scheduler_output):
-        original = super().annotate_profile(scheduler_output)
+        empty_prefill_step = (
+            scheduler_output.total_num_scheduled_tokens == 0
+            and os.environ.get("C48_PREFILL_TIMELINE") == "1"
+            and os.environ.get("C48_DIAG_ROLE") == "prefill"
+        )
+        # Connector-only calls also reach Worker.annotate_profile. Keep their
+        # C48 labels below, but reserve the capture budget for model iterations.
+        original = (
+            nullcontext() if empty_prefill_step
+            else super().annotate_profile(scheduler_output)
+        )
         if (os.environ.get("C48_PREFILL_TIMELINE") != "1"
                 or os.environ["C48_DIAG_ROLE"] != "prefill"
                 or not self.profiler or not self.profiler.should_annotate):

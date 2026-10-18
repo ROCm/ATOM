@@ -15,6 +15,20 @@ class PrefillCapture(Capture):
         super().__init__(args)
         self.endpoints = {"prefill": args.prefill}
 
+    def wait_target(self, child, phase_start, phase_start_unix_ns):
+        path = self.args.timeline / "target-request.json"
+        while child.poll() is None and time.monotonic() < phase_start + 3300:
+            if path.exists():
+                target = json.loads(path.read_text())
+                lo, hi = self.args.target_prompt_range
+                if not (phase_start_unix_ns <= target["unix_ns"] <= time.time_ns()
+                        and lo <= target["prompt_tokens"] <= hi):
+                    raise ValueError("Target marker is stale or outside the planned range")
+                self.event("target_capture_observed", target=target)
+                return time.monotonic(), target
+            time.sleep(0.25)
+        raise RuntimeError("Target request was not observed within the send window")
+
     def run(self, command):
         self.event("workload_start", argv=command)
         windows, errors = [], []
@@ -40,6 +54,9 @@ class PrefillCapture(Capture):
                                     for offset in self.args.offsets
                                 ],
                             }
+                            if self.args.target_prompt_range:
+                                plan["target_prompt_range"] = self.args.target_prompt_range
+                                plan["target_detail_seconds"] = 120
                             self.args.timeline.mkdir(parents=True, exist_ok=True)
                             temporary = self.args.timeline / "windows.tmp"
                             temporary.write_text(json.dumps(plan) + "\n")
@@ -65,6 +82,19 @@ class PrefillCapture(Capture):
                             min(1, max(0, phase_start + offset - time.monotonic()))
                         )
                     windows.extend(self.window(number, child))
+                if self.args.target_prompt_range:
+                    target_start, target = self.wait_target(
+                        child, phase_start, plan["phase_start_unix_ns"]
+                    )
+                    for number, offset in enumerate(
+                        self.args.target_offsets, len(self.args.offsets) + 1
+                    ):
+                        while time.monotonic() < target_start + offset:
+                            if child.poll() is not None:
+                                raise RuntimeError("AIPerf ended before target capture")
+                            time.sleep(min(0.25, max(0, target_start + offset - time.monotonic())))
+                        self.event("target_window_begin", window=number, target=target)
+                        windows.extend(self.window(number, child))
             except (OSError, ValueError, RuntimeError, EOFError, KeyError) as exc:
                 errors.append(repr(exc))
                 self.event("capture_failed", error=repr(exc))
@@ -86,7 +116,10 @@ class PrefillCapture(Capture):
             "traces": windows,
             "complete": not errors
             and rc == 0
-            and len(windows) == self.args.ranks * len(self.args.offsets),
+            and len(windows) == self.args.ranks * (
+                len(self.args.offsets)
+                + (len(self.args.target_offsets) if self.args.target_prompt_range else 0)
+            ),
             "note": "P-only profiler windows and export perturb latency; use the unprofiled control for performance.",
         }
         (self.args.output / "result.json").write_text(
@@ -110,6 +143,8 @@ def main():
     parser.add_argument("--aiperf-log", type=Path, required=True)
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--offsets", type=float, nargs="+", default=[600, 1500, 3000])
+    parser.add_argument("--target-prompt-range", type=int, nargs=2)
+    parser.add_argument("--target-offsets", type=float, nargs=2, default=[0, 25])
     parser.add_argument("--ranks", type=int, default=8)
     parser.add_argument("--phase-timeout", type=float, default=7200)
     parser.add_argument("--finish-timeout", type=float, default=5400)
@@ -122,6 +157,13 @@ def main():
         60 <= x <= 3300 for x in args.offsets
     ):
         parser.error("Offsets must be unique, ordered and within the full send window")
+    if args.target_prompt_range and not (
+        0 < args.target_prompt_range[0] <= args.target_prompt_range[1]
+        and len(args.offsets) == 1
+        and args.target_offsets == sorted(set(args.target_offsets))
+        and all(0 <= offset <= 60 for offset in args.target_offsets)
+    ):
+        parser.error("Target mode requires one general window and two ordered target offsets")
     raise SystemExit(PrefillCapture(args).run(command))
 
 

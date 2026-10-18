@@ -93,6 +93,7 @@ class Timeline:
         self.bytes = 0
         self.dropped = 0
         self.pending = {}
+        self.target_request = None
         atexit.register(self.close)
         self.emit(
             "installed",
@@ -150,7 +151,27 @@ class Timeline:
         detail = phase and any(
             lo <= elapsed <= hi for lo, hi in self.plan["detail_windows"]
         )
+        if self.target_request is not None:
+            target_elapsed = (time.time_ns() - self.target_request["unix_ns"]) / 1e9
+            detail = detail or (phase and 0 <= target_elapsed <= 120)
         return phase, detail
+
+    def observe_target(self, request, phase):
+        bounds = self.plan.get("target_prompt_range") if self.plan else None
+        if (not phase or bounds is None or self.target_request is not None
+                or not bounds[0] <= request.num_prompt_tokens <= bounds[1]):
+            return
+        self.target_request = {
+            "request_id": request.request_id,
+            "prompt_tokens": request.num_prompt_tokens,
+            "arrival_time": request.arrival_time,
+            "unix_ns": time.time_ns(),
+        }
+        temporary = self.directory / "target-request.tmp"
+        temporary.write_text(json.dumps(self.target_request) + "\n")
+        temporary.replace(self.directory / "target-request.json")
+        self.emit("target_observed", target=self.target_request)
+        self.stream.flush()
 
     def pressure(self):
         return {
@@ -256,6 +277,7 @@ class Timeline:
         def observed_add(request, *args, **kwargs):
             result = add(request, *args, **kwargs)
             phase, _ = self.active()
+            self.observe_target(request, phase)
             if phase:
                 self.emit(
                     "request_admitted",
