@@ -37,7 +37,19 @@ def run_qkv_attention(attn, x, x_scale, positions):
     try:
         if faults.active("op_raise", hooks.sp_rank()) is not None:
             raise RuntimeError("gemm_fusion fault seam: op_raise")  # E4 test seam
-        return site.run(x, x_scale, ctx)
+        result = site.run(x, x_scale, ctx)
+        if hooks.alias_check_enabled():
+            # C-S4 (debug assertion, off by default; ATOM_GEMM_FUSION_CHECK_ALIAS=1): after the
+            # large-M consumers ran, nothing returned or stored may alias a shared window.
+            (out, out_scale), _decision = result
+            hooks.check_no_window_alias(
+                [
+                    ("output", out),
+                    ("output_scale", out_scale),
+                    ("impl._index_q", getattr(attn.impl, "_index_q", None)),
+                ]
+            )
+        return result
     except Exception:
         # A host exception on THIS rank is a one-rank event while recover() is
         # collective. It is bounded: peers that do not arrive make this call raise

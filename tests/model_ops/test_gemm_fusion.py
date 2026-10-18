@@ -1458,3 +1458,123 @@ def test_first_bind_runs_no_collective(make_site, monkeypatch):
     hooks._KV = None
     hooks.bind_kv_cache(_kv_layer(1000))  # first bind: nothing prepared, no agreement needed
     assert calls == []
+
+# ------------- C-S1: a failed fused step must not publish KV or return output as valid
+def test_every_forward_path_checks_the_step_before_publishing_kv_ready():
+    """Reviewer C-S1. At each place ModelRunner announces a prefill's KV as ready for transfer
+    (``_record_kv_cache_ready``) the step has ALREADY been verified (``_gemm_fusion_check_step``),
+    and every forward path (normal, PD decode, PD prefill) verifies its step. A GemmFusionPoisonError
+    therefore propagates out of ``forward`` before the connector is told the KV is ready."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py").read_text(encoding="utf-8")
+    body_lines = src.splitlines()
+    checks = [i for i, l in enumerate(body_lines) if l.strip().startswith("self._gemm_fusion_check_step()")]
+    readies = [i for i, l in enumerate(body_lines) if l.strip() == "self._record_kv_cache_ready(batch)"]
+    assert len(readies) == 3 and len(checks) == 4  # normal x2 returns, PD prefill, PD decode (no ready call)
+    for r in readies:  # the nearest preceding check is within 3 lines: verified right before publishing
+        prior = [c for c in checks if c < r]
+        assert prior and r - max(prior) <= 3, f"KV-ready at line {r + 1} not preceded by a step check"
+    # each forward-like method returns only after a check
+    for name in ("def forward(self, batch: ScheduledBatch)", "def prefill_forward(self, batch: ScheduledBatch)"):
+        assert name in src
+
+
+def test_poison_error_in_check_step_is_not_swallowed_by_the_runner_wrapper():
+    """The wrapper must not catch the error: the worker dies, the engine shuts down (no
+    scheduler retry exists), so no request in the batch is answered from a failed step."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py").read_text(encoding="utf-8")
+    start = src.index("def _gemm_fusion_check_step")
+    wrapper = src[start: src.index("@staticmethod", start)]
+    assert "except" not in wrapper and "try:" not in wrapper
+    busy = (Path(__file__).resolve().parents[2] / "atom/model_engine/async_proc.py").read_text(encoding="utf-8")
+    loop = busy[busy.index("def busy_loop"): busy.index("def get_func")]
+    assert "except" not in loop and "try:" not in loop  # a step error ends the worker process
+
+
+# ------------- C-S4: nothing returned or stored by the op may alias a shared window
+class _Span:
+    def __init__(self, ptr, nbytes, shape=None, stride=None, esize=1):
+        self._p, self._n, self._e = ptr, nbytes, esize
+        n = nbytes // esize
+        self.shape = tuple(shape) if shape is not None else (n,)
+        self._stride = tuple(stride) if stride is not None else (1,)
+
+    def data_ptr(self):
+        return self._p
+
+    def element_size(self):
+        return self._e
+
+    def numel(self):
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n
+
+    def stride(self):
+        return self._stride
+
+
+def _res_with_shared(res, *wins):
+    res.inner = SimpleNamespace(
+        poison_local=lambda: 0,
+        _regs=[SimpleNamespace(name=n, local=p, bytes=b, shared=sh) for n, p, b, sh in wins],
+    )
+    return res
+
+
+def test_alias_check_flags_a_tensor_inside_a_shared_window(make_site):
+    make_site(FakeResources())
+    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True), ("S", 0x20000, 0x1000, True))
+    hooks.check_no_window_alias([("output", _Span(0x40000, 0x100)), ("none", None)])  # clear
+    with pytest.raises(site_mod.GemmFusionBindError, match="aliases shared window 'R'"):
+        hooks.check_no_window_alias([("output", _Span(0x10800, 0x100))])  # inside R
+    with pytest.raises(site_mod.GemmFusionBindError, match="impl._index_q"):
+        hooks.check_no_window_alias([("impl._index_q", _Span(0x0FF80, 0x100))])  # straddles R's start
+    # an adjacent tensor that ends exactly at the window start does not alias
+    hooks.check_no_window_alias([("output", _Span(0x0FF00, 0x100))])
+
+
+def test_alias_check_uses_the_strided_bounding_box_not_just_the_base_pointer(make_site):
+    make_site(FakeResources())
+    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x100, True))
+    # base is below R but a strided view reaches into it
+    strided = _Span(0x0FFF0, 0, shape=(4, 4), stride=(8, 1))  # extent = 3*8 + 3*1 + 1 = 28 bytes
+    strided.numel = lambda: 16
+    with pytest.raises(site_mod.GemmFusionBindError):
+        hooks.check_no_window_alias([("view", strided)])
+
+
+def test_alias_check_ignores_unshared_windows_and_is_a_noop_without_any(make_site):
+    make_site(FakeResources())
+    _res_with_shared(hooks.resources(), ("own_R", 0x10000, 0x1000, False))  # per-owner window: not shared
+    hooks.check_no_window_alias([("output", _Span(0x10000, 0x100))])
+    hooks.resources().inner = SimpleNamespace(poison_local=lambda: 0)  # no registry at all
+    hooks.check_no_window_alias([("output", _Span(0x10000, 0x100))])
+
+
+def test_alias_check_prefers_aiters_helper_when_it_exists(make_site):
+    make_site(FakeResources())
+    calls = []
+    res = _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True))
+    res.inner.assert_no_window_alias = lambda ts: calls.append(len(ts))
+    hooks.check_no_window_alias([("output", _Span(0x10800, 0x100))])  # would alias, but aiter decides
+    assert calls == [1]
+
+    def boom(ts):
+        raise AssertionError("aliases R")
+
+    res.inner.assert_no_window_alias = boom
+    with pytest.raises(site_mod.GemmFusionBindError, match="aliases R"):
+        hooks.check_no_window_alias([("output", _Span(0x40000, 0x100))])
+
+
+def test_alias_check_is_opt_in(monkeypatch):
+    monkeypatch.delenv(hooks.ALIAS_CHECK_ENV, raising=False)
+    assert hooks.alias_check_enabled() is False
+    monkeypatch.setenv(hooks.ALIAS_CHECK_ENV, "1")
+    assert hooks.alias_check_enabled() is True

@@ -98,6 +98,12 @@ class _FakeBackend:
     def peer_ptr(self, comm, local, peer):
         return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
+    def set_zero_mode(self, mode):
+        self.zero_mode = mode  # aiter D14: selects how windows are zeroed; nothing native here
+
+    def mem_info(self, device):
+        return (1 << 40, 1 << 40)  # (free, total) bytes: plenty, so no accounting path trips
+
     def zero(self, device, local, nbytes):
         pass
 

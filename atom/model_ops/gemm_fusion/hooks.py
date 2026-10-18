@@ -117,6 +117,72 @@ def register_plan(plan) -> None:
     _PLANS[owner] = plan
 
 
+# --------------------------------------------------- C-S4: shared-window aliasing check
+ALIAS_CHECK_ENV = "ATOM_GEMM_FUSION_CHECK_ALIAS"
+
+
+def alias_check_enabled() -> bool:
+    return os.environ.get(ALIAS_CHECK_ENV) == "1"
+
+
+def shared_window_ranges():
+    """``[(name, start, end)]`` of every registered SHARED window (the S/R/C windows that
+    several large plans reuse under the ``shared_large`` policy), read from aiter's registry.
+    Empty when the policy is not shared_large (nothing is shared, nothing can alias)."""
+    inner = getattr(_RES, "inner", None)
+    out = []
+    for w in getattr(inner, "_regs", None) or ():
+        if getattr(w, "shared", False):
+            start = int(w.local)
+            out.append((f"{w.name}", start, start + int(w.bytes)))
+    return out
+
+
+def _tensor_span(t):
+    """Address span ``[lo, hi)`` a tensor can touch (conservative bounding box of a strided view)."""
+    lo = int(t.data_ptr())
+    esz = int(t.element_size())
+    if t.numel() == 0:
+        return lo, lo
+    extent = 1 + sum((int(n) - 1) * abs(int(s)) for n, s in zip(t.shape, t.stride()))
+    return lo, lo + extent * esz
+
+
+def check_no_window_alias(named_tensors) -> None:
+    """Reviewer condition C-S4: after the large-M consumers have run INSIDE the op, no tensor the
+    op returns, and none it leaves stored on ``attn.impl`` (e.g. ``_index_q``), may lie inside a
+    shared window. Such a tensor would be silently overwritten by the next large launch of ANY
+    plan on this rank (every large plan's ``recv_view`` aliases the same R window under
+    ``shared_large``).
+
+    ``named_tensors``: iterable of ``(label, tensor-or-None)``. Pure host address arithmetic: no
+    collective, no sync. It is deterministic in the (uniform) code path, so every rank that
+    reaches it reaches the same verdict. Prefers aiter's own assertion helper when the installed
+    aiter provides one; otherwise uses the range check above. Raises ``GemmFusionBindError``.
+    """
+    from .site import GemmFusionBindError
+
+    items = [(n, t) for n, t in named_tensors if t is not None and hasattr(t, "data_ptr")]
+    helper = getattr(getattr(_RES, "inner", None), "assert_no_window_alias", None)
+    if helper is not None:  # aiter's helper (C-S4), when present, is authoritative
+        try:
+            helper([t for _, t in items])
+        except Exception as e:  # noqa: BLE001 - re-raised as our bind error with the label set
+            raise GemmFusionBindError(f"gemm_fusion: tensor aliases a shared window: {e}") from e
+        return
+    windows = shared_window_ranges()
+    if not windows:
+        return
+    for label, t in items:
+        lo, hi = _tensor_span(t)
+        for wname, ws, we in windows:
+            if lo < we and ws < hi:
+                raise GemmFusionBindError(
+                    f"gemm_fusion: {label} [{lo:#x},{hi:#x}) aliases shared window {wname!r} "
+                    f"[{ws:#x},{we:#x}): it would be overwritten by the next large launch"
+                )
+
+
 def record_decision(d) -> None:
     """Log a decision and fold the rank-uniform part into the step digest.
 

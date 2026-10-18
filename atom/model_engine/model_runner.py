@@ -3591,8 +3591,10 @@ class ModelRunner:
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
-            self._record_kv_cache_ready(batch)
+            # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
+            # ready. A step that fails check_step must not publish its KV.
             self._gemm_fusion_check_step()
+            self._record_kv_cache_ready(batch)
             return ScheduledBatchOutput(
                 req_ids=list(batch.req_ids),
                 token_ids=[],
@@ -3614,8 +3616,10 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
-        self._record_kv_cache_ready(batch)
+        # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
+        # ready. A step that fails check_step must not publish its KV.
         self._gemm_fusion_check_step()
+        self._record_kv_cache_ready(batch)
         return fwd_output
 
     def _gemm_fusion_check_step(self) -> None:
@@ -4728,6 +4732,7 @@ class RapidServeModelRunner(ModelRunner):
 
         self._record_forward_vars_event()
         reset_forward_context()
+        self._gemm_fusion_check_step()  # C-S1: a failed step must not return output as valid
         return fwd_output
 
     # ------------------------------------------------------------------
@@ -5074,6 +5079,8 @@ class RapidServeModelRunner(ModelRunner):
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
+        # C-S1: verify the step before announcing this prefill's KV as ready for transfer.
+        self._gemm_fusion_check_step()
         self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu
