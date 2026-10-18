@@ -15,7 +15,9 @@ CPUREF = {
     "V-QD-CPUREF2": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-LPT6144": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-FP8ATTN": "cpu-lru-refresh-v2",
 }
+FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 
 
 def mounts(case, root=REPO):
@@ -40,6 +42,20 @@ class PortMountTest(unittest.TestCase):
             self.assertEqual(cpuref[:3], base)
             self.assertTrue(cpuref[3].endswith(MANAGER))
             self.assertIn(f"/c48-model-gap/{fix_dir}/manager.py,", cpuref[3])
+            fp8 = case.endswith("-FP8ATTN")
+            self.assertEqual(len(cpuref), 5 if fp8 else 4)
+            if fp8:
+                self.assertTrue(cpuref[4].endswith(FP8ATTN))
+                self.assertIn("/c48-model-gap/mla-prefill-fp8/", cpuref[4])
+
+    def test_fp8attn_rejects_changed_overlay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            gap = Path(temp) / ".github/benchmark/c48-model-gap"
+            shutil.copytree(REPO / ".github/benchmark/c48-model-gap", gap)
+            with open(gap / "mla-prefill-fp8/aiter_flash_attn.py", "a") as f:
+                f.write("\n")
+            self.assertEqual(mounts("V-QD-CPUREF2", temp)[0], 0)
+            self.assertEqual(mounts("V-QD-CPUREF2-FP8ATTN", temp)[0], 2)
 
     def test_cpuref_rejects_changed_manager(self):
         for case, fix_dir in CPUREF.items():

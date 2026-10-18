@@ -7,7 +7,8 @@
   "cases": [
     "V-QD-CPUREF2",
     "V-QD-CPUREF2-LPT3072",
-    "V-QD-CPUREF2-LPT6144"
+    "V-QD-CPUREF2-LPT6144",
+    "V-QD-CPUREF2-FP8ATTN"
   ],
   "files": [
     {

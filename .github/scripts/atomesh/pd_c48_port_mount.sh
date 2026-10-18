@@ -30,7 +30,7 @@ c48_append_port_mount() {
     V-QD-CPUREF)
       c48_fix_dir=cpu-lru-refresh
       c48_fix_sha=7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea ;;
-    V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144)
+    V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144|V-QD-CPUREF2-FP8ATTN)
       c48_fix_dir=cpu-lru-refresh-v2
       c48_fix_sha=76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c ;;
     *) return 0 ;;
@@ -40,5 +40,13 @@ c48_append_port_mount() {
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "${c48_fix_sha}" ]] || return 2
+  docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
+  [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == V-QD-CPUREF2-FP8ATTN ]] || return 0
+  # Inert unless VLLM_ROCM_MLA_PREFILL_FLYDSL_FP8=1, which only the Prefill role sets.
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/mla-prefill-fp8/aiter_flash_attn.py"
+  c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py"
+  [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
+  c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
+  [[ "${c48_fix_digest%% *}" == "621739f0164c3ceba1790e7977f2d5362658b0969733269833d65b44fcf02a36" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }
