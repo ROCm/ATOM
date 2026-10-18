@@ -98,6 +98,21 @@ class _FakeBackend:
     def peer_ptr(self, comm, local, peer):
         return local + 0x1000 * (peer + 1)  # distinct fake peer address, not dereferenced
 
+    def win_view(self, comm, arena_win, offset):
+        # aiter 7648ac09 (arena policies): a VIEW struct over one registered arena window at
+        # `offset`. A distinct fake handle per view; nothing native is touched.
+        self._n += 1
+        self.calls.append(("win_view", offset))
+        return 5000 + self._n
+
+    def win_view_free(self, comm, view):
+        self.calls.append(("win_view_free", view))
+
+    def win_info(self, comm, win):
+        # (local_va, bytes, granule)-shaped triple of a registered window; aiter's Python layer
+        # does not call it, so only the shape matters here.
+        return (0x7000_0000_0000, 4 << 20, 4 << 20)
+
     def va_info(self, comm):
         # aiter a2dee878: (slot_base_va, per_rank_size, granule) of this rank's slot, where the
         # first-fit allocator starts. 2 MiB-aligned base, 4 GiB slot, 4 MiB granule: values the
