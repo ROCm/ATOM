@@ -340,6 +340,7 @@ echo "cell=${ATOMESH_CELL_ID}"
 echo "model=${MODEL_NAME}"
 echo "topology=${DISPLAY_TOPOLOGY}"
 echo "nodes=${NODE_LIST}"
+echo "excluded_nodes=${ATOMESH_SLURM_EXCLUDE_NODES:-}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
@@ -393,6 +394,28 @@ if ! command -v sbatch >/dev/null 2>&1; then
     fi
   done
   exit 127
+fi
+
+SLURM_EXCLUDE_ARGS=()
+if [[ -n "${ATOMESH_SLURM_EXCLUDE_NODES:-}" ]]; then
+  # This experiment still requests an automatic allocation, with only a
+  # confirmed occupied host removed. Do not turn a candidate pool into -w.
+  if [[ "${SLURM_SUBMIT_RUNNER}" != atomesh-cicd || -n "${NODE_LIST}" ||
+    ! "${ATOMESH_SLURM_EXCLUDE_NODES}" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*(,[a-zA-Z0-9][a-zA-Z0-9.-]*)*$ ]]; then
+    echo "ERROR: exclusions require automatic atomesh-cicd nodes and literal host names" >&2
+    exit 2
+  fi
+  SBATCH_HELP_RC=0
+  SBATCH_HELP="$(run_slurm_query sbatch --help 2>&1)" || SBATCH_HELP_RC=$?
+  printf '%s\n' "${SBATCH_HELP}" > "${RESULT_DIR}/sbatch-help.txt"
+  # Some Spur clients return 1 for help. A timeout/transport failure must not
+  # be mistaken for support, even if it includes part of the help text.
+  if [[ "${SBATCH_HELP_RC}" -gt 1 ||
+    ! "${SBATCH_HELP}" =~ (^|[[:space:],])--exclude([=[:space:]]|$) ]]; then
+    echo "ERROR: installed sbatch does not confirm --exclude support (rc=${SBATCH_HELP_RC})" >&2
+    exit 2
+  fi
+  SLURM_EXCLUDE_ARGS=(--exclude "${ATOMESH_SLURM_EXCLUDE_NODES}")
 fi
 
 stream_spur_shared_logs_once() {
@@ -527,6 +550,7 @@ else
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
   fi
+  SBATCH_CMD+=("${SLURM_EXCLUDE_ARGS[@]}")
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"
     --error "${SLURM_ERROR}"

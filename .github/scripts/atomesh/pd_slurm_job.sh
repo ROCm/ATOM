@@ -5,6 +5,20 @@
 
 set -euo pipefail
 
+if [[ -n "${ATOMESH_SLURM_EXCLUDE_NODES:-}" ]]; then
+  # Check both the batch host and every --spur-worker before starting Docker.
+  # Keep the exclusion observable even if the scheduler ignores its option.
+  PD_CURRENT_NODE="$(hostname -s)"
+  IFS=',' read -r -a PD_EXCLUDED_NODES <<< "${ATOMESH_SLURM_EXCLUDE_NODES}"
+  for PD_EXCLUDED_NODE in "${PD_EXCLUDED_NODES[@]}"; do
+    if [[ "${PD_CURRENT_NODE}" == "${PD_EXCLUDED_NODE%%.*}" ]]; then
+      echo "ERROR: scheduler allocated excluded node ${PD_CURRENT_NODE}" >&2
+      exit 2
+    fi
+  done
+  echo "[pd.launch] node=${PD_CURRENT_NODE} exclusion_check=passed excluded=${ATOMESH_SLURM_EXCLUDE_NODES}"
+fi
+
 if [[ -n "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" ]]; then
   PD_LAUNCH_EVIDENCE_ROLE=batch
   [[ "${1:-}" != --spur-worker ]] || PD_LAUNCH_EVIDENCE_ROLE=worker
