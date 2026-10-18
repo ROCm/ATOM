@@ -35,6 +35,7 @@ def create_scheduler(*args, **kwargs):
         "num_prefill_lookahead": scheduler.num_prefill_lookahead,
         "num_reprefillable_tokens": coordinator.num_reprefillable_tokens,
         "prefill_timeline_enabled": os.environ.get("C48_PREFILL_TIMELINE") == "1",
+        "prefill_request_ledger_enabled": os.environ.get("C48_PREFILL_REQUEST_LEDGER") == "1",
         "eagle_group_ids": sorted(coordinator.eagle_group_ids),
         "simple_kv_offload_manager_sha256": hashlib.sha256(
             Path(simple_kv_offload_manager.__file__).read_bytes()
@@ -64,5 +65,12 @@ def create_scheduler(*args, **kwargs):
         from pd_c48_cache_lifecycle import install_prefill_cache_probes
         install_prefill_cache_probes(
             scheduler, Path(os.environ["C48_DIAG_DIR"]).parent / "cache-lifecycle"
+        )
+    if record["prefill_request_ledger_enabled"]:
+        if record["role"] != "prefill":
+            raise ValueError("C48 request ledger is Prefill-only")
+        from pd_c48_request_ledger import install_request_ledger
+        install_request_ledger(
+            scheduler, Path(os.environ["C48_DIAG_DIR"]).parent / "prefill-request-ledger"
         )
     return scheduler
