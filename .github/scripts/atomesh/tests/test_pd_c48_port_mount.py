@@ -16,6 +16,7 @@ CPUREF = {
     "V-QD-CPUREF2-LPT3072": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-LPT6144": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-FP8ATTN-PROFILE": "cpu-lru-refresh-v2",
 }
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 
@@ -43,7 +44,7 @@ class PortMountTest(unittest.TestCase):
             self.assertEqual(cpuref[:3], base)
             self.assertTrue(cpuref[3].endswith(MANAGER))
             self.assertIn(f"/c48-model-gap/{fix_dir}/manager.py,", cpuref[3])
-            fp8 = case.endswith("-FP8ATTN")
+            fp8 = "-FP8ATTN" in case
             self.assertEqual(len(cpuref), 5 if fp8 else 4)
             if fp8:
                 self.assertTrue(cpuref[4].endswith(FP8ATTN))
