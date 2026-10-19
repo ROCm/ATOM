@@ -87,3 +87,31 @@ only as a scenario, with PP eager graphs=0, 32 GiB gather, approximately
 1.35 GiB Store buffers and 2% safety, the last-stage KV budget is about
 142.5 GiB, or 4.41M tokens. PP4 weight and activation measurements can change
 this estimate; the CI's per-stage budgets are required for a measured claim.
+
+## October 19 startup failures and fixes
+
+Gather run `39203564775` / job `117901909731` stopped before model startup
+on `pit2-p03-g52`. After file-cache advice, NUMA nodes 0 and 1 still had only
+280 / 303 GiB free and 1185 / 1180 GiB of file cache. Both 768 GiB THP
+preparations timed out after 600 seconds, but the old launcher treated these
+as warnings and started the owners. Owner 1 failed RDMA registration with
+`Cannot allocate memory`, then aborted with exit 134. The logs do not contain
+a successful owner THP measurement or any GSM8K / performance result.
+
+The Store now uses the existing bounded memory-preparation helper with
+explicit owner NUMA budgets. It reclaims file cache using base pages before
+THP compaction, requires full THP coverage and sufficient free capacity, and
+stops startup if preparation fails. It retains 128 GiB per-node reserve and
+the previous total preparation deadline (600 seconds per owner NUMA node),
+with at most three attempts and bounded child cleanup. Store preparation
+skips VM sysctl writes. Snapshots, child logs and the outcome are saved under
+`logs/<phase>/mooncake-memory-rank-<rank>/`. Store size remains 1536 GiB.
+
+Paged run `39208890418` / job `117918188182` passed all 33 AITER numerical
+cases, then failed the two cached/uncached TBO straddle fixture cases with
+`TypeError: a bytes-like object is required, not 'list'`. Production block
+tables export an int32 buffer; the fixture now constructs them with
+`new_block_table` and also checks the resulting block IDs. This correction
+is shared with gather, which inherited the same fixture. No attention kernel
+change was needed for either observed failure. Full Store RDMA, GSM8K and
+C72 validation still require the subsequent GPU CI run.

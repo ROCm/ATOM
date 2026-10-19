@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""CI-only host memory preparation, before either model service starts."""
+"""CI-only memory preparation for LMCache or Store, before services start."""
 
 import argparse
 import json
@@ -246,11 +246,13 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
         for directory in [*args.directories, *cache_roots]:
             if not Path(directory).is_dir():
                 raise ValueError(f"model directory is missing: {directory}")
-        planned = budget.plan_pins([], args.gpus, args.per_gpu_gib, Path("/sys"))
+        planned = budget.plan_pins(
+            getattr(args, "pins", []), args.gpus, args.per_gpu_gib, Path("/sys")
+        )
         if not planned or min(planned.values()) <= 0:
-            raise ValueError("a non-empty positive LMCache memory plan is required")
+            raise ValueError("a non-empty positive memory plan is required")
         result["planned_gib"] = planned
-        direct_available = True
+        direct_available = not getattr(args, "skip_direct", False)
         reclaimed_nodes = set()
         for attempt in range(1, args.attempts + 1):
             if clock() >= deadline:
@@ -463,8 +465,21 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpus", required=True)
-    parser.add_argument("--per-gpu-gib", required=True, type=budget.non_negative_gib)
+    parser.add_argument("--gpus", default="")
+    parser.add_argument("--per-gpu-gib", default=0, type=budget.non_negative_gib)
+    parser.add_argument(
+        "--pin",
+        dest="pins",
+        action="append",
+        default=[],
+        metavar="NODE:GIB",
+        help="explicit NUMA owner memory, added to any per-GPU memory",
+    )
+    parser.add_argument(
+        "--skip-direct",
+        action="store_true",
+        help="use bounded file-cache reclaim and full-THP checks without VM sysctl writes",
+    )
     parser.add_argument("--reserve-gib", type=budget.non_negative_gib, default=128)
     parser.add_argument("--attempts", type=int, choices=range(1, 4), default=3)
     parser.add_argument("--timeout", type=budget.positive_seconds, default=120)

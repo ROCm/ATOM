@@ -74,6 +74,62 @@ class PreparationTests(unittest.TestCase):
         self.result = json.loads((self.args.output / "summary.json").read_text())
         return rc
 
+    def test_store_reclaims_both_numa_nodes_before_full_thp_without_vm_writes(self):
+        # Failed gather CI 39203564775: each 768 GiB owner was started after
+        # compaction timed out with only 280 / 303 GiB free and >1 TiB cache.
+        self.args.gpus = ""
+        self.args.per_gpu_gib = 0
+        self.args.pins = ["0:768", "1:768"]
+        self.args.skip_direct = True
+        self.state["numa"] = {
+            node: {
+                "MemTotal": 1511 * PREP.GIB,
+                "MemFree": free * PREP.GIB,
+                "Inactive(file)": cache * PREP.GIB,
+            }
+            for node, free, cache in ((0, 280, 1185), (1, 303, 1180))
+        }
+        reclaimed, compacted = [], []
+
+        def run(command, seconds, output):
+            self.assertNotEqual(command[0], "sh")
+            result = self.run_step(command, seconds, output)
+            if "reclaim_file_cache.py" in str(command):
+                node = int(command[2])
+                reclaimed.append(node)
+                self.state["numa"][node].update(
+                    MemFree=1400 * PREP.GIB, **{"Inactive(file)": 65 * PREP.GIB}
+                )
+            if "compact_huge_pages.py" in str(command):
+                node = int(command[2])
+                self.assertIn(node, reclaimed)
+                self.assertEqual(command[-1], "768.0")
+                compacted.append(node)
+                result["text"] = "[thp-compact] 768 of 768 GiB came as huge pages"
+            return result
+
+        # Use the real plan parser: Store owners need no GPU discovery.
+        with patch.object(PREP.budget, "gpu_numa_nodes", side_effect=AssertionError):
+            rc = PREP.prepare(
+                self.args,
+                run=run,
+                take_snapshot=lambda planned: self.state,
+                clock=lambda: self.now,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(reclaimed, [0, 1])
+        self.assertEqual(compacted, [0, 1])
+        result = json.loads((self.args.output / "summary.json").read_text())
+        self.assertEqual(result["planned_gib"], {"0": 768, "1": 768})
+        self.assertEqual(result["method"], "file_cache_and_numa")
+
+    def test_store_rejects_partial_thp_even_when_compaction_exits_zero(self):
+        self.args.skip_direct = True
+        self.partial = 10
+        self.assertEqual(self.prepare(), 2)
+        self.assertEqual(self.result["status"], "numa_preparation_incomplete")
+        self.assertFalse(any(cmd[0] == "sh" for cmd, _ in self.calls))
+
     def test_direct_commands_have_no_sudo_and_stop_after_success(self):
         self.direct_ok = True
         self.assertEqual(self.prepare(), 0)
