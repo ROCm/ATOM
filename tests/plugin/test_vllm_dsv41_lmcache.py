@@ -465,8 +465,11 @@ def test_a_mid_prompt_request_entering_another_requests_slot_is_restored():
 def test_decode_keeps_are_stored_at_the_committed_position(monkeypatch):
     import numpy as np
 
-    from atom.plugin.vllm import paged_state_checkpoint, req_id_passthrough_patch
-    from atom.plugin.vllm import v41_speculative
+    from atom.plugin.vllm import (
+        paged_state_checkpoint,
+        req_id_passthrough_patch,
+        v41_speculative,
+    )
 
     batch = SimpleNamespace(num_computed_tokens_cpu=np.array([250, 1020]))
     monkeypatch.setattr(
