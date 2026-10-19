@@ -209,12 +209,13 @@ busiest_gpu_over_limit() {
 # Spur often ignores --exclusive. If another job already holds VRAM, model
 # load fails with opaque HIP OOM ("0 bytes free"). Fail fast with a clear
 # message so the cell is not attributed to the model or LMCache sizing.
-# Containers pre_cleanup_local just stopped release VRAM only after a while,
-# so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is recorded in
-# RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
+# Containers pre_cleanup_local just stopped, or the previous job's exited
+# ones, release VRAM only after a while (over 90 s after a DeepSeek-V4 TP8
+# job), so poll for ATOMESH_GPU_IDLE_WAIT_SECONDS first. A busy host is
+# recorded in RUN_DIR/gpu-busy/ for pd_submit.sh to resubmit without it.
 assert_gpus_idle() {
   local max_used_mb="${ATOMESH_GPU_BUSY_MB:-8192}"
-  local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-90}"
+  local wait_s="${ATOMESH_GPU_IDLE_WAIT_SECONDS:-300}"
   local deadline=$((SECONDS + wait_s))
   local busy
   if ! command -v amd-smi >/dev/null 2>&1; then
