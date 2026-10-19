@@ -26,6 +26,7 @@ re-imports ``__main__``), or in a ``sitecustomize.py`` on ``PYTHONPATH``. Settin
 import argparse
 import contextlib
 import json
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -37,6 +38,8 @@ from . import stages as S
 from .context import AttnFusionCtx
 from .resources import FusionResourcesWrapper, fusion_resources_cls
 from .site import GemmFusionBindError, GemmFusionSite, Resolution, _ShimFwdCtx  # noqa: F401
+
+logger = logging.getLogger("atom.gemm_fusion")
 
 # =============================================================================
 # 1. test state helpers
@@ -161,6 +164,15 @@ CHECK_ALIAS_ENV = "ATOM_GEMM_FUSION_CHECK_ALIAS"
 
 _PATCHES: list = []  # (obj, attr, original, had_own_attr)
 _FAULTS: dict = {}  # kind -> (rank or None, arg or None)
+_FIRED: set = set()  # fault kinds that have taken effect at least once in this process
+_STATS = {"alias_checks": 0}
+
+
+def stats():
+    """What this process's seams did: installed fault specs, kinds that fired, alias checks run.
+    A spawned worker can log this to PROVE the seams were installed and executed."""
+    return {"pid": os.getpid(), "faults": dict(_FAULTS), "fired": sorted(_FIRED),
+            "alias_checks": _STATS["alias_checks"], "patches": [f"{p[0].__name__}.{p[1]}" if hasattr(p[0], "__name__") else p[1] for p in _PATCHES]}
 
 
 def _patch(obj, attr, value):
@@ -191,6 +203,10 @@ def fault_active(kind):
     rank, arg = ent
     if rank is not None and rank != _my_rank():
         return None
+    if kind not in _FIRED:
+        _FIRED.add(kind)
+        logger.warning("gemm_fusion test_utils: fault %r FIRED (pid=%d sp_rank=%d arg=%r)",
+                       kind, os.getpid(), _my_rank(), arg)
     return arg or ""
 
 
@@ -297,6 +313,8 @@ def install_faults(spec=None):
     for kind, ent in parsed.items():
         if kind not in _FAULTS:
             _FAULT_INSTALLERS[kind]()
+            logger.warning("gemm_fusion test_utils: fault %r installed (pid=%d rank=%s arg=%r)",
+                           kind, os.getpid(), "*" if ent[0] is None else ent[0], ent[1])
         _FAULTS[kind] = ent
     return parsed
 
@@ -304,13 +322,19 @@ def install_from_env():
     """Apply env-selected seams: ``ATOM_GEMM_FUSION_FAULT``, the recover/shutdown timeouts, and the
     shared-window alias check (``ATOM_GEMM_FUSION_CHECK_ALIAS=1``). Call it at the top of a launch
     script so spawned workers get it (see the module docstring)."""
+    installed = []
     if os.environ.get(FAULT_ENV):
         install_faults()
+        installed.append(f"faults={os.environ[FAULT_ENV]}")
     for env, attr in ((RECOVER_TIMEOUT_ENV, "RECOVER_TIMEOUT_S"), (SHUTDOWN_TIMEOUT_ENV, "SHUTDOWN_TIMEOUT_S")):
         if os.environ.get(env):
             _patch(hooks, attr, float(os.environ[env]))
+            installed.append(f"{attr}={os.environ[env]}")
     if os.environ.get(CHECK_ALIAS_ENV) == "1":
         install_alias_check()
+        installed.append("alias_check")
+    logger.warning("gemm_fusion test_utils: install_from_env ran (pid=%d): %s",
+                   os.getpid(), ", ".join(installed) or "nothing selected by the environment")
 
 
 def uninstall_faults():
@@ -325,6 +349,8 @@ def uninstall_faults():
             except AttributeError:
                 pass
     _FAULTS.clear()
+    _FIRED.clear()
+    _STATS["alias_checks"] = 0
     global _ALIAS_INSTALLED
     _ALIAS_INSTALLED = False
 
@@ -405,6 +431,9 @@ def install_alias_check():
     def run_qkv_attention(attn, x, x_scale, positions):
         result = orig(attn, x, x_scale, positions)
         (out, out_scale), _decision = result
+        _STATS["alias_checks"] += 1
+        if _STATS["alias_checks"] == 1:
+            logger.warning("gemm_fusion test_utils: alias check EXECUTED for the first time (pid=%d)", os.getpid())
         check_no_window_alias([("out", out), ("scale", out_scale),
                                ("impl._index_q", getattr(attn.impl, "_index_q", None))])
         return result

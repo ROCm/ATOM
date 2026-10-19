@@ -1796,3 +1796,36 @@ def test_the_direct_site_copies_only_when_an_input_moved(make_site):
     st.rebound = True
     s._stage_inputs("X_SCALE", ctx, state, st)
     assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]  # self-heal by copy
+
+
+def test_seams_leave_proof_in_the_log_that_they_were_installed_and_fired(monkeypatch, caplog):
+    """Spawned workers must PROVE the seams ran, not assume the env activated them: install_from_env
+    always logs one summary line (its absence means it was never called), each installed kind logs
+    once, a fault logs once when it first takes effect, and stats() reports the same."""
+    import logging
+
+    res = _ready_hooks(FakeResources())
+    monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
+    monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "5")
+    with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
+        TU.install_from_env()
+        assert hooks._poison_local() == 1
+        assert hooks._poison_local() == 1  # fires twice, logs once
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "install_from_env ran" in text and "faults=poison_rank" in text and "RECOVER_TIMEOUT_S=5" in text
+    assert text.count("fault 'poison_rank' installed") == 1
+    assert text.count("fault 'poison_rank' FIRED") == 1
+    s = TU.stats()
+    assert s["fired"] == ["poison_rank"] and "poison_rank" in s["faults"] and s["alias_checks"] == 0
+    TU.uninstall_faults()
+    assert TU.stats()["fired"] == [] and TU.stats()["faults"] == {}
+
+
+def test_install_from_env_logs_even_when_the_environment_selects_nothing(monkeypatch, caplog):
+    import logging
+
+    for env in (TU.FAULT_ENV, TU.RECOVER_TIMEOUT_ENV, TU.SHUTDOWN_TIMEOUT_ENV, TU.CHECK_ALIAS_ENV):
+        monkeypatch.delenv(env, raising=False)
+    with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
+        TU.install_from_env()
+    assert any("nothing selected by the environment" in r.getMessage() for r in caplog.records)
