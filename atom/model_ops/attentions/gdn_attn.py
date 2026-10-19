@@ -907,9 +907,8 @@ class GDNStateMixin(PoolRowsMixin):
 
         Slot 0 into the pool's first units. Both are real addresses, which is
         the point: a warmup on scratch would compile a kernel and fill nothing.
-        The units are cleared right after. A KV block is not written before it
-        is read: decode reads every token slot of a tile, past the context
-        included, and pads a tile's block ids with block 0.
+        The units are cleared right after: decode reads KV rows no sequence
+        has written yet (`BlockPool.state_images`).
         """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -1765,33 +1764,26 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
 
     def clear_page_units(self, unit_ids: Sequence[int]) -> None:
-        """Zero every MHA row of these PAGE units, all fields and layers.
+        """Zero every MHA row of these PAGE units (`BlockPool.state_images`).
 
-        An image is GDN state, not KV; at fp8 its bytes include NaN encodings.
-        Once the unit holds KV again, decode's paged attention reads its
-        unwritten token slots, and zero probability times NaN is NaN. One
-        `index_fill_` per field (`MhaKvPool.zero_entries`). The ids go up
-        through a pinned buffer fenced on its previous upload: a pageable copy
-        here would wait out the forward still queued.
+        The ids go up through a pinned buffer fenced on its previous upload: a
+        pageable copy here would wait out the forward still queued.
         """
         ids = np.fromiter(unit_ids, dtype=np.int64)
         if not ids.size:
             return
         pools = list(self.kv_pools.values())
-        staged = getattr(self, "_clear_ids", None)
-        if staged is None:
+        if getattr(self, "_clear_ids", None) is None:
             entries = max(len(pool.region_tensors()[0][1]) for pool in pools)
-            staged = self._clear_ids = CpuGpuBuffer(
+            self._clear_ids = CpuGpuBuffer(
                 entries, dtype=torch.int64, device=self.device
             )
             self._clear_ids_uploaded = torch.cuda.Event()
-            self._clear_ids_pending = False
-        elif self._clear_ids_pending:
-            self._clear_ids_uploaded.synchronize()
-        staged.np[: ids.size] = ids
-        device_ids = staged.copy_to_gpu(ids.size)
+        # Returns at once before the first record.
+        self._clear_ids_uploaded.synchronize()
+        self._clear_ids.np[: ids.size] = ids
+        device_ids = self._clear_ids.copy_to_gpu(ids.size)
         self._clear_ids_uploaded.record()
-        self._clear_ids_pending = True
         for pool in pools:
             pool.zero_entries(device_ids)
 

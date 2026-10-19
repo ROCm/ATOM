@@ -382,12 +382,9 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
             )
 
     def clear_page_units(self, unit_ids: Sequence[int]) -> None:
-        """Zero PAGE units a state checkpoint gave back, before they hold KV.
+        """Zero PAGE units a state checkpoint gave back (`BlockPool.state_images`).
 
-        A no-op here. A backend whose decode reads a block's unwritten token
-        slots (`GDNAttentionMetadataBuilder` through aiter's gluon paged
-        attention) overrides it; until then such a unit's image bytes are read
-        as KV and can turn a zero-probability lane into NaN.
+        A no-op here; `GDNAttentionMetadataBuilder` overrides it for its MHA pool.
         """
 
     def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:

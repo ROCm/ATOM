@@ -253,8 +253,7 @@ class StateMaintenanceOps:
     relocations: tuple[tuple[int, int], ...] = ()
     checkpoint_stores: tuple[CheckpointStoreOp, ...] = ()
     checkpoint_restores: tuple[CheckpointRestoreOp, ...] = ()
-    # PAGE units given back since the last batch (`BlockPool.take_released_units`),
-    # cleared before this batch's copies and forward.
+    # `BlockPool.take_released_units`, zeroed before this batch's copies.
     checkpoint_clears: tuple[int, ...] = ()
 
     @property
