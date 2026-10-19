@@ -72,10 +72,37 @@ def test_supported_deployment_has_no_refusal(native):
             {"compilation_config": SimpleNamespace(cudagraph_mode=_Mode(True))},
             "piecewise",
         ),
+        # `model_runner` wraps the model and the drafter in
+        # `torch.compile(fullgraph=True)` at this level only, and mono calls
+        # `Tensor.data_ptr()`, which graph-breaks -- a break under `fullgraph`
+        # raises instead of falling back, so this has to refuse rather than
+        # crash a qualified deployment mid-request.
+        (
+            {
+                "compilation_config": SimpleNamespace(
+                    level=1, cudagraph_mode=_Mode(False)
+                )
+            },
+            "DYNAMO_AS_IS",
+        ),
     ],
 )
 def test_each_unsupported_setting_is_refused(native, overrides, reason):
     assert reason in dispatch._config_refusal(_atom_config(**overrides))
+
+
+@pytest.mark.parametrize("level", [0, 2, 3])
+def test_other_compilation_levels_are_not_refused(native, level):
+    """Only level 1 wraps in `fullgraph`; 2 and 3 go through the decorator.
+
+    Pinning the complement matters more than the refusal: copying copilot's
+    boundary without checking it would have refused every non-zero level and
+    turned mono off for the served `--level 3` launch.
+    """
+    cfg = _atom_config(
+        compilation_config=SimpleNamespace(level=level, cudagraph_mode=_Mode(False))
+    )
+    assert dispatch._config_refusal(cfg) is None
 
 
 def test_the_model_s_full_context_is_served(native):
@@ -96,7 +123,10 @@ def test_plugin_mode_is_refused(native, monkeypatch):
 # ---------------------------------------------------------------- per-step predicate
 
 
-def _decode_md(rows=4, slots=None, **overrides):
+_PER_SLOT = object()  # a batch id a slot row, the step's own
+
+
+def _decode_md(rows=4, slots=None, batch_ids=_PER_SLOT, **overrides):
     """Sparse decode metadata with ``rows`` table rows (a size-``rows`` graph)."""
     decode = {
         "max_query_len": 1,
@@ -104,14 +134,16 @@ def _decode_md(rows=4, slots=None, **overrides):
         "seq_lens": torch.ones(rows, dtype=torch.int32),
     }
     decode.update(overrides)
+    slots = slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
     return SimpleNamespace(
         sparse_attention_metadata=SimpleNamespace(
-            decode=SimpleNamespace(**decode),
-            num_prefills=0,
-            slot_mapping=(
-                slots if slots is not None else torch.zeros(rows, dtype=torch.int64)
-            ),
-        )
+            decode=SimpleNamespace(**decode), num_prefills=0, slot_mapping=slots
+        ),
+        batch_id_per_q_token=(
+            torch.zeros(slots.numel(), dtype=torch.int32)
+            if batch_ids is _PER_SLOT
+            else batch_ids
+        ),
     )
 
 
@@ -145,12 +177,21 @@ def test_decode_steps_of_up_to_max_tokens_are_taken(monkeypatch, n):
     assert _mono(monkeypatch, md).supports(*_step(n), None, None)
 
 
-def test_a_kernel_no_rank_could_build_turns_mono_off(monkeypatch):
-    """``prepare`` is the TP-wide verdict: false on every rank, so every rank falls
-    back, now and for the steps after."""
+def test_a_kernel_no_rank_could_build_is_declined_at_every_width(monkeypatch):
+    """``prepare`` is the TP-wide verdict: false on every rank, so every rank
+    falls back.
+
+    Asserted as behaviour rather than on ``_mono.enabled``. A width refusal
+    stopped latching the flag in `3b50fa529` -- it is memoized per width
+    instead -- and the flag is still the right assertion for a *create*
+    refusal, which is why the sibling check in `test_native_monokernel`
+    keeps it. What a caller can observe here is that no width is served,
+    this step and the ones after, because this runner builds nothing.
+    """
     mono = _mono(monkeypatch, _forward_context(_decode_md(rows=16)), builds=False)
     assert not mono.supports(*_step(4), None, None)
-    assert not mono._mono.enabled
+    assert not mono.supports(*_step(4), None, None)  # the memoized refusal
+    assert not mono.supports(*_step(8), None, None)  # and any other width
 
 
 def test_more_than_max_tokens_take_the_original_path(monkeypatch):
@@ -180,6 +221,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         ),
         _forward_context(_decode_md(slots=torch.zeros(4, dtype=torch.int32))),
         _forward_context(_decode_md(slots=torch.zeros(2, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=None)),
+        _forward_context(_decode_md(batch_ids=torch.zeros(4, dtype=torch.int64))),
+        _forward_context(_decode_md(batch_ids=torch.zeros(2, dtype=torch.int32))),
     ],
     ids=[
         "prefill",
@@ -193,6 +237,9 @@ def test_check_mode_takes_the_same_steps(monkeypatch):
         "strided_table_rows",
         "slots_int32",
         "fewer_slots",
+        "no_batch_ids",
+        "batch_ids_int64",
+        "fewer_batch_ids",
     ],
 )
 def test_other_steps_take_the_original_path(monkeypatch, fwd):
@@ -254,3 +301,47 @@ def test_disabled_mono_never_takes_a_step(monkeypatch):
     mono = _mono(monkeypatch, _forward_context())
     mono._mono.enabled = False
     assert not mono.supports(*_step(1), None, None)
+
+
+# --- rollout weight sync -----------------------------------------------------
+# A weight sync rewrites parameter buffers in place, so nothing moves address
+# and no shape or dtype check fires; the mono binds that cache a requantized or
+# dequantized copy go on serving the pre-sync weights. Until `weight_updater`
+# invalidates those copies, a runner that can take a sync must not get mono.
+
+
+class _UpdatingRunner:
+    def update_weights(self, named_tensors, clear_kv_cache=True):
+        raise NotImplementedError
+
+
+class _PlainRunner:
+    pass
+
+
+@pytest.mark.parametrize(
+    ("resolved", "refused"),
+    [(_PlainRunner, False), (_UpdatingRunner, True)],
+)
+def test_a_runner_that_takes_weight_updates_is_refused(
+    native, monkeypatch, resolved, refused
+):
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", lambda _: resolved)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="a.runner.Class"))
+    assert (why is not None and "rollout weight updates" in why) is refused
+
+
+def test_an_unresolvable_runner_is_refused(native, monkeypatch):
+    """Guessing wrong costs correctness; refusing only costs speed."""
+
+    def _boom(_):
+        raise ImportError("no such module")
+
+    monkeypatch.setattr(deployment, "resolve_obj_by_qualname", _boom)
+    why = dispatch._config_refusal(_atom_config(runner_qualname="gone.Runner"))
+    assert "rollout weight updates" in why
+
+
+def test_a_config_without_a_runner_qualname_is_unaffected(native):
+    """SGLang builds its own `atom_config` and sets no runner."""
+    assert dispatch._config_refusal(_atom_config()) is None

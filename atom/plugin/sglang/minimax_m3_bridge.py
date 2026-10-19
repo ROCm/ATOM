@@ -294,6 +294,29 @@ def _is_minimax_m3_owner(owner: Any) -> bool:
     return is_minimax_m3_config(getattr(model_config, "hf_config", None))
 
 
+def install_minimax_mono_plugin_refusal() -> None:
+    """Refuse MiniMax mono before the piecewise cudagraph check.
+
+    ``#2419`` builds every ``_config_refusal`` clause up front. SGLang leaves
+    ``compilation_config.cudagraph_mode`` as None, so
+    ``requires_piecewise_compilation`` crashes before the ``plugin mode``
+    clause can refuse. Mono is unsupported here; return that reason without
+    reading ``cudagraph_mode``.
+    """
+    from atom.models.minimax_m3.mono import dispatch
+
+    if getattr(dispatch, "_atom_sglang_mono_plugin_refusal", False):
+        return
+    dispatch._config_refusal_native = dispatch._config_refusal
+
+    def _config_refusal(atom_config, text_config):
+        del atom_config, text_config
+        return "plugin mode"
+
+    dispatch._config_refusal = _config_refusal
+    dispatch._atom_sglang_mono_plugin_refusal = True
+
+
 def install_minimax_m3_pool_patch() -> None:
     """Keep ATOM FP8 index dtype + scale ABI on MiniMaxSparseKVPool.
 

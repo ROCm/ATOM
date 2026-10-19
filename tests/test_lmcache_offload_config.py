@@ -154,32 +154,65 @@ def test_unknown_explicit_offload_layout_is_rejected(override):
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_linear_model_offload_is_refused(model_type):
-    # A GDN model must be turned away at config resolution, not fall through to
-    # `dense` and restore a KV prefix over its stale recurrent state. Clear
-    # `compress_ratios` so the hybrid branch does not claim it first.
+def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
+    # The PAGE-image tier already packs `page_unit_views`. Falling through to
+    # `dense` would restore KV over a stale slot. Clear `compress_ratios` so
+    # the hybrid branch does not claim the model first.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
 
-    with pytest.raises(ValueError, match="does not support GDN"):
-        offcfg.select_offload_layout(config)
+    assert offcfg.select_offload_layout(config) == "qwen"
+
+
+def test_qwen_offload_classes_inherit_the_k3_tier():
+    from atom.kv_transfer.offload._offload_common import StateOffloadFace
+    from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
+        KimiK3OffloadConnector,
+        KimiK3OffloadScheduler,
+    )
+    from atom.kv_transfer.offload.hybrid.qwen.connector import (
+        QwenOffloadConnector,
+        QwenOffloadScheduler,
+    )
+
+    assert issubclass(QwenOffloadConnector, KimiK3OffloadConnector)
+    assert issubclass(QwenOffloadScheduler, KimiK3OffloadScheduler)
+    assert issubclass(QwenOffloadScheduler, StateOffloadFace)
 
 
 @pytest.mark.parametrize(
     "model_type",
     ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
 )
-def test_gdn_refusal_is_not_bypassed_by_offload_layout_override(model_type):
-    # The refusal must run *before* an explicit override is honoured. Otherwise
-    # `offload_layout: dense` on a GDN checkpoint returns `dense` early and
-    # restores a KV prefix over stale recurrent state (silent wrong output).
+def test_gdn_page_namespace_names_ordinary_mha_pages(model_type):
+    # lmcache_mp hashes the PAGE bytes through select_offload_layout. The
+    # family name is ``qwen``, which is not a page-mode key, so the pages stay
+    # the dense MHA mode. An illegal offload_layout override fails here too.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = model_type
+
+    namespace = offcfg.build_page_namespace(config, _lmcache_config(), 4)
+    assert namespace.startswith("org/model::atom-page-v")
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.build_page_namespace(config, _lmcache_config(), 4)
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"],
+)
+def test_gdn_state_tier_is_not_downgraded_to_dense(model_type):
+    # An explicit `dense` override must not strip the state tier. Otherwise a
+    # KV prefix is restored over a stale slot.
     config = _config()
     config.hf_config.compress_ratios = None
     config.hf_config.model_type = model_type
     config.kv_transfer_config = {"offload_layout": "dense"}
 
-    with pytest.raises(ValueError, match="does not support GDN"):
+    with pytest.raises(ValueError, match="owns no tier"):
         offcfg.select_offload_layout(config)
 
 
@@ -324,7 +357,7 @@ def test_unknown_lmcache_override_is_rejected():
         )
 
 
-def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+def _install_metadata_modules(monkeypatch):
     @dataclass
     class _Metadata:
         model_name: str
@@ -346,6 +379,11 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     monkeypatch.setitem(sys.modules, "lmcache", types.ModuleType("lmcache"))
     monkeypatch.setitem(sys.modules, "lmcache.v1", types.ModuleType("lmcache.v1"))
     monkeypatch.setitem(sys.modules, "lmcache.v1.metadata", metadata_module)
+    return _Metadata
+
+
+def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
+    _install_metadata_modules(monkeypatch)
 
     scheduler = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 0)
     worker = offcfg.build_lmcache_metadata(_config(), _lmcache_config(), 4, 3)
@@ -353,6 +391,78 @@ def test_scheduler_and_worker_metadata_share_page_namespace(monkeypatch):
     assert scheduler.model_name == worker.model_name
     assert scheduler.worker_id == 0
     assert worker.worker_id == 3
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, [1]), (1, [0, 1]), (4, [4])],
+)
+def test_lmcache_metadata_rejects_lookup_scope_outside_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError) as exc_info:
+        offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+    expected = (
+        "lookup_server_worker_ids must be within the replica-local world "
+        f"[0, {world_size})"
+    )
+    assert expected in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "worker_ids"),
+    [(1, []), (1, [0]), (4, [0, 3])],
+)
+def test_lmcache_metadata_accepts_lookup_scope_within_replica_world(
+    monkeypatch,
+    world_size,
+    worker_ids,
+):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, world_size, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == world_size
+    assert metadata.worker_id == 0
+
+
+@pytest.mark.parametrize("worker_ids", [0, 3])
+def test_lmcache_metadata_rejects_scalar_lookup_scope(monkeypatch, worker_ids):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = worker_ids
+
+    with pytest.raises(ValueError, match="must be a list or tuple"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_rejects_duplicate_lookup_scope(monkeypatch):
+    _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = [0, 0]
+
+    with pytest.raises(ValueError, match="must not contain duplicate"):
+        offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+
+def test_lmcache_metadata_accepts_tuple_lookup_scope(monkeypatch):
+    metadata_type = _install_metadata_modules(monkeypatch)
+    cfg = _lmcache_config()
+    cfg.lookup_server_worker_ids = (0, 3)
+
+    metadata = offcfg.build_lmcache_metadata(_config(), cfg, 4, 0)
+
+    assert isinstance(metadata, metadata_type)
+    assert metadata.world_size == 4
 
 
 def test_page_namespace_survives_a_worker_normalising_hf_config():

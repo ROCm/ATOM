@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """An ``ATOM_MONO_DEBUG`` step's report: the mailbox waits that gave up
 (``atom.mono.device.sync._spin_bounded`` records, one a CTA) and the ranks the
-step fence gave up on (``PeerBuffer.missing_ranks``). Synchronizes: eager only."""
+step fence gave up on (``StepMailboxes.missing_ranks``). Synchronizes: eager only."""
 
 import zlib
 
@@ -46,10 +46,10 @@ def given_up_waits(diag: torch.Tensor, name_of) -> list[str]:
     ]
 
 
-def raise_if_given_up(what: str, rank: int, rows: int, waits, peers) -> None:
+def raise_if_given_up(what: str, rank: int, rows: int, waits, mailboxes) -> None:
     """Raise with ``waits`` and the fence's missing ranks, if any."""
     lines = list(waits) + [
-        f"step fence: rank {r} never arrived" for r in peers.missing_ranks()
+        f"step fence: rank {r} never arrived" for r in mailboxes.missing_ranks()
     ]
     if lines:
         raise RuntimeError(

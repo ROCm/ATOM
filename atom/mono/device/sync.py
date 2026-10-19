@@ -112,8 +112,8 @@ class Mailbox:
     Every 32-bit value is stored next to this launch's tag; a consumer
     polls the payload until all tags match, so a hand-off costs one round trip
     (no store drain, no separate flag). The tag is ``layer + 1``: it tells the
-    layers of one step apart, and the runner zeroes every mailbox between steps
-    (``MonoDecodeRunner.finish_step``), so a pair from an earlier step never
+    layers of one step apart, and the runner zeroes every mailbox at a step's
+    start (``StepMailboxes.begin_step``), so a pair from an earlier step never
     carries a live tag. Every address is an ``Addr``: its space picks the scope.
     """
 
@@ -162,7 +162,7 @@ class Mailbox:
 
     def poll(self, specs, batch=POLL_MAX):
         """Batched poll of pairs ``specs`` = [(Addr, pair index, npairs in {1, 2})],
-        all of one space.
+        each loaded at its own space's scope.
 
         All pairs are re-loaded together while any tag is stale, so a batch costs
         one round trip after its last producer lands. Returns the value words."""
@@ -170,15 +170,13 @@ class Mailbox:
             return []
         if const_expr(len(specs) > batch):
             return self.poll(specs[:batch], batch) + self.poll(specs[batch:], batch)
-        spaces = {a.space for a, _, _ in specs}
-        assert len(spaces) == 1, f"one poll batch spans {spaces}"
-        cm = _SCOPE_CM[spaces.pop()]
+        cms = [_SCOPE_CM[a.space] for a, _, _ in specs]
         bases = [_noted(a, "poll") for a, _, _ in specs]
         tag = self.tag
 
         def load_all():
             words = []
-            for b, (_, i, n) in zip(bases, specs):
+            for b, cm, (_, i, n) in zip(bases, cms, specs):
                 w = fx.Vector(
                     bo.buffer_load(
                         rsrc(b),

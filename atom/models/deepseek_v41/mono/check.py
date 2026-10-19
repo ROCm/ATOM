@@ -181,6 +181,21 @@ def check_front(runner, layer_id, block, state, rope, cache, step, res_out, gate
         logger.info("V4.1 mono check layer %d: %s", layer_id, "; ".join(parts))
 
 
+def decode_keys(cache, spec, step):
+    """The original decode's key rows as one pool-row list a token: its
+    selection, then its window (``cache.attention_indices`` hands a BF16
+    decode's window over as rows of the layer's ring, made pool rows here)."""
+    prefix, pptr, window, wptr = cache.attention_indices(spec, step)
+    start = cache.geometry.window(spec.layer_id, cache.num_pages).ring_start
+    pb, wb = pptr.tolist(), wptr.tolist()
+    rows = [
+        torch.cat([prefix[pb[t] : pb[t + 1]], window[wb[t] : wb[t + 1]] + start])
+        for t in range(step.width)
+    ]
+    counts = torch.tensor([0] + [len(r) for r in rows], device=pptr.device)
+    return torch.cat(rows), counts.cumsum(0).to(pptr.dtype)
+
+
 def _key_set_rows(runner, spec, keys, cache):
     """The tokens whose pool rows the mono attention reads (``attention.
     _key_row``: its selection's rows, then its window's) differ as a set from

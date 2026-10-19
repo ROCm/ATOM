@@ -11,6 +11,7 @@ from atom.model_ops.attentions.deepseek_v41.packed_attention import (
     packed_decode,
     packed_prefill,
 )
+from atom.model_ops.attentions.deepseek_v41.score_planner import score_layout
 from atom.model_ops.deepseek_v41.compressor import Compressor
 from atom.model_ops.deepseek_v41.paged_scoring import (
     quantize_query_fp4,
@@ -26,10 +27,7 @@ from atom.model_ops.linear import (
     RowParallelLinear,
 )
 from atom.model_ops.utils import atom_parameter
-from atom.model_ops.v4_kernels import (
-    sparse_attn_v4_paged_decode,
-    sparse_attn_v4_paged_prefill,
-)
+from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 from atom.utils.forward_context import side_stream
 
 from .config import AttentionMode
@@ -138,6 +136,8 @@ class Indexer(nn.Module):
         `project` the query alone (the kernel applies `weight_scale`)."""
         spec = self.spec
         ragged = self._ragged(cache, step)
+        # a ragged layer's logits pack where the step laid its rows out
+        packed = score_layout(step, spec.ratio) if ragged is not None else None
         self._publish(
             *score_topk_quantized(
                 query,
@@ -154,6 +154,7 @@ class Indexer(nn.Module):
                 workspace=cache.workspace,
                 weight_scale=weight_scale,
                 ragged=ragged,
+                packed=packed,
                 **self._bounds(cache, step),
             ),
             step,
@@ -278,9 +279,11 @@ class Attention(nn.Module):
         """Every compression boundary in the batch, in one call.
 
         The cache owns where the main latent lands; what comes back is the
-        unrotated latent, which is all the index key needs.
+        unrotated latent, which is all the index key needs. A step without a
+        compress plan is some rows of a forward whose compression ran over
+        all of them (bounded replay): nothing to do.
         """
-        if not self.spec.ratio or self.compressor is None:
+        if not self.spec.ratio or self.compressor is None or not step.plans:
             return
         owner = self.spec.kv_owner
         values, scores = self.compressor.project(hidden)
@@ -361,52 +364,79 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def forward(self, hidden, hidden_scale, cache, step, rope):
+    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+        """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
+        layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
         q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         selecting = self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed
         )
+        if queries is not None:
+            qr, qr_scale = queries.take(qr, qr_scale)
         query = self.wq_b(qr, x_scale=qr_scale).unflatten(
             -1, (self.heads, self.head_dim)
         )
         # One launch for both rotations, the KV row's FP8 bytes and, where a
         # decode allows it, the window write. `window_kv` is what is left for
         # `write_window` below, which is nothing when that fold happened.
-        kv, window_kv = cache.rope_quant_window(
-            self.spec.layer_id, query, kv_normed, rope, step
-        )
+        if queries is None:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, query, kv_normed, rope, step
+            )
+        else:
+            kv, window_kv = cache.rope_quant_window(
+                self.spec.layer_id, None, kv_normed, rope, step
+            )
+            cache.rotate_query(query, rope, queries.positions)
         # A forked compressor is already inside this join, having been waited
         # at the scorer; where the scorer itself was not forked it waited on
         # the main stream instead and there is nothing left to join here.
         if selecting is not None:
             selecting.wait_stream(self.index_stream)
-        prefix, prefix_indptr, extend, extend_indptr = cache.attention_indices(
-            self.spec, step
+        prefix, prefix_indptr, second, second_indptr = (
+            cache.attention_indices(self.spec, step)
+            if queries is None
+            else queries.indices(cache, self.spec)
         )
         flat_query = query.flatten(0, 1)
         if step.decode:
             cache.write_window(self.spec.layer_id, window_kv, step)
-            decode = packed_decode if cache.packed else sparse_attn_v4_paged_decode
-            output = decode(
-                flat_query,
-                cache.pool,
-                prefix,
-                prefix_indptr,
-                self.attn_sink,
-                self.softmax_scale,
-            )
+            if cache.packed:
+                output = packed_decode(
+                    flat_query,
+                    cache.pool,
+                    prefix,
+                    prefix_indptr,
+                    self.attn_sink,
+                    self.softmax_scale,
+                )
+            else:
+                # The window, this step's rows included, is read through the
+                # ring: the second source, beside the selection in the pool.
+                output = sparse_attn_v4_paged_2src(
+                    flat_query,
+                    cache.pool,
+                    prefix,
+                    prefix_indptr,
+                    cache.ring_view(self.spec.layer_id),
+                    second,
+                    second_indptr,
+                    self.attn_sink,
+                    self.softmax_scale,
+                    out=flat_query,
+                )
         else:
-            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_prefill
+            prefill = packed_prefill if cache.packed else sparse_attn_v4_paged_2src
             output = prefill(
                 flat_query,
                 cache.pool,
                 prefix,
                 prefix_indptr,
                 kv.flatten(0, 1),
-                extend,
-                extend_indptr,
+                second,
+                second_indptr,
                 self.attn_sink,
                 self.softmax_scale,
                 out=flat_query,
@@ -414,5 +444,7 @@ class Attention(nn.Module):
             # Preserve the prior ring until every query has consumed its prefix.
             cache.write_window(self.spec.layer_id, window_kv, step)
         return self._project_out(
-            output.view_as(query), rope, cache.rope_positions(step)
+            output.view_as(query),
+            rope,
+            cache.rope_positions(step) if queries is None else queries.positions,
         )

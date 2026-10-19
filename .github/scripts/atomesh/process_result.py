@@ -16,23 +16,34 @@ from interactivity import (
     METHOD_MEDIAN_TPOT,
     METHOD_P90_E2E,
     agentic_interactivity,
+    agentic_throughput,
     locate_records,
 )
 
 AGENTIC_BENCHMARK_KIND = "aiperf_agentic"
 
-# How each interactivity definition is spelled out in the markdown summary, so a
-# reader never has to guess which formula produced the number in the column.
+# How each definition behind the `interactivity` column is spelled out in the
+# markdown summary, so a reader never has to guess which formula produced it.
+# Header names follow InferenceX: "E2E Normalized Interactivity" includes TTFT,
+# plain "Interactivity" (its own column, P90_INTERACTIVITY_HEADER) does not.
 INTERACTIVITY_LABELS = {
     METHOD_P90_E2E: "P90 E2E Normalized",
     METHOD_MEDIAN_TPOT: "1 / median_tpot_s",
 }
+INTERACTIVITY_HEADERS = {
+    METHOD_P90_E2E: "P90 E2E Normalized Interactivity",
+    METHOD_MEDIAN_TPOT: "Interactivity (1 / median_tpot_s)",
+}
+P90_INTERACTIVITY_HEADER = "P90 Interactivity"
 
 RESULT_RE = re.compile(
     r"^pd-(?P<backend>[^-]+)-(?P<model>.+)-(?P<topology>[^-]+(?:-[^-]+)*)-"
     r"isl(?P<isl>\d+)-osl(?P<osl>\d+)-conc(?P<conc>\d+)-(?P<ratio>[0-9.]+)\.json$"
 )
 TOPOLOGY_RE = re.compile(r"(?P<p>\d+)p(?P<d>\d+)d", re.IGNORECASE)
+# `<P>p<D>d` names a split, `agg*` one server doing both, the same reading
+# `pd_server_atom.sh` and `pd_matrix.py` give the name.
+AGGREGATED_TOPOLOGY_RE = re.compile(r"(?:^|[\s_-])agg", re.IGNORECASE)
 TP_RE = re.compile(r"tp(?P<tp>\d+)", re.IGNORECASE)
 DCP_RE = re.compile(r"dcp(?P<dcp>\d+)", re.IGNORECASE)
 DUAL_TP_RE = re.compile(r"tp(?P<prefill_tp>\d+)-tp(?P<decode_tp>\d+)", re.IGNORECASE)
@@ -40,7 +51,7 @@ CPP_PP_RE = re.compile(r"(?:cpp|pp)(?P<pp>\d+)", re.IGNORECASE)
 PP_ARG_RE = re.compile(r"--pipeline-parallel-size(?:=|\s+)(\d+)", re.IGNORECASE)
 EVAL_CONC_RE = re.compile(r"(?:^|[_-])c(?P<conc>\d+)(?:$|[_-])", re.IGNORECASE)
 EVAL_TOPOLOGY_RE = re.compile(
-    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?)(?:$|[_-])",
+    r"(?:^|[_-])(?P<topology>\d+p\d+d(?:[_-]dpa)?|agg[a-z0-9]*)(?:$|[_-])",
     re.IGNORECASE,
 )
 
@@ -164,10 +175,10 @@ def interactivity_value(payload: dict[str, Any]) -> float | None:
     return None
 
 
-def apply_agentic_interactivity(
+def apply_agentic_record_metrics(
     path: Path, payload: dict[str, Any], fields: dict[str, Any]
 ) -> None:
-    """Set both interactivity definitions from the per-request AIPerf records.
+    """Set interactivity and token throughput from the per-request AIPerf records.
 
     Agentic traces run a ~1M-token prefill per turn, so 1000/median_TPOT sees
     only the decode phase and hides the prefill cost entirely. The InferenceX
@@ -179,6 +190,10 @@ def apply_agentic_interactivity(
     The same pass also yields the plain 1/p90(ITL) number InferenceX plots as
     "Interactivity", stored alongside as ``interactivity_p90_itl`` so the
     dashboard can offer both as x-axes for the same point.
+
+    The records also replace AIPerf's time-sliced token throughput with
+    InferenceX's records-over-span definition (see interactivity.py), so the
+    per-GPU numbers line up with the ones InferenceX publishes.
     """
     if string_value(payload.get("benchmark_kind")) != AGENTIC_BENCHMARK_KIND:
         payload.setdefault("interactivity_method", METHOD_MEDIAN_TPOT)
@@ -200,6 +215,20 @@ def apply_agentic_interactivity(
         )
         payload["interactivity_method"] = METHOD_MEDIAN_TPOT
         return
+
+    try:
+        throughput = agentic_throughput(records)
+    except (OSError, ValueError) as exc:
+        print(
+            f"WARNING: cannot compute record-span throughput from {records}: "
+            f"{exc}; keeping AIPerf's time-sliced throughput",
+            file=sys.stderr,
+        )
+    else:
+        payload["input_throughput"] = throughput["input_tput_tps"]
+        payload["output_throughput"] = throughput["output_tput_tps"]
+        payload["total_token_throughput"] = throughput["total_tput_tps"]
+        payload["throughput_window_s"] = throughput["duration_s"]
 
     try:
         result = agentic_interactivity(records)
@@ -229,6 +258,21 @@ def parse_payload_date(payload: dict[str, Any]) -> tuple[str | None, int | None]
     return None, None
 
 
+def is_aggregated(payload: dict[str, Any], text: str) -> bool:
+    """Whether one server ran both phases, so its GPUs are the whole cell.
+
+    The launcher states this in `disaggregated`; results written before it did,
+    and the non-agentic ones that carry no such field, are read from the
+    topology name instead.
+    """
+    declared = payload.get("disaggregated")
+    if isinstance(declared, bool):
+        return not declared
+    if isinstance(declared, str) and declared.strip():
+        return declared.strip().lower() in {"false", "0", "no"}
+    return AGGREGATED_TOPOLOGY_RE.search(text) is not None
+
+
 def topology_resources(
     payload: dict[str, Any], fields: dict[str, Any]
 ) -> dict[str, int | None | bool]:
@@ -240,6 +284,7 @@ def topology_resources(
             fields.get("topology"),
         )
     )
+    aggregated = is_aggregated(payload, text)
     topology = TOPOLOGY_RE.search(text)
     prefill_workers = int_value(
         payload.get("prefill_workers"), payload.get("num_prefill_workers")
@@ -250,6 +295,12 @@ def topology_resources(
     if topology:
         prefill_workers = prefill_workers or int(topology.group("p"))
         decode_workers = decode_workers or int(topology.group("d"))
+    if aggregated:
+        # There are no separate prefill and decode services to count. The env
+        # file still carries the launcher's 1/1 placeholders, and counting
+        # those would bill the cell for two services' worth of GPUs.
+        prefill_workers = None
+        decode_workers = None
 
     prefill_tp = int_value(
         payload.get("prefill_tp"), payload.get("prefill_tensor_parallel_size")
@@ -301,11 +352,15 @@ def topology_resources(
     if num_decode_gpu is None and decode_workers and decode_tp:
         num_decode_gpu = decode_workers * decode_tp
     total_gpu = int_value(payload.get("total_gpu"))
+    if total_gpu is None and aggregated:
+        # Both phases share one server's GPUs, so the cell is that server.
+        total_gpu = decode_tp or prefill_tp
     if total_gpu is None and num_prefill_gpu is not None and num_decode_gpu is not None:
         total_gpu = num_prefill_gpu + num_decode_gpu
 
     lowered = text.lower()
     return {
+        "disaggregated": not aggregated,
         "prefill_workers": prefill_workers,
         "decode_workers": decode_workers,
         "prefill_tp": prefill_tp,
@@ -450,7 +505,7 @@ def enrich_payload(
         "mean_tpot_ms",
         number(enriched.get("mean_tpot_ms"), enriched.get("mean_itl_ms")),
     )
-    apply_agentic_interactivity(path, enriched, fields)
+    apply_agentic_record_metrics(path, enriched, fields)
     enriched.setdefault("interactivity", interactivity_value(enriched))
     resources = topology_resources(enriched, fields)
     total_gpu = resources["total_gpu"]
@@ -577,6 +632,9 @@ def perf_point(
         "decode_dcp": resources["decode_dcp"],
         "speculative_method": speculative_label(payload),
         "num_speculative_tokens": num_speculative_tokens,
+        # False marks a single server doing both phases: its row has no
+        # per-role worker or GPU counts, and total_gpu is that one server's.
+        "disaggregated": resources["disaggregated"],
         "prefill_workers": resources["prefill_workers"],
         "decode_workers": resources["decode_workers"],
         "prefill_dpa": resources["prefill_dpa"],
@@ -796,6 +854,7 @@ SUMMARY_LAYOUT: list[tuple[str, bool]] = [
     ("ISL/OSL", False),
     ("Concurrency", True),
     (INTERACTIVITY_HEADER, True),
+    (P90_INTERACTIVITY_HEADER, True),
     ("TP", False),
     ("DCP", False),
     ("Spec", False),
@@ -833,10 +892,10 @@ def summary_headers(rows: list[dict[str, Any]]) -> list[str]:
     keeps the plain header; summary_note() carries the definitions instead.
     """
     methods = {interactivity_method(row) for row in rows}
-    label = INTERACTIVITY_LABELS.get(methods.pop()) if len(methods) == 1 else None
+    header = INTERACTIVITY_HEADERS.get(methods.pop()) if len(methods) == 1 else None
     headers = [header for header, _ in SUMMARY_LAYOUT]
-    if label:
-        headers[INTERACTIVITY_COLUMN] = f"{INTERACTIVITY_HEADER} ({label})"
+    if header:
+        headers[INTERACTIVITY_COLUMN] = header
     return headers
 
 
@@ -867,6 +926,8 @@ def summary_cells(row: dict[str, Any]) -> list[str]:
         ),
         string_value(row.get("max_concurrency"), default="--"),
         fmt(row.get("interactivity")),
+        # 1/p90(ITL) from the per-request records, so agentic rows only.
+        fmt(row.get("interactivity_p90_itl")),
         pd_label(resources["prefill_tp"], resources["decode_tp"]),
         pd_label(resources["prefill_dcp"], resources["decode_dcp"]),
         speculative_label(row) or "--",

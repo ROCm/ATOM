@@ -55,3 +55,41 @@ def sparse_indexer_row_chunk(total_rows: int, row_width: int, budget_mb: int) ->
     if max_rows >= _ROW_TILE:
         return (max_rows // _ROW_TILE) * _ROW_TILE
     return 1 << (max(1, max_rows).bit_length() - 1)
+
+
+def dcp_qsplit_rows(
+    num_rows: int, rank: int, world_size: int
+) -> tuple[int, int, int, int]:
+    """This rank's slot in the gathered buffer and the rows it scores into it.
+
+    Under DCP every rank already all-gathers the whole index cache, so having
+    all ``world_size`` of them score every row recomputes the same top-k that
+    many times. Each rank scores ``[row_lo, row_hi)`` instead, against the full
+    key set, and the selections are all-gathered back.
+
+    The stride is uniform -- ``ceil(num_rows / world_size)`` for every rank --
+    so a rank-major concatenation of stride-sized buffers lands row ``i`` back
+    at row ``i``, with no index exchange. The price is that the last rank's
+    buffer has a tail of unwritten rows: the gathered payload is
+    ``world_size * ceil(num_rows / world_size)`` rows, at most
+    ``world_size - 1`` more than ``num_rows``. That tail sits at gathered
+    indices ``>= num_rows`` and is never read back.
+
+    ``slot_lo`` is where this rank's stride sits in the gathered buffer, and it
+    is deliberately NOT clamped, while ``row_lo``/``row_hi`` -- the rows to
+    score -- are. The in-place all-gather requires its input to alias the
+    CALLING rank's own output slot; a rank with no rows clamps to ``num_rows``,
+    which lands inside a LOWER rank's slot, and that overlap is not a layout
+    RCCL supports. So the two have to be separate numbers rather than one
+    serving both.
+
+    ``row_lo == row_hi`` when a rank has no rows, which is exactly when
+    ``slot_lo >= num_rows``. That is not the same as ``num_rows < world_size``:
+    at ``num_rows=12, world_size=8`` the stride is 2 and the last two ranks are
+    already empty. At ``world_size == 1`` the range is the whole of it.
+    """
+    rows_per_rank = -(-num_rows // world_size)
+    slot_lo = rank * rows_per_rank
+    row_lo = min(slot_lo, num_rows)
+    row_hi = min(slot_lo + rows_per_rank, num_rows)
+    return rows_per_rank, slot_lo, row_lo, row_hi

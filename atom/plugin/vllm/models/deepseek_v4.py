@@ -103,6 +103,13 @@ class IndexerVllm(IndexerBase):
             next_n=int(indexer_meta["decode_next_n"]),
             n_committed_per_seq=n_committed_per_seq[:num_decodes],
         )  # [num_decode_tokens, topk] int32
+        if num_decode_tokens >= q_quant.size(0):
+            # No prefill rows left, e.g. under MTP a step of only 1-token
+            # decodes (max_query_len < decode_q, so not a uniform decode). The
+            # dense path must never run on an empty slice: its committed meta
+            # still claims one row and the paged K gather would read through an
+            # empty block table.
+            return decode_topk
         # Prefill rows: dense logits now sized only by the PREFILL seqs'
         # committed K (the bridge builds the committed meta over the prefill
         # sub-batch), so `total_committed` no longer explodes.
@@ -241,7 +248,7 @@ class DeepseekV4AttentionVllm(DeepseekV4AttentionBase):
       ``forward_impl`` — reconciled in the ``_sparse_attention`` override below,
       which is the one of the three that reads the real-sized metadata. (This is
       the path exercised by the launch config; without that clip the padded
-      ``q`` reaches ``sparse_attn_v4_paged_prefill`` while ``kv_indptr_prefix``
+      ``q`` reaches ``sparse_attn_v4_paged_2src`` while ``kv_indptr_prefix``
       is real-sized.)
 
     In both, slice every per-token input down to the real token count before the

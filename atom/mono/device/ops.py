@@ -9,7 +9,8 @@ Ported from the FlyDSL GLM-5 layer kernel (ROCm/FlyDSL branch
 ``kernels/mla_moe_layer/shared_reuse_moe_kernel.py``). Only published flydsl APIs
 and aiter's vendored ``buffer_ops`` / ``dpp_utils`` are used.
 
-Every function but ``kernel_symbol`` is traced inside a ``@flyc.kernel`` body.
+Every function but ``kernel_symbol`` and ``launcher`` is traced inside a
+``@flyc.kernel`` body.
 
 Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
 ``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
@@ -21,6 +22,9 @@ transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
 
 from __future__ import annotations
 
+import re
+
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
@@ -28,7 +32,7 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
@@ -53,6 +57,21 @@ def kernel_symbol(stem, **params):
     aiter's ``_ZN5aiter...E`` kernels are."""
     name = f"{stem}_{kernel_signature(**params)}"
     return f"_ZN4atom{len(name)}{name}E"
+
+
+def launcher(symbol):
+    """``flyc.jit`` for the launcher of the kernel named ``symbol``
+    (``kernel_symbol``), named ``launch_<stem>_<params>`` after it: FlyDSL
+    names a launcher's cache directory after the function, on its first call.
+    Renamed once jitted: the rewriter finds the function by its name."""
+    name = re.fullmatch(r"_ZN4atom\d+(\w+)E", symbol)[1]
+
+    def jit(fn):
+        jitted = flyc.jit(fn)
+        jitted.func.__name__ = f"launch_{name}"
+        return jitted
+
+    return jit
 
 
 def rsrc(addr, nbytes=None):
@@ -289,6 +308,13 @@ def ld_i32(ptr, i):
     return fx.Int32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.i32))
 
 
+def row_live(batch_ids, k):
+    """Whether row k of the step is a request's: its ``batch_id_per_q_token``
+    entry, -1 on a CUDA-graph pad row (wave-uniform for a uniform k). A pad row
+    runs like any other but joins no decision another row's work depends on."""
+    return uniform(ld_i32(batch_ids, k)) >= 0
+
+
 def ld_dev(ptr, i, words=1):
     """``words`` i32 (1, 2 or 4) of a buffer from word ``i``, at device scope
     (past the per-XCD L2)."""
@@ -300,17 +326,29 @@ def ld_dev(ptr, i, words=1):
 LOAD_BATCH = 4  # rounds of a strided loop whose loads go out together
 
 
+def first_rounds(tid, n, load, batch=LOAD_BATCH):
+    """``batched_rounds``' first batch of loads, issued by a caller ahead of a
+    wait the loads do not depend on (``batched_rounds(..., first=)``)."""
+    rounds = -(-n // THREADS)
+    return [load(fx.min(tid + THREADS * i, n - 1)) for i in range(min(batch, rounds))]
+
+
 @traced
-def batched_rounds(tid, n, load, use, batch=LOAD_BATCH):
+def batched_rounds(tid, n, load, use, batch=LOAD_BATCH, first=None):
     """A CTA's strided loop over elements v = tid + THREADS i < n (n a Python
     int): ``load(v)`` of ``batch`` rounds issued before any ``use(v, loaded)``.
     A round whose ``use`` stores to global memory keeps the next round's loads
     behind it (they may alias), so the rounds' loads would go out in series. A
-    round past n loads element n - 1 (in range) and uses nothing."""
+    round past n loads element n - 1 (in range) and uses nothing. ``first``:
+    the first batch's loads, already issued (``first_rounds``)."""
     rounds = -(-n // THREADS)
+    assert first is None or len(first) == min(batch, rounds), (len(first), n)
     for b0 in range_constexpr(0, rounds, batch):
         idx = range(b0, min(b0 + batch, rounds))
-        got = [load(fx.min(tid + THREADS * i, n - 1)) for i in idx]
+        if const_expr(b0 == 0 and first is not None):
+            got = first
+        else:
+            got = [load(fx.min(tid + THREADS * i, n - 1)) for i in idx]
         for i, g in zip(idx, got):
             v = tid + THREADS * i
             if v < n:
@@ -423,3 +461,157 @@ def fp8_pack4(a, b, c, d):
     """Four f32 (already in range) -> one dword of four E4M3 bytes, RNE."""
     lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a, b, fx.Int32(0), False))
     return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, c, d, lo, True))
+
+
+# --- moved verbatim from GLM-5.2's second copy of this file ---
+
+_UMAX_DPP_ASM = "\n".join(
+    [
+        "s_nop 1\nv_max_u32_dpp $0, $0, $0 " + control
+        for control in (
+            "row_shr:1 bound_ctrl:0",
+            "row_shr:2 bound_ctrl:0",
+            "row_shr:4 bound_ctrl:0",
+            "row_shr:8 bound_ctrl:0",
+            "row_bcast:15 row_mask:0xa",
+            "row_bcast:31 row_mask:0xc",
+        )
+    ]
+)
+
+
+def uniform_f32(value):
+    return uniform(fx.Float32(value).bitcast(fx.Int32)).bitcast(fx.Float32)
+
+
+def spin_pause() -> None:
+    """Keep tagged-mailbox polling loads inside the retry loop."""
+
+    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+
+
+def read_lane_i32(value, lane):
+    """Read one i32 from ``lane`` while keeping IR conversion local."""
+
+    return fx.Int32(rocdl.readlane(T.i32, fx.Int32(value), fx.Int32(lane)))
+
+
+def write_lane_i32(value, lane, vector):
+    """Write one i32 into ``lane`` of a wave-distributed value."""
+
+    return fx.Int32(
+        llvm.call_intrinsic(
+            T.i32,
+            "llvm.amdgcn.writelane.i32",
+            [as_ir_value(fx.Int32(item)) for item in (value, lane, vector)],
+            [],
+            [],
+        )
+    )
+
+
+def bpermute_i32(byte_offset, value):
+    """Read an i32 VGPR value from the lane selected by a byte offset."""
+
+    return fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(byte_offset), fx.Int32(value)))
+
+
+def mem_realtime():
+    """Read the device-wide 64-bit realtime counter."""
+
+    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+
+
+def _hardware_f32(name, value):
+    return fx.Float32(
+        llvm.call_intrinsic(T.f32, name, [fx.Float32(value).ir_value()], [], [])
+    )
+
+
+def rsq(value):
+    return _hardware_f32("llvm.amdgcn.rsq.f32", value)
+
+
+def rcp(value):
+    return _hardware_f32("llvm.amdgcn.rcp.f32", value)
+
+
+def exp(value):
+    return _hardware_f32("llvm.amdgcn.exp2.f32", fx.Float32(value) * 1.4426950408889634)
+
+
+def wave_umax(value):
+    return fx.Int32(fx.coop.warp_reduce(fx.Uint32(value), fx.ReductionOp.MAX, width=64))
+
+
+def wave_umax_dpp(value):
+    """Return a wave maximum through the tuned GLM/TileRT DPP schedule."""
+
+    result = llvm.InlineAsmOp(
+        T.i32, [as_ir_value(fx.Int32(value))], _UMAX_DPP_ASM, "=v,0"
+    ).result
+    return read_lane_i32(result, 63)
+
+
+def fp8_roundtrip(lhs, rhs):
+    """Round an f32 pair through E4M3FN and return the f32 pair."""
+
+    word = rocdl.cvt_pk_fp8_f32(T.i32, lhs, rhs, fx.Int32(0), False)
+    pair_type = fx.Vector.make_type(2, fx.Float32)
+    pair = fx.Vector(rocdl.cvt_pk_f32_fp8(res=pair_type, src=word, word_sel=False))
+    return pair[0], pair[1]
+
+
+def f8_word(k):
+    """Map an FP8 activation index to the packed LDS word order."""
+
+    return (k // 64) * 16 + ((k % 32) // 8) * 4 + ((k % 64) // 32) * 2 + (k % 8) // 4
+
+
+def fp8_to_bf16x8(word0, word1):
+    """Convert two dwords of eight FP8 values to a BF16 vector."""
+
+    one = as_ir_value(fx.Float32(1.0))
+    parts = []
+    for word in (word0, word1):
+        for half in range_constexpr(2):
+            pair = fx.Vector(
+                rocdl.cvt_scalef32_pk_bf16_fp8(
+                    T.vec(2, T.bf16), as_ir_value(word), one, bool(half)
+                )
+            )
+            parts += [pair[0], pair[1]]
+    return fx.Vector.from_elements(parts, fx.BFloat16)
+
+
+def mxfp8_to_bf16x8(word0, word1, scale):
+    """Convert two dwords of eight FP8 values with one E8M0 block scale to BF16."""
+
+    scale = as_ir_value(scale)
+    parts = []
+    for word in (word0, word1):
+        for half in range_constexpr(2):
+            pair = fx.Vector(
+                rocdl.cvt_scalef32_pk_bf16_fp8(
+                    T.vec(2, T.bf16), as_ir_value(word), scale, bool(half)
+                )
+            )
+            parts += [pair[0], pair[1]]
+    return fx.Vector.from_elements(parts, fx.BFloat16)
+
+
+def mxfp4_to_bf16x8(word, scale):
+    """Convert one packed dword of eight scaled E2M1 values to BF16."""
+
+    parts = []
+    for select in range_constexpr(4):
+        pair = fx.Vector(
+            rocdl.cvt_scalef32_pk_bf16_fp4(
+                T.vec(2, T.bf16),
+                as_ir_value(word),
+                as_ir_value(scale),
+                select,
+            )
+        )
+        parts += [pair[0], pair[1]]
+    return fx.Vector.from_elements(parts, fx.BFloat16)

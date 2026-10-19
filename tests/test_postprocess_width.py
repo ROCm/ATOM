@@ -170,6 +170,7 @@ def test_prefill_really_does_run_wider_than_it_scheduled():
         dp_size=1,
         dp_group=None,
         enforce_eager=False,
+        step_needs_eager=False,
         capture_sizes=np.array([1, 2, 4, 8], dtype=np.int32),
         captured_tokens=None,
         is_block_drafter=False,

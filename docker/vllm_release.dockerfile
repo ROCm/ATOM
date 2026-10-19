@@ -84,7 +84,7 @@ RUN echo "========== [OOT 4/7] Install vLLM ROCm build dependencies ==========" 
     "${VENV_PYTHON}" -m pip install --upgrade pip && \
     sed -i -e '/^[[:space:]]*"torch == /d' pyproject.toml && \
     sed -i -e '/xgrammar/d' -e '/compressed-tensors/d' requirements/common.txt && \
-    "${VENV_PYTHON}" -m pip install --no-deps "xgrammar>=0.2.1,<1.0.0" "compressed-tensors==0.17.0" loguru && \
+    "${VENV_PYTHON}" -m pip install --no-deps "xgrammar==0.2.7" "compressed-tensors==0.17.0" loguru && \
     sed -i -e '/peft/d' -e '/tensorizer/d' -e '/runai/d' -e '/timm/d' -e '/tilelang/d' requirements/rocm.txt && \
     "${VENV_PYTHON}" -m pip install --no-deps peft "tensorizer==2.10.1" "runai-model-streamer==0.15.7" "timm>=1.0.17" "tilelang==0.1.10" "torch-c-dlpack-ext==0.1.5" "z3-solver==4.15.4.0" && \
     "${VENV_PYTHON}" -m pip install --no-deps \
