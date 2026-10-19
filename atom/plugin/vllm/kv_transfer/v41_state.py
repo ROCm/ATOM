@@ -23,25 +23,11 @@ transfer may carry and caps hits to one. The blocks themselves are resolved by
 from __future__ import annotations
 
 import logging
-import os
-import time
 from typing import Any
 
 from .page_ride import NULL_BLOCK_ID, PageRideMixin
 
 logger = logging.getLogger("atom")
-
-
-#: Whether a checkpoint may back a LOCAL prefix hit. Separate from whether
-#: checkpoints are wired, so the two halves can be measured apart: storing and
-#: restoring checkpoints is testable without opening the gate that lets vLLM
-#: serve a hit which -- if no checkpoint happens to sit at that exact position --
-#: is a dead engine rather than a slow one.
-_CHECKPOINT_LOCAL_HITS_ENABLED = os.environ.get("ATOM_V41_CHECKPOINT_LOCAL_HITS") in (
-    "1",
-    "true",
-    "True",
-)
 
 
 class V41BoundaryPlanner(PageRideMixin):
@@ -64,19 +50,11 @@ class V41BoundaryPlanner(PageRideMixin):
         checkpoint_group_ids: tuple[int, ...] = (),
         keep_a_prefill_tail: bool = False,
     ) -> None:
+        # `hash_block_size` is the unit `request.block_hashes` is in;
+        # `boundary_grid` is where a STATE boundary may sit (V4.1's PAGE
+        # block). They differ once a second kv cache group makes the hash unit
+        # the smallest group's -- with DSpark, 32 against the proxy's 256.
         self.hash_block_size = int(hash_block_size)
-        # Two different things that used to be one.
-        #
-        # `hash_block_size` is the unit vLLM's `request.block_hashes` are in;
-        # indexing that list with anything else reads the wrong entry.
-        # `boundary_grid` is the grid a STATE boundary may sit on, which for
-        # V4.1 is its PAGE block: state is only restorable at a whole PAGE
-        # edge. They coincide while there is one kv cache group and diverge
-        # the moment there are two, because the hash unit is engine-wide and
-        # becomes the smallest group's -- with DSpark, 32 against the proxy's
-        # 256. Measured: `cap_hit` then accepted a boundary at 96 tokens,
-        # which is a legal 32-grid point, is not a PAGE edge, and floors to
-        # zero chunks at the caller. The hit it capped was 1280.
         self.boundary_grid = int(boundary_grid or hash_block_size)
         if self.boundary_grid % self.hash_block_size:
             raise ValueError(
@@ -107,36 +85,14 @@ class V41BoundaryPlanner(PageRideMixin):
                 "object with no checkpoint group to name it; a transfer would "
                 "carry KV whose state is someone else's"
             )
-        # Decided by the caller, which holds the VllmConfig. Asking vLLM for
-        # its *current* config from here returns None -- the scheduler calls
-        # `cap_local_hit` outside any `set_current_vllm_config` scope -- so a
-        # check made here was false on every request and this gate never
-        # opened (measured: local_cap_checkpoint=0 with ATOM_V41_CHECKPOINT_LOCAL_HITS=1).
+        # Decided by the caller, which holds the VllmConfig: the scheduler
+        # calls `cap_local_hit` outside any `set_current_vllm_config` scope.
         self._state_checkpoints_can_serve = bool(state_checkpoints_can_serve)
         self._lookup_ctx: tuple[str, Any] | None = None
-        self._counters: dict[str, int] = {
-            "cap_kept": 0,
-            "cap_declined": 0,
-            "cap_unarmed": 0,
-            # The same pair, for hits vLLM served from its own pool without
-            # asking the connector. Kept apart because they answer different
-            # questions: the connector pair measures the tier, this pair
-            # measures what prefix caching costs on a model whose state the
-            # block pool carries only through checkpoints.
-            "local_cap_declined": 0,
-            #: Local hits passed through whole because a checkpoint
-            #: can restore the state at the hit. Zero while checkpoints are off.
-            "local_cap_checkpoint": 0,
-            # Ride hits pulled one grid back so a speculative run never
-            # resumes with a single token left; see `keep_a_prefill_tail`.
-            "cap_prefill_tail": 0,
-        }
-        # Seeds the `ride_*` counters too; see `page_ride.RIDE_COUNTERS`.
         self._init_page_ride()
         # One warning per planner, not per hit: an unarmed cap fires once
         # per request on whatever path is missing its arming.
         self._warned_unarmed = False
-        self._last_stats_log = 0.0
 
     # -- lookup ----------------------------------------------------------
     def begin_lookup(self, request) -> None:
@@ -163,20 +119,13 @@ class V41BoundaryPlanner(PageRideMixin):
         if hit <= 0:
             return hit
         if self._lookup_ctx is None:
-            # Fail closed. An unarmed hook used to return the hit untouched,
-            # so an external hit that never reached a boundary test was served
-            # whole: PAGE restored to a position whose STATE was never
-            # written, and `_report_stale_state` then killing the engine
-            # ("needs state at 6912, found 3").
-            self._counters["cap_unarmed"] += 1
+            # Fail closed: an external hit that never reached a boundary test
+            # would restore PAGE to a position whose STATE was never written.
             if not self._warned_unarmed:
                 self._warned_unarmed = True
                 logger.warning(
                     "V4.1 state offload: the hit cap fired outside a lookup "
-                    "(seq=%s, hit=%d) and declined it. Every external hit has "
-                    "to pass a boundary test, so a path that caps without "
-                    "arming is a path that would restore PAGE bytes with no "
-                    "STATE behind them.",
+                    "(seq=%s, hit=%d); declining the external hit",
                     getattr(seq, "id", None),
                     hit,
                 )
@@ -193,58 +142,26 @@ class V41BoundaryPlanner(PageRideMixin):
         boundary = (hit // self.boundary_grid) * self.boundary_grid
         total = int(getattr(request, "num_tokens", 0) or 0)
         if self.keep_a_prefill_tail and total and total - boundary < 2:
-            # Measured: a 1025-token prompt hit at 1024 came back padded to
-            # a `(1024, 6, 5)` verify row, beside a resumed `(768, 200, 0)`
-            # prefill, and the batch was refused. One grid back costs a
-            # PAGE of recompute for prompts that end one token past a
-            # boundary.
+            # A one-token tail would be admitted as a padded verify row; one
+            # grid back keeps it a prefill, at a PAGE of recompute.
             boundary -= self.boundary_grid
-            self._counters["cap_prefill_tail"] += 1
         if boundary <= 0:
-            self._counters["cap_declined"] += 1
             return 0
-        self._counters["cap_kept"] += 1
         return min(hit, boundary)
 
-    def counters(self) -> dict:
-        return dict(self._counters)
-
     def cap_local_hit(self, request, hit: int) -> int:
-        """Pass vLLM's *own* prefix-cache hit only if a checkpoint backs it.
+        """vLLM's *own* prefix-cache hit, served only if a checkpoint backs it.
 
-        The connector-side `cap_hit` only sees hits vLLM asked it about. With
-        prefix caching on, vLLM's block pool answers first and keeps whatever
-        it can serve locally -- a path the connector is never consulted on. A
-        request admitted that way arrives with its PAGE prefix restored and a
-        state slot that was never written, which `_report_stale_state` turns
-        into a dead engine. So a local hit is served only when the checkpoint
-        group already reduced it to a boundary it holds a checkpoint for, and
-        declined otherwise -- which sends the whole prefix through the tier,
-        with its state.
+        vLLM has already reduced the hit to a boundary the checkpoint groups
+        hold a checkpoint for: its coordinator takes the minimum across groups,
+        and a checkpoint group offers only boundaries it has a cached block
+        for. So with checkpoint groups the hit stands as it is (capping it
+        again would land on a position nothing wrote). Without them nothing
+        could restore the state, and the hit is declined.
         """
         hit = int(hit)
-        self._counters["local_cap_calls"] = self._counters.get("local_cap_calls", 0) + 1
-        if hit <= 0:
+        if hit <= 0 or self._state_checkpoints_can_serve:
             return hit
-        if self._state_checkpoints_can_serve and _CHECKPOINT_LOCAL_HITS_ENABLED:
-            # Left alone. vLLM has already reduced this hit to a boundary
-            # the state group can serve: its coordinator takes the minimum
-            # across groups, and the checkpoint group only offers boundaries it
-            # has a cached checkpoint block for (measured: the group
-            # answered 1280 for a 1345-token prompt whose checkpoint is at
-            # 1280).
-            #
-            # Capping it here manufactured the very mismatch this branch
-            # was written to avoid. `get_mamba_prefill_checkpoint_position`
-            # is a rule about a raw prefix length; applied to an
-            # already-snapped hit it returns one block lower, which is a
-            # position nothing wrote -- `needs state at 1024, found 3`.
-            self._counters["local_cap_checkpoint"] += 1
-            return hit
-        # Declining is the only position a request may legally sit at besides
-        # a stored boundary, and the tier then serves the whole prefix with
-        # its checkpoint.
-        self._counters["local_cap_declined"] += 1
         return 0
 
     # -- load ------------------------------------------------------------
@@ -290,7 +207,6 @@ class V41BoundaryPlanner(PageRideMixin):
             return False
         block_ids = self._boundary_blocks(group_blocks, boundary)
         if not block_ids:
-            self._counters["ride_missing"] += 1
             return False
         self._record_ride_boundary(str(request.request_id), boundary, block_ids)
         return True
@@ -302,30 +218,3 @@ class V41BoundaryPlanner(PageRideMixin):
         bytes.
         """
         self.forget_ride(req_id)
-
-    # -- observability ---------------------------------------------------
-    def stats(self) -> dict[str, int]:
-        return dict(self._counters)
-
-    #: Seconds between stat lines.
-    _STATS_INTERVAL = 60.0
-
-    def log_stats(
-        self, *, interval_s: float | None = None, force: bool = False
-    ) -> None:
-        """Say what this leg did, including when it did nothing.
-
-        Unconditional, for the reason K3's counters exist: a run that produced
-        exactly zero joint hits otherwise produces exactly zero lines saying
-        so, and a by-construction null reads as a quiet success.
-        """
-        now = time.monotonic()
-        if interval_s is None:
-            interval_s = self._STATS_INTERVAL
-        if not force and now - self._last_stats_log < interval_s:
-            return
-        self._last_stats_log = now
-        logger.info(
-            "ATOM LMCache offload: V4.1 state leg %s",
-            ", ".join(f"{k}={v}" for k, v in sorted(self.stats().items())),
-        )

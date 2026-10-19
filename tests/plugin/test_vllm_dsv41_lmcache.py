@@ -11,7 +11,6 @@ from unittest.mock import Mock
 
 import pytest
 
-from atom.plugin.vllm.kv_transfer import v41_state
 from atom.plugin.vllm.kv_transfer.connector import AtomLMCacheOffloadConnector
 from atom.plugin.vllm.kv_transfer.page_ride import PageRideMixin
 from atom.plugin.vllm.kv_transfer.v41_state import V41BoundaryPlanner
@@ -59,13 +58,10 @@ def test_a_speculative_ride_never_resumes_one_token_short(keep_tail, expected):
     assert _cap(_planner(keep_tail=keep_tail), 1024, num_tokens=1025) == expected
 
 
-def test_a_local_hit_needs_both_a_checkpoint_and_the_gate(monkeypatch):
+def test_a_local_hit_stands_only_where_a_checkpoint_can_restore_it():
     request = SimpleNamespace(request_id="r")
-    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", True)
     assert _planner(can_serve=False).cap_local_hit(request, 1280) == 0
     assert _planner(can_serve=True).cap_local_hit(request, 1280) == 1280
-    monkeypatch.setattr(v41_state, "_CHECKPOINT_LOCAL_HITS_ENABLED", False)
-    assert _planner(can_serve=True).cap_local_hit(request, 1280) == 0
 
 
 @pytest.mark.parametrize(
@@ -98,7 +94,6 @@ def _ride():
         ride_group_ids = (1,)
 
         def __init__(self):
-            self._counters = {}
             self._init_page_ride()
 
     p = _P()
@@ -123,7 +118,7 @@ def test_a_save_rides_on_the_committed_source_and_pins_it():
     p, request = _ride()
     assert p.take_ride_state(request, "r0", 512, operation="op").block_ids == (42,)
     assert p.take_ride_state(request, "r0", 500, operation="op2") is None
-    assert p._counters["ride_pinned"] == 1
+    assert p._ride_pins == {"op": (42,)}
 
 
 # -- connector ---------------------------------------------------------------
@@ -195,7 +190,6 @@ def _promising_connector(parked):
     c._promised_loads = {"7": [0, 32, 64, parked]}
     c._config = SimpleNamespace(kv_cache_block_size=16)
     c._seqs = {"7": SimpleNamespace(block_table=list(range(100, 116)))}
-    c._scheduler = SimpleNamespace(last_load_skip_reason=lambda _rid: "declined")
     return c
 
 

@@ -42,7 +42,6 @@ What V4.1 decides differently from V4, and why:
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass
 
@@ -58,8 +57,6 @@ from atom.plugin.vllm.paged_state_checkpoint_scheduler import (
     SchedulerStateCheckpoints,
     StateCheckpointPlacement,
 )
-
-logger = logging.getLogger(__name__)
 
 #: Suffix of the checkpoint layer names. Positional: unit *i* of the checkpoint is
 #: layer *i*, so the order is the key space and renumbering makes every
@@ -459,14 +456,7 @@ def apply_vllm_v41_prefix_install() -> None:
     vLLM may never activate the platform.
     """
     register_v41_state_checkpoint_adapter()
-    installed = install()
-    if any(installed):
-        logger.info(
-            "ATOM DeepSeek-V4.1: installed checkpoint hooks "
-            "(get_kv_cache_configs=%s, kv zeroing=%s, runner events=%s, "
-            "placement scheduler=%s)",
-            *installed,
-        )
+    install()
     install_v41_store_sites()
     install_v41_state_checkpoint_group_ids()
     install_v41_runner_state_events()
@@ -517,13 +507,6 @@ def install_v41_group_check_scope() -> bool:
             kv_cache_groups=ours,
             kv_cache_tensors=cfg.kv_cache_tensors,
             num_blocks=cfg.num_blocks,
-        )
-        logger.info(
-            "ATOM DeepSeek-V4.1: checkpoint group check scoped to %d of %d groups "
-            "(%d belong to another pool, e.g. the DSpark draft)",
-            len(ours),
-            len(groups),
-            len(groups) - len(ours),
         )
         return original(scoped, adapter, sizing)
 
@@ -597,11 +580,6 @@ def install_v41_runner_state_events() -> int:
         _update_states._atom_v41_state_events = True
         setattr(cls, name, _update_states)
         patched += 1
-    if patched:
-        logger.info(
-            "ATOM DeepSeek-V4.1: checkpoint step events on %d model runner class(es)",
-            patched,
-        )
     return patched
 
 
@@ -645,12 +623,6 @@ def install_v41_state_checkpoint_group_ids() -> int:
         initialize_kv_cache._atom_v41_checkpoint_gids = True
         cls.initialize_kv_cache = initialize_kv_cache
         patched += 1
-    if patched:
-        logger.info(
-            "ATOM DeepSeek-V4.1: checkpoint group ids recorded on %d model runner "
-            "class(es)",
-            patched,
-        )
     return patched
 
 
@@ -729,10 +701,4 @@ def install_v41_store_sites() -> int:
         execute_model._atom_v41_store_site = True
         cls.execute_model = execute_model
         patched += 1
-    if patched:
-        logger.info(
-            "ATOM DeepSeek-V4.1: checkpoint store sites on %d model runner "
-            "class(es)",
-            patched,
-        )
     return patched

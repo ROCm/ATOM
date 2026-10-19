@@ -152,12 +152,6 @@ def _without_v41_checkpoint_groups(groups, kv_cache_config):
         if 0 <= int(group_id) < len(cfg_groups):
             names = list(getattr(cfg_groups[int(group_id)], "layer_names", []) or [])
         if names and all(is_state_checkpoint_layer(n) for n in names):
-            logger.info(
-                "ATOM LMCache offload: kv cache group %s is DeepSeek-V4.1's "
-                "state-checkpoint group (%d layers); not offloading it",
-                group_id,
-                len(names),
-            )
             continue
         kept.append((group_id, spec))
     return kept
@@ -289,15 +283,9 @@ class AtomOffloadWorkerMetadata(KVConnectorWorkerMetadata):
 def _v41_state_checkpoints_can_serve(vllm_config) -> bool:
     """Whether a V4.1 state checkpoint may back a LOCAL prefix hit.
 
-    Takes the config rather than reading vLLM's current one. The scheduler
-    calls `cap_local_hit` outside any `set_current_vllm_config` scope, so
-    `get_current_vllm_config_or_none()` is None there and the check it fed was
-    false on every request -- the gate `ATOM_V41_CHECKPOINT_LOCAL_HITS` opens never
-    actually opened. Here the caller already holds the config.
-
-    Guarded: this module is used on configurations where the checkpoint
-    module's vLLM imports are unavailable, and a local hit refused for that
-    reason is the old, safe behaviour.
+    Takes the config: the scheduler calls `cap_local_hit` outside any
+    `set_current_vllm_config` scope. Where the checkpoint module cannot be
+    imported, local hits are refused.
     """
     try:
         from atom.plugin.vllm.deepseek_v41_state_checkpoint import (
@@ -738,14 +726,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                         )
                         or 0
                     )
-                    logger.info(
-                        "ATOM LMCache offload: V4.1 proxy is kv cache group "
-                        "%d of %d, block_size=%d (engine-wide block size is "
-                        "the smallest group's, so coverage is priced here)",
-                        gid,
-                        len(groups),
-                        self._attn_block_size,
-                    )
                     return gid
             raise ValueError(
                 "ATOM offload connector: DeepSeek-V4.1 is configured but no "
@@ -790,14 +770,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         from .v41_state import V41BoundaryPlanner
 
         _, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
-        logger.info(
-            "ATOM LMCache offload: V4.1 planner hash_block_size=%d, "
-            "boundary grid=%d (the hash unit indexes "
-            "request.block_hashes and is engine-wide; the grid is where a "
-            "STATE boundary may sit and is the PAGE block)",
-            int(hash_block_size),
-            int(getattr(self, "_attn_block_size", 0) or 0) or int(hash_block_size),
-        )
         # The grid a STATE boundary may sit on is V4.1's PAGE block, which
         # is the attention group's. `hash_block_size` is engine-wide and
         # becomes the smallest group's, so with a draft group the two part
@@ -1947,7 +1919,6 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
             for req_id in skip:
                 self._v41_planner.forget_request(req_id)
-            self._v41_planner.log_stats()
             # After this step's stores, deliberately: a ride pinned for a save
             # built here must see its own operation in the scheduler's live
             # set. `_collect_kda_stores` does the same for the recurrent leg,
@@ -2280,10 +2251,7 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 "ATOM LMCache offload: promised a load for %s but none was "
                 "dispatched within %d steps; withdrawing the promise so the "
                 "request leaves WAITING_FOR_REMOTE_KVS and recomputes",
-                sorted(
-                    f"{r}({self._scheduler.last_load_skip_reason(r)})"
-                    for r, _ in withdrawn
-                ),
+                sorted(r for r, _ in withdrawn),
                 self._PROMISE_GRACE_STEPS,
             )
         return withdrawn

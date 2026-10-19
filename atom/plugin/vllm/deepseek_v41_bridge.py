@@ -2176,7 +2176,6 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         return len(slots)
 
     install_state_checkpoint_restore_hook(restore)
-    logger.info("ATOM DeepSeek-V4.1: checkpoint restores wired into prepare_state")
 
 
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:
