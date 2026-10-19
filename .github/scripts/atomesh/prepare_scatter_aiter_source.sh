@@ -27,3 +27,7 @@ src = root / "csrc/kernels/mxfp4_moe/moe_aux/moe_scatter_reduce.cuh"
 assert "sorted_pos >= max_sorted" in src.read_text()
 print(f"[scatter-bounds] aiter_sha={sys.argv[2]} source={aiter.__file__}")
 PY
+
+# Gate this kernel experiment before either model replica is loaded. The
+# checker asserts real Gluon execution, split coverage and numerical accuracy.
+python3 "${scatter_source}/op_tests/triton_tests/attention/check_m3_gluon.py"

@@ -869,6 +869,36 @@ class PagedAttentionImpl(nn.Module):
 
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
+        # Isolated C32 experiment: replace cached dense attention only. Keep
+        # uncached profiling, decode, cache allocation and the baseline CI
+        # instrumentation unchanged so the comparison has one runtime change.
+        if attn_metadata.has_cached:
+            from atom.model_ops.gluon_prefill import run_gluon_prefill
+
+            output = run_gluon_prefill(
+                unified_attention,
+                q,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                softmax_scale=self.scale,
+                sliding_window=self.sliding_window,
+                sinks=self.sinks,
+            )
+            if not getattr(self, "_logged_gluon_c32", False):
+                import logging
+
+                logging.getLogger("atom").info(
+                    "[gluon-c32] cached prefill backend=gluon draft=%s "
+                    "q=%s kv=%s; baseline decode and KV budgeting retained",
+                    fwd_ctx.context.is_draft,
+                    tuple(q.shape),
+                    tuple(k_cache.shape),
+                )
+                self._logged_gluon_c32 = True
+            return output
         # Prefix-cache hit: gather cached+new KV from the paged cache into a
         # dense packed [total_kv, ...] tensor (new tokens were already written
         # during rope_cache). The varlen kernel below (FP8 asm or BF16) then

@@ -519,6 +519,10 @@ jobs:
           fi
           cat atomesh-matrix.json
 
+      - name: Verify Gluon C32 has only the kernel change
+        if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') }}
+        run: python3 .github/scripts/atomesh/check_m3_gluon_c32.py --matrix atomesh-matrix.json
+
       - name: Group benchmark matrix by configuration
         id: groups
         if: ${{ steps.matrix.outputs.has_matrix == 'true' }}
