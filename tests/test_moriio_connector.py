@@ -13,8 +13,10 @@ their own, and the rest is asserted against the source.
 from __future__ import annotations
 
 import ast
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CONNECTOR = ROOT / "atom/kv_transfer/disaggregation/moriio/moriio_connector.py"
@@ -145,25 +147,25 @@ class ConnectorSourceTest(unittest.TestCase):
             body.index("self._verify_landed(req_id)"),
         )
 
-    def test_deferred_requests_are_all_drained(self):
+    def test_start_load_kv_never_waits_for_a_handshake(self):
         body = self.segment("start_load_kv")
-        # Every deferred request needs its read issued, not only the first.
-        self.assertNotIn("get_nowait", body)
-        self.assertIn("while deferred:", body)
-        self.assertIn("deferred -= 1", body)
+        # It runs on the worker's busy loop; get_finished issues the read.
+        self.assertNotIn("_ready_requests.get", body)
+        self.assertIn("self._awaiting_handshake[req_id] =", body)
+        self.assertIn("self._issue_ready_reads()", self.segment("get_finished"))
 
     def test_handshake_guard_uses_the_dp_suffixed_id(self):
         body = self.segment("start_load_kv")
-        inner = body[body.index("with self._handshake_lock:") :]
         # _remote_agents is keyed by the dp-suffixed id, so testing the bare
         # engine id would re-run the handshake for every request.
-        self.assertIn("if dp0_id not in self._remote_agents:", inner)
-        self.assertNotIn("if remote_engine_id not in self._remote_agents:", inner)
+        self.assertIn("known = peer in self._remote_agents", body)
+        self.assertNotIn("remote_engine_id in self._remote_agents", body)
 
     def test_handshake_wait_is_bounded(self):
-        body = self.segment("start_load_kv")
-        self.assertIn("self._handshake_timeout_s", body)
-        self.assertIn("queue.Empty", body)
+        body = self.segment("_issue_ready_reads")
+        self.assertIn("now >= deadline", body)
+        self.assertIn("self._failed_before_read.add(req_id)", body)
+        self.assertIn("zmq.RCVTIMEO", self.segment("_execute_handshake"))
 
     def test_unimplemented_transfer_subsets_are_not_ignored(self):
         body = self.segment("_rejects_transfer_subset")
@@ -178,7 +180,7 @@ class ConnectorSourceTest(unittest.TestCase):
         body = self.segment("_issue_read_for_req")
         # start_load_kv runs on the worker's busy_loop, so an escaping exception
         # takes down the async proc of the rank, not just the request.
-        self.assertIn("except ValueError:", body)
+        self.assertIn("except Exception:", body)
         self.assertNotIn("raise ValueError", body)
         # And the failure has to reach the scheduler, or the request hangs.
         self.assertIn("_failed_before_read", self.segment("get_finished"))
@@ -188,10 +190,26 @@ class ConnectorSourceTest(unittest.TestCase):
         # Echoed-back descriptors make every read a local copy that reports
         # SUCCESS while the destination never changes.
         self.assertIn("local_metas == remote_metas", body)
-        self.assertIn("logger.error", body)
+        check = body[body.index("local_metas == remote_metas") :]
+        self.assertIn("raise ValueError", check[:200])
+
+    def test_env_vars_are_defined_and_documented(self):
+        self.assertNotIn("os.environ", self.source)
+        defined = (ROOT / "atom/utils/envs.py").read_text()
+        documented = (ROOT / "docs/environment_variables.md").read_text()
+        for suffix in ("MODE", "HANDSHAKE_TIMEOUT_S", "WRITE_TIMEOUT_S", "VERIFY"):
+            name = f"ATOM_MORIIO_{suffix}"
+            self.assertIn(f"envs.{name}", self.source)
+            self.assertIn(f'"{name}"', defined)
+            self.assertIn(f"**{name}**", documented)
+
+    def test_engine_key_is_unique_per_process(self):
+        # MoRI reuses the queue pairs of a key it knows, so a restarted peer
+        # has to come back under a new one.
+        self.assertIn("uuid.uuid4()", self.segment("__init__"))
 
     def test_verify_mode_is_opt_in(self):
-        self.assertIn('os.environ.get("ATOM_MORIIO_VERIFY", "")', self.source)
+        self.assertIn("envs.ATOM_MORIIO_VERIFY", self.source)
         body = self.segment("get_finished")
         # Digesting under the wrapper lock would serialise the step loop
         # against every in-flight transfer.
@@ -332,10 +350,13 @@ class ConnectorBehaviourTest(unittest.TestCase):
         self.assertEqual(before[names[1]], after[names[1]])
 
     def test_a_bad_request_is_recorded_rather_than_raised(self):
+        import threading
         import types
 
         conn = object.__new__(self.connector)
         conn._failed_before_read = set()
+        conn._recving_transfers = {}
+        conn.moriio_wrapper = types.SimpleNamespace(lock=threading.Lock())
         conn.tp_rank = 0  # only read by the entry log
         meta = types.SimpleNamespace(
             num_computed_blocks=0,
@@ -461,18 +482,33 @@ class WritePathTest(unittest.TestCase):
         conn._handshake_timeout_s = 300.0
         conn._handshake_lock = threading.RLock()
         conn._remote_agents = {}
+        conn._read_handshakes = {}
+        conn._awaiting_handshake = {}
+        conn._ready_requests = queue.Queue()
+        conn._recving_transfers = {}
+        conn._recving_transfers_callback_addr = {}
+        conn._held_failures = {}
+        conn._built_sessions = {}
+        conn._retired_sessions = []
+        conn.remote_moriio_metadata = {}
+        conn.layer_name_to_remote_kv_cache_metadata = {}
         conn.done_sending = set()
 
         conn.sent = []
         conn.writes = []
+        conn.notified = []
 
         def write(szs, local_offsets, remote_offsets, session):
             conn.writes.append((session, local_offsets, remote_offsets, szs))
             return FakeStatus()
 
         conn.moriio_wrapper = types.SimpleNamespace(
+            lock=threading.Lock(),
             send_message=lambda frames, host, port: conn.sent.append(
                 (frames, host, port)
+            ),
+            send_notify=lambda transfer_id, host, port: conn.notified.append(
+                (transfer_id, host, port)
             ),
             write_remote_data_status=write,
         )
@@ -489,6 +525,7 @@ class WritePathTest(unittest.TestCase):
             remote_host="10.0.0.1",
             remote_handshake_port=7301,
             remote_dp_rank=0,
+            remote_dp_size=1,
             tp_size=8,
             transfer_id=0,
         )
@@ -509,15 +546,12 @@ class WritePathTest(unittest.TestCase):
 
     def test_mode_defaults_to_write(self):
         mode = self.connector._transfer_mode_from
-        self.assertEqual(mode({}, environ={}), "write")
-        self.assertEqual(mode({"moriio_mode": "READ"}, environ={}), "read")
+        self.assertEqual(mode({}, env_mode=""), "write")
+        self.assertEqual(mode({"moriio_mode": "READ"}, env_mode=""), "read")
         # The env var wins, so a run can flip modes without a new config.
-        self.assertEqual(
-            mode({"moriio_mode": "read"}, environ={"ATOM_MORIIO_MODE": "write"}),
-            "write",
-        )
+        self.assertEqual(mode({"moriio_mode": "read"}, env_mode="write"), "write")
         with self.assertRaises(ValueError):
-            mode({"moriio_mode": "push"}, environ={})
+            mode({"moriio_mode": "push"}, env_mode="")
 
     def test_offsets_are_grouped_by_chunk_pair(self):
         conn = self.make(producer=False)
@@ -531,6 +565,8 @@ class WritePathTest(unittest.TestCase):
         )
 
     def test_the_consumer_asks_its_producer_rank_for_a_push(self):
+        import time
+
         conn = self.make(producer=False)
         conn.request_id_to_transfer_id = {"d1": 77}
         conn._request_write("d1", self.recv_meta([4, 5], [10, 11, 12]))
@@ -549,7 +585,8 @@ class WritePathTest(unittest.TestCase):
             (request["decode_host"], request["decode_handshake_port"]),
             ("10.0.0.2", 7400),
         )
-        self.assertIn("d1", conn._awaiting_write)
+        self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
+        self.assertEqual(conn._awaiting_write["d1"], request["deadline"])
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
@@ -627,6 +664,7 @@ class WritePathTest(unittest.TestCase):
 
     def test_a_failed_push_still_frees_the_source(self):
         conn = self.make(producer=True)
+        conn._remote_agents = {"10.0.0.2:7400_dp0": {"agent"}}
         conn._write_target_ready = lambda request: True
         conn._write_blocks = lambda request, engine_id: [
             FakeStatus("ok"),
@@ -637,6 +675,8 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(conn.done_sending, {9})
         ((frames, _host, _port),) = conn.sent
         self.assertEqual(self.msgpack.loads(frames[1])["ok"], False)
+        # Re-handshaken by the next push, in case the consumer restarted.
+        self.assertEqual(conn._remote_agents, {})
 
     def test_a_malformed_push_request_is_dropped_not_raised(self):
         conn = self.make(producer=True)
@@ -717,16 +757,179 @@ class WritePathTest(unittest.TestCase):
         import time
 
         conn = self.make(producer=False)
-        now = time.monotonic()
-        conn._awaiting_write = {"a": now, "b": now, "late": now - 10_000}
+        now = time.time()
+        conn._awaiting_write = {
+            "a": now + 600,
+            "b": now + 600,
+            "late": now - 10_000,
+            "just_late": now - 1,
+        }
         conn._write_reports = {"a": True, "b": False, "stray": True}
         done, failed = set(), set()
-        conn._collect_write_reports(done, failed)
+        with mock.patch.dict(os.environ, {"ATOM_PD_FAILED_WRITE_HOLD_S": "60"}):
+            conn._collect_write_reports(done, failed)
         self.assertEqual(done, {"a"})
-        # b was reported failed; late never heard back inside the timeout.
-        self.assertEqual(failed, {"b", "late"})
-        self.assertEqual(conn._awaiting_write, {})
+        # just_late is inside the hold, so a push it started may still land.
+        self.assertEqual(failed, {"late"})
+        self.assertEqual(set(conn._awaiting_write), {"just_late"})
+        self.assertIn("b", conn._held_failures)
         self.assertEqual(conn._write_reports, {})
+
+    def test_a_failed_push_is_reported_only_once_no_write_is_in_flight(self):
+        conn = self.make(producer=True)
+        in_flight = FakeStatus("progress")
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: [
+            FakeStatus("failed"),
+            in_flight,
+        ]
+        conn._write_requests.put(self.push_request())
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, set())
+        self.assertEqual(conn.sent, [])
+
+        in_flight.state = "ok"
+        conn._service_write_requests()
+        self.assertEqual(conn.done_sending, {9})
+        ((frames, _host, _port),) = conn.sent
+        self.assertEqual(self.msgpack.loads(frames[1])["ok"], False)
+
+    def test_a_failed_read_is_reported_only_once_no_read_is_in_flight(self):
+        conn = self.make(producer=False)
+        in_flight = FakeStatus("progress")
+        conn.request_id_to_transfer_id = {"r": 77}
+        conn._recving_transfers = {"r": [FakeStatus("failed"), in_flight]}
+        conn._recving_transfers_callback_addr = {"r": ("10.0.0.1", "7302", "p_dp0")}
+        self.assertEqual(conn._pop_done_transfers(), (set(), set()))
+        self.assertEqual(conn.notified, [])
+
+        in_flight.state = "ok"
+        self.assertEqual(conn._pop_done_transfers(), (set(), {"r"}))
+        self.assertEqual(conn.notified, [(77, "10.0.0.1", "7302")])
+        self.assertEqual(conn._recving_transfers, {})
+
+    def test_a_failed_receive_is_held_before_it_is_reported(self):
+        import time
+
+        conn = self.make(producer=False)
+        with mock.patch.dict(os.environ, {"ATOM_PD_FAILED_WRITE_HOLD_S": "60"}):
+            conn._hold_failure("r")
+        failed = set()
+        conn._report_held_failures(failed)
+        self.assertEqual(failed, set())
+
+        conn._held_failures["r"] = time.monotonic() - 1
+        conn._report_held_failures(failed)
+        self.assertEqual(failed, {"r"})
+        self.assertEqual(conn._held_failures, {})
+
+    def test_the_producer_starts_no_push_past_the_consumers_deadline(self):
+        import time
+
+        conn = self.make(producer=True)
+        pushed = []
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: pushed.append(request) or []
+        conn._write_requests.put(self.push_request(deadline=time.time() - 1))
+        conn._service_write_requests()
+        self.assertEqual(pushed, [])
+        self.assertEqual(conn.done_sending, {9})
+        ((frames, _host, _port),) = conn.sent
+        self.assertEqual(self.msgpack.loads(frames[1])["ok"], False)
+
+    def test_a_failed_handshake_fails_the_read_instead_of_issuing_it(self):
+        import time
+
+        conn = self.make(producer=False)
+        issued = []
+        conn._issue_read_for_req = lambda req_id, meta: issued.append(req_id)
+        meta = self.recv_meta([4], [10])
+        meta.remote_engine_id = "10.0.0.1:7301"
+        conn._awaiting_handshake = {
+            "bad": time.monotonic() + 300,
+            "good": time.monotonic() + 300,
+        }
+        conn._ready_requests.put(("bad", meta, RuntimeError("producer gone")))
+        conn._ready_requests.put(("good", meta, None))
+        with self.assertLogs("atom", "ERROR"):
+            conn._issue_ready_reads()
+        self.assertEqual(issued, ["good"])
+        self.assertEqual(conn._failed_before_read, {"bad"})
+        self.assertEqual(conn._awaiting_handshake, {})
+
+    def test_a_read_whose_handshake_never_finishes_is_failed(self):
+        import time
+
+        conn = self.make(producer=False)
+        issued = []
+        conn._issue_read_for_req = lambda req_id, meta: issued.append(req_id)
+        conn._awaiting_handshake = {"r": time.monotonic() - 1}
+        with self.assertLogs("atom", "ERROR"):
+            conn._issue_ready_reads()
+        self.assertEqual(conn._failed_before_read, {"r"})
+        # A handshake finishing after that must not start a read for it.
+        conn._ready_requests.put(("r", self.recv_meta([4], [10]), None))
+        conn._issue_ready_reads()
+        self.assertEqual(issued, [])
+
+    def test_reads_for_one_producer_share_its_handshake(self):
+        import types
+        from concurrent.futures import Future
+
+        conn = self.make(producer=False)
+        conn.transfer_mode = "read"
+        submitted, futures = [], []
+
+        def submit(fn, *args):
+            submitted.append(args)
+            futures.append(Future())
+            return futures[-1]
+
+        conn._handshake_executor = types.SimpleNamespace(submit=submit)
+        conn.start_load_kv(
+            types.SimpleNamespace(
+                reqs_to_recv={
+                    "r1": self.recv_meta([4], [10]),
+                    "r2": self.recv_meta([5], [11]),
+                },
+                request_id_to_transfer_id={"r1": 1, "r2": 2},
+            )
+        )
+        self.assertEqual(submitted, [("10.0.0.1", 7301, 8, "10.0.0.1:7301_dp0", 0)])
+        self.assertEqual(set(conn._awaiting_handshake), {"r1", "r2"})
+
+        futures[0].set_result({"agent"})
+        issued = []
+        conn._issue_read_for_req = lambda req_id, meta: issued.append(req_id)
+        conn._issue_ready_reads()
+        self.assertEqual(sorted(issued), ["r1", "r2"])
+        self.assertIn("10.0.0.1:7301_dp0", conn._remote_agents)
+
+    def test_a_read_that_fails_part_way_waits_for_what_it_posted(self):
+        conn = self.make(producer=False)
+        posted = FakeStatus("progress")
+
+        def post_one_then_fail(**_kwargs):
+            conn._recving_transfers["r"] = [posted]
+            conn._recving_transfers_callback_addr["r"] = ("10.0.0.1", "7302", "p_dp0")
+            raise RuntimeError("could not post the rest")
+
+        conn._read_blocks = post_one_then_fail
+        meta = self.recv_meta([4, 5], [10, 11])
+        meta.remote_engine_id = "10.0.0.1:7301"
+        with self.assertLogs("atom", "ERROR"):
+            conn._issue_read_for_req("r", meta)
+        self.assertEqual(conn._failed_before_read, set())
+
+        posted.state = "ok"
+        conn.request_id_to_transfer_id = {"r": 77}
+        self.assertEqual(conn._pop_done_transfers(), (set(), {"r"}))
+
+    def test_descriptors_identical_to_ours_are_refused(self):
+        conn = self.block_peer([b"L0", b"L1"], [b"L0", b"L1"], remote_blocks=8)
+        with self.assertRaises(ValueError):
+            conn._get_or_build_sessions("engine")
+        self.assertEqual(conn._built_sessions, {})
 
     def block_peer(self, local, remote, remote_blocks):
         """A producer with one block layer, facing a consumer's descriptors."""

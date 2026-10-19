@@ -172,6 +172,7 @@ class MoRIIOConstants:
 
     # Timeouts
     ABORT_REQUEST_TIMEOUT = 3600
+    HANDSHAKE_RECV_TIMEOUT_S = 30.0
 
 
 def get_port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
