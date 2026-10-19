@@ -71,7 +71,7 @@ class PrefillRequestLengths:
                 raise ValueError(
                     f"Prefill request {end} needs {length} KV tokens, but the "
                     f"workspace fits {max_tokens}; increase "
-                    "--prefill-kv-workspace-mb or set it to 0 to disable "
+                    "--gqa-prefill-kv-workspace-mb or set it to 0 to disable "
                     "grouping. Context is never truncated."
                 )
             if self.cu_k[end + 1] - self.cu_k[start] > max_tokens:

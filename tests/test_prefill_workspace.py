@@ -213,14 +213,14 @@ def test_under_budget_does_not_need_host_metadata_or_copy_output():
 @pytest.mark.parametrize("budget", [-1, 0.5, True, "8192", None])
 def test_workspace_config_rejects_invalid_budgets_before_model_loading(budget):
     with pytest.raises(ValueError, match="non-negative integer"):
-        Config(model="unused", prefill_kv_workspace_mb=budget)
+        Config(model="unused", gqa_prefill_kv_workspace_mb=budget)
 
 
 def test_workspace_rejects_sharded_prefill_before_model_loading():
     with pytest.raises(ValueError, match="requires PCP=1"):
         Config(
             model="unused",
-            prefill_kv_workspace_mb=8192,
+            gqa_prefill_kv_workspace_mb=8192,
             prefill_context_parallel_size=2,
         )
 

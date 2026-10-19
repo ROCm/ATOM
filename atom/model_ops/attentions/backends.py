@@ -995,7 +995,7 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             state=AttnState.PREFILL_PREFIX if has_cached else AttnState.PREFILL_NATIVE,
             **ctx,
         )
-        if self.model_runner.config.prefill_kv_workspace_mb and scheduled_bs:
+        if self.model_runner.config.gqa_prefill_kv_workspace_mb and scheduled_bs:
             # Shared by target and Eagle step 0, even for an MLA target with
             # an MHA draft. Decide whether/how to group at the consuming layer.
             # Capture uncached passes too: a TBO straddle can add a prefix.

@@ -67,7 +67,7 @@ def make_runner(
         kv_cache_dtype="bf16",
         index_cache_dtype="fp4" if fp4 else "fp8",
         attn_prefill_chunk_size=0,
-        prefill_kv_workspace_mb=0,
+        gqa_prefill_kv_workspace_mb=0,
         compilation_config=SimpleNamespace(static_forward_context={}),
         speculative_config=SimpleNamespace(num_speculative_tokens=q - 1),
         hf_config=SimpleNamespace(
@@ -459,7 +459,7 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
     from atom.model_ops.attentions import aiter_mla
 
     runner, builder = make_runner(monkeypatch, pp=pp, sparse=True, tbo=False)
-    runner.config.prefill_kv_workspace_mb = 8192
+    runner.config.gqa_prefill_kv_workspace_mb = 8192
     snapshots = []
     monkeypatch.setattr(aiter_mla, "get_mla_metadata_v1", lambda *a, **kw: None)
     saved = []

@@ -362,12 +362,12 @@ class TestPrefillWorkspaceCli:
 
     def test_default_disabled(self):
         args = self._parse([])
-        assert args.prefill_kv_workspace_mb == 0
-        assert args._get_engine_kwargs()["prefill_kv_workspace_mb"] == 0
+        assert args.gqa_prefill_kv_workspace_mb == 0
+        assert args._get_engine_kwargs()["gqa_prefill_kv_workspace_mb"] == 0
 
     @pytest.mark.parametrize("method", [None, "eagle3", "mtp"])
     def test_budget_is_global_and_does_not_depend_on_drafter(self, method):
-        argv = ["--prefill-kv-workspace-mb", "8192"]
+        argv = ["--gqa-prefill-kv-workspace-mb", "8192"]
         if method:
             argv += ["--method", method, "--num-speculative-tokens", "3"]
         if method == "eagle3":
@@ -375,10 +375,10 @@ class TestPrefillWorkspaceCli:
         args = self._parse(argv)
         with patch("atom.model_engine.arg_utils.SpeculativeConfig") as spec:
             kwargs = args._get_engine_kwargs()
-        assert kwargs["prefill_kv_workspace_mb"] == 8192
+        assert kwargs["gqa_prefill_kv_workspace_mb"] == 8192
         if method:
-            assert "prefill_kv_workspace_mb" not in spec.call_args.kwargs
+            assert "gqa_prefill_kv_workspace_mb" not in spec.call_args.kwargs
 
     def test_rejects_fractional_mib(self):
         with pytest.raises(SystemExit):
-            self._parse(["--prefill-kv-workspace-mb", "0.5"])
+            self._parse(["--gqa-prefill-kv-workspace-mb", "0.5"])
