@@ -39,10 +39,14 @@ class TritonMLAMetadataBuilder(AiterMLAMetadataBuilder):
         kv_lora_rank = hf.kv_lora_rank
         num_kv_splits = 4
         triton_mla_buffers = {
+            # int64, not int32: aiter's Triton decode multiplies each KV row id by
+            # the row stride (576) in the id's own dtype. An int32 offset wraps past
+            # row 2**31 / 576 = 3,728,270 (block 233,016 of 16 tokens), and the
+            # decode then reads outside the KV cache.
             "triton_block_table": torch.zeros(
                 self.max_bs,
                 self.max_num_blocks_per_seq,
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=self.device,
             ),
             "triton_attn_logits": torch.empty(

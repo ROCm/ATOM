@@ -255,6 +255,7 @@ def make_embedding(monkeypatch):
         (None, None, False, torch.bfloat16),
         (None, "fp8", True, torch.float8_e4m3fn),
         (None, "fp8", False, torch.bfloat16),
+        (None, "quark", True, torch.bfloat16),
         ("float8_e4m3fn", "compressed-tensors", True, torch.float8_e4m3fn),
         ("float8_e4m3fn", "compressed-tensors", False, torch.float8_e4m3fn),
         ("float8_e4m3fn", None, False, torch.float8_e4m3fn),
@@ -268,8 +269,15 @@ def test_ple_checkpoint_storage(make_embedding, dtype, method, quantized, expect
 
 
 def test_ple_does_not_infer_fp8_from_arbitrary_quantization(make_embedding):
-    with pytest.raises(ValueError, match="supports BF16 or FP8"):
-        make_embedding(method="compressed-tensors")
+    # An undeclared table is BF16; the shard loader refuses any other dtype.
+    layer = make_embedding(method="compressed-tensors")
+    embedding = layer.ngram_embedding
+    assert embedding.weight.dtype == torch.bfloat16
+    shard = torch.zeros(
+        layer.checkpoint_shard_rows, layer.head_dim, dtype=torch.float8_e4m3fn
+    )
+    with pytest.raises(ValueError, match="expected torch.bfloat16 PLE weights"):
+        embedding.weight.weight_loader(embedding.weight, shard, 0)
     with pytest.raises(ValueError, match="unsupported ple_embedding_dtype"):
         make_embedding("float8_e5m2", "compressed-tensors")
 

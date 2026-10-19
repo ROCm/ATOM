@@ -386,6 +386,11 @@ class Sequence:
         # `BlockManager._extend_hash_chain` for why it cannot simply be the
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
+        # `prefix_hash.ShippedChain`, consumed by
+        # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
+        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
+        # inside a pickled seq (`__getstate__`).
+        self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`
@@ -393,6 +398,10 @@ class Sequence:
         # handed back by `cancel_midstep` if that forward never runs. Non-empty
         # only between those two points.
         self.midstep_reservations: list[tuple] = []
+        # `checkpoint_end_pos` as the forward holding these reservations files
+        # it: moved back onto that forward's snapshot grid. 0 when the forward
+        # does not reach the anchor. Read by `StateSlotPool._anchor_of`.
+        self.midstep_anchor_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -595,6 +604,12 @@ class Sequence:
         self.last_token = token_id
         self.output_tokens.append(token_id)
         self.num_tokens += 1
+
+    def __getstate__(self):
+        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        state = self.__dict__.copy()
+        state["prompt_hash_chain"] = None
+        return state
 
     # def __getstate__(self):
     #     return (

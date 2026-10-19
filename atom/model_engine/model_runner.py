@@ -153,6 +153,9 @@ mono_decode_installers = {
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
+    "KimiK3ForConditionalGeneration": (
+        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
+    ),
 }
 
 
@@ -2726,6 +2729,11 @@ class ModelRunner:
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             graph_shapes=self._producer_graph_shapes(),
+            dp_stage_report=(
+                self.attn_metadata_builder.dp_stage_report(batch)
+                if dp_size > 1
+                else None
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.

@@ -568,19 +568,19 @@ def test_a_kv_reach_too_small_to_load_replays_from_hbm(monkeypatch):
     assert bm.replay_start(seq, 32, hit=True) == 32 - REPLAY
 
 
-def test_a_claim_short_of_the_hbm_hit_drops_the_kv_only_load(monkeypatch):
+@pytest.mark.parametrize("fast_walk", [True, False])
+def test_a_claim_short_of_the_hbm_hit_drops_the_kv_only_load(monkeypatch, fast_walk):
     """A load past the hit would start above a gap: replay from the claim."""
     bm = _mp_bm(monkeypatch)
+    # Either way `allocate` claims: the probe's ids (`_take_admission_walk`)
+    # or a per-block re-walk.
+    bm.fast_prefix_walk = fast_walk
     seq = _mp_seq(bm, reach_with_state=0, reach_kv_only=48)
-    hit = bm.can_allocate(seq)
+    hashes = []
+    hit = bm.can_allocate(seq, block_hashes=hashes)
     assert seq.replay_kv_load
-    lookup, calls = bm.kv.lookup, []
-
-    def evicting(h):
-        calls.append(h)
-        return -1 if len(calls) == 7 else lookup(h)  # block 6 is gone
-
-    monkeypatch.setattr(bm.kv, "lookup", evicting)
+    # Block 6 is evicted between the probe and the claim.
+    assert bm.kv._unindex(bm.kv.lookup(hashes[6]))
     assert bm.allocate(seq, hit)
     assert seq.num_cached_tokens == 24
     assert seq.replays_hit and not seq.replay_kv_load

@@ -2640,15 +2640,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         for block_table, seq_len in zip(block_tables, context_lens)
                     ]
                 else:
-                    # One token per sequence reduces the gather to its last row,
-                    # and `last_block_num_tokens` names the offset directly.
+                    # One token per sequence reduces the gather to its last
+                    # position's block. Indexed by position, not
+                    # `block_table[-1]`: under MTP the table also holds the
+                    # draft round's lookahead blocks past the last token
+                    # (`draft_kv_lookahead`).
+                    bsz = self.model_runner.block_size
                     slots = [
-                        block_table[-1] * self.model_runner.block_size
-                        + last_block_num
-                        - 1
-                        for block_table, last_block_num in zip(
-                            block_tables, batch.last_block_num_tokens
-                        )
+                        block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                        for block_table, n in zip(block_tables, context_lens.tolist())
                     ]
 
         # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
