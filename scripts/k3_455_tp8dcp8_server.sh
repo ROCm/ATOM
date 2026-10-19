@@ -4,9 +4,10 @@
 #
 # Self-contained: it needs only a container of rocm/fw-bringup:gfx1250-atom-k3-20261016 (aiter, mori, Triton,
 # torch) and the Kimi-K3 checkpoint. It fetches the ATOM it serves, ROCm/ATOM branch gyu/k3-455-tp8 at the commit
-# below (the image's /app/ATOM, i.e. main d82f906b + #2557 + #2554, plus TP across nodes and DCP decode on
-# gfx1250's persistent PS1 kernel), patches the image's aiter with ROCm/aiter branch gyu/k3-455-tp8's cc8d4ff12
-# (embedded below; the grouped MoE GEMM's k-tile), and sets every environment variable itself.
+# below (the image's /app/ATOM, i.e. main d82f906b + #2557 + #2554, plus TP across nodes, and DCP decode and
+# DSpark with DCP on gfx1250's persistent PS1 kernel), patches the image's aiter with ROCm/aiter branch
+# gyu/k3-455-tp8's cc8d4ff12 (embedded below; the grouped MoE GEMM's k-tile), and sets every environment variable
+# itself.
 #
 # One container per tray, both from that image (--network=host is required: the ranks meet on data-plane IPs):
 #   docker run -d --name k3tp8 -w /tmp --device=/dev/kfd --device=/dev/dri --network=host --ipc=host --pid=host \
@@ -31,14 +32,21 @@
 #   K3_MOE       ep (default) | tp. tp splits every expert 8 ways as the MI355 recipe does (inter_dim 384 per rank).
 #                Without aiter cc8d4ff12 the gfx1250 grouped GEMM dropped the last 128 of that K, which cost 7 points
 #                of GSM8K (strict-match 0.8923 against 0.9575 with ep); with it the MoE matches aiter's reference
-#                (rel_l2 0.0027). End-to-end GSM8K with tp is not measured yet.
+#                (rel_l2 0.0027) and GSM8K strict-match is 0.9621 +-0.0053.
+#   K3_DSPARK    0 (default) | N: DSpark speculative decoding with N draft tokens (ATOM's recipes/Agentic-Kimi-K3.md
+#                drafts 7 at CONC 1-4 and 4 from CONC 8), never with forced acceptance. Sets NCCL_GRAPH_REGISTER=0:
+#                without it, capturing the first q_len N+1 graph fails in an RCCL all-reduce (HIP 'invalid argument').
+#                K3_MOE=tp, N=7: GSM8K strict-match 0.9545 +-0.0057, 53.6% of draft tokens accepted (4.75 per forward).
+#   K3_DRAFT     the DSpark draft checkpoint, Inferact/Kimi-K3-DSpark (default /models/Kimi-K3-DSpark)
 #   K3_ATOM_DIR  the ATOM checkout (default /root/.cache/atom-gyu-k3-455-tp8); fetched from GitHub on first use
 #   K3_MODEL     checkpoint directory (default /models/Kimi-K3)
 #   K3_PORT      API port on node0 (default 8000)
 #
-# Validated 2026-10-16 on CT11 (node0) + CT10, driver loaded without perf setup: gate PASS, full GSM8K 5-shot
-# strict-match 0.9575 +-0.0056 (dp8ep8 on the same image family: 0.9651). Not supported here: DSpark speculative
-# decoding (ATOM allows it with DCP only on gfx950) and the recipe's --block-size 128 (untested; 16 is used).
+# Validated on CT11 (node0) + CT10, driver loaded without perf setup, full GSM8K 5-shot:
+#   2026-10-19, this script at ff07fd8fd (serving ATOM 571d22de7, the same code as here when K3_DSPARK=0), defaults:
+#   gate PASS, strict-match 0.9629 +-0.0052 (2026-10-16, the same configuration: 0.9575; dp8ep8 on the same image
+#   family: 0.9651). The K3_MOE=tp and K3_DSPARK=7 scores above come from runs with this environment.
+# Not supported here: the recipe's --block-size 128 (untested; 16 is used).
 # Keep aiter's custom all-reduce off across the trays (AITER_CUSTOM_AR_USE_SYMM_MEM, ATOM_USE_CUSTOM_ALL_GATHER):
 # both times it was on, both trays took a fatal CPU error (Processor Context Corrupt) during startup and rebooted.
 set -euo pipefail
@@ -48,9 +56,9 @@ case $RANK0 in 0 | 4) ;; *) echo "usage: k3_455_tp8dcp8_server.sh <first TP rank
 [ -n "$MASTER" ] || { echo "usage: k3_455_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2; }
 
 ATOM_REPO=https://github.com/ROCm/ATOM.git
-# The code this serves: branch gyu/k3-455-tp8 at 571d22de7 (TP across nodes, DCP decode on PS1), without the branch's
-# later DSpark + DCP change. Both trays must serve the same.
-ATOM_COMMIT=571d22de7175af319844027553348c33012e599e
+# The code this serves: branch gyu/k3-455-tp8 at 6c442b7a6 (TP across nodes; DCP decode, and DSpark with DCP, on PS1).
+# Both trays must serve the same.
+ATOM_COMMIT=6c442b7a62fae86769c3a2d9f1648b6e2193a7a0
 ATOM_DIR=${K3_ATOM_DIR:-/root/.cache/atom-gyu-k3-455-tp8}
 MODEL=${K3_MODEL:-/models/Kimi-K3}
 MAX_SEQS=${K3_MAX_SEQS:-64}
@@ -197,16 +205,26 @@ case "${K3_MOE:-ep}" in
   tp) MOE_ARGS=() ;;
   *) echo "K3_MOE must be ep or tp, got '$K3_MOE'" >&2; exit 2 ;;
 esac
+DRAFT=${K3_DRAFT:-/models/Kimi-K3-DSpark}
+case "${K3_DSPARK:-0}" in
+  0) SPEC_ARGS=() ;;
+  [1-9] | [1-9][0-9])
+    [ -f "$DRAFT/config.json" ] || { echo "no DSpark draft at $DRAFT" >&2; exit 2; }
+    export NCCL_GRAPH_REGISTER=0
+    SPEC_ARGS=(--method dspark --draft-model "$DRAFT" --num-speculative-tokens "$K3_DSPARK") ;;
+  *) echo "K3_DSPARK must be 0 or a number of draft tokens, got '$K3_DSPARK'" >&2; exit 2 ;;
+esac
 
 # Online FP8 for the checkpoint's BF16 layers at load (the image's own launch passes the same)
 ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}'
 
 echo "[k3_455_tp8dcp8_server] $(date '+%F %T') $(hostname): TP ranks $RANK0-$((RANK0 + 3)) of 8, master $MASTER," \
-  "K3_MODE=${K3_MODE:-accuracy} K3_MOE=${K3_MOE:-ep} max-num-seqs $MAX_SEQS HSA_XNACK=$HSA_XNACK, ATOM $ATOM_COMMIT"
+  "K3_MODE=${K3_MODE:-accuracy} K3_MOE=${K3_MOE:-ep} K3_DSPARK=${K3_DSPARK:-0} max-num-seqs $MAX_SEQS" \
+  "HSA_XNACK=$HSA_XNACK, ATOM $ATOM_COMMIT"
 exec python3 -m atom.entrypoints.openai_server \
   --model "$MODEL" --served-model-name moonshotai/Kimi-K3 --trust-remote-code --server-port "${K3_PORT:-8000}" \
   -tp 8 --tensor-parallel-size-local 4 --tensor-parallel-rank "$RANK0" --decode-context-parallel-size 8 \
   --data-parallel-master-ip "$MASTER" --data-parallel-base-port 29700 "${MOE_ARGS[@]}" \
   --kv_cache_dtype fp8 --cudagraph-mode FULL --max-num-seqs "$MAX_SEQS" --gpu-memory-utilization 0.90 \
-  "${MODE_ARGS[@]}" --online_quant_config "$ONLINE_QUANT" --torch-profiler-dir /root/.cache/torch_profile \
-  --disable_uvicorn_access_log
+  "${MODE_ARGS[@]}" "${SPEC_ARGS[@]}" --online_quant_config "$ONLINE_QUANT" \
+  --torch-profiler-dir /root/.cache/torch_profile --disable_uvicorn_access_log
