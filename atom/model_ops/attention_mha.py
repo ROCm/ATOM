@@ -20,6 +20,7 @@ from atom.model_ops.base_attention import (
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
+    window_left,
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -35,18 +36,6 @@ def use_pa_decode_bf16_asm() -> bool:
         and not envs.ATOM_FORCE_ATTN_TRITON
         and get_gfx() == "gfx1250"
     )
-
-
-def window_left(sliding_window: int | None) -> int:
-    """aiter's inclusive left offset for an HF sliding-window span.
-
-    A span of W lets a query see itself and the W - 1 keys before it; aiter's
-    varlen and unified kernels attend over [i - left, i], so left = W - 1.
-    Anything not positive means no window.
-    """
-    if sliding_window is None or sliding_window <= 0:
-        return -1
-    return sliding_window - 1
 
 
 class PagedAttentionImpl(nn.Module):

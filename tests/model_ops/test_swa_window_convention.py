@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("aiter")
 
-from atom.model_ops.attention_mha import window_left
+from atom.model_ops.base_attention import window_left
 
 
 @pytest.mark.parametrize("span", [1, 128, 2048])
