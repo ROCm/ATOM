@@ -305,10 +305,8 @@ class RuntimeWatchTests(unittest.TestCase):
                 SCRIPTS.parents[2] / "atom/spec_decode/eagle_proposer.py"
             ).read_text()
             proposer.write_text(original_proposer)
-            with patch.dict(
-                sys.modules, {"minimax_bounded_gather": load("minimax_bounded_gather")}
-            ):
-                watch.prepare(source, runtime, output)
+            watch.prepare(source, runtime, output)
+            self.assertFalse((runtime / "atom/_ci_bounded_gather.py").exists())
             self.assertEqual(proposer.read_text(), original_proposer)
             compile(
                 (runtime / "atom/spec_decode/eagle_proposer.py").read_text(),

@@ -1342,7 +1342,7 @@ models:
           concurrency:
           - 40
           server: &minimax_m3_scatter_bounds_server
-            common_args:
+            common_args: &minimax_m3_scatter_bounds_common_args
               kv_cache_dtype: fp8
               block_size: 128
               enable_prefix_caching: true
@@ -1355,7 +1355,7 @@ models:
               method: eagle3
               draft_model: ${ATOMESH_MODEL_ROOT}/Inferact/MiniMax-M3-EAGLE3
               num_speculative_tokens: 3
-              extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900
+              extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900 --gqa-prefill-kv-workspace-mb 8192
           prefill: &minimax_m3_scatter_bounds_prefill
             workers: 1
             tp: 4
@@ -1405,6 +1405,84 @@ models:
           - 8
           accuracy:
             threshold: 0.8
+      mooncake_store:
+        - &minimax_m3_cpp4_store_c72
+          name: minimax-m3-fp4-1p1d-cpp4-tp4-eagle3-agentic-mcstore-1m-c72
+          topology: 1p1d_cpp4_tp4_eagle3
+          display_topology: 1P1D-CPP4-TP4-EAGLE3-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [72]
+          server:
+            <<: *minimax_m3_scatter_bounds_server
+            common_args:
+              <<: *minimax_m3_scatter_bounds_common_args
+              max_num_batched_tokens: 8192
+              decode_max_num_batched_tokens: 2048
+          prefill:
+            workers: 1
+            tp: 1
+            cudagraph: none
+            extra_args: --pipeline-parallel-size 4 --enforce-eager
+          decode:
+            <<: *minimax_m3_scatter_bounds_decode
+          env:
+            common:
+              PYTHONNOUSERSITE: '1'
+              PYTHONHASHSEED: '0'
+              MC_DISABLE_HIP: '1'
+              AITER_SITUV2_A4W4: '1'
+              AITER_FLYDSL_STAGE2_FP8: '1'
+              ATOM_PA_FLYDSL: '1'
+              ATOM_PA_FLYDSL_PLAN: '1'
+              ATOM_MONO_ENABLE: '0'
+              ATOM_PREFIX_CACHE_POLICY: slru
+              ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
+              ATOM_AITER_SCATTER_REF: 5eb866a95d66a38d64eecf151ac4ef3567a07ac5
+            prefill:
+              HIP_VISIBLE_DEVICES: 0,1,2,3
+              # M3 has 60 target layers; the final stage additionally owns EAGLE3.
+              VLLM_PP_LAYER_PARTITION: 15,15,15,15
+              ATOM_DRAFT_CUDAGRAPH: '0'
+              ATOM_M3_INDEXER_CP: '0'
+              OFFLOAD_PROFILE: '1'
+              OFFLOAD_MIN_LOAD_TOKENS: '0'
+              OFFLOAD_LOAD_WORKERS: '1'
+              MOONCAKE_STORE: '1'
+              # Match InferenceX #4045: one shared 1536 GiB pool. TW owners
+              # use rdma4-7, the existing tested fabric mapping for this CI.
+              MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
+              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
+              ATOMESH_M3_STORE_FUNCTIONAL_CHECK: '1'
+              PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}'
+            decode:
+              HIP_VISIBLE_DEVICES: 4,5,6,7
+              ATOM_DRAFT_CUDAGRAPH: '1'
+              ATOM_M3_INDEXER_CP: '1'
+          runner:
+            time_limit: '08:00:00'
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53]
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 5400
+            mesh_source: image
+            eval_before_benchmark: true
+          # Functional Store round-trip -> full GSM8K -> fresh C72 AgentX.
+          run_eval: true
+          eval_concurrency: [32]
+          accuracy:
+            task: gsm8k
+            fewshot: 20
+            limit: null
+            threshold: 0.90
+            model_type: local-completions
+            endpoint: completions
+            batch_size: 1
+            max_gen_toks: 8192
+            apply_chat_template: false
+
       nightly:
         # Reuse the verified 32K-warmup service and pinned scatter-bounds aiter.
         # Keep server capacity fixed at 80; each AgentX concurrency starts fresh.
@@ -1428,7 +1506,7 @@ models:
 
         # Successful gather baseline: run 38841844766 / f217aa3e3.
         # Sweep cases inherit host-memory preparation, allocator settings,
-        # runtime gather overlay, image Mesh, and node exclusions together.
+        # native grouped gather, image Mesh, and node exclusions together.
         - &minimax_m3_agentic_gather_baseline
           <<: *minimax_m3_agentic_lmcache_tp4_eagle3
           name: minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32
