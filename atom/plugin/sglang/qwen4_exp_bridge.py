@@ -23,6 +23,7 @@ Decode / TARGET_VERIFY graph contract:
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -238,6 +239,17 @@ _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
 # the target verify graph. A second set still keeps page tables and seq_lens
 # on device, so a draft step does not allocate or sync seq_lens back to host.
 _DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
+# PROTOTYPE: non-None marker returned to the draft runner's out-of-graph hook
+# before the first draft forward has populated _DRAFT_QSA.last_qsa.
+_DRAFT_GRAPH_METADATA_IN_GRAPH = object()
+
+
+def _is_draft_decode_batch(forward_batch: Any) -> bool:
+    """PROTOTYPE: draft-runner decode batch (EAGLE draft input), graphs enabled."""
+    if os.environ.get("ATOM_SGLANG_QWEN4_DRAFT_CG", "0").lower() not in ("1", "true"):
+        return False
+    spec = getattr(forward_batch, "spec_info", None)
+    return type(spec).__name__ == "EagleDraftInput"
 
 
 def _is_draft_forward() -> bool:
@@ -1489,6 +1501,12 @@ def prepare_qwen4_exp_decode_graph_metadata(
     is_verify = _is_target_verify(forward_batch)
     if not (mode.is_decode_or_idle() or is_verify):
         return None
+    # PROTOTYPE: a Flash draft decode graph rebuilds its QSA metadata into
+    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
+    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
+    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
+    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
+        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
     if atom_config is None:
         try:
             from atom.config import get_current_atom_config
@@ -1550,7 +1568,12 @@ def qwen4_exp_metadata_from_forward_batch(
     that storage in place; there is no extra PLE copy.
     """
     bind_qsa_caches(model, forward_batch, atom_config)
-    if _is_capturing() and _DECODE_GRAPH.last_qsa is not None:
+    # Draft graphs (PROTOTYPE) build into _DRAFT_QSA inside the graph instead.
+    if (
+        _is_capturing()
+        and not _is_draft_forward()
+        and _DECODE_GRAPH.last_qsa is not None
+    ):
         ple = _DECODE_GRAPH.last_ple
         if ple is None:
             ple = _build_decode_graph_ple_metadata(
