@@ -212,6 +212,46 @@ def test_extend_fallback_marks_padded_requests_as_empty():
     assert metadata.flydsl_prefill_metadata is None
 
 
+def test_extend_metadata_carries_per_step_prefill_indices():
+    """GatedDeltaNet prefill reads these per-step fields (#2534).
+
+    Left at None, the non-FlyDSL prefill fails in ``index_select`` and the
+    state write-back in ``index_copy_``. SGLang never forks a request's state
+    here, so the read and write slots are the same.
+    """
+    pool = _MambaPool()
+    forward_batch = SimpleNamespace(
+        forward_mode=_ExtendMode(),
+        batch_size=2,
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        req_to_token_pool=pool,
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 5], dtype=torch.int32),
+        extend_num_tokens=5,
+    )
+    linear_backend = SimpleNamespace(
+        forward_metadata=None,
+        req_to_token_pool=pool,
+    )
+
+    metadata = SGLangGDNForwardContext._build_gdn_metadata(
+        forward_batch, linear_backend
+    )
+
+    assert metadata is not None
+    assert metadata.non_spec_state_indices_i64.dtype == torch.int64
+    assert torch.equal(
+        metadata.non_spec_state_indices_i64,
+        torch.tensor([10, 11], dtype=torch.int64),
+    )
+    assert torch.equal(
+        metadata.non_spec_state_indices_in_i64,
+        metadata.non_spec_state_indices_i64,
+    )
+    assert torch.equal(metadata.no_initial_state, torch.tensor([True, False]))
+
+
 def test_build_context_falls_back_to_local_decode_mode(monkeypatch):
     monkeypatch.setattr(
         attention_gdn,
