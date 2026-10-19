@@ -20,6 +20,7 @@ from atom.plugin.rtpllm.models.qwen4_exp import (
     ATOMQwen4ExpMTP,
     _ATOMQwen4ExpMTPRuntime,
     _ATOMQwen4ExpRuntime,
+    _Qwen4ExpAttnPyObj,
 )
 from atom.plugin.rtpllm.models.qwen4_exp_mtp_hooks import (
     _rtp_apply_ple,
@@ -34,6 +35,10 @@ from atom.plugin.rtpllm.utils.qwen4_exp_context import (
     RTPQwen4ExpContext,
     _qsa_graph_slots_kernel,
 )
+
+
+def test_qwen4_exp_graph_uses_device_block_tables_only():
+    assert _Qwen4ExpAttnPyObj.requires_host_block_table_mirror is False
 
 
 @pytest.mark.parametrize("draft_steps", [1, 2, 3])
