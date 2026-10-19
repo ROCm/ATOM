@@ -663,7 +663,7 @@ class AttentionMetaData:
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
 
-    # Owned host lengths for grouping a draft cached prefill without GPU readback.
+    # Owned host lengths for layer-local prefill grouping without GPU readback.
     prefill_request_lengths: PrefillRequestLengths | None = None
 
     # for prefix cache

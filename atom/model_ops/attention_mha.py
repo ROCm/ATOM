@@ -100,9 +100,8 @@ class PagedAttentionImpl(nn.Module):
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
-        spec = get_current_atom_config().speculative_config
-        self.draft_prefill_kv_workspace_bytes = (
-            spec.draft_prefill_kv_workspace_mb * (1 << 20) if spec is not None else 0
+        self.prefill_kv_workspace_bytes = (
+            get_current_atom_config().prefill_kv_workspace_mb * (1 << 20)
         )
 
     def process_weights_after_loading(self):
@@ -871,9 +870,12 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        # Per-layer dispatch has selected dense MHA/GQA gather + FMHA here.
+        # Sparse/MLA/linear attention and direct paged reads never enter this
+        # wrapper. MHA (including Eagle's equal Q/KV head counts) is eligible.
         if (
-            self.draft_prefill_kv_workspace_bytes
-            and fwd_ctx.context.is_draft
+            self.prefill_kv_workspace_bytes
+            and fwd_ctx.context.is_prefill
             and fwd_ctx.attn_metadata.has_cached
         ):
             return run_grouped_prefill(
@@ -886,7 +888,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 fwd_ctx,
-                self.draft_prefill_kv_workspace_bytes,
+                self.prefill_kv_workspace_bytes,
             )
         return self._prefill_attention(
             q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx

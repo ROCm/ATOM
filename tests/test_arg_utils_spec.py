@@ -202,7 +202,6 @@ class TestEngineArgsSpeculativeValidation:
             method="mtp",
             model=args.model,
             num_speculative_tokens=3,
-            draft_prefill_kv_workspace_mb=0,
             synthetic_acceptance_rate=None,
             synthetic_acceptance_length=None,
         )
@@ -355,7 +354,7 @@ class TestKVOffloadEnv:
             self._kv()
 
 
-class TestDraftPrefillWorkspaceCli:
+class TestPrefillWorkspaceCli:
     def _parse(self, argv):
         parser = FlexibleArgumentParser()
         EngineArgs.add_cli_args(parser)
@@ -363,38 +362,23 @@ class TestDraftPrefillWorkspaceCli:
 
     def test_default_disabled(self):
         args = self._parse([])
-        assert args.draft_prefill_kv_workspace_mb == 0
-        assert "draft_prefill_kv_workspace_mb" not in args._get_engine_kwargs()
+        assert args.prefill_kv_workspace_mb == 0
+        assert args._get_engine_kwargs()["prefill_kv_workspace_mb"] == 0
 
-    def test_budget_reaches_speculative_config(self):
-        args = self._parse(
-            [
-                "--method",
-                "eagle3",
-                "--draft-model",
-                "test-draft",
-                "--num-speculative-tokens",
-                "3",
-                "--draft-prefill-kv-workspace-mb",
-                "8192",
-            ]
-        )
+    @pytest.mark.parametrize("method", [None, "eagle3", "mtp"])
+    def test_budget_is_global_and_does_not_depend_on_drafter(self, method):
+        argv = ["--prefill-kv-workspace-mb", "8192"]
+        if method:
+            argv += ["--method", method, "--num-speculative-tokens", "3"]
+        if method == "eagle3":
+            argv += ["--draft-model", "test-draft"]
+        args = self._parse(argv)
         with patch("atom.model_engine.arg_utils.SpeculativeConfig") as spec:
             kwargs = args._get_engine_kwargs()
-        assert kwargs["speculative_config"] is spec.return_value
-        assert spec.call_args.kwargs["draft_prefill_kv_workspace_mb"] == 8192
-        assert "draft_prefill_kv_workspace_mb" not in kwargs
-
-    @pytest.mark.parametrize("method,tokens", [(None, 1), ("mtp", 3), ("eagle3", 0)])
-    def test_requires_active_eagle3(self, method, tokens):
-        args = EngineArgs(
-            method=method,
-            num_speculative_tokens=tokens,
-            draft_prefill_kv_workspace_mb=8192,
-        )
-        with pytest.raises(ValueError, match="requires active --method eagle3"):
-            args._get_engine_kwargs()
+        assert kwargs["prefill_kv_workspace_mb"] == 8192
+        if method:
+            assert "prefill_kv_workspace_mb" not in spec.call_args.kwargs
 
     def test_rejects_fractional_mib(self):
         with pytest.raises(SystemExit):
-            self._parse(["--draft-prefill-kv-workspace-mb", "0.5"])
+            self._parse(["--prefill-kv-workspace-mb", "0.5"])
