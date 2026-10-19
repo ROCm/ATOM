@@ -36,7 +36,11 @@ from dataclasses import dataclass
 
 from atom.mono.plan.execution import BLOCKS
 from atom.mono.plan.shard import Shard, ShardError
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    persistent_kernel_refusals,
+)
 from atom.utils import envs
 
 # ---------------------------------------------------------------- model widths
@@ -213,21 +217,9 @@ def config_refusal(atom_config) -> str | None:
     # run under PIECEWISE -- every measurement to date used FULL -- and arming
     # an untested path is worse than requiring one documented flag. Drop it
     # when there is a PIECEWISE run to point at, not before.
-    checks += common_refusals(atom_config, Dims, SUPPORTED_TP) + [
-        # the kernels are one CTA a CU with every CTA resident: a spin wait on
-        # another CTA only makes progress while that CTA runs
-        (
-            _cu_count() in (None, BLOCKS),
-            f"{_cu_count()} CUs, the kernels need {BLOCKS}",
-        ),
-        # a connector's copy kernels run on another stream and can hold CUs,
-        # which wedges a kernel that waits on every one of them. The field is a
-        # dict that defaults to empty, so this is a truthiness test, as every
-        # other reader of it in ATOM does: `is None` refuses every deployment.
-        (
-            not getattr(atom_config, "kv_transfer_config", None),
-            "KV connector",
-        ),
+    checks += common_refusals(atom_config, Dims, SUPPORTED_TP)
+    checks += persistent_kernel_refusals(atom_config, BLOCKS)
+    checks += [
         # the KDA recurrence reads and writes fp32 state in place; a narrower
         # pool would be read as fp32 rather than converted
         (
@@ -321,15 +313,3 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
-
-
-def _cu_count() -> int | None:
-    """This device's CUs, or None where there is no device (a contract check
-    builds compile-only and never binds one)."""
-    import torch
-
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count

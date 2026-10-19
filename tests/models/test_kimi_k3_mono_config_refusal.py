@@ -88,12 +88,12 @@ def _atom_config(**hf_overrides):
 
 
 @pytest.fixture
-def servable(monkeypatch):
+def servable(monkeypatch, fake_gpu):
     """Everything outside the model config already satisfied, so
     `config_refusal` is reporting on the checkpoint and nothing else."""
     monkeypatch.setattr(deployment, "is_vllm", lambda: False)
     monkeypatch.setattr(deployment, "is_sglang", lambda: False)
-    monkeypatch.setattr(k3_config, "_cu_count", lambda: BLOCKS)
+    fake_gpu(cus=BLOCKS)
     monkeypatch.setattr(k3_config.envs, "ATOM_MONO_ENABLE", True)
     monkeypatch.setattr(k3_config.envs, "ATOM_GDN_SSM_DTYPE", "fp32")
     monkeypatch.setattr(k3_config.envs, "ATOM_ENABLE_REPLAYSSM", False)
@@ -116,3 +116,22 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
     servable, override, reason
 ):
     assert reason in config_refusal(_atom_config(**override))
+
+
+@pytest.mark.parametrize(
+    ("device", "kv_transfer_config", "reason"),
+    [
+        ({"arch": "gfx942"}, None, "not gfx950"),
+        ({"cus": BLOCKS - 16}, None, f"{BLOCKS - 16} CUs"),
+        ({}, {"kv_connector": "lmcache"}, "KV connector"),
+    ],
+)
+def test_the_persistent_kernel_preconditions_refuse_k3(
+    servable, fake_gpu, device, kv_transfer_config, reason
+):
+    atom_config = _atom_config()
+    assert config_refusal(atom_config) is None
+    atom_config.kv_transfer_config = kv_transfer_config
+    fake_gpu(**device)
+    why = config_refusal(atom_config)
+    assert why is not None and reason in why
