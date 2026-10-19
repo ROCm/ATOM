@@ -144,6 +144,80 @@ class ModelPathSelectionTest(unittest.TestCase):
             )
 
 
+class AccuracyConfigurationTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = pd_matrix.load_config(
+            SCRIPT.parents[2] / "benchmark/models_atomesh.yaml"
+        )
+        self.model = self.cfg["models"]["MiniMax-M3-MXFP4"]
+        self.case = next(
+            case
+            for case in self.model["suites"]["mooncake_store"]
+            if case["name"]
+            == "minimax-m3-fp4-1p1d-cpp4-tp4-eagle3-agentic-mcstore-1m-c72"
+        )
+
+    def build(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ATOMESH_SLURM_SUBMIT_RUNNER": "atomesh-cicd",
+                "ATOMESH_SINGLE_NODE": "auto",
+                "ATOMESH_SLURM_ACCOUNT": "auto",
+                "ATOMESH_SLURM_PARTITION": "amd-spur",
+                "ATOMESH_MODEL_ROOT": "/models",
+                "ATOMESH_LOG_ROOT": "/logs",
+                "ATOMESH_1P1D_NODES": "",
+                "ATOMESH_PD_RANK_MAPPING_POLICY": "none",
+            },
+            clear=True,
+        ):
+            return pd_matrix.build_cell(
+                cfg=self.cfg,
+                model_name="MiniMax-M3-MXFP4",
+                model_cfg=self.model,
+                suite_name="mooncake_store",
+                suite_cfg=self.case,
+                override_image=None,
+                override_benchmark_concurrency=None,
+                override_eval_concurrency=None,
+            )
+
+    def test_m3_completions_overrides_inherited_multiturn(self):
+        self.assertTrue(self.model["accuracy"]["fewshot_as_multiturn"])
+        cell = self.build()
+        accuracy = cell["accuracy"]
+        self.assertEqual(accuracy["model_type"], "local-completions")
+        self.assertEqual(accuracy["endpoint"], "completions")
+        self.assertFalse(accuracy["apply_chat_template"])
+        self.assertFalse(accuracy["fewshot_as_multiturn"])
+        self.assertEqual(accuracy["fewshot"], 20)
+        self.assertIsNone(accuracy["limit"])
+        self.assertEqual(accuracy["concurrency"], [32])
+        self.assertEqual(accuracy["threshold"], 0.90)
+        self.assertEqual(accuracy["max_gen_toks"], 8192)
+        self.assertTrue(cell["benchmark"]["eval_before_benchmark"])
+
+    def test_inherited_multiturn_without_template_fails_before_dispatch(self):
+        self.case["accuracy"].pop("fewshot_as_multiturn")
+        with self.assertRaisesRegex(
+            ValueError, "GSM8K fewshot_as_multiturn requires apply_chat_template"
+        ):
+            self.build()
+
+    def test_multiturn_with_chat_template_is_valid(self):
+        self.case["accuracy"].update(
+            apply_chat_template=True, fewshot_as_multiturn=True
+        )
+        self.assertTrue(self.build()["accuracy"]["fewshot_as_multiturn"])
+
+    def test_inactive_evaluation_does_not_block_benchmark(self):
+        self.case["accuracy"].pop("fewshot_as_multiturn")
+        self.case["run_eval"] = False
+        self.case["benchmark"]["eval_before_benchmark"] = False
+        self.assertFalse(self.build()["run_eval"])
+
+
 class TopologyKindTest(unittest.TestCase):
     """The topology name is what tells a split cell from an aggregated one."""
 

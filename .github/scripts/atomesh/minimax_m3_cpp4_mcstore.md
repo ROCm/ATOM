@@ -156,3 +156,24 @@ tables export an int32 buffer; the fixture now constructs them with
 is shared with gather, which inherited the same fixture. No attention kernel
 change was needed for either observed failure. Full Store RDMA, GSM8K and
 C72 validation still require the subsequent GPU CI run.
+
+## October 19 evaluation argument fix
+
+Run `39231577736` / job `117991267513` successfully mounted the full
+1536 GiB Store, passed the GPU/Store functional round trip, and initialized
+both model services and the router. The PP4 prefill pool was 37,824 blocks;
+the last stage reported 156.27 GiB available for KV and 4,435,968 bytes/block.
+These are startup measurements from the accuracy phase, not C72 results.
+
+GSM8K then exited before sending an inference request:
+`ValueError: When fewshot_as_multiturn is True, apply_chat_template must be set.`
+The case selected raw completions and disabled the chat template but inherited
+`fewshot_as_multiturn: true` from the M3 model's chat accuracy defaults.
+The case now explicitly sets it to false. Matrix generation also rejects this
+incompatible combination for enabled GSM8K evaluations before GPU allocation.
+The shared-memory errors after SIGTERM were secondary shutdown errors.
+
+The evaluation remains full GSM8K, 20-shot, concurrency 32, 8192 max generated
+tokens and flexible-extract >= 0.90 before the fresh C72 performance phase.
+The original flags reproduce the exception with local `lm-eval 0.4.13`;
+the corrected production matrix passes its configuration validation.
