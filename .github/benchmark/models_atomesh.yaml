@@ -407,6 +407,8 @@ models:
             atomesh-cicd-mi350:
               common:
                 MC_NUM_QP_PER_EP: "1"
+              prefill:
+                ATOM_PD_MLA_STAGING: "0"
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
