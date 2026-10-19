@@ -996,6 +996,20 @@ models:
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "192"
 
+        # The DSpark3 C48 cell with three 10 s prefill-only windows at the
+        # offsets of the vLLM C48 profile, for a per-kernel comparison.
+        - <<: *kimi_k3_agentic_hc_dspark3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48-p-profile
+          env:
+            common:
+              ATOM_ENABLE_REPLAYSSM: "1"
+              ATOMESH_TORCH_PROFILE_START: "600,1500,3000"
+              ATOMESH_TORCH_PROFILE_DURATION: "10"
+              ATOMESH_TORCH_PROFILE_ROLES: prefill
+              ATOM_PROFILER_MORE: "0"
+              ATOM_PROFILER_TIMEOUT: "1800"
+            prefill: *kimi_k3_agentic_hc_dspark3_prefill_env
+
     accuracy:
       task: gsm8k
       fewshot: 5

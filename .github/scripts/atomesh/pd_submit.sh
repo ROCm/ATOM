@@ -323,6 +323,7 @@ echo "nodes=${NODE_LIST}"
 echo "slurm_account=${SLURM_ACCOUNT:-default}"
 echo "slurm_partition=${SLURM_PARTITION:-default}"
 echo "slurm_qos=${SLURM_QOS:-default}"
+echo "slurm_exclude=${ATOMESH_SLURM_EXCLUDE:-}"
 echo "isl=${ISL_LIST} osl=${OSL} concurrency=${CONC_LIST}"
 echo "slurm_job_name=${SLURM_JOB_NAME}"
 echo "log_root=${LOG_ROOT}"
@@ -450,6 +451,10 @@ else
   if [[ -n "${NODE_LIST}" ]]; then
     slurm_node_selection_args "${NODE_LIST}" "${NUM_NODES}"
     SBATCH_CMD+=("${SLURM_NODE_SELECTION_ARGS[@]}")
+  fi
+  if [[ -n "${ATOMESH_SLURM_EXCLUDE:-}" ]]; then
+    # shortcut: a native-Slurm candidate pool also emits --exclude and this later one wins; drop nodes from the pool there instead.
+    SBATCH_CMD+=(--exclude "${ATOMESH_SLURM_EXCLUDE}")
   fi
   SBATCH_CMD+=(
     --output "${SLURM_OUTPUT}"

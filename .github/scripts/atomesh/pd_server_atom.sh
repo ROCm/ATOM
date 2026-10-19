@@ -1251,59 +1251,68 @@ run_torch_profile_window() {
     sleep 2
   done
 
-  local deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_START ))
-  echo "[profile] Profiling phase started at $(date -Is); window opens in ${ATOMESH_TORCH_PROFILE_START}s"
-  while (( $(date +%s) < deadline )); do
-    if aiperf_gone; then
-      echo "[profile] aiperf exited before the window opened; no trace taken"
-      return 0
-    fi
-    sleep 2
-  done
-
-  # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
-  # process substitution, which cannot end before this function does.
-  local -a pids=()
-  local start_marker="${out_dir}/.torch_trace_start"
-  touch "${start_marker}"
-  echo "[profile] start_profile at $(date -Is)"
-  for target in "${targets[@]}"; do
-    curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
-      | sed "s|^|[profile] ${target} start: |" &
-    pids+=($!)
-  done
-  wait "${pids[@]}"
-
-  deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_DURATION ))
-  while (( $(date +%s) < deadline )) && ! aiperf_gone; do
-    sleep 2
-  done
-
+  # ATOMESH_TORCH_PROFILE_START may list several offsets (e.g. 600,1500,3000),
+  # each opening a DURATION-second window measured from the phase start.
+  local -a offsets=()
+  IFS=',' read -r -a offsets <<< "${ATOMESH_TORCH_PROFILE_START}"
+  local phase_start deadline window
+  phase_start=$(date +%s)
+  echo "[profile] Profiling phase started at $(date -Is); windows open at ${ATOMESH_TORCH_PROFILE_START}s"
   # The server waits ATOM_PROFILER_TIMEOUT for its ranks; give curl headroom
   # past that so the client never abandons an export still being written.
   local stop_timeout=$(( ${ATOM_PROFILER_TIMEOUT:-300} + 300 ))
-  echo "[profile] stop_profile at $(date -Is) (client timeout ${stop_timeout}s)"
-  pids=()
-  local -a stop_files=()
+  local start_marker="${out_dir}/.torch_trace_start"
+  local -a pids=() stop_files=()
   local stop_file
-  for target in "${targets[@]}"; do
-    stop_file="${out_dir}/.stop_profile_${target//[:.]/_}.json"
-    stop_files+=("${stop_file}")
-    {
-      curl -sS -X POST --max-time "${stop_timeout}" "http://${target}/stop_profile" \
-        > "${stop_file}"
-      sed "s|^|[profile] ${target} stop: |" "${stop_file}"
-      echo
-    } &
-    pids+=($!)
-  done
-  wait "${pids[@]}"
-  echo "[profile] stop_profile returned at $(date -Is)"
+  for window in "${!offsets[@]}"; do
+    deadline=$(( phase_start + ${offsets[$window]//[[:space:]]/} ))
+    while (( $(date +%s) < deadline )); do
+      if aiperf_gone; then
+        echo "[profile] aiperf exited before window $(( window + 1 )) opened"
+        return 0
+      fi
+      sleep 2
+    done
 
-  if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
-    echo "[profile] traces incomplete; leaving aiperf to finish on its own"
-    return 0
-  fi
+    # Wait on the curl pids only: a bare `wait` also waits on the caller's tee
+    # process substitution, which cannot end before this function does.
+    pids=()
+    touch "${start_marker}"
+    echo "[profile] window $(( window + 1 )) start_profile at $(date -Is)"
+    for target in "${targets[@]}"; do
+      curl -sS -X POST --max-time 120 "http://${target}/start_profile" \
+        | sed "s|^|[profile] ${target} start: |" &
+      pids+=($!)
+    done
+    wait "${pids[@]}"
+
+    deadline=$(( $(date +%s) + ATOMESH_TORCH_PROFILE_DURATION ))
+    while (( $(date +%s) < deadline )) && ! aiperf_gone; do
+      sleep 2
+    done
+
+    echo "[profile] window $(( window + 1 )) stop_profile at $(date -Is) (client timeout ${stop_timeout}s)"
+    pids=()
+    stop_files=()
+    for target in "${targets[@]}"; do
+      stop_file="${out_dir}/.stop_profile_${target//[:.]/_}.json"
+      stop_files+=("${stop_file}")
+      {
+        curl -sS -X POST --max-time "${stop_timeout}" "http://${target}/stop_profile" \
+          > "${stop_file}"
+        sed "s|^|[profile] ${target} stop: |" "${stop_file}"
+        echo
+      } &
+      pids+=($!)
+    done
+    wait "${pids[@]}"
+    echo "[profile] window $(( window + 1 )) stop_profile returned at $(date -Is)"
+
+    if ! wait_for_torch_traces "${start_marker}" "${stop_files[@]}"; then
+      echo "[profile] window $(( window + 1 )) traces incomplete; leaving aiperf to finish on its own"
+      return 0
+    fi
+  done
   touch "${trace_ok_file}"
   local aiperf_pid
   aiperf_pid="$(cat "${aiperf_pid_file}" 2>/dev/null)"
@@ -1428,7 +1437,7 @@ run_aiperf_agentic_benchmark() {
     local aiperf_pid_file="${out_dir}/.aiperf_pid"
     rm -f "${profile_done}" "${trace_ok}" "${aiperf_pid_file}"
     if (( ATOMESH_TORCH_PROFILE_DURATION > 0 )); then
-      if (( AIPERF_BENCHMARK_DURATION < ATOMESH_TORCH_PROFILE_START + ATOMESH_TORCH_PROFILE_DURATION )); then
+      if (( AIPERF_BENCHMARK_DURATION < ${ATOMESH_TORCH_PROFILE_START##*,} + ATOMESH_TORCH_PROFILE_DURATION )); then
         echo "[profile] WARNING: benchmark duration ${AIPERF_BENCHMARK_DURATION}s ends before the" \
           "trace window (${ATOMESH_TORCH_PROFILE_START}s + ${ATOMESH_TORCH_PROFILE_DURATION}s)" >&2
       fi

@@ -168,6 +168,11 @@ on:
           - amd-frameworks
           - amd-tw
           - amd-spur
+      atomesh_slurm_exclude:
+        description: 'Comma-separated nodes the scheduler must not allocate (sbatch --exclude); empty keeps every node eligible'
+        required: false
+        default: ''
+        type: string
       atomesh_single_node:
         description: 'Single-node P/D placement; auto lets Slurm select an idle node, an explicit node pins the job'
         required: false
@@ -227,6 +232,7 @@ env:
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
+  ATOMESH_SLURM_EXCLUDE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_exclude || '' }}
   ATOMESH_SLURM_ACCOUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_account != 'auto' && inputs.atomesh_slurm_account || '' }}
   ATOMESH_SLURM_PARTITION: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_partition != 'auto' && inputs.atomesh_slurm_partition || (((github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-crusoe-mi355' || (github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd')) == 'atomesh-cicd-mi355-crusoe') && 'amd-spur' || '') }}
   ATOMESH_SLURM_SUBMIT_RUNNER: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_slurm_submit_runner || (github.event_name == 'schedule' && github.event.schedule == '10 16 * * *' && 'atomesh-cicd-mi350' || 'atomesh-cicd') }}
