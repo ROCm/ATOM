@@ -533,8 +533,8 @@ def test_mla_sparse_prefill_prefixes_and_tail(monkeypatch, pp, cached):
     for actual, expected in saved:
         assert actual.cpu().tolist() == expected
     for lengths, expected_q, expected_k in snapshots:
-        assert lengths.cu_q == expected_q
-        assert lengths.cu_k == expected_k
+        assert lengths.cu_q_lens == expected_q
+        assert lengths.cu_k_lens == expected_k
 
 
 @pytest.mark.parametrize("transport", ["direct", "packed"])

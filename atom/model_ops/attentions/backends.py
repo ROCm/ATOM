@@ -1000,8 +1000,8 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             # an MHA draft. Decide whether/how to group at the consuming layer.
             # Capture uncached passes too: a TBO straddle can add a prefix.
             attn_metadata.prefill_request_lengths = PrefillRequestLengths(
-                tuple(map(int, cu_seqlens_q)),
-                tuple(map(int, var["cu_seqlens_k"].np[: scheduled_bs + 1])),
+                cu_q_lens=tuple(map(int, cu_seqlens_q)),
+                cu_k_lens=tuple(map(int, var["cu_seqlens_k"].np[: scheduled_bs + 1])),
             )
         mrope_positions = self._build_mrope_prefill_positions(batch)
         if mrope_positions is not None:
