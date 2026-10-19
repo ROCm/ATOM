@@ -1,24 +1,35 @@
-"""Record cache gates; optionally observe the unchanged scheduler methods."""
+"""Record cache gates and enable the isolated Prefill scheduling experiment."""
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
 
+from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.simple_kv_offload import manager as simple_kv_offload_manager
 
 
 def create_scheduler(*args, **kwargs):
+    role = os.environ["C48_DIAG_ROLE"]
+    fairness = os.environ.get("C48_PREFILL_FAIRNESS", "0")
+    if fairness not in ("0", "1") or (fairness == "1" and role != "prefill"):
+        raise ValueError("C48 fairness requires Prefill role and a 0/1 gate")
+    scheduler_sha = hashlib.sha256(Path(scheduler_module.__file__).read_bytes()).hexdigest()
+    if scheduler_sha != "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c":
+        raise RuntimeError("C48 scheduler source differs from the pinned experiment")
     config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
     defaults = copy.copy(config.scheduler_config)
     defaults.scheduler_cls = None
     base = defaults.get_scheduler_cls()
     scheduler = base(*args, **kwargs)
+    scheduler._c48_prefill_fairness = fairness == "1"
     manager = scheduler.kv_cache_manager
     coordinator = manager.coordinator
     requested = scheduler.cache_config.enable_mamba_shared_prefix_checkpoint
     record = {
-        "role": os.environ["C48_DIAG_ROLE"],
+        "role": role,
+        "prefill_fairness_enabled": scheduler._c48_prefill_fairness,
+        "scheduler_source_sha256": scheduler_sha,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,
         "requested_shared_prefix_checkpoint": requested,

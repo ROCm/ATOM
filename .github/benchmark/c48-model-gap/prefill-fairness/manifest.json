@@ -1,0 +1,14 @@
+{
+  "scope": "Experimental C48 Prefill fairness; runtime base 81198e97b; only running rotation and waiting Mamba alignment bypass gated by instance attribute.",
+  "source_worktree": "/app/vllm-c48-cpu-prefill-fairness-20261019",
+  "source_parent_sha": "dfd87d33eca669b6023c1a6ce3e490605c914a7b",
+  "base_scheduler_sha256": "8bf1909e14569e1cb2bc5884a8e98e5dbc09e6b71bb095035898eb3033828630",
+  "patched_sha256": "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c",
+  "target": "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py",
+  "enabled_roles": [
+    "prefill"
+  ],
+  "tests": "/app/test_scripts/dspark_pd/c48-gap-round1-20261012/dispatch-prefill-fairness-20261019/test_prefill_fairness.py",
+  "performance_validated": false,
+  "source_commit": "58fa4b90b51567a6b74fffd473b7a4062291d1b6"
+}
