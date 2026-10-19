@@ -30,7 +30,6 @@ lane's heads in one fma chain, then the swaps): its logits bit for bit.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
@@ -40,6 +39,7 @@ from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
+    buffer_ptr,
     butterfly,
     global_load,
     ld_i32,
@@ -85,11 +85,8 @@ def _vop(asm, *args):
 
 
 def _sload4(addr):
-    """Four words at a wave-uniform address, a scalar load (the constant
-    address space): the scalar cache's round trip, not the vector memory's."""
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
-    v = fx.Vector(llvm.LoadOp(T.vec(4, T.i32), ptr, alignment=16).result)
-    return [fx.Int32(v[k]) for k in range(4)]
+    """Four words at a wave-uniform address, through the scalar cache."""
+    return list(rocdl.s_buffer_load(buffer_ptr(addr), 0, count=4))
 
 
 # the kernel arguments this stage reads (of K2a's many: reading them all at

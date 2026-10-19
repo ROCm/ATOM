@@ -62,9 +62,7 @@ def _spin_bounded(load_all, pending, diag, region_id, index, tag):
             record = [1, region_id, index, tag, v[1], bid, at, 0]
             for h in range_constexpr(2):  # 16 B a store
                 bo.buffer_store(
-                    fx.Vector.from_elements(
-                        [fx.Int32(w) for w in record[4 * h : 4 * h + 4]], fx.Int32
-                    ),
+                    fx.Vector.from_elements(record[4 * h : 4 * h + 4], fx.Int32),
                     rsrc(diag),
                     bid * DIAG_WORDS + 4 * h,
                     cache_modifier=CM_SYS,

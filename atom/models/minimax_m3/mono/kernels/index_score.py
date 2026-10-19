@@ -228,7 +228,7 @@ def emit_index_scores(
                         )
             out.append(
                 [
-                    fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
+                    fx.Vector.from_elements(d[2 * s : 2 * s + 2], fx.Int32)
                     for s in range(HEAD_DIM // 32)
                 ]
             )

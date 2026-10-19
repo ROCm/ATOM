@@ -287,10 +287,10 @@ def pk_fp4_f32(old, a, b, scale, j):
     return fx.Int32(
         rocdl.cvt_scalef32_pk_fp4_f32(
             T.i32,
-            as_ir_value(fx.Int32(old)),
-            as_ir_value(fx.Float32(a)),
-            as_ir_value(fx.Float32(b)),
-            as_ir_value(fx.Float32(scale)),
+            fx.Int32(old),
+            fx.Float32(a),
+            fx.Float32(b),
+            fx.Float32(scale),
             j,
         )
     )

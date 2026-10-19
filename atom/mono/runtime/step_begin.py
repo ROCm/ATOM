@@ -72,7 +72,7 @@ def _words(v):
 def _zero(base, nbytes, first, stride, cm=0):
     """``nbytes`` at ``base`` zeroed, 16 B a store, the grid's lanes from
     ``first`` by ``stride``."""
-    zero = fx.Vector.from_elements([fx.Int32(0)] * 4, fx.Int32)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
     i = first
     n = fx.Int32(nbytes >> 4)
     while i < n:

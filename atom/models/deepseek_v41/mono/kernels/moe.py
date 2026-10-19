@@ -384,11 +384,11 @@ def stage_route(c, t):
             best = wave_max(cv)
             ball = ballot(cv == best)
             win = (ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball)))
-            win_id = fx.Int32(rocdl.readlane(T.i32, ci.ir_value(), win.ir_value()))
+            win_id = fx.Int32(rocdl.readlane(T.i32, ci, win))
             won = (cursor < ept) & (ci == win_id)
             mine_o = won.select(co, fx.Float32(0.0))
             w = fx.Int32(rocdl.readlane(
-                T.i32, mine_o.bitcast(fx.Int32).ir_value(), (win_id & 63).ir_value()
+                T.i32, mine_o.bitcast(fx.Int32), win_id & 63
             )).bitcast(fx.Float32)  # fmt: skip
             cursor = cursor + won.select(1, 0)
             total = total + w
@@ -928,7 +928,7 @@ def ug_pass(c, e, part0, first, count, col):
     for t in range_constexpr(2):
         slot = ug_red_slot(rs, p, wave % 2, ks, t)
         fx.ptr_store(
-            fx.Vector.from_elements([acc[4 * t + q] for q in range(4)], fx.Float32),
+            acc.shuffle(acc, list(range(4 * t, 4 * t + 4))),
             red + (slot * 64 + lane) * 4,
         )
     gpu.barrier()

@@ -157,13 +157,11 @@ def dense_mlp_defs(dctx):
             )
             hw = (k * HIDDEN + e0) // 2
             bo.buffer_store(
-                fx.Vector.from_elements([hi[e] for e in range(4)], fx.Int32),
+                hi.shuffle(hi, [0, 1, 2, 3]),
                 rsrc(h_mid),
                 hw,
             )
-            bo.buffer_store(
-                fx.Vector.from_elements([hi[4], hi[5]], fx.Int32), rsrc(h_mid), hw + 4
-            )
+            bo.buffer_store(hi.shuffle(hi, [4, 5]), rsrc(h_mid), hw + 4)
         ss = fx.Float32(0.0)
         for e in range_constexpr(NE):
             ss = fmath.fma(v[e], v[e], ss)

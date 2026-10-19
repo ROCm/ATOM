@@ -200,7 +200,7 @@ def gather_x(cb, t):
         if q < _XG_QUADS:
             (w,) = cb["poll"]([(own, t * (HIDDEN // 2) + 2 * q, 2)])
             bo.buffer_store(
-                fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                fx.Vector.from_elements(w, fx.Int32),
                 rsrc(cb["args"]["x"]),
                 t * (HIDDEN // 2) + 2 * q,
                 cache_modifier=CM_DEV,

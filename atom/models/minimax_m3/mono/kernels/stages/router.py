@@ -220,12 +220,12 @@ def router_defs(k4ctx):
                     hb = fx.Vector.from_elements(v, fx.Float32).to(fx.BFloat16)
                     hi = hb.bitcast(fx.Int32)
                     bo.buffer_store(
-                        fx.Vector.from_elements([hi[e] for e in range(4)], fx.Int32),
+                        hi.shuffle(hi, [0, 1, 2, 3]),
                         rsrc(h_mid),
                         hw,
                     )
                     bo.buffer_store(
-                        fx.Vector.from_elements([hi[4], hi[5]], fx.Int32),
+                        hi.shuffle(hi, [4, 5]),
                         rsrc(h_mid),
                         hw + 4,
                     )

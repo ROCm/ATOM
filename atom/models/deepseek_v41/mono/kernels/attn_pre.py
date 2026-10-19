@@ -677,14 +677,11 @@ def _fp8_step_mfma(c, k, xl, xsl, st, ops, acc, live=None, rows=None):
     col = fx.min(lane % 16, s - 1)
     if const_expr(live is not None):
         st = fx.min(st, (k + 127) // 128 - 1)
-        lo = [live.select(lo[d], fx.Int32(0)) for d in range(4)]
+        lo = live.select(lo, 0)
     past = (2 * st + 1) * 64 >= k
     if const_expr(live is not None):
         past = past | ~live
-    av = fx.Vector.from_elements(
-        [lo[d] for d in range(4)] + [past.select(fx.Int32(0), hi[d]) for d in range(4)],
-        fx.Int32,
-    )
+    hi = past.select(0, hi)
     grp = st * 4 + j
     xlo = fx.ptr_load(
         xl + (col * x_row + st * 32 + j * 4),
@@ -696,17 +693,10 @@ def _fp8_step_mfma(c, k, xl, xsl, st, ops, acc, live=None, rows=None):
     )
     if const_expr(k % 64 != 0):
         over = 4 * st + j // 2 >= kg
-        av = fx.Vector.from_elements(
-            [over.select(fx.Int32(0), av[d]) for d in range(4)]
-            + [av[4 + d] for d in range(4)],
-            fx.Int32,
-        )
-        xlo = [over.select(fx.Int32(0), xlo[d]) for d in range(4)]
-    xv = fx.Vector.from_elements(
-        [xlo[d] for d in range(4)]
-        + [past.select(fx.Int32(0), xhi[d]) for d in range(4)],
-        fx.Int32,
-    )
+        lo = over.select(0, lo)
+        xlo = over.select(0, xlo)
+    av = lo.shuffle(hi, list(range(8)))
+    xv = xlo.shuffle(past.select(0, xhi), list(range(8)))
     sb = fx.ptr_load(xsl + (col * s_row + fx.min(grp, kg - 1)))
     unit = grp >= kg
     if const_expr(live is not None):
@@ -987,7 +977,7 @@ def normed_row_from(c, nbg, t, n):
             if q < HIDDEN // 4:
                 (w,) = c["poll"]([(nbg, t * (HIDDEN // 2) + 2 * q, 2)])
                 bo.buffer_store(
-                    fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                    fx.Vector.from_elements(w, fx.Int32),
                     rsrc(a["normed"]),
                     t * (HIDDEN // 2) + 2 * q,
                 )

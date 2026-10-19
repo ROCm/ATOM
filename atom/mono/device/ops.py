@@ -6,18 +6,17 @@ execution-model constants and the kernel symbol naming.
 
 Ported from the FlyDSL GLM-5 layer kernel (ROCm/FlyDSL branch
 ``glm5-mla-moe-layer-monokernel`` @ 1e28fd8a,
-``kernels/mla_moe_layer/shared_reuse_moe_kernel.py``). Only published flydsl APIs
-and aiter's vendored ``buffer_ops`` / ``dpp_utils`` are used.
+``kernels/mla_moe_layer/shared_reuse_moe_kernel.py``). Uses typed FlyDSL APIs
+and AITER's ``buffer_ops`` / ``dpp_utils``, with raw IR only at the boundaries
+listed below.
 
 Every function but ``kernel_symbol`` and ``launcher`` is traced inside a
 ``@flyc.kernel`` body.
 
-Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
-``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
-for ``make_buffer_tensor``); raw MFMA intrinsics (hand-laid operands: permlane
-transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
-``s_memrealtime``, ``writelane``) and the struct unpacking of
-``permlane*_swap``.
+Raw boundaries retained on the pinned FlyDSL: ``buffer_ops`` cache policies;
+unwrapped ROCDL math / conversion results; LLVM ``expect``, ``s_memrealtime``
+and ``writelane``; ``permlane*_swap`` struct results; and instruction scheduling
+in ``fresh`` / ``wave_umax_dpp``. Their typed equivalents are not available.
 """
 
 from __future__ import annotations
@@ -72,8 +71,15 @@ def launcher(symbol):
     return jit
 
 
+def buffer_ptr(addr, nbytes=None):
+    ptr = fx.inttoptr(
+        fx.Pointer[fx.Int8, fx.AddressSpace.Global].ir_type, fx.Int64(addr)
+    )
+    return rocdl.make_buffer_ptr(ptr, nbytes)
+
+
 def rsrc(addr, nbytes=None):
-    return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
+    return rocdl.get_buffer_rsrc(buffer_ptr(addr, nbytes))
 
 
 def permlane_swap(off, x, y):
@@ -305,8 +311,10 @@ def row_live(batch_ids, k):
 def ld_dev(ptr, i, words=1):
     """``words`` i32 (1, 2 or 4) of a buffer from word ``i``, at device scope
     (past the per-XCD L2)."""
-    return bo.buffer_load(
-        rsrc(ptr), i, vec_width=words, dtype=T.i32, cache_modifier=CM_DEV
+    return fx.as_dsl_value(
+        bo.buffer_load(
+            rsrc(ptr), i, vec_width=words, dtype=T.i32, cache_modifier=CM_DEV
+        )
     )
 
 
@@ -349,7 +357,7 @@ def rows_to_lds(tid, src, rows, row_words, dst, dst_row):
     assert row_words % 4 == 0, row_words
     batched_rounds(
         tid, rows * row_words // 4,
-        lambda v: fx.Vector(ld_dev(src, v * 4, 4)),
+        lambda v: ld_dev(src, v * 4, 4),
         lambda v, w: fx.ptr_store(
             w, dst + (v * 4 // row_words * dst_row + v * 4 % row_words)
         ),
@@ -401,14 +409,7 @@ def load_ptr64(table, i):
 def fp8x8_bf16_pk(words):
     """Eight fp8 of two dwords -> bf16 MFMA operand (exact) by
     v_cvt_scalef32_pk_bf16_fp8 (scale 1), two values an instruction."""
-    out = []
-    for w in words:
-        for hi in (False, True):
-            p = rocdl.cvt_scalef32_pk_bf16_fp8(
-                T.bf16x2, as_ir_value(fx.Int32(w)), as_ir_value(fx.Float32(1.0)), hi
-            )
-            out.append(fx.Vector(p).bitcast(fx.Int32)[0])
-    return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)
+    return fp8_to_bf16x8(words[0], words[1])
 
 
 def bf16_round(a):
@@ -474,7 +475,7 @@ def uniform_f32(value):
 def spin_pause() -> None:
     """Keep tagged-mailbox polling loads inside the retry loop."""
 
-    llvm.InlineAsmOp(None, [], "s_nop 0", "", has_side_effects=True)
+    rocdl.s_nop(0)
 
 
 def read_lane_i32(value, lane):
@@ -544,17 +545,7 @@ def f8_word(k):
 def fp8_to_bf16x8(word0, word1):
     """Convert two dwords of eight FP8 values to a BF16 vector."""
 
-    one = as_ir_value(fx.Float32(1.0))
-    parts = []
-    for word in (word0, word1):
-        for half in range_constexpr(2):
-            pair = fx.Vector(
-                rocdl.cvt_scalef32_pk_bf16_fp8(
-                    T.vec(2, T.bf16), as_ir_value(word), one, bool(half)
-                )
-            )
-            parts += [pair[0], pair[1]]
-    return fx.Vector.from_elements(parts, fx.BFloat16)
+    return mxfp8_to_bf16x8(word0, word1, fx.Float32(1.0))
 
 
 def mxfp8_to_bf16x8(word0, word1, scale):
@@ -581,8 +572,8 @@ def mxfp4_to_bf16x8(word, scale):
         pair = fx.Vector(
             rocdl.cvt_scalef32_pk_bf16_fp4(
                 T.vec(2, T.bf16),
-                as_ir_value(word),
-                as_ir_value(scale),
+                word,
+                scale,
                 select,
             )
         )

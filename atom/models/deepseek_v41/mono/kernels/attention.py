@@ -178,7 +178,7 @@ def _keys(a, t):
     first window position and its slot's row base (word 2 of its metadata, the
     block table offset, is the indexer's: ``index_score._selected_rows``)."""
     first, count, base = [ld_i32(a["kmeta"], t * KMETA + i) for i in (0, 1, 3)]
-    n_sel = ip.selected(fx.Int32(ld_dev(a["sbound"], t)))
+    n_sel = ip.selected(ld_dev(a["sbound"], t))
     return aplan.kv_len(n_sel, count), (n_sel, first, base)
 
 
@@ -417,7 +417,7 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
     accs = []
     for r in range_constexpr(8):
         sp = splits[r]
-        pb = fx.Vector.from_elements([pws[r][0], pws[r][1]], fx.Int32).bitcast(fx.Int16)
+        pb = fx.Vector.from_elements(pws[r], fx.Int32).bitcast(fx.Int16)
         ok = sp * BK + lane // 4 < kv_len
         # this wave's LDS tile: [key][32 columns], this lane's quarter row
         fx.ptr_store(

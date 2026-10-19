@@ -276,8 +276,8 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
         def load(q, i):
             if const_expr(level == 0):
                 # a quad stays in the row: strides are whole chunks / blocks
-                v = fx.Vector(ld_dev(src, t * stride + j * ip.SEG + i, 4))
-                return [fx.Int32(v[e]) for e in range(4)]
+                v = ld_dev(src, t * stride + j * ip.SEG + i, 4)
+                return list(v)
             return [got[4 * q + e][0] for e in range(4)]
 
         keys = c["sel_lds"]["keys"]
