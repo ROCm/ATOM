@@ -2738,6 +2738,35 @@ class TestScheduledBatchPDFirstDecodeMTP:
 
         assert list(batch.scheduled_tokens) == toks[-(mtp_k + 1) :]
 
+    def test_gap_anchor_overrides_placeholder_window_once(self):
+        mtp_k = 3
+        toks = list(range(100, 110))
+        seq = Sequence(toks, block_size=16)
+        seq.type = SequenceType.DECODE
+        seq._pending_gap_anchor = 999
+
+        first = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+        second = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[mtp_k + 1],
+            total_tokens_num=mtp_k + 1,
+            total_tokens_num_decode=mtp_k + 1,
+            total_seqs_num=1,
+            total_seqs_num_decode=1,
+            num_spec_step=mtp_k,
+        )
+
+        assert list(first.scheduled_tokens) == [999, *toks[-3:]]
+        assert list(second.scheduled_tokens) == toks[-4:]
+
 
 # ── detailed annotation aggregates ──────────────────────────────────────────
 

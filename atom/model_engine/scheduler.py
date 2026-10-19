@@ -331,7 +331,16 @@ class ScheduledBatch:
                 offset = self.num_cached_tokens[i]
             else:
                 offset = seq.num_tokens - num_rejected[i] - num
+            row_start = len(staged)
             staged.extend(seq.token_ids[offset : offset + num])
+            pending_anchor = getattr(seq, "_pending_gap_anchor", None)
+            if (
+                seq.type != SequenceType.PREFILL
+                and pending_anchor is not None
+                and num > 0
+            ):
+                staged[row_start] = pending_anchor
+                seq._pending_gap_anchor = None
         # Checked here because nothing downstream will: the array below wraps
         # whatever length was staged, and a sequence too short to fill its
         # window would otherwise leave the batch quietly short.
@@ -3931,6 +3940,7 @@ class Scheduler:
         finished_seqs = []
         stream_outputs = []
         num_new_generation_tokens = 0
+        current_batch_ids = set(batch.req_ids) if batch is not None else set()
 
         need_placeholder = is_deferred_out or self.spec_decode_local
         # Drafts occupy trailing slots only on an engine that verifies them; a
@@ -4010,6 +4020,18 @@ class Scheduler:
                 seq.prefix_hashes_published = True
             token_ids = prev_token_ids[idx]
             num_new_token = len(token_ids)
+            if (
+                is_deferred_out
+                and seq.id not in current_batch_ids
+                and batch is not None
+                and batch.total_seqs_num_prefill > 0
+                and num_new_token > 0
+            ):
+                # This output surfaced while another (usually prefill) batch
+                # occupied the worker. The next schedule cannot reconstruct
+                # this request's exact anchor from positional placeholders,
+                # because it is no longer in the worker's prev_batch.
+                seq._pending_gap_anchor = int(token_ids[-1])
             token_logprob = None
             if token_logprobs is not None and seq.return_logprobs:
                 token_logprob = token_logprobs.get(seq.id)
