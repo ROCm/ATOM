@@ -407,6 +407,9 @@ models:
             atomesh-cicd-mi350:
               common:
                 MC_NUM_QP_PER_EP: "1"
+                MC_WORKERS_PER_CTX: "1"
+                MC_MAX_WR: "64"
+                MC_IB_PCI_RELAXED_ORDERING: "0"
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
