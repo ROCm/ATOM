@@ -191,6 +191,24 @@ class DraftKvBuilder(PoolRowsMixin):
         from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import KVTransferTensors
 
+        from dataclasses import replace
+        from atom.config import _is_minimax_m3_config
+
+        if _is_minimax_m3_config(self.model_runner.config.hf_config):
+            return KVTransferTensors(
+                pages=[
+                    replace(
+                        page_region(
+                            t,
+                            semantic_role=(
+                                f"m3.draft.{role}.shuffle{self.kv_pool.block_size}.{self.kv_pool.kv_dtype}"
+                            ),
+                        ),
+                        tp_head_groups=(1, self.kv_pool.num_kv_heads),
+                    )
+                    for role, t in self.kv_pool.region_tensors()
+                ]
+            )
         return KVTransferTensors(
             # The draft's rows sit in the same block ids as the target's, so
             # its regions need a name that says which stack they are.

@@ -181,21 +181,20 @@ def parse_mooncake_store_config(
 
 
 def check_engine_compatibility(cfg: MooncakeStoreOffloadConfig, config: Any) -> None:
-    """Refuse what phase 1 does not move: non-dense layouts, DCP, odd chunks.
+    """Accept dense and M3 PAGE bytes; refuse stateful layouts and DCP.
 
-    The Store holds one object per (rank, chunk) of the dense codec's opaque
-    block bytes. A hybrid, M3 or Kimi-K3 layout needs PAGE regions or a state
-    tier this connector does not carry, and a DCP rank's pages cover a virtual
-    block that the chunk keys do not name.
+    M3 uses complete PAGE regions, including its NSA index cache. Stateful
+    layouts require a separate state tier, while a DCP rank's pages cover a
+    virtual block that the chunk keys do not name.
 
     Raises:
-        ValueError: The model is not on the dense layout, DCP > 1, or the
+        ValueError: The model uses neither dense nor M3 PAGE layout, DCP > 1, or the
             chunk is not a whole number of KV blocks.
     """
     layout = offcfg.select_offload_layout(config)
-    if layout != "dense":
+    if layout not in ("dense", "m3"):
         raise ValueError(
-            f"the Mooncake Store offload moves only the dense KV layout; this "
+            f"the Mooncake Store offload moves only the dense KV layout or M3 PAGE layout; this "
             f"model resolves to {layout!r}"
         )
     dcp = int(getattr(config, "decode_context_parallel_size", 1) or 1)

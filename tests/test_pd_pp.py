@@ -1944,3 +1944,71 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
     )
     staging_stream.synchronize.assert_called_once()
     conn._index_staging_slots.release.assert_called_once_with(3)
+
+
+@pytest.mark.parametrize("consumer_rank", range(4))
+def test_m3_pp_stage_writes_only_matching_tp_head_slices(consumer_rank):
+    """Execute real descriptor construction, copying bytes in place of RDMA."""
+    import ctypes
+    import torch
+
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    # Uneven PAGE counts: stage 0 dense, other stages sparse, final also draft.
+    specs = [
+        (
+            f"m3.layer_{layer}.{field}.shuffle{128 if layer == 0 else 16}.fp8",
+            stage,
+            None if field == "index" else (1 if layer == 0 else 8),
+            144 if field == "index" else (64 if "scale" in field else 2048),
+        )
+        for stage, layer in enumerate(range(4))
+        for field in ("k", "v", "k_scale", "v_scale", "index")
+        if layer != 0 or field != "index"
+    ] + [("m3.draft.k.layer_0.shuffle128.fp8", 3, 1, 2048)]
+    src, dst = {}, {}
+    for role, stage, groups, width in specs:
+        shape = (5, 1, 1, width) if groups is None else (5, groups, 8, width)
+        src[role] = torch.randint(0, 255, shape, dtype=torch.uint8)
+        ds = (7, 1, 1, width) if groups is None else (7, groups, 2, width)
+        dst[role] = torch.full(ds, 255, dtype=torch.uint8)
+    roles = [s[0] for s in reversed(specs)]  # Deliberately unlike producer order.
+    request = dict(
+        consumer_base_addrs=[dst[r].data_ptr() for r in roles],
+        consumer_region_roles=roles,
+        consumer_block_bpb=[dst[r][0].numel() for r in roles],
+        consumer_head_groups=[
+            None if dst[r].shape[2] == 1 else (dst[r].shape[1], 2) for r in roles
+        ],
+        consumer_tp_size=4,
+        consumer_tp_rank=consumer_rank,
+        consumer_dcp_size=1,
+    )
+
+    def copy(_target, sources, destinations, sizes, *args, **kwargs):
+        assert len(sources) <= 11
+        for s, d, n in zip(sources, destinations, sizes, strict=True):
+            ctypes.memmove(d, s, n)
+        return True
+
+    for stage in range(4):
+        local = [s for s in specs if s[1] == stage]
+        conn = object.__new__(mc.MooncakeConnector)
+        conn.tp_size, conn.dcp_size, conn.pp_size = 1, 1, 4
+        conn._MAX_RDMA_ENTRIES_PER_BATCH = 11
+        conn.kv_caches_base_addr = [src[r].data_ptr() for r, *_ in local]
+        conn._per_block_bytes_list = [src[r][0].numel() for r, *_ in local]
+        conn._block_region_roles = [r for r, *_ in local]
+        conn._block_head_groups = [
+            None if g is None else (g, 8) for _, _, g, _ in local
+        ]
+        conn._block_region_consumer_indices = None
+        conn._rdma_write = copy
+        assert conn._execute_block_transfer(request, "consumer", [3, 0], [1, 6], "req")
+    for role, _, groups, _ in specs:
+        expected = src[role][[3, 0]]
+        if groups is not None:
+            expected = expected[:, :, consumer_rank * 2 : (consumer_rank + 1) * 2]
+        assert torch.equal(dst[role][[1, 6]], expected), role
+        assert torch.all(dst[role][[0, 2, 3, 4, 5]] == 255), role

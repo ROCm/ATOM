@@ -779,6 +779,43 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
 
         if not self.kv_pools:
             return None
+        if _is_minimax_m3_config(self.model_runner.config.hf_config):
+            from dataclasses import replace
+
+            pages = []
+            for geometry, pool in self.kv_pools.items():
+                by_row = {
+                    row: module for module, row in self.pool_rows[geometry].items()
+                }
+                index_rows = {
+                    row: module
+                    for module, row in self.pool_rows.get(INDEX_ROWS, {}).items()
+                }
+                for role, tensor in pool.region_tensors():
+                    field, row = role.split(".layer_")
+                    module = (index_rows if field == "index" else by_row)[int(row)]
+                    sparse = _is_indexed_sparse_attention(module)
+                    # Sparse writers reinterpret the page as page-16 SHUFFLE.
+                    physical_page = 16 if sparse else pool.block_size
+                    groups = self.model_runner.block_size // physical_page
+                    storage = "index" if field == "index" else f"shuffle{physical_page}"
+                    page = page_region(
+                        tensor,
+                        semantic_role=(
+                            f"m3.layer_{module.layer_num}.{field}.{storage}.{pool.kv_dtype}"
+                        ),
+                    )
+                    pages.append(
+                        replace(
+                            page,
+                            tp_head_groups=(
+                                None
+                                if field == "index"
+                                else (groups, pool.num_kv_heads)
+                            ),
+                        )
+                    )
+            return KVTransferTensors(pages=pages, tp_replication_factor=1)
         return KVTransferTensors(
             # Every field of every pool, indexer cache included: a unit per
             # (pool, field, layer), in declared order. The geometry is in the
