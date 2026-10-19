@@ -160,9 +160,17 @@ class V41BoundaryPlanner(PageRideMixin):
         could restore the state, and the hit is declined.
         """
         hit = int(hit)
-        if hit <= 0 or self._state_checkpoints_can_serve:
+        if hit <= 0:
             return hit
-        return 0
+        if not self._state_checkpoints_can_serve:
+            return 0
+        total = int(getattr(request, "num_tokens", 0) or 0)
+        if self.keep_a_prefill_tail and total and total - hit < 2:
+            # `cap_hit`'s rule: a one-token tail is admitted as a padded verify
+            # row. Declined rather than moved a PAGE back, where no checkpoint
+            # need exist; the tier can still serve the prefix.
+            return 0
+        return hit
 
     # -- load ------------------------------------------------------------
     def _boundary_blocks(

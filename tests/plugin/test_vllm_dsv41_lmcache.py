@@ -59,9 +59,16 @@ def test_a_speculative_ride_never_resumes_one_token_short(keep_tail, expected):
 
 
 def test_a_local_hit_stands_only_where_a_checkpoint_can_restore_it():
-    request = SimpleNamespace(request_id="r")
+    request = SimpleNamespace(request_id="r", num_tokens=4096)
     assert _planner(can_serve=False).cap_local_hit(request, 1280) == 0
     assert _planner(can_serve=True).cap_local_hit(request, 1280) == 1280
+
+
+@pytest.mark.parametrize("num_tokens, expected", [(1025, 0), (1026, 1024)])
+def test_a_speculative_local_hit_keeps_a_prefill_tail(num_tokens, expected):
+    request = SimpleNamespace(request_id="r", num_tokens=num_tokens)
+    planner = _planner(keep_tail=True, can_serve=True)
+    assert planner.cap_local_hit(request, 1024) == expected
 
 
 @pytest.mark.parametrize(
@@ -115,10 +122,45 @@ def test_a_load_rides_only_on_its_recorded_destination():
 
 
 def test_a_save_rides_on_the_committed_source_and_pins_it():
+    """Never on a recorded load destination: a failed load leaves it stale."""
     p, request = _ride()
+    p._record_ride_boundary("r0", 512, (7,))
     assert p.take_ride_state(request, "r0", 512, operation="op").block_ids == (42,)
     assert p.take_ride_state(request, "r0", 500, operation="op2") is None
     assert p._ride_pins == {"op": (42,)}
+
+
+def test_a_finished_requests_save_still_finds_its_request():
+    """The scheduler's SeqView outlives the connector's request map."""
+    c = AtomLMCacheOffloadConnector.__new__(AtomLMCacheOffloadConnector)
+    c._requests = {}
+    c._v41_planner = Mock()
+    request = SimpleNamespace(request_id="r0")
+    seq = SimpleNamespace(id="r0", _request=request)
+    c._v41_state_for_transfer(seq, 512, operation="op")
+    c._v41_planner.take_ride_state.assert_called_once_with(
+        request, "r0", 512, operation="op"
+    )
+
+
+def test_an_unridable_finished_save_retires_and_frees_its_lease():
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+
+    s = ChunkedOffloadSchedulerBase.__new__(ChunkedOffloadSchedulerBase)
+    seq, other = SimpleNamespace(id="r0"), object()
+    s._save_tracker = {"r0": [seq, 256]}
+    s._save_lease_blocks = {id(seq): {10, 11, 12}}
+    s._save_lease_at = {id(seq): 0.0}
+    s._save_lease_owner = {id(seq): seq}
+    # An earlier operation of this request still reads block 10.
+    s._save_operation_owner = {"op1": seq, "op2": other}
+    s._save_operation_blocks = {"op1": {0: 10}, "op2": {0: 11}}
+    s._pending_source_safe_releases = []
+    s.total_source_safe_released_blocks = 0
+    s._drop_unridable_finished_save("r0", seq)
+    assert "r0" not in s._save_tracker
+    assert s._pending_source_safe_releases == [frozenset({11, 12})]
+    assert s._save_lease_blocks == {id(seq): {10}}
 
 
 # -- connector ---------------------------------------------------------------
@@ -373,3 +415,100 @@ def test_unsupported_vllm_cache_settings_are_refused(overrides, refused):
     else:
         with pytest.raises(ValueError, match=refused):
             check(config)
+
+
+# -- checkpoint restores and keeps -------------------------------------------
+
+
+def _from_source(relpath, name, scope, cls=None):
+    """One function from the repository's source, without importing its module.
+
+    Both modules below pull in the GPU stack at import; CPU CI cannot.
+    """
+    import ast
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / relpath
+    body = ast.parse(path.read_text()).body
+    if cls is not None:
+        body = next(
+            n for n in body if isinstance(n, ast.ClassDef) and n.name == cls
+        ).body
+    node = next(n for n in body if isinstance(n, ast.FunctionDef) and n.name == name)
+    exec(  # noqa: S102 - execute only AST nodes from this repository's source.
+        compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope
+    )
+    return scope[name]
+
+
+def test_a_mid_prompt_request_entering_another_requests_slot_is_restored():
+    """A previous tenant that stopped on the same boundary is not this state."""
+    import torch
+
+    scope = {"torch": torch, "_V41_SLOT_OWNERS": {}, "_V41_RESTORES_INSTALLED": True}
+    invalidate = _from_source(
+        "atom/plugin/vllm/deepseek_v41_bridge.py",
+        "_v41_invalidate_reowned_slots",
+        scope,
+    )
+    cache = SimpleNamespace(cursor=torch.tensor([[256, 0], [256, 0], [128, 0]]))
+    invalidate(cache, [0, 1, 2], ["a", "b", "c"], [256, 0, 128])
+    # New owners mid-prompt lose their cursor; one starting at 0 is fresh.
+    assert cache.cursor[:, 0].tolist() == [-1, 256, -1]
+    cache.cursor[:, 0] = torch.tensor([256, 256, 128])
+    invalidate(cache, [0, 1, 2], ["a", "b", "c"], [256, 300, 128])
+    assert cache.cursor[:, 0].tolist() == [256, 256, 128]  # same owners
+    invalidate(cache, [0], ["d"], [256])
+    assert cache.cursor[0, 0].item() == -1
+
+
+def test_decode_keeps_are_stored_at_the_committed_position(monkeypatch):
+    import numpy as np
+
+    from atom.plugin.vllm import paged_state_checkpoint, req_id_passthrough_patch
+    from atom.plugin.vllm import v41_speculative
+
+    batch = SimpleNamespace(num_computed_tokens_cpu=np.array([250, 1020]))
+    monkeypatch.setattr(
+        req_id_passthrough_patch, "get_current_input_batch", lambda: batch
+    )
+    monkeypatch.setattr(
+        req_id_passthrough_patch, "get_current_req_ids", lambda: ["a", "b"]
+    )
+    stored = {}
+    monkeypatch.setattr(
+        paged_state_checkpoint,
+        "store_decode_keeps",
+        lambda worker, ids, ends, fresh_rows: stored.update(zip(ids, ends.tolist())),
+    )
+    # Six rows each (one token plus five drafts); "a" keeps 6, "b" keeps 4.
+    v41_speculative._store_committed_decode_keeps(
+        object(), np.array([0, 2]), np.array([0, 6, 12]), 2
+    )
+    assert stored == {"a": 256, "b": 1024}
+
+
+def test_checkpoints_refuse_async_speculative_scheduling(monkeypatch):
+    import sys
+    import types
+
+    stub = types.ModuleType("atom.plugin.vllm.deepseek_v41_state_checkpoint")
+    stub.v41_state_checkpoints_requested = lambda: True
+    stub.register_deepseek_v41_state_checkpoint_layers = Mock()
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
+    register = _from_source(
+        "atom/plugin/vllm/model_wrapper.py", "_maybe_register_v41_state_checkpoints", {}
+    )
+    spec = SimpleNamespace(speculative_config=object())
+    with pytest.raises(ValueError, match="no-async-scheduling"):
+        register(
+            SimpleNamespace(
+                **vars(spec), scheduler_config=SimpleNamespace(async_scheduling=True)
+            )
+        )
+    register(
+        SimpleNamespace(
+            **vars(spec), scheduler_config=SimpleNamespace(async_scheduling=False)
+        )
+    )
+    stub.register_deepseek_v41_state_checkpoint_layers.assert_called_once()

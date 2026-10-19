@@ -712,10 +712,6 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
         """
         self._retire_recurrent_rides(self._live_transfers())
 
-    #: Saves dropped because the per-request state leg had nothing to offer
-    #: at the boundary. Per request id, so one request failing repeatedly is
-    #: visibly different from many failing once.
-
     def _may_emit_save(self) -> bool:
         """Return whether another save may be emitted this scheduler step."""
         return True
@@ -760,6 +756,37 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             save_operation=operation,
             recurrent_state=recurrent,
         )
+
+    def _drop_unridable_finished_save(self, sid: str, seq) -> None:
+        """Retire a finished request's save that cannot carry its state.
+
+        Gives back the suffix leased at teardown, except blocks an earlier
+        operation of this request may still read; `_release_operation_lease`
+        frees those when that operation becomes source-safe.
+        """
+        entry = self._save_tracker.get(sid)
+        if entry is None or entry[0] is not seq:
+            return
+        self._save_tracker.pop(sid, None)
+        lease_key = id(seq)
+        leased = self._save_lease_blocks.get(lease_key)
+        if not leased:
+            return
+        still_read: set[int] = set()
+        for operation, owner in self._save_operation_owner.items():
+            if owner is seq:
+                still_read.update(
+                    self._save_operation_blocks.get(operation, {}).values()
+                )
+        free = leased - still_read
+        if free:
+            leased.difference_update(free)
+            self._pending_source_safe_releases.append(frozenset(free))
+            self.total_source_safe_released_blocks += len(free)
+        if not leased:
+            self._save_lease_blocks.pop(lease_key, None)
+            self._save_lease_at.pop(lease_key, None)
+            self._save_lease_owner.pop(lease_key, None)
 
     def _save_source_is_backed(
         self,
@@ -1050,6 +1077,11 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
             if request is None:
                 if late_acquired:
                     self._block_manager.free_leased_blocks(late_acquired)
+                if getattr(seq, "_offload_finished", False):
+                    # Nothing will make a finished request's save ridable
+                    # again, and a tracker left behind would hold its lease
+                    # forever.
+                    self._drop_unridable_finished_save(sid, seq)
                 continue
             self._track_save_statistics(save_operation, aligned - saved)
             meta.add_request(request)

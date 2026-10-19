@@ -2379,3 +2379,60 @@ def test_every_step_records_a_fresh_event(fake_lmcache_modules, monkeypatch):
 
     assert len(created) == 2, "a settled event must not come back"
     assert [event.records for event in created] == [1, 1]
+
+
+def test_preemption_fence_covers_queued_transfers_and_fails_stop(monkeypatch):
+    """A queued save reaches the server after the fence; it must hold it."""
+    import threading
+
+    from atom.plugin.vllm.kv_transfer import mp_worker_adapter
+
+    monkeypatch.setattr(mp_worker_adapter, "_FENCE_TIMEOUT_S", 0.01)
+    inner = SimpleNamespace(
+        _lock=threading.Lock(),
+        _pending_saves={},
+        _pending_loads={},
+        _submitting_owner={"save:7:1": "7"},
+        _drain_wake=threading.Event(),
+    )
+    fence = mp_worker_adapter.MPOffloadWorkerAdapter(inner)
+    fence.wait_for_requests(["8"])  # someone else's transfer: no wait
+    with pytest.raises(RuntimeError, match="preemption fence timed out"):
+        fence.wait_for_requests(["7"])
+    assert inner._drain_wake.is_set()
+
+
+def test_get_finished_wakes_the_drain_while_transfers_are_pending(
+    fake_lmcache_modules,
+):
+    """An idle engine queues nothing, so only this call can wake the poll."""
+    worker = _worker(_WorkerAdapter())
+    worker._drain_wake.clear()
+    worker.get_finished()
+    assert not worker._drain_wake.is_set()
+    worker._pending_loads["load:5:1"] = object()
+    worker.get_finished()
+    assert worker._drain_wake.is_set()
+
+
+def test_a_recurrent_load_keeps_the_logical_transfer_end(monkeypatch):
+    """The state is restored at the capped hit, so the PAGE end must match."""
+    from atom.kv_transfer.offload.chunked_scheduler import ChunkedOffloadSchedulerBase
+    from atom.kv_transfer.offload.mp.scheduler import LMCacheMPConnectorScheduler
+
+    monkeypatch.setattr(
+        ChunkedOffloadSchedulerBase,
+        "get_num_new_matched_tokens",
+        lambda self, seq: (768, True),
+    )
+    sched = LMCacheMPConnectorScheduler.__new__(LMCacheMPConnectorScheduler)
+    spec = LoadSpec(0, 1024, can_load=True)
+    sched._load_specs = {"r": spec}
+    sched._hit_save_floors = {}
+    sched.chunk_size = 256
+    sched.block_size = 256
+    sched._last_tier_hit = lambda seq, sid: 1024
+    sched._recurrent_state_hook = object()
+    seq = SimpleNamespace(id="r", num_prompt_tokens=1024)
+    assert sched.get_num_new_matched_tokens(seq) == (768, True)
+    assert spec.transfer_end_tokens is None

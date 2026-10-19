@@ -373,6 +373,17 @@ def _maybe_register_v41_state_checkpoints(vllm_config) -> None:
 
     if not v41_state_checkpoints_requested():
         return
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if getattr(vllm_config, "speculative_config", None) is not None and getattr(
+        scheduler_config, "async_scheduling", False
+    ):
+        # Checkpoint keeps are placed from the CPU's computed count, which
+        # async speculative scheduling advances optimistically (as if every
+        # draft were accepted), so they would land on unwritten boundaries.
+        raise ValueError(
+            "DeepSeek-V4.1 state checkpoints (ATOM_V41_STATE_CHECKPOINTS=1) "
+            "with speculative decoding need --no-async-scheduling"
+        )
 
     register_deepseek_v41_state_checkpoint_layers(vllm_config)
 

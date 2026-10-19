@@ -127,6 +127,10 @@ class LMCacheMPConnector(KVConnectorBase):
         self._pending_loads: dict[str, _PendingLoad] = {}
         self._submitting_saves: set[str] = set()
         self._submitting_loads: set[str] = set()
+        # The request each queued or submitting operation reads or writes the
+        # blocks of. A preemption fence has to cover these too: they reach the
+        # server after the step that queued them.
+        self._submitting_owner: dict[str, str] = {}
         # Keep in-flight IDs in the unbounded pending/submitting collections.
         # Only completed IDs enter these bounded replay tombstones.
         self._completed_save_operations: set[str] = set()
@@ -450,6 +454,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP load operation {operation_id!r}"
                 )
             self._submitting_loads.add(operation_id)
+            self._submitting_owner[operation_id] = str(req.req_id)
         start = int(req.load_spec.hbm_cached_tokens)
         end = (
             int(req.load_spec.lmcache_cached_tokens)
@@ -477,6 +482,7 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             with self._lock:
                 self._submitting_loads.discard(operation_id)
+                self._submitting_owner.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_load_operations,
@@ -520,6 +526,7 @@ class LMCacheMPConnector(KVConnectorBase):
                     f"duplicate LMCache MP save operation {operation_id!r}"
                 )
             self._submitting_saves.add(operation_id)
+            self._submitting_owner[operation_id] = str(req.req_id)
         end = (len(req.token_ids) // self.chunk_size) * self.chunk_size
         start = (
             int(req.save_spec.skip_leading_tokens) // self.chunk_size
@@ -527,6 +534,7 @@ class LMCacheMPConnector(KVConnectorBase):
         if not self._is_kv_writer:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
+                self._submitting_owner.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,
@@ -539,6 +547,7 @@ class LMCacheMPConnector(KVConnectorBase):
         if start >= end:
             with self._lock:
                 self._submitting_saves.discard(operation_id)
+                self._submitting_owner.pop(operation_id, None)
                 _remember_operation_tombstone(
                     operation_id,
                     self._completed_save_operations,
@@ -563,6 +572,7 @@ class LMCacheMPConnector(KVConnectorBase):
             )
             with self._lock:
                 self._submitting_saves.discard(operation_id)
+                self._submitting_owner.pop(operation_id, None)
                 self._pending_saves[operation_id] = _PendingSave(
                     completion=completion,
                     future=None,
@@ -694,6 +704,7 @@ class LMCacheMPConnector(KVConnectorBase):
             transfer = _UnprovableSubmission()
         with self._lock:
             self._submitting_loads.discard(operation_id)
+            self._submitting_owner.pop(operation_id, None)
             self._pending_loads[operation_id] = _PendingLoad(
                 completion=completion,
                 future=transfer,
@@ -766,6 +777,7 @@ class LMCacheMPConnector(KVConnectorBase):
             transfer = _UnprovableSubmission()
         with self._lock:
             self._submitting_saves.discard(operation_id)
+            self._submitting_owner.pop(operation_id, None)
             self._pending_saves[operation_id] = _PendingSave(
                 completion=completion,
                 future=transfer,
@@ -847,6 +859,11 @@ class LMCacheMPConnector(KVConnectorBase):
             # The save drain thread cannot stop the engine; the step can.
             raise self._drain_error
         with self._lock:
+            # A step that queues nothing (an idle engine waiting on a load)
+            # raises no wake of its own; without this the result waits for
+            # the drain thread's 50 ms backstop.
+            if self._pending_loads or self._pending_saves or self._submitting_owner:
+                self._drain_wake.set()
             # The save side is advanced by `_drain_loop`; take whatever it
             # has settled since the last step. Heartbeat health is a control-plane
             # signal, not proof that GPU work has quiesced, so a save is only

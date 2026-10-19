@@ -859,13 +859,14 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
     def _v41_state_for_transfer(self, seq, end: int, operation=None):
         """Which state checkpoint the transfer ending at *end* carries.
 
-        The scheduler holds a ``SeqView``, which has no block hashes; the
-        planner needs vLLM's own request object for them, and this connector
-        is the only side that has both.
+        The planner needs vLLM's request object for its block hashes. It is
+        read off the ``SeqView``, which the scheduler holds for as long as a
+        save is still owed -- including after the request finished, when
+        ``_requests`` has already let it go.
         """
         planner = self._v41_planner
         req_id = str(seq.id)
-        request = self._requests.get(req_id)
+        request = getattr(seq, "_request", None) or self._requests.get(req_id)
         if planner is None or request is None:
             return None
         return planner.take_ride_state(request, req_id, end, operation=operation)

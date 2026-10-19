@@ -559,8 +559,10 @@ def _v41_stage_outside_forward(
     elif synthetic:
         batch = _v41_capture_batch(snapshot, vllm_config, builder)
     else:
-        batch = _v41_scheduled_batch(
-            snapshot, slots=_v41_request_state_slots(snapshot, vllm_config)
+        slots = _v41_request_state_slots(snapshot, vllm_config)
+        batch = _v41_scheduled_batch(snapshot, slots=slots)
+        _v41_invalidate_reowned_slots(
+            builder.cache, slots, snapshot.req_ids, snapshot.num_computed
         )
     running_bs, prepare_kwargs = _v41_prepare_shape(
         snapshot,
@@ -1407,6 +1409,35 @@ def _check_row_alignment(input_batch, num_computed, num_reqs: int) -> None:
         )
 
 
+#: Which request last held each STATE slot, for real batches only.
+_V41_SLOT_OWNERS: dict[int, object] = {}
+_V41_RESTORES_INSTALLED = False
+
+
+def _v41_invalidate_reowned_slots(cache, slots, req_ids, num_computed) -> None:
+    """Force a restore for a request entering a slot another request last held.
+
+    Its cursor can read the wanted position by coincidence -- a previous
+    tenant that stopped on the same boundary -- and the stale-state contract
+    would then pass that tenant's state. -1 matches no position, so
+    `prepare_state` restores the row or refuses it. Only rows that start
+    mid-prompt: one starting at 0 is fresh and reset there. Only with
+    checkpoint restores wired: without them nothing resumes mid-prompt.
+    """
+    if not _V41_RESTORES_INSTALLED or cache is None or req_ids is None:
+        return
+    changed = []
+    for slot, req_id, start in zip(slots, req_ids, num_computed):
+        slot = int(slot)
+        if _V41_SLOT_OWNERS.get(slot) != req_id:
+            _V41_SLOT_OWNERS[slot] = req_id
+            if int(start) > 0:
+                changed.append(slot)
+    if changed:
+        index = torch.as_tensor(changed, dtype=torch.long, device=cache.cursor.device)
+        cache.cursor[index, 0] = -1
+
+
 def _v41_request_state_slots(snapshot, vllm_config):
     """Use V2 RequestState ownership, never scheduled-subset LRU eviction."""
     slots = getattr(snapshot, "state_slots", None)
@@ -2173,6 +2204,8 @@ def _v41_install_restore_hook(adapter, worker) -> None:
         return len(slots)
 
     install_state_checkpoint_restore_hook(restore)
+    global _V41_RESTORES_INSTALLED
+    _V41_RESTORES_INSTALLED = True
 
 
 def v41_page_planes(cache) -> list[tuple[str, torch.Tensor]]:

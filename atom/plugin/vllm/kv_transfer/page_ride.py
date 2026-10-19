@@ -110,10 +110,11 @@ class PageRideMixin:
     def take_ride_state(self, request, req_id, end: int, operation=None):
         """The state blocks a transfer ending at *end* should carry.
 
-        Two sources, in this order. A load has already had its destination
-        resolved and its blocks allocated by vLLM, so the recorded tuple is
-        the only correct answer. A save has not: its source is whatever vLLM
-        has committed and still holds under this boundary's hash.
+        A load's destination was resolved and allocated by vLLM at admission,
+        so the recorded tuple is the only correct answer. A save's source is
+        whatever vLLM has committed and still holds under this boundary's
+        hash -- never a recorded load destination, which a failed load leaves
+        behind on blocks vLLM has since freed.
 
         Only the save source is pinned, and only when the caller names the
         operation that will report it back. A load's destination needs no pin:
@@ -129,8 +130,6 @@ class PageRideMixin:
         from atom.kv_transfer.offload.metadata import RecurrentStateTransfer
 
         end = int(end)
-        by_boundary = self._ride_boundaries.get(str(req_id))
-        recorded = None if by_boundary is None else by_boundary.get(end)
         if operation is None:
             # A load. Its destination is what vLLM allocated for this
             # request's external hit, recorded at admission; none recorded
@@ -139,15 +138,15 @@ class PageRideMixin:
             # request's -- so it is never a load's destination. None makes the
             # scheduler decline the load, and the connector withdraws the
             # promise through `_check_promised_loads`.
-            block_ids = recorded
+            by_boundary = self._ride_boundaries.get(str(req_id))
+            block_ids = None if by_boundary is None else by_boundary.get(end)
         else:
-            block_ids = recorded or (self.source_blocks_for(request, end) or None)
+            block_ids = self.source_blocks_for(request, end) or None
         if not block_ids:
             return None
         pool = self._pool
         pinnable = (
-            not recorded
-            and pool is not None
+            pool is not None
             and operation is not None
             and operation not in self._ride_pins
         )

@@ -127,7 +127,6 @@ class MPOffloadWorkerAdapter:
         if lock is None:
             return
 
-        import logging
         import time
 
         deadline = time.monotonic() + _FENCE_TIMEOUT_S
@@ -139,29 +138,34 @@ class MPOffloadWorkerAdapter:
                     for operation_id, entry in getattr(inner, source, {}).items()
                     if _req_id_of(entry.completion) in wanted
                 ]
-            # A submission still inside `_submit_save` has no future to wait on
-            # yet, but it has not reached the server either, so it is not
-            # reading blocks. Only in-flight futures gate the fence.
-            outstanding = [
+                # Queued or mid-submit: no future yet, but the drain thread
+                # will hand it to the server, which then reads these blocks.
+                submitting = [
+                    operation_id
+                    for operation_id, owner in getattr(
+                        inner, "_submitting_owner", {}
+                    ).items()
+                    if owner in wanted
+                ]
+            outstanding = submitting + [
                 operation_id
                 for operation_id, future in pending
                 if not _terminal_future_result(future)[0]
             ]
             if not outstanding:
                 return
+            if submitting:
+                wake = getattr(inner, "_drain_wake", None)
+                if wake is not None:
+                    wake.set()
             if time.monotonic() >= deadline:
-                # Not silent: proceeding means the forward may overwrite blocks
-                # a transfer is still reading, which shows up later as one
-                # wrong cached prefix and nothing else.
-                logging.getLogger("atom").error(
-                    "ATOM LMCache MP: preemption fence timed out after %.0fs "
-                    "with %d transfer(s) still in flight for %s; the freed "
-                    "blocks may be stored under the preempted token ids",
-                    _FENCE_TIMEOUT_S,
-                    len(outstanding),
-                    sorted(wanted),
+                # Fail-stop: returning would let the forward overwrite blocks
+                # a transfer still reads, caching one wrong prefix silently.
+                raise RuntimeError(
+                    f"ATOM LMCache MP: preemption fence timed out after "
+                    f"{_FENCE_TIMEOUT_S:.0f}s with {len(outstanding)} transfer(s) "
+                    f"still in flight for {sorted(wanted)}"
                 )
-                return
             time.sleep(_FENCE_POLL_S)
 
 
