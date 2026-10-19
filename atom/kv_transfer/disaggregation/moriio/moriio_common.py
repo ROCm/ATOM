@@ -63,6 +63,11 @@ class MoRIIOAgentMetadata(
     num_blocks: int = 0
     block_len: int = 0
     attn_backend_name: str = "aiter"
+    # Per-request state by tensor name: the packed descriptor of the whole
+    # tensor and the bytes of one slot. Omitted for models without any.
+    state_descs: dict[str, bytes] | None = None
+    state_slot_bytes: dict[str, int] | None = None
+    num_state_slots: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +164,10 @@ class MoRIIOConstants:
     # ZMQ handshake message types
     GET_META_MSG = b"get_meta_msg"
     POP_DONE_RECV = b"pop_done_recv"
+    # Serial WRITE mode: the consumer asks the producer to push KV into the
+    # blocks it allocated, and the producer reports back once it has.
+    WRITE_REQ = b"write_req"
+    WRITE_DONE = b"write_done"
     OVER = b"OVER"
     COMPLETION_PREFIX = "cmpl"
 
