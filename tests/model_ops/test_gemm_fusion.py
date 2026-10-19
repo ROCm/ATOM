@@ -2,10 +2,19 @@
 # CPU-only tests for atom.model_ops.gemm_fusion (fake aiter matcher, no GPU).
 from types import SimpleNamespace
 
+import sys
+
 import pytest
 
 from atom.config import GemmFusionConfig
 from atom.model_ops.gemm_fusion import consensus, hooks, site as site_mod, stages
+from atom.model_ops.gemm_fusion import test_utils as TU
+
+
+@pytest.fixture(autouse=True)
+def _clean_test_utils_patches():
+    yield
+    TU.uninstall_faults()
 
 
 # ---------------------------------------------------------------- fake aiter
@@ -82,19 +91,20 @@ def _fake_gf(res):
 
 @pytest.fixture
 def make_site(monkeypatch):
-    def _make(res):
-        hooks.reset_for_tests(res)
-        hooks.set_phase("preparing" if res is not None else "pre")
-        monkeypatch.setattr(stages, "_aiter_override", _fake_gf(res))
+    def _make(res, direct=False):
+        TU.reset_for_tests(res)
+        TU.set_phase("preparing" if res is not None else "pre")
+        TU.inject_aiter(monkeypatch, _fake_gf(res))
         linear = SimpleNamespace(output_size=10240, input_size=3072)
         stg = [SimpleNamespace(kind="sp_exchange"), SimpleNamespace(kind="head_norm_rope_cache")]
-        return site_mod.GemmFusionSite(
+        cls = TU.DirectGemmFusionSite if direct else site_mod.GemmFusionSite
+        return cls(
             "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)),
             q_size=8192, kv_size=128,
         )
 
     yield _make
-    hooks.reset_for_tests()
+    TU.reset_for_tests()
 
 
 # ---------------------------------------------------------------- consensus
@@ -193,7 +203,7 @@ def test_resolve_contract_error_raises_and_is_sticky(make_site):
 
 def test_resolve_profile_off_is_native_without_aiter(make_site, monkeypatch):
     s = make_site(None)  # hooks resources None == OFF
-    monkeypatch.setattr(stages, "_aiter_override", None)  # aiter must not be needed
+    monkeypatch.setitem(sys.modules, "aiter.gemm_fusion", None)  # aiter must not be needed (import would raise)
     r = s.resolve(64)
     assert (r.plan, r.n_fused, r.reason) == (None, 0, "profile_off")
 
@@ -205,14 +215,14 @@ def test_fallback_reasons_pad_rows_and_input_layout(make_site):
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
     x = torch.zeros((16, 8), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((16, 1), dtype=torch.float32)
-    assert s.fallback_reason(ctx, x, xs) == "pad_rows"
+    assert TU.fallback_reason(s, ctx, x, xs) == "pad_rows"
     ctx.real_tokens = 64
-    assert s.fallback_reason(ctx, x, xs) is None
-    assert s.fallback_reason(ctx, x, None) == "unquantized_input"
-    assert s.fallback_reason(ctx, x.to(torch.bfloat16), xs) == "unquantized_input"
-    assert s.fallback_reason(ctx, x, xs.view(1, 16)) == "xscale_layout"
+    assert TU.fallback_reason(s, ctx, x, xs) is None
+    assert TU.fallback_reason(s, ctx, x, None) == "unquantized_input"
+    assert TU.fallback_reason(s, ctx, x.to(torch.bfloat16), xs) == "unquantized_input"
+    assert TU.fallback_reason(s, ctx, x, xs.view(1, 16)) == "xscale_layout"
     ctx.is_dummy_run = True
-    assert s.fallback_reason(ctx, x, xs) == "dummy_run"
+    assert TU.fallback_reason(s, ctx, x, xs) == "dummy_run"
 
 
 def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
@@ -222,15 +232,14 @@ def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
     x = torch.zeros((512, 8), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((512, 1), dtype=torch.float32)
-    assert s.fallback_reason(ctx, x, xs, n_fused=1) is None
-    assert s.fallback_reason(ctx, x, xs, n_fused=2) == "pad_rows"
+    assert TU.fallback_reason(s, ctx, x, xs, n_fused=1) is None
+    assert TU.fallback_reason(s, ctx, x, xs, n_fused=2) == "pad_rows"
 
 
 def _direct_fixture(make_site, res=None):
     import torch
 
-    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)))
-    s.bind_mode = "direct"
+    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
     s.resolve(64, "eager")
     t = dict(
         x=torch.zeros((16, 8), dtype=torch.float8_e4m3fn),
@@ -246,17 +255,25 @@ def _direct_fixture(make_site, res=None):
     return s, t, state, ctx
 
 
-def test_bind_mode_validated_and_recorded(make_site):
+def test_decision_bind_label_is_staged_or_raw_for_the_runtime_site(make_site):
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
-    assert s.bind_mode == "staged"
-    with pytest.raises(ValueError):
-        site_mod.GemmFusionSite("x", SimpleNamespace(output_size=1, input_size=1), [], None,
-                                attn=SimpleNamespace(), q_size=1, kv_size=1, bind_mode="bogus")
+    assert not hasattr(s, "bind_mode") and not hasattr(s, "direct_provider")  # runtime site only stages
     ctx = SimpleNamespace(padded_tokens=64)
     d = s._decision(ctx, site_mod.Resolution(FakePlan(), 2, "v", ""), "profile_hit", "fused")
     assert d.bind_mode == "staged"
     d1 = s._decision(ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused")
     assert d1.bind_mode == "raw"
+
+
+def test_direct_site_labels_its_decisions_and_marks_a_moved_input_as_copy(make_site):
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)), direct=True)
+    assert s.bind_mode == "direct"
+    ctx = SimpleNamespace(padded_tokens=64)
+    r2 = site_mod.Resolution(FakePlan(), 2, "v", "")
+    assert s._decision(ctx, r2, "profile_hit", "fused").bind_mode == "direct"
+    assert s._decision(ctx, r2, "profile_hit", "fused", SimpleNamespace(rebound=True)).bind_mode == "direct+copy"
+    assert s._decision(ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused").bind_mode == "raw"
+    assert s._decision(ctx, r2, "dummy_run", "native").bind_mode == "direct"
 
 
 def test_resolve_after_finalize_without_windows_is_native(make_site):
@@ -268,7 +285,7 @@ def test_resolve_after_finalize_without_windows_is_native(make_site):
 
 # ---------------------------------------------------------- hooks / config
 def test_hooks_noop_when_off():
-    hooks.reset_for_tests()
+    TU.reset_for_tests()
     cfg = SimpleNamespace(gemm_fusion=GemmFusionConfig())
     hooks.init_gemm_fusion(cfg, sp_group=None)
     assert hooks.resources() is None
@@ -342,11 +359,11 @@ def test_native_full_matches_todays_call_sequence(monkeypatch):
 def test_phase_pre_is_native_not_cached_and_ready_is_late_bucket(make_site):
     res = FakeResources(plan_n=(FakePlan(), 2))
     s = make_site(res)
-    hooks.set_phase("pre")
+    TU.set_phase("pre")
     r = s.resolve(64)
     assert (r.plan, r.reason) == (None, "not_prepared") and not s._by_tokens
     assert res.agree_calls == 0  # no collective before prepare
-    hooks.set_phase("ready")
+    TU.set_phase("ready")
     r = s.resolve(64)
     assert (r.plan, r.reason) == (None, "late_bucket")
     assert res.agree_calls == 0  # nor after: decided without a collective in the forward
@@ -395,7 +412,7 @@ def test_agree_prepared_downgrades_unprepared_bucket(make_site):
 
 # --------------------------------------------------- S-B2 check_step
 def _ready_hooks(res):
-    hooks.reset_for_tests(res)
+    TU.reset_for_tests(res)
     hooks.register_plan(FakePlan())
     return res
 
@@ -431,37 +448,144 @@ def test_check_step_decision_mismatch_across_ranks_is_an_error():
 
 
 def test_check_step_noop_when_off_or_not_ready():
-    hooks.reset_for_tests()
+    TU.reset_for_tests()
     hooks.check_step()  # OFF: nothing
     res = FakeResources()
-    hooks.reset_for_tests(res)
-    hooks.set_phase("pre")
+    TU.reset_for_tests(res)
+    TU.set_phase("pre")
     hooks.check_step()
     assert res.resets == 0
 
 
-def test_negative_control_without_poison_check_is_silent(monkeypatch):
+def test_negative_control_without_poison_check_is_silent():
     """E1 negative control: the seam disables the check, poison goes unnoticed."""
-    from atom.model_ops.gemm_fusion import faults
-
     res = _ready_hooks(FakeResources())
     res.poison = 1
-    monkeypatch.setenv(faults.ENV, "no_poison_check")
-    faults.reload()
+    with pytest.raises(hooks.GemmFusionPoisonError):
+        hooks.check_step()  # without the seam the same poison raises
+    res.resets = 0
+    TU.install_faults("no_poison_check")
     hooks.check_step()  # no raise: this is what the check prevents
     assert res.resets == 0
-    monkeypatch.delenv(faults.ENV)
-    faults.reload()
 
 
-def test_poison_rank_fault_seam_targets_one_rank(monkeypatch):
-    from atom.model_ops.gemm_fusion import faults
+def test_poison_rank_fault_seam_targets_one_rank():
+    res = _ready_hooks(FakeResources())
+    res.rank = 1
+    TU.install_faults("poison_rank:1")
+    with pytest.raises(hooks.GemmFusionPoisonError):
+        hooks.check_step()  # rank 1 sees poison through the patched _poison_local
+    assert res.resets == 1
+    res.rank = 0
+    TU.install_faults("poison_rank:1")  # idempotent
+    hooks.check_step()  # rank 0 is untouched
+    assert res.resets == 1
 
-    monkeypatch.setenv(faults.ENV, "poison_rank:1")
-    faults.reload()
-    assert faults.active("poison_rank", 1) == "" and faults.active("poison_rank", 0) is None
-    monkeypatch.delenv(faults.ENV)
-    faults.reload()
+
+def test_recover_skip_seam_skips_the_collective_recovery_on_the_target_rank():
+    res = _ready_hooks(FakeResources())
+    TU.install_faults("recover_skip")
+    hooks.recover()
+    assert res.resets == 0
+    TU.uninstall_faults()
+    hooks.recover()
+    assert res.resets == 1
+
+
+def test_rank_native_seam_makes_only_the_target_rank_decide_native():
+    kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
+              real_tokens=64, padded_tokens=64, x_dtype_is_fp8=True, x_scale_ok=True)
+    orig = site_mod.GemmFusionSite.__dict__["decide_path"]
+    res = _ready_hooks(FakeResources())
+    res.rank = 1
+    TU.install_faults("rank_native:1")
+    assert site_mod.GemmFusionSite.decide_path(**kw) == ("native", "fault_rank_native")
+    res.rank = 0
+    assert site_mod.GemmFusionSite.decide_path(**kw) == ("fused", "profile_hit")  # other ranks fuse
+    TU.uninstall_faults()
+    assert site_mod.GemmFusionSite.__dict__["decide_path"] is orig  # restored exactly
+
+
+def test_slow_remainder_seam_spins_after_the_native_remainder(monkeypatch):
+    spun = []
+    monkeypatch.setattr(TU, "_spin_gpu_us", lambda us: spun.append(us))
+    monkeypatch.setattr(site_mod, "torch", SimpleNamespace(cuda=SimpleNamespace(current_stream=lambda: "s")),
+                        raising=False)
+    s = _ready_hooks(FakeResources()) and site_mod.GemmFusionSite.__new__(site_mod.GemmFusionSite)
+    TU.install_faults("slow_remainder:*:750")
+    out = s._remainder_after_exchange(None, {"packed": 1}, None, lambda packed: packed + 1)
+    assert out == 2 and spun == [750]
+
+
+def test_op_raise_seam_recovers_then_raises(monkeypatch):
+    import types
+
+    res = _ready_hooks(FakeResources())
+    fake_ops = types.ModuleType("atom.model_ops.gemm_fusion.ops")
+    fake_ops.run_qkv_attention = lambda attn, x, xs, pos: ("real-op-ran",)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.gemm_fusion.ops", fake_ops)
+    TU.install_faults("op_raise")
+    with pytest.raises(RuntimeError, match="op_raise"):
+        fake_ops.run_qkv_attention(None, None, None, None)
+    assert res.resets == 1  # the real op's except path: recover() before re-raising
+    TU.uninstall_faults()
+    assert fake_ops.run_qkv_attention(None, None, None, None) == ("real-op-ran",)
+
+
+def test_two_fault_kinds_installed_together_each_keep_their_own_original():
+    """Regression for a late-binding closure bug: with several kinds in one spec each wrapper must
+    call ITS original, not whichever was assigned last."""
+    res = _ready_hooks(FakeResources())
+    res.poison = 0
+    TU.install_faults("poison_rank:0,recover_skip:0,no_poison_check:7")
+    assert hooks._poison_local() == 1  # poison_rank wrapper, rank 0
+    hooks.recover()
+    assert res.resets == 0  # recover_skip wrapper
+    res.rank = 7
+    hooks.check_step()  # no_poison_check on rank 7: silent even with the poison seam
+    assert res.resets == 0
+    TU.uninstall_faults()
+    assert hooks._poison_local() == 0
+
+
+def test_unknown_fault_kind_is_rejected_and_the_env_spec_parses():
+    with pytest.raises(ValueError, match="unknown gemm_fusion fault"):
+        TU.install_faults("bogus")
+    assert TU.parse_faults("poison_rank:1:x,no_poison_check,op_raise:*") == {
+        "poison_rank": (1, "x"), "no_poison_check": (None, None), "op_raise": (None, None)}
+
+
+def test_install_from_env_applies_faults_and_timeouts_and_uninstall_restores(monkeypatch):
+    monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
+    monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "7")
+    monkeypatch.setenv(TU.SHUTDOWN_TIMEOUT_ENV, "3")
+    before = (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S)
+    TU.install_from_env()
+    assert TU.fault_active("poison_rank") == ""
+    assert (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S) == (7.0, 3.0)
+    TU.uninstall_faults()
+    assert (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S) == before
+    assert TU.fault_active("poison_rank") is None
+
+
+def test_the_runtime_package_has_no_test_hooks():
+    """The runtime keeps only what serving needs: no module imports test_utils, and none carries a
+    fault seam, a debug env branch, a test injection point, or a reset-for-tests helper."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion"
+    runtime = [f for f in root.glob("*.py") if f.name != "test_utils.py"]
+    assert {f.name for f in runtime} >= {"hooks.py", "site.py", "ops.py", "resources.py", "stages.py"}
+    forbidden = ("test_utils", "faults", "ATOM_GEMM_FUSION_FAULT", "ATOM_GEMM_FUSION_DEBUG_BIND",
+                 "ATOM_GEMM_FUSION_CHECK_ALIAS", "_aiter_override", "reset_for_tests", "golden_candidate",
+                 "m3_smoke", "hip_triage", "bind_mode=", "direct_provider", "gemm_fusion_kv_page",
+                 "ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S", "ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S")
+    for f in runtime:
+        src = f.read_text(encoding="utf-8")
+        for word in forbidden:
+            assert word not in src, f"{f.name} contains test-only {word!r}"
+    for gone in ("faults.py", "golden_candidate.py", "m3_smoke.py", "hip_triage.py"):
+        assert not (root / gone).exists()
 
 
 # ------------------------------------------------------------------ L-1
@@ -563,7 +687,7 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     import sys
     from pathlib import Path
 
-    from atom.model_ops.gemm_fusion import golden_candidate as GC
+    from atom.model_ops.gemm_fusion import test_utils as GC
 
     aiter_root = Path(__file__).resolve().parents[3] / "aiter-gemm-fusion"
     spec_py = aiter_root / "aiter/gemm_fusion/spec.py"
@@ -588,9 +712,9 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
         {k: getattr(spec, k) for k in ("FusionSpec", "GemmSpec", "Field", "SPExchange", "HeadNormRopeCache")}
     )
     specs = load("aiter.ops.gemm_fusion.sp_qkv.specs", specs_py)
-    monkeypatch.setattr(stages, "_aiter_override", sys.modules["aiter.gemm_fusion"])
+    TU.inject_aiter(monkeypatch, sys.modules["aiter.gemm_fusion"])
     monkeypatch.setattr(stages, "_kv_block_size", lambda: 16)
-    hooks.reset_for_tests()
+    TU.reset_for_tests()
     GC._SITES.clear()
     site, _, _ = GC._site_for(_golden_case(mode), None)
     assert site._static_prologue_ok() is True  # else every golden cell resolves 'uncovered'
@@ -684,15 +808,15 @@ def test_golden_adapter_sites_resolve_to_a_plan_when_a_row_matches(mode, monkeyp
     """The adapter's sites must be ELIGIBLE: resolve through the real site code to a plan
     (2 fused stages) when the matcher has a row for the site's own signature, and must
     carry no 'prologue_unsupported'. Uses only fakes; no aiter, no GPU."""
-    from atom.model_ops.gemm_fusion import golden_candidate as GC
+    from atom.model_ops.gemm_fusion import test_utils as GC
 
     matcher = _SigMatcher([])
     gf = _fake_spec_module(matcher)
-    monkeypatch.setattr(stages, "_aiter_override", gf)
+    TU.inject_aiter(monkeypatch, gf)
     monkeypatch.setattr(stages, "_kv_block_size", lambda: 16)
     res = FakeResources()
-    hooks.reset_for_tests(res)
-    hooks.set_phase("preparing")
+    TU.reset_for_tests(res)
+    TU.set_phase("preparing")
     GC._SITES.clear()
     site, _, _ = GC._site_for(_golden_case(mode), None)
     matcher.sigs.add(site.spec.signature())  # the "profile row" for this 2-stage spec
@@ -713,7 +837,7 @@ def test_golden_dense_gate_is_independent_of_the_decode_flag_and_pinned_to_the_r
     import re
     from pathlib import Path
 
-    from atom.model_ops.gemm_fusion import golden_candidate as GC
+    from atom.model_ops.gemm_fusion import test_utils as GC
 
     impl = SimpleNamespace(head_dim=128, sliding_window=-1, rotary_emb=object(), q_norm=object(), k_norm=object())
     for env in (None, "0", "1"):  # the production M3 env sets it to 1: eligibility must not change
@@ -843,7 +967,7 @@ def test_resolve_shares_one_plan_instance_between_eager_and_capture(make_site, m
     res = FakeResources()
     s = make_site(res)
     match_prefix, made = _fresh_plan_matcher()
-    stages._aiter_override.match_prefix = match_prefix
+    sys.modules["aiter.gemm_fusion"].match_prefix = match_prefix
     eager = s.resolve(64, "eager")
     capture = s.resolve(64, "capture")
     assert len(made) == 2  # the matcher really did build two objects...
@@ -851,7 +975,7 @@ def test_resolve_shares_one_plan_instance_between_eager_and_capture(make_site, m
     assert eager.plan is made[0]
     # order does not matter
     s2 = make_site(FakeResources())
-    stages._aiter_override.match_prefix = match_prefix
+    sys.modules["aiter.gemm_fusion"].match_prefix = match_prefix
     c2 = s2.resolve(128, "capture")
     e2 = s2.resolve(128, "eager")
     assert c2.plan is e2.plan
@@ -862,7 +986,7 @@ def test_prepare_then_capture_launch_never_needs_a_new_binding(make_site):
     different, unbound plan. Now the capture-mode resolution IS the prepared plan."""
     s = make_site(FakeResources())
     match_prefix, _ = _fresh_plan_matcher()
-    stages._aiter_override.match_prefix = match_prefix
+    sys.modules["aiter.gemm_fusion"].match_prefix = match_prefix
     eager = s.resolve(64, "eager")
     capture = s.resolve(64, "capture")
     eager.plan.prepare()  # what prepare_bucket does, once
@@ -902,11 +1026,11 @@ def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
     s.linear.weight_scale = _T(1)
     s.build_meta = lambda st, state: {"q_norm_w": _T(2), "positions": _T(3), "k_cache": _T(4)}
     st = SimpleNamespace(xs=_T(9), outs={"q": _T(5), "k": _T(6)}, m=16)
-    key = s.binding_key(st, {})
+    key = TU.binding_key(s, st, {})
     assert key == {"x_scale": 9, "w_scale": 1, "q_norm_w": 2, "positions": 3, "k_cache": 4,
                    "out_q": 5, "out_k": 6, "rows": 16}
     st.outs["q"] = _T(55)  # a per-call output buffer would show up as a differing key
-    assert s.binding_key(st, {}) != key
+    assert TU.binding_key(s, st, {}) != key
 
 def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monkeypatch):
     """Logic only, against a stand-in transformers (the real 5.16.1 is not installed here):
@@ -932,10 +1056,7 @@ def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monke
     fake = _t.ModuleType("transformers")
     fake.AutoConfig, fake.PretrainedConfig = _Auto, _Pre
     monkeypatch.setitem(sys.modules, "transformers", fake)
-    path = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion/m3_smoke.py"
-    s = importlib.util.spec_from_file_location("m3_smoke_under_test", path)
-    m = importlib.util.module_from_spec(s)
-    s.loader.exec_module(m)
+    m = TU  # the smoke-model helpers live in test_utils
     cls = m.register_hf_config()
     assert registry["minimax_m3"] is cls and cls.model_type == "minimax_m3" and issubclass(cls, _Pre)
     m.register_hf_config()  # second call: already registered -> no error
@@ -943,15 +1064,8 @@ def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monke
     with pytest.raises(ValueError, match="something else"):
         m.register_hf_config("other_type")
 
-def _load_m3_smoke(name="m3_smoke_vl_under_test"):
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion/m3_smoke.py"
-    s = importlib.util.spec_from_file_location(name, path)
-    m = importlib.util.module_from_spec(s)
-    s.loader.exec_module(m)
-    return m
+def _load_m3_smoke(name=None):
+    return TU  # the smoke-model helpers moved into test_utils
 
 
 def test_m3_smoke_vl_layout_follows_the_released_checkpoint_and_keeps_geometry():
@@ -1029,7 +1143,7 @@ def test_shutdown_is_bounded_when_release_hangs():
     res = FakeResources()
     gate = threading.Event()
     res.release = lambda: gate.wait()  # a peer never arrives: the barrier would block forever
-    hooks.reset_for_tests(res)
+    TU.reset_for_tests(res)
     t0 = time.monotonic()
     hooks.shutdown(timeout_s=0.2)  # must return, not raise
     assert time.monotonic() - t0 < 5
@@ -1044,7 +1158,7 @@ def test_shutdown_swallows_release_errors_and_still_clears_state():
         raise RuntimeError("HIP error: operation not supported")
 
     res.release = boom
-    hooks.reset_for_tests(res)
+    TU.reset_for_tests(res)
     hooks.register_plan(FakePlan())
     hooks.shutdown(timeout_s=2)  # does not raise: it would mask the real start-up failure
     assert hooks.resources() is None and not hooks._PLANS
@@ -1054,7 +1168,7 @@ def test_shutdown_normal_path_still_releases_once():
     res = FakeResources()
     calls = []
     res.release = lambda: calls.append(1)
-    hooks.reset_for_tests(res)
+    TU.reset_for_tests(res)
     hooks.shutdown()
     assert calls == [1]
     hooks.shutdown()  # idempotent
@@ -1330,8 +1444,7 @@ class _T:
 
 
 def _fake_direct(make_site, res=None):
-    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)))
-    s.bind_mode = "direct"
+    s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
     s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True))
     import torch as _torch
     t = dict(x=_T((16, 8), _torch.float8_e4m3fn), xs=_T((16, 1), _torch.float32),
@@ -1397,8 +1510,8 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
     for c, want_fused in zip(cases, expected):
         outcomes = set()
         for rank in range(4):
-            monkeypatch.setattr(hooks, "sp_rank", lambda r=rank: r)
             s, t, state, ctx = _fake_direct(make_site)
+            hooks.resources().rank = rank  # the decision must not depend on the rank
             _seed_prepared(s, t, state)
             ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = c["dummy"], c["real"], c["padded"]
             r, reason, _, _ = s._prepare(ctx, _T((16, 8), c["dtype"]), _T(c["scale"]))
@@ -1492,102 +1605,87 @@ def test_poison_error_in_check_step_is_not_swallowed_by_the_runner_wrapper():
 
 # ------------- C-S4: nothing returned or stored by the op may alias a shared window
 class _Span:
-    def __init__(self, ptr, nbytes, shape=None, stride=None, esize=1):
-        self._p, self._n, self._e = ptr, nbytes, esize
-        n = nbytes // esize
-        self.shape = tuple(shape) if shape is not None else (n,)
-        self._stride = tuple(stride) if stride is not None else (1,)
+    def __init__(self, ptr, nbytes):
+        self._p, self._n = ptr, nbytes
 
     def data_ptr(self):
         return self._p
 
-    def element_size(self):
-        return self._e
 
-    def numel(self):
-        n = 1
-        for d in self.shape:
-            n *= d
-        return n
+def _inject_aiter_test_utils(monkeypatch, helper):
+    """Stand in for ``aiter.ops.gemm_fusion.sp_qkv.test_utils`` (aiter's own alias helper)."""
+    import types
 
-    def stride(self):
-        return self._stride
+    class WindowAliasError(RuntimeError):
+        pass
 
-
-def _res_with_shared(res, *wins):
-    res.inner = SimpleNamespace(
-        poison_local=lambda: 0,
-        _regs=[SimpleNamespace(name=n, local=p, bytes=b, shared=sh) for n, p, b, sh in wins],
-    )
-    return res
+    mod = types.ModuleType("aiter.ops.gemm_fusion.sp_qkv.test_utils")
+    mod.assert_no_window_alias = helper
+    mod.WindowAliasError = WindowAliasError
+    monkeypatch.setitem(sys.modules, "aiter.ops.gemm_fusion.sp_qkv.test_utils", mod)
+    return mod
 
 
-def test_alias_check_flags_a_tensor_inside_a_shared_window(make_site):
-    make_site(FakeResources())
-    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True), ("S", 0x20000, 0x1000, True))
-    hooks.check_no_window_alias([("output", _Span(0x40000, 0x100)), ("none", None)])  # clear
-    with pytest.raises(site_mod.GemmFusionBindError, match="aliases shared window 'R'"):
-        hooks.check_no_window_alias([("output", _Span(0x10800, 0x100))])  # inside R
-    with pytest.raises(site_mod.GemmFusionBindError, match="impl._index_q"):
-        hooks.check_no_window_alias([("impl._index_q", _Span(0x0FF80, 0x100))])  # straddles R's start
-    # an adjacent tensor that ends exactly at the window start does not alias
-    hooks.check_no_window_alias([("output", _Span(0x0FF00, 0x100))])
-
-
-def test_alias_check_uses_the_strided_bounding_box_not_just_the_base_pointer(make_site):
-    make_site(FakeResources())
-    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x100, True))
-    # base is below R but a strided view reaches into it
-    strided = _Span(0x0FFF0, 0, shape=(4, 4), stride=(8, 1))  # extent = 3*8 + 3*1 + 1 = 28 bytes
-    strided.numel = lambda: 16
-    with pytest.raises(site_mod.GemmFusionBindError):
-        hooks.check_no_window_alias([("view", strided)])
-
-
-def test_alias_check_ignores_unshared_windows_and_is_a_noop_without_any(make_site):
-    make_site(FakeResources())
-    _res_with_shared(hooks.resources(), ("own_R", 0x10000, 0x1000, False))  # per-owner window: not shared
-    hooks.check_no_window_alias([("output", _Span(0x10000, 0x100))])
-    hooks.resources().inner = SimpleNamespace(poison_local=lambda: 0)  # no registry at all
-    hooks.check_no_window_alias([("output", _Span(0x10000, 0x100))])
-
-
-def test_alias_check_calls_aiters_helper_with_its_real_signature(make_site):
-    """aiter 7c857474: FusionResources.assert_no_window_alias(obj, what=<str>, force=<bool>). ATOM
-    passes a dict keyed by label and force=True (the check only runs under
-    ATOM_GEMM_FUSION_CHECK_ALIAS=1); aiter's WindowAliasError is re-raised as GemmFusionBindError."""
-    make_site(FakeResources())
+def test_alias_check_calls_aiters_test_utils_helper_with_its_real_signature(make_site, monkeypatch):
+    """aiter's helper is ``test_utils.assert_no_window_alias(res, obj, what=<str>, force=<bool>)``
+    (moved out of FusionResources). ATOM passes the wrapper's ``.inner`` as ``res``, a dict keyed by
+    label, and force=True; aiter's WindowAliasError is re-raised as GemmFusionBindError."""
+    res = FakeResources()
+    make_site(res)
     seen = {}
-    res = _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True))
 
-    def helper(obj, what="gemm_fusion output", force=False):
-        seen.update(obj=obj, what=what, force=force)
+    def helper(res_, obj, what="gemm_fusion output", force=False):
+        seen.update(res=res_, obj=obj, what=what, force=force)
 
-    res.inner.assert_no_window_alias = helper
+    _inject_aiter_test_utils(monkeypatch, helper)
     t_out, t_scale, t_iq = _Span(0x40000, 0x100), _Span(0x41000, 0x10), _Span(0x42000, 0x20)
-    hooks.check_no_window_alias(
-        [("out", t_out), ("scale", t_scale), ("impl._index_q", t_iq), ("skipped", None)]
-    )  # would alias nothing here, and aiter (not the local check) decides
-    assert seen["force"] is True and isinstance(seen["what"], str)
+    TU.check_no_window_alias([("out", t_out), ("scale", t_scale), ("impl._index_q", t_iq), ("skipped", None)])
+    assert seen["res"] is res.inner and seen["force"] is True and isinstance(seen["what"], str)
     assert seen["obj"] == {"out": t_out, "scale": t_scale, "impl._index_q": t_iq}  # None entries dropped
-    res.inner.assert_no_window_alias = lambda obj, what="", force=False: (_ for _ in ()).throw(
-        RuntimeError("out points into a CCO window")
-    )
+
+    def boom(res_, obj, what="", force=False):
+        raise RuntimeError("out points into a CCO window")
+
+    _inject_aiter_test_utils(monkeypatch, boom)
     with pytest.raises(site_mod.GemmFusionBindError, match="out points into a CCO window"):
-        hooks.check_no_window_alias([("out", _Span(0x10800, 0x100))])
+        TU.check_no_window_alias([("out", _Span(0x10800, 0x100))])
 
 
-def test_alias_check_falls_back_to_the_local_range_check_for_an_older_aiter(make_site):
-    make_site(FakeResources())
-    _res_with_shared(hooks.resources(), ("R", 0x10000, 0x1000, True))  # no assert_no_window_alias attribute
-    with pytest.raises(site_mod.GemmFusionBindError, match="aliases shared window 'R'"):
-        hooks.check_no_window_alias([("out", _Span(0x10800, 0x100))])
+def test_install_alias_check_wraps_the_op_and_checks_its_outputs(monkeypatch):
+    import types
 
-def test_alias_check_is_opt_in(monkeypatch):
-    monkeypatch.delenv(hooks.ALIAS_CHECK_ENV, raising=False)
-    assert hooks.alias_check_enabled() is False
-    monkeypatch.setenv(hooks.ALIAS_CHECK_ENV, "1")
-    assert hooks.alias_check_enabled() is True
+    fake_ops = types.ModuleType("atom.model_ops.gemm_fusion.ops")
+    out, scale = _Span(0x1000, 8), _Span(0x2000, 4)
+    fake_ops.run_qkv_attention = lambda attn, x, xs, pos: ((out, scale), "decision")
+    monkeypatch.setitem(sys.modules, "atom.model_ops.gemm_fusion.ops", fake_ops)
+    checked = []
+    monkeypatch.setattr(TU, "check_no_window_alias", lambda named: checked.append(dict(named)))
+    attn = SimpleNamespace(impl=SimpleNamespace(_index_q=_Span(0x3000, 2)))
+    TU.install_alias_check()
+    TU.install_alias_check()  # idempotent: one wrapper, one check per call
+    result = fake_ops.run_qkv_attention(attn, None, None, None)
+    assert result == ((out, scale), "decision")
+    assert len(checked) == 1 and set(checked[0]) == {"out", "scale", "impl._index_q"}
+    TU.uninstall_faults()
+    checked.clear()
+    fake_ops.run_qkv_attention(attn, None, None, None)
+    assert checked == []  # uninstalled: the op is the original again
+
+
+def test_alias_check_is_opt_in_through_the_environment_only(monkeypatch):
+    import types
+
+    fake_ops = types.ModuleType("atom.model_ops.gemm_fusion.ops")
+    orig = lambda attn, x, xs, pos: ((None, None), "d")  # noqa: E731
+    fake_ops.run_qkv_attention = orig
+    monkeypatch.setitem(sys.modules, "atom.model_ops.gemm_fusion.ops", fake_ops)
+    monkeypatch.delenv(TU.CHECK_ALIAS_ENV, raising=False)
+    TU.install_from_env()
+    assert fake_ops.run_qkv_attention is orig  # not installed without the env var
+    monkeypatch.setenv(TU.CHECK_ALIAS_ENV, "1")
+    TU.install_from_env()
+    assert fake_ops.run_qkv_attention is not orig
+
 
 # ------------- skip-index layers in the smoke config, decided by ATOM's REAL functions
 def _real_skip_functions():
@@ -1659,3 +1757,42 @@ def test_skip_layers_scale_with_depth_and_frequency_in_the_smoke_config():
     # ordinals 1 and 2 share it. I first expected NO skip here; the real function says otherwise
     # (max(ordinal - offset, 0) % freq != 0), which is why these tests run it instead of a formula copy.
     assert _skip_flags(m.m3_config(layers=4, index_topk_freq=4)) == [False, False, True, True]
+
+
+# ------------- staged (runtime) vs direct (test_utils) input handling
+class _Rec:
+    """Records copy_ calls; slicing returns a view that records into the same log."""
+
+    def __init__(self, name, log):
+        self.name, self.log = name, log
+
+    def copy_(self, src):
+        self.log.append((self.name, "copy", src))
+
+    def __getitem__(self, idx):
+        return _Rec(f"{self.name}[{idx.stop}]", self.log)
+
+
+def _inputs_fixture(make_site, direct):
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)), direct=direct)
+    log = []
+    st = SimpleNamespace(xs=_Rec("xs", log), pos=_Rec("pos", log), slot=_Rec("slot", log), rebound=False)
+    state = {"slot_mapping": _Rec("sm", log)}
+    ctx = SimpleNamespace(real_tokens=40, positions=_Rec("positions", log))
+    return s, st, state, ctx, log
+
+
+def test_the_runtime_site_always_copies_the_per_call_inputs_into_its_staging_buffers(make_site):
+    s, st, state, ctx, log = _inputs_fixture(make_site, direct=False)
+    s._stage_inputs("X_SCALE", ctx, state, st)
+    assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]  # x_scale whole, positions/slot [:real]
+    assert log[0][2] == "X_SCALE"
+
+
+def test_the_direct_site_copies_only_when_an_input_moved(make_site):
+    s, st, state, ctx, log = _inputs_fixture(make_site, direct=True)
+    s._stage_inputs("X_SCALE", ctx, state, st)
+    assert log == []  # unmoved: st.xs/pos/slot ARE the caller's tensors
+    st.rebound = True
+    s._stage_inputs("X_SCALE", ctx, state, st)
+    assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]  # self-heal by copy

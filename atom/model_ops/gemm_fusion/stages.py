@@ -10,13 +10,8 @@ still imports (and the OFF path still runs) without it.
 import importlib
 from typing import Optional
 
-_aiter_override = None  # tests inject a fake module here
-
-
 def aiter_gf():
-    """The ``aiter.gemm_fusion`` module (or an injected stand-in)."""
-    if _aiter_override is not None:
-        return _aiter_override
+    """The ``aiter.gemm_fusion`` module."""
     return importlib.import_module("aiter.gemm_fusion")
 
 
@@ -87,9 +82,7 @@ def head_norm_rope_cache_from_attention(attn, index: Optional[str] = None):
     kv_dtype = getattr(impl, "kv_cache_dtype", "bf16")
     # Sparse impl views the page-128 pool as page-16 SHUFFLE; dense keeps its own
     # page. Both paths are SHUFFLE layout with per-token fp8 scales.
-    page = getattr(impl, "gemm_fusion_kv_page", None) or (
-        16 if hasattr(impl, "index_head_dim") else _kv_block_size()
-    )
+    page = 16 if hasattr(impl, "index_head_dim") else _kv_block_size()
     return gf.HeadNormRopeCache(
         head_dim=impl.head_dim,
         q_heads=impl.num_heads,

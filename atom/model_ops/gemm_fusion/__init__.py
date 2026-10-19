@@ -6,7 +6,6 @@ Importing this package is cheap and does not touch aiter or register ops; the
 custom op lives in ``ops`` and is imported only by a model that adopts a site.
 """
 
-from .consensus import RankDisagreement, agree, decision_key  # noqa: F401
 from .hooks import (  # noqa: F401
     GemmFusionPoisonError,
     GemmFusionRecoveryTimeout,
@@ -16,16 +15,12 @@ from .hooks import (  # noqa: F401
     check_step,
     init_gemm_fusion,
     profile_enabled,
-    recover,
-    register_site,
     shutdown,
 )
 from .site import (  # noqa: F401
-    Decision,
     GemmFusionBindError,
     GemmFusionContractError,
     GemmFusionSite,
-    Resolution,
 )
 
 

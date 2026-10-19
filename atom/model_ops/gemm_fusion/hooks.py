@@ -12,7 +12,7 @@ Lifecycle (every step is collective and runs identically on every SP rank):
                         (match + consensus + window ensure), finalize, prepare
                         plans, quiesce. phase "ready".
   before/after_graph_capture -> coverage log + clean epoch (no new resolution).
-  check_step         -> end of every model step, outside capture (S-B2).
+  check_step         -> end of every model step, outside capture.
   recover / shutdown.
 
 Phases make every per-call decision rank-uniform without a hot-path collective:
@@ -25,13 +25,13 @@ Phases make every per-call decision rank-uniform without a hot-path collective:
 
 import hashlib
 import logging
-import os
 import threading
 from typing import Optional
 
-from . import faults
-
 logger = logging.getLogger("atom.gemm_fusion")
+
+RECOVER_TIMEOUT_S = 120.0  # recover(): bound on the collective quiesce/reset
+SHUTDOWN_TIMEOUT_S = 30.0  # shutdown(): bound on release() (a peer may already be gone)
 
 _SITES: dict = {}
 _RES = None  # FusionResourcesWrapper | None
@@ -40,8 +40,6 @@ _KV = None  # bound kv_cache_data
 _PHASE = "pre"  # "pre" | "preparing" | "ready"
 _BROKEN = None  # reason string once recovery failed; fused path must not be used
 _PLANS: dict = {}  # owner -> plan (chosen by consensus => identical on all ranks)
-DECISIONS: list = []  # bounded dispatch evidence, newest last
-_MAX_DECISIONS = 4096
 _STEP_DIGEST = hashlib.blake2b(digest_size=4)
 _STEP_CALLS = 0
 
@@ -71,10 +69,6 @@ def register_site(site) -> None:
     _SITES[site.name] = site
 
 
-def sites() -> dict:
-    return _SITES
-
-
 def resources():
     return _RES
 
@@ -99,17 +93,8 @@ def phase() -> str:
     return _PHASE
 
 
-def set_phase(p: str) -> None:
-    global _PHASE
-    _PHASE = p
-
-
 def world_or_1() -> int:
     return _RES.world if _RES is not None else 1
-
-
-def sp_rank() -> int:
-    return getattr(_RES, "rank", 0) if _RES is not None else 0
 
 
 def register_plan(plan) -> None:
@@ -117,93 +102,20 @@ def register_plan(plan) -> None:
     _PLANS[owner] = plan
 
 
-# --------------------------------------------------- C-S4: shared-window aliasing check
-ALIAS_CHECK_ENV = "ATOM_GEMM_FUSION_CHECK_ALIAS"
-
-
-def alias_check_enabled() -> bool:
-    return os.environ.get(ALIAS_CHECK_ENV) == "1"
-
-
-def shared_window_ranges():
-    """``[(name, start, end)]`` of every registered SHARED window (the S/R/C windows that
-    several large plans reuse under the ``shared_large`` policy), read from aiter's registry.
-    Empty when the policy is not shared_large (nothing is shared, nothing can alias)."""
-    inner = getattr(_RES, "inner", None)
-    out = []
-    for w in getattr(inner, "_regs", None) or ():
-        if getattr(w, "shared", False):
-            start = int(w.local)
-            out.append((f"{w.name}", start, start + int(w.bytes)))
-    return out
-
-
-def _tensor_span(t):
-    """Address span ``[lo, hi)`` a tensor can touch (conservative bounding box of a strided view)."""
-    lo = int(t.data_ptr())
-    esz = int(t.element_size())
-    if t.numel() == 0:
-        return lo, lo
-    extent = 1 + sum((int(n) - 1) * abs(int(s)) for n, s in zip(t.shape, t.stride()))
-    return lo, lo + extent * esz
-
-
-def check_no_window_alias(named_tensors) -> None:
-    """Reviewer condition C-S4: after the large-M consumers have run INSIDE the op, no tensor the
-    op returns, and none it leaves stored on ``attn.impl`` (e.g. ``_index_q``), may lie inside a
-    shared window. Such a tensor would be silently overwritten by the next large launch of ANY
-    plan on this rank (every large plan's ``recv_view`` aliases the same R window under
-    ``shared_large``).
-
-    ``named_tensors``: iterable of ``(label, tensor-or-None)``. Pure host address arithmetic: no
-    collective, no sync, deterministic in the (uniform) code path.
-
-    aiter (>= 7c857474) provides ``FusionResources.assert_no_window_alias(obj, what=, force=)``: it
-    walks nested dicts/lists/tuples, honours strides, and raises ``WindowAliasError``. It is used,
-    with ``force=True`` (this function only runs when ``ATOM_GEMM_FUSION_CHECK_ALIAS=1``), on a
-    dict keyed by label. For an older aiter without it, the local range check below is the
-    fallback. Either way a failure is raised as ``GemmFusionBindError``.
-    """
-    from .site import GemmFusionBindError
-
-    items = [(n, t) for n, t in named_tensors if t is not None and hasattr(t, "data_ptr")]
-    helper = getattr(getattr(_RES, "inner", None), "assert_no_window_alias", None)
-    if helper is not None:
-        try:
-            helper({n: t for n, t in items}, what="gemm_fusion_qkv_attention", force=True)
-        except Exception as e:  # noqa: BLE001 - aiter's WindowAliasError (a ResourceError)
-            raise GemmFusionBindError(f"gemm_fusion: tensor aliases a shared window: {e}") from e
-        return
-    windows = shared_window_ranges()
-    if not windows:
-        return
-    for label, t in items:
-        lo, hi = _tensor_span(t)
-        for wname, ws, we in windows:
-            if lo < we and ws < hi:
-                raise GemmFusionBindError(
-                    f"gemm_fusion: {label} [{lo:#x},{hi:#x}) aliases shared window {wname!r} "
-                    f"[{ws:#x},{we:#x}): it would be overwritten by the next large launch"
-                )
-
-
 def record_decision(d) -> None:
-    """Log a decision and fold the rank-uniform part into the step digest.
+    """Fold the rank-uniform part of a decision into the step digest.
 
     Digest = (site, tokens, vid, n_fused, path) and, for native paths, the
-    reason. ``bind_mode``/``rebound`` notes are rank-local and excluded.
+    reason. ``bind_mode`` is rank-local and excluded.
     """
     global _STEP_CALLS
-    DECISIONS.append(d)
-    if len(DECISIONS) > _MAX_DECISIONS:
-        del DECISIONS[: len(DECISIONS) - _MAX_DECISIONS]
     reason = d.reason if d.path == "native" else ""
     _STEP_DIGEST.update(f"{d.site}|{d.tokens}|{d.vid}|{d.n_fused}|{d.path}|{reason};".encode())
     _STEP_CALLS += 1
 
 
 # ----------------------------------------------------------------- lifecycle
-def init_gemm_fusion(config, sp_group, resources=None) -> None:
+def init_gemm_fusion(config, sp_group) -> None:
     """After distributed + SP group init, before model construction/KV alloc."""
     global _RES, _PROFILE, _PHASE
     if not profile_enabled(config):
@@ -218,7 +130,7 @@ def init_gemm_fusion(config, sp_group, resources=None) -> None:
     gf.load_profile(name)
     _PROFILE = name
     # the same profile feeds the resources (window budget / VMM heap), not only the matcher
-    _RES = resources or FusionResourcesWrapper(sp_group, sp_world(), profile=name)
+    _RES = FusionResourcesWrapper(sp_group, sp_world(), profile=name)
     _PHASE = "pre"
     inner = getattr(_RES, "inner", None)
     logger.info(
@@ -246,7 +158,7 @@ def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = N
     return sorted(toks)
 
 
-def prepare_buckets(tokens_list, device=None, out_dtype=None) -> None:
+def prepare_buckets(tokens_list) -> None:
     """Collective, outside capture, on every rank in the same order:
     resolve (match + consensus + ensure) every (site, bucket, mode) ->
     ``finalize`` -> ``plan.prepare`` -> ``quiesce_and_reset`` -> phase "ready".
@@ -261,14 +173,11 @@ def prepare_buckets(tokens_list, device=None, out_dtype=None) -> None:
                 s.resolve(t, graph_mode=mode)
     _RES.finalize()
     if _KV is not None:
-        if device is None:
-            import torch
+        import torch
+        from atom.config import get_current_atom_config
 
-            device = torch.device("cuda", torch.cuda.current_device())
-        if out_dtype is None:
-            from atom.config import get_current_atom_config
-
-            out_dtype = get_current_atom_config().torch_dtype
+        device = torch.device("cuda", torch.cuda.current_device())
+        out_dtype = get_current_atom_config().torch_dtype
         for s in _SITES.values():
             for t in tokens_list:
                 prepared = s.prepare_bucket(t, device, _KV, out_dtype)
@@ -278,10 +187,10 @@ def prepare_buckets(tokens_list, device=None, out_dtype=None) -> None:
 
 
 def bind_kv_cache(kv_cache_data) -> None:
-    """After KV allocation. Resolves/prepares every profile bucket (L-3)."""
+    """After KV allocation. Resolves/prepares every profile bucket."""
     global _KV
     if _KV is not None and _RES is not None:
-        # RE-bind. Staged plans hold raw pointers to the KV caches they were prepared on; a
+        # RE-bind. Plans hold raw pointers to the KV caches they were prepared on; a
         # re-allocated pool would be silently ignored by them. Agree across ranks (this call is
         # made on every rank, so the collective is uniform) and fail on ALL ranks before any
         # state changes. Not a per-call check, and absent on the first bind.
@@ -302,7 +211,7 @@ def bind_kv_cache(kv_cache_data) -> None:
         prepare_buckets(profile_tokens(_RES.world))
 
 
-def before_graph_capture(buckets, device=None, out_dtype=None) -> None:
+def before_graph_capture(buckets) -> None:
     """Coverage log + clean epoch. Everything the profile can fuse was resolved
     and prepared in ``bind_kv_cache``; a capture bucket outside it is native
     (``late_bucket``) on every rank, decided without a collective.
@@ -322,10 +231,8 @@ def after_graph_capture() -> None:
         _RES.quiesce_and_reset()
 
 
-# ------------------------------------------------------------------ S-B2
+# ----------------------------------------------------------- per-step check
 def _poison_local() -> int:
-    if faults.active("poison_rank", sp_rank()) is not None:
-        return 1
     return int(_RES.inner.poison_local())
 
 
@@ -340,7 +247,7 @@ def check_step() -> None:
     raises. A step that made no fused call and has no prepared plan does nothing
     (uniform across ranks).
 
-    LIMIT (E-3): this is a collective at the END of the step, so it only sees steps that
+    LIMIT: this is a collective at the END of the step, so it only sees steps that
     COMPLETE on every rank. A non-uniform decision whose collectives do not match (one rank in
     the native RCCL all_to_all while its peers wait in the fused CCO kernel) blocks the step
     mid-way and never reaches this call: that is FAIL-STOP at the process-group timeout, not a
@@ -352,9 +259,6 @@ def check_step() -> None:
         return
     if _BROKEN is not None:
         raise GemmFusionPoisonError(f"gemm_fusion disabled after failed recovery: {_BROKEN}")
-    if faults.active("no_poison_check", sp_rank()) is not None:
-        _reset_step()
-        return
     if not _PLANS and _STEP_CALLS == 0:
         return
     p = _poison_local()
@@ -381,23 +285,20 @@ def _reset_step() -> None:
     _STEP_CALLS = 0
 
 
-# ------------------------------------------------------------------ L-1
+# ---------------------------------------------------------------- recovery
 def recover(timeout_s: Optional[float] = None) -> None:
     """Collective recovery: device sync -> drain -> barrier -> re-init -> barrier.
 
     EVERY SP rank must call it (``check_step`` makes the decision collective).
     A rank that never arrives would block the others in the barrier, so the call
-    is bounded: after ``timeout_s`` (env ``ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S``,
-    default 120) it marks the fused path broken and raises
-    ``GemmFusionRecoveryTimeout``; the worker must then be treated as failed.
+    is bounded: after ``timeout_s`` (default ``RECOVER_TIMEOUT_S``) it marks the fused path
+    broken and raises ``GemmFusionRecoveryTimeout``; the worker must then be treated as failed.
     """
     global _BROKEN
     if _RES is None:
         return
-    if faults.active("recover_skip", sp_rank()) is not None:
-        return
     if timeout_s is None:
-        timeout_s = float(os.environ.get("ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S", "120"))
+        timeout_s = RECOVER_TIMEOUT_S
     err = []
 
     def _run():
@@ -429,7 +330,7 @@ def shutdown(timeout_s: Optional[float] = None) -> None:
     res, _RES = _RES, None
     if res is not None:
         if timeout_s is None:
-            timeout_s = float(os.environ.get("ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S", "30"))
+            timeout_s = SHUTDOWN_TIMEOUT_S
         err = []
 
         def _run():
@@ -448,21 +349,4 @@ def shutdown(timeout_s: Optional[float] = None) -> None:
             logger.error("gemm_fusion shutdown: release() failed: %r (continuing)", err[0])
     _PLANS.clear()
     _SITES.clear()
-    DECISIONS.clear()
     _PHASE = "pre"
-
-
-def reset_for_tests(res: Optional[object] = None, profile: str = "test-profile") -> None:
-    """Reset module state. ``profile`` is what ``hooks.profile()`` returns while ``res`` is set
-    (the harness passes the one it loaded; unit tests with fakes keep the default)."""
-    global _RES, _PROFILE, _KV, _PHASE, _BROKEN
-    _SITES.clear()
-    _PLANS.clear()
-    DECISIONS.clear()
-    _KV = None
-    _RES = res
-    _PROFILE = profile if res is not None else ""
-    _PHASE = "ready" if res is not None else "pre"
-    _BROKEN = None
-    _reset_step()
-    faults.reload()

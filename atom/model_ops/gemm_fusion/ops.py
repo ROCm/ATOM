@@ -12,7 +12,7 @@ import torch
 from atom.config import get_current_atom_config
 from atom.utils import mark_spliting_op
 
-from . import faults, hooks
+from . import hooks
 from .context import AttnFusionCtx
 
 
@@ -23,7 +23,7 @@ def _layer(layer_name):
 
 
 def run_qkv_attention(attn, x, x_scale, positions):
-    """Real implementation, shared by the custom op and test/evidence harnesses.
+    """Real implementation behind the custom op.
 
     Returns ``((output_fp8, scale), Decision)``. Any failure inside a fused op
     triggers ``hooks.recover()`` before re-raising.
@@ -35,21 +35,7 @@ def run_qkv_attention(attn, x, x_scale, positions):
         attn, positions, x.shape[0], get_sp_world_size()
     )
     try:
-        if faults.active("op_raise", hooks.sp_rank()) is not None:
-            raise RuntimeError("gemm_fusion fault seam: op_raise")  # E4 test seam
-        result = site.run(x, x_scale, ctx)
-        if hooks.alias_check_enabled():
-            # C-S4 (debug assertion, off by default; ATOM_GEMM_FUSION_CHECK_ALIAS=1): after the
-            # large-M consumers ran, nothing returned or stored may alias a shared window.
-            (out, out_scale), _decision = result
-            hooks.check_no_window_alias(
-                [
-                    ("out", out),
-                    ("scale", out_scale),
-                    ("impl._index_q", getattr(attn.impl, "_index_q", None)),
-                ]
-            )
-        return result
+        return site.run(x, x_scale, ctx)
     except Exception:
         # A host exception on THIS rank is a one-rank event while recover() is
         # collective. It is bounded: peers that do not arrive make this call raise
@@ -57,7 +43,6 @@ def run_qkv_attention(attn, x, x_scale, positions):
         # hanging. The engine must treat the worker as failed either way.
         hooks.recover()
         raise
-
 
 def _fake(
     x: torch.Tensor,

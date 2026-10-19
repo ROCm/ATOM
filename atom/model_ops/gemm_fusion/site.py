@@ -5,9 +5,12 @@
 Model-agnostic apart from the QKV split sizes. ``resolve`` asks aiter which
 stage prefix a profile covers for a token bucket (cached, consensus-checked);
 ``run`` executes the fused prefix through the aiter plan and the remainder with
-today's ATOM code. Every call yields a ``Decision`` record (evidence).
-``run_prologue`` stops after the norm/rope/cache stage (no attention); it is the
-entry the golden-harness candidate adapter uses.
+today's ATOM code. Every call yields a ``Decision`` record.
+
+Binding: the per-call tensors ATOM receives (x_scale, positions, slot_mapping)
+are not address-stable, so aiter's pointer bindings are made once, outside graph
+capture, against site-owned staging buffers; each call copies the small inputs
+into them (device-side, capturable).
 """
 
 import logging
@@ -17,9 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-import os
-
-from . import faults, hooks
+from . import hooks
 from .resources import plan_owner
 from .stages import aiter_gf
 
@@ -31,8 +32,9 @@ class GemmFusionContractError(RuntimeError):
 
 
 class GemmFusionBindError(RuntimeError):
-    """An invariant the fused path relies on was violated (unprepared bucket,
-    moved KV cache, wrong stream). Never downgraded to a one-rank fallback."""
+    """An invariant the fused path relies on was violated (KV page mismatch, a
+    re-bound KV pool, a consumer on the wrong stream). Never downgraded to a
+    one-rank fallback."""
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,7 @@ class Decision:
     n_fused: int
     path: str  # "native" | "fused"
     reason: str = ""
-    bind_mode: str = ""  # "direct" | "staged" | "raw" (1-stage plans take raw pointers)
+    bind_mode: str = ""  # "staged" | "raw" (1-stage plans take raw pointers)
 
 
 def _plan_vid(plan) -> str:
@@ -80,21 +82,8 @@ class GemmFusionSite:
         index_k_size=0,
         sparse=False,
         skip_index=False,
-        register=True,
-        bind_mode="staged",
-        direct_provider=None,
     ):
         gf = aiter_gf()
-        if bind_mode not in ("direct", "staged"):
-            raise ValueError(f"bind_mode must be 'direct' or 'staged', got {bind_mode!r}")
-        # 'staged': per-call copies into site-owned buffers (eager, unstable
-        # addresses). 'direct': plans bind the caller's own x_scale/positions/
-        # slot_mapping/cache tensors at prepare time, no per-call copies; the
-        # caller guarantees stable addresses (graph static buffers, harness
-        # cases). A changed address is never used silently: reason 'rebind_needed'.
-        self.bind_mode = bind_mode
-        # optional callable(tokens) -> {"x_scale","positions","slot_mapping","state"}
-        self.direct_provider = direct_provider
         self.name = name
         self.linear = linear
         self.stages = tuple(stages)
@@ -112,9 +101,7 @@ class GemmFusionSite:
         self._by_tokens: dict = {}
         self._wcache: dict = {}
         self._staging: dict = {}
-        self._bind_dump: dict = {}  # tokens -> (where, binding_key) from the first dump
-        if register:
-            hooks.register_site(self)
+        hooks.register_site(self)
 
     # -- layout helpers --------------------------------------------------
     def split_qkv(self, qkv):
@@ -127,13 +114,6 @@ class GemmFusionSite:
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         return q, k, v
-
-    def packed_width(self, impl) -> int:
-        """Columns of the exchanged rows (== ``_exchange_columns`` output)."""
-        w = impl.num_heads * impl.head_dim + 2 * impl.num_kv_heads * impl.head_dim
-        if self.sparse:
-            w += impl.index_q_size + impl.index_head_dim
-        return w
 
     def declared_page(self):
         """KV page size encoded in the site's HeadNormRopeCache.kv_cache string
@@ -175,12 +155,12 @@ class GemmFusionSite:
         return False if fn is None else bool(fn())
 
     def resolve(self, tokens: int, graph_mode: str = "eager") -> Resolution:
-        """Resolve a bucket. Cache key is ``(tokens, graph_mode)`` (L-2).
+        """Resolve a bucket. Cache key is ``(tokens, graph_mode)``.
 
         Only the collective ``preparing`` phase runs match/consensus/ensure. Before
         it every call is native (``not_prepared``); after it a bucket that was not
         resolved is native (``late_bucket``) -- both decided identically on every
-        rank without a collective inside the forward (L-3, M-1).
+        rank without a collective inside the forward.
         """
         key = (tokens, graph_mode)
         r = self._by_tokens.get(key)
@@ -251,21 +231,19 @@ class GemmFusionSite:
         self._by_tokens[key] = r
         return r
 
-    def _runtime_mode(self) -> str:
+    @staticmethod
+    def _runtime_mode() -> str:
         return "capture" if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing() else "eager"
 
     def _prepared_ok(self, tokens: int, r: Resolution, prepared: bool) -> bool:
         """This rank's local verdict that bucket ``tokens`` is safe to launch for resolution
-        ``r``. Every rank-local invariant the per-call path used to re-check (and raise on)
-        is folded in here, at prepare time, and then AGREED across ranks by
+        ``r``. Every rank-local invariant the per-call path would otherwise re-check (and raise
+        on) is folded in here, at prepare time, and then AGREED across ranks by
         ``agree_prepared``: a failure downgrades the bucket to native on ALL ranks instead
         of raising on one rank in the middle of a step.
-          * prepared            : this rank bound the plan (staged: copies into its buffers;
-                                  direct: caller tensors)
-          * plan instance      : the plan prepared is the plan this resolution will launch
-                                  (an unshared instance would need a new binding at run/capture)
-          * direct KV pointers : the caller's KV cache/scale addresses are still the ones the
-                                  plan was bound to (``kv_moved``)
+          * prepared    : this rank bound the plan (copies into its own staging buffers)
+          * plan instance : the plan prepared is the plan this resolution will launch
+                            (an unshared instance would need a new binding at run/capture)
         """
         if not prepared:
             return False
@@ -274,7 +252,7 @@ class GemmFusionSite:
         st = self._staging.get(tokens)
         if st is None or not st.prepared:
             return False
-        prepared_plan = getattr(st, "plan", None)
+        prepared_plan = st.plan
         if prepared_plan is not None and prepared_plan is not r.plan:
             logger.error("%s: bucket %d resolves to a plan instance other than the one prepared", self.name, tokens)
             return False
@@ -296,9 +274,9 @@ class GemmFusionSite:
                     None, 0, "native", "prepare_disagree" if outcome != "agree" else "unprepared"
                 )
 
-    # -- staged-mode KV pointer guard (bind time, collective) ------------------
+    # -- KV pointer guard (bind time, collective) --------------------------------
     def kv_ptrs(self, kv_cache_data):
-        """Addresses of this layer's KV caches and scales: what a staged binding is made on."""
+        """Addresses of this layer's KV caches and scales: what a binding is made on."""
         layer = kv_cache_data.get(f"layer_{self.attn.impl.layer_num}")
         if layer is None:
             return None
@@ -311,8 +289,7 @@ class GemmFusionSite:
         and agreed across ranks there; it is never evaluated per call."""
         now = self.kv_ptrs(kv_cache_data)
         return any(
-            getattr(st, "prepared", False) and getattr(st, "kv_ptrs", None) not in (None, now)
-            for st in self._staging.values()
+            st.prepared and st.kv_ptrs not in (None, now) for st in self._staging.values()
         )
 
     # -- persistent staging (aiter binds raw pointers once per tensor set) ------
@@ -336,16 +313,14 @@ class GemmFusionSite:
                 kv = (tokens, impl.num_kv_heads, impl.head_dim)
                 outs["k"] = torch.empty(kv, dtype=dtype, device=device)
                 outs["v"] = torch.empty(kv, dtype=dtype, device=device)
-            staged = self.bind_mode == "staged"
             st = SimpleNamespace(
                 outs=outs,
-                # direct mode: xs/pos/slot are the caller's tensors, set at prepare
-                xs=torch.empty((m, 1), dtype=torch.float32, device=device) if staged else None,
-                pos=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
-                slot=torch.empty((tokens,), dtype=torch.int64, device=device) if staged else None,
+                xs=torch.empty((m, 1), dtype=torch.float32, device=device),
+                pos=torch.empty((tokens,), dtype=torch.int64, device=device),
+                slot=torch.empty((tokens,), dtype=torch.int64, device=device),
                 prepared=False,
-                rebound=False,
-                ptrs=None,
+                plan=None,
+                kv_ptrs=None,
                 m=m,
             )
             self._staging[tokens] = st
@@ -359,8 +334,7 @@ class GemmFusionSite:
         return c[1]
 
     def build_meta(self, st, state) -> dict:
-        """``Plan.run(meta=...)``: the authoritative aiter sp_qkv.small.v1 key
-        contract (aiter-integration-notes.md, S2-2b-ii)."""
+        """``Plan.run(meta=...)``: the authoritative aiter sp_qkv.small.v1 key contract."""
         impl = self.attn.impl
         rot = impl.rotary_emb
         meta = {
@@ -391,7 +365,7 @@ class GemmFusionSite:
                     x_scale_ok):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
         (resolution agreed at resolve, the broadcast batch's dummy flag, global token counts,
-        and the input's dtype/shape facts). No rank, no env, no device state, no fault seam:
+        and the input's dtype/shape facts). No rank, no env, no device state:
         the same inputs give the same ``(path, reason)`` on every rank. -> (path, reason)."""
         if resolution.plan is None:
             return "native", resolution.reason
@@ -418,107 +392,10 @@ class GemmFusionSite:
         )
         return fp8, ok
 
-    def fallback_reason(self, ctx, x, x_scale, n_fused=2):
-        """Why the fused prefix cannot run for this call (None = it can). A view of
-        ``decide_path`` over the call's tensors; ``_prepare`` uses the same function."""
-        fp8, ok = self.input_facts(x, x_scale)
-        path, why = self.decide_path(
-            resolution=Resolution(object(), n_fused, "", ""),
-            is_dummy_run=ctx.is_dummy_run,
-            real_tokens=ctx.real_tokens,
-            padded_tokens=ctx.padded_tokens,
-            x_dtype_is_fp8=fp8,
-            x_scale_ok=ok,
-        )
-        return None if path == "fused" else why
-    def binding_key(self, st, state, x_scale=None) -> dict:
-        """Named data_ptr of every tensor aiter's small plan keys its binding on
-        (variants.py ``_binding``: x_scale, w_scale, norms, cos/sin, positions,
-        slot_mapping, q out, caches, k/v/index_q outs, index_cache) plus the row count.
-        Used by the debug dump below: diffing the dump at prepare against the dump at
-        run/capture names the tensor whose address moved."""
-        meta = self.build_meta(st, state)
-        d = {"x_scale": self._ptr(x_scale if x_scale is not None else st.xs),
-             "w_scale": self._ptr(self.linear.weight_scale)}
-        for k in ("q_norm_w", "k_norm_w", "index_q_norm_w", "index_k_norm_w", "cos_cache", "sin_cache",
-                  "positions", "slot_mapping", "k_cache", "v_cache", "k_scale", "v_scale", "index_cache"):
-            if k in meta:
-                d[k] = self._ptr(meta[k])
-        for k, v in st.outs.items():
-            d["out_" + k] = self._ptr(v)
-        d["rows"] = st.m
-        return d
-
-    def _dump_binding(self, where, tokens, st, state, x_scale=None):
-        """``ATOM_GEMM_FUSION_DEBUG_BIND=1``: log the binding key at prepare vs run."""
-        if os.environ.get("ATOM_GEMM_FUSION_DEBUG_BIND") != "1":
-            return
-        key = self.binding_key(st, state, x_scale)
-        first = self._bind_dump.setdefault(tokens, (where, key))
-        diff = {k: (first[1].get(k), v) for k, v in key.items() if first[1].get(k) != v}
-        logger.warning(
-            "gemm_fusion bind[%s] %s tokens=%d plan=%s mode=%s %s",
-            where, self.name, tokens, id(st), self._runtime_mode(),
-            "SAME as " + first[0] if not diff else "DIFFERS from " + first[0] + ": " + repr(diff),
-        )
-
-    def _live_ptrs(self, x_scale, positions, state):
-        """Addresses the plan binds (small-M); compared at run time in direct mode."""
-        return (
-            self._ptr(x_scale),
-            self._ptr(positions),
-            self._ptr(state["slot_mapping"]),
-            self._ptr(state["k_cache"]),
-            self._ptr(state.get("v_cache_shuffle", state["v_cache"])),
-            self._ptr(state.get("k_scale_view", state.get("k_scale"))),
-            self._ptr(state.get("v_scale_view", state.get("v_scale"))),
-        )
-
-    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, pad_rows=False, direct=None):
-        """Bind the plan for one (padded == real) bucket OUTSIDE graph capture.
-
-        Called after ``bind_kv_cache`` and the bucket's resolution, before capture.
-        ``direct`` (direct mode only; else ``direct_provider(tokens)``):
-        ``{"x_scale","positions","slot_mapping","state"}`` -- the caller's stable
-        tensors, bound as-is.
-        """
-        r = self.resolve(tokens, "eager")
-        if r.plan is None:
-            return False
-        if r.n_fused < 2:
-            # 1-stage prefix (large M): the plan takes raw per-launch pointers, no
-            # staging; just attach + init control after finalize, before capture.
-            hooks.resources().finalize()
-            prep = getattr(r.plan, "prepare", None)
-            if prep is not None:
-                prep(res=hooks.resources().bound)
-            return True
-        if pad_rows:
-            return False  # run time falls back (pad_rows); nothing to bind
-        st = self._stage(tokens, device, out_dtype)
-        if self.bind_mode == "direct":
-            if direct is None and self.direct_provider is not None:
-                direct = self.direct_provider(tokens)
-            if direct is None:
-                return st.prepared  # no stable tensors to bind; agree_prepared() downgrades uniformly
-            if st.prepared:
-                # Already bound. The KV cache/scale addresses are fixed at KV allocation: if the
-                # caller's differ from the ones bound, the plan would write a stale cache. Report
-                # "not prepared" so agree_prepared() downgrades the bucket to native on ALL ranks
-                # (moved x_scale/positions/slot are self-healed by copy at run time instead).
-                live = self._live_ptrs(direct["x_scale"], direct["positions"], direct["state"])
-                return live[3:] == st.ptrs[3:]
-            state = direct["state"]
-            st.xs, st.pos, st.slot = direct["x_scale"], direct["positions"], direct["slot_mapping"]
-            st.ptrs = self._live_ptrs(st.xs, st.pos, state)
-        else:
-            if st.prepared:
-                return True
-            state = self.attn.impl.gemm_fusion_prologue_state(
-                _ShimFwdCtx(kv_cache_data, st.slot, self.attn.impl)
-            )
-            if state is None:
-                return False
+    # -- binding -----------------------------------------------------------------
+    def _bind_plan(self, r, tokens, st, state, device, kv_cache_data):
+        """Create aiter's pointer binding for a 2-stage plan outside capture and mark the
+        bucket prepared. ``st.xs/pos/slot`` are the buffers the binding is made on."""
         x = torch.zeros((st.m, self.linear.input_size), dtype=torch.float8_e4m3fn, device=device)
         res = hooks.resources()
         res.finalize()
@@ -529,44 +406,68 @@ class GemmFusionSite:
         st.prepared = True
         st.plan = r.plan  # the exact plan instance whose binding was just created
         st.kv_ptrs = self.kv_ptrs(kv_cache_data) if kv_cache_data else None  # for kv_moved()
-        self._dump_binding("prepare", tokens, st, state)
         return True
+
+    @staticmethod
+    def _prepare_one_stage(r):
+        """1-stage prefix (large M): the plan takes raw per-launch pointers, no staging; just
+        attach + init control after finalize, before capture."""
+        hooks.resources().finalize()
+        prep = getattr(r.plan, "prepare", None)
+        if prep is not None:
+            prep(res=hooks.resources().bound)
+        return True
+
+    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype):
+        """Bind the plan for one bucket OUTSIDE graph capture (padded == real).
+
+        Called after ``bind_kv_cache`` and the bucket's resolution, before capture."""
+        r = self.resolve(tokens, "eager")
+        if r.plan is None:
+            return False
+        if r.n_fused < 2:
+            return self._prepare_one_stage(r)
+        st = self._stage(tokens, device, out_dtype)
+        if st.prepared:
+            return True
+        state = self.attn.impl.gemm_fusion_prologue_state(
+            _ShimFwdCtx(kv_cache_data, st.slot, self.attn.impl)
+        )
+        if state is None:
+            return False
+        return self._bind_plan(r, tokens, st, state, device, kv_cache_data)
 
     # -- execution -------------------------------------------------------
     def _prepare(self, ctx, x, x_scale):
         """-> (Resolution, reason, state, staging).
 
-        PER-CALL DECISION, M-1 / E-3. ``decide_path`` is a pure function of rank-uniform
-        inputs, so every rank takes the same path for the same call:
+        PER-CALL DECISION. ``decide_path`` is a pure function of rank-uniform inputs, so every
+        rank takes the same path for the same call:
           resolution   : agreed at resolve (collective consensus), cached, and downgraded
-                         uniformly by ``agree_prepared`` (prepared / plan instance / direct KV
-                         pointers are all folded into THAT agreement, at prepare time).
+                         uniformly by ``agree_prepared`` (prepared / plan instance are folded
+                         into THAT agreement, at prepare time).
           dummy_run    : ``batch.is_dummy_run`` comes from ONE pickled batch that
                          ``AsyncIOProcManager.call_func`` broadcasts to every worker of the
                          engine core (rpc_broadcast_mq.enqueue); SP ranks share that core.
           real/padded  : ``real_tokens`` = positions.shape[-1] (global, positions stay whole
                          under SP), ``padded_tokens`` = local rows * world, equal on every rank.
           x dtype / x_scale shape : follow from the model (SPMD) and equal local rows.
-        There is NO rank-local raise in this method any more: the "unprepared bucket",
-        "prologue state unavailable", "KV address moved" and "other plan instance" conditions
-        are unreachable after ``agree_prepared`` (they would downgrade the bucket to native on
-        every rank, or fail ``hooks.bind_kv_cache`` on every rank), so nothing here can make
-        one rank leave a step while its peers wait in a fused kernel.
+        There is NO rank-local raise in this method: the "unprepared bucket", "prologue state
+        unavailable" and "other plan instance" conditions are unreachable after
+        ``agree_prepared`` (they downgrade the bucket to native on every rank, or fail
+        ``hooks.bind_kv_cache`` on every rank), so nothing here can make one rank leave a step
+        while its peers wait in a fused kernel.
 
-        What this does NOT make safe: a non-uniform decision caused by a bug or a fault (the
-        ``rank_native`` seam, a one-rank exception before launch). The step-end digest in
-        ``hooks.check_step`` only sees steps that COMPLETE on every rank; a divergence that blocks
-        mid-step (one rank in the native RCCL all_to_all, the others in the fused CCO kernel)
-        never reaches it. Such a divergence is FAIL-STOP at the process-group timeout (E-3).
+        What this does NOT make safe: a non-uniform decision caused by a bug or a fault (a
+        one-rank exception before launch). The step-end digest in ``hooks.check_step`` only
+        sees steps that COMPLETE on every rank; a divergence that blocks mid-step (one rank in
+        the native RCCL all_to_all, the others in the fused CCO kernel) never reaches it. Such a
+        divergence is FAIL-STOP at the process-group timeout.
         """
         r = self.resolve(ctx.padded_tokens, self._runtime_mode())
         reason = r.reason
         if r.plan is None:
             return r, reason, None, None
-        if faults.active("rank_native", hooks.sp_rank()) is not None:
-            # TEST SEAM: deliberately non-uniform. Fail-stop by design (E-3): the peers block in
-            # their fused kernels, so the step-end digest is not reached.
-            return Resolution(None, 0, "native", "fault_rank_native"), "fault_rank_native", None, None
         fp8, scale_ok = self.input_facts(x, x_scale)
         path, why = self.decide_path(
             resolution=r,
@@ -582,32 +483,26 @@ class GemmFusionSite:
             return r, reason, None, None
         st = self._staging[ctx.padded_tokens]  # prepared on every rank (agree_prepared)
         state = ctx.prologue_state()  # eligibility was agreed at resolve; never None here
-        if self.bind_mode == "direct":
-            # x_scale / positions / slot_mapping may have moved since prepare: refreshed by copy
-            # in _execute (a device-side copy, no collective, no fallback). The KV addresses were
-            # checked at prepare (agree_prepared), not here.
-            live = self._live_ptrs(x_scale, ctx.positions, state)
-            st.rebound = live[:3] != st.ptrs[:3]
         return r, reason, state, st
+
+    def _stage_inputs(self, x_scale, ctx, state, st):
+        """Copy the per-call inputs into the buffers the plan is bound to (device-side,
+        capturable)."""
+        n = ctx.real_tokens
+        st.xs.copy_(x_scale)
+        st.pos[:n].copy_(ctx.positions[:n])
+        st.slot[:n].copy_(state["slot_mapping"][:n])
+
     def _execute(self, r, x, x_scale, ctx, state, st, out_dtype):
         """Run the fused prefix; return its ``outs`` dict."""
         res = hooks.resources()
         res.finalize()  # collective + idempotent; before any plan executes
         if r.n_fused >= 2:
-            if self.bind_mode == "staged" or getattr(st, "rebound", False):
-                # staged: always. direct: only when x_scale/positions/slot_mapping
-                # moved since prepare -- the plan is bound to the held buffers, so
-                # refresh them in place (self-heal) rather than fall back on one rank.
-                n = ctx.real_tokens
-                st.xs.copy_(x_scale)
-                st.pos[:n].copy_(ctx.positions[:n])
-                st.slot[:n].copy_(state["slot_mapping"][:n])
-            # direct, unmoved: st.xs/pos/slot ARE the caller's tensors; no copies
-            outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
+            self._stage_inputs(x_scale, ctx, state, st)
             # the plan keeps its pointer bindings per INSTANCE; that the plan launched here is the
             # one prepared is verified at prepare time (`_prepared_ok` via `agree_prepared`),
             # not per call, so no rank can raise here while its peers launch.
-            self._dump_binding("run", ctx.padded_tokens, st, state, xs)
+            outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
         r.plan.run(
@@ -616,8 +511,8 @@ class GemmFusionSite:
         )
         if r.n_fused < 2:
             # Zero-copy view of the plan's receive window; valid until this rank
-            # launches the next epoch of the SAME plan, i.e. past the native
-            # remainder that consumes it (same stream, in order). Reuse layers get
+            # launches the next large epoch (of ANY plan under a shared window), i.e. past
+            # the native remainder that consumes it (same stream, in order). Reuse layers get
             # the [T,2560] row-stride-2304 view: the IQ|IK columns alias the next
             # row and are never read (skip branch), and rope_cache's
             # qkv.contiguous() copies the view with those semantics intact.
@@ -629,25 +524,23 @@ class GemmFusionSite:
             outs = {"packed": view}
         return outs
 
+    def _bind_label(self, r, path, st):
+        return "raw" if (path == "fused" and r.n_fused < 2) else "staged"
+
     def _decision(self, ctx, r, reason, path, st=None):
-        bm = "raw" if (path == "fused" and r.n_fused < 2) else self.bind_mode
-        if path == "fused" and st is not None and getattr(st, "rebound", False):
-            bm += "+copy"  # direct bind refreshed by copy (rank-local, not in the digest)
-        d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason, bm)
+        d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason,
+                     self._bind_label(r, path, st))
         hooks.record_decision(d)
         return d
 
     def _remainder_after_exchange(self, r, outs, ctx, consumer):
-        """Run the native remainder on a large-M recv_view. L-4: the view is only
-        valid on the launching stream until this rank's next epoch of the plan, so
-        the launch and every consumer must be on ``torch.cuda.current_stream()``."""
+        """Run the native remainder on a large-M recv_view. The view is only valid on the
+        launching stream until this rank's next large launch, so the launch and every
+        consumer must be on ``torch.cuda.current_stream()``."""
         s0 = torch.cuda.current_stream()
         out = consumer(outs["packed"])
         if torch.cuda.current_stream() != s0:
             raise GemmFusionBindError("recv_view consumer ran on a different stream")
-        delay = faults.active("slow_remainder", hooks.sp_rank())
-        if delay is not None:  # TEST SEAM (E5): widen the WAR window on this rank
-            _spin_gpu_us(int(delay or "2000"))
         return out
 
     def run(self, x, x_scale, ctx):
@@ -665,22 +558,6 @@ class GemmFusionSite:
             )
         return out, self._decision(ctx, r, reason, "fused", st)
 
-    def run_prologue(self, x, x_scale, ctx, native_full, native_after_exchange, out_dtype):
-        """GEMM + exchange + norm/rope/cache only (no attention).
-
-        Returns ``(kind, payload, Decision)``: ``("outs", dict)`` when the fused
-        prefix covered the norm/rope/cache stage, else ``("native", result)``
-        from ``native_full(x, x_scale)`` / ``native_after_exchange(packed)``.
-        """
-        r, reason, state, st = self._prepare(ctx, x, x_scale)
-        if r.plan is None:
-            return "native", native_full(x, x_scale), self._decision(ctx, r, reason, "native")
-        outs = self._execute(r, x, x_scale, ctx, state, st, out_dtype)
-        if r.n_fused >= 2:
-            return "outs", outs, self._decision(ctx, r, reason, "fused", st)
-        out = self._remainder_after_exchange(r, outs, ctx, native_after_exchange)
-        return "native", out, self._decision(ctx, r, reason, "fused", st)
-
 
 class _ShimFwdCtx:
     """Just enough forward context for ``gemm_fusion_prologue_state`` before
@@ -695,15 +572,3 @@ def _out_dtype():
     from atom.config import get_current_atom_config
 
     return get_current_atom_config().torch_dtype
-
-
-def _out_dtype_from(ctx):
-    return _out_dtype()
-
-
-def _spin_gpu_us(us: int) -> None:
-    """Test seam: keep the current stream busy ~``us`` microseconds (E5)."""
-    try:
-        torch.cuda._sleep(int(us * 1000))  # cycles; order-of-magnitude is enough
-    except Exception:
-        torch.cuda.synchronize()

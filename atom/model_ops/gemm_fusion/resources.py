@@ -17,7 +17,6 @@ must ensure identical requests in identical order):
 """
 
 import logging
-from typing import Callable, Optional
 
 from . import consensus
 from .stages import aiter_gf
@@ -46,55 +45,28 @@ def fusion_resources_cls(gf):
 
 
 class FusionResourcesWrapper:
-    def __init__(
-        self,
-        sp_group=None,
-        world: int = 1,
-        *,
-        rank: Optional[int] = None,
-        pg=None,
-        inner=None,
-        reduce_min: Optional[Callable] = None,
-        device: Optional[int] = None,
-        arch: Optional[str] = None,
-        cu: Optional[int] = None,
-        profile: Optional[str] = None,
-    ):
+    def __init__(self, sp_group, world: int, profile: str):
+        gf = aiter_gf()
         self.group = sp_group
         self.world = world
-        gf = aiter_gf()
-        if rank is None:
-            rank = sp_group.rank_in_group
-        if pg is None and sp_group is not None:
-            # object broadcast / barrier go over the CPU group when present
-            pg = getattr(sp_group, "cpu_group", None) or getattr(
-                sp_group, "device_group", None
-            )
-        self.rank, self.pg = rank, pg
-        if inner is None:
-            import torch
+        self.rank = sp_group.rank_in_group
+        # object broadcast / barrier go over the CPU group when present
+        self.pg = getattr(sp_group, "cpu_group", None) or getattr(sp_group, "device_group", None)
+        import torch
 
-            device = torch.cuda.current_device() if device is None else device
-            caps = gf.detect_capabilities(sp_group)
-            # The uniform window size / count and the VMM heap come from the profile's
-            # window_budget. Pass the profile EXPLICITLY: aiter reads no environment variable to
-            # choose one, so omitting it leaves the budget unknown and the first (small, 4 MiB)
-            # request sizes every window (E2 new_on02: a later 40 MiB large-M plan is rejected).
-            if profile is None:
-                from . import hooks
-
-                profile = hooks.profile()
-            inner = fusion_resources_cls(gf)(
-                rank=rank, world=world, group=pg, device=device, caps=caps, profile=profile
-            )
-        self.inner = inner
-        self.caps = frozenset(getattr(inner, "caps", ()))
-        self._arch = arch or gf.detect_arch()
-        self._cu = cu if cu is not None else gf.detect_cu()
-        if reduce_min is None and world > 1:
-            reduce_min = consensus.torch_min_reducer(pg, device=_device())
-        self._reduce_min = reduce_min
-
+        device = torch.cuda.current_device()
+        caps = gf.detect_capabilities(sp_group)
+        # The window budget (and the VMM heap derived from it) comes from the profile's
+        # window_budget. The profile is passed EXPLICITLY: aiter reads no environment variable to
+        # choose one, so omitting it leaves the budget unknown and the first (small, 4 MiB)
+        # request sizes every window (E2 new_on02: a later 40 MiB large-M plan is rejected).
+        self.inner = fusion_resources_cls(gf)(
+            rank=self.rank, world=world, group=self.pg, device=device, caps=caps, profile=profile
+        )
+        self.caps = frozenset(getattr(self.inner, "caps", ()))
+        self._arch = gf.detect_arch()
+        self._cu = gf.detect_cu()
+        self._reduce_min = consensus.torch_min_reducer(self.pg, device=_device()) if world > 1 else None
     # -- matching / consensus ----------------------------------------------
     def local_m(self, tokens: int) -> int:
         return tokens // self.world
