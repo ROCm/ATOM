@@ -207,7 +207,7 @@ env:
   ATOMESH_NODE_POOL: ''
   # Slurm 8979/8980: independent qwen38-srv container held g09 GPUs at startup.
   # Keep automatic 2-node allocation; this experiment only excludes that host.
-  ATOMESH_SLURM_EXCLUDE_NODES: pit2-p03-g01,pit2-p03-g09,pit2-p03-g38,pit2-p03-g52,pit2-p03-g53
+  ATOMESH_SLURM_EXCLUDE_NODES: pit2-p03-g01,pit2-p03-g09,pit2-p03-g24,pit2-p03-g38,pit2-p03-g52,pit2-p03-g53
   # GID 1 selects IPv4 on TW; GID 0 is IPv6 link-local.
   NCCL_IB_GID_INDEX: '1'
   ATOMESH_SINGLE_NODE: ${{ github.event_name == 'workflow_dispatch' && inputs.atomesh_single_node || 'auto' }}
