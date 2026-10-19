@@ -6,9 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import PretrainedConfig
 
-from atom.config import Config, SpeculativeConfig
+from atom.config import Config
 from atom.model_ops.prefill_workspace import PrefillRequestLengths, run_grouped_prefill
 from atom.utils.forward_context import AttentionMetaData
 
@@ -80,7 +79,11 @@ def test_single_request_is_never_truncated():
 
 
 @pytest.mark.parametrize("max_tokens", [9, 10, 27])
-def test_grouped_paged_attention_matches_unsplit_reference(max_tokens):
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_grouped_paged_attention_matches_unsplit_reference(
+    max_tokens, kv_heads, is_draft
+):
     torch.manual_seed(23)
     q_lengths = torch.tensor([2, 3, 1, 4, 2], dtype=torch.int32)
     k_lengths = torch.tensor([7, 3, 9, 6, 2], dtype=torch.int32)
@@ -88,13 +91,13 @@ def test_grouped_paged_attention_matches_unsplit_reference(max_tokens):
     cu_k = torch.cat([torch.zeros(1, dtype=torch.int32), k_lengths.cumsum(0).int()])
     blocks = torch.randperm(25).reshape(5, 5)
     starts = torch.tensor([0, 1, 3, 0, 2], dtype=torch.int32)
-    k_cache = torch.randn(25, 4, 2, 4, dtype=torch.float64)
+    k_cache = torch.randn(25, 4, kv_heads, 4, dtype=torch.float64)
     v_cache = torch.randn_like(k_cache)
-    k_scale = torch.rand(25, 4, 2, 1, dtype=torch.float64) + 0.2
+    k_scale = torch.rand(25, 4, kv_heads, 1, dtype=torch.float64) + 0.2
     v_scale = torch.rand_like(k_scale) + 0.2
-    # GQA: four query heads for two KV heads.
+    # Four query heads exercise MQA, GQA and MHA (Eagle can have Q heads == KV heads).
     q = torch.randn(int(cu_q[-1]), 4, 4, dtype=torch.float64)
-    k = torch.empty(len(q), 2, 4, dtype=q.dtype)
+    k = torch.empty(len(q), kv_heads, 4, dtype=q.dtype)
     meta = AttentionMetaData(
         has_cached=True,
         total_kv=int(cu_k[-1]),
@@ -112,7 +115,9 @@ def test_grouped_paged_attention_matches_unsplit_reference(max_tokens):
             tuple(cu_q.tolist()), tuple(cu_k.tolist())
         ),
     )
-    ctx = SimpleNamespace(context=SimpleNamespace(is_draft=True), attn_metadata=meta)
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=True, is_draft=is_draft), attn_metadata=meta
+    )
     original = {
         name: value.clone()
         for name, value in vars(meta).items()
@@ -128,10 +133,10 @@ def test_grouped_paged_attention_matches_unsplit_reference(max_tokens):
             pages, offsets = md.block_tables[i, pos // 4], pos % 4
             keys = (
                 k_cache[pages, offsets] * k_scale[pages, offsets]
-            ).repeat_interleave(2, dim=1)
+            ).repeat_interleave(4 // kv_heads, dim=1)
             values = (
                 v_cache[pages, offsets] * v_scale[pages, offsets]
-            ).repeat_interleave(2, dim=1)
+            ).repeat_interleave(4 // kv_heads, dim=1)
             sub_q = queries[int(a) : int(b)]
             logits = torch.einsum("qhd,khd->hqk", sub_q, keys) / 2.0
             mask = torch.arange(count)[None, :] > torch.arange(len(sub_q))[
@@ -170,7 +175,7 @@ def test_grouped_paged_attention_matches_unsplit_reference(max_tokens):
         k_scale,
         v_scale,
         ctx,
-        max_tokens * 2 * 2 * 4 * 8,
+        max_tokens * 2 * kv_heads * 4 * 8,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert len(seen) == {9: 4, 10: 3, 27: 1}[max_tokens]
@@ -205,68 +210,110 @@ def test_under_budget_does_not_need_host_metadata_or_copy_output():
     assert run_grouped_prefill(attention, q, q, q, q, q, None, None, ctx, 64) is q
 
 
-@pytest.fixture
-def draft_config(monkeypatch):
-    # Synthetic acceptance is unrelated to workspace validation and imports
-    # AITER kernels. Keep configuration tests runnable on CPU workers.
-    monkeypatch.setattr(
-        SpeculativeConfig, "_resolve_synthetic_acceptance", lambda _: None
+@pytest.mark.parametrize("budget", [-1, 0.5, True, "8192", None])
+def test_workspace_config_rejects_invalid_budgets_before_model_loading(budget):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        Config(model="unused", prefill_kv_workspace_mb=budget)
+
+
+def test_workspace_rejects_sharded_prefill_before_model_loading():
+    with pytest.raises(ValueError, match="requires PCP=1"):
+        Config(
+            model="unused",
+            prefill_kv_workspace_mb=8192,
+            prefill_context_parallel_size=2,
+        )
+
+
+def test_layer_geometry_changes_groups_without_changing_shared_metadata():
+    # One shared request layout is used first by target MQA, then by Eagle MHA.
+    # No target-derived group plan may be reused for the larger draft heads.
+    cu = torch.tensor([0, 8, 16], dtype=torch.int32)
+    md = AttentionMetaData(
+        has_cached=True,
+        total_kv=16,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        context_lens=torch.tensor([8, 8], dtype=torch.int32),
+        seq_starts=torch.zeros(2, dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+        batch_id_per_k_token=torch.tensor([0] * 8 + [1] * 8, dtype=torch.int32),
+        prefill_request_lengths=PrefillRequestLengths((0, 8, 16), (0, 8, 16)),
+    )
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=True, is_draft=False), attn_metadata=md
+    )
+    q = torch.randn(16, 4, 4)
+    seen = []
+
+    def attention(q, k, v, kc, vc, ks, vs, fc):
+        seen.append(fc.attn_metadata.total_kv)
+        return q
+
+    budget = 1024
+    for is_draft, heads, expected in [(False, 1, [16]), (True, 4, [8, 8])]:
+        ctx.context.is_draft = is_draft
+        k = torch.empty(16, heads, 4)
+        seen.clear()
+        out = run_grouped_prefill(attention, q, k, k, k, k, None, None, ctx, budget)
+        torch.testing.assert_close(out, q)
+        assert seen == expected
+        assert ctx.attn_metadata is md
+        assert md.prefill_request_lengths.cu_k == (0, 8, 16)
+
+
+@pytest.mark.parametrize("has_cached", [False, True])
+@pytest.mark.parametrize("attach_legacy_lens", [False, True])
+def test_tbo_request_and_token_views_keep_owned_host_geometry(
+    monkeypatch, has_cached, attach_legacy_lens
+):
+    import numpy as np
+
+    from atom.utils.tbo.ubatch_splitting import (
+        UBatchSlice,
+        attach_tbo_cpu_lens,
+        split_attn_metadata,
     )
 
-    def build(**kwargs):
-        values = {
-            "method": "eagle3",
-            "num_speculative_tokens": 3,
-            "draft_model_hf_config": PretrainedConfig(
-                architectures=["LlamaForCausalLMEagle3"]
-            ),
-        }
-        values.update(kwargs)
-        return SpeculativeConfig(**values)
+    cu_q = np.array([0, 2, 5, 9], dtype=np.int32)
+    cu_k = np.array([0, 7, 16, 24], dtype=np.int32) if has_cached else cu_q.copy()
+    md = AttentionMetaData(
+        has_cached=has_cached,
+        total_kv=int(cu_k[-1]),
+        cu_seqlens_q=torch.from_numpy(cu_q.copy()),
+        cu_seqlens_k=torch.from_numpy(cu_k.copy()),
+        context_lens=torch.from_numpy(np.diff(cu_k).copy()),
+        block_tables=torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=torch.int32),
+        seq_starts=torch.zeros(3, dtype=torch.int32),
+        batch_id_per_k_token=torch.repeat_interleave(
+            torch.arange(3, dtype=torch.int32), torch.from_numpy(np.diff(cu_k))
+        ),
+        prefill_request_lengths=PrefillRequestLengths(
+            tuple(map(int, cu_q)), tuple(map(int, cu_k))
+        ),
+    )
+    if attach_legacy_lens:
+        attach_tbo_cpu_lens(md, "cu_seqlens_q", cu_q.copy())
+        attach_tbo_cpu_lens(md, "cu_seqlens_k", cu_k.copy())
+        attach_tbo_cpu_lens(md, "context_lens", np.diff(cu_k))
 
-    return build
+    def no_readback(*args, **kwargs):
+        pytest.fail("owned host lengths must not require device readback")
 
-
-def test_workspace_config_is_opt_in(draft_config):
-    assert draft_config().draft_prefill_kv_workspace_mb == 0
-    spec = draft_config(draft_prefill_kv_workspace_mb=8192)
-    assert spec.draft_prefill_kv_workspace_mb == 8192
-    assert spec.draft_model_hf_config.architectures == ["Eagle3LlamaModel"]
-
-
-@pytest.mark.parametrize("budget", [-1, 0.5, True, "8192", None])
-def test_workspace_config_rejects_invalid_budgets(draft_config, budget):
-    with pytest.raises(ValueError, match="non-negative integer"):
-        draft_config(draft_prefill_kv_workspace_mb=budget)
-
-
-@pytest.mark.parametrize("method", [None, "mtp", "dspark"])
-def test_workspace_requires_eagle3(draft_config, method):
-    with pytest.raises(ValueError, match="requires method='eagle3'"):
-        draft_config(method=method, draft_prefill_kv_workspace_mb=8192)
-
-
-def test_workspace_rejects_mla_draft(draft_config):
-    with pytest.raises(ValueError, match="requires an MHA draft"):
-        draft_config(
-            draft_prefill_kv_workspace_mb=8192,
-            draft_model_hf_config=PretrainedConfig(
-                architectures=["Eagle3DeepseekV2ForCausalLM"], kv_lora_rank=512
-            ),
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "item", no_readback)
+        m.setattr(torch.Tensor, "cpu", no_readback)
+        # The first selected request contributes only its last two query tokens.
+        ub = split_attn_metadata(
+            md, UBatchSlice(slice(1, 3), slice(3, 9)), running_bs=4
         )
-
-
-def test_workspace_rejects_dspark_routed_checkpoint(draft_config):
-    with pytest.raises(ValueError, match="does not support DSpark"):
-        draft_config(
-            draft_prefill_kv_workspace_mb=8192,
-            draft_model_hf_config=PretrainedConfig(
-                architectures=["Eagle3LlamaModel"], dspark_with_draft=True
-            ),
-        )
-
-
-def test_workspace_rejects_sharded_prefill_before_loading_model(draft_config):
-    spec = draft_config(draft_prefill_kv_workspace_mb=8192)
-    with pytest.raises(ValueError, match="requires PCP=1"):
-        Config(model="unused", speculative_config=spec, prefill_context_parallel_size=2)
+    expected_k = (0, 9, 17) if has_cached else (0, 2, 6)
+    assert ub.prefill_request_lengths == PrefillRequestLengths((0, 2, 6), expected_k)
+    assert ub.cu_seqlens_q.tolist() == [0, 2, 6, 6, 6]
+    assert ub.cu_seqlens_k.tolist() == list(expected_k) + [expected_k[-1]] * 2
+    assert ub.total_kv == (17 if has_cached else None)
+    assert md.total_kv == int(cu_k[-1])
+    assert md.prefill_request_lengths.cu_q == (0, 2, 5, 9)
+    cu_q[:] = -1
+    cu_k[:] = -1
+    assert ub.prefill_request_lengths.cu_q == (0, 2, 6)

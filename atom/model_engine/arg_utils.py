@@ -138,6 +138,7 @@ class EngineArgs:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
+    prefill_kv_workspace_mb: int = 0
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_decoder_swa_bounded_replay: bool = True
@@ -170,7 +171,6 @@ class EngineArgs:
     num_speculative_tokens: int = 1
     kv_transfer_config: str = "{}"
     draft_model: str | None = None
-    draft_prefill_kv_workspace_mb: int = 0
     spec_decode_acceptance_rate: float | None = None
     spec_decode_acceptance_length: float | None = None
     mark_trace: bool = False
@@ -449,15 +449,6 @@ class EngineArgs:
             "V4-Pro-DSpark which ships inside the target checkpoint).",
         )
         parser.add_argument(
-            "--draft-prefill-kv-workspace-mb",
-            type=int,
-            default=0,
-            help="Per-rank dense K+V workspace limit in MiB for EAGLE3 MHA cached "
-            "prefill (PCP=1). Groups whole requests without truncating context. "
-            "0 disables grouping; use 8192 for an 8 GiB limit. A single request "
-            "must fit the limit. Does not change the allocator or KV cache pool.",
-        )
-        parser.add_argument(
             "--spec-decode-acceptance-length",
             type=float,
             default=None,
@@ -505,6 +496,15 @@ class EngineArgs:
                 "MLA chunked-prefill budget in tokens. Default uses "
                 "max_num_batched_tokens."
             ),
+        )
+        parser.add_argument(
+            "--prefill-kv-workspace-mb",
+            type=int,
+            default=0,
+            help="Per-rank dense K+V workspace limit in MiB for MHA/GQA cached "
+            "prefill (PCP=1), including target and Eagle layers. Groups whole "
+            "requests only when the current layer uses dense gather + attention. "
+            "0 disables grouping; use 8192 for 8 GiB. A single request must fit.",
         )
         parser.add_argument(
             "--state-checkpoint-interval-tokens",
@@ -844,13 +844,6 @@ class EngineArgs:
                 else None
             ),
         )
-        draft_workspace_mb = kwargs.pop("draft_prefill_kv_workspace_mb")
-        if draft_workspace_mb and not (
-            self.method == "eagle3" and self.num_speculative_tokens > 0
-        ):
-            raise ValueError(
-                "--draft-prefill-kv-workspace-mb requires active --method eagle3"
-            )
         if self.method and self.num_speculative_tokens > 0:
             method = kwargs.pop("method")
             num_spec_tokens = kwargs.pop("num_speculative_tokens")
@@ -868,7 +861,6 @@ class EngineArgs:
                 method=method,
                 model=draft_model or self.model,
                 num_speculative_tokens=num_spec_tokens,
-                draft_prefill_kv_workspace_mb=draft_workspace_mb,
                 synthetic_acceptance_rate=synthetic_acceptance_rate,
                 synthetic_acceptance_length=synthetic_acceptance_length,
             )

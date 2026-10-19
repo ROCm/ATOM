@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class PrefillRequestLengths:
-    """Owned CPU cumulative lengths for one unsharded draft prefill pass."""
+    """Owned CPU cumulative lengths for the real requests in one prefill pass."""
 
     cu_q: tuple[int, ...]
     cu_k: tuple[int, ...]
@@ -36,6 +36,31 @@ class PrefillRequestLengths:
             if q_len <= 0 or k_len < q_len:
                 raise ValueError("Each prefill request must have 0 < query <= context")
 
+    def slice_requests(
+        self,
+        start: int,
+        end: int,
+        token_start: int,
+        token_end: int,
+        *,
+        has_cached: bool = True,
+    ) -> PrefillRequestLengths:
+        """Match a metadata request/token slice without reading device tensors.
+
+        Cached KV keeps complete contexts; uncached KV follows the query
+        slice. A backend that later changes visible KV must update the snapshot.
+        Padding is excluded from this owned description.
+        """
+        q = tuple(
+            min(max(value, token_start), token_end)
+            for value in self.cu_q[start : end + 1]
+        )
+        k = self.cu_k[start : end + 1] if has_cached else q
+        return PrefillRequestLengths(
+            tuple(value - q[0] for value in q),
+            tuple(value - k[0] for value in k),
+        )
+
     def groups(self, max_tokens: int) -> list[tuple[int, int]]:
         """Return half-open request ranges, preserving order and all context."""
         groups = []
@@ -44,9 +69,9 @@ class PrefillRequestLengths:
             length = self.cu_k[end + 1] - self.cu_k[end]
             if length > max_tokens:
                 raise ValueError(
-                    f"Draft prefill request {end} needs {length} KV tokens, but the "
+                    f"Prefill request {end} needs {length} KV tokens, but the "
                     f"workspace fits {max_tokens}; increase "
-                    "--draft-prefill-kv-workspace-mb or set it to 0 to disable "
+                    "--prefill-kv-workspace-mb or set it to 0 to disable "
                     "grouping. Context is never truncated."
                 )
             if self.cu_k[end + 1] - self.cu_k[start] > max_tokens:
@@ -74,7 +99,8 @@ def run_grouped_prefill(
     K/V tensors are bounded, not Q/output, persistent caches, kernel scratch or
     allocator-reserved memory. Both gathered tensors use k.dtype. Group calls
     stay on the caller's stream, ordering attention before workspace reuse.
-    Lengths are captured by the drafter on the host; no device readback occurs.
+    Lengths belong to this metadata view (including TBO slices), not to the
+    runner's reusable buffers. No device readback occurs.
     """
     meta = fwd_ctx.attn_metadata
     bytes_per_token = 2 * k.shape[1] * k.shape[2] * k.element_size()
@@ -84,12 +110,10 @@ def run_grouped_prefill(
 
     lengths = meta.prefill_request_lengths
     if lengths is None:
-        raise ValueError(
-            "Draft prefill workspace grouping requires CPU request lengths"
-        )
+        raise ValueError("Prefill workspace grouping requires CPU request lengths")
     cu_q, cu_k = lengths.cu_q, lengths.cu_k
     if cu_q[-1] != q.shape[0] or cu_k[-1] != meta.total_kv:
-        raise ValueError("CPU prefill lengths disagree with draft attention geometry")
+        raise ValueError("CPU prefill lengths disagree with attention geometry")
     groups = lengths.groups(max_tokens)
 
     import torch
