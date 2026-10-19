@@ -53,6 +53,11 @@ T = TypeVar("T", bound="BroadcastableModelInput")
 # and `fla_ops.replayssm` skip on.
 PAD_SLOT_ID = -1
 
+# `build()`'s checkpoint descriptor slot for forward_vars ring index i > 0.
+# Out-of-band restores reserve their slots counting up from 1, so these sit
+# far past any of theirs. Ring index 0 keeps slot 0.
+STEP_DESCRIPTOR_SLOT_BASE = 1 << 20
+
 
 class BroadcastableModelInput(ABC):
 
@@ -388,6 +393,30 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         these slots to `execute_paged_state_copies` reserves them up front.
         """
         self._checkpoint_staging().reserve(descriptor_slots)
+
+    def _reserve_step_descriptors(self) -> None:
+        """Give each forward_vars ring slot its own `build()` descriptor.
+
+        `DescriptorStaging` fences a slot on its own last upload, so with one
+        slot the next step's `build()` waits out the previous step's upload --
+        everything the GPU still has queued ahead of it -- and the host keeps a
+        single forward of lead. The runner's ring gate has already waited out
+        the forward that last used ring slot i, upload included, so a
+        descriptor slot per ring index makes that fence free.
+        """
+        ring = len(getattr(self.model_runner, "_fv_ring", ()) or ())
+        if ring <= 1:
+            return
+        slots = [STEP_DESCRIPTOR_SLOT_BASE + i for i in range(1, ring)]
+        self._checkpoint_staging().reserve(slots)
+        self._step_descriptor_ring = ring
+
+    def _step_descriptor_slot(self) -> int:
+        """Descriptor slot for this step's `build()` copies; see above."""
+        if getattr(self, "_step_descriptor_ring", 0) <= 1:
+            return 0
+        index = self.model_runner._fv_idx
+        return STEP_DESCRIPTOR_SLOT_BASE + index if index else 0
 
     def _checkpoint_descriptor_device(self) -> torch.device:
         """Device of the planes `execute_paged_state_copies` copies between."""
@@ -1058,7 +1087,9 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:
             self.execute_paged_state_copies(
-                state_ops.checkpoint_stores, state_ops.checkpoint_restores
+                state_ops.checkpoint_stores,
+                state_ops.checkpoint_restores,
+                descriptor_slot=self._step_descriptor_slot(),
             )
         is_prefill = batch.total_tokens_num_prefill > 0
         if is_prefill:

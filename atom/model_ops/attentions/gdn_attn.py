@@ -932,6 +932,7 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        self._reserve_step_descriptors()
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
