@@ -1425,7 +1425,7 @@ models:
             workers: 1
             tp: 1
             cudagraph: none
-            extra_args: --pipeline-parallel-size 4 --enforce-eager
+            extra_args: --pipeline-parallel-size 4 --enforce-eager --gqa-prefill-kv-workspace-mb 32768
           decode:
             <<: *minimax_m3_scatter_bounds_decode
           env:

@@ -16,7 +16,7 @@ is required before drawing a performance conclusion.
 | Decode | TP4, DCP1, original EAGLE3 settings |
 | P / D batched-token budget | 8192 / 2048 |
 | CPU tier | Shared Mooncake Store, 2 NUMA owners x 768 GiB = 1536 GiB |
-| Gather workspace | Native `--gqa-prefill-kv-workspace-mb 8192` |
+| Gather workspace | Prefill 32768 MiB (32 GiB), decode 8192 MiB (8 GiB), native grouped gather |
 | Performance | AgentX 1M, C72, 3600 s profiling, 10 warmup requests/lane |
 | Allocation | 8 hours, TW `amd-spur`, default Slurm account, automatic node |
 
@@ -61,3 +61,29 @@ CPU tests cover full PP auxiliary propagation, production RDMA descriptor
 construction with reordered layers, TP head slicing and replicated index
 bytes, all-plane Store codec creation, and phase sequencing. Actual model,
 GPU Store, GSM8K and performance validation run only on ATOMESH benchmark CI.
+
+## Cached-prefill memory budget
+
+TP1 EAGLE3 has 64 KV heads of width 128. Gather emits BF16 K and V,
+so a 1,048,576-token request needs exactly 32 GiB (2 x 64 x 128 x 2
+bytes/token). The former 8 GiB setting fits only 262,144 tokens under TP1.
+The prefill role overrides the common 8 GiB setting to 32 GiB; decode TP4
+retains 8 GiB. Batching keeps whole requests and does not truncate context.
+
+`ModelRunner.get_num_blocks` explicitly subtracts the local dense-gather
+reserve from both the utilization budget and the physical-free-memory clamp,
+in addition to the measured activation peak, CUDA graphs, 2% safety margin,
+and connector buffers. The largest bound across local target and draft layers
+is reserved, not the sum of all layers. TBO reserves two bounds. For this eager
+PP4 case the stage reservations are 32 / 0 / 0 / 32 GiB: the middle stages
+contain only sparse attention. Logs report `prefill_workspace` and
+`connector_reserve` next to the final KV budget and global-minimum block count.
+
+The 1536 GiB Store still holds at most 18,837,504 complete payload tokens
+(256-token chunks), at 87,552 bytes/token over all four stages. The last stage
+costs 34,656 bytes/token and is the likely GPU-capacity bottleneck. Using the
+old run's 287.98 GiB HBM, 65.94 GiB Torch peak and 26.06 GiB non-Torch usage
+only as a scenario, with PP eager graphs=0, 32 GiB gather, approximately
+1.35 GiB Store buffers and 2% safety, the last-stage KV budget is about
+142.5 GiB, or 4.41M tokens. PP4 weight and activation measurements can change
+this estimate; the CI's per-stage budgets are required for a measured claim.
