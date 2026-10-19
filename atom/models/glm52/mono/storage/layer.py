@@ -9,13 +9,13 @@ from dataclasses import dataclass
 
 import torch
 
-from atom.mono.runtime.consensus import MonoUnsupported
-from atom.mono.weights.config import (
+from atom.models.glm52.mono.storage.config import (
     LayerConfig,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
 )
-from atom.mono.weights.formats import dequantize_mxfp4
+from atom.models.glm52.mono.storage.formats import dequantize_mxfp4
+from atom.mono.runtime.consensus import MonoUnsupported
 
 
 def _need(ok: bool, what: str) -> None:
@@ -379,7 +379,7 @@ def prepare_mxfp4_expert_storage(
             ),
         )
 
-    from atom.mono.weights.packing import pack_mxfp4
+    from atom.models.glm52.mono.storage.packing import pack_mxfp4
 
     def values(name: str, rows: int, k: int) -> torch.Tensor:
         tensor = tensors[name]
@@ -432,7 +432,7 @@ def prepare_aiter_mxfp4_expert_storage(
         weights.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE
         and weights.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE
     ):
-        from atom.mono.weights.packing import (
+        from atom.models.glm52.mono.storage.packing import (
             pack_a16w4_scale,
             pack_a16w4_weight,
         )

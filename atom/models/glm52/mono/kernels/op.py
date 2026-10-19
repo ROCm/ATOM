@@ -35,7 +35,7 @@ from atom.models.glm52.mono.kernels.kernel import build_glm5_monokernel
 from atom.models.glm52.mono.kernels.layout import INDEX_ALIGNED_DIM, INDEX_DIM, INDEX_TILE, layout, stage_tasks
 from atom.models.glm52.mono.kernels.geometry import WAVES as MONO_WAVES
 from atom.models.glm52.mono.kernels.geometry import TL_COLS
-from atom.mono.weights.packing import (
+from atom.models.glm52.mono.storage.packing import (
     pack_bf16,
     pack_fp8,
     pack_layer_weights,
@@ -45,7 +45,7 @@ from atom.mono.weights.packing import (
 )
 from atom.mono.runtime.consensus import tp_uniform_local_validation
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
-from atom.mono.weights.layer import LayerWeights, prepare_mxfp4_expert_storage
+from atom.models.glm52.mono.storage.layer import LayerWeights, prepare_mxfp4_expert_storage
 
 __all__ = ["Glm5MonoKernel"]
 

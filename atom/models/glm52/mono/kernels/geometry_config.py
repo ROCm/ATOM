@@ -4,16 +4,16 @@
 """GLM-5.2's own geometry, and the widths its kernel is built for.
 
 The vocabulary these are expressed in -- ``LayerConfig``, ``MoeMode``, the weight
-and cache layouts -- is model-free and lives in ``atom.mono.weights.config``;
-what is GLM-5.2's alone is here. The shared names are re-exported, so a kernel
-source taking both from one place need not care which is which.
+and cache layouts -- lives in ``atom.models.glm52.mono.storage.config``; the
+geometry is here. The names are re-exported, so a kernel source taking both from
+one place need not care which is which.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
-from atom.mono.weights.config import (  # noqa: F401  (re-exported)
+from atom.models.glm52.mono.storage.config import (  # noqa: F401  (re-exported)
     AttentionWeight,
     EPS,
     ExpertActivation,
