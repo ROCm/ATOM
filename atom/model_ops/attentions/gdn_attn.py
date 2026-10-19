@@ -15,11 +15,12 @@ from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_ops.attention_gdn import GatedDeltaNet
+from atom.model_ops.fla_ops.index import attach_host_cu_seqlens
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_buffer_shapes,
     replayssm_commit,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .aiter_attention import (
@@ -1252,6 +1253,20 @@ class GDNStateMixin(PoolRowsMixin):
         host[: num_bonus.shape[0]] = num_bonus + 1
         self.num_accepted_tokens.copy_(torch.from_numpy(host), non_blocking=True)
 
+    def _host_query_start_loc(self, query_start_loc: torch.Tensor) -> np.ndarray | None:
+        """Host copy of `query_start_loc` when it is a prefix of this step's
+        published `cu_seqlens_q`, whose host half `prepare_cu_seqlens_q`
+        wrote; None for any other tensor."""
+        cu = self.model_runner.forward_vars.get("cu_seqlens_q")
+        if (
+            not isinstance(cu, CpuGpuBuffer)
+            or query_start_loc.dim() != 1
+            or query_start_loc.data_ptr() != cu.gpu.data_ptr()
+            or query_start_loc.dtype != cu.gpu.dtype
+        ):
+            return None
+        return cu.np[: query_start_loc.shape[0]].copy()
+
     def prepare_gdn_metadata(
         self,
         batch: ScheduledBatch,
@@ -1345,8 +1360,13 @@ class GDNStateMixin(PoolRowsMixin):
                 if cached is not None
                 else torch.zeros(num_prefills, dtype=torch.bool, device=self.device)
             )
+            query_start_loc_host = self._host_query_start_loc(non_spec_query_start_loc)
+            if query_start_loc_host is not None:
+                attach_host_cu_seqlens(non_spec_query_start_loc, query_start_loc_host)
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(non_spec_query_start_loc)
+                compute_causal_conv1d_metadata(
+                    non_spec_query_start_loc, query_start_loc_host
+                )
             )
         else:
             has_initial_state = None
@@ -1421,7 +1441,13 @@ class GDNStateMixin(PoolRowsMixin):
             # leave stale tail entries in the slice -- and a stale tail from a
             # decode step is PAD_SLOT_ID. index_fill_ would read that as "from
             # the end" and park a live, unrelated slot's cursor.
-            live = slot_idx[slot_idx >= 0].to(torch.int64)
+            # Filtered on the host half `copy_to_gpu` just published: a
+            # boolean-mask index on the device sizes its output with a sync.
+            host_idx = self.non_spec_state_indices_tensor.np[:num_reqs]
+            live = upload_numpy(
+                np.ascontiguousarray(host_idx[host_idx >= 0], dtype=np.int64),
+                write_pos.device,
+            )
             write_pos.index_fill_(0, live, -1)
             return
 
@@ -1973,9 +1999,19 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
 PAD_SLOT_ID = -1
 
 
-def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
+def compute_causal_conv1d_metadata(
+    query_start_loc_p: torch.Tensor,
+    query_start_loc_host: np.ndarray | None = None,
+):
+    """`query_start_loc_host`, when given, must hold the values of
+    `query_start_loc_p`. Reading them back from the device instead waits for
+    every kernel already queued on the stream -- under pipeline parallelism the
+    previous microbatch's whole forward -- and so does a blocking upload."""
     # Needed for causal_conv1d
-    seqlens = query_start_loc_p.diff().to("cpu")
+    if query_start_loc_host is not None:
+        seqlens = torch.from_numpy(np.diff(query_start_loc_host))
+    else:
+        seqlens = query_start_loc_p.diff().to("cpu")
     nums_dict = {}  # type: ignore
     batch_ptr = None
     token_chunk_offset_ptr = None
@@ -1985,15 +2021,19 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
         nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
+        nums_np = nums.numpy()
+        mlist_np = np.repeat(np.arange(len(nums_np), dtype=np.int32), nums_np)
+        mlist = torch.from_numpy(mlist_np)
         nums_dict[BLOCK_M]["mlist"] = mlist
         mlist_len = len(nums_dict[BLOCK_M]["mlist"])
         nums_dict[BLOCK_M]["mlist_len"] = mlist_len
         MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist = []  # type: ignore
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(num))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
+        # Chunk index within its sequence, for every BLOCK_M chunk.
+        starts = np.cumsum(nums_np) - nums_np
+        offsetlist_np = (
+            np.arange(mlist_len, dtype=np.int64) - np.repeat(starts, nums_np)
+        ).astype(np.int32)
+        offsetlist = torch.from_numpy(offsetlist_np)
         nums_dict[BLOCK_M]["offsetlist"] = offsetlist
 
         if batch_ptr is None:
@@ -2011,8 +2051,10 @@ def compute_causal_conv1d_metadata(query_start_loc_p: torch.Tensor):
                     PAD_SLOT_ID
                 )
 
-        batch_ptr[0:mlist_len].copy_(mlist)
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)  # type: ignore
+        batch_ptr[0:mlist_len].copy_(upload_numpy(mlist_np, device))
+        token_chunk_offset_ptr[0:mlist_len].copy_(  # type: ignore
+            upload_numpy(offsetlist_np, device)
+        )
         nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
         nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr  # type: ignore
 

@@ -35,6 +35,7 @@ from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from atom.model_ops.fla_ops.index import install_aiter_kda_host_chunk_indices
 from atom.model_ops.fla_ops.replayssm import (
     replayssm_sigmoid_gating_delta_rule,
 )
@@ -977,6 +978,7 @@ class KimiKDAAttention(nn.Module):
         if self.layer_name in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer: {self.layer_name}")
         compilation_config.static_forward_context[self.layer_name] = self
+        install_aiter_kda_host_chunk_indices()
 
         # The top-level model maps four separate checkpoint projections
         # directly into this fused [q | k | v | g] parameter. Mapping keys
