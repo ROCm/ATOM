@@ -43,7 +43,7 @@ from atom.mono.weights.packing import (
     pack_mxfp4_scale_tiles,
     pack_ptpc_fp8,
 )
-from atom.mono.runtime.consensus import MonoUnsupported
+from atom.mono.runtime.consensus import tp_uniform_local_validation
 from atom.mono.runtime.peer_memory import SymmetricPeerBuffer
 from atom.mono.weights.layer import LayerWeights, prepare_mxfp4_expert_storage
 
@@ -248,9 +248,6 @@ class Glm5MonoKernel:
             missing = [name for name in required if name not in t]
             if missing:
                 raise ValueError(f"with_indexer=True requires weights: {', '.join(missing)}")
-            self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
-            self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
-            self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
         self.scr_layout, self.sym_layout = layout(
             samples,
             W.heads,
@@ -265,14 +262,6 @@ class Glm5MonoKernel:
             native_fp4_mfma=native_fp4_mfma,
         )
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.identity_block_tables = (
-            torch.arange(self.index_block_table_stride, dtype=torch.int32, device=dev).unsqueeze(0)
-            if with_indexer
-            and self.kv_cache_layout is KvCacheLayout.ATOM
-            and samples == self.index_request_width
-            and self.index_block_table_stride == index_max_seq // index_page_size
-            else None
-        )
         self.stages = stage_tasks(
             samples,
             W.heads,
@@ -286,70 +275,12 @@ class Glm5MonoKernel:
             split_head_merge=W.heads // MONO_WAVES > 1,
         )
         n_tasks = sum(n for _, n in self.stages)
-        if with_indexer:
-            index_tensors = dict(t, **self.packed)
-            self.index_params = torch.tensor(
-                [
-                    index_tensors[name].data_ptr()
-                    for name in (
-                        "w_index_k",
-                        "s_index_k",
-                        "w_index_w",
-                        "w_index_q",
-                        "s_index_q",
-                        "g_index_k",
-                        "b_index_k",
-                    )
-                ]
-                + [0],
-                dtype=torch.int64,
-                device=dev,
-            )
-        else:
-            self.index_params = None
         self._owns_runtime = runtime is None
+        # Every rank-local device allocation of this constructor happens in one
+        # attempt-report-agree window, ahead of `SymmetricPeerBuffer`'s
+        # collective constructor. See `_allocate_rank_local`.
+        self._allocate_rank_local(dev, group)
         if runtime is None:
-            # `scratch` and `step` are rank-local, but `SymmetricPeerBuffer`'s
-            # constructor is COLLECTIVE (it all-gathers IPC handles). Allocating
-            # them straight through would let one rank fail here -- an OOM is the
-            # realistic case -- and unwind into the runner's next collective while
-            # its peers sit inside the peer-buffer all-gather. That is a collective
-            # ORDER mismatch, which hangs, instead of the uniform fallback every
-            # other refusal in this path gives.
-            #
-            # So agree first, in exactly the shape SymmetricPeerBuffer uses for its
-            # own allocation: every rank attempts, every rank reports, and the whole
-            # group raises together -- a rank that succeeded locally still raises, so
-            # nobody is left holding a buffer the others do not have.
-            local_error = None
-            try:
-                self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
-                self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-            except Exception as error:
-                self.scratch = None
-                self.step = None
-                local_error = f"{type(error).__name__}: {error}"
-            if npes > 1:
-                import torch.distributed as dist
-
-                reports = [None] * npes
-                dist.all_gather_object(reports, local_error, group=group)
-            else:
-                reports = [local_error]
-            failed = [(peer, why) for peer, why in enumerate(reports) if why is not None]
-            if failed:
-                self.scratch = None
-                self.step = None
-                # MonoUnsupported, not RuntimeError: `_build` routes on
-                # MonoUnsupported, so a RuntimeError here skipped the uniform
-                # fallback this whole consensus exists to give and took the
-                # server down instead. Safe to fall back on because
-                # the verdict is already agreed -- every rank sees the same
-                # `failed` list and raises together.
-                raise MonoUnsupported(
-                    "mono scratch/step allocation failed: "
-                    + "; ".join(f"rank {peer}: {why}" for peer, why in failed)
-                )
             self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
         else:
             if runtime.scr_layout != self.scr_layout or runtime.sym_layout != self.sym_layout:
@@ -388,6 +319,69 @@ class Glm5MonoKernel:
                 else W.t["w_uv"].shape[0] // W.t["s_uv"].shape[0]
             ),
             indexer_cp=indexer_cp,
+        )
+
+
+    def _allocate_rank_local(self, dev, group) -> None:
+        """Every allocation of ``__init__`` that one rank can fail alone: the
+        indexer weight packing, the block tables, the index-parameter table and
+        (when this call owns the runtime) ``scratch`` and ``step``.
+
+        ``SymmetricPeerBuffer``'s constructor is COLLECTIVE (it all-gathers IPC
+        handles). A rank that failed here -- an OOM is the realistic case -- and
+        unwound into the runner's next collective while its peers sat inside an
+        earlier one would be a collective ORDER mismatch, which hangs, instead
+        of the uniform fallback every other refusal in this path gives.
+
+        So every rank attempts, every rank reports, and the whole group raises
+        together: a rank that succeeded locally still raises, so nobody is left
+        holding state the others do not have. It is `MonoUnsupported`, not a
+        `RuntimeError`, because `_build` routes on it; the verdict is already
+        agreed, so falling back on it is safe."""
+
+        failure = None
+        try:
+            t = self.W.t
+            if self.with_indexer:
+                self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
+                self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
+                self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
+            self.identity_block_tables = (
+                torch.arange(self.index_block_table_stride, dtype=torch.int32, device=dev).unsqueeze(0)
+                if self.with_indexer
+                and self.kv_cache_layout is KvCacheLayout.ATOM
+                and self.S == self.index_request_width
+                and self.index_block_table_stride == self.index_max_seq // self.index_page_size
+                else None
+            )
+            if self.with_indexer:
+                index_tensors = dict(t, **self.packed)
+                self.index_params = torch.tensor(
+                    [
+                        index_tensors[name].data_ptr()
+                        for name in (
+                            "w_index_k",
+                            "s_index_k",
+                            "w_index_w",
+                            "w_index_q",
+                            "s_index_q",
+                            "g_index_k",
+                            "b_index_k",
+                        )
+                    ]
+                    + [0],
+                    dtype=torch.int64,
+                    device=dev,
+                )
+            else:
+                self.index_params = None
+            if self._owns_runtime:
+                self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
+                self.step = torch.zeros(1, dtype=torch.int32, device=dev)
+        except Exception as error:
+            failure = error
+        tp_uniform_local_validation(
+            failure, group=group, world_size=self.npes, context="mono rank-local allocation failed"
         )
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
