@@ -14,10 +14,10 @@
 #     --cap-add=SYS_PTRACE --cap-add=SYS_ADMIN --security-opt seccomp=unconfined --shm-size=128g \
 #     -v <dir holding Kimi-K3/>:/models:ro -v <work>/cache:/root/.cache -v <work>/triton:/root/.triton \
 #     --entrypoint sleep rocm/fw-bringup:gfx1250-atom-k3-20261016 infinity
-#   docker cp k3_tp8dcp8_server.sh k3tp8:/root/
+#   docker cp k3_455_tp8dcp8_server.sh k3tp8:/root/
 # Then on each tray, in either order (each waits for the other):
-#   node0, TP ranks 0-3, serves :8000   docker exec -d k3tp8 bash -c 'bash /root/k3_tp8dcp8_server.sh 0 <node0 IP> > /root/.cache/tp8.log 2>&1'
-#   node1, TP ranks 4-7, workers only   docker exec -d k3tp8 bash -c 'bash /root/k3_tp8dcp8_server.sh 4 <node0 IP> > /root/.cache/tp8.log 2>&1'
+#   node0, TP ranks 0-3, serves :8000   docker exec -d k3tp8 bash -c 'bash /root/k3_455_tp8dcp8_server.sh 0 <node0 IP> > /root/.cache/tp8.log 2>&1'
+#   node1, TP ranks 4-7, workers only   docker exec -d k3tp8 bash -c 'bash /root/k3_455_tp8dcp8_server.sh 4 <node0 IP> > /root/.cache/tp8.log 2>&1'
 #   until curl -sf -m 5 http://<node0 IP>:8000/health; do sleep 15; done    # ~3 min; ~10 min while aiter JIT-builds
 # <node0 IP> is node0's data-plane (enp1s0f1) address, the one you ssh to on these trays.
 # Stop it on each tray with only this container's processes: --pid=host makes a plain pkill reach other people's.
@@ -44,8 +44,8 @@
 set -euo pipefail
 RANK0=${1:-}
 MASTER=${2:-}
-case $RANK0 in 0 | 4) ;; *) echo "usage: k3_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2 ;; esac
-[ -n "$MASTER" ] || { echo "usage: k3_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2; }
+case $RANK0 in 0 | 4) ;; *) echo "usage: k3_455_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2 ;; esac
+[ -n "$MASTER" ] || { echo "usage: k3_455_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2; }
 
 ATOM_REPO=https://github.com/ROCm/ATOM.git
 # Branch gyu/k3-455-tp8's code; the branch's later commits only add or edit this script. Both trays must serve the same.
@@ -200,7 +200,7 @@ esac
 # Online FP8 for the checkpoint's BF16 layers at load (the image's own launch passes the same)
 ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*self_attn.kv_b_proj": "ptpc_fp8"}, "exclude_layer": ["*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*"]}'
 
-echo "[k3_tp8dcp8_server] $(date '+%F %T') $(hostname): TP ranks $RANK0-$((RANK0 + 3)) of 8, master $MASTER," \
+echo "[k3_455_tp8dcp8_server] $(date '+%F %T') $(hostname): TP ranks $RANK0-$((RANK0 + 3)) of 8, master $MASTER," \
   "K3_MODE=${K3_MODE:-accuracy} K3_MOE=${K3_MOE:-ep} max-num-seqs $MAX_SEQS HSA_XNACK=$HSA_XNACK, ATOM $ATOM_COMMIT"
 exec python3 -m atom.entrypoints.openai_server \
   --model "$MODEL" --served-model-name moonshotai/Kimi-K3 --trust-remote-code --server-port "${K3_PORT:-8000}" \
