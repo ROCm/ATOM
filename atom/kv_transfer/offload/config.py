@@ -75,7 +75,16 @@ _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
 # delivered only through transfer_tensors.block_regions, so the dense codec --
 # which builds from per-layer KVCacheTensor K/V -- would silently drop it.
 _GDN_LINEAR_MODEL_TYPES = frozenset(
-    {"qwen3_next", "qwen3_next_mtp", "qwen3_5_text", "qwen3_5_moe_text"}
+    {
+        "qwen3_next",
+        "qwen3_next_mtp",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        # Qwen3.8 publishes its QSA arena as the PAGE image and appends PLE
+        # to the same GDN checkpoint. The tier is still `qwen`.
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
 )
 
 # Layouts that own a tier for a model's per-request *recurrent* state.

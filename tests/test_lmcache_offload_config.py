@@ -165,6 +165,23 @@ def test_gdn_linear_model_offload_uses_the_page_image_tier(model_type):
     assert offcfg.select_offload_layout(config) == "qwen"
 
 
+def test_qwen38_offload_uses_the_qwen_tier():
+    # Text config, not the wrapper name: `get_hf_text_config` peels it.
+    # `dense` must still be refused, or QSA KV comes back over a stale slot.
+    config = _config()
+    config.hf_config.compress_ratios = None
+    config.hf_config.model_type = "qwen4_exp"
+    config.hf_config.text_config = SimpleNamespace(
+        model_type="qwen4_exp_text",
+        num_attention_heads=32,
+    )
+
+    assert offcfg.select_offload_layout(config) == "qwen"
+    config.kv_transfer_config = {"offload_layout": "dense"}
+    with pytest.raises(ValueError, match="owns no tier"):
+        offcfg.select_offload_layout(config)
+
+
 def test_qwen_offload_classes_inherit_the_k3_tier():
     from atom.kv_transfer.offload._offload_common import StateOffloadFace
     from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (

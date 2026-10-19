@@ -65,8 +65,11 @@ and draft share the embedding and output head.
 - Chunked text prefill and full decode CUDA graphs are supported. Piecewise
   compilation/CUDA graphs are not supported.
 - Only native MTP speculation is supported. Pipeline parallelism, context
-  parallelism, DP attention, TBO, and external KV transfer/offload are not
-  supported.
+  parallelism, DP attention, and TBO are not supported.
+- Text LMCache offload is the `qwen` layout: QSA pages (K, V, raw index,
+  compressed index) plus a PAGE checkpoint of the GDN state and the PLE
+  conv/n-gram windows. Pipeline parallelism and RapidServe stay on fork
+  slots and still reject offload.
 - This example covers FP8 with TP1. Pure TP2 is not currently validated;
   it can fail MoE warmup on gfx950 due to an MoE dispatch limitation.
 - Video inference and long-context accuracy have not been validated.

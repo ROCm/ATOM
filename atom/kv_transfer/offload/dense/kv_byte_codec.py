@@ -138,6 +138,12 @@ class DenseKVByteCodec:
                 # `build_page_namespace` has no segment order in it to notice --
                 # so a reorder has to bump `PAGE_LAYOUT_VERSION`.
                 getattr(kvt, "index_scale", None),
+                # Qwen3.8 QSA. Same rule: new tails, never a reorder. Absent
+                # tensors stay out, so a model that does not set them keeps
+                # the byte layout it already stored.
+                getattr(kvt, "index_raw", None),
+                getattr(kvt, "index_compressed", None),
+                getattr(kvt, "rope_positions", None),
             ):
                 if t is not None and isinstance(t, torch.Tensor) and t.numel() > 0:
                     self._segments.append(t)
