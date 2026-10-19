@@ -3,6 +3,7 @@
 
 # from flash_attn import flash_attn_with_kvcache
 import functools
+import importlib.util
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -218,10 +219,33 @@ def _flydsl_arch_supported() -> bool:
     """Whether FlyDSL builds kernels for the running GPU.
 
     aiter raises NotImplementedError on anything else, from inside the call.
+    gfx1250 has a separate wave32 WMMA backend (ROCm/aiter#6462), so its
+    presence is probed instead of assumed from the arch name.
     """
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx_runtime() in _FLYDSL_PA_ARCHS
+    arch = get_gfx_runtime()
+    if arch == "gfx1250":
+        try:
+            spec = importlib.util.find_spec(
+                "aiter.ops.flydsl.kernels.pa_decode.gfx1250"
+            )
+        except ModuleNotFoundError:
+            return False
+        return spec is not None
+    return arch in _FLYDSL_PA_ARCHS
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_bf16_kv_supported() -> bool:
+    """Whether native BF16 KV goes to FlyDSL: gfx1250 only.
+
+    gfx1250 has no gluon paged decode, so FlyDSL is its only paged kernel.
+    gfx942/gfx950 keep BF16 KV on gluon, as before.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime() == "gfx1250" and _flydsl_arch_supported()
 
 
 @functools.lru_cache(maxsize=1)
@@ -297,9 +321,15 @@ def _flydsl_pa_decode_num_seqs(
         return None
     if sliding_window > 0 or not ps:
         return None
-    if compute_type is not aiter.dtypes.fp8 or k_cache.dtype is not aiter.dtypes.fp8:
+    # Native BF16 KV uses 8-element vectors and no scales; FP8 uses 16.
+    is_bf16_kv = compute_type is torch.bfloat16 and k_cache.dtype is torch.bfloat16
+    is_fp8_kv = compute_type is aiter.dtypes.fp8 and k_cache.dtype is aiter.dtypes.fp8
+    if not (is_fp8_kv or is_bf16_kv):
         return None
-    if k_cache.dim() != 5 or k_cache.shape[-1] != 16:
+    if is_bf16_kv and not _flydsl_bf16_kv_supported():
+        return None
+    x = 8 if is_bf16_kv else 16
+    if k_cache.dim() != 5 or k_cache.shape[-1] != x:
         return None
     # block_size is dim -2 of the page-16 cache. --block-size 256/1024 reaches
     # this site whenever use_triton_attn is set, which the published recipe does.
@@ -316,9 +346,9 @@ def _flydsl_pa_decode_num_seqs(
     head_dim = q.shape[-1]
     if not (head_dim == 64 or (head_dim % 128 == 0 and head_dim <= 1024)):
         return None
-    # The cache encodes head_dim as num_hgroups * 16; aiter rejects a q whose
+    # The cache encodes head_dim as num_hgroups * x; aiter rejects a q whose
     # own head_dim disagrees, and nothing upstream forces the two to match.
-    if k_cache.shape[2] * 16 != head_dim:
+    if k_cache.shape[2] * x != head_dim:
         return None
     if q.dtype not in (torch.bfloat16, torch.float16):
         return None
@@ -524,6 +554,27 @@ def _flydsl_prepare_explicit_plan(
     return plan
 
 
+def flydsl_decode_seqs(*, max_context_length=None, **kwargs):
+    """Sequence count FlyDSL's paged decode takes a run_pa_decode call with.
+
+    False when ATOM_PA_FLYDSL is off, None when it is on and the call is outside
+    FlyDSL's domain. Callers on an arch without gluon decode ask this first and
+    take unified attention when it is falsy.
+    """
+    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(**kwargs)
+    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH sequences.
+    if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
+        flydsl_seqs = None
+    # Only on the FlyDSL path; a bound below the query window goes to gluon.
+    if flydsl_seqs:
+        context_bound = _flydsl_context_bound(
+            max_context_length, kwargs["block_tables"], kwargs["k_cache"]
+        )
+        if context_bound < kwargs["max_seqlen_q"]:
+            flydsl_seqs = None
+    return flydsl_seqs
+
+
 def run_pa_decode(
     output: torch.Tensor,
     q: torch.Tensor,
@@ -563,7 +614,7 @@ def run_pa_decode(
     validation so an unsupported shape falls back here instead of raising
     inside aiter.
     """
-    flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(
+    flydsl_seqs = flydsl_decode_seqs(
         output=output,
         q=q,
         k_cache=k_cache,
@@ -579,15 +630,14 @@ def run_pa_decode(
         sinks=sinks,
         sliding_window=sliding_window,
         ps=ps,
+        max_context_length=max_context_length,
     )
-    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH sequences.
-    if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
-        flydsl_seqs = None
-    # Only on the FlyDSL path; a bound below the query window goes to gluon.
-    if flydsl_seqs:
-        context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
-        if context_bound < max_seqlen_q:
-            flydsl_seqs = None
+    # No gluon decode to fall back to (gfx1250): callers must have asked
+    # flydsl_decode_seqs and routed a refused call to unified attention.
+    if not flydsl_seqs and not gluon_decode_supports_arch():
+        raise RuntimeError(
+            "run_pa_decode: FlyDSL refused the call and this GPU has no gluon decode"
+        )
     # Inside the guard, not before it: this runs 63 times per decode step and
     # attention is a piecewise split op, so graph replay does not elide it. A
     # deployment that never enables FlyDSL should pay nothing here.
@@ -604,25 +654,35 @@ def run_pa_decode(
     # constant would make the env unpatchable, which the tests rely on.
     if (
         flydsl_seqs is not False
-        and (route_sig := (bool(flydsl_seqs), max_seqlen_q, q.shape[-1], compute_type))
+        and (
+            route_sig := (
+                bool(flydsl_seqs),
+                max_seqlen_q,
+                q.shape[-1],
+                compute_type,
+                k_cache.shape[-2],
+            )
+        )
         not in _flydsl_pa_routed
     ):
         _flydsl_pa_routed.add(route_sig)
         logger.info(
             "pa_decode -> %s (rows=%d max_seqlen_q=%d padded_seqs=%d "
-            "head_dim=%d %s)",
+            "head_dim=%d %s page=%d)",
             f"flydsl[{flydsl_seqs} seqs]" if flydsl_seqs else "gluon",
             q.shape[0],
             max_seqlen_q,
             context_lens.shape[0],
             q.shape[-1],
             compute_type,
+            k_cache.shape[-2],
         )
 
     if flydsl_seqs:
         from aiter.ops.flydsl.pa_decode import pa_decode as _flydsl_pa_decode
 
         n = flydsl_seqs
+        context_bound = _flydsl_context_bound(max_context_length, block_tables, k_cache)
         # Handed in by the caller off the ForwardContext it already holds, not
         # re-read from the thread-local one: under TBO a worker thread that
         # never installed its own context would read whatever the other ubatch

@@ -205,3 +205,42 @@ def test_gfx1250_sparse_fallback_rejects_per_token_scales_on_old_aiter(
             k_scale,
             v_scale,
         )
+
+
+@pytest.mark.parametrize("flydsl_takes", [True, False])
+def test_no_gluon_sparse_rows_go_to_flydsl_or_unified(monkeypatch, flydsl_takes):
+    """Without gluon decode (gfx1250) a row batch FlyDSL accepts reaches
+    run_pa_decode; one it refuses (e.g. a prefill past the planner limit) goes
+    to unified attention. Neither may reach gluon."""
+    from atom.model_ops import base_attention
+
+    monkeypatch.setattr(base_attention, "gluon_decode_supports_arch", lambda: False)
+    monkeypatch.setattr(base_attention, "pa_fwd_asm_supports_arch", lambda: False)
+    monkeypatch.setattr(pa_decode_gluon, "get_recommended_splits", lambda *a, **k: 4)
+    monkeypatch.setattr(
+        sparse_attn, "_sparse_flydsl_takes", lambda *a, **k: flydsl_takes
+    )
+    seen = []
+    monkeypatch.setattr(
+        base_attention, "run_pa_decode", lambda **kw: seen.append("flydsl")
+    )
+    monkeypatch.setattr(
+        sparse_attn, "_sparse_unified_per_row", lambda *a, **k: seen.append("unified")
+    )
+
+    q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
+    k_cache = torch.empty((32, 1, 8, 16, 16), dtype=torch.uint8, device="meta")
+    v_cache = torch.empty((32, 1, 1, 128, 16), dtype=torch.uint8, device="meta")
+    sparse_attn._sparse_pa_per_row(
+        q,
+        k_cache,
+        v_cache,
+        torch.empty((4, 128), dtype=torch.int32, device="meta"),
+        torch.empty((4,), dtype=torch.int32, device="meta"),
+        1,
+        128**-0.5,
+        torch.empty_like(q),
+        None,
+        None,
+    )
+    assert seen == ["flydsl" if flydsl_takes else "unified"]

@@ -879,10 +879,13 @@ class TestWorkPlanWiring:
         monkeypatch.delenv("ATOM_PA_FLYDSL", raising=False)
         assert envs.ATOM_PA_FLYDSL is False, "FlyDSL must be opt-in"
 
-        src = inspect.getsource(ba.run_pa_decode)
+        src = inspect.getsource(ba.flydsl_decode_seqs)
         assert (
             "flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs" in src
         ), "the env gate is gone, or no longer short-circuits the capability check"
+        assert "flydsl_seqs = flydsl_decode_seqs(" in inspect.getsource(
+            ba.run_pa_decode
+        ), "run_pa_decode no longer routes through flydsl_decode_seqs"
 
     def test_lengths_aiter_would_reject_build_no_plan(self, monkeypatch):
         """int64 or host lengths must fall back, not raise from plan_pa_decode.
@@ -1209,6 +1212,8 @@ class TestPlanBatchLimit:
         from atom.model_ops import base_attention as ba
 
         n = ba._FLYDSL_PLAN_MAX_BATCH + 1
+        # gluon's fallback exists on gfx942/gfx950 only; pin it whatever runs this.
+        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
 
@@ -1291,6 +1296,8 @@ class TestPlanBatchLimit:
         from atom.model_ops import base_attention as ba
 
         n = 4
+        # gluon's fallback exists on gfx942/gfx950 only; pin it whatever runs this.
+        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
         monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: n)
 
@@ -1721,3 +1728,146 @@ class TestUnifiedPerTokenKvScales:
         scale = torch.ones(4, 1, 128)
         with pytest.raises(NotImplementedError, match="per-token KV scales"):
             layer._reject_per_token_scales_on_unified(scale, scale, phase)
+
+
+class TestNoGluonFlyDSLRouting:
+    """Without gluon decode (gfx1250), FlyDSL takes what it accepts and
+    everything else goes to unified attention; nothing may reach gluon."""
+
+    @staticmethod
+    def _meta(*shape):
+        import torch
+
+        return torch.empty(shape, device="meta")
+
+    def test_run_pa_decode_raises_instead_of_calling_gluon(self, monkeypatch):
+        import torch
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: False)
+        monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
+        monkeypatch.setattr(ba, "_flydsl_pa_decode_num_seqs", lambda **kw: None)
+        monkeypatch.setattr(
+            torch.ops.aiter,
+            "pa_decode_gluon",
+            lambda *a, **kw: pytest.fail("gluon called on an arch without it"),
+        )
+        m = self._meta
+        with pytest.raises(RuntimeError, match="no gluon decode"):
+            ba.run_pa_decode(
+                output=m(4, 16, 128),
+                q=m(4, 16, 128),
+                k_cache=m(8, 1, 8, 128, 16),
+                v_cache=m(8, 1, 8, 128, 16),
+                context_lens=m(4),
+                block_tables=m(4, 8),
+                softmax_scale=1.0,
+                max_seqlen_q=1,
+                max_context_partition_num=8,
+                context_partition_size=256,
+                compute_type=torch.bfloat16,
+                q_scale=None,
+                k_scale=None,
+                v_scale=None,
+                exp_sums=m(4, 1, 8, 16),
+                max_logits=m(4, 1, 8, 16),
+                temporary_output=m(4, 1, 8, 16, 128),
+            )
+
+    @pytest.mark.parametrize("has_backend", [True, False])
+    def test_gfx1250_support_is_probed_from_aiter(self, monkeypatch, has_backend):
+        import importlib.util
+
+        from aiter.jit.utils import chip_info
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name: object() if has_backend else None,
+        )
+        ba._flydsl_arch_supported.cache_clear()
+        ba._flydsl_bf16_kv_supported.cache_clear()
+        try:
+            assert ba._flydsl_arch_supported() is has_backend
+            assert ba._flydsl_bf16_kv_supported() is has_backend
+        finally:
+            ba._flydsl_arch_supported.cache_clear()
+            ba._flydsl_bf16_kv_supported.cache_clear()
+
+    @pytest.mark.parametrize("arch", ["gfx942", "gfx950"])
+    def test_bf16_kv_stays_on_gluon_where_gluon_exists(self, monkeypatch, arch):
+        from aiter.jit.utils import chip_info
+
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: arch)
+        ba._flydsl_arch_supported.cache_clear()
+        ba._flydsl_bf16_kv_supported.cache_clear()
+        try:
+            assert ba._flydsl_arch_supported()
+            assert not ba._flydsl_bf16_kv_supported()
+        finally:
+            ba._flydsl_arch_supported.cache_clear()
+            ba._flydsl_bf16_kv_supported.cache_clear()
+
+    def _dense_layer(self, monkeypatch, gluon, env, accepts):
+        from atom.model_ops import attention_mha as mha
+
+        monkeypatch.setattr(mha, "gluon_decode_supports_arch", lambda: gluon)
+        monkeypatch.setattr(mha.envs, "ATOM_PA_FLYDSL", env)
+        monkeypatch.setattr(mha, "dense_decode_splits", lambda *a: 8)
+        monkeypatch.setattr(
+            mha, "flydsl_decode_seqs", lambda **kw: 4 if accepts else None
+        )
+        layer = SimpleNamespace(sliding_window=-1, sinks=None, kv_cache_dtype="fp8")
+        for name in ("_flydsl_takes_decode", "_shuffle_v_for_flydsl"):
+            setattr(layer, name, getattr(mha.PagedAttentionImpl, name).__get__(layer))
+        layer._view_v_cache_for_pa_decode_bf16_asm = lambda v, k: v
+        md = SimpleNamespace(
+            context_lens=self._meta(4),
+            block_tables=self._meta(4, 8),
+            max_seqlen_q=1,
+        )
+        return mha, layer, md
+
+    @pytest.mark.parametrize(
+        "gluon, env, accepts, takes",
+        [
+            (False, True, True, True),
+            (False, True, False, False),
+            (False, False, True, False),
+            (True, True, True, False),
+        ],
+    )
+    def test_dense_takes_flydsl_only_without_gluon(
+        self, monkeypatch, gluon, env, accepts, takes
+    ):
+        _mha, layer, md = self._dense_layer(monkeypatch, gluon, env, accepts)
+        m = self._meta
+        assert (
+            layer._flydsl_takes_decode(
+                m(4, 16, 128), m(8, 1, 8, 128, 16), m(8, 1, 128, 128), md
+            )
+            is takes
+        )
+
+    def test_unified_decode_hands_accepted_calls_to_flydsl(self, monkeypatch):
+        mha, layer, md = self._dense_layer(monkeypatch, False, True, True)
+        layer.paged_attention_triton = lambda *a: "flydsl"
+        m = self._meta
+        out = mha.PagedAttentionImpl.paged_attention_unified(
+            layer,
+            m(4, 16, 128),
+            None,
+            None,
+            m(8, 1, 8, 128, 16),
+            m(8, 1, 128, 128),
+            None,
+            None,
+            SimpleNamespace(attn_metadata=md),
+        )
+        assert out == "flydsl"
