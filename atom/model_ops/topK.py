@@ -174,8 +174,9 @@ def rocm_aiter_topk_softmax_impl(
             f"AITER topK meta data support {total_topk_weights.shape[0]} tokens which "
             f"is determined by max_num_batched_tokens, but got {token} tokens now."
         )
-        topk_weights = total_topk_weights[:token]
+        total_topk_weights = total_topk_weights[:token]
         total_topk_ids = total_topk_ids[:token]
+        topk_weights = total_topk_weights
         topk_ids, _ = torch.split(
             total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
         )
