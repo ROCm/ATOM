@@ -5,8 +5,13 @@ from pathlib import Path
 
 
 def verify_quant_patch(vllm_root: Path) -> dict:
-    manifest_path = Path(__file__).parent / '../../benchmark/c48-model-gap/online-quant-fix/manifest.json'
-    manifest = json.loads(manifest_path.read_text())
+    gap = Path(__file__).parent / '../../benchmark/c48-model-gap'
+    manifest = json.loads((gap / 'online-quant-fix/manifest.json').read_text())
+    # -INPAD cases mount the same fix with 128-row in_proj padding (pd_c48_port_mount.sh).
+    pad128 = json.loads((gap / 'inproj-pad128/manifest.json').read_text())
+    kda = hashlib.sha256((vllm_root / pad128['files'][0]['relative_path']).read_bytes()).hexdigest()
+    if kda == pad128['files'][0]['patched_sha256']:
+        manifest = pad128
     mounts = Path('/proc/self/mountinfo').read_text().splitlines()
     observed = []
     for record in manifest['files']:

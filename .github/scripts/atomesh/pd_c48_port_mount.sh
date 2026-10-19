@@ -13,11 +13,16 @@ c48_append_port_mount() {
   docker_args+=(--mount "type=bind,source=${c48_source},target=${c48_target},readonly")
   # The loading fix is fixed to this experiment branch and mounted read-only.
   local c48_fix_source c48_fix_target c48_fix_digest
-  c48_fix_source="$1/.github/benchmark/c48-model-gap/online-quant-fix/kda.py"
+  local c48_kda_dir=online-quant-fix c48_kda_sha=8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed
+  if [[ "${ATOMESH_ENV_ATOMESH_C48_CASE:-}" == *-INPAD ]]; then
+    c48_kda_dir=inproj-pad128
+    c48_kda_sha=26b42764a2f4a248cccaa360435659d5f6bfa9e784dc91c28a3d6a1ea48273da
+  fi
+  c48_fix_source="$1/.github/benchmark/c48-model-gap/${c48_kda_dir}/kda.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/kda.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "8318855c6eede76b8072bc7ba744523a331c6ebe2bd3d145b6e6e3c1722518ed" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "${c48_kda_sha}" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
   c48_fix_source="$1/.github/benchmark/c48-model-gap/online-quant-fix/meta.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/model_executor/model_loader/reload/meta.py"
@@ -30,7 +35,7 @@ c48_append_port_mount() {
     V-QD-CPUREF)
       c48_fix_dir=cpu-lru-refresh
       c48_fix_sha=7bcfccfdb1cf57c70300848abc861985007627f87ad1d7cb7d12530349b97dea ;;
-    V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144|V-QD-CPUREF2-FP8ATTN|V-QD-CPUREF2-FP8ATTN-PROFILE|V-QD-CPUREF2-FP8ATTN-FQ|V-QD-CPUREF2-FP8ATTN-FQ2|V-QD-CPUREF2-FP8ATTN-FQ2-PQ|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4)
+    V-QD-CPUREF2|V-QD-CPUREF2-LPT3072|V-QD-CPUREF2-LPT6144|V-QD-CPUREF2-FP8ATTN|V-QD-CPUREF2-FP8ATTN-PROFILE|V-QD-CPUREF2-FP8ATTN-FQ|V-QD-CPUREF2-FP8ATTN-FQ2|V-QD-CPUREF2-FP8ATTN-FQ2-PQ|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4|V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD)
       c48_fix_dir=cpu-lru-refresh-v2
       c48_fix_sha=76e038dc1bcfdf0fbe95e6a87844e8409ac45dd7f85f115267bc85d6e84f739c ;;
     *) return 0 ;;
@@ -49,7 +54,7 @@ c48_append_port_mount() {
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
   [[ "${c48_fix_digest%% *}" == "5012ac98ac714a9d28743345250bb587925b6e411b8756eb99f514d9706f26ae" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
-  [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4 ]] || return 0
+  [[ "${ATOMESH_ENV_ATOMESH_C48_CASE}" == V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4* ]] || return 0
   # Inert unless the role's online config selects routed_expert_down_proj (Prefill only).
   c48_fix_source="$1/.github/benchmark/c48-model-gap/latent-down-mxfp4/linear.py"
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/amd/linear.py"

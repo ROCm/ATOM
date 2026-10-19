@@ -1,0 +1,26 @@
+{
+  "name": "kimi_kda_online_quant_padding_coverage_inproj_pad128",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "online-quant-fix/kda.py with the KDA in_proj TP-local row padding raised from 16 to 128 (6288 -> 6400 at TP8), as ATOM pads a8w8 preshuffle N to the 128 tile",
+    "6400x7168 is in AITER's a8w8_bpreshuffle_tuned_gemm_kimik3.csv, so PTPC in_proj_qkvgfab selects AiterPreshuffledPerTokenFp8ScaledMMLinearKernel instead of RowWiseTorchFP8ScaledMMLinearKernel on Prefill and Decode",
+    "meta.py is the unchanged online-quant-fix file"
+  ],
+  "cases": [
+    "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD"
+  ],
+  "files": [
+    {
+      "relative_path": "models/kimi_k3/amd/kda.py",
+      "mount_source": "kda.py",
+      "base_sha256": "8d9fb5f714b1cf3b18692b18c69a5a115fa448abb3b772ea27c3a31ba0e25208",
+      "patched_sha256": "26b42764a2f4a248cccaa360435659d5f6bfa9e784dc91c28a3d6a1ea48273da"
+    },
+    {
+      "relative_path": "model_executor/model_loader/reload/meta.py",
+      "mount_source": "../online-quant-fix/meta.py",
+      "base_sha256": "749d03cc94639c6e0133c1f0e326eaec2b43ee7d8fe3288963982bf50a1aeed4",
+      "patched_sha256": "3bb991f43b5b53fab7383ec89c0ef5add4d035dc7312bbd55a4bebe7291ab56d"
+    }
+  ]
+}
