@@ -177,7 +177,8 @@
         "C48_PREFILL_REQUEST_LEDGER": "1",
         "C48_PREFILL_FAIRNESS": "0",
         "C48_PHYSICAL_CACHE_LIFECYCLE": "1",
-        "C48_CACHE_LOOKUP_MODE": "first_last"
+        "C48_CACHE_LOOKUP_MODE": "first_last",
+        "C48_PREFIX_INVENTORY": "1"
       }
     },
     "decode": {

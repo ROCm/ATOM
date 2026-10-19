@@ -1,0 +1,32 @@
+{
+  "purpose": "Complete sparse prefix map inventory for selected unresolved C48 targets; no serving policy changes",
+  "parent_harness_sha": "a9bbb5cd9c1730483ae570ee574ff34ac86d7e4b",
+  "source_sha256": {
+    ".github/scripts/atomesh/pd_c48_prefix_inventory.py": "085fb011ce8e54f56a3aae2248c57483dd15e6fb3fc6327910f8fdcbeaa55a48",
+    ".github/scripts/atomesh/pd_c48_cache_lifecycle.py": "01e44bd68954ee1dddfe694179031059cd82e87d2d6dfcc457b054e1ed26ea1d",
+    ".github/scripts/atomesh/pd_c48_scheduler.py": "a0d27b4b2824275d5920738860dc77075e4baa541a2e5044ffec625524898488",
+    ".github/benchmark/c48-model-gap/prefix-inventory/test_prefix_inventory.py": "8ee2746ca80373eab7746210a5d14e3ed33fa0fa43aef722a96e8238c52236c8"
+  },
+  "cpu_tests_passed": 12,
+  "scope": "Actual BlockPool/hybrid scheduler/factory, no GPU tensors. Both-tier early hole with 30 later FA keys captured; no reference count, free-queue, matcher query or lookup result changes.",
+  "capture_policy": {
+    "first_lookup_only": true,
+    "prompt_ranges": [
+      [
+        451600,
+        451750
+      ],
+      [
+        544000,
+        544200
+      ],
+      [
+        686300,
+        686450
+      ]
+    ],
+    "max_requests_per_pool": 16,
+    "max_hashes_per_request": 8192
+  },
+  "complete_gpu_validation_pending": true
+}

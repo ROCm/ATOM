@@ -23,6 +23,9 @@ def create_scheduler(*args, **kwargs):
     ):
         raise ValueError("C48 physical evidence requires Prefill lifecycle observation")
     lookup_mode = os.environ.get("C48_CACHE_LOOKUP_MODE", "all")
+    inventory = os.environ.get("C48_PREFIX_INVENTORY", "0")
+    if inventory not in ("0", "1") or (inventory == "1" and physical != "1"):
+        raise ValueError("C48 prefix inventory requires physical Prefill observation")
     if lookup_mode not in ("all", "first_last") or (
         lookup_mode == "first_last"
         and (role != "prefill" or os.environ.get("C48_CACHE_LIFECYCLE") != "1")
@@ -42,6 +45,7 @@ def create_scheduler(*args, **kwargs):
         "prefill_fairness_enabled": scheduler._c48_prefill_fairness,
         "physical_cache_lifecycle_enabled": physical == "1",
         "cache_lookup_mode": lookup_mode,
+        "prefix_inventory_enabled": inventory == "1",
         "scheduler_source_sha256": scheduler_sha,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,

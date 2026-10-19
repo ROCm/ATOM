@@ -476,6 +476,13 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
     ):
         raise ValueError("Physical cache evidence is Prefill-only and requires a 0/1 gate")
     physical_probes = {}
+    inventory_enabled = os.environ.get("C48_PREFIX_INVENTORY", "0")
+    if inventory_enabled not in ("0", "1") or (
+        inventory_enabled == "1" and physical_enabled != "1"
+    ):
+        raise ValueError("Prefix inventory requires physical Prefill observation")
+    inventories = []
+    inventory_stream = None
     limits.setdefault("lookup_mode", os.environ.get("C48_CACHE_LOOKUP_MODE", "all"))
     physical_source_sha256 = None
     if physical_enabled == "1":
@@ -543,14 +550,49 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
             (directory / f"{prefix}-manifest.json").write_text(
                 json.dumps(manifest, indent=2) + "\n"
             )
+        if inventory_enabled == "1":
+            import pd_c48_prefix_inventory
+            inventory_dir = directory.parent / "prefix-inventory"
+            inventory_dir.mkdir(parents=True, exist_ok=True)
+            inventory_stream = (inventory_dir / f"prefix-inventory-{os.getpid()}.jsonl").open(
+                "x", buffering=65536
+            )
+            for probe in probes:
+                inventories.append(pd_c48_prefix_inventory.PrefixInventory(
+                    probe, physical_probes[probe.cache_kind], inventory_stream,
+                    group_ids=cpu.prefix_cacheable_group_ids,
+                ).install())
+            manifest["prefix_inventory"] = {
+                "enabled": True,
+                "source_sha256": hashlib.sha256(
+                    Path(pd_c48_prefix_inventory.__file__).read_bytes()
+                ).hexdigest(),
+                "initial_coverage": [item.coverage() for item in inventories],
+            }
+            (directory / f"{prefix}-manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n"
+            )
     except BaseException:
         stream.close()
+        if inventory_stream is not None:
+            inventory_stream.close()
         raise
 
     def close():
         if stream.closed:
             return
         try:
+            if inventory_stream is not None:
+                try:
+                    for inventory in inventories:
+                        inventory_stream.write(json.dumps({
+                            "event": "prefix_inventory_closed",
+                            "cache_kind": inventory.probe.cache_kind,
+                            **inventory.coverage(),
+                        }) + "\n")
+                    inventory_stream.flush()
+                except OSError:
+                    pass
             # Outside the per-lookup record cap so exhausted coverage is visible.
             for probe in probes:
                 probe.flush_pending()
@@ -581,6 +623,8 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
             pass
         finally:
             stream.close()
+            if inventory_stream is not None:
+                inventory_stream.close()
 
     original_shutdown = scheduler.shutdown
 
