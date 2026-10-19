@@ -15,6 +15,28 @@ if TYPE_CHECKING:
     from atom.utils.forward_context import ForwardContext
 
 
+def prefill_workspace_reserve_bytes(models, *, overlapping_batches: int = 1) -> int:
+    """Reserve the largest enabled local dense gather, including the draft.
+
+    A warmup's short or uncached prefill does not exercise long cached KV
+    materialization. Keep its configured bound outside the persistent KV pool.
+    Layers and request groups reuse storage on one stream, so take their max;
+    TBO may keep two microbatches live. Sparse/MLA/linear implementations do
+    not use this dense gather. Dense layers are conservatively counted even
+    when a particular request can dispatch to a direct-paged alternative.
+    """
+    largest = max(
+        (
+            getattr(module, "gqa_prefill_kv_workspace_bytes", 0)
+            for model in models
+            for module in model.modules()
+            if not getattr(module, "is_indexed_sparse_attention", False)
+        ),
+        default=0,
+    )
+    return largest * overlapping_batches
+
+
 @dataclass(frozen=True)
 class PrefillRequestLengths:
     """Owned CPU cumulative lengths for the real requests in one prefill pass."""

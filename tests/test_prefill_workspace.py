@@ -317,3 +317,64 @@ def test_tbo_request_and_token_views_keep_owned_host_geometry(
     cu_q[:] = -1
     cu_k[:] = -1
     assert ub.prefill_request_lengths.cu_q == (0, 2, 6)
+
+
+def test_tp1_eagle_1m_requests_fit_32_gib_but_not_8_gib():
+    """Exercise real grouping at the production length without allocating KV."""
+    length = 1 << 20
+    q = torch.empty((2, 64, 128), dtype=torch.bfloat16)
+    meta = AttentionMetaData(
+        has_cached=True,
+        total_kv=2 * length,
+        cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, length, 2 * length], dtype=torch.int32),
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        seq_starts=torch.zeros(2, dtype=torch.int32),
+        context_lens=torch.full((2,), length, dtype=torch.int32),
+        batch_id_per_k_token=torch.repeat_interleave(torch.arange(2), length),
+        prefill_request_lengths=PrefillRequestLengths(
+            (0, 1, 2), (0, length, 2 * length)
+        ),
+    )
+    ctx = SimpleNamespace(attn_metadata=meta)
+    seen = []
+
+    def attention(q, k, v, kc, vc, ks, vs, context):
+        seen.append(context.attn_metadata.total_kv)
+        return torch.ones_like(q)
+
+    with pytest.raises(ValueError, match="workspace fits 262144"):
+        run_grouped_prefill(attention, q, q, q, None, None, None, None, ctx, 8 << 30)
+    result = run_grouped_prefill(
+        attention, q, q, q, None, None, None, None, ctx, 32 << 30
+    )
+    assert seen == [length, length]
+    assert torch.equal(result, torch.ones_like(q))
+
+
+@pytest.mark.parametrize("overlap", [1, 2])
+def test_workspace_reservation_includes_local_draft_not_sparse_layers(overlap):
+    from atom.model_ops.prefill_workspace import prefill_workspace_reserve_bytes
+
+    def model(*layers):
+        return SimpleNamespace(modules=lambda: iter(layers))
+
+    sparse = SimpleNamespace(
+        gqa_prefill_kv_workspace_bytes=64 << 30, is_indexed_sparse_attention=True
+    )
+    dense = SimpleNamespace(gqa_prefill_kv_workspace_bytes=8 << 30)
+    draft = SimpleNamespace(gqa_prefill_kv_workspace_bytes=32 << 30)
+    other = SimpleNamespace()
+    assert prefill_workspace_reserve_bytes([model(sparse, other)]) == 0
+    assert (
+        prefill_workspace_reserve_bytes(
+            [model(SimpleNamespace(gqa_prefill_kv_workspace_bytes=0))]
+        )
+        == 0
+    )
+    assert (
+        prefill_workspace_reserve_bytes(
+            [model(dense, dense, sparse), model(draft)], overlapping_batches=overlap
+        )
+        == (32 << 30) * overlap
+    )

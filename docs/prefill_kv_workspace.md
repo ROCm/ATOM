@@ -63,6 +63,37 @@ and allocator-reserved memory. Concurrent TBO calls each have their own budget;
 this is not a rank-wide aggregate or a bound on total model memory. It does not
 change allocator/IPC settings or perform LMCache host-memory cleanup.
 
+## Reserve workspace before sizing persistent KV
+
+A short or uncached warmup may not allocate long-context gather tensors. When
+this option is enabled, `ModelRunner.get_num_blocks()` therefore reserves the
+largest configured dense-gather bound among the rank's local target and draft
+layers before planning persistent KV pools. Sequential layers and request groups
+reuse the workspace; their bounds are not added together. With TBO enabled,
+the reservation is twice the largest local bound for two overlapping batches.
+
+Sparse/MLA/linear implementations do not incur this dense-gather reservation.
+A rank without eligible local layers reserves zero. Dense implementations are
+conservatively counted even if some requests dispatch to a direct-paged path.
+For example, MiniMax-M3 PP4 has target dense GQA layers on the first stage and
+an EAGLE MHA draft on the last stage; those stages reserve workspace while the
+sparse-only middle stages do not.
+
+The reservation is deducted independently from both the utilization-based KV
+budget and the physically free memory limit. The smaller resulting budget sizes
+the KV pool; the two deductions are not added together. Existing activation,
+CUDA graph, safety and connector budgets remain in place. Per-rank budgets can
+differ; PP ultimately uses the minimum supported KV block count across ranks.
+Startup logs report the workspace reserve and resulting KV budget. This is
+memory accounting, not an eager allocation of a dedicated workspace tensor.
+
+Increasing the workspace limit can reduce persistent KV capacity. At TP1, an
+EAGLE layer with 64 local KV heads, head dimension 128 and BF16 gather output
+needs 32 GiB for one 1,048,576-token request; 8 GiB accommodates only 262,144
+tokens for that layer. Choose the budget for the intended context and local
+head geometry. Setting the option to zero disables grouping and this explicit
+reservation; it does not make an unbounded gather consume zero memory.
+
 ## Shared metadata and Eagle
 
 The common prefill metadata builder captures owned CPU cumulative query and
