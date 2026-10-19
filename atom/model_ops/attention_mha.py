@@ -100,8 +100,8 @@ class PagedAttentionImpl(nn.Module):
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
-        self.prefill_kv_workspace_bytes = (
-            get_current_atom_config().prefill_kv_workspace_mb * (1 << 20)
+        self.gqa_prefill_kv_workspace_bytes = (
+            get_current_atom_config().gqa_prefill_kv_workspace_mb * (1 << 20)
         )
 
     def process_weights_after_loading(self):
@@ -874,7 +874,7 @@ class PagedAttentionImpl(nn.Module):
         # Sparse/MLA/linear attention and direct paged reads never enter this
         # wrapper. MHA (including Eagle's equal Q/KV head counts) is eligible.
         if (
-            self.prefill_kv_workspace_bytes
+            self.gqa_prefill_kv_workspace_bytes
             and fwd_ctx.context.is_prefill
             and fwd_ctx.attn_metadata.has_cached
         ):
@@ -888,7 +888,7 @@ class PagedAttentionImpl(nn.Module):
                 k_scale,
                 v_scale,
                 fwd_ctx,
-                self.prefill_kv_workspace_bytes,
+                self.gqa_prefill_kv_workspace_bytes,
             )
         return self._prefill_attention(
             q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx

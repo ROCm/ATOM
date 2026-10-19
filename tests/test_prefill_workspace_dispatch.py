@@ -26,7 +26,7 @@ from atom.utils.forward_context import AttentionMetaData
 def layer(cls=PagedAttentionImpl):
     obj = cls.__new__(cls)
     torch.nn.Module.__init__(obj)
-    obj.prefill_kv_workspace_bytes = 1024
+    obj.gqa_prefill_kv_workspace_bytes = 1024
     obj.use_flash_layout = False
     obj._can_use_prefill_sink_asm = lambda *args: False
     obj._prefill_attention = lambda *args: "dense"
@@ -73,7 +73,7 @@ def test_dense_fast_paths_do_not_group(monkeypatch, budget, has_cached):
         lambda *args: pytest.fail("fast path must not group"),
     )
     obj = layer()
-    obj.prefill_kv_workspace_bytes = budget
+    obj.gqa_prefill_kv_workspace_bytes = budget
     ctx = SimpleNamespace(
         context=SimpleNamespace(is_prefill=True, is_draft=True),
         attn_metadata=AttentionMetaData(has_cached=has_cached),

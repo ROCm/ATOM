@@ -138,7 +138,7 @@ class EngineArgs:
     max_num_batched_tokens: int = 16384
     long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
-    prefill_kv_workspace_mb: int = 0
+    gqa_prefill_kv_workspace_mb: int = 0
     state_checkpoint_interval_tokens: int = 8192
     state_checkpoint_demand: bool = True
     enable_decoder_swa_bounded_replay: bool = True
@@ -493,7 +493,7 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
-            "--prefill-kv-workspace-mb",
+            "--gqa-prefill-kv-workspace-mb",
             type=int,
             default=0,
             help="Per-rank dense K+V workspace limit in MiB for MHA/GQA cached "

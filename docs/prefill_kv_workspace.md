@@ -8,7 +8,7 @@ can make these temporary tensors much larger than the new-token batch:
 To bound this expansion, add the global engine option:
 
 ```bash
---prefill-kv-workspace-mb 8192
+--gqa-prefill-kv-workspace-mb 8192
 ```
 
 The default is `0` (disabled). Values are in MiB, so `8192` allows **8 GiB per
