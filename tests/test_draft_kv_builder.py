@@ -173,8 +173,9 @@ def test_draft_exports_zero_copy_mp_views_and_disables_tp_collapse():
         kv_dtype=torch.bfloat16,
     )
     pool.allocate(2, "cpu")
-    builder = DraftKvBuilder.__new__(DraftKvBuilder)
-    builder._kv_pool = pool
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
+    builder = DraftKvBuilder(runner, lambda **_: pool)
 
     transfer = builder.get_kv_transfer_tensors()
     transfer.set_block_count(2)
@@ -217,3 +218,27 @@ def test_the_count_tracks_the_model_it_walked(draft_layers):
     assert builder.kv_pool is not None
 
     assert asked == [(draft_layers, TARGET_BLOCK)]
+
+
+@pytest.mark.parametrize("heads", [16, 64])
+def test_m3_draft_exports_every_plane_with_head_geometry(heads):
+    pool = MhaKvPool(
+        layers=1,
+        block_size=128,
+        num_kv_heads=heads,
+        head_dim=128,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+    pool.allocate(2, "cpu")
+    runner = _runner(draft_layers=1)
+    runner.config = SimpleNamespace(hf_config=SimpleNamespace(model_type="minimax_m3"))
+    builder = DraftKvBuilder(runner, lambda **_: pool)
+    transfer = builder.get_kv_transfer_tensors()
+    transfer.set_block_count(2)
+    roles = [page.region.semantic_role for page in transfer.pages]
+    assert len(roles) == len(set(roles)) == 4
+    assert all(role.startswith("m3.draft.") for role in roles)
+    assert all(".shuffle128.torch.float8_e4m3fn" in role for role in roles)
+    assert all(page.tp_head_groups == (1, heads) for page in transfer.pages)
+    assert sum(page.region.unit_bytes for page in transfer.pages) == pool.entry_bytes
+    assert all(page.region.base_addr == page.view.data_ptr() for page in transfer.pages)
