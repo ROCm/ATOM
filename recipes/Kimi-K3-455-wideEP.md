@@ -27,7 +27,7 @@ and DSpark figures are from this one.
 | Gate | B0 text; chat `17 * 23` answers `391`. Decode and prefill continuations may part after a few words, because FP8 runs different kernels at small and large M |
 | Cold start | about 8 min in a fresh container: aiter JIT, plus about 30 s of online quantization |
 | Prefix caching, AgentX | 20261014 image, 2026-10-16: concurrency 16, 32 and 64 in [Agentic](#agentic-agentx) |
-| KV offload (LMCache MP) | ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621). 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU**, prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
+| KV offload (LMCache MP) | ATOM PR [#2621](https://github.com/ROCm/ATOM/pull/2621). 20261016 image, 2026-10-17: AgentX concurrency 64 at **10,400 tok/s per GPU** (96: 7,124; 128: 4,676), prefix hit 95.1%, LMCache stores and loads on both trays with no failures. Most of the gain is `--state-checkpoint-interval-tokens -1`. See [KV offload](#kv-offload-with-lmcache-mp) |
 | Speculative decoding (DSpark) | 20261016 image plus [ATOM #2620](https://github.com/ROCm/ATOM/pull/2620), 2026-10-17: GSM8K 0.9629; zero-shot GSM8K acceptance length 5.47 at K=7 (model card 5.64). AgentX concurrency 16 at InferenceX's fixed acceptance (K=4, 3.36): **1 / p90(ITL) 56.0 tok/s/user against 28.0 without it, 5,054 tok/s per GPU against 4,136**. See [DSpark](#speculative-decoding-dspark) |
 
 Contents:
@@ -771,7 +771,23 @@ prefix cache hit is 95.1% of the 96.2% the traces allow:
 - 95 KDA checkpoints were evicted, against 501.
 
 Most of the gain is the `-1` ladder. The same launch without LMCache is still to run. Details are in
-[Results at concurrency 64](#results-at-concurrency-64). This point is not in the chart above.
+[Results at concurrency 64](#results-at-concurrency-64). This point is in the chart above (the LMCache MP diamond).
+
+#### 2026-10-18: concurrency 96 and 128 with LMCache MP, the 20261016 image
+
+- **Server:** as on 2026-10-17, with `--max-num-seqs 32` (24 crashes, see [Known issues](#known-issues)).
+- **Trays:** CT3 (node0) + CT15, no perf_setup, NUMA balancing off for the load and the run. Concurrency 128 ran
+  right after 96, with a fresh server.
+- **Warm-up:** 34 min at 96 and 46 min at 128.
+
+| concurrency | P90 interactivity, E2E-normalized | P90 interactivity, 1 / p90(ITL) | throughput per GPU (total), tok/s | output tok/s per GPU | TTFT p50 / p90 | ITL p50 / p90 | requests done | prefix cache hit (theoretical) | valid |
+|---|---|---|---|---|---|---|---|---|---|
+| 96 | **2.71** | **4.15** | **7,124** | 44.8 | 5.1 / 19.2 s | 124 / 241 ms | 1,229 | 90.3% (95.6%) | yes |
+| 128 | **0.80** | **1.09** | **4,676** | 28.9 | 6.3 / 62.3 s | 277 / 921 ms | 917 | 83.7% (94.9%) | yes |
+
+**Throughput peaks at 64 with this launch.** At 96 and 128 the HBM prefix cache alone serves 80.6% and 66.4% of the
+prompt tokens. LMCache serves another 9.9% and 16.0%, about half of what would otherwise be prefilled again. Details
+are in [Results at concurrency 96 and 128](#results-at-concurrency-96-and-128). These points are not in the chart above.
 
 #### Reference: ATOM on MI355X, from InferenceX (2026-10-15)
 
@@ -935,6 +951,10 @@ python3 -m lmcache.v1.multiprocess.server --host 127.0.0.1 --port 5555 \
   checkpoint from disk again.
 - The server's metrics are on `:9090/metrics` (`lmcache_mp_l1_memory_usage_bytes`,
   `lmcache_mp_lookup_hit_tokens_total`).
+- **Keep NUMA balancing off**, for the weight load and the run (`echo 0 > /proc/sys/kernel/numa_balancing`;
+  perf_setup does it, a plain driver load does not). See [Known issues](#known-issues).
+- **Above concurrency 64, use `--max-num-seqs 32`**, not 24: it must be one of the CUDA graph sizes. See
+  [Known issues](#known-issues).
 
 Then the AgentX launch with these differences:
 
@@ -1001,6 +1021,29 @@ The prefix cache over the profiling window, from node0's `/metrics` (all eight r
   sessions get further into their traces.
 
 Next: the same launch without LMCache, to measure its share of the throughput.
+
+### Results at concurrency 96 and 128
+
+**2026-10-18, CT3 (node0) + CT15, the 20261016 image, no perf_setup.** The same method and launch as at 64, with
+`--max-num-seqs 32` and NUMA balancing off for the load and the run. Client figures are in the
+[AgentX results](#2026-10-18-concurrency-96-and-128-with-lmcache-mp-the-20261016-image).
+
+| concurrency | prompt tokens | served from HBM | served from LMCache | prefilled again | KDA checkpoints evicted | KV pool used, average / p90 | LMCache stores / loads (tokens) |
+|---|---|---|---|---|---|---|---|
+| 64 (2026-10-17) | 182.4M | 93.5% | 1.5% | 5.0% | 95 | 82.7% / 94.4% | 2,087 (11.4M) / 38 (5.2M) |
+| 96 | 138.7M | 80.6% | 9.9% | 9.4% | 200 | 84.1% / 95.8% | 1,746 (17.3M) / 123 (19.4M) |
+| 128 | 94.0M | 66.4% | 16.0% | 17.7% | 296 | 82.6% / 97.1% | 1,180 (18.2M) / 127 (19.2M) |
+
+All columns are for the profiling window, from node0's `/metrics`. No load failed.
+
+- **LMCache matters more as concurrency grows.** Its share of the prompt tokens goes from 1.5% at 64 to 9.9% at 96
+  and 16.0% at 128. Without it, about twice as much would be prefilled again at 96 and 128 (19.3% and 33.6% instead of
+  9.4% and 17.7%).
+- **It does not stop the slide past 64.** Throughput per GPU is 10,400 at 64, 7,124 at 96 and 4,676 at 128. The HBM
+  hit falls to 66.4%, and both 400 GiB pools stay at their eviction watermark.
+- **The warm-up waits for one very long first turn.** In one run at 96, aiperf sat at `sent=101, in_flight=1` for about
+  10 min. The last first turn was a prompt of more than 500k tokens, prefilling 16k tokens per step at about 2k
+  tokens/s while the other ranks stepped along idle.
 
 ### Notes
 
@@ -1155,6 +1198,8 @@ tuned trays.
 | perf_setup says mode D, but `mtype_local` / `noretry` read `-1` | `amdgpu` was loaded before it ran. Reboot, then perf_setup first |
 | Engines `<defunct>`, kfd list never drains, `MES … REMOVE_QUEUE` in dmesg | GPU wedged (`gpu_recovery=0` keeps it so). BMC `ForceRestart`, then perf_setup |
 | A tray drops out; next boot's BERT says `event severity: fatal`, `Perr: CPU0` | Host CPU fatal error, not the engine |
+| Every rank dies with `AssertionError: expected size N==21, stride 7168==7168 at dim=0` (`cuda_piecewise_backend.py`, from `kimi_k3.py`) once a rank runs more sequences than the largest CUDA graph | `--max-num-seqs` is not a CUDA graph size. ATOM drops the capture sizes above it (`cudagraph capture sizes [...] exceed the schedulable batch size ... Remaining: [16, 8, ...]` at 24) but does not capture `max_num_seqs` itself. DP-padded decode batches from 17 to 24 then take the general-shape piecewise path, which asserts under DP attention. Use a capture size (16, 32, 48, …), or list it in `--cudagraph-capture-sizes` |
+| Startup hangs in warm-up: the last line is `Directly load the compiled graph(s) …`, all GPUs at 100%. rocgdb shows seven ranks in `tdm_compact_plan` and one rank with no waves | NUMA balancing is on. Turning it back on before a restart hung the warm-up four times out of four, with or without LMCache; with it off, two restarts on the same boot came up in about 150 s. With it on, pinning the LMCache pool logs `svm_range_restore_work … hogged CPU` (KFD evicting and restoring SVM ranges), and the idle rank's queue apparently stays evicted. Keep it at 0 for the load and the run. The ranks stop cleanly on SIGTERM |
 | Killing the ranks left on the other tray logs `LSDMA PIO failed to copy memory` and `EXP-CLEANUP: NPA-REVOKE send failed to remote:N` | The driver cannot revoke its mappings on the tray that went down. Expected; the rack's mes-monitor raises an alert for these lines |
 | helicop FAILs `0x??` / `I2C read failed (bus 4, dev 0x20)` | Expected on this BMC firmware. Check Redfish `PowerState` and `boot_id` |
 | Log looks frozen | tqdm writes `\r`; pipe through `tr '\r' '\n'` |
