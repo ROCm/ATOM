@@ -37,6 +37,18 @@ def use_pa_decode_bf16_asm() -> bool:
     )
 
 
+def window_left(sliding_window: int | None) -> int:
+    """aiter's inclusive left offset for an HF sliding-window span.
+
+    A span of W lets a query see itself and the W - 1 keys before it; aiter's
+    varlen and unified kernels attend over [i - left, i], so left = W - 1.
+    Anything not positive means no window.
+    """
+    if sliding_window is None or sliding_window <= 0:
+        return -1
+    return sliding_window - 1
+
+
 class PagedAttentionImpl(nn.Module):
     """
     Attention paged implementation
@@ -592,9 +604,8 @@ class PagedAttentionImpl(nn.Module):
         else:
             o = torch.empty_like(q)
 
-        sliding_window = (
-            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0) if left >= 0 else (-1, -1)
         unified_attention(
             q,
             k_cache,
@@ -915,9 +926,8 @@ class PagedAttentionImpl(nn.Module):
             )
             return o if o.dtype == output_dtype else o.to(output_dtype)
 
-        sliding_window = (
-            (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0, 0) if left >= 0 else (-1, -1, 0)
         o = aiter.flash_attn_varlen_func(
             q,
             k,
@@ -959,9 +969,8 @@ class PagedAttentionImpl(nn.Module):
         else:
             o = torch.empty_like(q)
 
-        sliding_window = (
-            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0) if left >= 0 else (-1, -1)
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
         # For pure prefill (no cached tokens) it is, by default, the fake table
