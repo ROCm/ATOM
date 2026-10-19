@@ -47,6 +47,17 @@ def _attribute_calls(method: ast.FunctionDef, attribute: str) -> list[ast.Call]:
     ]
 
 
+def _processor_flags(method: ast.FunctionDef) -> set[str]:
+    """Names this method reads off ``self.tokenID_processor``."""
+    return {
+        node.attr
+        for node in ast.walk(method)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "tokenID_processor"
+    }
+
+
 def _parent_map(root: ast.AST) -> dict[ast.AST, ast.AST]:
     return {
         child: parent
@@ -99,6 +110,18 @@ def test_dummy_forward_participates_in_staging_lifetime():
         < calls_by_name["_mark_staging_h2d_enqueued"][0].lineno
         < run_model[0].lineno
     )
+
+
+def test_draft_lockstep_reads_pipeline_parallel_not_deferred_output():
+    """Only PP may be excluded from DP draft lockstep, and only by name.
+
+    `is_deferred_out` is off under PP, which once made it a usable stand-in,
+    but it is also off on a P/D producer -- a rank that keeps its drafter
+    loaded and still owes its DP peers the collectives `propose()` carries.
+    """
+    assert _processor_flags(_method("_dp_draft_lockstep_active")) == {
+        "is_pipeline_parallel"
+    }
 
 
 def test_prefill_ready_events_are_recorded_after_model_submission():
@@ -154,3 +177,30 @@ def test_late_draft_uploads_are_staged_by_prepare_model():
     assert not _attribute_calls(propose, "anchors_to_gpu")
     assert not _attribute_calls(propose, "copy_to_gpu")
     assert not _attribute_calls(compute_draft_kv, "anchors_to_gpu")
+
+
+def test_kv_budget_refuses_free_memory_below_the_connector_reserve():
+    """The KV connector allocates its buffers after the KV cache is sized.
+
+    With less free HBM than they need, planning would give the KV cache
+    nothing and the connector would allocate from memory that is not there;
+    startup must stop before planning, with the reason.
+    """
+    method = _method("get_num_blocks")
+    plan = next(
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "plan_pools"
+    )
+    refusals = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.If)
+        and "free_for_kv" in ast.unparse(node.test)
+        and "connector_bytes" in ast.unparse(node.test)
+        and any(isinstance(child, ast.Raise) for child in ast.walk(node))
+    ]
+    assert len(refusals) == 1
+    assert refusals[0].lineno < plan.lineno

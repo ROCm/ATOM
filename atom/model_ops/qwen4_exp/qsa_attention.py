@@ -337,6 +337,7 @@ class Qwen4ExpAttention(nn.Module):
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
+            allow_flydsl=get_forward_context().context.is_prefill,
         )
 
     def forward(

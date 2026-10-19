@@ -56,6 +56,18 @@ def test_targets_preserve_distinct_hosts_ports_and_roles(collector):
         collector.scrape_config(["user:secret@host:8010"], ["host:8020"], "host:29100")
 
 
+def test_aggregated_server_is_scraped_once_and_needs_no_router(collector):
+    config = collector.scrape_config([], [], None, standalone=["10.0.0.1:8000"])
+    (api,) = config["scrape_configs"]
+    assert api["job_name"] == "atom"
+    assert api["static_configs"] == [
+        {
+            "targets": ["10.0.0.1:8000"],
+            "labels": {"observer": "api", "role": "standalone"},
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     "interval,duration,timeout",
     [
@@ -107,6 +119,36 @@ def test_scrape_interval_cli(collector, monkeypatch, option, expected):
     collector.main()
     assert received[0].scrape_interval_seconds == expected
     assert received[0].command == ["benchmark"]
+
+
+@pytest.mark.parametrize(
+    "targets,error",
+    [
+        (["--standalone", "host:8000", "--decode", "host:8020"], "cannot be combined"),
+        (["--prefill", "host:8010"], "required without --standalone"),
+        ([], "required without --standalone"),
+    ],
+)
+def test_targets_are_either_a_pd_pair_or_one_aggregated_server(
+    collector, monkeypatch, capsys, targets, error
+):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "collect_metrics.py",
+            "--output",
+            "unused",
+            "--model",
+            "test",
+            *targets,
+            "--",
+            "benchmark",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        collector.main()
+    assert error in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -164,6 +206,7 @@ def test_collector_interval_waits_and_report_window(
         model="test",
         prefill=["host:8010"],
         decode=["host:8020"],
+        standalone=[],
         mesh="host:29100",
         command=["benchmark"],
         scrape_interval_seconds=interval,
@@ -177,6 +220,55 @@ def test_collector_interval_waits_and_report_window(
     data = json.loads((args.output / "report-data.json").read_text())
     assert data["meta"]["window"] == window
     assert any(f"preceding {window} seconds" in note for note in data["meta"]["notes"])
+
+
+def test_aggregated_run_waits_on_one_target_and_reports_standalone(
+    collector, monkeypatch, tmp_path
+):
+    """No router runs, so waiting for a mesh target would stall every run."""
+    monkeypatch.setattr(collector.time, "sleep", lambda _: None)
+    monkeypatch.setattr(collector.signal, "signal", lambda sig, fn: None)
+    monkeypatch.setattr(collector, "ensure_prometheus", lambda _: "prometheus")
+    process = Mock(returncode=0)
+    process.poll.return_value = 0
+    monkeypatch.setattr(collector.subprocess, "Popen", Mock(return_value=process))
+    ready = Mock(return_value="http://127.0.0.1:9090")
+    final = Mock(return_value=collector.time.time())
+    monkeypatch.setattr(collector, "wait_for_prometheus", ready)
+    monkeypatch.setattr(collector, "wait_for_final_scrape", final)
+    monkeypatch.setattr(collector, "get_json", lambda _: {"data": {"result": []}})
+    reports = []
+
+    def collect_report(_url, start, end, **kwargs):
+        reports.append(kwargs)
+        return collector.empty_report(
+            start, end, "test", [], window=kwargs["window"], deployment="standalone"
+        )
+
+    monkeypatch.setattr(collector.export_report, "collect_report", collect_report)
+    args = argparse.Namespace(
+        output=tmp_path / "report",
+        model="test",
+        prefill=[],
+        decode=[],
+        standalone=["host:8000"],
+        mesh=None,
+        command=["benchmark"],
+        scrape_interval_seconds=1.0,
+    )
+    assert collector.run(args) == 0
+    assert ready.call_args.args[2] == 1
+    assert final.call_args.args[4] == 1
+    assert reports[0]["deployment"] == "standalone"
+    assert (
+        json.loads((args.output / "prometheus.yml").read_text())["scrape_configs"][0][
+            "static_configs"
+        ][0]["labels"]["role"]
+        == "standalone"
+    )
+    data = json.loads((args.output / "report-data.json").read_text())
+    assert data["meta"]["title"] == "Agentic aggregated inference report"
+    assert {panel["role"] for panel in data["panels"]} == {"standalone"}
 
 
 def test_collector_startup_wait_is_interruptible(collector, tmp_path):
@@ -200,6 +292,7 @@ def test_collector_setup_failure_preserves_benchmark_exit_and_diagnostic_report(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         scrape_interval_seconds=1.0,
         command=[
@@ -271,6 +364,7 @@ def test_publication_failure_preserves_benchmark_exit(
         model="test",
         prefill=["127.0.0.1:8010"],
         decode=["127.0.0.1:8020"],
+        standalone=[],
         mesh="127.0.0.1:29100",
         scrape_interval_seconds=1.0,
         command=[sys.executable, "-c", f"raise SystemExit({exit_code})"],

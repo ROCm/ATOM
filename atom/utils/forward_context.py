@@ -3,6 +3,7 @@
 
 import logging
 import threading
+from collections.abc import Collection
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
@@ -168,12 +169,32 @@ class DPMetadata:
 
 @dataclass
 class SpecDecodeMetadata:
-    draft_token_ids: torch.Tensor
+    # The step's input ids. Draft r is input_ids[target_logits_indices[r] + 1]:
+    # logits row t verifies the token that follows it. Read in place by the
+    # rejection sampler, on the forward stream the next step publishes its
+    # input ids on, so they cannot be overwritten under it.
+    input_ids: torch.Tensor
     num_spec_steps: int
     num_draft_tokens_np: np.ndarray
     cu_num_draft_tokens: torch.Tensor
     target_logits_indices: torch.Tensor
     bonus_logits_indices: torch.Tensor
+
+
+_uncaptured_decode_shape_warned = False
+
+
+def _warn_uncaptured_decode_shape(running_bs: int, max_seqlen_q: int) -> None:
+    global _uncaptured_decode_shape_warned
+    if _uncaptured_decode_shape_warned:
+        return
+    _uncaptured_decode_shape_warned = True
+    _logger.warning(
+        "No CUDA graph recorded at (bs=%d, q=%d): decode steps at an uncaptured "
+        "shape run eagerly. Expected only on a P/D producer that keeps a drafter.",
+        running_bs,
+        max_seqlen_q,
+    )
 
 
 @dataclass(frozen=True)
@@ -222,6 +243,8 @@ class ForwardMode:
     # What else the one per-step collective returned: per-rank token counts, the
     # DSpark shape max. Not shape. None on a single rank.
     sync: Any | None = None
+    # This rank's own `BoundedReplayDPReport` for the step, if its model sends one.
+    dp_stage_report: Any | None = None
 
     @classmethod
     def decide(
@@ -231,16 +254,22 @@ class ForwardMode:
         dp_size: int,
         dp_group,
         enforce_eager: bool,
+        step_needs_eager: bool,
         capture_sizes: list[int],
         captured_tokens: list[int] | None,
         is_block_drafter: bool,
         tbo_on: bool,
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
+        graph_shapes: Collection[tuple[int, int]] | None = None,
+        dp_stage_report: "BoundedReplayDPReport | None" = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
 
         Any new force-eager condition belongs here, not in a caller-side check.
+        `step_needs_eager` is this rank's attention backend refusing a graph for
+        the step (`AttentionMetadataBuilder.step_needs_eager`); the DP group
+        agrees on it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
         from atom.utils.tbo.ubatching import sync_dp_metadata
@@ -262,6 +291,7 @@ class ForwardMode:
                 scheduled_bs=scheduled_bs,
                 is_prefill=is_prefill,
                 tbo_on=tbo_on,
+                needs_eager=step_needs_eager,
                 local_meets_min_tokens=meets_min,
                 local_can_split=can_split,
                 local_ub_tokens=(ub0, ub1),
@@ -269,6 +299,11 @@ class ForwardMode:
                 # other flavor keeps its own and the two extra wire rows are
                 # not sent.
                 max_seqlen_q=max_seqlen_q if is_block_drafter else None,
+                # A model's per-stage token counts (`BoundedReplayDPReport`), so the
+                # step still issues one collective.
+                dp_stage_row=(
+                    None if dp_stage_report is None else dp_stage_report.wire()
+                ),
             )
             # The group's query length, taken BEFORE the rows are read off it:
             # a rank still on its local q settles on a different `running_tokens`
@@ -283,6 +318,9 @@ class ForwardMode:
             # group, and then each rank runs its own count through the
             # variable-length gather.
             unified = not sync.any_rank_has_prefill
+            # A graph replays its collectives: the group replays or runs
+            # eagerly as one.
+            step_needs_eager = sync.any_rank_needs_eager
         else:
             # One rank pads to nobody, so it has one height by construction, and
             # its TBO answer stands unvetoed.
@@ -308,7 +346,26 @@ class ForwardMode:
         # Whether the TARGET replays. It no longer decides how wide anything
         # is; when the batch answered four ways depending on this, `running_bs`
         # was per-rank on two of them and every consumer had to know which.
-        use_cudagraph = not is_prefill and unified and not enforce_eager and on_ladder
+        #
+        # The ladder answers the batch question alone, but a recording is keyed
+        # by `(running_bs, max_seqlen_q)`. Only a P/D producer passes
+        # `graph_shapes`: it keeps its drafter, so capture holds the q=mtp_k+1
+        # shapes, while the scheduler never speculates for it and every decode
+        # it runs is q=1. That holds on every rank, its DP dummy included, and
+        # `running_bs` is the group's, so the lookup is DP-agreed: the group
+        # replays or runs eagerly as one.
+        replayable = (
+            not is_prefill
+            and unified
+            and not (enforce_eager or step_needs_eager)
+            and on_ladder
+        )
+        shape_captured = (
+            graph_shapes is None or (running_bs, max_seqlen_q) in graph_shapes
+        )
+        if replayable and not shape_captured:
+            _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
+        use_cudagraph = replayable and shape_captured
 
         running_tokens, piecewise_captured = cls._running_tokens(
             is_prefill=is_prefill,
@@ -332,6 +389,7 @@ class ForwardMode:
             piecewise_captured=piecewise_captured,
             tbo_collective_active=tbo_collective_active,
             sync=sync,
+            dp_stage_report=dp_stage_report,
         )
 
     @staticmethod
@@ -596,6 +654,10 @@ class AttentionMetaData:
     # DSA + DCP indexer: MTP verify gives each draft position its own window.
     # The padded running-width buffer is shared by eager, graph and TBO paths.
     dcp_local_context_lens: torch.Tensor | None = None
+    # The FP4 sparse indexer's key bound for each query token (its position +
+    # 1), published once per decode step for every full layer; a draft step's
+    # aliases context_lens.
+    index_row_ends: torch.Tensor | None = None
     # Block-table row per query token, for the same indexer -- both aiter ops
     # address the table by row. Aliases block_tables at one query per sequence.
     # Every producer that rewrites block_tables must rewrite this too: a stale
@@ -638,6 +700,7 @@ class AttentionMetaData:
         sparse_kv_indptr: torch.Tensor | None = None,
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
+        index_row_ends: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -678,6 +741,7 @@ class AttentionMetaData:
         self.sparse_kv_indptr = sparse_kv_indptr
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
+        self.index_row_ends = index_row_ends
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set
@@ -753,6 +817,74 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class BoundedReplayDPReport:
+    """A rank's report for the step's DP sync, from a model some of whose MoE
+    layers run on other rows than the step (`AttentionMetadataBuilder.
+    dp_stage_report`).
+
+    ``names``/``tokens``: this rank's token count per stage, in an order the
+    model fixes (every rank sends the same layout). ``applies``: this rank
+    runs those stages on these counts this step; the group uses the stage
+    tables when any rank does. ``active``: a model-defined flag, OR-reduced.
+    """
+
+    names: tuple[str, ...]
+    tokens: tuple[int, ...]
+    applies: bool
+    active: bool = True
+
+    def wire(self) -> tuple[int, ...]:
+        return (int(self.applies), int(self.active), *self.tokens)
+
+
+@dataclass(frozen=True)
+class BoundedReplayDPStage:
+    """One stage's token counts across DP and the `DPMetadata` the MoE
+    variable-length gather reads while it runs (`ForwardContext.use_dp_stage`)."""
+
+    tokens_across_dp: tuple[int, ...]
+    local_tokens: int
+    dp_metadata: DPMetadata
+
+
+@dataclass(frozen=True)
+class BoundedReplayDPStages:
+    """The step's stage tables, when its DP sync carried them.
+
+    ``applies``: this rank's own report -- the one decision it acts on, so
+    what it forwards is what it told the group. ``active``: OR over the
+    group's flags."""
+
+    applies: bool
+    active: bool
+    stages: dict[str, BoundedReplayDPStage]
+
+
+def _bounded_replay_dp_stages(
+    parallel_config, report, sync
+) -> "BoundedReplayDPStages | None":
+    rows = None if sync is None else getattr(sync, "dp_stage_rows", None)
+    if rows is None or report is None:
+        return None
+    rank = parallel_config.data_parallel_rank
+    stages = {}
+    for name, tokens in zip(report.names, rows[2:]):
+        tokens = tuple(int(n) for n in tokens)
+        stages[name] = BoundedReplayDPStage(
+            tokens_across_dp=tokens,
+            local_tokens=tokens[rank],
+            dp_metadata=DPMetadata.make(
+                parallel_config,
+                tokens[rank],
+                torch.tensor(tokens, dtype=torch.int32),
+            ),
+        )
+    return BoundedReplayDPStages(
+        applies=report.applies, active=any(rows[1]), stages=stages
+    )
+
+
 @dataclass
 class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
@@ -812,11 +944,55 @@ class ForwardContext:
     cudagraph_runtime_mode: Any = None
     batch_descriptor: Any | None = None
 
+    # The DP pad-row work this forward already did (see `step_pad_rows`).
+    pad_rows_done: set = field(default_factory=set)
+
+    # Stage tables for a model some of whose MoE layers run on other rows
+    # than the step (`BoundedReplayDPReport`), built from the step's DP sync when the
+    # forward context is set. None on every step that did not carry them.
+    dp_stages: BoundedReplayDPStages | None = None
+
     def __post_init__(self):
         if not hasattr(self, "no_compile_layers") or self.no_compile_layers is None:
             self.no_compile_layers = {}
         if self.attn_metadata is None:
             self.attn_metadata = {}
+
+    @contextmanager
+    def use_dp_stage(self, name: str | None):
+        """Size the DP MoE collectives for stage ``name`` while this block runs.
+
+        The variable-length gather reads every rank's count from
+        ``dp_metadata`` and this rank's own from ``context.scheduled_tokens``;
+        both are switched to the stage's, prepared with the forward context,
+        and restored on exit. A no-op when ``name`` is None or this step has
+        no such stage, so a caller outside DP runs unchanged.
+        """
+        stage = (
+            None
+            if self.dp_stages is None or name is None
+            else self.dp_stages.stages.get(name)
+        )
+        if stage is None:
+            yield
+            return
+        context = self.context
+        outer = (
+            self.dp_metadata,
+            context.scheduled_tokens,
+            context.running_tokens_across_dp,
+        )
+        self.dp_metadata = stage.dp_metadata
+        context.scheduled_tokens = stage.local_tokens
+        context.running_tokens_across_dp = stage.tokens_across_dp
+        try:
+            yield
+        finally:
+            (
+                self.dp_metadata,
+                context.scheduled_tokens,
+                context.running_tokens_across_dp,
+            ) = outer
 
 
 _forward_context: ForwardContext | None = ForwardContext()
@@ -825,6 +1001,88 @@ _forward_kv_cache_context: ForwardContext | None = ForwardContext()
 # Cached once at module import — CUDA availability does not change at
 # runtime, so we don't pay torch.cuda.is_available() per set_forward_context().
 _CUDA_AVAILABLE: bool = torch.cuda.is_available()
+
+# DP pad-row mask for consumers recorded into CUDA graphs (MegaMoE). A replay
+# runs no Python, so each pass derives its mask on the device, on its first call,
+# from buffers every step already refreshes -- never from a host count:
+#   target pass: rows at or past `cu_seqlens_q[running_bs]` (padded requests
+#     have length 0, so that entry is this rank's real token count);
+#   draft pass (`[running_bs, q]` rows): rows at or past q times the real request
+#     count the step's target pass recorded.
+# A target pass records that count first thing, whatever else it decides, so a
+# draft never reads an older step's; one that cannot tell (no cu_seqlens_q, a TBO
+# micro-batch) records "no padding". The buffers are persistent because graphs,
+# and the pieces of a piecewise graph, record their addresses.
+_NO_PADDING = 1 << 30
+_row_index_device: torch.Tensor | None = None
+_pad_rows_device: torch.Tensor | None = None
+_real_requests_device: torch.Tensor | None = None
+
+
+def enable_pad_rows_device(num_rows: int, device: torch.device) -> None:
+    """Allocate (or grow) the mask buffers. Call before any capture."""
+    global _row_index_device, _pad_rows_device, _real_requests_device
+    if _pad_rows_device is None or _pad_rows_device.shape[0] < num_rows:
+        # int64: the draft threshold (requests x q, or _NO_PADDING x q) is a 0-d
+        # int64 tensor, which would be cast to the row index's dtype.
+        _row_index_device = torch.arange(
+            num_rows, dtype=torch.int64, device=device
+        ).unsqueeze(1)
+        _pad_rows_device = torch.zeros((num_rows, 1), dtype=torch.bool, device=device)
+        _logger.info("DP pad-row mask enabled for %d rows", num_rows)
+    if _real_requests_device is None:
+        _real_requests_device = torch.full(
+            (), _NO_PADDING, dtype=torch.int64, device=device
+        )
+
+
+def step_pad_rows(num_rows: int) -> torch.Tensor | None:
+    """The `[num_rows, 1]` DP pad-row mask for this pass, or None when no row can
+    be padding: masking is off, a TBO micro-batch, the rows are not the pass's
+    `running_tokens` (a PCP shard, a sub-slice), or an eager pass has no padding.
+    While capturing it always returns the mask, so each replay follows its step."""
+    from atom.utils.tbo.ubatching import tbo_active
+
+    forward_context = get_forward_context()
+    context = forward_context.context
+    if context is None or _pad_rows_device is None:
+        return None
+    capturing = torch.cuda.is_current_stream_capturing()
+    done = forward_context.pad_rows_done
+    cu = getattr(forward_context.attn_metadata, "cu_seqlens_q", None)
+    running_bs = context.running_bs
+    tbo = tbo_active()
+    if not context.is_draft and ("requests", capturing) not in done:
+        done.add(("requests", capturing))
+        if tbo or cu is None or not 0 < running_bs < cu.shape[0]:
+            _real_requests_device.fill_(_NO_PADDING)
+        else:
+            _real_requests_device.copy_(
+                (cu[1 : running_bs + 1] > cu[:running_bs]).sum()
+            )
+    if tbo or num_rows != context.running_tokens:
+        return None
+    if not capturing and context.scheduled_tokens >= num_rows:
+        return None
+    if _pad_rows_device.shape[0] < num_rows:
+        return None
+    pad_rows = _pad_rows_device[:num_rows]
+    key = ("mask", context.is_draft, num_rows, capturing)
+    if key not in done:
+        rows = _row_index_device[:num_rows]
+        if context.is_draft:
+            if running_bs <= 0 or num_rows % running_bs:
+                return None
+            torch.ge(
+                rows, _real_requests_device * (num_rows // running_bs), out=pad_rows
+            )
+        else:
+            if cu is None or not 0 < running_bs < cu.shape[0]:
+                return None
+            torch.ge(rows, cu[running_bs], out=pad_rows)
+        done.add(key)
+    return pad_rows
+
 
 # Thread-local storage for TBO dual-thread execution
 
@@ -966,6 +1224,15 @@ def set_forward_context(
         ub_tokens_across_dp=ub_tokens_across_dp,
         main_stream=(torch.cuda.current_stream() if _CUDA_AVAILABLE else None),
         in_hipgraph=in_hipgraph,
+        dp_stages=(
+            None
+            if dp_metadata is None or context.forward_mode is None
+            else _bounded_replay_dp_stages(
+                atom_config.parallel_config,
+                context.forward_mode.dp_stage_report,
+                context.forward_mode.sync,
+            )
+        ),
     )  # _forward_context.attn_metadata = attn_metadata
     # _forward_context.no_compile_layers = atom_config.compilation_config.static_forward_context
     # _forward_context = ForwardContext(no_compile_layers=atom_config.compilation_config.static_forward_context, attn_metadata=attn_metadata)

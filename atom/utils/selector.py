@@ -3,7 +3,15 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # Python 3.10 used by RTP-LLM
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
+
+
 from functools import cache
 from typing import TYPE_CHECKING
 
@@ -42,6 +50,17 @@ class Family(StrEnum):
         indexer has rows to ride, and what a drafter's target does.
         """
         return self in (Family.MLA, Family.KIMI_MLA)
+
+    @property
+    def has_recurrent_state(self) -> bool:
+        """Whether this family keeps a slot-addressed per-request state.
+
+        The hybrids and pure GDN register such a pool, tagged
+        `per_request_state=True`. Applying a token to it advances it, so
+        unlike a paged write -- which lands at the token's own position --
+        doing it twice is not idempotent.
+        """
+        return self in (Family.KIMI_MLA, Family.QSA_GDN, Family.GDN)
 
 
 # What makes a hybrid one is which of its layers are linear, and no field says

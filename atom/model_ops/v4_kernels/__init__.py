@@ -31,9 +31,15 @@ from atom.model_ops.v4_kernels.indexer_weights import (
     scale_indexer_weights,
 )
 from atom.model_ops.v4_kernels.inverse_rope import inverse_rope_inplace
+from atom.model_ops.v4_kernels.paged_2src import (
+    sparse_attn_v4_paged_2src,
+    sparse_attn_v4_paged_2src_reference,
+)
 from atom.model_ops.v4_kernels.paged_decode import (
     sparse_attn_v4_paged_decode,
     sparse_attn_v4_paged_decode_reference,
+    v4_decode_split_plan,
+    v4_uniform_split_table,
 )
 from atom.model_ops.v4_kernels.paged_decode_indices import (
     build_v4_paged_decode_indptr,
@@ -41,10 +47,6 @@ from atom.model_ops.v4_kernels.paged_decode_indices import (
     hca_compress_paged_offsets,
     write_v4_paged_decode_indices,
     write_v4_paged_decode_indices_reference,
-)
-from atom.model_ops.v4_kernels.paged_prefill import (
-    sparse_attn_v4_paged_prefill,
-    sparse_attn_v4_paged_prefill_reference,
 )
 from atom.model_ops.v4_kernels.paged_prefill_indices import (
     write_v4_paged_prefill_indices,
@@ -82,13 +84,15 @@ __all__ = [
     "qk_norm_rope_maybe_quant_fp8_2buff",
     "qk_norm_rope_maybe_quant_reference",
     "scale_indexer_weights",
+    "sparse_attn_v4_paged_2src",
+    "sparse_attn_v4_paged_2src_reference",
     "sparse_attn_v4_paged_decode",
     "sparse_attn_v4_paged_decode_reference",
-    "sparse_attn_v4_paged_prefill",
-    "sparse_attn_v4_paged_prefill_reference",
     "swa_write",
     "swa_write_2buff_prepacked",
     "update_compressor_states",
+    "v4_decode_split_plan",
+    "v4_uniform_split_table",
     "write_v4_paged_decode_indices",
     "write_v4_paged_decode_indices_reference",
     "write_v4_paged_prefill_indices",

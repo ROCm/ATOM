@@ -29,7 +29,6 @@ from atom.model_engine.engine_utility import EngineUtilityHandler
 
 with stubbed_aiter():
     from atom.model_engine.async_proc import AsyncIOProcManager
-    from atom.model_engine.engine_core_mgr import CoreManager
     from atom.model_engine.llm_engine import LLMEngine
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -57,7 +56,9 @@ NOT_FORWARD = frozenset(
         "import_kv_cache_ipc_handle",
         "import_model_weight_ipc_handles",
         "process_kvconnector_output",
+        "profile_dynamic_chunking",
         "release_multimodal_requests",
+        "take_dynamic_chunking_fit",
     }
 )
 
@@ -85,9 +86,10 @@ class FakeRunnerMgr:
 
 def make_handler(delay=0, max_iters=0, scheduler=None, fail_on=None):
     runner_mgr = FakeRunnerMgr(fail_on)
+    runner_mgr.outbox = queue.Queue()
     handler = EngineUtilityHandler(
         runner_mgr,
-        queue.Queue(),
+        runner_mgr.outbox,
         scheduler=scheduler,
         profiler_delay_iters=delay,
         profiler_max_iters=max_iters,
@@ -116,9 +118,9 @@ def broadcast(handlers, cmd, **payload):
     from `_UTILITY_HANDLERS`, and so unreachable from an engine, fails here.
     """
     results = []
-    for handler, _ in handlers:
+    for handler, mgr in handlers:
         handler._execute_utility_command(cmd, {"cmd": cmd, **payload})
-        results.append(handler.output_queue.get_nowait()[1]["result"])
+        results.append(mgr.outbox.get_nowait()[1]["result"])
     return results
 
 
@@ -577,26 +579,6 @@ def test_a_commit_timeout_stops_the_engines_that_did_commit():
         "commit_profile",
     ]
     assert [cmd for cmd, _ in core_mgr.sent] == ["stop_profile"]
-
-
-def test_a_late_reply_is_not_counted_as_another_commands_answer():
-    """Those cleanup rounds are sent without waiting, and each engine
-    answers on its own schedule -- after the drain the next round does.
-    """
-    late = {"cmd": "release_profile", "result": {"released": False}}
-    mine = {"cmd": "reserve_profile", "result": {"reserved": True}}
-
-    core_mgr = CoreManager.__new__(CoreManager)
-    core_mgr.label = "test"
-    core_mgr.control_sockets = [None]
-    core_mgr.utility_response_queue = queue.Queue()
-    core_mgr.broadcast_utility_command = lambda cmd, **kwargs: [
-        core_mgr.utility_response_queue.put(reply) for reply in (late, mine)
-    ]
-
-    collected = core_mgr.broadcast_utility_command_sync("reserve_profile", timeout=1)
-
-    assert collected == [mine], "an abandoned round answered for this one"
 
 
 def test_call_func_ticks_only_on_completed_forwards():

@@ -372,3 +372,78 @@ def quantize_to_bucket(q: int, buckets: list[int]) -> int:
         if b >= q:
             return b
     return buckets[-1]
+
+
+def apply_q_bucket(batch, drafter, dspark, *, apply_ragged=None) -> int | None:
+    """Shrink a pure-decode step to one CUDA-graph bucket, or leave it alone.
+
+    Returns the chosen q when the step shrank, otherwise None so the caller
+    keeps `num_spec_step + 1`. A batch with no draft slots (a P/D producer
+    reserves one token) must not be widened: the drafter still carries `mtp_k`,
+    and rounding ell+1 up into a bucket would read past the reserved tokens.
+    """
+    if drafter is None or not drafter.uses_confidence_schedule:
+        return None
+    if batch.total_tokens_num_prefill > 0:
+        return None
+    scheduled_bs = batch.total_seqs_num_decode
+    if scheduled_bs <= 0:
+        return None
+    if int(getattr(batch, "num_spec_step", 0) or 0) <= 0:
+        return None
+    full_q = drafter.mtp_k + 1
+
+    verify_scheduler = drafter.verify_scheduler
+    by_req = (
+        verify_scheduler.ell_by_req if verify_scheduler is not None else None
+    ) or {}
+    if not by_req:
+        return None
+
+    if dspark.ragged:
+        return apply_ragged(scheduled_bs, full_q, by_req)
+
+    buckets = resolve_q_buckets(dspark.q_buckets, full_q)
+    if buckets == [full_q]:
+        return None
+
+    max_ell = 0
+    for rid in batch.req_ids[:scheduled_bs]:
+        ell = by_req.get(rid)
+        max_ell = full_q - 1 if ell is None else max(max_ell, int(ell))
+        if max_ell >= full_q - 1:
+            break
+
+    max_num_bonus = 0
+    num_bonus_arr = getattr(batch, "num_bonus", None)
+    if num_bonus_arr is not None:
+        nb = np.asarray(num_bonus_arr)[:scheduled_bs]
+        if nb.size > 0:
+            max_num_bonus = int(nb.max())
+    need = max(max_ell + 1, max_num_bonus + 1)
+    q = quantize_to_bucket(need, buckets)
+    if q >= full_q:
+        return None
+
+    old_nst = batch.num_scheduled_tokens
+    if int(np.min(old_nst[:scheduled_bs])) < q:
+        return None
+    sched = np.asarray(batch.scheduled_tokens)
+    old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
+    np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
+    new_sched = np.empty(scheduled_bs * q, dtype=sched.dtype)
+    for i in range(scheduled_bs):
+        start = int(old_cu[i])
+        new_sched[i * q : (i + 1) * q] = sched[start : start + q]
+    batch.scheduled_tokens = new_sched
+
+    nst = old_nst.copy()
+    prefill_tok = int(batch.total_tokens_num_prefill)
+    nst[:scheduled_bs] = q
+    batch.num_scheduled_tokens = nst
+    batch.total_tokens_num_decode = int(nst[:scheduled_bs].sum())
+    batch.total_tokens_num = prefill_tok + batch.total_tokens_num_decode
+    spec = batch.scheduled_spec_decode_tokens
+    if spec is not None and getattr(spec, "size", 0) > 0:
+        batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
+    return q

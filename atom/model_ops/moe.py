@@ -740,17 +740,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 for slot in range(num_mori_ops)
             ]
 
-            # Off the op, not re-derived: the mapping is aiter's.
-            kernel_name = mori_ops[0].config.kernel_type.name
-            logger.info(
-                "[MORI] EP all2all kernel=%s internode=%s low_latency=%s "
-                "tbo_ubatch_ops=%d",
-                kernel_name,
-                all2all_manager.internode,
-                low_latency,
-                len(mori_ops) if tbo_is_enabled else 0,
-            )
-
             prepare_finalize = MoriPrepareAndFinalize(
                 mori_ops,
                 max_tokens_per_rank=moe.max_num_tokens,
@@ -771,8 +760,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         else:
             return None
 
-    # Note: init_prepare_finalize should only be called by
-    # prepare_communication_buffer_for_model.
+    # Called once after weight post-processing and before graph capture.
     def init_prepare_finalize(self, layer: torch.nn.Module):
         # print("init_prepare_finalize")
         assert self.moe is not None
@@ -818,6 +806,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             bind_mega = getattr(prepare_finalize, "bind_mega_transport", None)
             if bind_mega is not None:
                 bind_mega(layer, self)
+
+        comm_fused = getattr(layer, "_comm_fused_moe", None)
+        if comm_fused is not None:
+            comm_fused.initialize(layer)
 
     @property
     def using_modular_kernel(self) -> bool:
@@ -1263,7 +1255,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_dtype = quant_config.quant_dtype
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV
+        self.fp8_activations = moe.mxfp4_fp8_activations
+        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
@@ -2061,6 +2054,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ),
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
+        if self.fp8_activations:
+            moe_extra_args["quant_dtype_a"] = dtypes.fp8
         if activation == ActivationType.Situv2:
             moe_extra_args["beta"] = getattr(layer, "activation_situ_beta", None)
             moe_extra_args["linear_beta"] = getattr(
@@ -3323,6 +3318,7 @@ class FusedMoE(torch.nn.Module):
         shared_expert_prefix: str | None = None,
         pad_align: int | None = None,
         enable_comm_fused: bool = False,
+        mxfp4_fp8_activations: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -3555,6 +3551,7 @@ class FusedMoE(torch.nn.Module):
             expert_layout=self.expert_layout,
             in_dtype=atom_config.torch_dtype,
             a_quant_dtype=a_quant_dtype,
+            mxfp4_fp8_activations=mxfp4_fp8_activations,
             max_num_tokens=moe_token_capacity,
             has_bias=self.has_bias,
             # is_act_and_mul=True,
@@ -3589,6 +3586,11 @@ class FusedMoE(torch.nn.Module):
             )
 
         assert self.quant_method is not None
+        if self._comm_fused_moe is not None:
+            # This must precede create_weights and process_weights_after_loading:
+            # comm-fused runners consume the Aiter/FlyDSL layout, while the
+            # Triton paths rewrite the same MXFP4 parameters incompatibly.
+            self._comm_fused_moe.configure_quant_method(self.quant_method)
         if self.expert_layout.uses_all2all_fusion and not isinstance(
             self.quant_method, (Mxfp4MoEMethod, Nvfp4MoEMethod)
         ):
@@ -3707,8 +3709,6 @@ class FusedMoE(torch.nn.Module):
     def process_weights_after_loading(self):
         self._online_quant()
         self._validate_moe_backend()
-        if self._comm_fused_moe is not None:
-            self._comm_fused_moe.initialize(self)
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -5136,7 +5136,8 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_partial: torch.Tensor | None,
-        before_stage2: Callable[[], torch.Tensor] | None = None,
+        before_stage2_for_rows: Callable[[int], torch.Tensor] | None = None,
+        before_shared_add: Callable[[], None] | None = None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """Return ``(output, complete)`` after fused or ordinary dispatch.
@@ -5144,14 +5145,21 @@ class FusedMoE(torch.nn.Module):
         A complete output already contains the shared expert and TP reduction.
         """
         backend = self._comm_fused_moe
-        if backend is not None and backend.supports(hidden_states.shape[0]):
+        if (
+            backend is not None
+            and (
+                self.custom_routing_function is None or backend.supports_custom_routing
+            )
+            and backend.supports(hidden_states.shape[0])
+        ):
             return (
                 backend.forward(
                     self,
                     hidden_states,
                     router_logits,
                     shared_partial,
-                    before_stage2=before_stage2,
+                    before_stage2_for_rows=before_stage2_for_rows,
+                    before_shared_add=before_shared_add,
                     stage2_stream=stage2_stream,
                 ),
                 True,

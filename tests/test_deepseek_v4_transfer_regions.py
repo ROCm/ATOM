@@ -126,6 +126,12 @@ def _stub_v4_runtime_imports():
     aiter_jit_utils.__path__ = []
     chip_info = types.ModuleType("aiter.jit.utils.chip_info")
     chip_info.get_gfx = lambda: "gfx950"
+    # Replaced, not reused: other test modules leave their own, narrower
+    # parallel_state stub in sys.modules.
+    aiter_dist = types.ModuleType("aiter.dist")
+    aiter_dist.__path__ = []
+    parallel_state = types.ModuleType("aiter.dist.parallel_state")
+    parallel_state.get_tensor_model_parallel_world_size = lambda: 1
 
     pcp_utils = types.ModuleType("atom.distributed.pcp_utils")
     for name in (
@@ -155,16 +161,25 @@ def _stub_v4_runtime_imports():
         "fp4_indexer_enabled",
         "hca_compress_paged_offsets",
         "plan_context_lens",
+        "v4_decode_split_plan",
+        "v4_uniform_split_table",
         "write_v4_paged_decode_indices",
         "write_v4_paged_prefill_indices",
     ):
         setattr(kernels, name, lambda *args, **kwargs: None)
+    # No aiter here, so the persistent HCA decode is never usable.
+    kernels.hca_persist = SimpleNamespace(
+        unusable_reason=lambda **kwargs: "no aiter in this test",
+        prepare=lambda *args, **kwargs: None,
+    )
 
     replacements = {
         "aiter": aiter,
         "aiter.jit": aiter_jit,
         "aiter.jit.utils": aiter_jit_utils,
         "aiter.jit.utils.chip_info": chip_info,
+        "aiter.dist": aiter_dist,
+        "aiter.dist.parallel_state": parallel_state,
         "atom.distributed.pcp_utils": pcp_utils,
         "atom.model_ops.attentions.backends": backends,
         "atom.model_ops.v4_kernels": kernels,
@@ -810,14 +825,24 @@ def test_fp4_pd_copies_data_scales_and_swa_without_touching_other_blocks(
 
     selected_engine = object()
 
-    def write(target, sources, destinations, sizes, request_id, kind, *, engine=None):
+    def write(
+        target,
+        sources,
+        destinations,
+        sizes,
+        request_id,
+        kind,
+        *,
+        engine=None,
+        deadline=None,
+    ):
         assert engine is selected_engine
         calls.append(kind)
         for s, d, size in zip(sources, destinations, sizes, strict=True):
             ctypes.memmove(d, s, size)
         return True
 
-    conn._rdma_write_with_retry = write
+    conn._rdma_write = write
     assert conn._execute_block_slot_transfer(
         req,
         "test",
@@ -879,7 +904,7 @@ def test_fp4_pd_layout_mismatch_fails_before_any_write(
             conn._block_region_roles = [r.semantic_role for r in regions]
 
     calls = []
-    conn._rdma_write_with_retry = lambda *args: calls.append(args) or True
+    conn._rdma_write = lambda *args: calls.append(args) or True
     with pytest.raises(
         RuntimeError,
         match="mismatch|out of range|disagree|requires the consumer|Cannot layer-map|one-to-one",
