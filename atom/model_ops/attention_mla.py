@@ -34,6 +34,7 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -291,6 +292,11 @@ _MLA_DCP_KERNEL_WIDTHS = (16, 32, 64, 128)
 # width sets below, which only hold widths that have their own kernel.
 _MLA_DCP_MAX_KERNEL_HEADS = 128
 
+# gfx1250's persistent decode is aiter's PS1 kernel. It takes a multi-token
+# (q > 1) query only at these gathered widths, and aiter does not fold the
+# others onto it, so a wider verify or draft-block decode is padded up to one.
+_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN = (16, 96)
+
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT = (16, 32, 128)
 _MLA_DCP_KERNEL_WIDTHS_NON_PERSISTENT_FP8 = (16, 128)
 _MLA_DCP_SPARSE_PREFILL_WIDTHS = (16, 128)
@@ -311,6 +317,7 @@ def mla_dcp_kernel_num_heads(
     *,
     kv_cache_dtype: str,
     persistent: bool,
+    multi_token: bool = False,
 ) -> int:
     """Width to gather the query heads to for a DCP decode.
 
@@ -324,9 +331,19 @@ def mla_dcp_kernel_num_heads(
     ``kv_cache_dtype`` only selects the non-persistent set: gqa=64 is excluded
     for both dtypes there (fp8 aborts on it, bf16 silently miscomputes it), and
     fp8 lacks a gqa=32 kernel on top of that while bf16 does not.
+
+    ``multi_token``: the decode takes more than one query per sequence (a
+    speculative verify pass, or a draft block). gfx1250's persistent kernel
+    serves that only at ``_MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN``.
     """
     gathered = mla_kernel_num_heads(max(num_heads * dcp_world_size, min_kernel_heads))
-    if persistent:
+    widest = _MLA_DCP_MAX_KERNEL_HEADS
+    if persistent and multi_token and get_gfx() == "gfx1250":
+        widest = _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN[-1]
+        for width in _MLA_DCP_KERNEL_WIDTHS_PS1_MULTI_TOKEN:
+            if width >= gathered:
+                return width
+    elif persistent:
         if gathered <= _MLA_DCP_MAX_KERNEL_HEADS:
             return gathered
     else:
@@ -343,7 +360,7 @@ def mla_dcp_kernel_num_heads(
         _dcp_kernel_width_warned = True
         logger.warning(
             f"DCP decode gathers {gathered} query heads, past the widest MLA "
-            f"kernel aiter dispatches ({_MLA_DCP_MAX_KERNEL_HEADS}); it serves "
+            f"kernel aiter dispatches ({widest}); it serves "
             "neither a kernel nor a fold that wide and will abort in "
             "mla_decode_fwd. Lower decode_context_parallel_size or raise tp."
         )
@@ -914,6 +931,9 @@ class MLAAttention(nn.Module):
                         self, "sparse_dcp_metadata_rebuild", False
                     ),
                 ),
+                # A speculative run decodes several queries per sequence: the
+                # target's verify pass and the draft's block pass alike.
+                multi_token=get_current_atom_config().speculative_config is not None,
             )
             self.dcp_head_pad = (
                 self.dcp_kernel_num_heads - self.num_heads * dcp_world_size
