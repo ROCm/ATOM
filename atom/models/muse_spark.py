@@ -205,21 +205,21 @@ class MuseSparkAttention(nn.Module):
             total_num_heads=config.num_attention_heads,
             total_num_kv_heads=config.num_key_value_heads,
             bias=False,
-            quant_config=None,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
         self.gate_proj = ColumnParallelLinear(
             config.hidden_size,
             config.num_attention_heads * self.head_dim,
             bias=False,
-            quant_config=None,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.gate_proj",
         )
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
             config.hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=atom_config.quant_config,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -286,7 +286,7 @@ class MuseSparkMoE(nn.Module):
             config.hidden_size,
             self.expert_dim,
             bias=False,
-            quant_config=None,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.pre_expert_proj",
         )
         self.pre_expert_norm = MuseRMSNorm(self.expert_dim, config.rms_norm_eps)
@@ -310,7 +310,7 @@ class MuseSparkMoE(nn.Module):
             self.expert_dim,
             config.hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=atom_config.quant_config,
             prefix=f"{prefix}.post_expert_proj",
         )
 
