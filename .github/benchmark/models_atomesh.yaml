@@ -1482,6 +1482,8 @@ models:
             batch_size: 1
             max_gen_toks: 8192
             apply_chat_template: false
+            # Override the model's chat-evaluation default for raw completions.
+            fewshot_as_multiturn: false
 
       nightly:
         # Reuse the verified 32K-warmup service and pinned scatter-bounds aiter.
