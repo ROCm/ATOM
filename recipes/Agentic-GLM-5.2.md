@@ -255,7 +255,8 @@ depth is chosen per concurrency point.
 
 | Concurrency | Parallelism | `--num-speculative-tokens` | `--spec-decode-acceptance-length` |
 |---|---|---:|---:|
-| C2, C4, C8 | TP4 | 5 | `3.61` |
+| C1, C2 | TP4, mono decode | 3 | `2.99` |
+| C4, C8 | TP4 | 5 | `3.61` |
 | C10 | TP4 | 4 | `3.33` |
 | C16, C24, C32, C40 | TP4 + DCP4 | 4 | `3.33` |
 | C48 | TP4 + DCP4 | 3 | `2.99` |
@@ -266,15 +267,25 @@ Acceptance lengths are the golden values from
 
 #### GLM-5.2 MXFP4 with TP + MTP (small concurrency)
 
-For small-concurrency runs, `C2`-`C8` use five speculative tokens and `C10` uses
-four; the case block resolves both the draft depth and its golden AL from
+For small-concurrency runs, `C1` and `C2` run the GLM-5.2 MonoKernel decode
+with three speculative tokens, `C4`-`C8` use five and `C10` uses four; the
+script resolves the draft depth, its golden AL and whether mono is on from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
 offload is only used from `C16` upwards.
 
-The default recipe keeps MTP5 on the production path. The scaled-FP4
-MonoKernel has measured model-level evidence for MTP4 C1/C2 only; set
-`ENABLE_MTP4_MONO=1` for that controlled A/B. C4 and above remain on the
-production path because the current multi-chunk native schedule is slower.
+Mono's per-step cost grows with the verify width, so it is fastest at the
+shallowest served draft, while the production path is fastest at MTP5. In a C2
+AgentX sweep (TP4, 1800 s per point, golden AL per depth), mono at MTP3 reached
+239.82 output tok/s/user against 206.95 for the production path at MTP5
+(+15.9%; ROCm/ATOM#2535). C1 uses the same depth: swept on mono alone, it was
+also fastest at MTP3. C4 and above stay on the production path because the
+current multi-chunk native schedule is slower. Set `ENABLE_MONO=0` to run C1/C2
+on the production path (MTP5, AL 3.61) for an A/B.
+
+Check the server log before using a mono number: an armed run logs
+`GLM-5.2 MonoKernel on: S=<width> ...` on its first served step, and a refused
+deployment logs `GLM-5.2 MonoKernel off: <why>` and serves on the production
+path without any other sign.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -285,7 +296,7 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
-export ENABLE_MTP4_MONO=${ENABLE_MTP4_MONO:-0}
+export ENABLE_MONO=${ENABLE_MONO:-1}
 ATOM_MONO_ENABLE=0
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
@@ -306,17 +317,11 @@ case "${CONC}" in
     ;;
 esac
 
-if [[ "${ENABLE_MTP4_MONO}" == "1" ]]; then
-  if [[ "${CONC}" != "1" && "${CONC}" != "2" ]]; then
-    echo "ENABLE_MTP4_MONO=1 supports only C1/C2" >&2
-    exit 2
-  fi
-  MTP_K=4
-  # the golden AL for depth 4, per the table above. 3.61 is MTP5's, and
-  # pinning it on a 4-token draft forces more accepted tokens than the depth
-  # can produce -- which overstates the mono arm in the very A/B this flag is
-  # for. MTP_K and MTP_AL move together.
-  MTP_AL=3.33
+# C1/C2 run mono decode at MTP3, mono's fastest depth; 2.99 is MTP3's golden
+# AL. ENABLE_MONO=0 keeps them on the production path (MTP5 above).
+if [[ "${ENABLE_MONO}" == "1" && ( "${CONC}" == "1" || "${CONC}" == "2" ) ]]; then
+  MTP_K=3
+  MTP_AL=2.99
   ATOM_MONO_ENABLE=1
 fi
 
@@ -375,6 +380,13 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
 > as the time to the first token of a unique prompt with `max_tokens=1`, mean of
 > 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
+>
+> The sparse-prefill indexer is also split across the DCP group by query row
+> instead of by key (ROCm/ATOM#2496). This has no switch and is always on under
+> DCP. On this configuration (AgentX, 3600 s per arm, the two arms differing
+> only in that commit) it cut per-request latency by a paired median of 4.15%
+> at C32 and 5.53% at C48, raised p90 ITL interactivity by 8.3% and 8.9%, and
+> raised throughput per GPU by 3.5% and 5.1%.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
