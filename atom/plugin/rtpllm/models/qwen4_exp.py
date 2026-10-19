@@ -24,6 +24,10 @@ logger = logging.getLogger("atom.plugin.rtpllm.models")
 
 
 class _Qwen4ExpAttnPyObj(_ATOMAttnPyObj):
+    # Graph replay refreshes and consumes device block tables only. The host
+    # mirrors are not read by this plugin's prepare_cuda_graph hook.
+    requires_host_block_table_mirror = False
+
     def prepare_cuda_graph(self, attn_inputs) -> None:
         if isinstance(attn_inputs, dict):
             attn_inputs = attn_inputs["full"]
