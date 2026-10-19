@@ -70,6 +70,20 @@ pub(crate) fn encoder(entry: &TokenizerEntry) -> Arc<dyn Tokenizer> {
     }
 }
 
+/// Load every group's copy now, in parallel, for a pool of `workers` threads,
+/// so no request waits on a load (or several workers race to load the same
+/// copy) when traffic first arrives.
+pub(crate) fn preload(entry: &TokenizerEntry, workers: usize) {
+    if !entry.tokenizer.as_any().is::<HuggingFaceTokenizer>() {
+        return;
+    }
+    std::thread::scope(|scope| {
+        for group in 0..workers.div_ceil(WORKERS_PER_COPY) {
+            scope.spawn(move || group_copy(entry, group));
+        }
+    });
+}
+
 fn group_encoder(entry: &TokenizerEntry, group: usize) -> Arc<dyn Tokenizer> {
     if !entry.tokenizer.as_any().is::<HuggingFaceTokenizer>() {
         return entry.tokenizer.clone();

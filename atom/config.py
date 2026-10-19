@@ -1993,6 +1993,9 @@ class Config:
     compilation_config: CompilationConfig = field(default_factory=CompilationConfig)
     quant_config: QuantizationConfig = field(init=False)
     asyncio_mode: bool = False
+    # Another process (the atomesh Rust runtime) is the EngineCores' client:
+    # CoreManager spawns them and reaps them, but never connects.
+    external_engine_client: bool = False
     mark_trace: bool = False
     load_dummy: str | None = None
     enable_expert_parallel: bool = False

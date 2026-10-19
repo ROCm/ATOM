@@ -1,16 +1,16 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use clap::Parser;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 
 use crate::{
+    atom_engine::AtomEngine,
     cliargs::{
         filter_decode_args_from, filter_prefill_args_from, parse_decode_args_from,
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
     core::runtime::build_runtime,
-    routers::atom_standalone::AtomStandaloneRuntime,
     server::{self, ServerConfig},
     version,
 };
@@ -51,29 +51,33 @@ impl PyServerConfig {
     }
 }
 
+/// How long the EngineCores get to report `Stopped` once the server exits.
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Serve until shutdown. With `engine_spec` (ATOM standalone), first connect
+/// to the EngineCores it lists, and stop them once the server has exited;
+/// the caller still owns, and reaps, their processes.
 #[pyfunction]
-#[pyo3(signature = (
-    *,
-    server_config,
-    standalone_service = None
-))]
+#[pyo3(signature = (*, server_config, engine_spec = None))]
 pub fn launch_mesh(
     py: Python<'_>,
     mut server_config: PyRefMut<'_, PyServerConfig>,
-    standalone_service: Option<Py<PyAny>>,
+    engine_spec: Option<String>,
 ) -> PyResult<()> {
-    let runtime = standalone_service.map(|service| {
-        Arc::new(AtomStandaloneRuntime {
-            service,
-            close_service_on_shutdown: false,
-        })
-    });
-
     let mut server_config = server_config.inner.take().unwrap();
-    server_config.router_config.atom_standalone = runtime.is_some();
-    server_config.atom_standalone_runtime = runtime;
-
-    py.detach(move || startup_runtime(server_config))
+    py.detach(move || {
+        let engine = engine_spec
+            .map(|spec| AtomEngine::start(&spec).map(Arc::new))
+            .transpose()
+            .map_err(|e| PyRuntimeError::new_err(format!("ATOM engine failed to start: {e}")))?;
+        server_config.router_config.atom_standalone = engine.is_some();
+        server_config.atom_engine = engine.clone();
+        let served = startup_runtime(server_config);
+        if let Some(engine) = engine {
+            engine.client.shutdown(ENGINE_SHUTDOWN_TIMEOUT);
+        }
+        served
+    })
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {

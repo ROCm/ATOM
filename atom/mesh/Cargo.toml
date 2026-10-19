@@ -89,10 +89,14 @@ tonic-prost = { version = "0.14.2", optional = true }
 once_cell = "1.21.3"
 pyo3 = { version = "0.28.2", features = ["auto-initialize"] }
 portpicker = "0.1"
+zmq = "0.10"
+mimalloc = { version = "0.1", default-features = false }
 
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14", optional = true }
+prost-build = "0.14"
+protox = "0.9"
 chrono = { version = "0.4", features = ["clock"] }
 toml = "0.9"
 
@@ -135,3 +139,8 @@ codegen-units = 1
 [profile.dev-opt]
 inherits = "dev"
 opt-level = 1
+
+# llm-tokenizer 1.0.0 with the incremental-decode fix in vendor/llm-tokenizer/src/sequence.rs
+# and minijinja's `loop_controls` ({% break %} / {% continue %}, used by GLM-5.x templates).
+[patch.crates-io]
+llm-tokenizer = { path = "vendor/llm-tokenizer" }

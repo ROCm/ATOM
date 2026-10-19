@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
 use crate::{
@@ -10,7 +8,6 @@ use crate::{
     },
     core::ConnectionMode,
     observability::metrics::PrometheusConfig,
-    routers::atom_standalone::AtomStandaloneRuntime,
     server::{ServerConfig, ServerTlsConfig},
 };
 
@@ -671,14 +668,6 @@ impl CliArgs {
     }
 
     pub fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
-        self.to_server_config_with_runtime(router_config, None)
-    }
-
-    pub fn to_server_config_with_runtime(
-        &self,
-        router_config: RouterConfig,
-        atom_standalone_runtime: Option<Arc<AtomStandaloneRuntime>>,
-    ) -> ServerConfig {
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port,
             host: self.prometheus_host.clone(),
@@ -713,7 +702,7 @@ impl CliArgs {
                     cert_path: cert_path.clone(),
                     key_path: key_path.clone(),
                 }),
-            atom_standalone_runtime,
+            atom_engine: None,
         }
     }
 }

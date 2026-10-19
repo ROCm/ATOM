@@ -7,7 +7,6 @@ import logging
 import multiprocessing
 import multiprocessing.shared_memory
 import os
-import pickle
 import queue
 import weakref
 from dataclasses import dataclass
@@ -18,8 +17,15 @@ import zmq.asyncio
 
 from atom.config import Config
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
+from atom.model_engine.protocol.codec import (
+    decode_core_message,
+    encode_abort,
+    encode_command,
+    encode_shutdown,
+    encode_submit,
+)
+from atom.model_engine.protocol.requests import CompletionResult, IngressRequest
 from atom.model_engine.request import RequestOutput
-from atom.model_engine.sequence import Sequence
 from atom.utils import (
     envs,
     get_open_zmq_inproc_path,
@@ -183,7 +189,7 @@ class CoreManager:
             local_engine_count if global_engine_count is None else global_engine_count
         )
         self.ctx = zmq.Context(io_threads=2)
-        self.outputs_queue = queue.Queue[list[Sequence]]()
+        self.outputs_queue = queue.Queue[list[CompletionResult]]()
         self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
@@ -305,6 +311,11 @@ class CoreManager:
                 "parallelism (pipeline_parallel_size > 1) is not supported: "
                 "the engine index space folds PP stages into DP ranks, and the "
                 "two mappings have not been reconciled across nodes."
+            )
+        if config.external_engine_client and (multinode or pp_size > 1):
+            raise ValueError(
+                "An external engine client supports neither multi-node data "
+                "parallelism nor pipeline parallelism yet."
             )
 
         rank_assignments = iter_dp_rank_assignments(config)
@@ -439,6 +450,26 @@ class CoreManager:
                     info["process"].start()
                     self.engine_core_processes.append(info["process"])
 
+                if config.external_engine_client:
+                    # The Cores' client is another process (atom/mesh's
+                    # atom_engine): it binds these addresses and serves them.
+                    # This manager only reaps the processes, in close().
+                    self.engine_endpoints = [
+                        {
+                            "dp_rank": info["dp_rank"],
+                            "pid": info["process"].pid,
+                            "input": info["addresses"]["input_address"],
+                            "control": info["addresses"]["control_address"],
+                            "output": info["addresses"]["output_address"],
+                        }
+                        for info in processes_info
+                    ]
+                    self._finalizer = weakref.finalize(self, self.close)
+                    self.async_output_queue = None
+                    self._output_handler_task = None
+                    self._asyncio_mode = False
+                    return
+
                 if not self.is_coordinator:
                     # A worker node hosts engines but owns no router: the
                     # coordinator binds every socket. Wait for the children and
@@ -572,8 +603,8 @@ class CoreManager:
                 if ready_received[dp_rank]:
                     continue
 
-                obj = socket.recv(copy=False)
-                request_type, data = pickle.loads(obj)
+                frames = socket.recv_multipart(copy=False)
+                request_type, data = decode_core_message(frames)
 
                 if request_type == EngineCoreRequestType.READY:
                     logger.info(
@@ -614,8 +645,17 @@ class CoreManager:
                         )
                         break
 
-                    obj = output_socket.recv(copy=False)
-                    request_type, data = pickle.loads(obj)
+                    frames = output_socket.recv_multipart(copy=False)
+                    try:
+                        request_type, data = decode_core_message(frames)
+                    except Exception:
+                        # Every request on this DP rank waits on this thread,
+                        # so one message it cannot decode must not end it.
+                        logger.exception(
+                            f"{self.label} (DP {dp_rank}): dropping an engine "
+                            f"message that cannot be decoded"
+                        )
+                        continue
                     if request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(
                             f"{self.label} (DP {dp_rank}): output thread receive SHUTDOWN request"
@@ -689,7 +729,9 @@ class CoreManager:
                         # logger.info(f"Engine core output sequence id: {seq.id}")
                         seqs = data
                         # Offline (non-streaming) completions arrive here as
-                        # finished sequences; release their in-flight DP load.
+                        # finished sequences (`CompletionResult`s); release their
+                        # in-flight DP load. A request the engine could not admit
+                        # arrives the same way, its leave_reason saying why.
                         #
                         # So do sequences the scheduler rejected before they
                         # ever ran (`_unschedulable_reason`, abort-while-waiting)
@@ -757,7 +799,7 @@ class CoreManager:
                 break
             await self.async_output_queue.put(seqs)
 
-    async def get_output_async(self) -> list[Sequence]:
+    async def get_output_async(self) -> list[CompletionResult]:
         if not self.async_output_queue:
             raise RuntimeError("Engine async mode not enabled")
 
@@ -838,8 +880,8 @@ class CoreManager:
         self._distributed_stores.clear()
         logger.info(f"{self.label}: All EngineCores shut down")
 
-    def _send_request(self, dp_rank: int, payload: bytes) -> None:
-        """Send one already-pickled request to an engine core. Hot path.
+    def _send_request(self, dp_rank: int, frames: list) -> None:
+        """Send one already-encoded request to an engine core. Hot path.
 
         Deliberately unsynchronized: ``input_sockets`` carries nothing but
         ``add_request``, which runs on a single thread (the API server's event
@@ -850,18 +892,17 @@ class CoreManager:
         That separation is load-bearing, not stylistic. A ZMQ socket is not
         thread-safe: two unserialized ``send_multipart`` calls interleave their
         frames, the DEALER on the other end then reads a routing identity where
-        a payload should be, and its input thread dies on ``UnpicklingError``.
-        Nothing recovers from that -- the engine spins on a forever-empty input
-        queue, the workers idle, and every client hangs with no error logged
-        anywhere but that thread's own traceback. So: never send to
-        ``input_sockets`` from anywhere but here.
+        an envelope should be, and the message cannot be decoded. Nothing
+        recovers what it carried -- its requests never reach the engine and
+        their clients hang. So: never send to ``input_sockets`` from anywhere
+        but here.
         """
         self.input_sockets[dp_rank].send_multipart(
-            [self.engine_core_identities[dp_rank], payload], copy=False
+            [self.engine_core_identities[dp_rank], *frames], copy=False
         )
 
-    def _send_control(self, dp_rank: int, payload: bytes, copy: bool = False) -> None:
-        """Send one already-pickled control message. Serialized, never hot.
+    def _send_control(self, dp_rank: int, frames: list, copy: bool = False) -> None:
+        """Send one already-encoded control message. Serialized, never hot.
 
         Writers here are the event loop (abort, the /debug/* endpoints) and the
         per-rank output threads (shutdown), so this does need a lock -- but none
@@ -869,10 +910,10 @@ class CoreManager:
         """
         with self._control_send_lock:
             self.control_sockets[dp_rank].send_multipart(
-                [self.control_identities[dp_rank], payload], copy=copy
+                [self.control_identities[dp_rank], *frames], copy=copy
             )
 
-    def add_request(self, seqs: list[Sequence]):
+    def add_request(self, seqs: list[IngressRequest]):
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -885,11 +926,11 @@ class CoreManager:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            self._send_request(0, encode_submit(seqs))
         elif self._routable_engine_count == 1:
             # Single routable engine, send all requests
             logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+            self._send_request(0, encode_submit(seqs))
         else:
             self._dispatch_to_dp_ranks(seqs)
 
@@ -905,7 +946,9 @@ class CoreManager:
         """
         return getattr(self, "global_engine_count", self.local_engine_count)
 
-    def _resolve_and_validate_hints(self, seqs: list[Sequence]) -> list[int | None]:
+    def _resolve_and_validate_hints(
+        self, seqs: list[IngressRequest]
+    ) -> list[int | None]:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
@@ -930,7 +973,7 @@ class CoreManager:
             hints.append(hint)
         return hints
 
-    def _dispatch_to_dp_ranks(self, seqs: list[Sequence]) -> None:
+    def _dispatch_to_dp_ranks(self, seqs: list[IngressRequest]) -> None:
         """Route a batch across DP ranks and send each rank its sub-batch.
 
         Honors an explicit ``data_parallel_rank`` hint; otherwise picks a rank
@@ -977,9 +1020,7 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self._send_request(
-                    dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
-                )
+                self._send_request(dp_rank, encode_submit(rank_seqs))
                 dispatched[dp_rank] = True
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
@@ -1118,7 +1159,7 @@ class CoreManager:
         return rank
 
     def _select_dp_rank_for_seq_locked(
-        self, seq: Sequence, explicit_rank: int | None
+        self, seq: IngressRequest, explicit_rank: int | None
     ) -> int:
         """Route one sequence using explicit hint, strict owner, then load.
 
@@ -1188,7 +1229,7 @@ class CoreManager:
                 "session_count_per_rank": sessions_per_rank,
             }
 
-    def _charge_seq_load_locked(self, seq: Sequence, dp_rank: int) -> None:
+    def _charge_seq_load_locked(self, seq: IngressRequest, dp_rank: int) -> None:
         """Record a seq's in-flight load on dp_rank. Caller must hold _lb_lock."""
         req_cost = 1
         prompt_tokens = int(getattr(seq, "num_prompt_tokens", 0) or 0)
@@ -1319,16 +1360,12 @@ class CoreManager:
                 logger.debug(
                     f"{self.label}: Send utility command '{cmd}' to DP rank {rank}"
                 )
-                self._send_control(
-                    rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
-                )
+                self._send_control(rank, encode_command({"cmd": cmd}))
         else:
             logger.debug(
                 f"{self.label}: Send utility command '{cmd}' to DP rank {dp_rank}"
             )
-            self._send_control(
-                dp_rank, pickle.dumps((EngineCoreRequestType.UTILITY, {"cmd": cmd}))
-            )
+            self._send_control(dp_rank, encode_command({"cmd": cmd}))
 
     def abort_request(self, req_id):
         """Tell the engine core(s) to drop a request (client disconnected).
@@ -1342,20 +1379,22 @@ class CoreManager:
         # its in-flight count. _release_seq_load is idempotent.
         self._release_seq_load(req_id)
         try:
-            self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:
+            frames = encode_abort([req_id])
+            for rank in range(len(self.control_sockets)):
+                self._send_control(rank, frames, copy=True)
+        except Exception as e:  # noqa: BLE001 - disconnect cleanup must not raise
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}
-        # Serialize once and reuse for all ranks (optimization: avoid repeated pickle.dumps)
-        serialized_payload = pickle.dumps((EngineCoreRequestType.UTILITY, payload))
+        # Encode once and reuse for all ranks.
+        frames = encode_command(payload)
         for rank in range(len(self.control_sockets)):
             logger.debug(
                 f"{self.label}: Broadcast utility command '{cmd}' to DP rank {rank}"
             )
-            # copy=True: the same buffer is reused for every rank.
-            self._send_control(rank, serialized_payload, copy=True)
+            # copy=True: the same buffers are reused for every rank.
+            self._send_control(rank, frames, copy=True)
 
     def broadcast_utility_command_sync(
         self, cmd: str, timeout: float = 300.0, **kwargs
@@ -1404,9 +1443,7 @@ class CoreManager:
         if should_send:
             try:
                 if has_control_socket:
-                    self._send_control(
-                        dp_rank, pickle.dumps((EngineCoreRequestType.SHUTDOWN, None))
-                    )
+                    self._send_control(dp_rank, encode_shutdown())
                     logger.debug(f"{self.label}: Sent shutdown to DP rank {dp_rank}")
                 else:
                     logger.warning(
@@ -1418,7 +1455,7 @@ class CoreManager:
                     f"{self.label}: Error sending shutdown to DP rank {dp_rank}: {e}"
                 )
 
-    def get_output(self) -> list[Sequence]:
+    def get_output(self) -> list[CompletionResult]:
         seqs = self.outputs_queue.get()
         if isinstance(seqs, BaseException):
             raise seqs
@@ -1522,6 +1559,10 @@ class DisaggCoreManager(CoreManager):
 
         import torch
 
+        if config.external_engine_client:
+            raise ValueError(
+                "An external engine client does not support rapidserve yet."
+            )
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
             torch.multiprocessing.set_start_method("spawn", force=False)
 
@@ -1690,8 +1731,8 @@ class DisaggCoreManager(CoreManager):
         """Block until output_sockets[idx] sends a READY signal."""
         sock = self.output_sockets[idx]
         while True:
-            obj = sock.recv(copy=False)
-            request_type, data = pickle.loads(obj)
+            frames = sock.recv_multipart(copy=False)
+            request_type, data = decode_core_message(frames)
             if request_type == EngineCoreRequestType.READY:
                 self._record_ready_payload(data)
                 return
@@ -1700,7 +1741,7 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: list[Sequence]):
+    def add_request(self, seqs: list[IngressRequest]):
         """Fan-out: send every new sequence to BOTH prefill and decode."""
         logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to prefill and decode")
         # Register stream callbacks before sending (decode will produce output).
@@ -1710,22 +1751,13 @@ class DisaggCoreManager(CoreManager):
                 seq.stream_callback = None
 
         # Send decode payload as-is.
-        decode_payload = pickle.dumps((EngineCoreRequestType.ADD, seqs))
-        self._send_request(1, decode_payload)
+        self._send_request(1, encode_submit(seqs))
 
         # For prefill: limit each sequence to 1 output token.  Prefill discards
         # all sampled tokens (postprocess is a no-op), but setting max_tokens=1
         # ensures the forward pass terminates after a single generate step and
         # that num_scheduled_tokens correctly reflects only the prompt tokens.
-        import copy as _copy
-
-        prefill_seqs = []
-        for seq in seqs:
-            ps = _copy.copy(seq)
-            ps.max_tokens = 1
-            prefill_seqs.append(ps)
-        prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-        self._send_request(0, prefill_payload)
+        self._send_request(0, encode_submit(seqs, max_tokens=1))
 
     def close(self):
         super().close()

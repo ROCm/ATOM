@@ -1,4 +1,9 @@
+// Many threads allocate and free per token; glibc's arenas contend on that.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod app_context;
+pub mod atom_engine;
 pub mod cliargs;
 pub mod config;
 pub mod core;
