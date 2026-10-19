@@ -527,6 +527,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # GLM-5.2 mono kernel scheduling switches, read once per kernel build
+    # (atom/models/glm52/mono/kernels/{kernel,layout}.py). All of the variants
+    # are bit-identical; they exist to A/B one schedule change against the one
+    # before it in a single process. Named MONO_*, not ATOM_MONO_*, as they
+    # were before they were registered here.
+    "MONO_DN_HOIST": lambda: os.getenv("MONO_DN_HOIST", "1") == "1",
+    "MONO_R2_OFF": lambda: os.getenv("MONO_R2_OFF", "0") == "1",
+    "MONO_SPLIT_QHEADS": lambda: os.getenv("MONO_SPLIT_QHEADS", "1") == "1",
+    "MONO_UG_SCALE_PAIR": lambda: os.getenv("MONO_UG_SCALE_PAIR", "1") == "1",
+    "MONO_DN_BATCH": lambda: _optional_int_env("MONO_DN_BATCH"),
+    "MONO_PTPC_CHUNK": lambda: _optional_int_env("MONO_PTPC_CHUNK"),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

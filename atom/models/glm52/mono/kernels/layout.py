@@ -4,7 +4,6 @@
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
 import math
-import os
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     HIDDEN,
@@ -30,6 +29,7 @@ from atom.models.glm52.mono.kernels.geometry import (
     UV_TILE,
     WAVES,
 )
+from atom.utils import envs
 
 INDEX_HEADS = 32
 INDEX_DIM = 128
@@ -265,12 +265,11 @@ def down_prefetch_batch(samples: int, native_fp4_mfma: bool = False, atom_expert
     slower, presumably register pressure), and 2 is the best of the values
     tried at both widths.
 
-    ``MONO_DN_BATCH`` overrides it for an A/B (see
-    ``tests/models/glm52/kernels/bench_glm52_atom_shape.py --ab-env``).
+    ``MONO_DN_BATCH`` overrides it for an A/B.
     """
-    override = os.environ.get("MONO_DN_BATCH", "")
-    if override:
-        return int(override)
+    override = envs.MONO_DN_BATCH
+    if override is not None:
+        return override
     if samples <= 4:
         return 9
     if native_fp4_mfma:
@@ -287,8 +286,8 @@ def ptpc_stage_chunk(samples: int) -> int:
     term from ``q_b``, ``uk`` and ``o`` -- stages whose task count and weight
     bytes do not depend on ``S`` at all.
 
-    Measured on the TP4 GLM-5.2 shard (``bench_glm52_atom_shape --ab-env
-    MONO_PTPC_CHUNK=...``, 7 trials, interleaved, spread <= 0.27%):
+    Measured on the TP4 GLM-5.2 shard (``MONO_PTPC_CHUNK=...``, 7 trials,
+    interleaved, spread <= 0.27%):
 
     ==========  ===============  ================
     chunk       S=6 us/launch    S=12 us/launch
@@ -305,9 +304,9 @@ def ptpc_stage_chunk(samples: int) -> int:
     reduction and spills.  ``MONO_PTPC_CHUNK`` overrides this for an A/B;
     ``1`` restores the per-cell walk exactly.
     """
-    override = os.environ.get("MONO_PTPC_CHUNK", "")
-    if override:
-        return int(override)
+    override = envs.MONO_PTPC_CHUNK
+    if override is not None:
+        return override
     return 2 if samples <= 6 else 4
 
 

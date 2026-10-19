@@ -383,3 +383,58 @@ def test_malformed_offload_timeout_names_the_variable(monkeypatch):
     monkeypatch.setenv("OFFLOAD_PUBLICATION_TIMEOUT_S", "soon")
     with pytest.raises(ValueError, match="OFFLOAD_PUBLICATION_TIMEOUT_S must be"):
         _ = _get_envs().OFFLOAD_PUBLICATION_TIMEOUT_S
+
+
+_MONO_FLAGS = {
+    "MONO_DN_HOIST": True,
+    "MONO_R2_OFF": False,
+    "MONO_SPLIT_QHEADS": True,
+    "MONO_UG_SCALE_PAIR": True,
+}
+_MONO_INTS = ["MONO_DN_BATCH", "MONO_PTPC_CHUNK"]
+
+
+def test_mono_kernel_switches_are_documented():
+    """The GLM-5.2 mono scheduling switches are registered and in the env reference."""
+    import pathlib
+
+    from atom.utils import envs
+
+    doc = (
+        pathlib.Path(__file__).parents[1] / "docs" / "environment_variables.md"
+    ).read_text()
+    names = [*_MONO_FLAGS, *_MONO_INTS]
+    assert [n for n in names if n not in envs.environment_variables] == []
+    assert [n for n in names if f"**{n}**" not in doc] == []
+
+
+@pytest.mark.parametrize("name", list(_MONO_FLAGS))
+def test_mono_kernel_flag_defaults_and_overrides(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(_get_envs(), name) is _MONO_FLAGS[name]
+    monkeypatch.setenv(name, "0" if _MONO_FLAGS[name] else "1")
+    assert getattr(_get_envs(), name) is (not _MONO_FLAGS[name])
+
+
+@pytest.mark.parametrize("name", _MONO_INTS)
+def test_mono_kernel_int_switch_unset_empty_value_and_garbage(monkeypatch, name):
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(_get_envs(), name) is None
+    monkeypatch.setenv(name, "")
+    assert getattr(_get_envs(), name) is None
+    monkeypatch.setenv(name, "0")
+    assert getattr(_get_envs(), name) == 0
+    monkeypatch.setenv(name, "two")
+    with pytest.raises(ValueError, match=name):
+        getattr(_get_envs(), name)
+
+
+def test_glm_layout_takes_its_overrides_from_the_registered_switches(monkeypatch):
+    from atom.models.glm52.mono.kernels import layout
+
+    monkeypatch.delenv("MONO_DN_BATCH", raising=False)
+    monkeypatch.delenv("MONO_PTPC_CHUNK", raising=False)
+    assert (layout.down_prefetch_batch(6), layout.ptpc_stage_chunk(6)) == (4, 2)
+    monkeypatch.setenv("MONO_DN_BATCH", "7")
+    monkeypatch.setenv("MONO_PTPC_CHUNK", "1")
+    assert (layout.down_prefetch_batch(6), layout.ptpc_stage_chunk(6)) == (7, 1)
