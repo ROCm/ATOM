@@ -121,7 +121,9 @@ def make_scheduler(
         enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
@@ -140,6 +142,8 @@ def make_scheduler(
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
     assert connections == [checkpoints.store.spec]
+    # Once, on the chunk grid images are stored on (the rebind is a no-op).
+    assert manager.anchor_grids == [8]
     scheduler._min_load_tokens = 0
     return scheduler, checkpoints, adapter
 

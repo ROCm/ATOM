@@ -142,6 +142,12 @@ class NativeStateLMCacheMPConnectorScheduler(LMCacheMPConnectorScheduler):
                 "every hit replays %d tokens below the KV it loads.",
                 self._replay_tokens,
             )
+        else:
+            # An image is saved only at a chunk boundary (`_save_frontier`), so
+            # a prompt-end anchor off the chunk grid never reaches LMCache and
+            # the next turn resumes from the ladder, 8192 tokens apart by
+            # default, or from nothing.
+            block_manager.align_checkpoint_anchor(self.chunk_size)
         # sid -> (seq, KV-only reach in tokens) of the request's lookup, from
         # its answer until admission weighs it. The lookup keeps the PAGE KV
         # locked up to the reach meanwhile, so nothing releases it before then.

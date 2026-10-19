@@ -334,6 +334,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         fragment = self._ple_layout_fragment()
         if not fragment:
             return transfer
+        # Not readable midstep even under ATOM_GDN_STATE_MIDSTEP: a midstep
+        # snapshot is the GDN chunk kernel's `h`, and nothing snapshots the PLE
+        # conv / n-gram windows inside a forward, so prefill stays cut onto rungs.
         return StateTransfer.copy(transfer.paged_layout_id + fragment)
 
     def _ple_layout_fragment(self) -> str:
