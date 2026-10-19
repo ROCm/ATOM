@@ -412,9 +412,6 @@ class _ParkScheduler:
         self.asked_park += 1
         return self._park
 
-    def last_load_skip_reason(self, req_id) -> str:
-        return "unknown"
-
 
 def _lookup_adapter(scheduler):
     adapter = object.__new__(connector_mod.AtomLMCacheOffloadConnector)

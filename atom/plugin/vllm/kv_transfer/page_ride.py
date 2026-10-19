@@ -15,8 +15,6 @@ The host planner must provide:
 
 ``self._pool``
     vLLM's GPU block pool, or None before :meth:`bind_gpu_block_pool`.
-``self._counters``
-    The planner's tally dict, pre-seeded with the ``ride_*`` keys below.
 ``self.hash_block_size``
     The unit ``request.block_hashes`` is indexed in.
 ``self.ride_boundary_grid``
@@ -32,24 +30,6 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-
-#: The counters this mixin keeps. Seeded by the host so a planner's stats line
-#: has every key whether or not a ride was ever taken -- a key that appears
-#: only once it is non-zero reads as "not instrumented" rather than "zero".
-RIDE_COUNTERS = (
-    "ride_recorded",
-    "ride_served",
-    "ride_missing",
-    # Split by the gate that refused, because one number for three reasons
-    # could not say whether a configuration stores nothing or looks nothing up.
-    "ride_missing_boundary_unaligned",
-    "ride_missing_boundary_past_hashes",
-    "ride_missing_no_group_cached",
-    "ride_missing_no_pool",
-    "ride_missing_load_unrecorded",
-    "ride_pinned",
-    "ride_unpinned",
-)
 
 #: vLLM's placeholder block. ``vllm.v1.attention.backends.utils.NULL_BLOCK_ID``
 #: is the authority; it is mirrored rather than imported so this module stays
@@ -72,9 +52,6 @@ class PageRideMixin:
         # operation -> the blocks pinned for it, given back in
         # `retire_ride_pins` once the scheduler no longer lists it as live.
         self._ride_pins: dict[Any, tuple[int, ...]] = {}
-        self._last_ride_gate: str | None = None
-        for key in RIDE_COUNTERS:
-            self._counters.setdefault(key, 0)
 
     def bind_gpu_block_pool(self, pool) -> None:
         self._pool = pool
@@ -94,7 +71,6 @@ class PageRideMixin:
         self._ride_boundaries.setdefault(str(req_id), {})[int(boundary_tokens)] = tuple(
             block_ids
         )
-        self._counters["ride_recorded"] += 1
 
     def forget_ride(self, req_id: str) -> None:
         """Drop a finished request's recorded destinations."""
@@ -110,7 +86,6 @@ class PageRideMixin:
         stored for some of them is a checkpoint that cannot be restored.
         """
         pool = self._pool
-        self._last_ride_gate = "no_pool"
         if pool is None:
             return ()
         block_hashes = getattr(request, "block_hashes", None) or ()
@@ -120,19 +95,15 @@ class PageRideMixin:
         # state can sit on. The grid is a multiple of the hash unit, so the
         # index below is still exact.
         if boundary_tokens <= 0 or boundary_tokens % self.ride_boundary_grid:
-            self._last_ride_gate = "boundary_unaligned"
             return ()
         index = boundary_tokens // self.hash_block_size - 1
         if index < 0 or index >= len(block_hashes):
-            self._last_ride_gate = "boundary_past_hashes"
             return ()
         blocks = pool.get_cached_block(block_hashes[index], list(self.ride_group_ids))
         if not blocks:
-            self._last_ride_gate = "no_group_cached"
             return ()
         block_ids = tuple(int(block.block_id) for block in blocks)
         if any(block_id <= NULL_BLOCK_ID for block_id in block_ids):
-            self._last_ride_gate = "no_group_cached"
             return ()
         return block_ids
 
@@ -162,28 +133,17 @@ class PageRideMixin:
         recorded = None if by_boundary is None else by_boundary.get(end)
         if operation is None:
             # A load. Its destination is what vLLM allocated for this
-            # request's external hit, recorded at admission; if none was
-            # recorded, admission refused it and there is no correct place to
-            # put the state. `source_blocks_for` is the SAVE source -- blocks
-            # already committed under this hash, possibly another request's --
-            # and writing a load into them is how a refused request used to
-            # get a load dispatched anyway: it then completed, was reported a
-            # second time after the promise had already been withdrawn, and
-            # vLLM asserted on a RUNNING request. Returning None here makes the
+            # request's external hit, recorded at admission; none recorded
+            # means admission refused it. `source_blocks_for` is the SAVE
+            # source -- blocks committed under this hash, possibly another
+            # request's -- so it is never a load's destination. None makes the
             # scheduler decline the load, and the connector withdraws the
-            # promise once, through `_check_promised_loads`.
+            # promise through `_check_promised_loads`.
             block_ids = recorded
-            if not block_ids:
-                self._last_ride_gate = "load_unrecorded"
         else:
             block_ids = recorded or (self.source_blocks_for(request, end) or None)
         if not block_ids:
-            self._counters["ride_missing"] += 1
-            key = f"ride_missing_{getattr(self, '_last_ride_gate', None)}"
-            if key in self._counters:
-                self._counters[key] += 1
             return None
-        self._counters["ride_served"] += 1
         pool = self._pool
         pinnable = (
             not recorded
@@ -198,7 +158,6 @@ class PageRideMixin:
             # the share back on every exit the save has, terminal or not.
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
             self._ride_pins[operation] = tuple(block_ids)
-            self._counters["ride_pinned"] += 1
         return RecurrentStateTransfer(boundary_tokens=end, block_ids=tuple(block_ids))
 
     def retire_ride_pins(self, live_operations) -> None:
@@ -216,6 +175,5 @@ class PageRideMixin:
         live = set(live_operations)
         for operation in [op for op in self._ride_pins if op not in live]:
             block_ids = self._ride_pins.pop(operation)
-            self._counters["ride_unpinned"] += 1
             if pool is not None:
                 pool.free_blocks([pool.blocks[block_id] for block_id in block_ids])

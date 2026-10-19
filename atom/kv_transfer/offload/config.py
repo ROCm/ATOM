@@ -490,16 +490,6 @@ def build_page_namespace(
         digest_size=_PAGE_FINGERPRINT_BYTES,
         person=b"ATOM-PAGE-CFG-v3",
     ).hexdigest()
-    # The namespace is a hash, so two processes that disagree about any input
-    # produce two valid-looking names and no error anywhere: the workers
-    # register their layout under one, every lookup asks for the other, and the
-    # tier answers each lookup with a miss. Logging the document it was hashed
-    # from is the only way to see which field they disagreed about.
-    logger.info(
-        "ATOM PAGE namespace %s from %s",
-        digest,
-        canonical.decode("ascii"),
-    )
     return f"{base_model_name}::atom-page-v{layout_version}-{digest}"
 
 
