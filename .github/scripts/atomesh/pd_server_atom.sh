@@ -1844,9 +1844,51 @@ start_mooncake_store_decode_owners() {
   echo "[wait][OK] mooncake-store decode owners mounted on ${NODE0_ADDR}'s pools ${mooncake_pool_devices[*]:-shared}"
 }
 
+# Experiment (c112 InferenceX gap): every GPU's busy percent and power, and the
+# host's context switches and runnable tasks, once a second for the whole run,
+# to set this node's prefill duty cycle against InferenceX's tachometer.
+# Columns are named by PCI address: HIP numbers the GPUs in KFD order.
+gpu_sampler_pid=""
+start_gpu_sampler() {
+  local out="${RUNTIME_LOG_DIR}/gpu-sampler-rank-${NODE_RANK}.csv"
+  local dev bdf header="epoch" power_header=""
+  local -a busy=() power=()
+  for dev in /sys/class/drm/card*/device; do
+    [[ -r "${dev}/gpu_busy_percent" ]] || continue
+    bdf="$(basename "$(readlink -f "${dev}")")"
+    busy+=("${dev}/gpu_busy_percent")
+    power+=("$(ls "${dev}"/hwmon/hwmon*/power1_input 2>/dev/null | head -1)")
+    header+=",busy_${bdf}"
+    power_header+=",watts_${bdf}"
+  done
+  if [[ "${#busy[@]}" -eq 0 ]]; then
+    echo "[gpu-sampler] no gpu_busy_percent in /sys/class/drm; not sampling"
+    return 0
+  fi
+  (
+    set +e
+    echo "${header}${power_header},ctxt,procs_running"
+    while :; do
+      line="$(date +%s)"
+      for f in "${busy[@]}"; do line+=",$(<"${f}")"; done
+      for f in "${power[@]}"; do
+        if [[ -n "${f}" ]]; then line+=",$(($(<"${f}") / 1000000))"; else line+=","; fi
+      done
+      line+=",$(awk '/^ctxt /{c=$2} /^procs_running /{r=$2} END{print c "," r}' /proc/stat)"
+      echo "${line}"
+      sleep 1
+    done
+  ) > "${out}" 2>/dev/null &
+  gpu_sampler_pid=$!
+  echo "[gpu-sampler] ${#busy[@]} GPUs -> ${out} (pid ${gpu_sampler_pid})"
+}
+
 cleanup_processes() {
   local rc=$?
   local pid
+  if [[ -n "${gpu_sampler_pid}" ]]; then
+    kill "${gpu_sampler_pid}" 2>/dev/null || true
+  fi
   # Before the router's end reaches a decode node, which then stops its owners.
   save_mooncake_store_metrics
   for pid in "$@"; do
@@ -2749,6 +2791,7 @@ run_benchmark_and_eval() {
 
 validate_mooncake_store_settings
 write_metadata
+start_gpu_sampler
 
 # Every branch installs its EXIT trap before its first start (the pids expand
 # at exit): start_prefill and start_decode start the Store's masters and owners
