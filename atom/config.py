@@ -2318,17 +2318,21 @@ class Config:
             )
             # Spec-decode + DCP arch gating. Any speculative method (mtp /
             # eagle3 / dspark) runs a q>1 verify pass, and DCP decode with q>1
-            # uses the round-robin CP (cprr) MLA kernel, which is persistent-only
-            # and ships only on gfx950; on gfx942 the non-persistent fallback
-            # ignores the cprr masking and silently produces WRONG output.
+            # needs a persistent MLA kernel that applies the causal mask on the
+            # GLOBAL positions of the round-robin KV shard: gfx950's cprr kernel,
+            # or gfx1250's PS1 one, which takes g_kv_indptr. On gfx942 the
+            # non-persistent fallback ignores the cprr masking and silently
+            # produces WRONG output.
             if self.speculative_config is not None:
                 from aiter.jit.utils.chip_info import get_gfx
 
-                gfx = get_gfx()
-                assert gfx == "gfx950", (
-                    f"Speculative decode + DCP is only supported on gfx950 (needs "
-                    f"the persistent cprr MLA kernel); got {gfx}. Disable DCP or "
-                    f"speculative decode on this GPU."
+                from atom.distributed.dcp_utils import dcp_persistent_supported
+
+                assert dcp_persistent_supported(), (
+                    f"Speculative decode + DCP needs the persistent round-robin CP "
+                    f"MLA decode (gfx950, or gfx1250 with "
+                    f"AITER_MLA_DECODE_PS1_FLYDSL=1); got {get_gfx()}. Disable DCP "
+                    f"or speculative decode on this GPU."
                 )
                 # TBO slices its ubatch work buffers by request, while the
                 # sparse DCP indexer indexes them by query token. The two agree
