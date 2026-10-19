@@ -121,7 +121,7 @@ def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
                 result_type=fx.Vector.make_type(4, fx.Int32),
             )
             if const_live(per, n):
-                xb = live.select(xb, fx.Vector.filled(4, 0, fx.Int32))
+                xb = live.select(xb, 0)
             acc = mfma_bf16(
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )

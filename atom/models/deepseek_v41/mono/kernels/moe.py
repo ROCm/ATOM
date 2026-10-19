@@ -115,6 +115,7 @@ from atom.mono.device.ops import (
     popcount,
     row_sum,
     rsrc,
+    wave_max,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
@@ -322,10 +323,10 @@ def stage_router(c, task, wvs):
 # ---------------------------------------------------------------- route
 def _score(x):
     """sqrt(log2(1 + exp2(x log2e)) ln2), x itself past 20 (topk_gating)."""
-    sp = fx.Float32((x > fx.Float32(20.0)).select(
+    sp = (x > fx.Float32(20.0)).select(
         x, hw_log2(fx.Float32(1.0) + hw_exp2(x * fx.Float32(LOG2E)))
         * fx.Float32(LN2),
-    ))  # fmt: skip
+    )  # fmt: skip
     return fmath.sqrt(sp)
 
 
@@ -360,7 +361,7 @@ def stage_route(c, t):
             e = lane + 64 * i
             sc = _score(logits[i])
             # aiter's NaN guards: a NaN score weighs 0 and never wins
-            orig.append(fx.Float32(fx.isnan(sc).select(fx.Float32(0.0), sc)))
+            orig.append(fx.isnan(sc).select(fx.Float32(0.0), sc))
             vals.append(fx.max(sc + bias[i], fx.Float32(float("-inf"))))
             idxs.append(fx.Int32(e))
         for p, q in c["rs"].sort_net:
@@ -380,14 +381,12 @@ def stage_route(c, t):
                     at.select(idxs[i], ci),
                     at.select(orig[i], co),
                 )
-            best = butterfly(cv, (32, 16, 8, 4, 2, 1), fx.max)
+            best = wave_max(cv)
             ball = ballot(cv == best)
-            win = fx.Int32(
-                (ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball)))
-            )
+            win = (ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball)))
             win_id = fx.Int32(rocdl.readlane(T.i32, ci.ir_value(), win.ir_value()))
             won = (cursor < ept) & (ci == win_id)
-            mine_o = fx.Float32(won.select(co, fx.Float32(0.0)))
+            mine_o = won.select(co, fx.Float32(0.0))
             w = fx.Int32(rocdl.readlane(
                 T.i32, mine_o.bitcast(fx.Int32).ir_value(), (win_id & 63).ir_value()
             )).bitcast(fx.Float32)  # fmt: skip
@@ -532,7 +531,7 @@ def _silu_mul(g, u):
     x * rcp(1 + exp(-x)) (ocml exp)."""
     g = bf16_round(fx.min(g, fx.Float32(LIMIT)))
     u = fx.max(fx.min(u, fx.Float32(LIMIT)), fx.Float32(-LIMIT))
-    act = g * hw_rcp(fx.Float32(1.0) + fx.Float32(fmath.exp(-g)))
+    act = g * hw_rcp(fx.Float32(1.0) + fmath.exp(-g))
     return act * u
 
 
@@ -764,7 +763,7 @@ def fp4_tile_weights(c, w, e, n_rows, k, rg, st0, blk, k_real=None):
             at = lane * 4
         v = fp4_tile_load(rsrc(w), base, rg, k, st0 + i, at)
         if const_expr(past):
-            v = real.select(v, fx.Vector.filled(4, 0, fx.Int32))
+            v = real.select(v, 0)
         out.append(v)
     return out
 

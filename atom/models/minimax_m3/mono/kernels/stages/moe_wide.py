@@ -123,7 +123,7 @@ def moe_wide_defs(k4ctx):
         """Token k's slot routed to expert e (TOP_K: the shared expert)."""
         s = fx.Int32(TOP_K)
         for j in range_constexpr(TOP_K):
-            s = (fx.Int32(fx.ptr_load(route + (8 * k + j))) == e).select(fx.Int32(j), s)
+            s = (fx.ptr_load(route + (8 * k + j)) == e).select(fx.Int32(j), s)
         return s
 
     def build_experts():
@@ -133,16 +133,14 @@ def moe_wide_defs(k4ctx):
         m = fx.Int32(0)
         if tid < N_ROUTED:
             for w in range_constexpr(WAVES):
-                m = m | fx.Int32(fx.ptr_load(xs + (W_UPP + w * N_ROUTED + tid)))
+                m = m | fx.ptr_load(xs + (W_UPP + w * N_ROUTED + tid))
         bal = ballot(m != 0)
         below = lanes_below(bal, lane)
         if tid == 0:
             fx.ptr_store(popcount(bal), umask + (U_MAX + 1))
         gpu.barrier()
         if tid < N_ROUTED:
-            off = (wave == 0).select(
-                fx.Int32(0), fx.Int32(fx.ptr_load(umask + (U_MAX + 1)))
-            )
+            off = (wave == 0).select(fx.Int32(0), fx.ptr_load(umask + (U_MAX + 1)))
             rank_ = off + below
             if m != 0:
                 fx.ptr_store(fx.Int32(tid), uexp + rank_)
@@ -240,8 +238,8 @@ def moe_wide_defs(k4ctx):
         hi = bf16_round(y_hi)
         sc, inv = mx8_scale([lo, hi], (1, 2, 4, 8))
         words = [fp8_lanes4(mx8_q(v, inv)) for v in (lo, hi)]
-        e_u = fx.Int32(fx.ptr_load(uexp + u))
-        m_u = fx.Int32(fx.ptr_load(umask + u))
+        e_u = fx.ptr_load(uexp + u)
+        m_u = fx.ptr_load(umask + u)
         row = k * MOE_SLOTS + slot_of(k, e_u)
         if (tid < UG_ROWS * tokens) & (((m_u >> k) & 1) != 0):
             if r % 4 == 0:
@@ -271,8 +269,8 @@ def moe_wide_defs(k4ctx):
             if ix < U_MAX * 16:
                 xu = ix // 16
                 xk = ix % 16
-                xe = fx.Int32(fx.ptr_load(uexp + fx.min(xu, nu)))
-                xm = fx.Int32(fx.ptr_load(umask + fx.min(xu, nu)))
+                xe = fx.ptr_load(uexp + fx.min(xu, nu))
+                xm = fx.ptr_load(umask + fx.min(xu, nu))
                 xt = fx.min(xk, tokens - 1)
                 xs_ = slot_of(xt, xe)
                 xh = (((xm >> xk) & 1) != 0) & (xu <= nu)
@@ -431,7 +429,7 @@ def moe_wide_defs(k4ctx):
             """A loaded unit plus its B row and route weight (the tables are in),
             read ahead so the unit's B loads wait on one LDS trip."""
             dwv, dsc, du, dkc, ok = u
-            drow = fx.Int32(fx.ptr_load(urow + (du * 16 + l16)))
+            drow = fx.ptr_load(urow + (du * 16 + l16))
             dw = ok.select(fx.ptr_load(uwt + (du * 16 + l16)), fx.Float32(0.0))
             return dwv, dsc, drow, dkc, dw, ok
 

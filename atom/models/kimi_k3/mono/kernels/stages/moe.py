@@ -854,7 +854,7 @@ def stage_down(c, rgd, nu, ops0):
                     result_type=fx.Vector.make_type(4, fx.Int32),
                 )
                 scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
-                bw = picked.select(bw, fx.Vector.filled(4, 0, fx.Int32))
+                bw = picked.select(bw, 0)
                 sb = picked.select(scode, fx.Int32(UNIT_SCALE))
                 acc = mfma_scaled(
                     ops[j * W2_STEPS + st],

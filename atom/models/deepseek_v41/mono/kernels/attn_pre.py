@@ -40,7 +40,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr import math as fmath
+from flydsl.expr.math import fma
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -217,10 +217,6 @@ def scratch_layout(tokens: int) -> dict[str, tuple[int, int]]:
 
 def scratch_bytes(tokens: int) -> int:
     return sum(n for _, n in scratch_layout(tokens).values())
-
-
-def fma(a, b, c):
-    return fmath.fma(a, b, c)
 
 
 def sigmoid(z):
@@ -787,7 +783,7 @@ def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
     for i, (st, live) in enumerate(_gemv_steps(c, k, split, tiled)):
         acc = _fp8_step_mfma(c, k, xl, xsl, st, ops[i], acc, live, rows)
     if const_expr(split is not None and not tiled):
-        acc = (wave < split).select(acc, fx.Vector.filled(4, 0, fx.Float32))
+        acc = (wave < split).select(acc, 0.0)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
 
 
@@ -1058,8 +1054,8 @@ def stage_wqb(c, task, ops, t0, n, rope):
         d = r0 % HEAD_DIM
         live = d >= HEAD_DIM - ROPE
         cs, sn = rope
-        e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
-        e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
+        e0 = live.select(v0 * cs - v1 * sn, v0)
+        e1 = live.select(v0 * sn + v1 * cs, v1)
         out = t * c["d"].heads * HEAD_DIM + r0
         bo.buffer_store(e0.to(fx.BFloat16), rsrc(a["q_out"]), out)
         bo.buffer_store(e1.to(fx.BFloat16), rsrc(a["q_out"]), out + 1)
@@ -1093,8 +1089,8 @@ def stage_iq(c, task, ops, t0, n, rope):
         live = d >= ip.DIM - IDX_ROPE
         cs, sn = rope
         # bf16 x bf16 products are exact: the original's contraction cannot show
-        e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
-        e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
+        e0 = live.select(v0 * cs - v1 * sn, v0)
+        e1 = live.select(v0 * sn + v1 * cs, v1)
         c["put_bf"](c["iq"], t * IDX_ROWS + r0, [e0, e1])
     gpu.barrier()
 

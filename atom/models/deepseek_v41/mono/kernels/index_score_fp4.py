@@ -195,12 +195,12 @@ def _rows(c, rows):
     out = []
     for r in range_constexpr(rows):
         row = lds + r * ROW_WORDS
-        bound = fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r)))
+        bound = fx.ptr_load(lds + (BOUNDS_AT + r))
         q = [
             fx.ptr_load(row + ((mi * 16 + l) * 16 + g * 4), result_type=v4)
             for mi in range(M_TILES)
         ]
-        qs = fx.Int32(fx.ptr_load(row + (Q_WORDS + g * 16 + l)))
+        qs = fx.ptr_load(row + (Q_WORDS + g * 16 + l))
         w = []
         for mi in range_constexpr(M_TILES):
             w4 = fx.ptr_load(
@@ -318,8 +318,8 @@ def _block_maxima(c, lead, rows, totals, key, st):
     l, g = lane % 16, lane // 16
     vals = []
     for r in range_constexpr(len(rows)):
-        best = fx.Float32(fx.isnan(totals[r]).select(fx.Float32(NEG), totals[r]))
-        vals.append(fx.Float32((key < rows[r][0]).select(best, fx.Float32(NEG))))
+        best = fx.isnan(totals[r]).select(fx.Float32(NEG), totals[r])
+        vals.append((key < rows[r][0]).select(best, fx.Float32(NEG)))
     if const_expr(len(rows) == ip.WALK_ROWS):
         h01, h23, h45 = (_swap_max(32, vals[i], vals[i + 1]) for i in (0, 2, 4))
         # quarter q (lanes 16 q ..) of packed[k] holds row quarter_rows[k][q]
@@ -338,7 +338,7 @@ def _block_maxima(c, lead, rows, totals, key, st):
             row = here.select(fx.Int32(quarter_rows[k][q]), row)
             bound = here.select(rows[quarter_rows[k][q]][0], bound)
         blocks = ip.blocks(bound)
-        best = fx.Float32((blk == blocks - 1).select(fx.Float32(float("inf")), best))
+        best = (blk == blocks - 1).select(fx.Float32(float("inf")), best)
         # a row twice in `packed[k]` is stored from its first quarter only
         first = None
         for q in range_constexpr(4):
@@ -439,7 +439,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
         init = _stage_rows(c, lead, span, lambda: _first_keys(c, pages, nt))
         _lds_barrier()
     lds = c["sel_lds"]["keys"]
-    bounds = [fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r))) for r in range(ip.WALK_ROWS)]
+    bounds = [fx.ptr_load(lds + (BOUNDS_AT + r)) for r in range(ip.WALK_ROWS)]
     # steps up to the rows' last scored chunk, from the bounds in LDS: the
     # first reads went out before them, on the chunks alone
     top = ip.score_chunks(bounds[0])

@@ -26,6 +26,7 @@ from atom.mono.device.ops import (
     hw_rcp,
     hw_rsq,
     rsrc,
+    wave_max,
     wave_sum,
 )
 from atom.mono.device.sync import preg, publish
@@ -106,7 +107,7 @@ def router_defs(k4ctx):
             fx.ptr_store(sc1, sig + (k * N_ROUTED + 64 + lane))
             pid = fx.Int32(0)
             for p in range_constexpr(TOP_K):
-                m = butterfly(fx.max(k0, k1), (32, 16, 8, 4, 2, 1), fx.max)
+                m = wave_max(fx.max(k0, k1))
                 hit0 = k0 == m
                 k0 = hit0.select(fx.Int32(-(2**31)), k0)
                 k1 = ((k1 == m) & (k0 != m)).select(fx.Int32(-(2**31)), k1)
@@ -119,7 +120,7 @@ def router_defs(k4ctx):
                     w * (route_scale / fx.max(tot, 1e-20)), rwt + (8 * k + lane)
                 )
                 if const_expr(wave_mask is not None):
-                    was = fx.Int32(fx.ptr_load(wave_mask + pid))
+                    was = fx.ptr_load(wave_mask + pid)
                     fx.ptr_store(was | mask_bit, wave_mask + pid)
             if lane == 0:
                 fx.ptr_store(fx.Int32(SHARED_EXPERT), route + (8 * k + TOP_K))

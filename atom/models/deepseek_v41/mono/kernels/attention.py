@@ -60,6 +60,7 @@ from atom.mono.device.ops import (
     readlane,
     row_shr,
     rsrc,
+    wave_max,
     xshfl,
 )
 from atom.mono.plan.execution import BLOCKS
@@ -200,11 +201,11 @@ def _key_row(a, t, meta, key):
     key = fx.max(key, 0)
     picked = key < n_sel
     # a layer without a selection passes a dummy ``sel``: its row is never used
-    selected = fx.Int32(
-        picked.select(ld_dev(a["sel"], t * a["topk"] + fx.min(key, a["topk"] - 1)), 0)
+    selected = picked.select(
+        ld_dev(a["sel"], t * a["topk"] + fx.min(key, a["topk"] - 1)), 0
     )
     window = base + a["ring_off"] + (first + key - n_sel) % a["ring_slots"]
-    return fx.Int32(picked.select(selected, window))
+    return picked.select(selected, window)
 
 
 def only_live(cond, live):
@@ -276,14 +277,12 @@ def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
         ok = key < kv_len
         sc = fx.Vector.filled(4, 0.0, fx.Float32)
         for ch in range_constexpr(HEAD_DIM // 32):
-            kw = ok.select(kws[ch], fx.Vector.filled(4, 0, fx.Int32))
+            kw = ok.select(kws[ch], 0)
             qw = qws[ch]
             sc = mfma_bf16(kw.bitcast(fx.BFloat16), qw.bitcast(fx.BFloat16), sc)
         scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
         sv = [
-            fx.Float32(
-                (s * BK + 4 * g + i < kv_len).select(sc[i] * scale, fx.Float32(NEG))
-            )
+            (s * BK + 4 * g + i < kv_len).select(sc[i] * scale, fx.Float32(NEG))
             for i in range(4)
         ]
         m = butterfly(
@@ -308,9 +307,9 @@ def _l_tree(l, alpha, lane):
         v = row_shr(v, lane, k) + v
     row = lane // 16
     b15 = lane_gather(v.bitcast(fx.Int32), fx.max(row * 16 - 1, 0)).bitcast(fx.Float32)
-    v = fx.Float32((row % 2 == 1).select(b15 + v, v))
+    v = (row % 2 == 1).select(b15 + v, v)
     b31 = lane_gather(v.bitcast(fx.Int32), 31).bitcast(fx.Float32)
-    v = fx.Float32((row >= 2).select(b31 + v, v))
+    v = (row >= 2).select(b31 + v, v)
     return lane_gather(v.bitcast(fx.Int32), 63).bitcast(fx.Float32)
 
 
@@ -333,9 +332,9 @@ def _pv_stats(got, act, lane, wave, att):
     live = lane < act
     for k in range_constexpr(2):
         h = 2 * wave + k
-        m = fx.Float32(live.select(got[k][0].bitcast(fx.Float32), fx.Float32(NEG)))
-        l = fx.Float32(live.select(got[2 + k][0].bitcast(fx.Float32), fx.Float32(0.0)))
-        m_max = butterfly(m, (32, 16, 8, 4, 2, 1), fx.max)
+        m = live.select(got[k][0].bitcast(fx.Float32), fx.Float32(NEG))
+        l = live.select(got[2 + k][0].bitcast(fx.Float32), fx.Float32(0.0))
+        m_max = wave_max(m)
         alpha = hw_exp2(m - m_max)
         l_comb = _l_tree(l, alpha, lane)
         fx.ptr_store(alpha, att["alpha"] + (lane * HEAD_TILE + h))
@@ -422,13 +421,13 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
         ok = sp * BK + lane // 4 < kv_len
         # this wave's LDS tile: [key][32 columns], this lane's quarter row
         fx.ptr_store(
-            ok.select(tiles[r], fx.Vector.filled(4, 0, fx.Int32)),
+            ok.select(tiles[r], 0),
             kt + (lane // 4 * (COLS // 2) + lane % 4 * 4),
         )
         for tt in range_constexpr(2):
             col = tt * 16 + head
             half = [
-                fx.Int32(fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2)))
+                fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2))
                 >> (col % 2 * 16)
                 & 0xFFFF
                 for i4 in range(4)
@@ -443,9 +442,7 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
                 )
             )
             live = sp < act
-            accs.append(
-                [fx.Float32(live.select(acc[j], fx.Float32(0.0))) for j in range(4)]
-            )
+            accs.append([live.select(acc[j], fx.Float32(0.0)) for j in range(4)])
     for k in range_constexpr(8):
         tt, j = k // 4, k % 4
         av = [accs[2 * r + tt][j] for r in range(8)]
@@ -472,6 +469,6 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
     alpha_sink = hw_exp2(fmath.fma(sink, log2e, -m_final))
     l_final = fmath.fma(l_comb, alpha_kv, alpha_sink)
     o = (tot * alpha_kv) / fx.max(l_final, fx.Float32(1e-30))
-    o = fx.Float32((l_final > fx.Float32(0.0)).select(o, fx.Float32(0.0)))
+    o = (l_final > fx.Float32(0.0)).select(o, fx.Float32(0.0))
     fx.ptr_store(bf16_round(o), att["out"] + ((i * HEAD_TILE + h) * COLS + col))
     gpu.barrier()

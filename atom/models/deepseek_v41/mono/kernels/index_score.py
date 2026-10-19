@@ -118,9 +118,9 @@ def _chunk_keys(a, t, ch0, width, wave, lane):
     ]
     keys = []
     for blk, tile in zip(blks, tiles):
-        ks = fx.Int32(
-            fx.ptr_load(_plane_ptr(a["plane"], tile, TILE * ip.DIM + r8 * 4))
-        ).bitcast(fx.Float32)
+        ks = fx.ptr_load(_plane_ptr(a["plane"], tile, TILE * ip.DIM + r8 * 4)).bitcast(
+            fx.Float32
+        )
         kv = [
             fx.ptr_load(
                 _plane_ptr(a["plane"], tile, ((4 * p + j) * TILE + r8) * 16),
@@ -189,17 +189,17 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
         for e in range_constexpr(4):
             terms[h, e] = (fx.max(acc[e] * ks, fx.Float32(0.0)), wts[e])
     live = col < bound
-    score = fx.Float32(live.select(_head_sum(terms), fx.Float32(NEG)))
+    score = live.select(_head_sum(terms), fx.Float32(NEG))
     if lane < 16:
         _st_dev(score, a["ilog"], t * a["lstride"] + col)
     if a["iprod"] != 0:
         # a block's best visible score: its 8 rows are 8 lanes
-        best = fx.Float32(fx.isnan(score).select(fx.Float32(NEG), score))
-        best = fx.Float32(live.select(best, fx.Float32(NEG)))
+        best = fx.isnan(score).select(fx.Float32(NEG), score)
+        best = live.select(best, fx.Float32(NEG))
         best = butterfly(best, (1, 2, 4), fx.max)
         best = fx.min(best, fx.Float32(FLT_MAX))
         newest = blk == blocks - 1
-        best = fx.Float32(newest.select(fx.Float32(float("inf")), best))
+        best = newest.select(fx.Float32(float("inf")), best)
         if (lane < 16) & (r8 == 0) & (blk < blocks):
             _st_dev(best, a["ibmax"], t * a["bstride"] + blk)
 
@@ -335,7 +335,7 @@ def _selected_rows(c, t, ident):
         )
     )
     lifted = cand * TILE + fx.max(ident, 0) % TILE
-    row = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident))
+    row = ((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident)
     toff = fx.Int32(
         bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
     )

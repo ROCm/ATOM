@@ -239,7 +239,7 @@ def block_max(v, lane, wave, red):
 def row_shr(v, lane, k):
     """DPP row_shr:k of an f32: lane - k of the same 16-lane row, else 0."""
     moved = lane_gather(v.bitcast(fx.Int32), fx.max(lane - k, 0)).bitcast(fx.Float32)
-    return fx.Float32((lane % 16 >= k).select(moved, fx.Float32(0.0)))
+    return (lane % 16 >= k).select(moved, fx.Float32(0.0))
 
 
 def _xpartner(v, off, lane):
