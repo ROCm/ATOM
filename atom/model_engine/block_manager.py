@@ -254,6 +254,7 @@ class BlockManager:
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
             on_remap=self._note_index_change,
+            state_images=state_runtime.checkpoint_spec is not None,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -545,6 +546,7 @@ class BlockManager:
             relocations=relocations,
             checkpoint_stores=stores,
             checkpoint_restores=restores,
+            checkpoint_clears=self.kv.take_released_units(),
         )
 
     def state_checkpoint_fates(self) -> dict[str, int]:

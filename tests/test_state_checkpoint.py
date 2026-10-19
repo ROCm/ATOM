@@ -3309,14 +3309,15 @@ class TestTheCacheCannotStarveLiveKv:
     reserve finds the argument instead of re-inventing one.
     """
 
-    def _pool_of_three_with_one_checkpoint(self, pin: bool):
+    def _pool_with_one_checkpoint_and_nothing_spare(self, pin: bool):
         """A pool holding exactly one image, optionally being read.
 
         Three units, one checkpoint, nothing spare -- the tightest state the
-        cache can put the pool in.
+        cache can put the pool in. Four blocks: a pool that holds images never
+        hands out block 0.
         """
         bm = make_block_manager(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         checkpoints = bm.paged_state_checkpoints
@@ -3335,7 +3336,7 @@ class TestTheCacheCannotStarveLiveKv:
         holding checkpoints costs live KV nothing and there is nothing for a
         floor to ration.
         """
-        bm, store = self._pool_of_three_with_one_checkpoint(pin=False)
+        bm, store = self._pool_with_one_checkpoint_and_nothing_spare(pin=False)
         assert store.has_available_units(3), "the image was not counted as free space"
         assert not store.has_available_units(4), "more was counted than exists"
 
@@ -3353,7 +3354,7 @@ class TestTheCacheCannotStarveLiveKv:
         list empty, the gate answers no and the request waits for the pass that
         releases the pin -- `_fresh_block` is never reached.
         """
-        bm, store = self._pool_of_three_with_one_checkpoint(pin=True)
+        bm, store = self._pool_with_one_checkpoint_and_nothing_spare(pin=True)
         assert not store.has_available_units(1), "the cache is meant to be pinned"
 
         seq = stateful_seq(list(range(BLOCK)))
@@ -3366,7 +3367,7 @@ class TestTheCacheCannotStarveLiveKv:
         Without this one, `can_allocate` returning -1 would be indistinguishable
         from a scenario that was never tight enough to matter.
         """
-        bm, _ = self._pool_of_three_with_one_checkpoint(pin=True)
+        bm, _ = self._pool_with_one_checkpoint_and_nothing_spare(pin=True)
         seq = stateful_seq(list(range(BLOCK)))
 
         with pytest.raises(AssertionError, match="No PAGE unit"):
@@ -3380,7 +3381,7 @@ class TestTheCacheCannotStarveLiveKv:
         possible once the pinned image becomes spendable again.
         """
         scheduler = make_scheduler(
-            paged_copy_config(num_kvcache_blocks=3, state_checkpoint_interval_tokens=0),
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
             state_runtime=PAGED_COPY_RUNTIME,
         )
         # The same pinned pool as the tests above, built inside a scheduler,
@@ -3400,6 +3401,37 @@ class TestTheCacheCannotStarveLiveKv:
         _, scheduled = scheduler.schedule()
 
         assert scheduled, "the pass allocated before releasing the previous pin"
+
+
+class TestAGivenBackImageIsCleared:
+    """An image's units go back to the pool still holding GDN state bytes.
+
+    The batch drained after the release carries them as `checkpoint_clears`,
+    which the worker zeroes before that batch's copies and forward.
+    """
+
+    def _pool_with_one_image(self):
+        bm = make_block_manager(
+            paged_copy_config(num_kvcache_blocks=4, state_checkpoint_interval_tokens=0),
+            state_runtime=PAGED_COPY_RUNTIME,
+        )
+        store = bm.paged_state_checkpoints.store
+        op = store.begin_store(33, src_slot=0)
+        store.complete_inflight()
+        assert not bm.take_state_maintenance_ops().checkpoint_clears
+        return bm, store, op
+
+    def test_no_image_is_placed_on_block_0(self):
+        _, _, op = self._pool_with_one_image()
+        assert 0 not in op.unit_ids
+
+    def test_an_evicted_image_reaches_the_next_batch_as_clears(self):
+        bm, store, op = self._pool_with_one_image()
+        assert store.ensure_free_units(3), "the image was not spendable"
+        ops = bm.take_state_maintenance_ops()
+        assert sorted(ops.checkpoint_clears) == sorted(op.unit_ids)
+        assert not ops.empty
+        assert bm.take_state_maintenance_ops().checkpoint_clears == ()
 
 
 # ── midstep checkpoints ────────────────────────────────────────────────────

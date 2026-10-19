@@ -276,6 +276,17 @@ class MhaKvPool:
             self.field_view("v_scale", layer, torch.float32, shape),
         )
 
+    def zero_entries(self, entries: torch.Tensor) -> None:
+        """Zero every field of ``entries``, in every layer.
+
+        One `index_fill_` per field: a field's view is `[layers, entries, ...]`
+        over the pool, so indexing the entry axis reaches all layers at once.
+        An entry here is a PAGE unit, one scheduler block, as in
+        `mha_page_unit_regions`.
+        """
+        for view in self._views.values():
+            view.index_fill_(1, entries, 0)
+
     def region_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """One `(role, tensor)` per (field, layer), in declared field order.
 

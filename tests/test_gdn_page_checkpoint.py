@@ -221,3 +221,30 @@ class TestMhaRegionsMatchThePublishedPages:
             assert "outside" in str(exc)
         else:
             raise AssertionError("expected an out-of-range PAGE unit to raise")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="clears run on the GPU")
+def test_clear_page_units_zeroes_the_named_units_in_every_pool():
+    """Target and draft pools both host the image, so both are cleared; the
+    second call takes the fenced reuse of the pinned id buffer."""
+    builder = object.__new__(_builder_cls())
+    pools = {}
+    for name in ("target", "draft"):
+        pool = MhaKvPool(
+            layers=2, block_size=16, num_kv_heads=1, head_dim=256, kv_dtype=torch.int8
+        )
+        pool.allocate(6, "cuda")
+        for _, tensor in pool.region_tensors():
+            tensor.view(torch.uint8).fill_(0x7F)
+        pools[name] = pool
+    builder.kv_pools = pools
+    builder.device = torch.device("cuda")
+    builder.clear_page_units([1, 4])
+    builder.clear_page_units(iter([2]))
+    builder.clear_page_units(())
+    torch.cuda.synchronize()
+    for pool in pools.values():
+        for role, tensor in pool.region_tensors():
+            raw = tensor.view(torch.uint8).reshape(tensor.shape[0], -1).cpu()
+            assert raw[[1, 2, 4]].eq(0).all(), role
+            assert raw[[0, 3, 5]].eq(0x7F).all(), role
