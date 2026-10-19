@@ -1,59 +1,31 @@
 # SPDX-License-Identifier: MIT
 # PD-disaggregation + pipeline-parallel unit tests (GPU-free).
 
+import importlib
 import logging
 import os
 import subprocess
-import sys
 import threading
 import time
-import types
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from aiter_stub import stubbed_aiter
 
-# Ensure aiter.dist.parallel_state exposes symbols mooncake_connector needs.
-# The top-level name is taken back down below.
-_ps = sys.modules.get("aiter.dist.parallel_state")
-_stubbed: list[str] = []
-if _ps is not None:
-    for _fn in ("get_dp_group", "get_tp_group"):
-        if not hasattr(_ps, _fn):
-            setattr(_ps, _fn, MagicMock())
-else:
-    _aiter_pkg = types.ModuleType("aiter")
-    _aiter_pkg.__path__ = []
-    _dist = types.ModuleType("aiter.dist")
-    _dist.__path__ = []
-    _ps_stub = types.ModuleType("aiter.dist.parallel_state")
-    for _fn in ("get_dp_group", "get_tp_group"):
-        setattr(_ps_stub, _fn, MagicMock())
-    for _name, _mod in (
-        ("aiter", _aiter_pkg),
-        ("aiter.dist", _dist),
-        ("aiter.dist.parallel_state", _ps_stub),
-    ):
-        if _name not in sys.modules:
-            sys.modules[_name] = _mod
-            _stubbed.append(_name)
+# Bind the real connector while the optional GPU imports are scoped. Retaining
+# fake aiter.dist submodules makes later real attention imports skip or fail.
+with stubbed_aiter():
+    importlib.import_module(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
 
 from atom.kv_transfer.disaggregation.port_offset import (
     consumer_region_indices,
     side_channel_port_offset,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata
-
-# Drop the top-level name now that the imports above are bound. The submodules
-# stay -- the connectors reach for them lazily, at call time -- but `aiter`
-# itself has no reader here, and leaving it is what made
-# `pytest.importorskip("aiter")` succeed in every module collected after this
-# one: the skip did not fire, and the real `from aiter import ...` inside the
-# module under test then raised ImportError during collection, which takes the
-# whole run down instead of skipping one file.
-if "aiter" in _stubbed:
-    del sys.modules["aiter"]
 
 
 @pytest.fixture(autouse=True)
@@ -1205,18 +1177,8 @@ def _fake_batch(req_ids, meta):
 
 
 def _pp_engine_core_cls():
-    # The aiter stubs above shadow the real package; fill in the submodules the
-    # engine-core import chain reaches for.
-    for name, attrs in (
-        ("aiter.dist.shm_broadcast", ("MessageQueue",)),
-        ("aiter.ops.communication", ("set_custom_all_reduce",)),
-    ):
-        if name not in sys.modules:
-            mod = types.ModuleType(name)
-            for attr in attrs:
-                setattr(mod, attr, MagicMock())
-            sys.modules[name] = mod
-    from atom.model_engine.pp_engine_core import PPEngineCoreProc
+    with stubbed_aiter():
+        from atom.model_engine.pp_engine_core import PPEngineCoreProc
 
     return PPEngineCoreProc
 
@@ -1950,6 +1912,7 @@ def test_staged_index_write_preserves_selected_engine(monkeypatch):
 def test_m3_pp_stage_writes_only_matching_tp_head_slices(consumer_rank):
     """Execute real descriptor construction, copying bytes in place of RDMA."""
     import ctypes
+
     import torch
 
     mc = pytest.importorskip(
@@ -1974,17 +1937,17 @@ def test_m3_pp_stage_writes_only_matching_tp_head_slices(consumer_rank):
         ds = (7, 1, 1, width) if groups is None else (7, groups, 2, width)
         dst[role] = torch.full(ds, 255, dtype=torch.uint8)
     roles = [s[0] for s in reversed(specs)]  # Deliberately unlike producer order.
-    request = dict(
-        consumer_base_addrs=[dst[r].data_ptr() for r in roles],
-        consumer_region_roles=roles,
-        consumer_block_bpb=[dst[r][0].numel() for r in roles],
-        consumer_head_groups=[
+    request = {
+        "consumer_base_addrs": [dst[r].data_ptr() for r in roles],
+        "consumer_region_roles": roles,
+        "consumer_block_bpb": [dst[r][0].numel() for r in roles],
+        "consumer_head_groups": [
             None if dst[r].shape[2] == 1 else (dst[r].shape[1], 2) for r in roles
         ],
-        consumer_tp_size=4,
-        consumer_tp_rank=consumer_rank,
-        consumer_dcp_size=1,
-    )
+        "consumer_tp_size": 4,
+        "consumer_tp_rank": consumer_rank,
+        "consumer_dcp_size": 1,
+    }
 
     def copy(_target, sources, destinations, sizes, *args, **kwargs):
         assert len(sources) <= 11

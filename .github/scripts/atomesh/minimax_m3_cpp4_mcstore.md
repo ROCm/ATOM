@@ -177,3 +177,25 @@ The evaluation remains full GSM8K, 20-shot, concurrency 32, 8192 max generated
 tokens and flexible-extract >= 0.90 before the fresh C72 performance phase.
 The original flags reproduce the exception with local `lm-eval 0.4.13`;
 the corrected production matrix passes its configuration validation.
+
+## Checks before GPU allocation
+
+The hosted config job now exercises the production `run_eval` command with
+`lm-eval 0.4.13` and `transformers 5.16.1` against a loopback completions
+server. It needs no model, dataset or GPU. It checks real CLI validation,
+client initialization, concurrent requests, preservation of long raw prompts,
+response ordering, stop strings and the 8192-token generation limit. Disabled
+evaluations skip this check. A failure stops the workflow before its GPU job
+is queued. This checks client plumbing; GSM8K accuracy is still measured by
+the subsequent model run.
+
+The PP test imports now clean up all temporary AITER modules so later real
+attention tests remain collectible. Draft transfer tests use the current
+builder constructor and verify all four FP8 PAGE planes at TP1 and TP4 head
+counts. FlyDSL geometry tests isolate optional API availability and explicitly
+verify fallback when the required API is absent; tests of the actual optional
+FlyDSL module still require an image that provides it.
+
+Paged run `39231588890` failed with the same inherited GSM8K chat flag conflict
+as gather run `39231577736`; both experiment branches carry the case-level
+flag correction and these checks.
