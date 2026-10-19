@@ -13,6 +13,7 @@ from flydsl.expr import rocdl
 from flydsl.expr.typing import T
 
 from atom.mono.device.ops import CM_NT
+from atom.mono.plan.tiles import atom_mxfp4_scale_index as scale_index  # noqa: F401
 
 FP8_MAX = 448.0
 # the f8f6f4 MFMA's operand formats (cbsz / blgp)
@@ -44,14 +45,6 @@ def rcp_pow2(code):
     """1 / ``pow2(code)``, exact (code in [1, 253]): x times it is x / scale
     bit for bit, a multiply where the division is a dozen instructions."""
     return ((254 - code) << 23).bitcast(fx.Float32)
-
-
-def scale_index(row, col, cols):
-    """Byte of e8m0 scale (row, col) in aiter's ``shuffle_scale`` layout:
-    ``view(rows/32, 2, 16, cols/8, 2, 4).permute(0, 3, 5, 2, 4, 1)``."""
-    r32, a, b = row // 32, (row // 16) % 2, row % 16
-    c8, d, e = col // 8, (col // 4) % 2, col % 4
-    return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
 
 
 def fp4_tile_load(r_w, base, rg, k, st, at):
