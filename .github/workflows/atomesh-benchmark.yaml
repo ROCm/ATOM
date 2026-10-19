@@ -172,7 +172,7 @@ on:
           - atomesh-cicd-mi350
           - atomesh-cicd-mi355-crusoe
       atomesh_slurm_account:
-        description: 'Slurm account: amd-atom uses amd-atom-qos (salloc -A amd-atom --qos=amd-atom-qos); TW: amd-frameworks[42/44/47]; Crusoe v2 uses amd-aifw-dev'
+        description: 'Slurm account: amd-atom uses amd-atom-qos, amd-frameworks uses amd-frameworks-qos; Crusoe v2 uses amd-aifw-dev'
         required: false
         default: auto
         type: choice
