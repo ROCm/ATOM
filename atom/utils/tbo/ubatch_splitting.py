@@ -274,11 +274,11 @@ def _get_tbo_cpu_lens(attn_metadata: AttentionMetaData, field_name: str):
         lengths = attn_metadata.prefill_request_lengths
         if lengths is not None:
             if field_name == "cu_seqlens_q":
-                return np.asarray(lengths.cu_q, dtype=np.int64)
+                return np.asarray(lengths.cu_q_lens, dtype=np.int64)
             if field_name == "cu_seqlens_k":
-                return np.asarray(lengths.cu_k, dtype=np.int64)
+                return np.asarray(lengths.cu_k_lens, dtype=np.int64)
             if field_name == "context_lens":
-                return np.diff(np.asarray(lengths.cu_k, dtype=np.int64))
+                return np.diff(np.asarray(lengths.cu_k_lens, dtype=np.int64))
         t = getattr(attn_metadata, field_name, None)
         setattr(
             attn_metadata,
@@ -471,17 +471,17 @@ def split_attn_metadata(
     ub_prefill_lengths = None
     if attn_metadata.prefill_request_lengths is not None and ub_num_reqs > 0:
         ub_prefill_lengths = attn_metadata.prefill_request_lengths.slice_requests(
-            req_start,
-            req_end,
-            ts.start,
-            ts.stop,
+            request_start=req_start,
+            request_end=req_end,
+            q_token_start=ts.start,
+            q_token_end=ts.stop,
             has_cached=attn_metadata.has_cached,
         )
 
     ub_total_kv = None
     if attn_metadata.has_cached:
         if ub_prefill_lengths is not None:
-            ub_total_kv = ub_prefill_lengths.cu_k[-1]
+            ub_total_kv = ub_prefill_lengths.cu_k_lens[-1]
         elif ub_cu_seqlens_k is not None and ub_num_reqs > 0:
             ub_total_kv = int(ub_cu_seqlens_k[ub_num_reqs].item())
         elif ub_context_lens is not None and ub_num_reqs > 0:

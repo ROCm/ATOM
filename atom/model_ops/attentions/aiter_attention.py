@@ -1209,7 +1209,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             # Keep the shared host description aligned with the final visible
             # context after reattaching the preceding micro-batch's prefix.
             ub_attn.prefill_request_lengths = PrefillRequestLengths(
-                ub_attn.prefill_request_lengths.cu_q, tuple(map(int, cu_k))
+                cu_q_lens=ub_attn.prefill_request_lengths.cu_q_lens,
+                cu_k_lens=tuple(map(int, cu_k)),
             )
 
     def prepare_decode(

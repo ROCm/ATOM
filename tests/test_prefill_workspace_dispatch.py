@@ -165,4 +165,4 @@ def test_tbo_straddle_snapshot_matches_final_visible_context(monkeypatch, cached
     assert ub.batch_id_per_k_token.tolist() == [0] * expected_k[1] + [1] * (
         expected_k[2] - expected_k[1]
     )
-    assert md.prefill_request_lengths.cu_q == (0, 2, 5, 9)
+    assert md.prefill_request_lengths.cu_q_lens == (0, 2, 5, 9)

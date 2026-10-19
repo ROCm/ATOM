@@ -259,7 +259,7 @@ def test_layer_geometry_changes_groups_without_changing_shared_metadata():
         torch.testing.assert_close(out, q)
         assert seen == expected
         assert ctx.attn_metadata is md
-        assert md.prefill_request_lengths.cu_k == (0, 8, 16)
+        assert md.prefill_request_lengths.cu_k_lens == (0, 8, 16)
 
 
 @pytest.mark.parametrize("has_cached", [False, True])
@@ -313,10 +313,10 @@ def test_tbo_request_and_token_views_keep_owned_host_geometry(
     assert ub.cu_seqlens_k.tolist() == list(expected_k) + [expected_k[-1]] * 2
     assert ub.total_kv == (17 if has_cached else None)
     assert md.total_kv == int(cu_k[-1])
-    assert md.prefill_request_lengths.cu_q == (0, 2, 5, 9)
+    assert md.prefill_request_lengths.cu_q_lens == (0, 2, 5, 9)
     cu_q[:] = -1
     cu_k[:] = -1
-    assert ub.prefill_request_lengths.cu_q == (0, 2, 6)
+    assert ub.prefill_request_lengths.cu_q_lens == (0, 2, 6)
 
 
 def test_tp1_eagle_1m_requests_fit_32_gib_but_not_8_gib():
