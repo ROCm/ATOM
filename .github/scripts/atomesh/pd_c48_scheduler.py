@@ -17,6 +17,17 @@ def create_scheduler(*args, **kwargs):
     scheduler_sha = hashlib.sha256(Path(scheduler_module.__file__).read_bytes()).hexdigest()
     if scheduler_sha != "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c":
         raise RuntimeError("C48 scheduler source differs from the pinned experiment")
+    physical = os.environ.get("C48_PHYSICAL_CACHE_LIFECYCLE", "0")
+    if physical not in ("0", "1") or (
+        physical == "1" and (role != "prefill" or os.environ.get("C48_CACHE_LIFECYCLE") != "1")
+    ):
+        raise ValueError("C48 physical evidence requires Prefill lifecycle observation")
+    lookup_mode = os.environ.get("C48_CACHE_LOOKUP_MODE", "all")
+    if lookup_mode not in ("all", "first_last") or (
+        lookup_mode == "first_last"
+        and (role != "prefill" or os.environ.get("C48_CACHE_LIFECYCLE") != "1")
+    ):
+        raise ValueError("C48 lookup coverage requires Prefill lifecycle observation")
     config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
     defaults = copy.copy(config.scheduler_config)
     defaults.scheduler_cls = None
@@ -29,6 +40,8 @@ def create_scheduler(*args, **kwargs):
     record = {
         "role": role,
         "prefill_fairness_enabled": scheduler._c48_prefill_fairness,
+        "physical_cache_lifecycle_enabled": physical == "1",
+        "cache_lookup_mode": lookup_mode,
         "scheduler_source_sha256": scheduler_sha,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,

@@ -1,0 +1,18 @@
+{
+  "purpose": "Physical cache lifecycle, first/last lookup coverage, fairness disabled",
+  "parent_harness_sha": "14504e931141831c6d953d2170b90b2adac803e3",
+  "performance_reference_slurm": 9116,
+  "fairness_result_slurm": 9207,
+  "model_policy": "cap6144; P fairness0; other V-QD parameters unchanged",
+  "source_sha256": {
+    ".github/scripts/atomesh/pd_c48_physical_lifecycle.py": "74ffcfb0f738ca992196efb585dde536c94b557465330870230d360df5bc035c",
+    ".github/scripts/atomesh/pd_c48_cache_lifecycle.py": "b1763d5f24d4f6ba8e03d36c3938cfc2ab9e0c9317d9d3296397acdc6ad1894f",
+    ".github/scripts/atomesh/pd_c48_scheduler.py": "389507d327d08808f01733637bc52b1a5746c35fc4a92f80a54a861e714e2178"
+  },
+  "test_sha256": "3f795a8c1298cf540b6b065d2f9640538c87b6684a73e99e0e3f704e61fa42cf",
+  "limits": [
+    "First and last actual lookup per request; intermediate lookup attempts coalesced.",
+    "Physical state is last events, not complete global LRU history.",
+    "Observation adds CPU/memory overhead and is not a performance fix."
+  ]
+}

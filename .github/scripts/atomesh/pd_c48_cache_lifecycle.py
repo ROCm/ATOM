@@ -24,7 +24,13 @@ class CacheLifecycleProbe:
         watch_published_group_ids=None,
         cache_kind="cpu",
         result_summary=None,
+        lookup_mode="all",
+        max_pending_requests=2048,
     ):
+        if lookup_mode not in ("all", "first_last"):
+            raise ValueError("Unknown cache lookup observation mode")
+        if max_pending_requests <= 0:
+            raise ValueError("Pending observation limit must be positive")
         self.offload = offload
         self.pool = offload.cpu_block_pool
         self.stream = stream
@@ -52,6 +58,78 @@ class CacheLifecycleProbe:
         self._installed_map = None
         self.history_started_empty = False
         self.installed = False
+        self.lookup_mode = lookup_mode
+        self.max_pending_requests = max_pending_requests
+        self.pending_lookups = {}
+        self.qualifying_lookup_calls = 0
+        self.observed_lookup_calls = 0
+        self.coverage_dropped_lookup_calls = 0
+        self.pending_limit_dropped_lookup_calls = 0
+        self.observed_request_instances = 0
+        self.peak_pending_requests = 0
+        self.coalesced_lookup_rows = 0
+        self.control_records_dropped = 0
+
+    def _can_observe(self, request_id):
+        if self.io_error is not None:
+            return False
+        if self.lookup_mode == "all":
+            return self.records < self.max_records
+        if request_id in self.pending_lookups:
+            return True
+        if len(self.pending_lookups) >= self.max_pending_requests:
+            self.pending_limit_dropped_lookup_calls += 1
+            return False
+        # Reserve one last-lookup slot for every pending request, plus both
+        # first/last slots for a new request. Retries consume no extra slots.
+        return self.records + len(self.pending_lookups) + 2 <= self.max_records
+
+    def _emit_lookup(self, row):
+        if self.lookup_mode == "all":
+            self._emit(row)
+            return
+        request_id = row["request_id"]
+        state = self.pending_lookups.get(request_id)
+        if state is None:
+            state = {"count": 1, "last": None}
+            self.pending_lookups[request_id] = state
+            self.observed_request_instances += 1
+            self.peak_pending_requests = max(
+                self.peak_pending_requests, len(self.pending_lookups)
+            )
+            row.update(lookup_sequence=1, lookup_capture="first")
+            self._emit(row)
+        else:
+            state["count"] += 1
+            if state["last"] is not None:
+                self.coalesced_lookup_rows += 1
+            row.update(lookup_sequence=state["count"], lookup_capture="last")
+            state["last"] = row
+
+    def finish_request(self, request_id, reason="request_finished"):
+        state = self.pending_lookups.pop(request_id, None)
+        if state is not None and state["last"] is not None:
+            row = state["last"]
+            row["lookup_flush_reason"] = reason
+            self._emit(row)
+
+    def flush_pending(self):
+        for request_id in list(self.pending_lookups):
+            self.finish_request(request_id, reason="probe_close")
+
+    def lookup_coverage(self):
+        return {
+            "lookup_mode": self.lookup_mode,
+            "qualifying_lookup_calls": self.qualifying_lookup_calls,
+            "observed_lookup_calls": self.observed_lookup_calls,
+            "coverage_dropped_lookup_calls": self.coverage_dropped_lookup_calls,
+            "pending_limit_dropped_lookup_calls": self.pending_limit_dropped_lookup_calls,
+            "observed_request_instances": self.observed_request_instances,
+            "pending_requests": len(self.pending_lookups),
+            "peak_pending_requests": self.peak_pending_requests,
+            "coalesced_intermediate_lookup_rows": self.coalesced_lookup_rows,
+            "control_records_dropped": self.control_records_dropped,
+        }
 
     def _remember(self, key, event, block_id):
         watched = self.watched.get(key)
@@ -186,6 +264,13 @@ class CacheLifecycleProbe:
     def _emit(self, row):
         if self.records >= self.max_records or self.io_error is not None:
             return
+        if (
+            self.lookup_mode == "first_last"
+            and row["event"] != "prefix_lookup"
+            and self.records + len(self.pending_lookups) >= self.max_records
+        ):
+            self.control_records_dropped += 1
+            return
         try:
             row["cache_kind"] = self.cache_kind
             self.stream.write(json.dumps(row) + "\n")
@@ -223,13 +308,13 @@ class CacheLifecycleProbe:
             return result
 
         def lookup(request, num_computed_tokens):
-            observe = (
-                request.num_prompt_tokens >= self.min_prompt
-                and self.records < self.max_records
-                and self.io_error is None
-            )
-            if not observe:
+            if request.num_prompt_tokens < self.min_prompt:
                 return original_lookup(request, num_computed_tokens)
+            self.qualifying_lookup_calls += 1
+            if not self._can_observe(request.request_id):
+                self.coverage_dropped_lookup_calls += 1
+                return original_lookup(request, num_computed_tokens)
+            self.observed_lookup_calls += 1
             hashes = request.block_hashes
             hash_indices = {h: i for i, h in enumerate(hashes)}
             sampled_indices = sorted(
@@ -273,7 +358,7 @@ class CacheLifecycleProbe:
                 map_publications=self.published,
                 map_removals=self.removed,
             )
-            self._emit(row)
+            self._emit_lookup(row)
             return result
 
         self.pool.get_new_blocks = allocate
@@ -288,6 +373,10 @@ class CacheLifecycleProbe:
                 "max_history": self.max_history,
                 "max_watched": self.max_watched,
                 "max_records": self.max_records,
+                "lookup_mode": self.lookup_mode,
+                "max_pending_requests": self.max_pending_requests,
+                "lookup_record_scope": "First and last actual lookup per request; intermediate attempts coalesced"
+                if self.lookup_mode == "first_last" else "Each observed lookup",
                 "max_positive_miss_examples_per_group": self.max_positive_miss_examples,
                 "watch_published_group_ids": sorted(self.watch_published_group_ids),
                 "history_start": "Installation; not earlier cache events.",
@@ -381,13 +470,31 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
     if len(managers) != 1 or managers[0] is None:
         raise ValueError("Cache probe requires exactly one SimpleCPU scheduler manager")
     cpu = managers[0]
+    physical_enabled = os.environ.get("C48_PHYSICAL_CACHE_LIFECYCLE", "0")
+    if physical_enabled not in ("0", "1") or (
+        physical_enabled == "1" and os.environ.get("C48_DIAG_ROLE") != "prefill"
+    ):
+        raise ValueError("Physical cache evidence is Prefill-only and requires a 0/1 gate")
+    physical_probes = {}
+    limits.setdefault("lookup_mode", os.environ.get("C48_CACHE_LOOKUP_MODE", "all"))
+    physical_source_sha256 = None
+    if physical_enabled == "1":
+        import pd_c48_physical_lifecycle
+        physical_source_sha256 = hashlib.sha256(
+            Path(pd_c48_physical_lifecycle.__file__).read_bytes()
+        ).hexdigest()
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     prefix = f"cache-lifecycle-{os.getpid()}"
     stream = (directory / f"{prefix}.jsonl").open("w", buffering=65536)
     gpu = scheduler.kv_cache_manager.coordinator
     manifest = {
-        "probe_schema_version": 2,
+        "probe_schema_version": 3,
+        "lookup_mode": limits["lookup_mode"],
+        "max_pending_requests_per_pool": limits.get("max_pending_requests", 2048),
+        "physical_last_events_enabled": physical_enabled == "1",
+        "physical_source_sha256": physical_source_sha256,
+        "physical_history_scope": "last events, not complete access history",
         "pid": os.getpid(),
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "min_prompt": limits.get("min_prompt", 200000),
@@ -423,6 +530,19 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
             install_gpu_cache_probe(scheduler, stream, **limits),
             CacheLifecycleProbe(cpu, stream, **limits).install(),
         )
+        if physical_enabled == "1":
+            for probe in probes:
+                physical = pd_c48_physical_lifecycle.PhysicalLifecycle(probe.pool).install()
+                physical.attach_to_map_probe(probe)
+                if probe.cache_kind == "cpu":
+                    physical.observe_cpu_refresh(cpu)
+                physical_probes[probe.cache_kind] = physical
+            manifest["physical_installation"] = {
+                name: probe.coverage() for name, probe in physical_probes.items()
+            }
+            (directory / f"{prefix}-manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n"
+            )
     except BaseException:
         stream.close()
         raise
@@ -433,6 +553,7 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
         try:
             # Outside the per-lookup record cap so exhausted coverage is visible.
             for probe in probes:
+                probe.flush_pending()
                 stream.write(
                     json.dumps(
                         {
@@ -447,6 +568,11 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
                             "map_publications": probe.published,
                             "map_removals": probe.removed,
                             "io_error": probe.io_error,
+                            "lookup_coverage": probe.lookup_coverage(),
+                            "physical_last_events": (
+                                physical_probes[probe.cache_kind].coverage()
+                                if probe.cache_kind in physical_probes else None
+                            ),
                         }
                     )
                     + "\n"
@@ -465,6 +591,16 @@ def install_prefill_cache_probes(scheduler, directory, **limits):
             close()
 
     scheduler.shutdown = shutdown
+    original_free_request = scheduler._free_request
+
+    def free_request(request, *args, **kwargs):
+        try:
+            return original_free_request(request, *args, **kwargs)
+        finally:
+            for probe in probes:
+                probe.finish_request(request.request_id)
+
+    scheduler._free_request = free_request
     # EngineCore tears down the executor before invoking scheduler.shutdown.
     # Flush at its entry so slow/interrupted executor teardown does not lose
     # the observer's final coverage counters. The original teardown is intact.
