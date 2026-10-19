@@ -48,7 +48,8 @@ case $RANK0 in 0 | 4) ;; *) echo "usage: k3_455_tp8dcp8_server.sh <first TP rank
 [ -n "$MASTER" ] || { echo "usage: k3_455_tp8dcp8_server.sh <first TP rank of this tray: 0|4> <node0 IP>" >&2; exit 2; }
 
 ATOM_REPO=https://github.com/ROCm/ATOM.git
-# Branch gyu/k3-455-tp8's code; the branch's later commits only add or edit this script. Both trays must serve the same.
+# The code this serves: branch gyu/k3-455-tp8 at 571d22de7 (TP across nodes, DCP decode on PS1), without the branch's
+# later DSpark + DCP change. Both trays must serve the same.
 ATOM_COMMIT=571d22de7175af319844027553348c33012e599e
 ATOM_DIR=${K3_ATOM_DIR:-/root/.cache/atom-gyu-k3-455-tp8}
 MODEL=${K3_MODEL:-/models/Kimi-K3}
