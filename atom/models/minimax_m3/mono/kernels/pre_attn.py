@@ -70,7 +70,6 @@ from atom.mono.device.ops import (
     mfma_fp8,
     rows_to_lds,
     rsrc,
-    traced,
     uniform,
     wave_max,
 )
@@ -171,7 +170,7 @@ def head_norm_rope(e, lane, gw4, cs, sn, eps):
     return out
 
 
-@traced
+@flyc.jit
 def emit_pre_attn(
     tid, bid, lane, wave, x8, red, mb_put, mb_put_words, mb_poll, qkv_mb, x8_mb,
     x8s_mb, stamp, eps, tokens, heads, ptrs, signal=None, long_step=None,
@@ -334,11 +333,9 @@ def emit_pre_attn(
             for i in range_constexpr(2):
                 if (i == 0) | (lane < 32):
                     bo.buffer_store(
-                        fx.Vector(
-                            fx.ptr_load(
-                                x8 + lts[i] * 2,
-                                result_type=fx.Vector.make_type(2, fx.Int32),
-                            )
+                        fx.ptr_load(
+                            x8 + lts[i] * 2,
+                            result_type=fx.Vector.make_type(2, fx.Int32),
                         ),
                         rsrc(x8_mb),
                         tk * (HIDDEN // 4) + lts[i] * 2,
@@ -424,11 +421,9 @@ def emit_pre_attn(
         c = fx.Vector.filled(4, 0.0, fx.Float32)
         for cc in range_constexpr(CHUNKS_PER_WAVE):
             kc = wave * CHUNKS_PER_WAVE + cc
-            xb = fx.Vector(
-                fx.ptr_load(
-                    x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
-                    result_type=fx.Vector.make_type(4, fx.Float32),
-                )
+            xb = fx.ptr_load(
+                x8 + (col_tok * (HIDDEN // 4) + kc * 16 + (lane // 16) * 4),
+                result_type=fx.Vector.make_type(4, fx.Float32),
             ).bitcast(fx.Int64)
             wa = wts[cc].bitcast(fx.Int64)
             for h in range_constexpr(2):
@@ -595,7 +590,7 @@ K1_ARGS = (
 )  # fmt: skip
 
 
-@traced
+@flyc.jit
 def emit_k1(
     tid, bid, lane, wave, x8, red, qs, stamp, layer, eps, index_scale, tokens,
     q_len, init_blocks, local_blocks, heads, ptrs, bt_width, signal=False, diag=None,
@@ -662,11 +657,9 @@ def emit_k1(
         """This lane's MFMA B operand of token tk's index q of head ``head``,
         k-chunk s."""
         row = (tk * heads.count + head) * (HEAD_DIM // 2)
-        return fx.Vector(
-            fx.ptr_load(
-                qs + (row + (32 * s + 8 * (lane // 16)) // 2),
-                result_type=fx.Vector.make_type(4, fx.Float32),
-            )
+        return fx.ptr_load(
+            qs + (row + (32 * s + 8 * (lane // 16)) // 2),
+            result_type=fx.Vector.make_type(4, fx.Float32),
         ).bitcast(fx.BFloat16)
 
     def q_frag(tk, s):

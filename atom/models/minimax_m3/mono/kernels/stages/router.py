@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K4 stages: the router GEMV (and the MXFP8 operand helpers the experts share)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -25,14 +26,13 @@ from atom.mono.device.ops import (
     hw_rcp,
     hw_rsq,
     rsrc,
-    traced,
     wave_sum,
 )
 from atom.mono.device.sync import preg, publish
 from atom.mono.plan.execution import THREADS, WAVES
 
 
-@traced
+@flyc.jit
 def router_defs(k4ctx):
     """The functions of the router GEMV (and the MXFP8 operand helpers the experts
     share)."""
@@ -143,9 +143,9 @@ def router_defs(k4ctx):
         fp8 k 16 g .. + 16 then 64 + 16 g .. + 16 (g = lane // 16), the
         f8f6f4 MFMA's B layout (harness/mfma_f4f8_probe.py)."""
         h = [
-            fx.Vector(
-                fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f)
-            ).bitcast(fx.Int32)
+            fx.ptr_load(xs + (chunk_word + 16 * j + 4 * g4), result_type=v4f).bitcast(
+                fx.Int32
+            )
             for j in range(2)
         ]
         return fx.Vector.from_elements(
@@ -277,9 +277,9 @@ def router_defs(k4ctx):
             # 12-long chains instead of one 96-long FMA chain behind 192 widenings
             accs = [fx.Float32(0.0) for _ in range(4)]
             for i in range_constexpr(HIDDEN // 512):
-                xv = fx.Vector(
-                    fx.ptr_load(xs + (i * 64 + lane) * 4, result_type=v4f)
-                ).bitcast(fx.Int32)
+                xv = fx.ptr_load(xs + (i * 64 + lane) * 4, result_type=v4f).bitcast(
+                    fx.Int32
+                )
                 for j in range_constexpr(4):
                     accs[j] = fx.Float32(
                         rocdl.fdot2_f32_bf16(

@@ -45,7 +45,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
 )
 from atom.models.kimi_k3.mono.kernels.stages import gemv
 from atom.models.kimi_k3.mono.kernels.stages import moe as k2b
-from atom.mono.device.ops import load_ptr64, traced
+from atom.mono.device.ops import load_ptr64
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
@@ -149,7 +149,7 @@ def scratch_bytes(key: K2Build) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
-@traced
+@flyc.jit
 def stage_oproj(c, gi):
     """o_proj tasks gi, gi + 200, gi + 400 (< 448): every task's weights in
     flight at once (one memory latency, not three), then the MFMAs."""

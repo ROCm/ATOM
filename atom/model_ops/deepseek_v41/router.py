@@ -35,7 +35,6 @@ from atom.mono.device.ops import (
     mfma_bf16,
     row_sum,
     rsrc,
-    traced,
 )
 from atom.mono.plan.execution import THREADS, WAVES
 
@@ -47,7 +46,7 @@ PARTS = 4  # contiguous K parts of a tile, summed in order
 _CURRENT_STREAM = fx.Stream(None)
 
 
-@traced
+@flyc.jit
 def router_tile(x, w, task, part, s, lane, wave, red):
     """Wave ``wave``'s partial of rows 16 task .., K part ``part``, for the s
     tokens of ``x`` (raw bf16 pointers) -> red[wave][lane] (4 f32: rows

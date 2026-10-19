@@ -9,6 +9,7 @@ down_proj, ``fused_allreduce_gemma_rms_norm_quant`` (scale = amax / FP8_MAX, a
 true divide) in front of gate_up, ``gemm_a8w8_bpreshuffle``'s bf16(acc * x_scale *
 w_scale), and Triton's ``_swiglu_oai_kernel``."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -40,7 +41,6 @@ from atom.mono.device.ops import (
     row_sum,
     rows_to_lds,
     rsrc,
-    traced,
     wave_max,
     wave_sum,
 )
@@ -53,7 +53,7 @@ DE = 8  # a down thread's mid elements of a token (DENSE_INTER // DE threads)
 MID_GROUP = 4  # tokens whose mids a down task holds at once
 
 
-@traced
+@flyc.jit
 def dense_mlp_defs(dctx):
     """The dense layer's stages after the attention."""
     AG_RS = dctx["AG_RS"]
@@ -277,11 +277,9 @@ def dense_mlp_defs(dctx):
                 c = fx.Vector.filled(4, 0.0, fx.Float32)
                 for cc in range_constexpr(UG_CPW):
                     kc = wave * UG_CPW + cc
-                    xb = fx.Vector(
-                        fx.ptr_load(
-                            xs + (col_tok * DX_ROW + kc * 16 + g4 * 4),
-                            result_type=v4f,
-                        )
+                    xb = fx.ptr_load(
+                        xs + (col_tok * DX_ROW + kc * 16 + g4 * 4),
+                        result_type=v4f,
                     ).bitcast(fx.Int64)
                     wa = wts[g_ * UG_CPW + cc].bitcast(fx.Int64)
                     for h in range_constexpr(2):
@@ -420,16 +418,14 @@ def dense_mlp_defs(dctx):
             # chunks kc, kc + 1 in one 16x16x128 FP8 MFMA (unit scales), as o_proj
             for p in range_constexpr(DN_CPW // 2):
                 xb = [
-                    fx.Vector(
-                        fx.ptr_load(
-                            xs
-                            + (
-                                col_tok * DMID_ROW
-                                + ((wave % 4) * DN_CPW + 2 * p + h) * 16
-                                + g4 * 4
-                            ),
-                            result_type=v4f,
-                        )
+                    fx.ptr_load(
+                        xs
+                        + (
+                            col_tok * DMID_ROW
+                            + ((wave % 4) * DN_CPW + 2 * p + h) * 16
+                            + g4 * 4
+                        ),
+                        result_type=v4f,
                     ).bitcast(fx.Int32)
                     for h in range(2)
                 ]

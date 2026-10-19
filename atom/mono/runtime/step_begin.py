@@ -31,7 +31,6 @@ from atom.mono.device.ops import (
     load_ptr64,
     memrealtime,
     rsrc,
-    traced,
 )
 from atom.mono.device.sync import DIAG_TICKS
 from atom.mono.plan.build_key import key_tuple, source_digest
@@ -69,7 +68,7 @@ def _words(v):
     )
 
 
-@traced
+@flyc.jit
 def _zero(base, nbytes, first, stride, cm=0):
     """``nbytes`` at ``base`` zeroed, 16 B a store, the grid's lanes from
     ``first`` by ``stride``."""
@@ -81,7 +80,7 @@ def _zero(base, nbytes, first, stride, cm=0):
         i = i + stride
 
 
-@traced
+@flyc.jit
 def _wait_arrived(state, e):
     """Until every other CTA flagged epoch ``e`` (lane l: CTAs 4 l ..)."""
     lane = fx.thread_idx.x
@@ -104,7 +103,7 @@ def _wait_arrived(state, e):
         rocdl.s_sleep(1)
 
 
-@traced
+@flyc.jit
 def _fence(peers, fence_off, rank, state, e, tp, debug):
     """Epoch ``e`` into this rank's slot at every rank, then this rank's slots
     polled (lane p: source rank p's) until every one reaches it. A debug build

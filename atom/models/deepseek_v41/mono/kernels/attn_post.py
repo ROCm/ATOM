@@ -106,7 +106,6 @@ from atom.mono.device.ops import (
     launcher,
     ld_i32,
     row_sum,
-    traced,
     xshfl,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
@@ -222,7 +221,7 @@ def attn_region_pair(src, t, s, col):
 
 
 # ---------------------------------------------------------------- irq
-@traced
+@flyc.jit
 def stage_attn_irq(c, task, groups):
     """Token t, ``groups`` column groups of 32 of a head tile's heads
     (``tile_task``): the decode attention's PV and combine (``stage_attn_pv``),
@@ -259,7 +258,7 @@ def irq_rope_loads(c, t, dcs):
     return out
 
 
-@traced
+@flyc.jit
 def irq_group(c, t, tile, dc, out, rope):
     """Token t, columns 32 dc .. of a head tile's heads (PV out [head][column]
     at ``out``, the dims' ``rope`` (cos, sin): ``irq_rope_loads``) -> inverse
@@ -295,7 +294,7 @@ def irq_group(c, t, tile, dc, out, rope):
         )
 
 
-@traced
+@flyc.jit
 def load_rows(
     c, words_mb, codes_mb, stride_w, off_w, words, stride_g, off_g, groups, xl, xsl,
     t0=0, n=None,
@@ -331,7 +330,7 @@ def load_rows(
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_woa(c, task, ops, t0=0, n=None):
     """Rows 32 task .. of wo_a (two tiles, ``woa_loads``' operands) -> bf16 ->
     ATOM ``quantize_fp8`` of the 32 (one group: amax floored 1e-4, the ceil
@@ -372,7 +371,7 @@ def stage_woa(c, task, ops, t0=0, n=None):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def woa_tile(c, task, ops, t0, n):
     """wo_a task ``task`` (``woa_loads``' ``ops``) on tokens t0 .. t0 + n: its
     group's attention output rows into LDS, then ``stage_woa``."""
@@ -400,7 +399,7 @@ def wob_loads(c, task):
     return gemv_fp8_loads(c, a["wob"], a["wob_s"], c["d"].o_rows, task)
 
 
-@traced
+@flyc.jit
 def stage_wob(c, task, ops, t0=0, n=None):
     """Rows 16 task .. of wo_b (``wob_loads``' operands) -> this rank's bf16
     partial, pushed to every rank (token parallel: to the token's owner); the
@@ -432,7 +431,7 @@ def stage_wob(c, task, ops, t0=0, n=None):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_reduce(c, task):
     """The attention output at this slice's 32 columns: the TP ranks' partials
     in the all-reduce's order (``sum_partials``), in fp32 -> bf16 ->
@@ -443,7 +442,7 @@ def stage_reduce(c, task):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def reduce_attn_pair(c, task, idx):
     """Thread ``idx``'s column pair of token idx / 16 (``stage_reduce``)."""
     s = c["S"]
@@ -559,7 +558,7 @@ def attn_post_context(key, s, lds, mb, bases, layout, scratch, args, rank, sym):
     return c
 
 
-@traced
+@flyc.jit
 def run_attn_post(c, key, bid, tls, tl0, after_norm=None, gates=True):
     """K2a's stages, in order; ``timeline`` stamps from point ``tl0`` + 1.
     ``after_norm(t)``: once token t's ``normed`` row is written (a launch that
@@ -662,7 +661,7 @@ def run_attn_post(c, key, bid, tls, tl0, after_norm=None, gates=True):
         stamp(timeline, tls, tid, tl0 + 8)
 
 
-@traced
+@flyc.jit
 def run_gates(c, key, bid):
     """The FFN seam's gates (``stage_gate``) -> the next layer's post / comb /
     pre: nothing in this launch waits on them."""

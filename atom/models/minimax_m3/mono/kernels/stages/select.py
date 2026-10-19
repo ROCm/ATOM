@@ -3,6 +3,7 @@
 """K4 stages: the indexer's top-k selection (every block ranked, or a long context's
 shares)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -23,11 +24,7 @@ from atom.models.minimax_m3.mono.layout import (
     PAGES_PER_BLOCK,
     SPARSE_TABLE_WORDS,
 )
-from atom.mono.device.ops import (
-    rsrc,
-    traced,
-    unlikely,
-)
+from atom.mono.device.ops import rsrc, unlikely
 from atom.mono.device.select import (
     BATCH,
     KEY_LEAST,
@@ -41,7 +38,7 @@ from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import THREADS, WAVES
 
 
-@traced
+@flyc.jit
 def select_defs(k4ctx):
     """The functions of the indexer's top-k selection (every block ranked, or a long
     context's shares)."""

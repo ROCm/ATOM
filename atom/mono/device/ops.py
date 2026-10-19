@@ -16,7 +16,7 @@ Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
 ``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
 for ``make_buffer_tensor``); raw MFMA intrinsics (hand-laid operands: permlane
 transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
-``s_memrealtime``, the approximate rsq / rcp / exp2) and the struct unpacking of
+``s_memrealtime``, ``writelane``) and the struct unpacking of
 ``permlane*_swap``.
 """
 
@@ -29,9 +29,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
@@ -95,9 +93,7 @@ def permlane_swap(off, x, y):
 
 def lane_gather(v, src_lane):
     """Lane ``src_lane``'s value of v, a source lane a lane (ds_bpermute)."""
-    return fx.Int32(
-        rocdl.ds_bpermute(T.i32, fx.Int32(src_lane) * 4, fx.Int32(v).ir_value())
-    )
+    return fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(src_lane) * 4, fx.Int32(v)))
 
 
 def readlane(v, src_lane):
@@ -118,7 +114,7 @@ def unlikely(cond):
     never runs (the long-context selection: S = 16, 3k context +1.4 us)."""
     return fx.Boolean(
         llvm.call_intrinsic(
-            ir.IntegerType.get_signless(1),
+            fx.Boolean.ir_type,
             "llvm.expect.i1",
             [as_ir_value(cond), as_ir_value(fx.Boolean(False))],
             [],
@@ -141,26 +137,24 @@ def fresh(v):
 
 
 def uniform(v):
-    return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v).ir_value()))
-
-
-def _hw_f32(name, x):
-    return fx.Float32(
-        llvm.call_intrinsic(T.f32, name, [fx.Float32(x).ir_value()], [], [])
-    )
+    return fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(v)))
 
 
 def hw_rsq(x):
     """v_rsq_f32 (~1 ulp, no libm range fixups)."""
-    return _hw_f32("llvm.amdgcn.rsq.f32", x)
+    return fx.Float32(rocdl.rsq(T.f32, fx.Float32(x).ir_value()))
 
 
 def hw_rcp(x):
-    return _hw_f32("llvm.amdgcn.rcp.f32", x)
+    return fx.Float32(rocdl.rcp(T.f32, fx.Float32(x)))
 
 
 def hw_exp2(x):
-    return _hw_f32("llvm.amdgcn.exp2.f32", x)
+    return fx.Float32(rocdl.exp2(T.f32, fx.Float32(x).ir_value()))
+
+
+def hw_log2(x):
+    return fx.Float32(rocdl.log(T.f32, fx.Float32(x).ir_value()))
 
 
 def div_rn(x, d, r):
@@ -168,7 +162,7 @@ def div_rn(x, d, r):
     ``r = 1.0 / d`` from one true division per divisor (Markstein: a quotient
     within 1 ulp plus its exact fma residual times RN(1/d) rounds correctly)."""
     q = x * r
-    return fx.Float32(fmath.fma(fx.Float32(fmath.fma(-q, d, x)), r, q))
+    return fmath.fma(fmath.fma(-q, d, x), r, q)
 
 
 def xshfl(v, off):
@@ -223,17 +217,11 @@ def wave_sum(v):
     return butterfly(v, (32, 16, 8, 4, 2, 1))
 
 
-def traced(fn):
-    """Apply flydsl's AST rewriting to a helper, so its ``while`` / ``if`` over
-    traced values lower to scf ops. Kernels rewrite only their own body."""
-    return ASTRewriter.transform(fn)
-
-
 def wave_max(v):
-    return butterfly(v, (32, 16, 8, 4, 2, 1), fx.max)
+    return fx.coop.warp_reduce(v, fx.ReductionOp.MAX, width=64)
 
 
-@traced
+@flyc.jit
 def block_max(v, lane, wave, red):
     """Max of v over the CTA's WAVES waves; ``red`` needs WAVES words."""
     wv = wave_max(v)
@@ -273,7 +261,7 @@ def wave_incl_scan(v, lane):
     return v
 
 
-@traced
+@flyc.jit
 def block_excl_scan(v, lane, wave, buf):
     """(exclusive prefix of v over the CTA in thread order, CTA total); ``buf``
     needs WAVES words."""
@@ -295,12 +283,11 @@ def global_load(addr, words=1, nt=False):
     """``words`` i32 (1, 2 or 4) at the 64-bit global address ``addr``. A pool
     past 4 GiB is reached only this way: a buffer load's offset (index x stride
     included) is 32 bits. ``nt``: nontemporal."""
-    i32 = ir.IntegerType.get_signless(32)
-    ty = i32 if words == 1 else ir.VectorType.get([words], i32)
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr)))
-    return llvm.LoadOp(
-        ty, ptr.result, alignment=4 * words, nontemporal=nt or None
-    ).result
+    ptr = fx.inttoptr(
+        fx.Pointer[fx.Int32, fx.AddressSpace.Global, 4 * words].ir_type,
+        fx.Int64(addr),
+    )
+    return fx.generic_load(ptr, count=words, nontemporal=nt)
 
 
 def ld_i32(ptr, i):
@@ -333,7 +320,7 @@ def first_rounds(tid, n, load, batch=LOAD_BATCH):
     return [load(fx.min(tid + THREADS * i, n - 1)) for i in range(min(batch, rounds))]
 
 
-@traced
+@flyc.jit
 def batched_rounds(tid, n, load, use, batch=LOAD_BATCH, first=None):
     """A CTA's strided loop over elements v = tid + THREADS i < n (n a Python
     int): ``load(v)`` of ``batch`` rounds issued before any ``use(v, loaded)``.
@@ -392,7 +379,7 @@ def mfma_fp8(a, b, c):
 
 def ballot(pred):
     """The wave's lanes where ``pred`` holds, a bit a lane."""
-    return fx.Int64(rocdl.ballot(T.i64, as_ir_value(pred)))
+    return fx.Int64(rocdl.ballot(T.i64, pred))
 
 
 def popcount(x):
@@ -516,28 +503,14 @@ def bpermute_i32(byte_offset, value):
     return fx.Int32(rocdl.ds_bpermute(T.i32, fx.Int32(byte_offset), fx.Int32(value)))
 
 
-def mem_realtime():
-    """Read the device-wide 64-bit realtime counter."""
-
-    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
-
-
-def _hardware_f32(name, value):
-    return fx.Float32(
-        llvm.call_intrinsic(T.f32, name, [fx.Float32(value).ir_value()], [], [])
-    )
-
-
-def rsq(value):
-    return _hardware_f32("llvm.amdgcn.rsq.f32", value)
-
-
-def rcp(value):
-    return _hardware_f32("llvm.amdgcn.rcp.f32", value)
+# GLM's names share the same hardware primitives as the other model kernels.
+mem_realtime = memrealtime
+rsq = hw_rsq
+rcp = hw_rcp
 
 
 def exp(value):
-    return _hardware_f32("llvm.amdgcn.exp2.f32", fx.Float32(value) * 1.4426950408889634)
+    return hw_exp2(fx.Float32(value) * 1.4426950408889634)
 
 
 def wave_umax(value):

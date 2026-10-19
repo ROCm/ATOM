@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K4 stages: the expert-grouped MoE (S > 4)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
@@ -48,7 +49,6 @@ from atom.mono.device.ops import (
     row_sum,
     rows_to_lds,
     rsrc,
-    traced,
     uniform,
     xshfl,
 )
@@ -57,7 +57,7 @@ from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 
 
-@traced
+@flyc.jit
 def moe_wide_defs(k4ctx):
     """The functions of the expert-grouped MoE (S > 4)."""
     BASE = k4ctx["BASE"]

@@ -8,13 +8,14 @@ stamp would sit on every later ``s_waitcnt vmcnt(0)``.
 ``on`` is the build's compile-time switch: off, every call traces to nothing.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr
 
-from atom.mono.device.ops import memrealtime, traced
+from atom.mono.device.ops import memrealtime
 
 
-@traced
+@flyc.jit
 def stamp_begin(on, tls, tid, points):
     """Zero the LDS record, then point 0."""
     if const_expr(on):  # noqa: SIM102
@@ -23,7 +24,7 @@ def stamp_begin(on, tls, tid, points):
     stamp(on, tls, tid, 0)
 
 
-@traced
+@flyc.jit
 def stamp(on, tls, tid, k):
     # compile-time gate outside, traced condition inside: they cannot be one `and`
     if const_expr(on):  # noqa: SIM102
@@ -31,7 +32,7 @@ def stamp(on, tls, tid, k):
             fx.ptr_store(memrealtime(), tls + k)
 
 
-@traced
+@flyc.jit
 def stamp_flush(on, tls, tl, tid, bid, points):
     """The CTA's record -> ``tl`` [CTA][points] int64."""
     if const_expr(on):  # noqa: SIM102

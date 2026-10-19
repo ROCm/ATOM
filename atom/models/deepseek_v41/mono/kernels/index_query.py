@@ -26,6 +26,7 @@ heads, as the original does.
             order and the weight rn(w x weights_scale)
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -45,7 +46,6 @@ from atom.mono.device.ops import (
     lane_gather,
     row_shr,
     rsrc,
-    traced,
 )
 from atom.mono.plan.execution import WAVES
 
@@ -78,7 +78,7 @@ def _wv_reduce(v, lane):
     return lane_gather(v.bitcast(fx.Int32), 63).bitcast(fx.Float32)
 
 
-@traced
+@flyc.jit
 def stage_iw(c, task, hidden, nbl, load_group):
     """Row ``task`` of weights_proj; wave w its tokens w, w + WAVES, ..., a group
     of WAVES tokens' normed rows at a time in LDS ``nbl`` (bf16 pairs,
@@ -118,11 +118,9 @@ def stage_iw(c, task, hidden, nbl, load_group):
             k = ks[i] + lane * 8
             live = k < hidden
             kk = fx.min(k, hidden - 8)
-            xv = fx.Vector(
-                fx.ptr_load(
-                    nbl + ((tl * hidden + kk) // 2),
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xv = fx.ptr_load(
+                nbl + ((tl * hidden + kk) // 2),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             wv = wvs[i]
             ax = [bf_lo(xv[j]) for j in range(4)]
@@ -132,8 +130,8 @@ def stage_iw(c, task, hidden, nbl, load_group):
             accx = ax[0] * bx[0]
             accy = ay[0] * by[0]
             for j in range_constexpr(1, 4):
-                accx = fx.Float32(fmath.fma(ax[j], bx[j], accx))
-                accy = fx.Float32(fmath.fma(ay[j], by[j], accy))
+                accx = fmath.fma(ax[j], bx[j], accx)
+                accy = fmath.fma(ay[j], by[j], accy)
             total = fx.Float32(live.select(total + (accx + accy), total))
         w = _wv_reduce(total, lane)
         if (lane == 0) & (wave < n):
@@ -155,7 +153,7 @@ def poll_query(c, t, h, lane):
     return c["poll"]([q, w])
 
 
-@traced
+@flyc.jit
 def stage_iquant(c, task):
     """Token task // 32, head task % 32: a wave, 2 dims a lane (wave 0)."""
     lane, wave = c["lane"], c["wave"]
@@ -209,7 +207,7 @@ def _e2m1(x):
     return code | (sign << 3)
 
 
-@traced
+@flyc.jit
 def stage_iquant_fp4(c, task):
     """``stage_iquant`` on the FP4 plane: token task // 32, head task % 32, a
     wave (wave 0), 2 dims a lane and a 32-dim group 16 lanes. ``quantize_fp4``

@@ -13,11 +13,12 @@ winners. Four 8-bit radix passes find the k-th key; integer counts, so the
 answer does not depend on arrival order.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
-from atom.mono.device.ops import block_excl_scan, traced, wave_incl_scan, wave_max
+from atom.mono.device.ops import block_excl_scan, wave_incl_scan, wave_max
 from atom.mono.plan.execution import THREADS, WAVES
 
 PER_THREAD = 64  # the largest a CTA's LDS takes alone: 32768 keys
@@ -54,7 +55,7 @@ def _no_extra():
     return None
 
 
-@traced
+@flyc.jit
 def lds_topk(n, k, load, emit, lds, tid, per_thread=PER_THREAD, after_keys=None):
     """Top ``k`` of ``n`` <= THREADS x per_thread values, given a quad at a
     time: ``load(q, i)`` -> the 4 values (fp32 bits as Int32) at indices i ..

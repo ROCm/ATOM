@@ -55,7 +55,6 @@ from atom.mono.device.ops import (
     mfma_bf16,
     row_sum,
     rsrc,
-    traced,
     uniform,
     wave_max,
 )
@@ -271,7 +270,7 @@ def sum_polled(vals):
 
 
 # ---------------------------------------------------------------- attn CTAs
-@traced
+@flyc.jit
 def stage_slice(c, task):
     """Columns 128 task ..: every token's sources into LDS ``vals`` (4 columns a
     thread), the prefix (+ delta) rounded to bf16 and stored back, per-(token,
@@ -355,7 +354,7 @@ def stage_slice(c, task):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_gate(c, t):
     """Token t: the 56 slices' partials -> source weights e_s and their sum."""
     s, ns, tid, lane, wave, red = (
@@ -395,7 +394,7 @@ def stage_gate(c, t):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_mix(c, task):
     """Columns 128 task ..: the softmax mix of ``vals`` (4 columns a thread), its
     sum of squares (MSQ), every slice's -> rstd, then bf16 x = mixed rstd w ->
@@ -482,7 +481,7 @@ def gemv_loads(c, rg, chunks):
     return out
 
 
-@traced
+@flyc.jit
 def await_x(c):
     """Every slice's x ready. Hoisted out of the staging so that slabbing it
     does not re-poll the same mailboxes once a slab."""
@@ -491,7 +490,7 @@ def await_x(c):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def load_x(c, i0: int, ni: int):
     """Column groups ``i0 .. i0 + ni`` of every token's bf16 x row into LDS.
 
@@ -521,7 +520,7 @@ def load_x(c, i0: int, ni: int):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def gemv_slab(c, ops, ni: int, acc):
     """``acc`` advanced by this slab's ``ni`` column groups of rows 16 rg ...
 
@@ -536,11 +535,9 @@ def gemv_slab(c, ops, ni: int, acc):
     for j in range_constexpr(ni):
         k = wave * KCH + j * KGROUP + g * 8
         for q in range_constexpr(4):
-            xb = fx.Vector(
-                fx.ptr_load(
-                    c["xl"] + (t * row + k + 32 * q) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xb = fx.ptr_load(
+                c["xl"] + (t * row + k + 32 * q) // 2,
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             acc = mfma_bf16(
                 ops[j][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
@@ -548,7 +545,7 @@ def gemv_slab(c, ops, ni: int, acc):
     return acc
 
 
-@traced
+@flyc.jit
 def gemv_finish(c, rg, acc):
     """A finished accumulator reduced across waves -> bf16 PROJ (and proj_dbg)."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
@@ -627,7 +624,7 @@ def kda_stage(c, req, h, ch):
     return k
 
 
-@traced
+@flyc.jit
 def kda_conv(c, k, req, h, ch):
     """Owned channels: the spec conv update of request ``req``'s L tokens -> new
     conv state; q / k out through QK, v to LDS."""
@@ -672,7 +669,7 @@ def kda_conv(c, k, req, h, ch):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def kda_gates(c, k, req, h):
     """f_a, beta and the head's q / k (one poll batch a thread); g1 = f_b f_a by
     MFMA (a wave 16 rows) -> lower-bound gate -> decay in LDS; q / k l2-normed
@@ -732,7 +729,7 @@ def kda_gates(c, k, req, h):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def kda_recur(c, k, req, h, ch):
     """State rows 16 ch .. of head h: the recurrence over the L tokens, a state
     written a token, bf16 outputs to LDS ``ol`` and their partial norms (ONRM)."""
@@ -772,7 +769,7 @@ def kda_recur(c, k, req, h, ch):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def kda_norm(c, req, h, ch):
     """Rows 16 ch ..: gated RMSNorm over the head's 128 (every chunk's partial)
     -> core_out."""
@@ -800,7 +797,7 @@ def kda_norm(c, req, h, ch):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def kda_tasks(c, on, tls):
     s, L, tid, bid = c["S"], c["L"], c["tid"], c["bid"]
     for task in range(first_task(bid, c["kda0"]), (s // L) * NH * NVCH, BLOCKS):

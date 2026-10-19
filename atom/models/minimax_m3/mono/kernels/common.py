@@ -7,6 +7,7 @@ order the original path's fused all-reduce + RMSNorm reduces
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
@@ -14,7 +15,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.mono.device.mx import FP8_MAX
-from atom.mono.device.ops import butterfly, hw_rcp, traced
+from atom.mono.device.ops import butterfly, hw_rcp
 
 
 def ld_bf16x4(r, k, cm=0):
@@ -54,7 +55,7 @@ def ar_pack_sumsq(vals):
     return acc
 
 
-@traced
+@flyc.jit
 def ar_block_sum(p0, p1, lane, wave, red):
     """Sum of the 768 per-pack partials of a 6144-wide bf16 row in the order the
     1-stage fused all-reduce + RMSNorm reduces them: 24 warps of 32, a 16..1
@@ -67,7 +68,7 @@ def ar_block_sum(p0, p1, lane, wave, red):
     return ar_block_sums([(p0, p1)], lane, wave, red)[0]
 
 
-@traced
+@flyc.jit
 def ar_block_sums(parts, lane, wave, red):
     """``ar_block_sum`` of several rows ``parts = [(p0, p1), ...]`` behind one set
     of barriers; ``red`` needs 24 words per row."""

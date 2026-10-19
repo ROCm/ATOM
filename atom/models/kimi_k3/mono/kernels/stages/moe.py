@@ -68,7 +68,6 @@ from atom.mono.device.ops import (
     popcount,
     row_sum,
     rsrc,
-    traced,
     uniform,
     wave_sum,
 )
@@ -312,7 +311,7 @@ def pk_fp4_bf16(old, word, scale, j):
 
 
 # ---------------------------------------------------------------- early
-@traced
+@flyc.jit
 def early_out(c, kind, i, q, red):
     """Task (i, q) of ``kind`` (0 router, 1 latent, 2 sgu): its 16 rows. A K-split
     kind's parts q > 0 publish fp32 partials; part 0 adds them in part order and
@@ -391,7 +390,7 @@ def early_loads(c, kind, i, q):
     ]
 
 
-@traced
+@flyc.jit
 def early_compute(c, kind, i, q, ops):
     """Early task (i, q): x's K slice (the input row, or -- ``xflags`` -- the
     row this launch's AttnRes stage publishes) against ``ops`` -> ``early_out``.
@@ -410,7 +409,7 @@ def early_compute(c, kind, i, q, ops):
         gpu.barrier()
     acc = None
     # ``range_constexpr`` + indexing, not ``enumerate``: this body is
-    # AST-rewritten (``@traced``), and a ``for`` over an arbitrary Python
+    # AST-rewritten (``@flyc.jit``), and a ``for`` over an arbitrary Python
     # iterable with tuple unpacking is not a form the rewriter is meant to see.
     for sl in range_constexpr(len(plan)):
         k0 = plan[sl][0]
@@ -429,7 +428,7 @@ def early_compute(c, kind, i, q, ops):
     early_out(c, kind, i, q, red)
 
 
-@traced
+@flyc.jit
 def stage_early(c, bid):
     """K2b alone: CTA bid's early task (router parts, latent parts, sgu)."""
     lb = bid - R_TASKS
@@ -462,7 +461,7 @@ def _okey(v):
     return fx.Uint32(neg.select(~b, b ^ fx.Int32(-2147483648)))
 
 
-@traced
+@flyc.jit
 def stage_route(c, t):
     """Token t (wave 0): 896 logits, 14 a lane (expert lane + 64 i) -> sigmoid
     (v_rcp) + bias -> the top-16 by a radix select (the 16th largest key by a
@@ -555,7 +554,7 @@ def bo_ld_f32(ptr, i):
     return fx.Float32(bo.buffer_load(rsrc(ptr), i, vec_width=1, dtype=T.f32))
 
 
-@traced
+@flyc.jit
 def load_route(c):
     """ROUTE -> LDS (ids, weights); the union U: slot_of[e], expert_of[slot],
     kof[slot][t] (the token's top-k index, -1 if not picked); returns |U|."""
@@ -605,7 +604,7 @@ def load_route(c):
     return uniform(tot)
 
 
-@traced
+@flyc.jit
 def load_latq(c):
     """LAT (every rank's 448 columns) -> MXFP4 as aiter's inline quant: a
     thread a (token, 32-block): amax of |bf16| bits, the ceil code of amax / 6,
@@ -677,7 +676,7 @@ def ug_loads(c, task):
     return av + sw
 
 
-@traced
+@flyc.jit
 def stage_ug(c, task, ops):
     """Slot task / 12, 32-column group task % 12: gate rows 32 g .. and up rows
     384 + 32 g .. of the slot's expert (``ops``: ``ug_loads``) against the MXFP4
@@ -698,11 +697,9 @@ def stage_ug(c, task, ops):
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for i in range_constexpr(len(steps) if c["xp"] != 2 else 0):
         st = steps[i]
-        bw = fx.Vector(
-            fx.ptr_load(
-                c["latq"] + (t * (LAT // 8) + st * 16 + kb * 4),
-                result_type=fx.Vector.make_type(4, fx.Int32),
-            )
+        bw = fx.ptr_load(
+            c["latq"] + (t * (LAT // 8) + st * 16 + kb * 4),
+            result_type=fx.Vector.make_type(4, fx.Int32),
         )
         sb = fx.ptr_load(c["latsc"] + (t * (LAT // 32) + st * 4 + kb))
         # the code's byte (st % 2) 2 + rg % 2 of the word; rg % 2 is the wave's
@@ -756,7 +753,7 @@ def stage_ug(c, task, ops):
 
 
 # ---------------------------------------------------------------- down
-@traced
+@flyc.jit
 def load_inter(c):
     """Every pick's INTER words and ISC codes -> LDS."""
     s, tid = c["S"], c["tid"]
@@ -825,7 +822,7 @@ def down_loads(c, rgd, nu, b0):
     return av + sa
 
 
-@traced
+@flyc.jit
 def stage_down(c, rgd, nu, ops0):
     """Latent rows 16 rgd ..: every slot's w2 against its picks (wave w the slots
     w, w + 8, ...; a batch of DOWN_BATCH in flight, the next issued under this
@@ -852,16 +849,12 @@ def stage_down(c, rgd, nu, ops0):
             # this slot's picks' INTER, polled here (not all of U first): a slot
             # whose ug tasks are done is multiplied while later ones still run
             for st in range_constexpr(W2_STEPS):
-                bw = fx.Vector(
-                    fx.ptr_load(
-                        c["interq"] + (pick * 48 + st * 16 + kb * 4),
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
+                bw = fx.ptr_load(
+                    c["interq"] + (pick * 48 + st * 16 + kb * 4),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
                 )
                 scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
-                bw = fx.Vector.from_elements(
-                    [picked.select(bw[d], fx.Int32(0)) for d in range(4)], fx.Int32
-                )
+                bw = picked.select(bw, fx.Vector.filled(4, 0, fx.Int32))
                 sb = picked.select(scode, fx.Int32(UNIT_SCALE))
                 acc = mfma_scaled(
                     ops[j * W2_STEPS + st],
@@ -910,7 +903,7 @@ def stage_down(c, rgd, nu, ops0):
 
 
 # ---------------------------------------------------------------- shared down
-@traced
+@flyc.jit
 def stage_h(c, t):
     """Token t's shared h = SiTU(g, u) (vLLM's situ_and_mul, bf16) of SGU, once
     -> H; a thread a column pair, its polls in one batch."""
@@ -929,7 +922,7 @@ def stage_h(c, t):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def load_h(c):
     """H -> LDS rows (for the shared down GEMV), once a CTA."""
     s, tid = c["S"], c["tid"]
@@ -946,7 +939,7 @@ def load_h(c):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_sdown(c, j, ops):
     """Shared down rows 16 j .. (K 768) against h in LDS (``load_h``): bf16
     partial -> SHP (this rank's up columns) or every rank's FINAL."""
@@ -991,7 +984,7 @@ def stage_sdown(c, j, ops):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def run_sdown(c, bid, w_sd):
     """This rank's 56 shared-down tasks whose columns the up stage adds to (k ->
     row group (k + 56 rank) % 448), on the CTAs past the down tasks: up waits
@@ -1004,7 +997,7 @@ def run_sdown(c, bid, w_sd):
             stage_sdown(c, j, gemv.loads(c["lane"], c["wave"], w_sd, j * ROWS, SI))
 
 
-@traced
+@flyc.jit
 def run_sdown_rest(c, bid, w_sd):
     """The other 392 shared-down tasks (only the final reduce waits on them), on
     the CTAs past lnorm / up's (84 ..), after their down: off the latent-norm ->
@@ -1019,7 +1012,7 @@ def run_sdown_rest(c, bid, w_sd):
 
 
 # ---------------------------------------------------------------- lnorm / up / reduce
-@traced
+@flyc.jit
 def stage_lnorm(c, j):
     """Columns 128 j ..: the ranks' LATR (rank order, fp32 -> bf16), every
     task's sum of squares -> rstd -> bf16(acc rstd w) -> LN, LNRDY.
@@ -1079,7 +1072,7 @@ def stage_lnorm(c, j):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_up(c, j):
     """This rank's up rows 16 j .. of its shard (hidden rows 896 rank ..): LN GEMV
     + SHP -> bf16 -> FINAL."""
@@ -1120,7 +1113,7 @@ def stage_up(c, j):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_reduce(c, j):
     """Columns 128 j ..: FINAL in rank order -> bf16 out.
 

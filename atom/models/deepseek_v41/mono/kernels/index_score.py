@@ -31,6 +31,7 @@ through global memory at device scope (SC1: past the per-XCD L2): stored,
 several chunks a task.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -41,16 +42,7 @@ from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.models.deepseek_v41.mono.kernels.index_score_fp4 import run_scores4
 from atom.models.deepseek_v41.mono.kernels.topk import key_bits, lds_topk
 from atom.models.deepseek_v41.mono.step_meta import KMETA
-from atom.mono.device.ops import (
-    CM_DEV,
-    butterfly,
-    ld_dev,
-    ld_i32,
-    mfma_fp8,
-    rsrc,
-    traced,
-    xred,
-)
+from atom.mono.device.ops import CM_DEV, butterfly, ld_dev, ld_i32, mfma_fp8, rsrc, xred
 from atom.mono.device.sync import publish
 from atom.mono.plan.arith import pick, sel
 from atom.mono.plan.execution import BLOCKS, THREADS, first_task
@@ -86,7 +78,7 @@ def _head_sum(terms):
     (s0 + s2) + (s1 + s3); lane groups xor 32, then xor 16."""
     rw = [terms[k // 4, k % 4] for k in range(8)]
     firsts = [
-        fx.Float32(fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1]))
+        fmath.fma(rw[a][0], rw[a][1], rw[b][0] * rw[b][1])
         for a, b in ((0, 2), (1, 3), (4, 6), (5, 7))
     ]
     v = (firsts[0] + firsts[2]) + (firsts[1] + firsts[3])
@@ -130,11 +122,9 @@ def _chunk_keys(a, t, ch0, width, wave, lane):
             fx.ptr_load(_plane_ptr(a["plane"], tile, TILE * ip.DIM + r8 * 4))
         ).bitcast(fx.Float32)
         kv = [
-            fx.Vector(
-                fx.ptr_load(
-                    _plane_ptr(a["plane"], tile, ((4 * p + j) * TILE + r8) * 16),
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            fx.ptr_load(
+                _plane_ptr(a["plane"], tile, ((4 * p + j) * TILE + r8) * 16),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             for p in range(2)
         ]
@@ -181,7 +171,7 @@ def _token_query(a, t, lane):
     return query
 
 
-@traced
+@flyc.jit
 def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
     """Token t's scores (``bound`` its columns, ``blocks`` its candidate
     blocks) of the tile holding ``blk``, and its block's best on a candidate
@@ -214,7 +204,7 @@ def _score_chunk(c, t, bound, blocks, query, blk, ks, b64):
             _st_dev(best, a["ibmax"], t * a["bstride"] + blk)
 
 
-@traced
+@flyc.jit
 def stage_iscore(c, lead, span, ch0, width, max_chunks):
     """Chunks [ch0, ch0 + width) of the ``span`` tokens from ``lead``, which
     read lead's tile table (``index_plan.score_tasks``): the keys loaded once,
@@ -238,7 +228,7 @@ def stage_iscore(c, lead, span, ch0, width, max_chunks):
     publish(c["put"], c["isf"], row * max_chunks + ch0 + m, 1, who)
 
 
-@traced
+@flyc.jit
 def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
     """List j of ``level`` for token t (``raw`` its column bound); see the
     module. Only the lists ``index_plan.list_count`` gives a token run."""
@@ -367,7 +357,7 @@ def _final(c, kind, t, pos, ident, rows=None):
         _st_dev(Int32(ident), a["icout"], t * ip.TOPK_BLOCKS + pos)
 
 
-@traced
+@flyc.jit
 def run_indexer(c, s, bid, bound_max):
     """Every indexer stage of a selecting layer, the tasks of each laid out from
     the step's bounds (``index_plan``): only live tasks. The bounds were written
@@ -384,7 +374,7 @@ def run_indexer(c, s, bid, bound_max):
         _run_tree(c, s, bid, "blk", bounds, bound_max, max_chunks)
 
 
-@traced
+@flyc.jit
 def run_scores(c, s, bid, bounds, max_chunks):
     """The score stage's tasks (``index_plan.score_tasks``). A request's tokens
     share its tile table (key metadata word 2: its block table offset); a
@@ -401,7 +391,7 @@ def run_scores(c, s, bid, bounds, max_chunks):
         stage_iscore(c, lead, pick(spans, lead), i << width_log2, width, max_chunks)
 
 
-@traced
+@flyc.jit
 def _run_tree(c, s, bid, kind, bounds, bound_max, max_chunks):
     k = ip.KINDS[kind]
     for level in range_constexpr(ip.top_level(kind, bound_max) + 1):
