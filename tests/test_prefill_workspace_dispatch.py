@@ -26,10 +26,10 @@ from atom.utils.forward_context import AttentionMetaData
 def layer(cls=PagedAttentionImpl):
     obj = cls.__new__(cls)
     torch.nn.Module.__init__(obj)
-    obj.gqa_prefill_kv_workspace_bytes = 1024
     obj.use_flash_layout = False
     obj._can_use_prefill_sink_asm = lambda *args: False
-    obj._prefill_attention = lambda *args: "dense"
+    obj.prefill_attention = lambda *args: "dense"
+    obj.prefill_attention_paged = lambda *args: "paged"
     obj.prefill_attention_triton = lambda *args: "paged"
     obj._dispatch_decode = lambda *args: lambda *args: "decode"
     obj._sparse_prefill = lambda *args: "sparse"
@@ -37,49 +37,45 @@ def layer(cls=PagedAttentionImpl):
 
 
 @pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("has_cached", [False, True])
 @pytest.mark.parametrize(
     "path", ["dense", "paged", "unified", "sink", "sparse", "decode"]
 )
-def test_grouping_follows_current_layer_dispatch(monkeypatch, is_draft, path):
+def test_cached_prefill_reads_pool_for_target_and_draft(
+    monkeypatch, is_draft, has_cached, path
+):
     monkeypatch.setattr(attention_mha.envs, "ATOM_USE_UNIFIED_ATTN", path == "unified")
-    called = []
-    monkeypatch.setattr(
-        attention_mha,
-        "run_grouped_prefill",
-        lambda *args: called.append(args) or "grouped",
-    )
     obj = layer(SparseMHAPagedAttentionImpl if path == "sparse" else PagedAttentionImpl)
     obj.use_flash_layout = path in ("paged", "sink")
     obj._can_use_prefill_sink_asm = lambda *args: path == "sink"
     ctx = SimpleNamespace(
         context=SimpleNamespace(is_prefill=path != "decode", is_draft=is_draft),
-        attn_metadata=AttentionMetaData(has_cached=True, max_seqlen_q=1),
+        attn_metadata=AttentionMetaData(has_cached=has_cached, max_seqlen_q=1),
     )
     q = torch.empty(2, 4, 8)
     backend = obj.dispatch_backend(ctx, q, q, q)
     result = backend(q, q, q, q, q, None, None, ctx)
-    expected = "grouped" if path in ("dense", "sink") else path
-    if path == "unified":
+    if path in ("sparse", "decode"):
+        expected = path
+    elif has_cached or path in ("paged", "unified"):
         expected = "paged"
+    else:
+        expected = "dense"
     assert result == expected
-    assert len(called) == (1 if expected == "grouped" else 0)
 
 
-@pytest.mark.parametrize("budget,has_cached", [(0, True), (1024, False)])
-def test_dense_fast_paths_do_not_group(monkeypatch, budget, has_cached):
-    monkeypatch.setattr(
-        attention_mha,
-        "run_grouped_prefill",
-        lambda *args: pytest.fail("fast path must not group"),
-    )
+@pytest.mark.parametrize("entry", ["prefill_attention", "prefill_attention_triton"])
+def test_cached_direct_entry_points_also_read_pool(entry):
     obj = layer()
-    obj.gqa_prefill_kv_workspace_bytes = budget
     ctx = SimpleNamespace(
         context=SimpleNamespace(is_prefill=True, is_draft=True),
-        attn_metadata=AttentionMetaData(has_cached=has_cached),
+        attn_metadata=AttentionMetaData(has_cached=True),
     )
     q = torch.empty(2, 4, 8)
-    assert obj.prefill_attention(q, q, q, q, q, None, None, ctx) == "dense"
+    assert (
+        getattr(PagedAttentionImpl, entry)(obj, q, q, q, q, q, None, None, ctx)
+        == "paged"
+    )
 
 
 def test_eagle_clears_prefill_snapshot_when_reusing_metadata_for_decode(monkeypatch):

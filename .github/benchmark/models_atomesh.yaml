@@ -1421,11 +1421,12 @@ models:
               <<: *minimax_m3_scatter_bounds_common_args
               max_num_batched_tokens: 8192
               decode_max_num_batched_tokens: 2048
+              extra_args: --index-cache-dtype fp8 --default-chat-template-kwargs {"thinking_mode":"enabled"} --timeout-keep-alive 900 --gqa-prefill-kv-workspace-mb 0
           prefill:
             workers: 1
             tp: 1
             cudagraph: none
-            extra_args: --pipeline-parallel-size 4 --enforce-eager --gqa-prefill-kv-workspace-mb 32768
+            extra_args: --pipeline-parallel-size 4 --enforce-eager --gqa-prefill-kv-workspace-mb 0
           decode:
             <<: *minimax_m3_scatter_bounds_decode
           env:
@@ -1440,7 +1441,7 @@ models:
               ATOM_MONO_ENABLE: '0'
               ATOM_PREFIX_CACHE_POLICY: slru
               ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
-              ATOM_AITER_SCATTER_REF: 5eb866a95d66a38d64eecf151ac4ef3567a07ac5
+              ATOM_AITER_SCATTER_REF: af88b4020521e25b677c5c6e5ff1d33d40395cb3
             prefill:
               HIP_VISIBLE_DEVICES: 0,1,2,3
               # M3 has 60 target layers; the final stage additionally owns EAGLE3.
@@ -1456,6 +1457,7 @@ models:
               MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
               MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
               ATOMESH_M3_STORE_FUNCTIONAL_CHECK: '1'
+              ATOMESH_PAGED_PREFILL_NUMERICAL_CHECK: '1'
               PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}'
             decode:
               HIP_VISIBLE_DEVICES: 4,5,6,7

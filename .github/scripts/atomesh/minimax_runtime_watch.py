@@ -252,6 +252,12 @@ def instrument_kv_pool(path):
 
 def instrument_gather(path):
     source = path.read_text()
+    if (
+        "def _gather_prefix_and_concat_kv(" not in source
+        and "def prefill_attention_paged(" in source
+    ):
+        # Direct-paged attention has no dense K/V allocation to instrument.
+        return
     old = """        k_full = torch.empty(
             (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
         )

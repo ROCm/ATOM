@@ -1888,6 +1888,15 @@ start_prefill() {
     echo "ERROR: LMCache memory must be prepared on the allocated host before container startup" >&2
     return 2
   fi
+  if [[ "${ATOMESH_PAGED_PREFILL_NUMERICAL_CHECK:-0}" == "1" && "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
+    # Run the pinned kernel's complete standalone numerical suite (including
+    # mixed lengths and GQA ratios up to 64) before any model allocation.
+    # set -o pipefail makes an incorrect/failed kernel stop the accuracy gate.
+    python3 "${scatter_source:?Pinned AITER source is required}/op_tests/triton_tests/attention/test_unified_attention_scale_cache.py" \
+      | tee "${RUNTIME_LOG_DIR}/paged-prefill-numerical.log"
+    python3 -m pytest -q tests/test_paged_prefill.py tests/test_prefill_workspace_dispatch.py \
+      | tee "${RUNTIME_LOG_DIR}/paged-prefill-adapter.log"
+  fi
   start_mooncake_store
   if [[ "${ATOMESH_M3_STORE_FUNCTIONAL_CHECK:-0}" == "1" && "${ATOMESH_EXECUTION_PHASE}" == "eval" ]]; then
     # Refuse a skipped GPU check: this phase is a correctness gate.

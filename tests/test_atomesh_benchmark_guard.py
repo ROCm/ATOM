@@ -322,7 +322,8 @@ class RuntimeWatchTests(unittest.TestCase):
             self.assertEqual(attention.read_text(), original_attention)
             instrumented = (runtime / "atom/model_ops/attention_mha.py").read_text()
             compile(instrumented, "attention_mha.py", "exec")
-            self.assertIn("k_full, v_full = empty_gather_kv(", instrumented)
+            self.assertEqual(instrumented, original_attention)
+            self.assertNotIn("empty_gather_kv(", instrumented)
             env = {
                 **os.environ,
                 "ATOM_CI_RUNTIME_DIAGNOSTICS": str(output),
