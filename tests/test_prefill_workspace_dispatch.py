@@ -15,6 +15,7 @@ import torch
 pytest.importorskip("aiter", reason="real attention/proposer imports require AITER")
 pytest.importorskip("triton", reason="real attention/proposer imports require Triton")
 
+from atom.model_engine.sequence import new_block_table
 from atom.model_ops import attention_mha
 from atom.model_ops.attention_mha import PagedAttentionImpl, SparseMHAPagedAttentionImpl
 from atom.model_ops.prefill_workspace import PrefillRequestLengths
@@ -142,7 +143,9 @@ def test_tbo_straddle_snapshot_matches_final_visible_context(monkeypatch, cached
     builder = SimpleNamespace(
         device=torch.device("cpu"),
         _tbo_prefill_state=SimpleNamespace(
-            cu_tokens=cu_q, num_cached=prefix, block_tables=[[0], [1], [2]]
+            cu_tokens=cu_q,
+            num_cached=prefix,
+            block_tables=[new_block_table([i]) for i in range(3)],
         ),
     )
     monkeypatch.setattr(
@@ -158,6 +161,7 @@ def test_tbo_straddle_snapshot_matches_final_visible_context(monkeypatch, cached
     assert ub.prefill_request_lengths == PrefillRequestLengths((0, 2, 6), expected_k)
     assert ub.cu_seqlens_k.tolist() == list(expected_k)
     assert ub.total_kv == expected_k[-1]
+    assert ub.block_tables.tolist() == [[1], [2]]
     assert ub.batch_id_per_k_token.tolist() == [0] * expected_k[1] + [1] * (
         expected_k[2] - expected_k[1]
     )

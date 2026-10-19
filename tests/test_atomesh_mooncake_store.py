@@ -6,7 +6,7 @@ prefill workers' mooncake_store offload env.
 
 No Mooncake process starts: a ``python3`` stub on PATH stands in for
 numa_exec.py (and so for mooncake_master / mooncake_client), drop_page_cache.py
-and numa_memory_budget.py, and a ``curl`` stub for the master's metadata and
+and prepare_lmcache_host_memory.py, and a ``curl`` stub for the master's metadata and
 metrics servers. The stub master listens on its RPC port, as the readiness
 check needs; each owner the stub starts adds its segment to the capacity the
 metrics stub reports. The stub also answers the image check's
@@ -58,7 +58,7 @@ PYTHON_STUB = textwrap.dedent("""\
         ;;
       # The page-cache dropper keeps its command line, as python3 would.
       *" --every "*) exec -a "$0 $*" sleep 60 ;;
-      *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
+      *"/prepare_lmcache_host_memory.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
     esac
     exit 0
     """)
@@ -281,18 +281,17 @@ stop_mooncake_store
 """,
             MOONCAKE_STORE_OWNERS="0:64;1:96",
         )
-        # The page cache goes before anything allocates, then the budget of the
-        # owners' pins.
-        drop, budget = [
-            line.split(" ", 1)[1]
-            for line in self.calls.read_text().splitlines()
-            if "drop_page_cache.py /" in line or "numa_memory_budget.py" in line
-        ]
-        self.assertTrue(drop.endswith("/scripts/drop_page_cache.py /models/m"), drop)
+        # Preparation must complete before the master or any owner starts.
+        calls = self.calls.read_text().splitlines()
+        (prep,) = [line for line in calls if "prepare_lmcache_host_memory.py" in line]
         self.assertIn(
-            "/scripts/numa_memory_budget.py --reserve-gib 128 --compact "
-            "--compact-timeout 600 0:64 1:96",
-            budget,
+            "--skip-direct --reserve-gib 128 --attempts 3 --step-timeout 90", prep
+        )
+        self.assertIn("--timeout 1200", prep)
+        self.assertTrue(prep.endswith("--pin 0:64 --pin 1:96 /models/m"), prep)
+        self.assertLess(
+            calls.index(prep),
+            next(i for i, c in enumerate(calls) if " mooncake_master " in c),
         )
         (master,) = self.store_calls("mooncake_master")
         self.assertIn("HIP=-1 QP=1 ", master)
@@ -330,8 +329,7 @@ stop_mooncake_store
             (64 * GIB, 96 * GIB),
         ):
             self.assertIn(
-                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1 BIND={HOST} "
-                "MR=68719476736 ",
+                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1 BIND={HOST} MR=68719476736 ",
                 call,
             )
             self.assertIn(f"/scripts/numa_exec.py {numa} mooncake_client ", call)
@@ -370,7 +368,8 @@ stop_mooncake_store
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers + """
+            servers
+            + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
@@ -694,11 +693,9 @@ stop_mooncake_store
         (budget,) = [
             line
             for line in self.calls.read_text().splitlines()
-            if "numa_memory_budget.py" in line
+            if "prepare_lmcache_host_memory.py" in line
         ]
-        self.assertIn(
-            "--reserve-gib 128 --compact --compact-timeout 600 0:96 0:96", budget
-        )
+        self.assertIn("--pin 0:96 --pin 0:96 /models/m", budget)
         owners = self.store_calls("mooncake_client")
         self.assertEqual(len(owners), 2)
         for device, pool in (("rdma0", 0), ("rdma1", 1)):
@@ -924,22 +921,23 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         result = self.run_shell(
             "start_mooncake_store\n", expect_rc=2, STUB_BUDGET_RC="2"
         )
-        self.assertIn("must fit their NUMA nodes", result.stderr)
+        self.assertIn("memory preparation did not complete", result.stderr)
+        self.assertEqual(self.store_calls("mooncake_client"), [])
         self.assertEqual(self.store_calls("mooncake_master"), [])
 
     def test_page_cache_drop_covers_the_configured_directories(self):
         self.run_shell(
-            "prepare_mooncake_store_memory\n",
+            "plan_mooncake_store_owners\nprepare_mooncake_store_memory\n",
             MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS="/share/models:/data/cache",
-            # A fragmented node may need longer than the default 600 s.
             MOONCAKE_STORE_COMPACT_TIMEOUT="1800",
         )
         calls = self.calls.read_text()
-        self.assertIn("/scripts/drop_page_cache.py /share/models /data/cache\n", calls)
-        self.assertIn(
-            "--reserve-gib 128 --compact --compact-timeout 1800\n",
-            calls,
-        )
+        self.assertIn("--timeout 3600", calls)
+        self.assertIn("--pin 0:768 --pin 1:768 /share/models /data/cache\n", calls)
+
+    def test_no_local_owners_need_no_memory_preparation(self):
+        self.run_shell("prepare_mooncake_store_memory\n")
+        self.assertEqual(self.calls.read_text(), "")
 
     def test_owner_devices_must_be_active_and_on_one_numa_node(self):
         (self.ib / "rdma6/ports/1/state").write_text("1: DOWN\n")

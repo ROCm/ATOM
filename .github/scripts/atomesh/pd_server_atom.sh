@@ -1381,27 +1381,30 @@ check_mooncake_owner_devices() {
   done
 }
 
-# prepare_mooncake_store_memory: drops the clean page cache that the owners'
-# huge-page faults would otherwise reclaim through compaction, then refuses pins
-# that do not fit a NUMA node (numa_memory_budget.py warns when they exceed its
-# free memory), and compacts each node for its pins: owners that fault a
-# fragmented node from many threads get 4 KiB pages, which the NICs refuse.
+# Reclaim file cache with base pages before compacting THP. Huge-page faults
+# directly against a cache-saturated node can stall for minutes, then leave
+# base pages that the NIC refuses to register. The bounded preparation helper
+# requires full THP coverage and free capacity before any Store process starts.
 prepare_mooncake_store_memory() {
-  local -a drop_dirs=()
+  local -a drop_dirs=() pins=()
   IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
-  echo "[mooncake-store] dropping the page cache of ${drop_dirs[*]}"
-  python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" "${drop_dirs[@]}"
-  local -a pins=()
-  local i
+  local i nodes timeout
   for i in "${!mooncake_owner_plan_numa[@]}"; do
-    pins+=("${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
+    pins+=(--pin "${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
   done
-  if ! python3 "${ATOMESH_SCRIPT_DIR}/numa_memory_budget.py" \
-    --reserve-gib 128 \
-    --compact \
-    --compact-timeout "$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
-    ${pins[@]+"${pins[@]}"}; then
-    echo "[mooncake-store][FAIL] this node's Store owners must fit their NUMA nodes, see numa-budget above" >&2
+  # Decode-only nodes may have no local owners.
+  ((${#pins[@]})) || return 0
+  nodes="$(printf '%s\n' "${mooncake_owner_plan_numa[@]}" | sort -u | wc -l)"
+  # Retain the old total preparation allowance, shared by bounded retries.
+  timeout="$(awk -v nodes="${nodes}" \
+    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
+    'BEGIN { print nodes * compact }')"
+  if ! python3 "${ATOMESH_SCRIPT_DIR}/prepare_lmcache_host_memory.py" \
+    --skip-direct --reserve-gib 128 --attempts 3 --step-timeout 90 \
+    --timeout "${timeout}" \
+    --output "${RUNTIME_LOG_DIR}/mooncake-memory-rank-${NODE_RANK}" \
+    "${pins[@]}" "${drop_dirs[@]}"; then
+    echo "[mooncake-store][FAIL] memory preparation did not complete; see ${RUNTIME_LOG_DIR}/mooncake-memory-rank-${NODE_RANK}/summary.json" >&2
     exit 2
   fi
 }
@@ -1672,9 +1675,9 @@ report_mooncake_store_owners() {
 
 # mooncake_store_cross_node_timeout <owner setting>: the wait for the other
 # node's part of the Store, whose owners <owner setting> lists:
-# MOONCAKE_STORE_WAIT_TIMEOUT plus that node's compaction, which comes first
-# there: numa_memory_budget.py compacts each NUMA node with pins in turn, and
-# stops each after MOONCAKE_STORE_COMPACT_TIMEOUT.
+# MOONCAKE_STORE_WAIT_TIMEOUT plus that node's bounded memory preparation,
+# whose total deadline is the number of owner NUMA nodes times
+# MOONCAKE_STORE_COMPACT_TIMEOUT.
 mooncake_store_cross_node_timeout() {
   local -a numa=() gib=() devices=()
   parse_mooncake_owner_spec "$1" numa gib devices
