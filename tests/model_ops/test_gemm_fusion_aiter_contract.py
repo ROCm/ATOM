@@ -295,7 +295,10 @@ def _dense_site(spec):
     from atom.model_ops.gemm_fusion import site as site_mod
 
     impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
-    site = site_mod.GemmFusionSite("t.qkv", SimpleNamespace(output_size=9216, input_size=6144),
+    site = site_mod.GemmFusionSite("t.qkv", SimpleNamespace(
+        output_size=9216, input_size=6144, is_output_padded=False,
+        weight=SimpleNamespace(shape=(9216, 6144), is_shuffled=True),
+        weight_scale=SimpleNamespace(shape=(9216, 1))),
                                    list(spec.stages), None, attn=SimpleNamespace(impl=impl),
                                    q_size=2048, kv_size=128)
     site.spec = spec

@@ -154,6 +154,40 @@ class GemmFusionSite:
         # or no method) is not eligible -> native on every rank (via the agreement).
         return False if fn is None else bool(fn())
 
+    def _static_weight_reason(self):
+        """Why the QKV weight cannot be handed to an aiter plan as-is (None = it can).
+
+        aiter's plans take ``w`` as a 16x16-PRESHUFFLED fp8 ``[N, K]`` matrix and ``w_scale`` with at
+        least N rows (``variants.py`` / ``variants_large.py`` contracts; the spec declares
+        ``w_layout="shuffle_16x16"`` but only the weight itself knows what it holds). ATOM stores it
+        so unless ``ATOM_USE_TRITON_GEMM=1`` (unshuffled) or a loader path skipped the shuffle; a
+        plan fed an unshuffled weight would compute wrong values with no error, so it is checked
+        here, once, at resolve time (after ``process_weights_after_loading``), and agreed across ranks.
+          weight_layout : ``weight.is_shuffled`` is not True
+          weight_shape  : K of the weight is not ``input_size``, or its rows are fewer than N. A
+                          weight whose N was padded for the preshuffle GEMM (``is_output_padded``)
+                          has MORE rows than N and is fine: the first N rows of a 16-row-block
+                          shuffle are a contiguous prefix and aiter reads exactly N rows. An
+                          unpadded weight must have exactly N rows.
+        """
+        lin = self.linear
+        w = getattr(lin, "weight", None)
+        if w is None or getattr(w, "is_shuffled", False) is not True:
+            return "weight_layout"
+        n, k = lin.output_size, lin.input_size
+        shape = tuple(getattr(w, "shape", ()))
+        if len(shape) != 2 or shape[1] != k:
+            return "weight_shape"
+        if getattr(lin, "is_output_padded", False) is True:
+            if shape[0] < n:
+                return "weight_shape"
+        elif shape[0] != n:
+            return "weight_shape"
+        ws_shape = tuple(getattr(getattr(lin, "weight_scale", None), "shape", ()))
+        if not ws_shape or ws_shape[0] < n:
+            return "weight_shape"
+        return None
+
     def resolve(self, tokens: int, graph_mode: str = "eager") -> Resolution:
         """Resolve a bucket. Cache key is ``(tokens, graph_mode)``.
 
@@ -189,9 +223,15 @@ class GemmFusionSite:
             )
         except contract_err as e:  # covered but contract fails
             errored, msg = True, str(e)
-        unsupported = False
-        if plan is not None and n >= 2 and not self._static_prologue_ok():
-            plan, n, unsupported = None, 0, True  # agreed below => native on every rank
+        static_reason = None  # why a covered row is still not fusable (static, per layer)
+        if plan is not None:
+            # Both are properties of the layer, not of the call, so every rank computes the same
+            # answer; they are folded into the agreement below (plan=None => native on all ranks).
+            static_reason = self._static_weight_reason()  # applies to 1- and 2-stage plans: both read w
+            if static_reason is None and n >= 2 and not self._static_prologue_ok():
+                static_reason = "prologue_unsupported"
+            if static_reason is not None:
+                plan, n = None, 0
         outcome = res.agree(self.name, tokens, plan, n, errored=errored)
         if outcome == "error":
             r = GemmFusionContractError(msg or "contract error on all ranks")
@@ -201,10 +241,10 @@ class GemmFusionSite:
             if outcome == "disagree":
                 reason = "rank_disagree"
             else:
-                # a profile row covered the spec but this layer's prologue cannot be
-                # fused (static eligibility, identical on every rank): say so, do not
-                # report it as a profile miss
-                reason = "prologue_unsupported" if unsupported else "uncovered"
+                # a profile row covered the spec but this layer cannot be fused (static
+                # eligibility, identical on every rank): say so, do not report it as a
+                # profile miss
+                reason = static_reason or "uncovered"
             r = Resolution(None, 0, "native", reason)
         elif not res.can_ensure(plan):
             r = Resolution(None, 0, "native", "after_finalize")  # uniform: same order on all ranks
@@ -362,10 +402,11 @@ class GemmFusionSite:
 
     @staticmethod
     def decide_path(*, resolution, is_dummy_run, real_tokens, padded_tokens, x_dtype_is_fp8,
-                    x_scale_ok):
+                    x_scale_ok, x_k_ok=True):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
         (resolution agreed at resolve, the broadcast batch's dummy flag, global token counts,
-        and the input's dtype/shape facts). No rank, no env, no device state:
+        and the input's dtype/shape facts, including whether x's K equals the layer's
+        ``input_size``). No rank, no env, no device state:
         the same inputs give the same ``(path, reason)`` on every rank. -> (path, reason)."""
         if resolution.plan is None:
             return "native", resolution.reason
@@ -377,6 +418,8 @@ class GemmFusionSite:
             return "native", "unquantized_input"
         if not x_scale_ok:
             return "native", "xscale_layout"
+        if not x_k_ok:
+            return "native", "x_k_mismatch"  # the plan's K is the spec's (input_size); never feed it another
         return "fused", resolution.reason
 
     @staticmethod
@@ -476,6 +519,7 @@ class GemmFusionSite:
             padded_tokens=ctx.padded_tokens,
             x_dtype_is_fp8=fp8,
             x_scale_ok=scale_ok,
+            x_k_ok=x.shape[-1] == self.linear.input_size,  # SPMD: same on every rank
         )
         if path == "native":
             return Resolution(None, 0, "native", why), why, None, None

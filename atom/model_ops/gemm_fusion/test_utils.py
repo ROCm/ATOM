@@ -369,6 +369,7 @@ def fallback_reason(site, ctx, x, x_scale, n_fused=2):
         padded_tokens=ctx.padded_tokens,
         x_dtype_is_fp8=fp8,
         x_scale_ok=ok,
+        x_k_ok=x.shape[-1] == site.linear.input_size,
     )
     return None if path == "fused" else why
 
@@ -650,6 +651,25 @@ def _kv_page(page):
         S._kv_block_size = orig
 
 
+class _GoldenSite(DirectGemmFusionSite):
+    """Golden-harness site. The harness's weight IS the layout the plan consumes (16x16-preshuffled),
+    but golden tensors carry no ``is_shuffled`` marker (ATOM's loader sets it), so the layout verdict
+    is taken from the harness contract while the shape checks (K, N, scale rows) still run."""
+
+    def _static_weight_reason(self):
+        lin = self.linear
+        proxy = SimpleNamespace(
+            output_size=lin.output_size, input_size=lin.input_size,
+            weight=SimpleNamespace(is_shuffled=True, shape=lin.weight.shape),
+            weight_scale=lin.weight_scale,
+        )
+        saved, self.linear = lin, proxy
+        try:
+            return super()._static_weight_reason()
+        finally:
+            self.linear = saved
+
+
 def _site_for(case, comm):
     mode = _mode(case)
     key = (mode, case.spec.tokens)
@@ -688,7 +708,7 @@ def _site_for(case, comm):
                     attn, index="fp8_unit_page128" if mode == "indexer" else None
                 ),
             ]
-        site = DirectGemmFusionSite(  # case tensors are address-stable (refresh_input keeps them)
+        site = _GoldenSite(  # case tensors are address-stable (refresh_input keeps them)
             f"golden.{mode}.T{case.spec.tokens}", linear, stages, None, attn=attn,
             q_size=8192 // WORLD, kv_size=512 // WORLD,
             index_q_size=128 if sparse else 0, index_k_size=128 if sparse else 0,

@@ -17,6 +17,19 @@ def _clean_test_utils_patches():
     TU.uninstall_faults()
 
 
+def _fake_linear(n, k, *, shuffled=True, rows=None, padded=False, ws_rows=None, k_cols=None):
+    """What the site reads off ATOM's QKV linear: logical N/K, a weight that is (or is not)
+    16x16-preshuffled with a given shape, and a weight_scale with N rows."""
+    w = SimpleNamespace(shape=(rows if rows is not None else n, k_cols if k_cols is not None else k))
+    if shuffled is not None:
+        w.is_shuffled = shuffled
+    return SimpleNamespace(
+        output_size=n, input_size=k, weight=w,
+        weight_scale=SimpleNamespace(shape=(ws_rows if ws_rows is not None else (rows if rows is not None else n), 1)),
+        is_output_padded=padded,
+    )
+
+
 # ---------------------------------------------------------------- fake aiter
 class FakeContractError(RuntimeError):
     pass
@@ -95,7 +108,7 @@ def make_site(monkeypatch):
         TU.reset_for_tests(res)
         TU.set_phase("preparing" if res is not None else "pre")
         TU.inject_aiter(monkeypatch, _fake_gf(res))
-        linear = SimpleNamespace(output_size=10240, input_size=3072)
+        linear = _fake_linear(10240, 3072)
         stg = [SimpleNamespace(kind="sp_exchange"), SimpleNamespace(kind="head_norm_rope_cache")]
         cls = TU.DirectGemmFusionSite if direct else site_mod.GemmFusionSite
         return cls(
@@ -213,7 +226,7 @@ def test_fallback_reasons_pad_rows_and_input_layout(make_site):
 
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
-    x = torch.zeros((16, 8), dtype=torch.float8_e4m3fn)
+    x = torch.zeros((16, 3072), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((16, 1), dtype=torch.float32)
     assert TU.fallback_reason(s, ctx, x, xs) == "pad_rows"
     ctx.real_tokens = 64
@@ -230,7 +243,7 @@ def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
 
     s = make_site(FakeResources(plan_n=(FakePlan(), 1)))
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
-    x = torch.zeros((512, 8), dtype=torch.float8_e4m3fn)
+    x = torch.zeros((512, 3072), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((512, 1), dtype=torch.float32)
     assert TU.fallback_reason(s, ctx, x, xs, n_fused=1) is None
     assert TU.fallback_reason(s, ctx, x, xs, n_fused=2) == "pad_rows"
@@ -242,7 +255,7 @@ def _direct_fixture(make_site, res=None):
     s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
     s.resolve(64, "eager")
     t = dict(
-        x=torch.zeros((16, 8), dtype=torch.float8_e4m3fn),
+        x=torch.zeros((16, 3072), dtype=torch.float8_e4m3fn),
         xs=torch.zeros((16, 1), dtype=torch.float32),
         pos=torch.arange(64),
         slot=torch.arange(64),
@@ -673,7 +686,8 @@ def _golden_case(mode, tokens=64):
         spec=spec, spec_is_real=real,
         rotary=SimpleNamespace(rotary_dim=64), q_norm=norm(), k_norm=norm(),
         index_q_norm=norm(), index_k_norm=norm(), caches={"index_cache": object()},
-        weight=object(), weight_scale=object(),
+        weight=SimpleNamespace(shape=((9856 if has_idx else 9216), 6144)),
+        weight_scale=SimpleNamespace(shape=((9856 if has_idx else 9216), 1)),
     )
 
 @pytest.mark.parametrize("mode,gm", [("qkv_dense", "dense"), ("qkv_indexer", "indexer"),
@@ -1447,7 +1461,7 @@ def _fake_direct(make_site, res=None):
     s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
     s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True))
     import torch as _torch
-    t = dict(x=_T((16, 8), _torch.float8_e4m3fn), xs=_T((16, 1), _torch.float32),
+    t = dict(x=_T((16, 3072), _torch.float8_e4m3fn), xs=_T((16, 1), _torch.float32),
              pos=_T((64,), _torch.int64), slot=_T((64,), _torch.int64))
     state = {"slot_mapping": t["slot"], "k_cache": _T(), "v_cache": _T(), "k_scale": _T(), "v_scale": _T()}
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
@@ -1514,7 +1528,7 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
             hooks.resources().rank = rank  # the decision must not depend on the rank
             _seed_prepared(s, t, state)
             ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = c["dummy"], c["real"], c["padded"]
-            r, reason, _, _ = s._prepare(ctx, _T((16, 8), c["dtype"]), _T(c["scale"]))
+            r, reason, _, _ = s._prepare(ctx, _T((16, 3072), c["dtype"]), _T(c["scale"]))
             outcomes.add((r.plan is not None, r.n_fused, reason))
         assert len(outcomes) == 1, (c, outcomes)  # every rank decided identically
         assert next(iter(outcomes))[0] is want_fused, c
@@ -1829,3 +1843,72 @@ def test_install_from_env_logs_even_when_the_environment_selects_nothing(monkeyp
     with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
         TU.install_from_env()
     assert any("nothing selected by the environment" in r.getMessage() for r in caplog.records)
+
+
+# ------------- task-265: the site refuses a weight or activation aiter's plan cannot take as-is
+@pytest.mark.parametrize("n_fused", [2, 1])  # both plans read w: the check is not 2-stage only
+@pytest.mark.parametrize("kw,reason", [
+    (dict(shuffled=False), "weight_layout"),  # ATOM_USE_TRITON_GEMM=1: stored unshuffled
+    (dict(shuffled=None), "weight_layout"),  # no marker at all
+    (dict(k_cols=6144), "weight_shape"),  # weight K != input_size
+    (dict(rows=10000), "weight_shape"),  # fewer rows than N
+    (dict(rows=10368), "weight_shape"),  # more rows, but not a padded weight
+    (dict(rows=10000, padded=True), "weight_shape"),  # padded weights still need >= N rows
+    (dict(ws_rows=10000), "weight_shape"),  # w_scale with fewer than N rows
+])
+def test_static_weight_checks_make_the_bucket_native_and_are_agreed(make_site, kw, reason, n_fused):
+    res = FakeResources(plan_n=(FakePlan(), n_fused))
+    s = make_site(res)
+    s.linear = _fake_linear(10240, 3072, **kw)
+    r = s.resolve(64, "eager")
+    assert (r.plan, r.n_fused, r.reason) == (None, 0, reason)
+    assert res.agree_calls == 1  # the collective still ran on this rank: the verdict is AGREED, not local
+
+
+def test_a_padded_weight_with_extra_rows_is_still_fused(make_site):
+    """is_output_padded: N padded up to the GEMM tile for the preshuffle kernel. aiter reads exactly N
+    rows (a 16-row-block shuffle keeps the first N rows contiguous), so more rows than N is fine."""
+    s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    s.linear = _fake_linear(10240, 3072, rows=10368, padded=True, ws_rows=10368)
+    r = s.resolve(64, "eager")
+    assert r.plan is not None and r.reason == "profile_hit"
+
+
+def test_the_weight_check_names_the_layout_before_the_prologue_reason(make_site):
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    s = make_site(res)
+    s.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False))
+    s.linear = _fake_linear(10240, 3072, shuffled=False)
+    assert s.resolve(64, "eager").reason == "weight_layout"
+    s2 = make_site(FakeResources(plan_n=(FakePlan(), 2)))
+    s2.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False))
+    assert s2.resolve(64, "eager").reason == "prologue_unsupported"  # unchanged when the weight is fine
+
+
+def test_decide_path_rejects_a_k_mismatch_after_the_other_input_facts():
+    kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
+              real_tokens=64, padded_tokens=64, x_dtype_is_fp8=True, x_scale_ok=True)
+    decide = site_mod.GemmFusionSite.decide_path
+    assert decide(**kw) == ("fused", "profile_hit")  # x_k_ok defaults to True: existing callers unchanged
+    assert decide(**kw, x_k_ok=False) == ("native", "x_k_mismatch")
+    assert decide(**{**kw, "x_scale_ok": False}, x_k_ok=False) == ("native", "xscale_layout")
+    assert decide(**{**kw, "real_tokens": 40}, x_k_ok=False) == ("native", "pad_rows")
+
+
+def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_rank(make_site):
+    import torch as _torch
+
+    fp8 = _torch.float8_e4m3fn
+    for k, want_fused in ((3072, True), (2048, False), (6144, False)):
+        outcomes = set()
+        for rank in range(4):
+            s, t, state, ctx = _fake_direct(make_site)
+            hooks.resources().rank = rank
+            _seed_prepared(s, t, state)
+            r, reason, _, _ = s._prepare(ctx, _T((16, k), fp8), _T((16, 1)))
+            outcomes.add((r.plan is not None, reason))
+        assert len(outcomes) == 1, (k, outcomes)  # identical on every rank
+        got = next(iter(outcomes))
+        assert got[0] is want_fused and (want_fused or got[1] == "x_k_mismatch"), (k, got)
+    assert TU.fallback_reason(
+        s, ctx, _T((16, 2048), fp8), _T((16, 1))) == "x_k_mismatch"  # the test view agrees
