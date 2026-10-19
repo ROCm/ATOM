@@ -22,7 +22,7 @@ each concurrency**.
 Related guides: [`Kimi-K3.md`](Kimi-K3.md) (generic serving / GSM8K),
 [`DSpark.md`](DSpark.md) (DSpark draft),
 [`mesh/Agentic-Kimi-K3.md`](mesh/Agentic-Kimi-K3.md) (two-node PD serving with
-DSpark3, on-demand checkpoints, and a 128 GiB CPU state retention cap per rank).
+DSpark4, on-demand checkpoints, and a 128 GiB CPU state retention cap per rank).
 
 | Band | CONC | Serving defaults |
 |---|---|---|

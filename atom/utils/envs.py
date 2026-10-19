@@ -403,6 +403,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_DEMAND": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_DEMAND", "1") == "1"
     ),
+    # Tokens kept between the prompt-end state checkpoint and the prompt end,
+    # at least; the backend's own successor room still applies when it is
+    # larger. A chat template rewrites the tail of an assistant turn when the
+    # next user turn is appended (Qwen3.5 drops the generation prompt's
+    # `<think>`), so the next prompt diverges a few tokens before this one
+    # ends; an anchor inside that suffix is never matched again. 0 keeps the
+    # old placement. See docs/environment_variables.md for what a margin wider
+    # than a block costs.
+    "ATOM_STATE_CHECKPOINT_END_MARGIN": lambda: max(
+        0, int(os.getenv("ATOM_STATE_CHECKPOINT_END_MARGIN", "0"))
+    ),
     # vLLM plugin, state checkpoints: overrides the native checkpoint interval
     # (tokens; 0 = publish no state checkpoint, -1 = no rungs, anchor and demand only).
     # Unset: the model's native default.
@@ -414,6 +425,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_STATE_CHECKPOINT_CHECK_BLOCKS": lambda: (
         os.getenv("ATOM_STATE_CHECKPOINT_CHECK_BLOCKS", "0") == "1"
     ),
+    # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
+    # interior states instead of cutting prefill chunks onto them. PAGE path
+    # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
+    "ATOM_GDN_STATE_MIDSTEP": lambda: (os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1"),
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by

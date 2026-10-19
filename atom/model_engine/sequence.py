@@ -398,6 +398,10 @@ class Sequence:
         # handed back by `cancel_midstep` if that forward never runs. Non-empty
         # only between those two points.
         self.midstep_reservations: list[tuple] = []
+        # `checkpoint_end_pos` as the forward holding these reservations files
+        # it: moved back onto that forward's snapshot grid. 0 when the forward
+        # does not reach the anchor. Read by `StateSlotPool._anchor_of`.
+        self.midstep_anchor_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see

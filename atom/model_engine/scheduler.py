@@ -35,7 +35,7 @@ import numpy as np
 from atom.config import Config
 from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
-from atom.model_engine.block_manager import BlockManager
+from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
     CALIBRATION_SWEEP_RATIO,
     USEFUL_SHRINK_REFERENCE_CHUNKS,
@@ -239,11 +239,17 @@ class ScheduledBatch:
         # whose committed slot was never claimed carries the -1 sentinel in a
         # one-element list, which is truthy, and letting it through would shift
         # every list positionally aligned with this one.
-        state_seqs = [
-            seq
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.state_slot >= 0
-        ]
+        state_rows: list[int] = []
+        state_seqs: list[Sequence] = []
+        for row, seq in enumerate(seqs.values()):
+            if seq.has_per_req_cache and seq.state_slot >= 0:
+                state_rows.append(row)
+                state_seqs.append(seq)
+        # Batch row of each state-holding seq. Every list below is indexed by
+        # state-holding seq; the token counts, `cu_seqlens` and the kernels'
+        # rows are indexed by batch row. The two coincide only when every row
+        # holds state, so a backend translating between them goes through this.
+        self.state_rows = state_rows
         self.state_slots = [seq.state_slots for seq in state_seqs]
         # Column 0 broken out, because it is what every non-speculative backend
         # wants and rebuilding it per step in each of them would cost the same
@@ -685,6 +691,12 @@ class Scheduler:
         # (which only drafts for handoff to the decode node).
         pp_size = getattr(config, "pipeline_parallel_size", 1)
         self.spec_decode_local = self.use_spec and pp_size == 1
+        # Positions past `len(seq)` each forward's draft round writes KV to.
+        # Allocated before the forward, with the step's own blocks: see
+        # `draft_kv_lookahead` for the arithmetic and what an unallocated one
+        # costs.
+        self.draft_lookahead = draft_kv_lookahead(self.mtp_k)
+        self.block_manager.draft_lookahead = self.draft_lookahead
         if self.use_spec and not self.spec_decode_local:
             logger.info(
                 "Speculative decoding: drafting only (pipeline_parallel_size=%d). "
@@ -1208,7 +1220,9 @@ class Scheduler:
         target = self.block_manager.checkpoint_cut(
             seq, _cut_floor(seq, start, resume), start + chunk, record=False
         )
-        return target - start if target else chunk
+        if target:
+            return target - start
+        return self.block_manager.align_midstep_chunk(seq, start, chunk)
 
     def _can_admit_head_prefill(self) -> bool:
         """Match SGL's `local_prefillable=True` semantics: report True iff
@@ -2283,6 +2297,7 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.waiting.appendleft(seq)
                 break
+            self._allocate_prefill_draft_lookahead(seq)
 
             # Detached before the alloc notification, which reads the save
             # floor `detach_lookup` sets.
@@ -2556,6 +2571,7 @@ class Scheduler:
                 self.block_manager.plan_midstep(
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
+            self._check_draft_writes_allocated(scheduled_seqs.values())
 
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -2608,7 +2624,9 @@ class Scheduler:
                 continue
             blocked_by_pinned_save = False
             preempted_current = False
-            while not self.block_manager.can_append(seq, num_new_tokens):
+            while not self.block_manager.can_append(
+                seq, num_new_tokens, self.draft_lookahead
+            ):
                 if self._preempt_one_running():
                     continue
                 if self.preempt(seq):
@@ -2635,8 +2653,13 @@ class Scheduler:
                     is_first
                     and (seq.kv_transfer_params or {}).get("first_token_id") is not None
                 )
-                if not is_first or has_injected_t0:
-                    self.block_manager.may_append(seq, num_new_tokens)
+                # The draft lookahead either way: the transfer filled the
+                # prompt's blocks, not the positions past it the draft writes.
+                self.block_manager.may_append(
+                    seq,
+                    num_new_tokens if not is_first or has_injected_t0 else 0,
+                    lookahead=self.draft_lookahead,
+                )
                 if is_first:
                     logger.debug(
                         "[PD-FIRST-DECODE] seq %s: num_tokens=%d, "
@@ -2686,6 +2709,7 @@ class Scheduler:
             self._publish_state_stores()
             connector_meta_output = self.kv_connector.build_connector_meta()
 
+        self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -3348,6 +3372,11 @@ class Scheduler:
         target = bm.checkpoint_cut(seq, _cut_floor(seq, start, start), start + chunk)
         if target:
             chunk = target - start
+        else:
+            # A readable class is never cut onto a rung; keep the next
+            # chunk's start on the block grid instead, or every snapshot
+            # position in it is off the grid too.
+            chunk = bm.align_midstep_chunk(seq, start, chunk)
         # `cancel_state_fork` runs only when the first two hold, and returning
         # False is what leaves the fork in place — hence holding the chunk open.
         if (
@@ -3460,6 +3489,48 @@ class Scheduler:
         scheduled_seqs[seq.id] = seq
         num_scheduled_tokens.append(chunk)
         return num_seqs_prefill, num_batched_tokens
+
+    def _allocate_prefill_draft_lookahead(self, seq: Sequence) -> None:
+        """Allocate the blocks past the prompt that its draft round writes.
+
+        Right after `allocate`, which sized the table on the prompt alone.
+        `can_allocate` already charged these blocks (`draft_lookahead_blocks`),
+        so the units are there. Skipped for a P/D remote prefill: the transfer
+        pairs this table block for block with the producer's, and nothing
+        prefills here; its first decode allocates the lookahead instead.
+        """
+        if not self.draft_lookahead or (seq.kv_transfer_params or {}).get(
+            "do_remote_prefill"
+        ):
+            return
+        self.block_manager.may_append(seq, 0, lookahead=self.draft_lookahead)
+
+    def _check_draft_writes_allocated(self, seqs) -> None:
+        """Refuse a batch whose draft round would write past a row's blocks.
+
+        A position past the last allocated block reads block id 0 from the
+        zeroed block-table tail, and the KV write lands in physical block 0 --
+        silently, in whatever request or state checkpoint owns it. Every path
+        that schedules a forward has to have allocated through
+        `len(seq) + draft_lookahead` (`may_append(..., lookahead=)`); this is
+        where one that did not fails loudly. Remote-prefill rows are skipped:
+        nothing runs a forward for them here.
+        """
+        if not self.draft_lookahead:
+            return
+        bm = self.block_manager
+        for seq in seqs:
+            if bm.draft_writes_allocated(seq) or (seq.kv_transfer_params or {}).get(
+                "do_remote_prefill"
+            ):
+                continue
+            raise RuntimeError(
+                f"seq {seq.id}: {len(seq.block_table)} blocks of "
+                f"{bm._effective_block_size()} tokens do not reach position "
+                f"{len(seq) + self.draft_lookahead - 1}, the end of this "
+                f"forward's draft round (len(seq)={len(seq)}, draft lookahead "
+                f"{self.draft_lookahead}); its KV write would land in block 0"
+            )
 
     def _notify_connector_after_prefill_alloc(self, seq: Sequence) -> None:
         if self.kv_connector is not None:
@@ -5135,6 +5206,8 @@ class DecodeScheduler(Scheduler):
                     # the front of waiting to retry once the pool has room.
                     self.block_manager.deallocate(seq)
                     break
+                # The prefill process drafts into this allocation too.
+                self._allocate_prefill_draft_lookahead(seq)
             self.waiting.popleft()
 
             # Shared-cache prefill writes into this allocation; there is no
@@ -5216,7 +5289,9 @@ class DecodeScheduler(Scheduler):
                 # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
                 #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
                 #     len(self.running), self.block_manager.kv.num_free)
-                while not self.block_manager.can_append(seq, self.mtp_k + 1):
+                while not self.block_manager.can_append(
+                    seq, self.mtp_k + 1, self.draft_lookahead
+                ):
                     logger.warning("Cannot allocate")
                     if self.running:
                         self.preempt(self.running.pop())
@@ -5227,7 +5302,9 @@ class DecodeScheduler(Scheduler):
                     if self.spec_decode_local and seq.spec_token_ids.size > 0:
                         scheduled_spec_decode_tokens[seq.id] = seq.spec_token_ids
                     num_new_tokens = self.mtp_k + 1
-                    self.block_manager.may_append(seq, num_new_tokens)
+                    self.block_manager.may_append(
+                        seq, num_new_tokens, lookahead=self.draft_lookahead
+                    )
                     scheduled_seqs[seq.id] = seq
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
@@ -5252,6 +5329,7 @@ class DecodeScheduler(Scheduler):
                 pwait = sum(seq.num_tokens for seq in self.prefill_waiting.values())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
+        self._check_draft_writes_allocated(scheduled_seqs.values())
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,

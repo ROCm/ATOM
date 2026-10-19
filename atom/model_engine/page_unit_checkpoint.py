@@ -90,6 +90,19 @@ class PagedStateCheckpointSpec:
         )
 
 
+def checkpoint_copy_ops_per_batch(max_num_seqs: int) -> int:
+    """PAGE checkpoint copies one batch's descriptor holds, stores and restores.
+
+    One store and one restore per sequence. The runner sizes its pinned
+    descriptor staging with this (`AttentionMetadataBuilder.
+    _checkpoint_staging`), and the coordinator bounds how many queued midstep
+    stores one batch begins with it (`attach_midstep_scratch`). Both read it
+    from here: a coordinator that began more than the staging holds would make
+    `build()` raise mid-serving.
+    """
+    return 2 * int(max_num_seqs or 0)
+
+
 @dataclass(frozen=True)
 class CheckpointStoreOp:
     """Scatter the checkpointed part of an Active Slot into PAGE units."""
@@ -875,25 +888,35 @@ class PagedStateCheckpointCoordinator:
     """Schedules PAGE-backed checkpoints for per-request state."""
 
     successor_room = 0.0
-    # A PAGE image is written by a copy the runner issues after the forward that
-    # produced the state, out of the slot that forward left behind. There are no
-    # interior positions to slice: unlike a chunk kernel's `h`, the compressor
-    # ring is not materialized at boundaries inside a step. So the engine keeps
-    # cutting prefill chunks onto rungs for this class, and the three methods
-    # below are the no-ops `StateCache` documents for a class that is not
-    # readable midstep — present because `BlockManager` calls them across every
-    # member of `state_caches` without asking which kind it holds.
-    readable_midstep = False
 
-    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
-        del seq, positions
-        return []
-
-    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
-        del reservations, seq
-
-    def cancel_midstep(self, reservations: list[tuple]) -> None:
-        del reservations
+    # ------------------------- midstep checkpointing ------------------------ #
+    #
+    # A PAGE image is written by a copy the runner issues before a later batch,
+    # out of a slot. Unreadable by default: the image then comes from the slot
+    # a forward *ended* in, so the engine cuts prefill chunks onto rungs.
+    #
+    # A backend whose kernel exposes interior states (GDN's `h`) can declare
+    # `readable_midstep`, and then a position inside a forward reaches the
+    # image through a scratch slot borrowed from the state pool:
+    #
+    #   `reserve_midstep`  before the forward, borrow a scratch slot per
+    #                      position. The runner copies the interior state in.
+    #   `publish_midstep`  after it, queue `(hash, scratch)` for storing.
+    #   `take_checkpoint_ops`
+    #                      while building the next batch, `begin_store` each
+    #                      queued scratch, exactly as `checkpoint`'s pending
+    #                      boundaries are begun. Not at publish: `begin_store`
+    #                      enters the store's inflight list, which the *next*
+    #                      `complete_previous_batch` turns READY, so begun at
+    #                      publish the image would be READY -- and restorable
+    #                      -- one batch before its copy ran.
+    #   `complete_previous_batch`
+    #                      the batch carrying those copies has been issued, so
+    #                      the scratch goes back to the state pool. A later
+    #                      writer of the slot runs after it on the same stream.
+    #
+    # A scratch slot is never a request's runtime slot, so nothing the owner
+    # does next can overwrite it before its store is issued.
 
     def __init__(
         self,
@@ -901,8 +924,20 @@ class PagedStateCheckpointCoordinator:
         spec: PagedStateCheckpointSpec,
         enabled: bool,
         offload=None,
+        readable_midstep: bool = False,
     ) -> None:
         self.enabled = enabled
+        self.readable_midstep = bool(readable_midstep)
+        # The state pool scratch slots are borrowed from, and how many stores
+        # one batch's copy descriptor has room for. Set by
+        # `attach_midstep_scratch`; a readable coordinator without them
+        # reserves nothing.
+        self._scratch = None
+        self._max_ops_per_batch = 0
+        # Published `(hash, scratch slot)` not yet begun, oldest first.
+        self._scratch_queued: list[tuple[int, int]] = []
+        # Scratch slots whose store rides the batch built last pass.
+        self._scratch_issued: list[int] = []
         # The CPU tier beneath this one, or None. Not a member of
         # `BlockManager.state_caches`: every one of those is a veto over where a
         # prefix may resume, and this does the opposite -- it makes MORE
@@ -929,6 +964,80 @@ class PagedStateCheckpointCoordinator:
 
     def applies(self, seq: Sequence) -> bool:
         return self.enabled and seq.has_per_req_cache
+
+    def attach_midstep_scratch(self, slot_pool, max_ops_per_batch: int) -> None:
+        """Where scratch slots come from, and the per-batch copy budget.
+
+        `max_ops_per_batch` is what the runner's descriptor staging holds,
+        stores and restores together (`AttentionMetadataBuilder.
+        _checkpoint_staging`). A sequence can now publish several positions in
+        one forward, so the one-store-per-sequence bound no longer holds on its
+        own; `take_checkpoint_ops` begins only what fits and leaves the rest
+        queued, still held in their scratch slots, for the next batch.
+        """
+        self._scratch = slot_pool
+        self._max_ops_per_batch = int(max_ops_per_batch)
+
+    def reserve_midstep(self, seq, positions: list[tuple[int, int]]) -> list[tuple]:
+        """Borrow a scratch slot for each `(position, hash)` this forward covers.
+
+        Best-effort and order-preserving, like the slot pool's: stops at the
+        first position no slot is free for. A hash already stored, or already
+        on its way, is skipped -- writing it again would be refused by
+        `begin_store` after spending the slot and the copy.
+        """
+        if not (self.readable_midstep and self.applies(seq)):
+            return []
+        if self._scratch is None:
+            return []
+        queued = {h for h, _slot in self._scratch_queued}
+        out = []
+        for pos, h in positions:
+            if h in queued or self.store.contains_or_pending(h):
+                continue
+            if not self._scratch.has_free():
+                self.checkpoints_dropped += 1
+                break
+            out.append((self._scratch.pop(), pos, h))
+        return out
+
+    def publish_midstep(self, reservations: list[tuple], seq=None) -> None:
+        """Queue each written scratch slot for storing under its hash.
+
+        Nothing is findable yet: the image is begun at the next
+        `take_checkpoint_ops` and READY one batch after that, the same two
+        steps `checkpoint`'s boundaries take.
+        """
+        del seq
+        for slot, _pos, h in reservations:
+            self._scratch_queued.append((h, slot))
+
+    def cancel_midstep(self, reservations: list[tuple]) -> None:
+        """Hand back scratch slots whose forward never ran."""
+        for slot, _pos, _h in reservations:
+            self._scratch.release(slot)
+
+    def _take_scratch_stores(self, budget: int) -> None:
+        """Begin queued scratch stores, at most `budget` of them."""
+        queued, self._scratch_queued = self._scratch_queued, []
+        for i, (h, slot) in enumerate(queued):
+            if budget <= 0:
+                self._scratch_queued = queued[i:]
+                return
+            op = None
+            if not self.store.contains_or_pending(h):
+                op = self.store.begin_store(h, slot)
+            if op is None:
+                # Already stored, or no units for it: the scratch holds
+                # nothing anybody will read, and the forward that wrote it has
+                # completed, so it can go back now.
+                self._scratch.release(slot)
+                self.checkpoints_dropped += 1
+                continue
+            self._store_ops.append(op)
+            self._scratch_issued.append(slot)
+            self.checkpoints_kept += 1
+            budget -= 1
 
     def resumable_hit(
         self,
@@ -1056,11 +1165,20 @@ class PagedStateCheckpointCoordinator:
                 continue
             self._store_ops.append(op)
             self.checkpoints_kept += 1
+        restores = self.store.take_restore_ops()
+        if self._scratch_queued:
+            self._take_scratch_stores(
+                self._max_ops_per_batch - len(self._store_ops) - len(restores)
+            )
         stores, self._store_ops = self._store_ops, []
-        return tuple(stores), self.store.take_restore_ops()
+        return tuple(stores), restores
 
     def complete_previous_batch(self) -> None:
         self.store.complete_inflight()
+        # The batch that carried these stores has been issued.
+        issued, self._scratch_issued = self._scratch_issued, []
+        for slot in issued:
+            self._scratch.release(slot)
 
     def has_available_units(
         self, count: int, protected_hash: int | None = None

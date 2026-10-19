@@ -24,7 +24,10 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointCoordinator,
+    checkpoint_copy_ops_per_batch,
+)
 from atom.model_engine.prefix_hash import (
     block_hash,
     chained_block_hashes,
@@ -40,6 +43,8 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
     StateTransfer,
+    midstep_target_ok,
+    snap_midstep_position,
 )
 from atom.utils import envs
 
@@ -120,6 +125,26 @@ class JointBoundaryDecision:
 # older than this many is re-walked.
 _RECENT_INDEX_CHANGES = 8192
 
+
+def draft_kv_lookahead(num_speculative_tokens: int) -> int:
+    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+
+    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
+    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    mid-steps after it bumps `context_lens` and writes one token at
+    `context_lens - 1`. So a forward whose target context ends at `C` writes
+    draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
+    (prefill: `C` is the chunk end; decode: `C = len(seq) - num_rejected`, the
+    placeholders the scheduler appended assume full acceptance). The draft
+    therefore needs `k - 1` positions past `len(seq)`.
+
+    A position past the row's allocated blocks reads its block id from the
+    zeroed tail of the block table, so the write lands in physical block 0 --
+    another request's KV, or the units of a PAGE state checkpoint.
+    """
+    return max(0, int(num_speculative_tokens or 0) - 1)
+
+
 # Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
 # from MIN to MAX; bounds the hashing wasted past the first miss.
 _WALK_HASH_ROUND_MIN = 64
@@ -181,6 +206,10 @@ class BlockManager:
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
         self.hash_block_size = hash_block_size_for(self.block_size, self.dcp_world_size)
+        # `draft_kv_lookahead`: positions past `len(seq)` a forward's draft
+        # round writes. Set by the scheduler, which knows whether this engine
+        # drafts; admission charges for it and `may_append` allocates it.
+        self.draft_lookahead = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
         self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
@@ -261,6 +290,8 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             -1, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        # See ATOM_STATE_CHECKPOINT_END_MARGIN and `_record_checkpoint_end`.
+        self.state_checkpoint_end_margin = envs.ATOM_STATE_CHECKPOINT_END_MARGIN
         # Independent of the interval, because the demand rung is not part of
         # the grid: it is the one placement a *refused* hit makes for itself.
         # See `_record_checkpoint_demand` for what turning it off is testing.
@@ -288,6 +319,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
+            state_tier_cpu_bytes,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -317,6 +349,7 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
+                readable_midstep=state_runtime.transfer.readable_midstep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -334,6 +367,18 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        # Where a readable backend can snapshot inside a forward; see
+        # `midstep_target_ok`. Zero for a backend that cannot.
+        self.midstep_grid = state_runtime.transfer.midstep_grid
+        self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
+        if self.paged_state_checkpoints is not None:
+            # A PAGE midstep checkpoint is copied into a scratch slot from
+            # this pool, then stored from there, within the copy budget the
+            # runner's descriptor staging is sized to: one definition for both.
+            self.paged_state_checkpoints.attach_midstep_scratch(
+                self.state,
+                checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
+            )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
         # up — the ladder would checkpoint into a void. The interval defaults to
@@ -443,6 +488,16 @@ class BlockManager:
             self.state_offload = StateOffloadIndex(
                 can_store=self.state_tier_capability.can_store_state,
                 can_load=self.state_tier_capability.can_load_state,
+                # The codec stores one `image_bytes` image per entry (the
+                # worker turns the tier off unless its entry is exactly that).
+                # Not `slot_bytes`: under MTP a slot holds more than an image
+                # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
+                # this index a third below the codec, hiding images it holds.
+                max_cpu_entries=(
+                    state_tier_cpu_bytes() // checkpoint_spec.image_bytes
+                    if checkpoint_spec is not None
+                    else None
+                ),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -464,6 +519,11 @@ class BlockManager:
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
         self.chunks_cut_for_end: int = 0
+        # Ladder, demand or anchor positions a forward covered but could not
+        # snapshot even after moving back onto its grid: too close to the
+        # forward's start for the conv window, or the forward started off the
+        # block grid. Each is a checkpoint the cutting ladder would have kept.
+        self.midstep_positions_unreadable: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
@@ -542,7 +602,10 @@ class BlockManager:
         pass. `allocate` protects the one checkpoint it is about to pin and
         sees the pins taken before it; `may_append` runs only in a pass that
         scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
-        first), so every pin was already released at the top of that pass.
+        first), so every pin was already released at the top of that pass --
+        except for the draft lookahead an admission allocates right after its
+        `allocate`, which `can_allocate` charged in the same units check
+        (`draft_lookahead_blocks`), against the same protected checkpoint.
         Under contention the reachable outcome is a refused admission, not
         this.
 
@@ -660,6 +723,18 @@ class BlockManager:
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
+    def draft_lookahead_blocks(self, seq_len: int) -> int:
+        """Blocks past `num_pool_blocks(seq_len)` that `draft_lookahead` adds.
+
+        What admission charges on top of the prompt, so the block `may_append`
+        takes for a forward ending at `seq_len` was paid for in the same pass.
+        """
+        if not self.draft_lookahead:
+            return 0
+        return self.num_pool_blocks(
+            seq_len + self.draft_lookahead
+        ) - self.num_pool_blocks(seq_len)
+
     @property
     def max_pool_tokens(self) -> int:
         """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
@@ -686,7 +761,7 @@ class BlockManager:
         lo = 0
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self.num_pool_blocks(mid) <= capacity:
+            if self.num_pool_blocks(mid) + self.draft_lookahead_blocks(mid) <= capacity:
                 lo = mid
             else:
                 hi = mid - 1
@@ -1107,7 +1182,9 @@ class BlockManager:
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(self.num_pool_blocks(len(seq))):
+            if not self._has_page_units(
+                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+            ):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
@@ -1142,8 +1219,12 @@ class BlockManager:
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = self._n_hash_blocks(seq) - self.kv.count_used(
-            walk.ids, num_cached_blocks
+        # Plus the draft round's lookahead past the prompt, which the scheduler
+        # allocates right after `allocate` (`may_append(..., lookahead=)`).
+        num_new_blocks = (
+            self._n_hash_blocks(seq)
+            - self.kv.count_used(walk.ids, num_cached_blocks)
+            + self.draft_lookahead_blocks(len(seq))
         )
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
@@ -1178,10 +1259,9 @@ class BlockManager:
         # argument, and `_record_checkpoint_end` derives its position from
         # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
         #
-        # Which makes it free today: the call returns at its first line while
-        # no backend declares `readable_midstep` (see
-        # `GDNStateMixin.state_transfer`). Kept in place, and in the right
-        # place, because that is a policy decision and this is not.
+        # Free unless a backend declares `readable_midstep`: the call returns
+        # at its first line otherwise. Qwen GDN does under
+        # `ATOM_GDN_STATE_MIDSTEP=1`, and then every admission pays it.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
 
@@ -2348,6 +2428,19 @@ class BlockManager:
         # than the model's final forward runs would back off below it
         # (`replay_start`), recomputing what the checkpoint saves.
         room = max(room, self.min_final_prefill_rows)
+        # The next turn re-renders this prompt's last few tokens (the chat
+        # template's generation prompt), so an anchor must sit before them too.
+        # Measured on Qwen3.5 AgentX: with no margin, prompts of length
+        # 16k + 1 put the divergence inside the anchor's block, and their
+        # follow-ups resumed from the anchor 1 time in 282 (95.6% otherwise).
+        #
+        # The larger of the room and the margin, not their sum. Against no
+        # margin the anchor moves back by up to `ceil((margin - room) / block)`
+        # blocks -- one for Qwen3.5's 5 over a PAGE room of 0 -- so a margin
+        # wider than a block costs a verbatim resend several blocks, and a
+        # prompt shorter than `margin + block` keeps no anchor (`end` below is
+        # 0). Pinned by `TestPromptEndAnchorTemplateMargin`.
+        room = max(int(room), self.state_checkpoint_end_margin)
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the
@@ -2400,7 +2493,7 @@ class BlockManager:
         blocks the forward just finished, and this would be a hash pass over the
         whole prompt on every admission, spent on nothing.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             seq.block_hashes = []
             return
         # The continuation itself -- resume from the last APPENDED hash (on a
@@ -2445,29 +2538,76 @@ class BlockManager:
         one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
         behavior end to end rather than the check.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             return []
         interval = self.state_checkpoint_interval_tokens
         hbs = self.hash_block_size
+        grid, min_offset = self.midstep_grid, self.midstep_min_offset
         hashes = seq.block_hashes
         rung = 0
         if limit := self.checkpoint_limit(seq):
             rung = min(end, limit)
             rung -= rung % interval
-        out = []
+        out = {}
         for pos in sorted(
             {p for p in (rung, seq.checkpoint_demand_pos, seq.checkpoint_end_pos) if p}
         ):
             if not start < pos <= end:
                 continue
             assert not pos % hbs, f"checkpoint position {pos} is off the {hbs} grid"
-            nblocks = pos // hbs
+            # The state the kernel materialized at or before `pos`. It must
+            # still be a block boundary to have a hash, which holds exactly
+            # when this forward starts on one -- the scheduler keeps non-final
+            # chunk ends on the block grid (`align_midstep_chunk`) for that.
+            snapped = snap_midstep_position(pos, start, end, grid)
+            if snapped % hbs or not midstep_target_ok(
+                snapped, start, end, grid, min_offset
+            ):
+                self.midstep_positions_unreadable += 1
+                continue
+            nblocks = snapped // hbs
             # A position past the chain is one `_extend_hash_chain` could not
             # name — nothing to file it under, so it cannot be found again.
             if nblocks > len(hashes):
                 continue
-            out.append((pos, hashes[nblocks - 1]))
-        return out
+            out[snapped] = hashes[nblocks - 1]
+        return sorted(out.items())
+
+    def midstep_anchor(self, seq: Sequence, start: int, end: int) -> int:
+        """Where this forward files the prompt-end anchor, or 0.
+
+        `checkpoint_end_pos` moved onto the forward's grid, as
+        `midstep_positions` moves it. The class that ranks checkpoints by
+        whether they are the anchor compares against this, not the unsnapped
+        position, or the anchor it actually filed is ranked as a guess.
+        """
+        anchor = seq.checkpoint_end_pos
+        if not (anchor and start < anchor <= end):
+            return 0
+        return snap_midstep_position(anchor, start, end, self.midstep_grid)
+
+    def _midstep_applies(self, seq: Sequence) -> bool:
+        cache = self._state_checkpoint_cache
+        return cache.readable_midstep and cache.applies(seq)
+
+    def align_midstep_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+        """`chunk` shortened so a non-final prefill chunk ends on a block boundary.
+
+        A readable class needs no cut onto its rungs, so the budget alone ends
+        a chunk -- anywhere. The next chunk would then start off the block
+        grid, every position on *its* grid would be off it too, and
+        `midstep_positions` would have to drop them all: for a prompt longer
+        than one batch, the anchor along with them. Giving back under one
+        block of this forward's budget keeps the next start on the grid.
+
+        Unchanged when the chunk finishes the prompt, or when it is shorter
+        than reaching the next boundary.
+        """
+        if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
+            return chunk
+        hbs = self.hash_block_size
+        aligned = (start + chunk) // hbs * hbs - start
+        return aligned if aligned > 0 else chunk
 
     def plan_midstep(self, seq: Sequence, start: int, end: int) -> None:
         """Reserve a destination slot for every checkpoint this forward covers.
@@ -2481,13 +2621,14 @@ class BlockManager:
         one forward, so a second plan for the same seq means the first forward
         never ran — hand its slots back rather than leak them.
         """
-        if not self.state.readable_midstep:
+        if not self._state_checkpoint_cache.readable_midstep:
             return
         if seq.midstep_reservations:
             self.cancel_midstep(seq)
-        seq.midstep_reservations = self.state.reserve_midstep(
+        seq.midstep_reservations = self._state_checkpoint_cache.reserve_midstep(
             seq, self.midstep_positions(seq, start, end)
         )
+        seq.midstep_anchor_pos = self.midstep_anchor(seq, start, end)
 
     def commit_midstep(self, seq: Sequence) -> None:
         """File this forward's reservations, now that its bytes exist.
@@ -2498,7 +2639,7 @@ class BlockManager:
         """
         if not seq.midstep_reservations:
             return
-        self.state.publish_midstep(seq.midstep_reservations, seq)
+        self._state_checkpoint_cache.publish_midstep(seq.midstep_reservations, seq)
         # The rightmost published position, for the decode-side spacing rule in
         # `checkpointers_at`. Generation is never midstep-readable — its
         # forwards end where acceptance puts them — so it still measures from
@@ -2508,13 +2649,15 @@ class BlockManager:
             seq.last_checkpoint_pos, max(p for _g, p, _h in seq.midstep_reservations)
         )
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def cancel_midstep(self, seq: Sequence) -> None:
         """Hand back reservations whose forward is not going to run."""
         if not seq.midstep_reservations:
             return
-        self.state.cancel_midstep(seq.midstep_reservations)
+        self._state_checkpoint_cache.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def checkpoint_cut(
         self, seq: Sequence, start: int, end: int, *, record: bool = True
@@ -2613,6 +2756,7 @@ class BlockManager:
             "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
+            "midstep_positions_unreadable": self.midstep_positions_unreadable,
             "joint_boundaries": self.joint_boundaries,
             "state_hbm": self.state_hbm_boundaries,
             "state_tier": self.state_tier_boundaries,
@@ -3119,31 +3263,62 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
-    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+    def can_append(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> bool:
+        """Whether the pool can back what `may_append` takes for this step.
+
+        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
+        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
+        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
+        passed so the check states what it covers.
+        """
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
-        needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
+        reach = seq_len + max(num_new_tokens, lookahead)
+        needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         return self._has_page_units(new_blocks_needed)
 
-    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
-        # Note: in disaggregated (P/D) mode the scheduler skips this call on
-        # the first decode step after remote prefill, because blocks were
-        # already allocated during the KV transfer phase.
+    def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
+        """Allocate every block this step's KV writes land in.
+
+        The target writes up to `len(seq) - 1`; the draft round writes
+        `lookahead` positions past that (`draft_kv_lookahead`). Checking that
+        the pool has room (`can_append`) is not the same as allocating it: a
+        position past the last allocated block reads block id 0 from the zeroed
+        block-table tail, and the write lands in whoever owns physical block 0.
+        """
+        # Note: in disaggregated (P/D) mode the scheduler skips the
+        # `num_new_tokens` half on the first decode step after remote prefill,
+        # because those blocks were already allocated during the KV transfer.
         block_table = seq.block_table
         seq_len = len(seq)
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
         ebs = self._effective_block_size()
+        needed_blocks = 0
         if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
             needed_blocks = (seq_len + ebs - 1) // ebs
-            while len(block_table) < needed_blocks:
-                # Decode-generated blocks: token not finalized yet (depends on
-                # sampling / speculative verification), so we cannot compute a
-                # correct hash here.  Just allocate the block without hashing.
-                block_table.append(self._fresh_block())
+        if lookahead:
+            needed_blocks = max(needed_blocks, (seq_len + lookahead + ebs - 1) // ebs)
+        while len(block_table) < needed_blocks:
+            # Decode-generated blocks: token not finalized yet (depends on
+            # sampling / speculative verification), so we cannot compute a
+            # correct hash here.  Just allocate the block without hashing.
+            block_table.append(self._fresh_block())
+
+    def draft_writes_allocated(self, seq: Sequence) -> bool:
+        """Whether `seq`'s blocks reach the end of this forward's draft round.
+
+        `len(seq) + draft_lookahead` positions, the bound `draft_kv_lookahead`
+        derives. The scheduler checks it on every sequence it schedules.
+        """
+        ebs = self._effective_block_size()
+        reach = len(seq) + self.draft_lookahead
+        return len(seq.block_table) * ebs >= reach
 
     # ---------------- KV event API ---------------- #
 
