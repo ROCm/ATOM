@@ -265,7 +265,7 @@ concurrency:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 jobs:
   load-config:
@@ -280,7 +280,7 @@ jobs:
       dashboard_hardware: ${{ env.ATOMESH_DASHBOARD_HARDWARE }}
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install YAML parser
         run: python3 -m pip install pyyaml
@@ -544,7 +544,7 @@ jobs:
           PY
 
       - name: Upload expanded matrix
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomesh-benchmark-matrix
           path: atomesh-matrix.json
@@ -564,7 +564,7 @@ jobs:
       SLURM_SUBMIT_RUNNER: ${{ inputs.atomesh_slurm_submit_runner }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Run Mooncake RDMA transfer test on selected nodes
         id: rdma-smoke
@@ -1575,10 +1575,10 @@ jobs:
       has_results: ${{ steps.summary.outputs.has_results }}
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download model benchmark artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: atomesh-model-benchmark-*
           merge-multiple: true
@@ -1691,7 +1691,7 @@ jobs:
       # its per-case artifact.
       - name: Download torch profiler traces
         if: always()
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: atomesh-torch-traces-*
           path: torch-traces
@@ -1755,7 +1755,7 @@ jobs:
       - name: Upload per-rank torch profiler traces
         if: ${{ always() && steps.torch-traces.outputs.has_traces == 'true' }}
         continue-on-error: true
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             const fs = require('fs')
@@ -1809,7 +1809,7 @@ jobs:
 
       - name: Upload benchmark summary
         if: ${{ steps.summary.outputs.has_results == 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomesh-benchmark-summary
           path: |
@@ -1824,6 +1824,9 @@ jobs:
       group: gh-pages-deploy
       cancel-in-progress: false
     name: Update ATOMesh Benchmark Dashboard
+    permissions:
+      actions: read
+      contents: write
     needs: [summarize-results]
     if: >-
       !cancelled()
@@ -1836,10 +1839,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download CI benchmark dashboard inputs
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: atomesh-benchmark-summary
           path: atomesh-dashboard-input
@@ -1857,7 +1860,7 @@ jobs:
           data-path: benchmark-dashboard/data.js
 
       - name: Store ATOMesh benchmark result to dashboard
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           tool: customBiggerIsBetter
           output-file-path: atomesh-dashboard-input/atomesh-benchmark-action.json

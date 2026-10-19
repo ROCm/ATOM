@@ -4502,7 +4502,7 @@ class RapidServeModelRunner(ModelRunner):
         # Session ID derived from the disagg IPC address so IPC handoff temp
         # files from different engine runs never collide.
         self._disagg_session_id = hashlib.md5(
-            config.disagg_kvcache_ipc_addr.encode()
+            config.disagg_kvcache_ipc_addr.encode(), usedforsecurity=False
         ).hexdigest()[:12]
 
     @staticmethod

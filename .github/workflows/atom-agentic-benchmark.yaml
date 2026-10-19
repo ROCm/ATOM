@@ -81,7 +81,7 @@ jobs:
       checkout_sha: ${{ steps.revision.outputs.sha }}
       aiter_wheel_artifact_id: ${{ steps.aiter-upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.atom_commit || github.sha }}
       - name: Record checked-out commit
@@ -104,7 +104,7 @@ jobs:
       - name: Share pinned AITER wheel with all points
         id: aiter-upload
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_wheel != '' && inputs.dry_run != true }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atom-agentic-aiter-wheel-${{ github.run_attempt }}
           path: aiter-whl/
@@ -112,7 +112,7 @@ jobs:
           retention-days: 15
           if-no-files-found: error
       - name: Save run configuration
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atom-agentic-run-config-${{ github.run_attempt }}
           path: agentic-run-config/

@@ -42,7 +42,7 @@ jobs:
       reason: ${{ steps.gate.outputs.reason }}
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Check approval and label gate
         id: gate
@@ -74,7 +74,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Wait for Pre Checkin workflow
         run: bash ./.github/scripts/check_signal.sh
@@ -95,7 +95,7 @@ jobs:
       aiter_wheel_name: ${{ steps.download.outputs.aiter_wheel_name }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Prefer latest main aiter wheel manifest and fallback to artifact
         id: download
@@ -105,7 +105,7 @@ jobs:
         run: bash .github/scripts/download_aiter_wheel.sh
 
       - name: Upload aiter wheel
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: aiter-whl
           path: aiter-whl/amd_aiter*.whl
@@ -217,10 +217,10 @@ jobs:
       RESULT_DIR: plugin-ci-results
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download aiter wheel
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: aiter-whl
           path: aiter-whl
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload SGLang artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sglang-${{ matrix.model_name }}-artifacts
           path: plugin-ci-results/

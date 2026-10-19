@@ -102,7 +102,7 @@ jobs:
       has_model_cells_mi308: ${{ steps.meta.outputs.has_model_cells_mi308 }}
     steps:
       - name: Checkout selected ATOM branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Resolve SGLang version metadata
         run: python3 .github/scripts/resolve_sglang_metadata.py
@@ -770,9 +770,9 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
 
@@ -780,7 +780,7 @@ jobs:
         run: mkdir -p /tmp/accuracy-results
 
       - name: Download accuracy artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/accuracy-results
           pattern: accuracy-*
@@ -826,7 +826,7 @@ jobs:
 
       - name: Store SGLANG accuracy result to dashboard
         if: steps.transform.outputs.entries_count != '0' && steps.transform.outputs.entries_count != ''
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           tool: customBiggerIsBetter
           output-file-path: accuracy-benchmark-input.json

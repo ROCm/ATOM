@@ -62,28 +62,31 @@ runs:
         MODEL_LOCK_WAIT_SECONDS: "1800"
         MODEL_LOCK_POLL_INTERVAL: "30"
         MODEL_PROGRESS_INTERVAL: "60"
+        MODEL_PATH: ${{ inputs.model-path }}
+        CONTAINER_NAME: ${{ inputs.container-name }}
+        DOWNLOAD_REQUIRED: ${{ inputs.download-required }}
       run: |
         set -euo pipefail
         if [ -z "${MODEL_HOST_ROOT:-}" ]; then
           echo "Model cache directory not found, skipping model download"
           exit 0
         fi
-        model_dir="/models/${{ inputs.model-path }}"
+        model_dir="/models/${MODEL_PATH}"
         echo "Lock-protected download for ${model_dir}"
         if docker exec \
           -e HF_TOKEN="${HF_TOKEN:-}" \
-          -e MODEL_ID="${{ inputs.model-path }}" \
+          -e MODEL_ID="${MODEL_PATH}" \
           -e TARGET_DIR="${model_dir}" \
           -e MODEL_DOWNLOAD_TIMEOUT="${MODEL_DOWNLOAD_TIMEOUT}" \
           -e MODEL_LOCK_WAIT_SECONDS="${MODEL_LOCK_WAIT_SECONDS}" \
           -e MODEL_LOCK_POLL_INTERVAL="${MODEL_LOCK_POLL_INTERVAL}" \
           -e MODEL_PROGRESS_INTERVAL="${MODEL_PROGRESS_INTERVAL}" \
-          "${{ inputs.container-name }}" \
+          "${CONTAINER_NAME}" \
           bash -lc 'bash /workspace/.github/scripts/download_model_with_lock.sh "$MODEL_ID" "$TARGET_DIR"'; then
           echo "Model ready: ${model_dir}"
-        elif [ "${{ inputs.download-required }}" = "true" ]; then
-          echo "Model download failed for '${{ inputs.model-path }}'. Aborting."
+        elif [ "${DOWNLOAD_REQUIRED}" = "true" ]; then
+          echo "Model download failed for '${MODEL_PATH}'. Aborting."
           exit 1
         else
-          echo "::warning::Failed to download ${{ inputs.model-path }}, will use HF online"
+          echo "::warning::Failed to download ${MODEL_PATH}, will use HF online"
         fi

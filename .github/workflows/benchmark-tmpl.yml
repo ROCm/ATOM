@@ -136,7 +136,7 @@ jobs:
         run: docker ps -a && rocm-smi --showmemuse 2>/dev/null || true
 
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ inputs.atom_commit || github.sha }}
 
@@ -175,7 +175,7 @@ jobs:
 
       - name: Download pinned AITER wheel
         if: ${{ inputs.aiter_wheel_artifact_id != '' }}
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           artifact-ids: ${{ inputs.aiter_wheel_artifact_id }}
           path: ${{ runner.temp }}/benchmark-aiter-whl
@@ -223,9 +223,9 @@ jobs:
         env:
           REQUESTED_IMAGE: ${{ inputs.image }}
           IMAGE_DISPLAY: ${{ inputs.image_display || inputs.image }}
+          RUNNER_HINT: ${{ inputs.runner }}
         run: |
           set -euo pipefail
-          RUNNER_HINT="${{ inputs.runner }}"
           bash .github/scripts/collect_gpu_info.sh atom-benchmark docker "$RUNNER_HINT"
           # A registry's latest may have changed since startup. Use the name
           # resolved with this run's digest, never a second remote lookup.
@@ -286,6 +286,8 @@ jobs:
           docker exec atom-benchmark cat /tmp/atom_client.log 2>/dev/null || true
 
       - name: Inject GPU metadata into benchmark result
+        env:
+          DISPLAY_NAME: ${{ inputs.display }}
         run: |
           docker exec \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
@@ -293,7 +295,7 @@ jobs:
             -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
             -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
             -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
-            -e DISPLAY_NAME="${{ inputs.display }}" \
+            -e DISPLAY_NAME="${DISPLAY_NAME}" \
             atom-benchmark python3 -c "
           import json, os
           p = os.environ['RESULT_PATH']
@@ -354,7 +356,7 @@ jobs:
 
       - name: Upload profiler traces
         if: always() && inputs.enable_profiler
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: profiler-traces-${{ env.RESULT_FILENAME }}
           path: profiler-traces/
@@ -368,13 +370,13 @@ jobs:
 
       - name: Upload RTL traces
         if: inputs.enable_rtl
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rtl-traces-${{ env.RESULT_FILENAME }}
           path: rtl-traces/
 
       - name: Upload benchmark result
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-${{ env.RESULT_FILENAME }}
           path: ${{ env.RESULT_FILENAME }}.json
@@ -391,7 +393,7 @@ jobs:
       - name: Upload versioned summary
         id: bundle-summary
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atom-benchmark-summary-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
           path: bundle-summaries/${{ env.RESULT_FILENAME }}/
@@ -401,7 +403,7 @@ jobs:
       - name: Upload complete bundle
         id: bundle-full
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atom-benchmark-bundle-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
           path: benchmark-bundles/${{ env.RESULT_FILENAME }}/
@@ -423,7 +425,7 @@ jobs:
       - name: Preserve unpackaged failure evidence
         id: bundle-diagnostics
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atom-benchmark-diagnostics-v1-${{ github.run_attempt }}-${{ env.RESULT_FILENAME }}
           path: benchmark-evidence/${{ env.RESULT_FILENAME }}/
@@ -432,7 +434,7 @@ jobs:
 
       - name: Link agentic point artifacts
         if: always() && inputs.bench_kind == 'aiperf_agentic'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           POINT_DISPLAY: ${{ inputs.display }}
           POINT_STATUS: ${{ job.status }}
@@ -469,8 +471,10 @@ jobs:
 
       - name: Clean Up
         if: always()
+        env:
+          CLEANUP_IMAGE: ${{ inputs.image }}
         run: |
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace \
-            ${{ inputs.image }} bash -lc "chmod -R u+rwX /workspace/atom /workspace/aiter /workspace/bench_serving 2>/dev/null || true; rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
+            "${CLEANUP_IMAGE}" bash -lc "chmod -R u+rwX /workspace/atom /workspace/aiter /workspace/bench_serving 2>/dev/null || true; rm -rf /workspace/atom/ /workspace/aiter/ /workspace/bench_serving/" || true
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true

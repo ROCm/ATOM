@@ -128,12 +128,12 @@ jobs:
       artifact: ${{ steps.wheel.outputs.artifact }}
     steps:
       - name: Checkout ATOM
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: atom-src
 
       - name: Checkout LMCache
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: LMCache/LMCache
           ref: ${{ inputs.lmcache_commit }}
@@ -241,7 +241,7 @@ jobs:
             '
 
       - name: Upload wheel as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lmcache-rocm-torch210-${{ github.run_id }}-${{ github.run_attempt }}
           path: lmcache-src/dist_rocm_torch210/*.whl
@@ -252,7 +252,7 @@ jobs:
         run: |
           {
             echo "## LMCache ROCm torch 2.10 Wheel"
-            echo "- **LMCache commit**: [${{ inputs.lmcache_commit }}](https://github.com/LMCache/LMCache/commit/${{ inputs.lmcache_commit }})"
+            echo "- **LMCache commit**: [${LMCACHE_COMMIT}](https://github.com/LMCache/LMCache/commit/${LMCACHE_COMMIT})"
             echo "- **Version**: ${{ steps.version.outputs.version }}"
             echo "- **Wheel**: ${{ steps.wheel.outputs.wheel || '(build failed)' }}"
             echo "- **sha256**: ${{ steps.wheel.outputs.sha256 }}"
@@ -295,7 +295,7 @@ jobs:
       BUILT_SHA256: ${{ needs.build.outputs.sha256 }}
     steps:
       - name: Checkout ATOM
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           sparse-checkout: |
             .github/actions
@@ -356,7 +356,7 @@ jobs:
           echo "Publishing ${artifact} from ${branch}"
 
       - name: Download the wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ steps.source.outputs.artifact }}
           run-id: ${{ steps.source.outputs.run_id }}
@@ -505,12 +505,12 @@ jobs:
       SOURCE_RUN: ${{ needs.publish.outputs.source_run }}
     steps:
       - name: Checkout ATOM
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
 
       - name: Download the wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.publish.outputs.artifact }}
           run-id: ${{ needs.publish.outputs.source_run }}
@@ -539,6 +539,8 @@ jobs:
             > "${RUNNER_TEMP}/requires.diff" || true
 
       - name: Open the PR
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           .github/scripts/bump_lmcache_wheel_pin.py \
@@ -577,7 +579,7 @@ jobs:
           pr_url="$(gh pr list --head "${branch}" --state open --json url --jq '.[0].url // empty')"
           if [ -z "${pr_url}" ]; then
             pr_url="$(gh pr create --draft \
-              --base "${{ github.event.repository.default_branch }}" \
+              --base "${DEFAULT_BRANCH}" \
               --head "${branch}" \
               --title "build(docker): pin LMCache ${VERSION} wheel" \
               --body-file "${RUNNER_TEMP}/pr.md")"
