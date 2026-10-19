@@ -1,6 +1,6 @@
 {
   "atom_integration_commit": "7b231f15ee4981c1efacb3cc1acd65c65bc257db",
-  "aiter_commit": "9cdcf70d5e4efb1f649381e9e30da40a4f193233",
+  "aiter_commit": "70c93048e57fa40008707b803d35732d44fc3a3b",
   "packages": {
     "torch": "2.10.0+rocm7.2.4.lw.git3d3aa833",
     "amd-aiter": "0.1.25.dev210+gcc7099335.d20261013",
@@ -80,11 +80,11 @@
     "model-00059-of-00059.safetensors": 5370979136
   },
   "model_identity_note": "Metadata hashes and shard sizes only; full weight-content hashes were not collected.",
-  "atom_tree_sha": "c1234f60d66a197a28c3050e47b41657b9a4fc38",
-  "aiter_policy": "Clean checkout of ROCm/aiter PR #6514 at the pinned SHA (MegaMoeTP big-M; descends from main cc709933); no local patch in either arm.",
+  "atom_tree_sha": "54ad4a154433f8348d4b4951d525b4155c0d607e",
+  "aiter_policy": "Clean checkout of ROCm/aiter PR #6514 at the pinned SHA (MegaMoeTP big-M; descends from main cc709933); no local patch in either arm. Big-M SDMA needs MORI main with ROCm/mori#786, built with BUILD_CCO_SDMA=ON (validated eb211db5c9cd5a39ee771b5c6799db96ab8cf1c0).",
   "historical_validation_scope": "Existing GPU, full-model trace and GSM8K results used AITER main cc709933 plus the former tiled-sort extension. They do not validate the new pure-main comparison.",
-  "current_validation_scope": "Rebased onto main ffd113bc. Complete CPU suite in the SP container: failures and collection errors match unmodified main ffd113bc in the same container (155 failed, 12 collection errors, mostly vLLM/SGLang plugin tests against the installed versions); 12933 passed vs 12604 on main, both 394 skipped and 3 xfailed. Before this rebase (base 2c948339, clean AITER main cc709933): 209 focused tests, 81 CPU-only SP tests, 9 GPU copy/graph tests, full-model level-3/FULL graph capture, 2K/4K four-rank traces and short decode passed. ATOM runtime watchdog checks are removed; each full fused prefill block uses sp_rs_norm, MegaMoE and copy_tail. No new end-to-end throughput or GSM8K result.",
-  "atom_base_commit": "ffd113bc5e3c750dce3888a29df7461d0a7e5b75",
+  "current_validation_scope": "Rebased onto main 53e4fb52. Complete CPU suite in the SP container: 155 failed and 12 collection errors, the same nodes as unmodified main ffd113bc in that container (mostly vLLM/SGLang plugin tests against the installed versions); 13389 passed, 394 skipped, 3 xfailed. Before the earlier rebases (base 2c948339, clean AITER main cc709933): 209 focused tests, 81 CPU-only SP tests, 9 GPU copy/graph tests, full-model level-3/FULL graph capture, 2K/4K four-rank traces and short decode passed. ATOM runtime watchdog checks are removed; each full fused prefill block uses sp_rs_norm, MegaMoE and copy_tail. End-to-end throughput and GSM8K: bigm_validation_scope.",
+  "atom_base_commit": "53e4fb52403707ab07b69ee909501ea3cc25ca5c",
   "atom_validation_commit": "7a44d3ac45a1640a8f525084206384c77a4e6ff7",
-  "bigm_validation_scope": "AITER 9cdcf70d, max_num_batched_tokens=32768 with 8192 local tokens per tile, measured on an experiment tree whose tail used torch copies instead of copy_tail: one warmup and one formal A/B round (128K input + 100 output, C16), formal total throughput 52169.19 -> 62336.82 tok/s (+19.49%); GSM8K 3-shot 87.72 (native 87.49), 72-shot 93.78 (native 93.71). This tree: copy_tail covers FP8 scales of tiles over 4096 rows; the tile is min(ceil(max_num_batched_tokens / SP size), 8192) (MXFP8: 256 / SP size), so the 32768 budget on SP4 selects the same 8192-row tile without an environment variable; 74 SP MegaMoE tests including GPU copy/graph at 8192 rows passed. No full-model run on this exact tree yet."
+  "bigm_validation_scope": "AITER 70c93048 and MORI eb211db5 on ATOM f2314f45 (this implementation before the rebase onto 53e4fb52), max_num_batched_tokens=32768 (tile 8192): one warmup and one formal A/B round (128K input + 100 output, C16), formal total throughput 51245.14 -> 65179.51 tok/s (+27.19%), warmup +24.59%; GSM8K strict-match 3-shot 89.16 (native 87.79), 72-shot 93.71 (native 93.40) with 99.4% of 72-shot prefill tokens on big-M. Budget 16384 (tile 4096) also served. Big-M kernels compile at initialization into a disk cache; none compiled while serving. Of 29 mega starts, one 32K warmup took 183 s and the 72-shot run had one big-M watchdog timeout after a single-rank stall. Big-M rejects 16384 local rows (32-bit offsets), so the tile stays at most 8192."
 }

@@ -6,11 +6,13 @@
 
 2026-10-16 更新：AITER 固定提交换为 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head（见第 1 节），其 `MegaMoeTP` 在本地行数 ≥ 2048（SP4 下全局 8192 token）时走 big-M kernel。ATOM 侧去掉 tile 的环境变量，每次 launch 的本地行数自动取 `min(ceil(max_num_batched_tokens / SP), 8192)`，SP 为实际的 SP group 大小（MXFP8 激活的上限为 `256 / SP`，SP4 下为 64），并修复 `copy_tail` 在超过 4096 行的 tile 上只拷前 4096 个 FP8 scale 的问题。32K budget 的 A/B 与 GSM8K 见 3.1 节。分支随后 rebase 到 ATOM main `ffd113bc`。
 
+2026-10-19 更新：AITER 固定提交换为 PR #6514 的新 head `70c93048`。该版本为 big-M kernel 加了磁盘缓存，初始化时编译全部档位，不再在服务中途编译；SDMA 设备函数改由 MORI 提供，需要 MORI main 包含 [ROCm/mori#786](https://github.com/ROCm/mori/pull/786)（已验证 `eb211db5`）。3.1 节的 A/B 与 GSM8K 已在本分支实现上重测。分支随后 rebase 到 ATOM main `53e4fb52`。
+
 ## 1. 拉取版本和依赖
 
 ATOM 远程分支：[`hexwang/atom_sp`](https://github.com/ROCm/ATOM/tree/hexwang/atom_sp)。rebase 后的全融合接入提交：[`7b231f15ee4981c1efacb3cc1acd65c65bc257db`](https://github.com/ROCm/ATOM/commit/7b231f15ee4981c1efacb3cc1acd65c65bc257db)。当前实现还包含上述 watchdog 删除与 tail 拷贝合并，使用随分支更新的 [experiment-source.json](../../scripts/experiments/sp_mega_moe/experiment-source.json) 校验实现树。
 
-AITER 固定在 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head [`9cdcf70d5e4efb1f649381e9e30da40a4f193233`](https://github.com/ROCm/aiter/commit/9cdcf70d5e4efb1f649381e9e30da40a4f193233)（尚未合入；其祖先包含此前使用的 main `cc709933`），两组都使用干净源码。tile 小于 2048 时（如默认 A/B 的 2K / 4K budget）在 main `cc709933` 上同样可用；tile 达到 2048（budget ≥ 8192，包括 ATOM 默认的 16384）需要 big-M。big-M 的 SDMA 需要以 `BUILD_CCO_SDMA=ON` 编译的 MORI：`AITER_MORI_PATH` 指向其安装目录；环境里已装有其他 MORI 时，把该目录加入 `PYTHONPATH`（`run_ab.py` 保留调用方的 `PYTHONPATH`）。遵照用户最后确认，**不安装 tiled sorting 或其他本地补丁**。ATOM 会根据 AITER API 自动关闭 tiled sorting 扩展，native 和小 batch 回退走 main 自带的路径。
+AITER 固定在 [PR #6514](https://github.com/ROCm/aiter/pull/6514) 的 head [`70c93048e57fa40008707b803d35732d44fc3a3b`](https://github.com/ROCm/aiter/commit/70c93048e57fa40008707b803d35732d44fc3a3b)（尚未合入；其祖先包含此前使用的 main `cc709933`），两组都使用干净源码。tile 小于 2048 时（如默认 A/B 的 2K / 4K budget）在 main `cc709933` 上同样可用；tile 达到 2048（budget ≥ 8192，包括 ATOM 默认的 16384）需要 big-M。big-M 的 SDMA 需要以 `BUILD_CCO_SDMA=ON` 编译、包含 ROCm/mori#786 的 MORI main（已验证 `eb211db5c9cd5a39ee771b5c6799db96ab8cf1c0`，更早的 main 缺少 `cco_sdma_put_ptr_rsig__thread`）：`AITER_MORI_PATH` 指向其安装目录；环境里已装有其他 MORI 时，把该目录加入 `PYTHONPATH`（`run_ab.py` 保留调用方的 `PYTHONPATH`）。遵照用户最后确认，**不安装 tiled sorting 或其他本地补丁**。ATOM 会根据 AITER API 自动关闭 tiled sorting 扩展，native 和小 batch 回退走 main 自带的路径。
 
 以下路径均可换成新机器的空闲目录；执行后沿用这些 shell 变量：
 
@@ -28,7 +30,7 @@ git -C "$SP_ATOM" merge-base --is-ancestor \
 git clone https://github.com/ROCm/aiter.git "$SP_WORK/aiter"
 export SP_AITER="$SP_WORK/aiter"
 git -C "$SP_AITER" fetch origin pull/6514/head
-git -C "$SP_AITER" switch --detach 9cdcf70d5e4efb1f649381e9e30da40a4f193233
+git -C "$SP_AITER" switch --detach 70c93048e57fa40008707b803d35732d44fc3a3b
 git -C "$SP_AITER" submodule update --init --recursive
 git -C "$SP_AITER" status --short
 ```
@@ -133,22 +135,24 @@ python -u "$SP_TOOLS/run_ab.py" --model "$SP_MODEL" --batches 32768 --rounds 1 \
 python "$SP_TOOLS/summarize.py" "$SP_WORK/ab-32k" > "$SP_WORK/ab-32k-summary.json"
 ```
 
-mega 服务日志应包含 `tile=8192`。2026-10-16 在 AITER `9cdcf70d` 上先跑一轮 warmup A/B，再跑一轮正式 A/B，正式轮均值：
+mega 服务日志应包含 `tile=8192`。2026-10-19 在本分支实现（ATOM `f2314f45`）、AITER `70c93048` 与 MORI `eb211db5` 上先跑一轮 warmup A/B，再跑一轮正式 A/B，正式轮均值：
 
 | 指标 | native | mega | 变化 |
 |---|---:|---:|---:|
-| 总吞吐 (tok/s) | 52,169.19 | 62,336.82 | +19.49% |
-| 输出吞吐 (tok/s) | 39.77 | 47.52 | +19.49% |
-| TTFT (ms) | 22,065.75 | 18,562.14 | -15.88% |
-| TPOT (ms) | 182.95 | 152.10 | -16.86% |
-| ITL (ms) | 181.12 | 150.58 | -16.86% |
-| E2EL (ms) | 40,177.75 | 33,619.78 | -16.32% |
+| 总吞吐 (tok/s) | 51,245.14 | 65,179.51 | +27.19% |
+| 输出吞吐 (tok/s) | 39.07 | 49.69 | +27.19% |
+| TTFT (ms) | 22,668.53 | 17,477.55 | -22.90% |
+| TPOT (ms) | 184.12 | 148.18 | -19.52% |
+| ITL (ms) | 182.28 | 146.70 | -19.52% |
+| E2EL (ms) | 40,896.18 | 32,147.34 | -21.39% |
 
-warmup 轮总吞吐 +26.64%。每个 32K prefill batch：native 0.583–0.592 s，mega 0.465–0.470 s。GSM8K（完整 1319 题，`--serve mega --batches 32768`，lm_eval local-completions）：3-shot 87.72%（native 87.49%），72-shot 93.78%（native 93.71%）；72-shot 的 prefill token 99.4% 走 big-M。
+warmup 轮总吞吐 +24.59%。每个 32K prefill batch：native 0.587 s，mega 0.460 s。GSM8K（完整 1319 题，lm_eval local-completions，strict-match）：3-shot 89.16%（native 87.79%），72-shot 93.71%（native 93.40%）；72-shot 的 prefill token 99.4% 走 big-M。2026-10-16 在 AITER `9cdcf70d`、tail 用 torch 拷贝的实验分支上，正式轮总吞吐为 +19.49%。
 
-以上结果来自 tail 用 torch 拷贝、尚无 `copy_tail` 的实验分支；本分支的 `copy_tail` 已通过 8192 行 GPU 拷贝 / graph 测试，整模型复测待补。
+big-M 编译：初始化时编译全部档位并写入 `FLYDSL_RUNTIME_CACHE_DIR/aiter_bigm`，首次启动约 320 s，之后约 75 s 就绪；各档位首次出现时不再停顿。budget 16384（tile 4096）同样验证通过。
 
-已知问题：big-M kernel 以 `link_extern` 链接 MORI 的 bitcode，FlyDSL 不为 extern-linked kernel 写磁盘缓存。每个进程第一次碰到某个 big-M 档位（全局 8192 / 16384 / 32768 token）的某个 tail 变体时，需要编译约 86 s。初始化只预编 32768 档，服务就绪约 240 s；长度不一的负载（如 GSM8K）在其他档位首次出现时会停顿。
+已知问题：
+- big-M 本地行数上限为 8192。16384 行（全局 65536 token）在 forward 时报 32 位偏移越界，tile 因此不超过 8192。
+- 间歇性单 rank 停顿：29 次 mega 启动中，一次 32K warmup 用了 183 s（通常 9–13 s），之后服务正常；72-shot GSM8K 中有一次 big-M 调用停顿 7.6 s，其余 rank 的看门狗超时，该层结果无效。期间没有编译。ATOM 不读取 MegaMoE 的看门狗位，此类超时不会报错。
 
 ## 4. 单独抓 trace，验收融合并观察 step 跳变
 
