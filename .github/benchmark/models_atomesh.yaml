@@ -397,6 +397,16 @@ models:
               # MC_ENABLE_DEST_DEVICE_AFFINITY pick the prefill GPU's rail.
               DECODE_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_consumer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma","ib_enable_alternate_hca":true,"ib_hca_count":8}
+          env_by_runner:
+            # MI350X ionic NICs: with Mooncake's default 2 QPs per endpoint,
+            # the first P->D write to the DCP decode ranks (sent from the MLA
+            # staging pool by 16 workers) fails with "ionic_comp_msn: wqe is
+            # not posted", and Mooncake then spins on CQ poll errors; the
+            # Mooncake Store needs 1 QP on these NICs for the same reason.
+            # Both sides must use the same QP count to connect.
+            atomesh-cicd-mi350:
+              common:
+                MC_NUM_QP_PER_EP: "1"
 
         - <<: *glm52_agentic_lmcache_cpp4_dcp4
           name: glm-52-mxfp4-1p1d-cpp4-dcp4-agentic-lmcache-1m-c64
