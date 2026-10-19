@@ -6,12 +6,13 @@ from pathlib import Path
 from atom.models.glm52.mono.config import AGENTX_BATCHES, GRAPH_BATCHES
 
 
-def test_only_batch_one_and_two_are_routed():
-    # Review Focus 2: batches 3..96 build but must not be routed. If this ever
-    # widens, the GSM8K gate at concurrency 1 stops covering what ships.
-    assert AGENTX_BATCHES == (1, 2)
+def test_only_batch_one_is_routed():
+    # Review Focus 2: batches 2..96 build but must not be routed (batch 2 runs
+    # slower than the production path). If this ever widens, the GSM8K gate
+    # at concurrency 1 stops covering what ships.
+    assert AGENTX_BATCHES == (1,)
     assert set(AGENTX_BATCHES) < set(GRAPH_BATCHES)
-    for batch in (3, 4, 8, 96):
+    for batch in (2, 3, 4, 8, 96):
         assert batch in GRAPH_BATCHES and batch not in AGENTX_BATCHES
 
 

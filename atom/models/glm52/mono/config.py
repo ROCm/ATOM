@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
-    GLM5_AGENTX_BATCHES,
     GLM5_GRAPH_BATCHES,
     GLM5_QUERY_LENGTHS,
     glm5_tp_config,
@@ -31,10 +30,13 @@ EXPERT_INTER = 2048  # moe_intermediate_size
 
 # the TP sizes the kernels are built for
 SUPPORTED_TP = (4,)
-# the batches a build covers, and the batches a step is routed at: only one and
-# two were measured faster than the production path, so only they are served
+# the batches a build covers, and the batches a step is routed at. The kernels
+# serve batch one and two (GLM5_AGENTX_BATCHES), but only batch one is faster
+# than the production path: at MTP4 concurrency 2 on AgentX, batch-1 steps
+# (S=5) ran 13% faster and batch-2 steps (S=10) 16% slower, matching the
+# engine A/B's batch-2 loss at S=12. So only batch one is routed.
 GRAPH_BATCHES = GLM5_GRAPH_BATCHES
-AGENTX_BATCHES = GLM5_AGENTX_BATCHES
+AGENTX_BATCHES = (1,)
 # the served decode widths: no speculation at all (1), and an MTP verify of
 # the anchor token plus 3/4/5 drafts (4, 5, 6) -- sourced from the kernel's own
 # declaration so a width added there cannot silently fail to reach here

@@ -443,7 +443,7 @@ class Glm52MonoRunner:
             # scheme is the opposite -- one `step` bump per decode step, a
             # distinct `layer` per launch -- and the two cannot be mixed: the
             # chunks would share a mailbox epoch. No width mono actually routes
-            # is chunked (`AGENTX_BATCHES` is (1, 2) and every supported
+            # is chunked (`AGENTX_BATCHES` is (1,) and every supported
             # `QUERY_LENGTHS` entry divides a kernel width exactly), so this is
             # unreachable today and refuses loudly rather than silently
             # corrupting a mailbox if that ever changes.

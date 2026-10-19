@@ -867,11 +867,11 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
     assert not module.MonoDecode(causal_lm, atom_config)._mono.enabled
 
 
-def test_glm_c1_c2_padded_graph_dispatches_q5(monkeypatch):
+def test_glm_c1_padded_graph_dispatches_q5(monkeypatch):
     import torch
 
     module = _glm_mono_module()
-    samples, active = 16 * 5, 2 * 5
+    samples, active = 16 * 5, 1 * 5
     decode = object.__new__(module.MonoDecode)
     decode._atom_config = SimpleNamespace(
         tensor_parallel_size=4,
@@ -904,7 +904,7 @@ def test_glm_c1_c2_padded_graph_dispatches_q5(monkeypatch):
             )
         ),
     )
-    context = SimpleNamespace(is_prefill=False, scheduled_bs=2, running_tokens=samples)
+    context = SimpleNamespace(is_prefill=False, scheduled_bs=1, running_tokens=samples)
     monkeypatch.setattr(
         module,
         "get_forward_context",
@@ -925,26 +925,23 @@ def test_glm_c1_c2_padded_graph_dispatches_q5(monkeypatch):
     )
     assert seen == [samples]
 
-    context.scheduled_bs = 1
-    assert decode.supports(
-        torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
-    )
-    assert seen == [samples, samples]
-
-    context.scheduled_bs = 4
-    assert not decode.supports(
-        torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
-    )
-    assert seen == [samples, samples]
+    # the kernels serve batch 2, but it measured slower than the production
+    # path, so it is not routed
+    for batch in (2, 4):
+        context.scheduled_bs = batch
+        assert not decode.supports(
+            torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
+        )
+    assert seen == [samples]
 
     # q2 (MTP1) is not one of GLM5_QUERY_LENGTHS == (1, 4, 5, 6) the kernels
     # are built for -- unlike q4, which the widened gate now admits
-    context.scheduled_bs = 2
+    context.scheduled_bs = 1
     metadata.max_seqlen_q = 2
     assert not decode.supports(
         torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
     )
-    assert seen == [samples, samples]
+    assert seen == [samples]
 
 
 def test_glm_fp8_fused_576_cache_has_explicit_device_io():

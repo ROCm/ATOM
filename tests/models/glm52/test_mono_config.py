@@ -17,6 +17,7 @@ from atom.models.glm52.mono.config import (
 )
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
+    GLM5_AGENTX_BATCHES,
     GLM5_CONFIG,
     glm5_kernel_samples,
     glm5_tp_config,
@@ -40,9 +41,13 @@ def test_indivisible_tp_is_refused_by_name(tp):
     assert why is not None and str(tp) in why
 
 
-def test_agentx_batches_are_one_and_two():
-    # Review Focus 2: the gate that makes the accuracy run meaningful.
-    assert AGENTX_BATCHES == (1, 2)
+def test_only_batch_one_is_routed_of_the_batches_the_kernels_serve():
+    # Review Focus 2: the gate that makes the accuracy run meaningful. The
+    # kernels serve batch one and two; batch two measured slower than the
+    # production path, so routing narrows to batch one.
+    assert GLM5_AGENTX_BATCHES == (1, 2)
+    assert AGENTX_BATCHES == (1,)
+    assert set(AGENTX_BATCHES) <= set(GLM5_AGENTX_BATCHES)
 
 
 def test_query_lengths_are_sourced_from_the_kernel_declaration():
@@ -190,9 +195,10 @@ def test_mtp1_and_mtp2_are_still_refused(num_speculative_tokens):
 def test_agentx_batches_cover_every_admitted_query_length(
     batch, query_length, expected_chunk
 ):
-    # AGENTX_BATCHES == (1, 2); every reachable (batch, query_length) row
-    # count across the four admitted widths must resolve to a kernel chunk.
-    assert AGENTX_BATCHES == (1, 2)
+    # Every (batch, query_length) row count the kernels serve
+    # (GLM5_AGENTX_BATCHES, a superset of what is routed) across the four
+    # admitted widths must resolve to a kernel chunk.
+    assert batch in GLM5_AGENTX_BATCHES
     assert glm5_kernel_samples(batch * query_length, query_length) == expected_chunk
 
 
