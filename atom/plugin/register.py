@@ -410,8 +410,18 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
     def _draft_extend_graph_enabled(runner) -> bool:
         if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_EXTEND_CG"):
             return False
-        return _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG") or (
-            _is_dsv4_nextn_runner(runner) and _is_dsv4_flash_runner(runner)
+        return (
+            _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG")
+            or (_is_dsv4_nextn_runner(runner) and _is_dsv4_flash_runner(runner))
+            or _qwen4_draft_extend_graph_enabled(runner)
+        )
+
+    def _qwen4_draft_extend_graph_enabled(runner) -> bool:
+        """PROTOTYPE: Flash draft-extend graph, on top of the draft decode graph."""
+        return (
+            _is_qwen4_exp_nextn_runner(runner)
+            and _env_flag("ATOM_SGLANG_QWEN4_DRAFT_CG")
+            and _env_flag("ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG")
         )
 
     def _target_verify_graph_enabled() -> bool:
@@ -606,16 +616,18 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                 return False
             return _dsv4_draft_extend_graph_layout_ok(self, forward_batch)
 
-        def replay(self, forward_batch):
+        # SGLang 0.5.20's ``execute(forward_batch, select_index)`` passes an
+        # extra argument; forward whatever the runner API passes.
+        def replay(self, forward_batch, *args, **kwargs):
             model_runner = getattr(self, "model_runner", None)
             if _is_glm52_nextn_runner(model_runner):
                 if not _draft_extend_graph_enabled(model_runner):
                     raise RuntimeError(
                         "GLM-5.2 draft-extend cuda graph replay was disabled"
                     )
-                return original_extend_replay(self, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _is_dsv4_nextn_runner(model_runner):
-                return original_extend_replay(self, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _draft_extend_graph_enabled(getattr(self, "model_runner", None)):
                 raise RuntimeError(
                     "DSV4 draft-extend cuda graph replay was disabled after capture; "
@@ -651,7 +663,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                                 :num_tokens
                             ],
                         )
-                out = original_extend_replay(self, forward_batch)
+                out = original_extend_replay(self, forward_batch, *args, **kwargs)
                 # EAGLE V2 consumes draft-extend logits with a fixed
                 # `seq * speculative_num_draft_tokens + offset` layout.
                 # SGLang's runner trims to the actual compact token count,
@@ -903,7 +915,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
+                # PROTOTYPE: the Flash drafter also takes this plugin-built
+                # draft-extend runner; SGLang's own HIP gate only admits aiter
+                # multi-step / DSV4 / DSA backends.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
+                    getattr(self, "draft_runner", None)
+                ) or _qwen4_draft_extend_graph_enabled(
                     getattr(self, "draft_runner", None)
                 )
                 if (
@@ -929,16 +946,23 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                             or 1
                         ),
                     )
-                    for backend in (
-                        getattr(
-                            getattr(self, "draft_runner", None), "attn_backend", None
-                        ),
-                        getattr(self, "draft_extend_attn_backend", None),
+                    # DSV4 / GLM-5.2 pad rows need a long fill; Flash QSA keeps
+                    # the backend default.
+                    if _is_dsv4_or_glm52_nextn_runner(
+                        getattr(self, "draft_runner", None)
                     ):
-                        if backend is not None and hasattr(
-                            backend, "_cuda_graph_seq_len_fill_value"
+                        for backend in (
+                            getattr(
+                                getattr(self, "draft_runner", None),
+                                "attn_backend",
+                                None,
+                            ),
+                            getattr(self, "draft_extend_attn_backend", None),
                         ):
-                            backend._cuda_graph_seq_len_fill_value = seq_len_fill
+                            if backend is not None and hasattr(
+                                backend, "_cuda_graph_seq_len_fill_value"
+                            ):
+                                backend._cuda_graph_seq_len_fill_value = seq_len_fill
                     self.cuda_graph_runner_for_draft_extend = (
                         EAGLEDraftExtendCudaGraphRunner(self)
                     )
@@ -946,7 +970,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     self.cuda_graph_runner_for_draft_extend = None
             except Exception as exc:
                 logger.warning(
-                    "Failed to enable DSV4 draft-extend cuda graph in ATOM plugin: %s",
+                    "Failed to enable draft-extend cuda graph in ATOM plugin: %s",
                     exc,
                 )
             return ret
