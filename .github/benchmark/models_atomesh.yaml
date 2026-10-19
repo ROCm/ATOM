@@ -1046,64 +1046,81 @@ models:
               max_num_seqs: 176
           env: *kimi_k3_agentic_lmcache192_env
 
-        # High-concurrency DSpark3 PD recipe: recipes/mesh/Agentic-Kimi-K3.md.
+        # High-concurrency DSpark4 PD recipe: recipes/mesh/Agentic-Kimi-K3.md.
         # State and paged KV share the existing 224 GiB per-rank CPU pool.
         # Raise only the state retention cap to 128 GiB.
         # On-demand keeps observed shared-prefix checkpoints in addition to
         # prompt-end anchors; the fixed-interval ladder remains disabled.
-        - &kimi_k3_agentic_hc_dspark3
+        - &kimi_k3_agentic_hc_dspark4
           <<: *kimi_k3_agentic_no_dspark
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c48
-          display_topology: 1P1D-TP8-DCP8-DSPARK3
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          display_topology: 1P1D-TP8-DCP8-DSPARK4
           concurrency: [48]
           server:
-            common_args: &kimi_k3_agentic_hc_dspark3_args
+            common_args: &kimi_k3_agentic_hc_dspark4_args
               <<: *kimi_k3_agentic_no_dspark_args
               max_num_seqs: 96
               method: dspark
               draft_model: "${ATOMESH_MODEL_ROOT}/Inferact/Kimi-K3-DSpark"
-              num_speculative_tokens: 3
-              spec_decode_acceptance_length: 3.00
+              num_speculative_tokens: 4
+              spec_decode_acceptance_length: 3.36
           env:
             common:
               ATOM_ENABLE_REPLAYSSM: "1"
               ATOM_STATE_CHECKPOINT_DEMAND: "1"
-            prefill: &kimi_k3_agentic_hc_dspark3_prefill_env
+            prefill: &kimi_k3_agentic_hc_dspark4_prefill_env
               <<: *kimi_k3_agentic_lmcache128_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "128"
 
-        - <<: *kimi_k3_agentic_hc_dspark3
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c56
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c56
           concurrency: [56]
           server:
             common_args:
-              <<: *kimi_k3_agentic_hc_dspark3_args
+              <<: *kimi_k3_agentic_hc_dspark4_args
               max_num_seqs: 112
-          env: &kimi_k3_agentic_hc_dspark3_reuse_env
+          env: &kimi_k3_agentic_hc_dspark4_reuse_env
             common:
               ATOM_ENABLE_REPLAYSSM: "1"
               ATOM_STATE_CHECKPOINT_DEMAND: "1"
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
-            prefill: *kimi_k3_agentic_hc_dspark3_prefill_env
+            prefill: *kimi_k3_agentic_hc_dspark4_prefill_env
 
-        - <<: *kimi_k3_agentic_hc_dspark3
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c72
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c72
           concurrency: [72]
           server:
             common_args:
-              <<: *kimi_k3_agentic_hc_dspark3_args
+              <<: *kimi_k3_agentic_hc_dspark4_args
               max_num_seqs: 144
-          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+          env: *kimi_k3_agentic_hc_dspark4_reuse_env
 
-        - <<: *kimi_k3_agentic_hc_dspark3
-          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark3-agentic-lmcache-1m-c88
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c88
           concurrency: [88]
           server:
             common_args:
-              <<: *kimi_k3_agentic_hc_dspark3_args
+              <<: *kimi_k3_agentic_hc_dspark4_args
               max_num_seqs: 176
-          env: *kimi_k3_agentic_hc_dspark3_reuse_env
+          env: *kimi_k3_agentic_hc_dspark4_reuse_env
+
+        # 1P2D: the DSpark4 C48 cell with a second TP8+DCP8 decode node (three
+        # nodes), so each decode carries about half the sessions while the one
+        # prefill is not yet the limit. The router picks a decode at random, as
+        # in the 1P1D cells. `decode` is restated whole: `<<` merges one level.
+        - <<: *kimi_k3_agentic_hc_dspark4
+          name: kimi-k3-mxfp4-1p2d-tp8-dcp8-dspark4-agentic-lmcache-1m-c48
+          topology: 1p2d
+          display_topology: 1P2D-TP8-DCP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          decode:
+            workers: 2
+            tp: 8
+            dcp: 8
+            cudagraph: auto
+            cudagraph_mode: FULL
+            compilation_level: 3
 
         # Non-disaggregated counterpart to the no-draft C72 cell: one server does
         # prefill and decode on a single node, same workload and same server
