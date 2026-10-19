@@ -862,11 +862,16 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         )
             # Flash draft stays eager: mRoPE positions are [3, N], same as
             # Native EagleProposer skipping mid-step graphs.
+            # PROTOTYPE: ATOM_SGLANG_QWEN4_DRAFT_CG=1 lets SGLang capture the
+            # Flash draft decode graph (draft-extend stays eager).
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            ) or _is_qwen4_exp_nextn_runner(draft_runner)
+            ) or (
+                _is_qwen4_exp_nextn_runner(draft_runner)
+                and not _env_flag("ATOM_SGLANG_QWEN4_DRAFT_CG")
+            )
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
                 original_capture_cuda_graphs = self._capture_cuda_graphs
