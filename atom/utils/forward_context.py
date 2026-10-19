@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
+from atom.model_ops.prefill_workspace import PrefillRequestLengths
 
 
 class AttnState(Enum):
@@ -671,6 +672,9 @@ class AttentionMetaData:
     reduce_final_map: torch.Tensor | None = None
     reduce_partial_map: torch.Tensor | None = None
 
+    # Owned host lengths for grouping a draft cached prefill without GPU readback.
+    prefill_request_lengths: PrefillRequestLengths | None = None
+
     # for prefix cache
     has_cached: bool = False
     total_kv: int | None = None
@@ -715,7 +719,9 @@ class AttentionMetaData:
         kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        prefill_request_lengths: PrefillRequestLengths | None = None,
     ):
+        self.prefill_request_lengths = prefill_request_lengths
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.kpool_total_pools = kpool_total_pools

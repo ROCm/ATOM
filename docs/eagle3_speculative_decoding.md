@@ -136,6 +136,59 @@ The legacy draft's `config.json` has none of the new fields, so all `getattr`
 toggles fall through to their EAGLE 3 defaults. Behavior is byte-equivalent
 to pre-EAGLE-3.1 ATOM.
 
+## Limit the draft cached-prefill K/V workspace
+
+For EAGLE3 with an MHA/GQA draft and prefill context parallel size 1, add:
+
+```bash
+--draft-prefill-kv-workspace-mb 8192
+```
+
+The default is `0` (disabled). The value is in MiB, so `8192` limits the
+materialized dense K+V tensors to **8 GiB per rank, per attention call**.
+It applies to draft cached prefill, including both `propose()` and the
+standalone `compute_draft_kv()` path. Target attention and draft decode
+keep their existing behavior. Paged attention backends that do not expand
+cached K/V into dense tensors do not need this grouping.
+
+Cached prefill ordinarily gathers every request's full context into dense
+K/V tensors before running variable-length attention. Long cached contexts
+can make these temporary tensors much larger than the new-token batch.
+With the limit enabled, contiguous whole requests are grouped in order,
+then the existing gather and attention run once per group on the same
+stream. Outputs are placed back in their original query-token positions;
+no request's context is split or truncated.
+
+The group limit in KV tokens is calculated from the actual dense tensor
+shape and dtype:
+
+```text
+max_group_kv_tokens = floor(workspace_bytes /
+    (2 * local_num_kv_heads * head_dim * dtype_bytes))
+```
+
+For 16 local KV heads, head dimension 128 and BF16, 8 GiB fits 1,048,576
+KV tokens. Both cached and newly added tokens count toward this limit.
+The workspace therefore depends on the sum of full context lengths, not
+just `max_num_batched_tokens`, which limits newly scheduled query tokens.
+For example, a recorded MiniMax-M3 batch has 32,721 query tokens but
+4,030,289 full-context KV tokens: an ungrouped BF16 K+V expansion needs
+30.75 GiB per rank. An 8 GiB budget partitions that batch into six complete
+request groups, with 6.64 GiB in the largest group. These are tensor-size
+calculations, not measurements of total process peak memory.
+
+If one request alone exceeds the limit, the forward raises an error asking
+for a larger budget (or `0` to disable grouping); it does not silently
+exceed the configured limit. Grouping adds attention launches and an output
+copy, so choose a budget large enough for the desired maximum context.
+
+This setting bounds only the dense K/V materialization. It does not bound
+model-wide peak or allocator-reserved memory, persistent KV pools, Q/output
+tensors, cache-layout conversions, or attention-kernel scratch/conversions.
+It does not change allocator/IPC settings or perform LMCache host-memory
+cleanup. MLA drafts and PCP greater than 1 are rejected when the option is
+enabled.
+
 ## Runtime acceptance stats
 
 ATOM's scheduler already emits per-window acceptance via the spec section of

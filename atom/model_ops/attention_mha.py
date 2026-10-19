@@ -21,6 +21,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode,
     run_pa_fwd_asm,
 )
+from atom.model_ops.prefill_workspace import run_grouped_prefill
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -99,6 +100,10 @@ class PagedAttentionImpl(nn.Module):
         self.use_flash_layout = False
 
         self.supports_quant_query_input = False
+        spec = get_current_atom_config().speculative_config
+        self.draft_prefill_kv_workspace_bytes = (
+            spec.draft_prefill_kv_workspace_mb * (1 << 20) if spec is not None else 0
+        )
 
     def process_weights_after_loading(self):
         if (
@@ -866,7 +871,30 @@ class PagedAttentionImpl(nn.Module):
     def prefill_attention(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
+        if (
+            self.draft_prefill_kv_workspace_bytes
+            and fwd_ctx.context.is_draft
+            and fwd_ctx.attn_metadata.has_cached
+        ):
+            return run_grouped_prefill(
+                self._prefill_attention,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                self.draft_prefill_kv_workspace_bytes,
+            )
+        return self._prefill_attention(
+            q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+        )
 
+    def _prefill_attention(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
         # Prefix-cache hit: gather cached+new KV from the paged cache into a
