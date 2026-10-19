@@ -103,9 +103,9 @@ def test_mixed_reduction_walk_can_select_a_zero_mass_index():
             found_zero_mass = True
             # The consistent walk must pick a token that actually has mass.
             fixed = walk(tiles, target_u, mixed=False)
-            assert fixed != block or b[0] > 0.0, (
-                "consistent walk also selected a zero-mass index"
-            )
+            assert (
+                fixed != block or b[0] > 0.0
+            ), "consistent walk also selected a zero-mass index"
             flat = np.concatenate(tiles)
             assert flat[fixed] > 0.0, f"fixed walk picked zero-mass id {fixed}"
             break
@@ -150,7 +150,7 @@ def test_residual_draw_never_returns_zero_mass_token():
     two_token_batch, draw = helpers.two_token_batch, helpers.draw
 
     torch.manual_seed(20261019)
-    block = rs._RATIO_BLOCK_V  # noqa: SLF001
+    block = rs._RATIO_BLOCK_V
     vocab = block * 40  # 40 tiles, so the walk crosses many boundaries
     n = 500
     width = 2
