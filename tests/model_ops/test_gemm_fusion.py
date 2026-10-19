@@ -48,6 +48,8 @@ class FakeResources:
     bound = object()
 
     rank = 0
+    arch = "gfx950"
+    cu = 256
     _reduce_min = None
 
     def __init__(self, plan_n=(None, 0), outcome="agree", raise_contract=False):
@@ -221,14 +223,14 @@ def test_resolve_profile_off_is_native_without_aiter(make_site, monkeypatch):
     assert (r.plan, r.n_fused, r.reason) == (None, 0, "profile_off")
 
 
-def test_fallback_reasons_pad_rows_and_input_layout(make_site):
+def test_fallback_reasons_input_layout_and_padded_rows_run_fused(make_site):
     import torch
 
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
     x = torch.zeros((16, 3072), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((16, 1), dtype=torch.float32)
-    assert TU.fallback_reason(s, ctx, x, xs) == "pad_rows"
+    assert TU.fallback_reason(s, ctx, x, xs) is None  # 62 real of 64: padded rows run the fused kernel
     ctx.real_tokens = 64
     assert TU.fallback_reason(s, ctx, x, xs) is None
     assert TU.fallback_reason(s, ctx, x, None) == "unquantized_input"
@@ -238,15 +240,15 @@ def test_fallback_reasons_pad_rows_and_input_layout(make_site):
     assert TU.fallback_reason(s, ctx, x, xs) == "dummy_run"
 
 
-def test_one_stage_large_m_has_no_pad_rows_constraint(make_site):
+def test_padded_rows_do_not_change_the_path_for_either_plan_kind(make_site):
     import torch
 
-    s = make_site(FakeResources(plan_n=(FakePlan(), 1)))
-    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
-    x = torch.zeros((512, 3072), dtype=torch.float8_e4m3fn)
-    xs = torch.zeros((512, 1), dtype=torch.float32)
-    assert TU.fallback_reason(s, ctx, x, xs, n_fused=1) is None
-    assert TU.fallback_reason(s, ctx, x, xs, n_fused=2) == "pad_rows"
+    for n_fused in (1, 2):
+        s = make_site(FakeResources(plan_n=(FakePlan(), n_fused)))
+        ctx = SimpleNamespace(is_dummy_run=False, real_tokens=2000, padded_tokens=2048)
+        x = torch.zeros((512, 3072), dtype=torch.float8_e4m3fn)
+        xs = torch.zeros((512, 1), dtype=torch.float32)
+        assert TU.fallback_reason(s, ctx, x, xs, n_fused=n_fused) is None
 
 
 def _direct_fixture(make_site, res=None):
@@ -507,7 +509,7 @@ def test_recover_skip_seam_skips_the_collective_recovery_on_the_target_rank():
 
 def test_rank_native_seam_makes_only_the_target_rank_decide_native():
     kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
-              real_tokens=64, padded_tokens=64, x_dtype_is_fp8=True, x_scale_ok=True)
+              x_dtype_is_fp8=True, x_scale_ok=True)
     orig = site_mod.GemmFusionSite.__dict__["decide_path"]
     res = _ready_hooks(FakeResources())
     res.rank = 1
@@ -1372,8 +1374,7 @@ def test_native_rope_cache_writes_shuffle_in_the_gemma_branch_whatever_the_flag(
 # ------------- E-3 / M-1: the per-call decision is a pure function of rank-uniform inputs
 def _decide_inputs(**over):
     base = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
-                is_dummy_run=False, real_tokens=64, padded_tokens=64,
-                x_dtype_is_fp8=True, x_scale_ok=True)
+                is_dummy_run=False, x_dtype_is_fp8=True, x_scale_ok=True)
     base.update(over)
     return base
 
@@ -1381,13 +1382,10 @@ def _decide_inputs(**over):
 @pytest.mark.parametrize("over,expect", [
     ({}, ("fused", "profile_hit")),
     ({"is_dummy_run": True}, ("native", "dummy_run")),
-    ({"real_tokens": 60}, ("native", "pad_rows")),
     ({"x_dtype_is_fp8": False}, ("native", "unquantized_input")),
     ({"x_scale_ok": False}, ("native", "xscale_layout")),
     ({"resolution": site_mod.Resolution(None, 0, "native", "uncovered")}, ("native", "uncovered")),
-    # 1-stage large-M has no pad_rows constraint
-    ({"resolution": site_mod.Resolution(FakePlan(), 1, "fake.large", "profile_hit"), "real_tokens": 60},
-     ("fused", "profile_hit")),
+    ({"resolution": site_mod.Resolution(FakePlan(), 1, "fake.large", "profile_hit")}, ("fused", "profile_hit")),
 ])
 def test_decide_path_is_the_documented_function_of_its_inputs(over, expect):
     assert site_mod.GemmFusionSite.decide_path(**_decide_inputs(**over)) == expect
@@ -1520,7 +1518,7 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
         dict(dummy=False, real=64, padded=64, dtype=bf16, scale=(16, 1)),
         dict(dummy=False, real=64, padded=64, dtype=fp8, scale=(16, 2)),
     ]
-    expected = [True, False, False, False, False]  # fused only for the first
+    expected = [True, False, True, False, False]  # fused for the first and for the PADDED one (40 -> 64)
     for c, want_fused in zip(cases, expected):
         outcomes = set()
         for rank in range(4):
@@ -1784,7 +1782,13 @@ class _Rec:
         self.log.append((self.name, "copy", src))
 
     def __getitem__(self, idx):
-        return _Rec(f"{self.name}[{idx.stop}]", self.log)
+        return _Rec(f"{self.name}[{idx.stop}]" if idx.stop is not None else f"{self.name}[{idx.start}:]", self.log)
+
+    def zero_(self):
+        self.log.append((self.name, "zero"))
+
+    def fill_(self, v):
+        self.log.append((self.name, "fill", v))
 
 
 def _inputs_fixture(make_site, direct):
@@ -1792,7 +1796,7 @@ def _inputs_fixture(make_site, direct):
     log = []
     st = SimpleNamespace(xs=_Rec("xs", log), pos=_Rec("pos", log), slot=_Rec("slot", log), rebound=False)
     state = {"slot_mapping": _Rec("sm", log)}
-    ctx = SimpleNamespace(real_tokens=40, positions=_Rec("positions", log))
+    ctx = SimpleNamespace(real_tokens=40, padded_tokens=40, positions=_Rec("positions", log))
     return s, st, state, ctx, log
 
 
@@ -1887,12 +1891,12 @@ def test_the_weight_check_names_the_layout_before_the_prologue_reason(make_site)
 
 def test_decide_path_rejects_a_k_mismatch_after_the_other_input_facts():
     kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
-              real_tokens=64, padded_tokens=64, x_dtype_is_fp8=True, x_scale_ok=True)
+              x_dtype_is_fp8=True, x_scale_ok=True)
     decide = site_mod.GemmFusionSite.decide_path
     assert decide(**kw) == ("fused", "profile_hit")  # x_k_ok defaults to True: existing callers unchanged
     assert decide(**kw, x_k_ok=False) == ("native", "x_k_mismatch")
     assert decide(**{**kw, "x_scale_ok": False}, x_k_ok=False) == ("native", "xscale_layout")
-    assert decide(**{**kw, "real_tokens": 40}, x_k_ok=False) == ("native", "pad_rows")
+    assert decide(**{**kw, "is_dummy_run": True}, x_k_ok=False) == ("native", "dummy_run")
 
 
 def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_rank(make_site):
@@ -1912,3 +1916,213 @@ def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_ra
         assert got[0] is want_fused and (want_fused or got[1] == "x_k_mismatch"), (k, got)
     assert TU.fallback_reason(
         s, ctx, _T((16, 2048), fp8), _T((16, 1))) == "x_k_mismatch"  # the test view agrees
+
+
+# ------------- task-265: padded rows run the fused kernel (small-M plan reads all T rows)
+def test_pad_rows_are_rewritten_to_position_0_slot_minus_1_on_every_call(make_site):
+    for direct in (False, True):
+        s, st, state, ctx, log = _inputs_fixture(make_site, direct=direct)
+        st.rebound = True  # (direct site) an input moved: the copy path runs
+        ctx.padded_tokens = 64  # 40 real rows of a 64-row bucket
+        s._stage_inputs("X_SCALE", ctx, state, st)
+        assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]", "pos[40:]", "slot[40:]"]
+        assert log[3][1:] == ("zero",) and log[4][1:] == ("fill", -1)  # the decode pad-row values
+        log.clear()
+        ctx.padded_tokens = 40  # no padding in this call: nothing to rewrite
+        s._stage_inputs("X_SCALE", ctx, state, st)
+        assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]
+
+
+class _Arr:
+    def __init__(self, shape, dtype, fill):
+        self.shape, self.dtype, self.fill = tuple(shape), dtype, fill
+
+
+def test_staging_buffers_are_t_long_and_start_as_pad_rows(make_site, monkeypatch):
+    """The kernel reads positions/slot_mapping for all T = padded tokens: never shorter, and never
+    uninitialised (position 0, slot -1 is exactly what a pad row must hold)."""
+    fake = SimpleNamespace(
+        empty=lambda shape, dtype=None, device=None: _Arr(shape, dtype, None),
+        zeros=lambda shape, dtype=None, device=None: _Arr(shape, dtype, 0),
+        full=lambda shape, v, dtype=None, device=None: _Arr(shape, dtype, v),
+        float32="f32", int64="i64",
+    )
+    monkeypatch.setattr(site_mod, "torch", fake)
+    s = make_site(FakeResources())
+    s.attn = SimpleNamespace(impl=SimpleNamespace(num_heads=16, head_dim=128, num_kv_heads=1))
+    st = s._stage(64, "dev", "bf16")
+    assert st.pos.shape == (64,) and st.pos.fill == 0 and st.pos.dtype == "i64"
+    assert st.slot.shape == (64,) and st.slot.fill == -1 and st.slot.dtype == "i64"
+    assert st.xs.shape == (16, 1) and st.outs["q"].shape[0] == 64  # outputs are T rows too
+
+
+def test_the_post_prologue_attention_drops_pad_rows_like_native(monkeypatch):
+    """q/k/v/index_q are sliced to the real rows before attention, and the output is re-padded to the
+    SP-divisible row count (finish_attention): what native ``attend_packed`` does for the packed path."""
+    import types
+
+    calls = []
+    ulysses = types.ModuleType("atom.distributed.ulysses_sp")
+    ulysses.finish_attention = lambda out, padded, real, tf: calls.append((out, padded, real, tf)) or "RESULT"
+    attn8 = types.ModuleType("atom.model_ops.minimax_m3.attention_fp8")
+    attn8.gather_heads_fp8 = "GATHER"
+    monkeypatch.setitem(sys.modules, "atom.distributed.ulysses_sp", ulysses)
+    monkeypatch.setitem(sys.modules, "atom.model_ops.minimax_m3.attention_fp8", attn8)
+    from atom.model_ops.gemm_fusion import stages_native
+
+    seen = {}
+    impl = SimpleNamespace(forward_after_prologue=lambda q, k, v, kc, vc, ks, vs, fc, index_q=None:
+                           seen.update(q=q, k=k, v=v, iq=index_q) or "ATTN")
+    ctx = SimpleNamespace(real_tokens=61, padded_tokens=64, attn=SimpleNamespace(impl=impl), fwd_ctx="F")
+    log = []
+    outs = {"q": _Rec("q", log), "k": _Rec("k", log), "v": _Rec("v", log), "index_q": _Rec("iq", log)}
+    out = stages_native.attend_after_prologue(None, outs, {"k_cache": 1, "v_cache": 2}, ctx)
+    assert out == "RESULT"
+    assert (seen["q"].name, seen["k"].name, seen["v"].name, seen["iq"].name) == ("q[61]", "k[61]", "v[61]", "iq[61]")
+    assert calls == [("ATTN", 64, 61, "GATHER")]  # re-padded to 64 rows, like native
+    # indexer layers have no k/v outputs
+    seen.clear()
+    stages_native.attend_after_prologue(None, {"q": _Rec("q", log), "index_q": _Rec("iq", log)},
+                                        {"k_cache": 1, "v_cache": 2}, ctx)
+    assert seen["k"] is None and seen["v"] is None and seen["iq"].name == "iq[61]"
+
+
+def test_native_packed_path_also_drops_the_pad_rows_it_is_pinned_in_the_source():
+    """``attend_packed`` (the 1-stage large-M remainder) slices packed[:real] and ``finish_attention``
+    re-pads: pinned to the source so the two entry depths cannot drift apart."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "atom/distributed/ulysses_sp.py").read_text(encoding="utf-8")
+    assert "if real_tokens < padded_tokens:\n        packed = packed[:real_tokens]" in src
+    assert "padded_tokens - real_tokens" in src and "out.new_zeros" in src
+
+
+def test_direct_site_binds_its_own_t_long_arrays_when_the_callers_are_shorter(make_site):
+    import torch as _torch
+
+    for caller_len, own in ((61, True), (64, False)):
+        s, t, state, ctx = _fake_direct(make_site)
+        staged = SimpleNamespace(xs=None, pos=_T((64,), _torch.int64), slot=_T((64,), _torch.int64),
+                                 prepared=False, plan=None, kv_ptrs=None, m=16, ptrs=None,
+                                 rebound=False, own_token_arrays=False)
+        s._stage = lambda tokens, device, dtype, _st=staged: s._staging.setdefault(tokens, _st)
+        s._bind_plan = lambda *a, **k: True
+        caller_pos, caller_slot = _T((caller_len,), _torch.int64), _T((caller_len,), _torch.int64)
+        direct = {"x_scale": t["xs"], "positions": caller_pos, "slot_mapping": caller_slot, "state": state}
+        assert s.prepare_bucket(64, None, {}, None, direct=direct) is True
+        assert staged.own_token_arrays is own
+        if own:  # the caller's 61-long arrays would be read out of bounds: bind the site's 64-long ones
+            assert staged.pos.shape == (64,) and staged.slot.shape == (64,)
+            assert staged.ptrs[1] == staged.pos.data_ptr() and staged.ptrs[2] == staged.slot.data_ptr()
+        else:  # full-length caller arrays are bound as-is
+            assert staged.pos is caller_pos and staged.slot is caller_slot
+
+
+def test_direct_site_always_copies_for_a_padded_bucket(make_site):
+    s, t, state, ctx = _fake_direct(make_site)
+    st = _seed_prepared(s, t, state)
+    st.own_token_arrays = True  # bound to site-owned arrays: the caller's tensors never ARE the bound ones
+    fp8 = __import__("torch").float8_e4m3fn
+    r, reason, _, got = s._prepare(ctx, _T((16, 3072), fp8), t["xs"])
+    assert r.plan is not None and got.rebound is True
+    st.own_token_arrays = False
+    _, _, _, got = s._prepare(ctx, _T((16, 3072), fp8), t["xs"])
+    assert got.rebound is False  # unpadded and unmoved: no copy
+
+
+def test_golden_adapter_returns_only_the_real_rows_of_a_padded_case(monkeypatch):
+    import types
+
+    log = []
+    monkeypatch.setitem(sys.modules, "operators", types.ModuleType("operators"))
+    monkeypatch.setattr(TU, "_site_for", lambda c, comm: ("S", "H", "A"))
+    monkeypatch.setattr(TU, "_ctx", lambda c, a: "CTX")
+    monkeypatch.setattr(TU, "run_prologue", lambda *a, **k: ("outs", {"q": _Rec("q", log), "k": _Rec("k", log)}, "D"))
+    for tokens, padded in ((61, 64), (64, 64)):
+        case = SimpleNamespace(spec=SimpleNamespace(tokens=tokens, padded_tokens=padded, mode="qkv_dense"),
+                               x="X", x_scale="XS", caches={"k_cache": "KC"})
+        out = TU.qkv_proj_all2all_norm_rope_cache(case, SimpleNamespace(rank=0))
+        if tokens < padded:
+            assert (out["q"].name, out["k"].name) == ("q[61]", "k[61]")  # baseline shape: real rows only
+        else:
+            assert (out["q"].name, out["k"].name) == ("q", "k")  # untouched, no slicing
+        assert out["k_cache"] == "KC"
+
+
+def test_golden_prepare_cases_prepares_padded_cases_instead_of_skipping_them(monkeypatch):
+    calls = []
+    fake_site = SimpleNamespace(resolve=lambda *a, **k: None,
+                                prepare_bucket=lambda *a, **k: calls.append((a, k)) or True,
+                                agree_prepared=lambda *a: None)
+    monkeypatch.setattr(TU, "_site_for", lambda c, comm: (fake_site, None, None))
+    TU.reset_for_tests(FakeResources())
+    case = SimpleNamespace(
+        spec=SimpleNamespace(tokens=61, padded_tokens=64), x=SimpleNamespace(device="dev"), x_scale="XS",
+        positions="POS", slot_mapping="SLOT",
+        caches={"k_cache": 1, "v_cache": 2, "k_scale": 3, "v_scale": 4})
+    TU.prepare_cases([case], SimpleNamespace(rank=0))
+    assert len(calls) == 1
+    args, kw = calls[0]
+    assert args[0] == 64 and "pad_rows" not in kw  # no skip, no flag
+    assert kw["direct"]["positions"] == "POS" and kw["direct"]["slot_mapping"] == "SLOT"
+
+
+# ------------- task-265: profile-wide prebuild at init
+def _init_with_fake_gf(monkeypatch, res, **gf_attrs):
+    calls = []
+    gf = SimpleNamespace(load_profile=lambda name: calls.append(("load", name)), **gf_attrs)
+    TU.inject_aiter(monkeypatch, gf)
+    TU.reset_for_tests()
+    TU.init_with_resources(SimpleNamespace(gemm_fusion=GemmFusionConfig(profile="prof_x")), res)
+    return calls
+
+
+def test_init_prebuilds_the_profile_once_with_the_detected_target(monkeypatch):
+    res = FakeResources()
+    built = []
+    calls = _init_with_fake_gf(
+        monkeypatch, res,
+        prebuild_profile=lambda name, *, arch=None, cu=None, world=None: built.append((name, arch, cu, world)) or ["v1"])
+    assert built == [("prof_x", "gfx950", 256, 4)]
+    assert calls == [("load", "prof_x")]  # fail-fast profile load stays first
+    assert hooks.phase() == "pre"  # before any forward / bucket resolution
+
+
+def test_prebuild_failure_on_this_rank_is_reported_to_peers_then_raised(monkeypatch):
+    res = FakeResources()
+    reports = []
+    res._reduce_min = lambda v: reports.append(list(v)) or list(v)
+
+    def boom(name, **kw):
+        raise RuntimeError("hipcc failed")
+
+    with pytest.raises(RuntimeError, match="hipcc failed"):
+        _init_with_fake_gf(monkeypatch, res, prebuild_profile=boom)
+    assert reports == [[0]]  # the collective still ran and carried this rank's failure
+
+
+def test_prebuild_failure_on_a_peer_rank_stops_every_rank(monkeypatch):
+    res = FakeResources()
+    res._reduce_min = lambda v: [0]  # a peer reported failure
+    with pytest.raises(RuntimeError, match="failed on a peer rank"):
+        _init_with_fake_gf(monkeypatch, res, prebuild_profile=lambda name, **kw: ["ok"])
+
+
+def test_prebuild_success_runs_the_agreement_collective_exactly_once(monkeypatch):
+    res = FakeResources()
+    reports = []
+    res._reduce_min = lambda v: reports.append(list(v)) or list(v)
+    _init_with_fake_gf(monkeypatch, res, prebuild_profile=lambda name, **kw: None)
+    assert reports == [[1]]
+
+
+def test_an_aiter_without_prebuild_is_logged_and_skipped_without_a_collective(monkeypatch, caplog):
+    import logging
+
+    res = FakeResources()
+    reports = []
+    res._reduce_min = lambda v: reports.append(list(v)) or list(v)
+    with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
+        _init_with_fake_gf(monkeypatch, res)  # no prebuild_profile on the fake aiter
+    assert any("no prebuild_profile" in r.getMessage() for r in caplog.records)
+    assert reports == [] and hooks.resources() is res  # uniform skip: nothing to agree on

@@ -76,6 +76,18 @@ def _reset_runtime_state():
     TU.reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_jit_build(request, monkeypatch):
+    """hooks.init_gemm_fusion calls aiter's prebuild_profile when it exists; the contract tests run on
+    CPU boxes and must never start a real JIT build. The real function stays reachable as
+    ``real_gf._orig_prebuild`` for the one test that pins its signature."""
+    if "real_gf" not in request.fixturenames:
+        return
+    gf = request.getfixturevalue("real_gf")
+    monkeypatch.setattr(gf, "_orig_prebuild", getattr(gf, "prebuild_profile", None), raising=False)
+    monkeypatch.setattr(gf, "prebuild_profile", lambda *a, **k: [], raising=False)
+
+
 def test_every_symbol_atom_reads_exists_on_the_real_package_or_its_submodule(real_gf):
     from atom.model_ops.gemm_fusion.resources import fusion_resources_cls
 
@@ -504,3 +516,30 @@ def test_explicit_uniform_policy_keeps_the_phase1_heap_for_the_profile_budget(re
     assert res.policy == "uniform"
     assert res.window_bytes == wb["window_bytes"] and res.max_windows == wb["max_windows"]
     assert res._vmm >= res.window_bytes * res.max_windows
+
+
+def test_aiters_prebuild_profile_has_the_signature_atom_calls(real_gf):
+    """ATOM calls ``aiter.gemm_fusion.prebuild_profile(profile, *, arch=None, cu=None, world=None)`` once
+    at init on every rank (agreed name and shape). Skipped until the installed aiter defines it."""
+    import inspect
+
+    fn = real_gf._orig_prebuild
+    if fn is None:
+        pytest.skip("aiter does not define prebuild_profile yet (ATOM logs a warning and skips the call)")
+    params = inspect.signature(fn).parameters
+    assert next(iter(params)) in ("profile", "name"), list(params)
+    for kw in ("arch", "cu", "world"):
+        assert kw in params and params[kw].kind is inspect.Parameter.KEYWORD_ONLY, (kw, list(params))
+
+
+def test_init_calls_prebuild_with_the_wrapper_target_on_the_real_aiter(real_gf, atu, monkeypatch):
+    from atom.model_ops.gemm_fusion import hooks
+
+    seen = []
+    monkeypatch.setattr(real_gf, "prebuild_profile",
+                        lambda name, *, arch=None, cu=None, world=None: seen.append((name, arch, cu, world)) or [],
+                        raising=False)
+    TU.reset_for_tests()
+    TU.init_with_resources(_config(PROFILE_NAME), _wrapper(real_gf, atu))
+    assert seen == [(PROFILE_NAME, "gfx950", 256, 4)]
+    assert hooks.phase() == "pre"

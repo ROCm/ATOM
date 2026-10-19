@@ -137,6 +137,46 @@ def init_gemm_fusion(config, sp_group) -> None:
         "gemm_fusion ON profile=%s world=%d window_bytes=%s max_windows=%s",
         _PROFILE, _RES.world, getattr(inner, "window_bytes", None), getattr(inner, "max_windows", None),
     )
+    _prebuild_profile(gf, name, _RES)
+
+
+def _prebuild_profile(gf, name, res) -> None:
+    """Compile every kernel variant the profile can select, once, before any forward.
+
+    Without it the first fused call of each variant JIT-builds inside a step, on whichever rank
+    reaches it first, which stalls that rank while its peers wait in a collective (and can blow the
+    process-group timeout). ``aiter.gemm_fusion.prebuild_profile(profile, *, arch, cu, world)`` is
+    idempotent and single-builder inside aiter (lock + cache), so EVERY rank calls it.
+
+    Collective-safe: each rank reports success with a MIN all-reduce, so when any rank failed every
+    rank raises (none proceeds to a forward while a peer died building) and all ranks leave this
+    function together. An aiter without the function is logged loudly and skipped (variants then
+    JIT-build on first use); every rank has the same install, so the skip is uniform and needs no
+    collective."""
+    fn = getattr(gf, "prebuild_profile", None)
+    if fn is None:
+        logger.warning(
+            "gemm_fusion: the installed aiter has no prebuild_profile(); kernel variants will be "
+            "JIT-built on first use, inside a step (slow first forward, rank-skewed)"
+        )
+        return
+    err = None
+    try:
+        built = fn(name, arch=res.arch, cu=res.cu, world=res.world)
+        logger.info("gemm_fusion prebuild_profile(%s): %s", name, built if built is not None else "done")
+    except Exception as e:  # noqa: BLE001 - reported to every rank below
+        err = e
+        logger.error("gemm_fusion prebuild_profile(%s) failed on this rank: %r", name, e)
+    ok = 0 if err is not None else 1
+    reduce = getattr(res, "_reduce_min", None)
+    all_ok = ok if reduce is None else int(reduce([ok])[0])
+    if err is not None:
+        raise err
+    if not all_ok:
+        raise RuntimeError(
+            f"gemm_fusion: prebuild_profile({name}) failed on a peer rank; refusing to start "
+            "with an incomplete kernel build"
+        )
 
 
 def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = None):

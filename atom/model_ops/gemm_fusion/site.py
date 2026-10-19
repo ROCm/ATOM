@@ -356,8 +356,10 @@ class GemmFusionSite:
             st = SimpleNamespace(
                 outs=outs,
                 xs=torch.empty((m, 1), dtype=torch.float32, device=device),
-                pos=torch.empty((tokens,), dtype=torch.int64, device=device),
-                slot=torch.empty((tokens,), dtype=torch.int64, device=device),
+                # T = padded tokens long, never shorter: the kernel reads all T entries. Initialised to
+                # the pad-row values (position 0, slot -1) so no launch can ever see garbage.
+                pos=torch.zeros((tokens,), dtype=torch.int64, device=device),
+                slot=torch.full((tokens,), -1, dtype=torch.int64, device=device),
                 prepared=False,
                 plan=None,
                 kv_ptrs=None,
@@ -401,19 +403,20 @@ class GemmFusionSite:
         return 0 if t is None else t.data_ptr()
 
     @staticmethod
-    def decide_path(*, resolution, is_dummy_run, real_tokens, padded_tokens, x_dtype_is_fp8,
-                    x_scale_ok, x_k_ok=True):
+    def decide_path(*, resolution, is_dummy_run, x_dtype_is_fp8, x_scale_ok, x_k_ok=True):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
-        (resolution agreed at resolve, the broadcast batch's dummy flag, global token counts,
-        and the input's dtype/shape facts, including whether x's K equals the layer's
-        ``input_size``). No rank, no env, no device state:
-        the same inputs give the same ``(path, reason)`` on every rank. -> (path, reason)."""
+        (resolution agreed at resolve, the broadcast batch's dummy flag, and the input's
+        dtype/shape facts, including whether x's K equals the layer's ``input_size``). No rank,
+        no env, no device state: the same inputs give the same ``(path, reason)`` on every rank.
+        -> (path, reason).
+
+        Padded rows (``real_tokens < padded_tokens``) are NOT a reason to go native: both plan
+        kinds run them. The small-M plan reads positions/slot_mapping for all T = 4*M rows, so the
+        site stages T-length arrays whose pad rows are (position 0, slot -1); see ``_stage_inputs``."""
         if resolution.plan is None:
             return "native", resolution.reason
         if is_dummy_run:
             return "native", "dummy_run"
-        if resolution.n_fused >= 2 and real_tokens != padded_tokens:
-            return "native", "pad_rows"  # small-M kernel needs T == 4*M with every row live; the 1-stage large-M exchange moves padded rows and the native remainder drops them, so it has no such constraint
         if not x_dtype_is_fp8:
             return "native", "unquantized_input"
         if not x_scale_ok:
@@ -492,9 +495,10 @@ class GemmFusionSite:
           dummy_run    : ``batch.is_dummy_run`` comes from ONE pickled batch that
                          ``AsyncIOProcManager.call_func`` broadcasts to every worker of the
                          engine core (rpc_broadcast_mq.enqueue); SP ranks share that core.
-          real/padded  : ``real_tokens`` = positions.shape[-1] (global, positions stay whole
-                         under SP), ``padded_tokens`` = local rows * world, equal on every rank.
-          x dtype / x_scale shape : follow from the model (SPMD) and equal local rows.
+          x dtype / x_scale shape / K : follow from the model (SPMD) and equal local rows.
+        Padded rows do not change the path: ``real_tokens`` = positions.shape[-1] (global,
+        positions stay whole under SP) and ``padded_tokens`` = local rows * world only decide how
+        ``_stage_inputs`` fills the T-length token arrays.
         There is NO rank-local raise in this method: the "unprepared bucket", "prologue state
         unavailable" and "other plan instance" conditions are unreachable after
         ``agree_prepared`` (they downgrade the bucket to native on every rank, or fail
@@ -515,8 +519,6 @@ class GemmFusionSite:
         path, why = self.decide_path(
             resolution=r,
             is_dummy_run=ctx.is_dummy_run,
-            real_tokens=ctx.real_tokens,
-            padded_tokens=ctx.padded_tokens,
             x_dtype_is_fp8=fp8,
             x_scale_ok=scale_ok,
             x_k_ok=x.shape[-1] == self.linear.input_size,  # SPMD: same on every rank
@@ -531,11 +533,22 @@ class GemmFusionSite:
 
     def _stage_inputs(self, x_scale, ctx, state, st):
         """Copy the per-call inputs into the buffers the plan is bound to (device-side,
-        capturable)."""
+        capturable).
+
+        ``st.pos`` / ``st.slot`` are T = padded_tokens long: the small-M kernel reads
+        positions[t] / slot_mapping[t] for EVERY t < T (all ranks' rows, after the exchange), while
+        ATOM's metadata covers only the ``real`` rows. Rows [real, T) are the SP divisibility pad,
+        which is the GLOBAL tail (so only the last rank(s) hold pad rows in x, but every rank's
+        kernel reads all T entries): they get position 0 and slot -1, the values ATOM already uses
+        for decode batch-padding rows, and the kernel skips cache writes for slot < 0. The tail is
+        rewritten on every call because the same bucket can be reached with a different ``real``."""
         n = ctx.real_tokens
         st.xs.copy_(x_scale)
         st.pos[:n].copy_(ctx.positions[:n])
         st.slot[:n].copy_(state["slot_mapping"][:n])
+        if n < ctx.padded_tokens:
+            st.pos[n:].zero_()
+            st.slot[n:].fill_(-1)
 
     def _execute(self, r, x, x_scale, ctx, state, st, out_dtype):
         """Run the fused prefix; return its ``outs`` dict."""

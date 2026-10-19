@@ -67,6 +67,15 @@ class FusionResourcesWrapper:
         self._arch = gf.detect_arch()
         self._cu = gf.detect_cu()
         self._reduce_min = consensus.torch_min_reducer(self.pg, device=_device()) if world > 1 else None
+
+    @property
+    def arch(self) -> str:
+        return self._arch
+
+    @property
+    def cu(self) -> int:
+        return self._cu
+
     # -- matching / consensus ----------------------------------------------
     def local_m(self, tokens: int) -> int:
         return tokens // self.world

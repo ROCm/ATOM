@@ -365,8 +365,6 @@ def fallback_reason(site, ctx, x, x_scale, n_fused=2):
     path, why = site.decide_path(
         resolution=Resolution(object(), n_fused, "", ""),
         is_dummy_run=ctx.is_dummy_run,
-        real_tokens=ctx.real_tokens,
-        padded_tokens=ctx.padded_tokens,
         x_dtype_is_fp8=fp8,
         x_scale_ok=ok,
         x_k_ok=x.shape[-1] == site.linear.input_size,
@@ -467,7 +465,7 @@ class DirectGemmFusionSite(GemmFusionSite):
     def _stage(self, tokens, device, dtype):
         st = super()._stage(tokens, device, dtype)
         if not hasattr(st, "ptrs"):
-            st.ptrs, st.rebound = None, False
+            st.ptrs, st.rebound, st.own_token_arrays = None, False, False
         return st
 
     def _live_ptrs(self, x_scale, positions, state):
@@ -483,17 +481,19 @@ class DirectGemmFusionSite(GemmFusionSite):
             ptr(state.get("v_scale_view", state.get("v_scale"))),
         )
 
-    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, pad_rows=False, direct=None):
+    def prepare_bucket(self, tokens, device, kv_cache_data, out_dtype, direct=None):
         """Bind the plan for one bucket against the caller's tensors OUTSIDE graph capture.
         ``direct`` (else ``direct_provider(tokens)``): ``{"x_scale","positions","slot_mapping",
-        "state"}``, the caller's stable tensors, bound as-is."""
+        "state"}``, the caller's stable tensors, bound as-is.
+
+        PADDED BUCKETS (the caller's positions / slot_mapping are shorter than ``tokens`` = T): the
+        small-M kernel reads T entries, so the site's own T-length arrays (position 0 / slot -1 in the
+        pad rows) are bound instead and refreshed by copy on every call; x_scale stays direct."""
         r = self.resolve(tokens, "eager")
         if r.plan is None:
             return False
         if r.n_fused < 2:
             return self._prepare_one_stage(r)
-        if pad_rows:
-            return False  # run time falls back (pad_rows); nothing to bind
         st = self._stage(tokens, device, out_dtype)
         if direct is None and self.direct_provider is not None:
             direct = self.direct_provider(tokens)
@@ -505,8 +505,16 @@ class DirectGemmFusionSite(GemmFusionSite):
             live = self._live_ptrs(direct["x_scale"], direct["positions"], direct["state"])
             return live[3:] == st.ptrs[3:]
         state = direct["state"]
-        st.xs, st.pos, st.slot = direct["x_scale"], direct["positions"], direct["slot_mapping"]
-        st.ptrs = self._live_ptrs(st.xs, st.pos, state)
+        st.xs = direct["x_scale"]
+        st.own_token_arrays = (
+            int(direct["positions"].shape[-1]) < tokens or int(direct["slot_mapping"].shape[-1]) < tokens
+        )
+        if not st.own_token_arrays:
+            st.pos, st.slot = direct["positions"], direct["slot_mapping"]
+        # else: keep the T-length arrays _stage allocated (the caller's would be read out of bounds)
+        ptrs = list(self._live_ptrs(st.xs, st.pos, state))
+        ptrs[2] = self._ptr(st.slot)  # the slot array the plan is actually bound to
+        st.ptrs = tuple(ptrs)
         return self._bind_plan(r, tokens, st, state, device, kv_cache_data)
 
     def _prepare(self, ctx, x, x_scale):
@@ -515,7 +523,7 @@ class DirectGemmFusionSite(GemmFusionSite):
             # x_scale / positions / slot_mapping may have moved since prepare: refreshed by copy
             # in _stage_inputs. The KV addresses were checked at prepare, not here.
             live = self._live_ptrs(x_scale, ctx.positions, state)
-            st.rebound = live[:3] != st.ptrs[:3]
+            st.rebound = bool(getattr(st, "own_token_arrays", False)) or live[:3] != st.ptrs[:3]
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
@@ -746,7 +754,6 @@ def prepare_cases(cases, comm):
             sp = c.spec
             prepared = site.prepare_bucket(
                 sp.padded_tokens, c.x.device, None, torch.bfloat16,
-                pad_rows=sp.padded_tokens != sp.tokens,
                 # direct bind: the case's own tensors, no staging copies
                 direct={
                     "x_scale": c.x_scale,
@@ -803,6 +810,11 @@ def qkv_proj_all2all_norm_rope_cache(case, comm):
     _LAST = d
     if kind == "native":
         return payload
+    real = case.spec.tokens
+    if real < case.spec.padded_tokens:
+        # The fused kernel ran the SP-divisibility pad rows too (position 0, slot -1); the baseline
+        # returns only the real rows, so return the same rows (a view, no copy).
+        payload = {k: v[:real] for k, v in payload.items()}
     return {**payload, **case.caches}
 
 
