@@ -943,7 +943,13 @@ def rejection_ratio_sample_kernel(
             # `q_safe_base` aliases row 0.
             q_val = tl.where(has_q, q_val, 0.0)
             diff = p_val - q_val
-            norm_sum += tl.sum(tl.where(diff > 0.0, diff, 0.0))
+            val = tl.where(diff > 0.0, diff, 0.0)
+            # Reduce with the SAME tree pass 2 walks with. `tl.sum` and
+            # `tl.cumsum` lower differently and disagree by an ulp, which would
+            # let `target_u = coin * norm_sum` exceed the CDF pass 2 actually
+            # accumulates and miss in the final tile. val >= 0, so the scan is
+            # monotone and its max is its last element.
+            norm_sum += tl.max(tl.cumsum(val, axis=0), axis=0)
 
         # Pass 2: walk the CDF. A degenerate residual (norm_sum == 0, i.e.
         # p == q everywhere on rejection) leaves the cumsum at 0 <= target_u and
@@ -975,7 +981,14 @@ def rejection_ratio_sample_kernel(
                     match_idx = tl.argmax(candidates_mask.to(tl.int32), axis=0)
                     final_token = v_start + match_idx
                     found = 1
-                cum_sum += tl.sum(val)
+                # Advance with the same reduction the hit test used above.
+                # Mixing `tl.cumsum` (test) with `tl.sum` (advance) lets the two
+                # disagree by an ulp; `target_u` landing in that gap makes this
+                # tile miss, leaves `cum_sum` already above `target_u`, and the
+                # next tile's element 0 then satisfies the test before its own
+                # mass is consulted -- returning a multiple of BLOCK_V chosen by
+                # position, with possibly zero residual mass.
+                cum_sum += tl.max(block_cumsum, axis=0)
 
         tl.store(
             output_token_ids_ptr + req_idx * (num_spec_steps + 1) + reject_pos,
