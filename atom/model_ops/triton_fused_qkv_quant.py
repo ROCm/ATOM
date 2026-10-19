@@ -322,30 +322,36 @@ def fused_qkv_per_tensor_quant(q, k, v, *, k_rope=None):
     return (*outputs, *(scales[i : i + 1] for i in range(5)))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _kv_amax(
     K,
     V,
     Partial,
-    NK: tl.constexpr,
-    NV: tl.constexpr,
+    TOKENS: tl.int64,
+    K_ROW: tl.constexpr,
+    V_ROW: tl.constexpr,
     PARTS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     part = tl.program_id(0)
     kind = tl.program_id(1)
     X = K if kind == 0 else V
-    n = NK if kind == 0 else NV
-    offsets = part * BLOCK + tl.arange(0, BLOCK)
+    # Fixed row widths preserve vector alignment for every token count.
+    row = K_ROW if kind == 0 else V_ROW
+    n = TOKENS * row
     acc = tl.full((BLOCK,), 0, tl.float32)
-    for start in range(tl.cdiv(n, PARTS * BLOCK)):
-        index = offsets + start * PARTS * BLOCK
+    # The small-input configuration benefits from overlapping two loads;
+    # larger reductions favor the occupancy of the compact loop.
+    for start in tl.range(
+        part * BLOCK, n, PARTS * BLOCK, loop_unroll_factor=2 if PARTS == 256 else 1
+    ):
+        index = tl.multiple_of(start, BLOCK) + tl.arange(0, BLOCK)
         x = tl.load(X + index, index < n, 0).to(tl.float32)
         acc = tl.maximum(acc, tl.abs(x))
     tl.store(Partial + kind * PARTS + part, tl.max(acc, 0))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"])
 def _kv_quant(
     K,
     V,
@@ -353,18 +359,20 @@ def _kv_quant(
     V8,
     Partial,
     Scales,
-    NK: tl.constexpr,
-    NV: tl.constexpr,
+    TOKENS: tl.int64,
+    K_ROW: tl.constexpr,
+    V_ROW: tl.constexpr,
     PARTS: tl.constexpr,
     BLOCK: tl.constexpr,
-    WORKERS: tl.constexpr,
     SINGLE_PASS: tl.constexpr,
 ):
     worker = tl.program_id(0)
     kind = tl.program_id(1)
     X = K if kind == 0 else V
     Y = K8 if kind == 0 else V8
-    n = NK if kind == 0 else NV
+    # Fixed row widths preserve vector alignment for every token count.
+    row = K_ROW if kind == 0 else V_ROW
+    n = TOKENS * row
     offsets = worker * BLOCK + tl.arange(0, BLOCK)
     if SINGLE_PASS:
         x = tl.load(X + offsets, offsets < n, 0).to(tl.float32)
@@ -387,8 +395,8 @@ def _kv_quant(
         value = tl.minimum(tl.maximum(x * inv, -448.0), 448.0)
         tl.store(Y + offsets, value, offsets < n)
     else:
-        for start in range(tl.cdiv(n, WORKERS * BLOCK)):
-            index = offsets + start * WORKERS * BLOCK
+        for start in range(worker * BLOCK, n, tl.num_programs(0) * BLOCK):
+            index = tl.multiple_of(start, BLOCK) + tl.arange(0, BLOCK)
             x = tl.load(X + index, index < n, 0).to(tl.float32)
             value = tl.minimum(tl.maximum(x * inv, -448.0), 448.0)
             tl.store(Y + index, value, index < n)
@@ -432,16 +440,20 @@ def fused_kv_per_tensor_quant(k: torch.Tensor, v: torch.Tensor):
     if not k.is_contiguous() or not v.is_contiguous():
         raise ValueError("K/V must be contiguous")
 
-    nk, nv = k.numel(), v.numel()
-    n = max(nk, nv)
+    tokens = k.shape[0]
+    k_row, v_row = k.shape[1] * k.shape[2], v.shape[1] * v.shape[2]
+    n = tokens * max(k_row, v_row)
     parts, block, workers, warps = _kv_config(n)
     k8 = torch.empty(k.shape, dtype=torch.float8_e4m3fn, device=k.device)
     v8 = torch.empty(v.shape, dtype=torch.float8_e4m3fn, device=v.device)
     scales = torch.empty(2, dtype=torch.float32, device=k.device)
-    partial = torch.empty((2, parts), dtype=torch.float32, device=k.device)
+    partial = None
     single = n <= 8192
     if not single:
-        _kv_amax[(parts, 2)](k, v, partial, nk, nv, parts, block, num_warps=warps)
+        partial = torch.empty((2, parts), dtype=torch.float32, device=k.device)
+        _kv_amax[(parts, 2)](
+            k, v, partial, tokens, k_row, v_row, parts, block, num_warps=warps
+        )
     _kv_quant[(workers, 2)](
         k,
         v,
@@ -449,11 +461,11 @@ def fused_kv_per_tensor_quant(k: torch.Tensor, v: torch.Tensor):
         v8,
         partial,
         scales,
-        nk,
-        nv,
+        tokens,
+        k_row,
+        v_row,
         parts,
         block,
-        workers,
         single,
         num_warps=warps,
     )

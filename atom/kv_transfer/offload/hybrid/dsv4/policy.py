@@ -14,13 +14,14 @@ import array
 import hashlib
 import heapq
 import json
-import os
 import threading
 from collections import OrderedDict
 from collections.abc import Iterator, MutableSet
 from dataclasses import dataclass
 from math import lcm
 from numbers import Integral
+
+from atom.utils import envs
 
 
 @dataclass(frozen=True)
@@ -287,13 +288,9 @@ def _committed_sidecar_capacity(kvc) -> int:
     extra = (kvc or {}).get("kv_connector_extra_config", kvc or {}) or {}
     configured = extra.get("committed_sidecar_index_capacity")
     if configured is None:
-        raw = os.environ.get("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", "65536")
-        try:
-            capacity = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "committed sidecar index capacity must be a positive integer"
-            ) from exc
+        capacity = envs.OFFLOAD_COMMITTED_SIDECAR_CAPACITY
+        if capacity is None:
+            capacity = 65536
     else:
         if isinstance(configured, bool) or not isinstance(configured, int):
             raise ValueError(

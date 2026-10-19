@@ -41,6 +41,10 @@ import triton
 import triton.language as tl
 
 from atom.model_ops.attentions.pool_layout.v4_pool_geometry import WindowParams
+from atom.model_ops.v4_kernels.paged_decode import (
+    v4_decode_split_plan,
+    v4_uniform_split_table,
+)
 from atom.model_ops.v4_kernels.pool_index import window_constexprs, window_row
 
 
@@ -142,11 +146,14 @@ class DSparkIndexBuffers:
     kv_indptr: torch.Tensor  # [max_b*T+1] int32
     draft_rows: torch.Tensor  # [max_b*T] int32
     qo_indptr: torch.Tensor  # [max_b*T+1] int32, constant ramp
+    split_table: torch.Tensor  # [16, max_b*T+1] int32, constant, see `split_plan`
     batch_ids: torch.Tensor  # [max_b*T] int32, [0]*T ++ [1]*T ++ ..., -1 on pad
     max_batch: int
     draft_width: int  # T
     draft_window: int  # W
     built_for: int = -1
+    # The fp8 decode ASM split plan for `built_for` requests (None: aiter picks).
+    split_plan: tuple[int, torch.Tensor] | None = None
 
     @classmethod
     def allocate(
@@ -174,6 +181,7 @@ class DSparkIndexBuffers:
             kv_indptr=torch.empty(n + 1, **i32),
             draft_rows=torch.empty(n, **i32),
             qo_indptr=torch.arange(n + 1, **i32),
+            split_table=v4_uniform_split_table(n, device),
             batch_ids=torch.arange(n, **i32) // draft,
             max_batch=max_batch,
             draft_width=draft,
@@ -199,11 +207,13 @@ class DSparkIndexBuffers:
         window: WindowParams,
         slots: torch.Tensor,  # [B] per-request ring slot
         anchors: torch.Tensor,  # [B] per-request anchor position
+        heads: int,  # local attention heads, for the split plan
     ) -> None:
         """Fill this bundle for one block, in one launch. Read it with :meth:`views`.
 
         `T` and `W` come from the bundle, so the slices can never be cut to a shape
-        the buffers were not allocated for.
+        the buffers were not allocated for. The split plan is built alongside,
+        for `B * T` rows of at most `W + T` KV each.
         """
         B = anchors.shape[0]
         T, W = self.draft_width, self.draft_window
@@ -228,6 +238,7 @@ class DSparkIndexBuffers:
             BLOCK_B=triton.next_power_of_2(B),
             BLOCK_K=triton.next_power_of_2(W + T),
         )
+        self.split_plan = v4_decode_split_plan(B * T, heads, W + T, self.split_table)
         # Last: a launch that raised must not leave the bundle claiming a batch.
         self.built_for = B
 

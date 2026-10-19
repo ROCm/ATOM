@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from atom.config import Config
 from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
+from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.sequence import Sequence
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
@@ -599,6 +600,12 @@ class LLMEngine:
             "saved_tokens",
             "loads_pending",
             "saves_pending",
+            # Why a waiting request is not costing a tier lookup per step, and
+            # whether its one external-tier attempt was already spent. Both are
+            # what an operator reads when the engine looks stalled with the
+            # GPUs idle; see `OffloadSchedulerMixin._init_tier_hit_memo`.
+            "lookups_skipped_by_memo",
+            "suppressed_load_retries",
         )
         offload_totals = {
             key: sum(int(stats.get(key, 0)) for stats in offload_rank_stats)
@@ -679,6 +686,8 @@ class LLMEngine:
 
 
 class InputOutputProcessor:
+    # Class default: a processor built without `__init__` ships nothing.
+    prefix_hash_block_size = 0
 
     def __init__(self, config, tokenizer, block_size):
         self.config = config
@@ -703,6 +712,13 @@ class InputOutputProcessor:
             )
         if self.config.hf_config.model_type in self._per_req_cache_model_types():
             self.has_per_req_cache = True
+        # `BlockManager.hash_block_size`, for shipping the prompt hash chain;
+        # 0 = no prefix cache. The engine rehashes on a mismatch.
+        self.prefix_hash_block_size = 0
+        if getattr(config, "enable_prefix_caching", False):
+            self.prefix_hash_block_size = hash_block_size_for(
+                block_size, config.decode_context_parallel_size
+            )
 
     @staticmethod
     def _per_req_cache_model_types() -> frozenset[str]:
@@ -799,6 +815,7 @@ class InputOutputProcessor:
             request_validator(
                 num_draft_tokens=self.num_speculative_tokens,
                 multimodal_data=multimodal_data,
+                enable_dp_attention=self.config.enable_dp_attention,
             )
         n = max(1, int(getattr(sampling_params, "n", 1)))
 
@@ -864,6 +881,13 @@ class InputOutputProcessor:
                 self._external_to_internal[seq.external_request_id] = seq.id
                 self._internal_to_external[seq.id] = seq.external_request_id
             seqs.append(seq)
+
+        # Runs in an executor or submit thread, not the event loop. Siblings
+        # share a prompt and seed, so one chain serves them all.
+        if self.prefix_hash_block_size:
+            ship_prompt_hash_chain(seqs[0], self.prefix_hash_block_size)
+            for seq in seqs[1:]:
+                seq.prompt_hash_chain = seqs[0].prompt_hash_chain
 
         if n == 1:
             logger.info(

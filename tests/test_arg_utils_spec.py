@@ -2,8 +2,11 @@
 # Regression tests for speculative-config validation in EngineArgs._get_engine_kwargs.
 
 import argparse
+import json
 import sys
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # conftest.py stubs atom.* and zmq before any atom imports are attempted,
 # but arg_utils.py imports LLMEngine from atom and CompilationConfig /
@@ -236,3 +239,116 @@ class TestEngineArgsIndexCacheDtype:
         )
 
         assert args.index_cache_dtype == "fp8"
+
+
+class TestKVOffloadEnv:
+    """ATOM_KV_OFFLOAD folds into kv_transfer_config without owning that flag."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_env(self, monkeypatch):
+        monkeypatch.delenv("ATOM_KV_OFFLOAD", raising=False)
+        monkeypatch.delenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", raising=False)
+
+    def _kv(self, argv=()):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        args = EngineArgs.from_cli_args(parser.parse_args(list(argv)))
+        return json.loads(args._get_engine_kwargs()["kv_transfer_config"])
+
+    def test_cli_flag_is_gone(self):
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--kv-offload-config", "{}"])
+
+    @pytest.mark.parametrize("mode", ["", "0", "off", "none"])
+    def test_off_leaves_transfer_config_untouched(self, monkeypatch, mode):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", mode)
+        assert self._kv() == {}
+
+    @pytest.mark.parametrize(
+        "mode, connector",
+        [
+            ("lmcache", "lmcache_offload"),
+            ("LMCache", "lmcache_offload"),
+            ("lmcache_mp", "lmcache_mp"),
+        ],
+    )
+    def test_mode_selects_connector(self, monkeypatch, mode, connector):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", mode)
+        assert self._kv() == {"kv_connector": connector, "kv_role": "offload"}
+
+    def test_extra_config_becomes_connector_extra_config(self, monkeypatch):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
+        monkeypatch.setenv(
+            "ATOM_KV_OFFLOAD_EXTRA_CONFIG",
+            '{"lmcache.mp.port": 5556, "lmcache.chunk_size": 256}',
+        )
+        assert self._kv() == {
+            "kv_connector": "lmcache_mp",
+            "kv_role": "offload",
+            "kv_connector_extra_config": {
+                "lmcache.mp.port": 5556,
+                "lmcache.chunk_size": 256,
+            },
+        }
+
+    def test_pd_connector_and_offload_become_multi(self, monkeypatch):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache")
+        pd = {"kv_connector": "mooncake", "kv_role": "kv_producer"}
+        cfg = self._kv(["--kv-transfer-config", json.dumps(pd)])
+        assert cfg == {
+            "kv_connector": "multi",
+            "connectors": [
+                pd,
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        }
+
+    def test_existing_multi_gets_offload_appended(self, monkeypatch):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache_mp")
+        pd = {"kv_connector": "moriio", "kv_role": "kv_producer"}
+        multi = {"kv_connector": "multi", "connectors": [pd]}
+        cfg = self._kv(["--kv-transfer-config", json.dumps(multi)])
+        assert cfg["kv_connector"] == "multi"
+        assert [c["kv_connector"] for c in cfg["connectors"]] == [
+            "moriio",
+            "lmcache_mp",
+        ]
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            {"kv_connector": "LMCacheMPConnector", "kv_role": "kv_both"},
+            {
+                "kv_connector": "multi",
+                "connectors": [
+                    {"kv_connector": "moriio"},
+                    {"kv_connector": "lmcache_offload"},
+                ],
+            },
+        ],
+    )
+    def test_duplicate_offload_is_rejected(self, monkeypatch, transfer):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache")
+        with pytest.raises(ValueError, match="conflicts with an offload connector"):
+            self._kv(["--kv-transfer-config", json.dumps(transfer)])
+
+    def test_unknown_mode_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "1")
+        with pytest.raises(ValueError, match="expected one of"):
+            self._kv()
+
+    def test_non_object_extra_config_is_rejected(self, monkeypatch):
+        monkeypatch.setenv("ATOM_KV_OFFLOAD", "lmcache")
+        monkeypatch.setenv("ATOM_KV_OFFLOAD_EXTRA_CONFIG", "[]")
+        with pytest.raises(TypeError, match="must be a JSON object"):
+            self._kv()
+
+    def test_extra_config_without_mode_is_rejected(self, monkeypatch):
+        monkeypatch.setenv(
+            "ATOM_KV_OFFLOAD_EXTRA_CONFIG", '{"lmcache.chunk_size": 256}'
+        )
+        with pytest.raises(ValueError, match="ATOM_KV_OFFLOAD is off"):
+            self._kv()

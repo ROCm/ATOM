@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 import torch
 
@@ -61,10 +62,14 @@ def test_native_byte_accounting():
     assert geo.page_bytes < bf16.page_bytes / 2
     assert geo.state_bytes < bf16.state_bytes * 0.52
     assert geo.layout_id != bf16.layout_id
-    # A ratio-2 owner halves the PAGE, so the tile bound is a statement about
-    # twice it: 16 tokens leave that owner 8 rows, which no block id names.
-    with pytest.raises(ValueError, match="16-row tiles"):
+    # A ratio-2 owner halves the PAGE, so the block bound is a statement about
+    # twice it: 16 tokens leave that owner 8 rows, which no block id names --
+    # at this geometry's 16-row blocks. Declaring 8-row ones makes the same
+    # PAGE legal, which is what says the gate is about the block and not the
+    # PAGE.
+    with pytest.raises(ValueError, match="16-row blocks"):
         replace(geo, block_size=16)
+    replace(geo, block_size=16, index_block_rows=8)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
@@ -200,3 +205,42 @@ def test_packed_plan_scatter_graph_replay_preserves_other_fields(ratio):
             rtol=0,
             atol=0,
         )
+
+
+def test_packed_window_keeps_rows_below_cached_until():
+    """The packed ring write leaves a request's rows below `swa_cached_until`
+    as they are (V4.1 decoder bounded replay recomputes rows its ring holds),
+    and writes the rest exactly as without it."""
+    from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
+    from atom.model_ops.blockscale import quantize_fp8
+    from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
+    geo = V41PoolGeometry(3, ((0, 2), (1, 1), (2, 2)), 32, 128, 512, 128, packed=True)
+    requests = (
+        PagedRequest(1, 32, 0, 40, 0, (0, 1, 2)),
+        PagedRequest(2, 0, 40, 10, 1, (3,)),
+    )
+    x = torch.randn(50, 512, device="cuda", dtype=torch.bfloat16)
+    rows = quantize_fp8(x)
+    caches = []
+    for cached in (None, [48, 0]):
+        cache = PagedAttentionCache(geo, 8, 2, "cuda")
+        cache.backing.zero_()
+        step = begin_step(
+            cache,
+            requests,
+            floors=None if cached is None else np.asarray([32, 0], np.int32),
+            cached_until=None if cached is None else np.asarray(cached, np.int32),
+        )
+        cache.write_window(1, rows, step)
+        caches.append(cache.backing.clone())
+    torch.cuda.synchronize()
+    whole, kept = caches
+    window = geo.window(1, 8)
+    row_bytes = 512 + 512 // 32
+    expected = whole.clone()
+    for pos in range(32, 48):
+        start = window.ring_start + 0 * window.slot_rows + (pos % 128) * row_bytes
+        expected[start : start + row_bytes] = 0
+    assert not torch.equal(whole, expected)
+    torch.testing.assert_close(kept, expected, rtol=0, atol=0)

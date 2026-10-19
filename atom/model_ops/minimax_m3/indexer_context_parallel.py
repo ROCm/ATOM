@@ -7,6 +7,7 @@ import triton.language as tl
 from atom.model_ops.minimax_m3.index_topk import (
     DECODE_TOPK_BLOCK_SIZE_K,
     DECODE_TOPK_NUM_WARPS,
+    PAGES_PER_SPARSE_BLOCK,
     _alloc_emit,
     _decode_score_chunks,
     _launch_select,
@@ -14,7 +15,7 @@ from atom.model_ops.minimax_m3.index_topk import (
 )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["LOCAL_BLOCKS", "GLOBAL_BLOCKS", "CHUNK"])
 def _context_score(
     Q,
     Cache,
@@ -24,18 +25,18 @@ def _context_score(
     Q_TOKEN_STRIDE: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
-    TOKENS: tl.constexpr,
     HEADS: tl.constexpr,
     QUERY_LEN: tl.constexpr,
-    LOCAL_BLOCKS: tl.constexpr,
-    GLOBAL_BLOCKS: tl.constexpr,
+    LOCAL_BLOCKS,
+    GLOBAL_BLOCKS,
     RANK: tl.constexpr,
     WORLD: tl.constexpr,
-    CHUNK: tl.constexpr,
+    CHUNK,
     N: tl.constexpr,
     SCALE: tl.constexpr,
 ):
     request = tl.program_id(0)
+    tokens = tl.num_programs(0) * QUERY_LEN
     chunk = tl.program_id(1)
     n = tl.arange(0, N)
     token, head = n // HEADS, n % HEADS
@@ -63,7 +64,7 @@ def _context_score(
             )
             score = tl.max(dot, 0)
         tl.store(
-            Scores + (head * TOKENS + row) * LOCAL_BLOCKS + local,
+            Scores + (head * tokens + row) * LOCAL_BLOCKS + local,
             score,
             mask=n < HEADS * QUERY_LEN,
         )
@@ -150,7 +151,6 @@ def indexer_context_scores(
             Q_TOKEN_STRIDE=idx_q.stride(0),
             Q_HEAD_STRIDE=idx_q.stride(1),
             TABLE_STRIDE=block_table.stride(0),
-            TOKENS=tokens,
             HEADS=heads,
             QUERY_LEN=max_query_len,
             LOCAL_BLOCKS=local,
@@ -219,5 +219,8 @@ def select_global_blocks(
             DECODE_TOPK_BLOCK_SIZE_K,
             DECODE_TOPK_NUM_WARPS,
             True,
+            # This path's cache has its blocks back to back, so the stride
+            # equals the pages a block fills.
+            block_page_stride=PAGES_PER_SPARSE_BLOCK,
         )
     return indices, *output

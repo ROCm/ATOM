@@ -3,6 +3,9 @@ ARG BASE_IMAGE="rocm/pytorch:latest"
 ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
+# LMCache wheel image (FROM scratch, one wheel at /), pinned by digest. See the
+# LMCache section of atom_image.
+ARG LMCACHE_WHEEL_IMAGE="rocm/atom-dev:lmcache-v0.5.6.dev139-gf22dec28-rocm-torch210@sha256:deee808c0b7c461459acffc3fafd45c7bc994e886874c18e92a09d3e95ebf98c"
 
 # OOT image extends an ATOM base image that already contains atom/aiter/mori.
 FROM ${OOT_BASE_IMAGE} AS atom_oot
@@ -171,7 +174,7 @@ FROM ${SGLANG_BASE_IMAGE} AS atom_sglang
 ARG GPU_ARCH
 ARG VENV_PYTHON="/opt/venv/bin/python"
 ARG SGLANG_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGLANG_REF="v0.5.17"
+ARG SGLANG_REF="v0.5.20"
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -222,7 +225,7 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
     cp pyproject_other.toml pyproject.toml && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps -e . && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir tomli && \
-    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; deps = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']['runtime_common']; blocked_prefixes = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar=='); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in deps if dep != 'numpy' and not any(dep.startswith(prefix) for prefix in blocked_prefixes)))" && \
+    "${VENV_PYTHON}" -c "import tomli; from pathlib import Path; extras = tomli.loads(Path('pyproject_other.toml').read_text())['project']['optional-dependencies']; blocked = ('compressed-tensors', 'outlines==', 'timm==', 'torchao==', 'xgrammar==', 'transformers'); seen = set(); out = []; walk = lambda names: [None for dep in names for key in [dep.strip()] if key and key not in seen and not seen.add(key) and (walk(extras[key[len('sglang['):-1]]) if key.startswith('sglang[') and key.endswith(']') else out.append(key))]; pkg = lambda dep: dep.split('[')[0].split('=')[0].split('<')[0].split('>')[0].split('!')[0].strip(); walk(extras['runtime_common']); Path('/tmp/sglang-runtime-common.txt').write_text(''.join(f'{dep}\\n' for dep in out if pkg(dep) != 'numpy' and not any(dep.startswith(p) or pkg(dep) == p.split('=', 1)[0] for p in blocked)))" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir \
       -r /tmp/sglang-runtime-common.txt \
       airportsdata \
@@ -250,6 +253,18 @@ RUN echo "========== [SGLANG-ATOM 3/6] Install SGLang dependencies ==========" &
       "apache-tvm-ffi @ git+https://github.com/apache/tvm-ffi.git@37d0485b2058885bf4e7a486f7d7b2174a8ac1ce" \
       "z3-solver==4.15.4.0" && \
     rm -f /tmp/sglang-runtime-common.txt && \
+    TORCH_HIP="$("${VENV_PYTHON}" -c "import torch; print(torch.version.hip or '')")" && \
+    test -n "${TORCH_HIP}" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir --no-deps "transformers==5.16.1" && \
+    "${VENV_PYTHON}" -m pip install --no-cache-dir \
+      "huggingface-hub==1.5.0" \
+      "tokenizers==0.23.1" \
+      "safetensors>=0.8.0" \
+      "regex>=2025.10.22" \
+      "typer" \
+      "packaging>=20.0" \
+      "pyyaml>=5.1" \
+      "tqdm>=4.60" && \
     "${VENV_PYTHON}" -m pip show sglang torch triton transformers IPython orjson pybase64 petit-kernel wave-lang xgrammar outlines apache-tvm-ffi || true
 
 # Keep SGLang aligned with the Triton that the ATOM base image ships.  SGLang
@@ -277,7 +292,8 @@ RUN echo "========== [SGLANG-ATOM 5/6] Validate vision/audio wheels ==========" 
 
 RUN echo "========== [SGLANG-ATOM 5.5/6] Pin smg-grpc-servicer ==========" && \
     "${VENV_PYTHON}" -m pip install --no-cache-dir "smg-grpc-servicer==0.5.2" && \
-    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer
+    "${VENV_PYTHON}" -m pip show smg-grpc-proto smg-grpc-servicer && \
+    "${VENV_PYTHON}" -c "import importlib.metadata as m; import torch; from transformers import AutoConfig; assert torch.version.hip is not None, 'pip replaced ROCm torch'; assert m.version('transformers') == '5.16.1', m.version('transformers'); assert m.version('tokenizers') == '0.23.1', m.version('tokenizers'); assert m.version('huggingface-hub') == '1.5.0', m.version('huggingface-hub'); cfg = AutoConfig.for_model('qwen4_exp_text'); assert cfg.model_type == 'qwen4_exp_text', cfg.model_type"
 
 RUN echo "========== [SGLANG-ATOM 6/6] Check Aiter/FlyDSL versions after SGLang build ==========" && \
     "${VENV_PYTHON}" -m pip show atom amd-mori-nightly amd-aiter flydsl sglang triton triton-kernels || true
@@ -399,6 +415,9 @@ RUN echo "========== [Parallel] Building Aiter ==========" && \
     pip install -r requirements.txt && \
     MAX_JOBS=$MAX_JOBS PREBUILD_KERNELS=$PREBUILD_KERNELS \
     GPU_ARCHS=$GPU_ARCH_LIST python3 setup.py develop
+
+# The LMCache wheel, published by .github/workflows/lmcache-rocm-wheel.yaml.
+FROM ${LMCACHE_WHEEL_IMAGE} AS lmcache_wheel
 
 # --------------------------------------------------------------------
 # Stage 3: Final merge — collect all build artifacts + install MORI/ATOM
@@ -530,10 +549,12 @@ RUN pip install rocm-trace-lite && \
 # ATOM: Python package install (editable) with the atomesh build hook enabled.
 # CACHEBUST invalidates only this layer so parallel stages stay cached
 ARG CACHEBUST=1
+# Optional Cargo features; ext-proc is excluded unless explicitly requested.
+ARG ATOM_MESH_FEATURES=""
 RUN git clone $ATOM_REPO /app/ATOM && \
     cd /app/ATOM && \
     git checkout $ATOM_COMMIT && \
-    ATOM_MESH_BUILD=1 python -m pip install -e .
+    ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES="${ATOM_MESH_FEATURES}" python -m pip install -e .
 RUN pip show atom || true
 
 RUN pip install --no-cache-dir msgpack msgspec quart
@@ -546,23 +567,33 @@ RUN echo "========== Install atomesh binary ==========" && \
     atomesh --version
 
 # ========== LMCache (ROCm 7.2.4 / torch 2.10) for KV offload ==========
-# Install the official wheel built for the image's exact PyTorch ABI. Keep
-# --no-deps so pip cannot replace the preinstalled ROCm torch stack.
-ARG LMCACHE_WHEEL_NAME=lmcache-0.5.5rc3+rocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_URL=https://github.com/LMCache/LMCache/releases/download/v0.5.5rc3-rocm-torch210/lmcache-0.5.5rc3%2Brocm7.2.4.torch2.10.git3d3aa833.cxx11abi1-cp312-cp312-manylinux_2_39_x86_64.whl
-ARG LMCACHE_WHEEL_SHA256=06cda2fef1c2cf3926ffa59c4ba13b6029c6e40d3fba6db2bc2e7350a29c280f
-RUN echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
-    curl -fL "${LMCACHE_WHEEL_URL}" -o "/tmp/${LMCACHE_WHEEL_NAME}" && \
-    echo "${LMCACHE_WHEEL_SHA256}  /tmp/${LMCACHE_WHEEL_NAME}" | sha256sum -c - && \
+# Install a wheel built for the image's exact PyTorch ABI. Keep --no-deps so
+# pip cannot replace the preinstalled ROCm torch stack. The wheel comes from
+# LMCACHE_WHEEL_IMAGE, a FROM scratch image holding only the wheel, which
+# .github/workflows/lmcache-rocm-wheel.yaml pushes to Docker Hub; the same
+# workflow opens the PR that moves the pin. The expected lmcache.__version__
+# follows from the wheel name; the ABI suffix and wheel tag are the workflow's
+# ROCM_TORCH210_LOCAL_VERSION and EXPECTED_WHEEL_TAG, and change only with the
+# image's torch.
+ARG LMCACHE_WHEEL_SHA256=68c0f6870c82497b4a1fef5c365960119bedfe66715a410457ae45eb6164cc03
+RUN --mount=type=bind,from=lmcache_wheel,target=/tmp/lmcache-wheel \
+    echo "========== [ATOM] Install LMCache ROCm torch 2.10 wheel ==========" && \
+    set -- /tmp/lmcache-wheel/*.whl && \
+    { [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "Expected one wheel in LMCACHE_WHEEL_IMAGE, found: $*"; exit 1; }; } && \
+    lmcache_wheel="$1" && \
+    lmcache_version="$(basename "${lmcache_wheel}" | sed -nE \
+        's/^lmcache-([^-]+\.rocm7\.2\.4\.torch2\.10\.git3d3aa833\.cxx11abi1)-cp312-cp312-manylinux_2_39_x86_64\.whl$/\1/p')" && \
+    { [ -n "${lmcache_version}" ] || { echo "Unexpected LMCache wheel ${lmcache_wheel}"; exit 1; }; } && \
+    echo "${LMCACHE_WHEEL_SHA256}  ${lmcache_wheel}" | sha256sum -c - && \
     "${VENV_PYTHON}" -m pip install \
         prometheus_client==0.25.0 aiofile==3.11.1 aiofiles caio==0.9.25 \
         blake3 redis sortedcontainers pyzmq cupy-rocm-7-0 \
         cachetools cryptography numba openai \
         opentelemetry-api==1.40.0 opentelemetry-sdk==1.40.0 \
         opentelemetry-exporter-otlp==1.40.0 \
-        opentelemetry-exporter-prometheus==0.61b0 && \
-    "${VENV_PYTHON}" -m pip install --no-deps "/tmp/${LMCACHE_WHEEL_NAME}" && \
-    rm -f "/tmp/${LMCACHE_WHEEL_NAME}" && \
+        opentelemetry-exporter-prometheus==0.61b0 \
+        "grpcio>=1.78.0" "protobuf>=6.31.1,<7" && \
+    "${VENV_PYTHON}" -m pip install --no-deps "${lmcache_wheel}" && \
     "${VENV_PYTHON}" -c "import torch; torch.cuda.is_available = lambda: True; import lmcache, lmcache.cuda_ops, lmcache.lmcache_native; \
 from lmcache.v1.cache_engine import LMCacheEngineBuilder; \
 from lmcache.v1.memory_management import MemoryFormat; \
@@ -574,7 +605,7 @@ from lmcache.utils import EngineType; \
 from lmcache.v1.multiprocess.futures import DeviceMessagingFuture; \
 from lmcache.v1.multiprocess.group_view import EngineGroupInfo; \
 assert 'rocm' in torch.__version__, torch.__version__; \
-assert lmcache.__version__.startswith('0.5.5rc3+rocm7.2.4.torch2.10'), lmcache.__version__; \
+assert lmcache.__version__ == '${lmcache_version}', lmcache.__version__; \
 assert lmcache.cuda_ops.__file__.endswith('.so'), lmcache.cuda_ops.__file__; \
 assert lmcache.lmcache_native.__file__.endswith('.so'), lmcache.lmcache_native.__file__; \
 assert hasattr(lmcache.cuda_ops, 'execute_object_group_transfer'), 'cuda_ops extension is incomplete'; \

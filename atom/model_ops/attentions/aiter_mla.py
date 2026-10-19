@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import inspect
 import logging
 from dataclasses import dataclass
@@ -16,9 +17,13 @@ from aiter import (
 )
 
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     get_dcp_rank,
     get_dcp_world_size,
+    mla_dcp_decode_is_persistent,
+    mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -41,8 +46,8 @@ from atom.model_ops.attention_mla import (
     _MLA_MIN_HEADS,
     _MLA_SPLIT_BUDGET_AUTO,
     MLAAttention,
-    mla_dcp_decode_is_persistent,
     mla_dcp_kernel_num_heads,
+    mla_dcp_sparse_prefill_num_heads,
 )
 from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
@@ -51,16 +56,17 @@ from atom.model_ops.glm5_next.geometry import (
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
-    fp4_decode_parallel_units,
-    fp4_decode_schedule,
+    fp4_index_scale_rows,
     fp4_prefill_schedule,
     sparse_indexer_fp4_enabled,
 )
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_convert import (
+    decompose_slots_triton,
     kv_indices_generate_triton,
     mtp_prepare_decode_mla_kernel,
 )
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
@@ -70,6 +76,22 @@ from .token_layout.decode import decode_positions
 from .token_layout.slots import slot_mapping
 
 logger = logging.getLogger("atom")
+
+
+@functools.cache
+def _warn_legacy_shuffle_kv() -> None:
+    if envs.ATOM_USE_TRITON_MLA:
+        logger.warning(
+            "ATOM_USE_TRITON_MLA_SHUFFLE_KV is deprecated; use "
+            "ATOM_MLA_KV_SHUFFLED=1 (keep ATOM_USE_TRITON_MLA=1 for the "
+            "Triton decode)"
+        )
+    else:
+        logger.warning(
+            "ATOM_USE_TRITON_MLA_SHUFFLE_KV has no effect without "
+            "ATOM_USE_TRITON_MLA=1 and is deprecated"
+        )
+
 
 # The MLA pool's row space. Named rather than derived from a geometry: every
 # MLA layer packs into one row of the same width, so there is only ever one.
@@ -136,7 +158,7 @@ def aligned_index_cache_dim(hf_config) -> int:
 def _pad_prefill_mla_draft_tail(
     kv_indptr: torch.Tensor,
     kv_last_page_lens: np.ndarray,
-    block_tables: np.ndarray,
+    block_tables: np.ndarray | None,
     scheduled_bs: int,
     running_bs: int,
 ) -> None:
@@ -146,7 +168,8 @@ def _pad_prefill_mla_draft_tail(
         return
     kv_indptr[scheduled_bs + 1 : running_bs + 1] = kv_indptr[scheduled_bs]
     kv_last_page_lens[scheduled_bs:running_bs] = 0
-    block_tables[scheduled_bs:running_bs] = 0
+    if block_tables is not None:
+        block_tables[scheduled_bs:running_bs] = 0
 
 
 def _global_index_cache_layer_ids(
@@ -358,9 +381,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             self.block_size = envs.ATOM_MLA_PAGE_SIZE
         else:
             self.block_size = 1
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+            _warn_legacy_shuffle_kv()
+        self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
+        if self.kv_shuffled:
             assert model_runner.block_size == 64, (
-                f"ATOM_USE_TRITON_MLA=1 and ATOM_USE_TRITON_MLA_SHUFFLE_KV=1 expects --block-size 64 "
+                f"ATOM_MLA_KV_SHUFFLED=1 expects --block-size 64 "
                 f"for {model_runner.kv_cache_dtype} KV cache, "
                 f"got --block-size {model_runner.block_size}"
             )
@@ -403,6 +429,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.dcp_rank = get_dcp_rank()
         self._publishes_dcp_local_lens = self.is_sparse and self.dcp_world_size > 1
         self._tbo_full_running_bs = 0
+        # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
+        # now: warmup never reaches a long DCP prefill.
+        self._fp4_scale_row_lut = None
+        if self._indexer_fp4 and self.dcp_world_size > 1:
+            block = model_runner.block_size
+            rows = torch.arange(block, dtype=torch.int32, device=self.device)
+            self._fp4_scale_row_lut = fp4_index_scale_rows(rows, block)
+            decompose_slots_triton(rows[:1], 1, block, self._fp4_scale_row_lut)
 
         # DCP decode all-gathers Q on the head dim, so the head count reaching
         # mla_decode_fwd (and thus the persistent decode metadata) is the padded
@@ -433,6 +467,57 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
         else:
             self.persistent_num_heads = self.padded_num_attention_heads
+
+        nonps_args = (
+            self.dcp_world_size,
+            self.num_attention_heads * self.dcp_world_size,
+            self.dtype_q == dtypes.fp8 and self.dtype_kv == dtypes.fp8,
+            dcp_persistent,
+        )
+        self.dcp_sparse_prefill_nonps = self.is_sparse and (
+            mla_dcp_sparse_prefill_uses_nonps(
+                *nonps_args, config.max_num_batched_tokens
+            )
+        )
+        # Warn only when the step budget is what turned the flag off.
+        if (
+            self.is_sparse
+            and not self.dcp_sparse_prefill_nonps
+            and mla_dcp_sparse_prefill_uses_nonps(*nonps_args, NONPS_MAX_Q_ROWS)
+        ):
+            logger.warning(
+                "ATOM_DCP_SPARSE_PREFILL_NONPS ignored: max_num_batched_tokens=%d "
+                "exceeds the %d q rows the non-persistent gqa64 kernel takes; "
+                "DCP sparse prefill keeps its default kernel.",
+                config.max_num_batched_tokens,
+                NONPS_MAX_Q_ROWS,
+            )
+        if self.sparse_dcp_metadata_rebuild:
+            # persistent_num_heads above is decode's width; sparse prefill
+            # rounds differently and can disagree (see
+            # mla_dcp_sparse_prefill_num_heads's docstring) -- catch that here
+            # instead of a corrupted reduce write. Both sides use the default
+            # min_kernel_heads=16, so this doesn't cover a model overriding
+            # min_query_heads (Kimi-K3 DSpark: 32), a pre-existing gap
+            # unrelated to QREP.
+            expected_sparse_prefill_num_heads = mla_dcp_sparse_prefill_num_heads(
+                self.num_attention_heads,
+                self.dcp_world_size,
+                persistent=mla_dcp_sparse_prefill_is_persistent(
+                    self.dcp_world_size,
+                    dcp_persistent,
+                    sparse_metadata_rebuild=self.sparse_dcp_metadata_rebuild,
+                ),
+            )
+            assert self.persistent_num_heads == expected_sparse_prefill_num_heads, (
+                "sparse-prefill work buffers would be sized for "
+                f"{self.persistent_num_heads} gathered heads (decode's width "
+                f"function), but the sparse-prefill kernel actually dispatches "
+                f"at {expected_sparse_prefill_num_heads} heads (its own width "
+                "function) -- decode's and sparse prefill's width tables "
+                "disagree for this num_attention_heads/dcp combination. See "
+                "mla_dcp_sparse_prefill_num_heads's docstring."
+            )
 
         max_seqlen_qo = getattr(model_runner, "num_spec_tokens", 0) + 1
         (
@@ -476,36 +561,54 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 dtype=reduce_partial_map_type,
                 device=self.device,
             ),
-            "kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "kv_indptr": CpuGpuBuffer(
+                self.max_bs + 1, publication_group="mla_csr", **i32_kwargs
+            ),
             # Global (un-sharded) per-request KV indptr for round-robin CP: cumsum
             # of the GLOBAL context_lens (token-level, page_size=1). Only filled
             # when dcp_world_size > 1; consumed by the cprr kernel via
             # mla_decode_fwd(g_kv_indptr=...) to apply the global-position causal
             # mask for MTP (max_q_len > 1).
-            "g_kv_indptr": CpuGpuBuffer(self.max_bs + 1, **i32_kwargs),
+            "g_kv_indptr": CpuGpuBuffer(
+                self.max_bs + 1, publication_group="mla_csr", **i32_kwargs
+            ),
             "kv_indices": CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             ),
-            "kv_last_page_lens": CpuGpuBuffer(self.max_bs, **i32_kwargs),
+            "kv_last_page_lens": CpuGpuBuffer(
+                self.max_bs, publication_group="mla_csr", **i32_kwargs
+            ),
         }
         if self._publishes_dcp_local_lens:
             # Layer-invariant sparse-DSA indexer metadata: one row per query
             # token, derived once per step and reused by every full layer.
             mla_metadata["dcp_local_context_lens"] = CpuGpuBuffer(
-                self.max_bs * max_seqlen_qo, **i32_kwargs
+                self.max_bs * max_seqlen_qo, publication_group="mla_csr", **i32_kwargs
+            )
+        if self._indexer_fp4:
+            # The FP4 indexer's key bound for each query token (its position +
+            # 1), derived once per step and read by every full layer.
+            mla_metadata["index_row_ends"] = CpuGpuBuffer(
+                self.max_bs * max_seqlen_qo, publication_group="mla_csr", **i32_kwargs
             )
         mla_metadata["kv_last_page_lens"].cpu.fill_(1)
         mla_metadata["kv_last_page_lens"].copy_to_gpu()
         if self.is_sparse:
             mla_metadata["cu_seqlen_ke"] = CpuGpuBuffer(
-                self.max_num_batched_tokens, **i32_kwargs
+                self.max_num_batched_tokens,
+                publication_group="mla_sparse",
+                **i32_kwargs,
             )
             mla_metadata["cu_seqlen_ks"] = CpuGpuBuffer(
-                self.max_num_batched_tokens, **i32_kwargs
+                self.max_num_batched_tokens,
+                publication_group="mla_sparse",
+                **i32_kwargs,
             )
             mla_metadata["sparse_kv_indptr"] = CpuGpuBuffer(
-                self.max_num_batched_tokens + 1, **i32_kwargs
+                self.max_num_batched_tokens + 1,
+                publication_group="mla_sparse",
+                **i32_kwargs,
             )
             mla_metadata["sparse_cu_seqlens_q"] = CpuGpuBuffer(
                 self.max_num_batched_tokens + 1, **i32_kwargs
@@ -536,23 +639,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 self.max_num_batched_tokens,
                 dtype=torch.int32,
                 device=self.device,
-            )
-            # `[P, 4]` int32 read by the mqa-logits kernel during a CUDAGraph
-            # replay, so it has to be a fixed address refreshed in place, and
-            # one per ubatch since TBO has two in flight.
-            self._indexer_fp4_cta_info = (
-                [
-                    torch.zeros(
-                        fp4_decode_parallel_units(self.max_bs, max_seqlen_qo),
-                        4,
-                        **i32_kwargs,
-                    )
-                    for _ in range(
-                        self._NUM_TBO_UBATCHES + 1 if config.enable_tbo else 1
-                    )
-                ]
-                if self._indexer_fp4
-                else []
             )
             # One block-table row per query token; only MTP verify needs a
             # copy. Built once per step, not in the indexer, where every
@@ -654,6 +740,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
 
         self.model_runner.forward_vars.update(mla_metadata)
+        if self.is_sparse:
+            self.model_runner.forward_vars["batch_id_per_q_token"].publication_group = (
+                "mla_tokens"
+            )
 
         # Chunked-context workspaces for the prefill has_cached path. Sized
         # to config.attn_prefill_chunk_size (defaults to max_num_batched_tokens)
@@ -758,26 +848,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         for ub_idx in range(self._NUM_TBO_UBATCHES):
             p = f"ub{ub_idx}_"
-            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            host_i32 = dict(i32_kwargs, publication_group=f"{p}mla_metadata")
+            host_i64 = dict(i64_kwargs, publication_group=f"{p}mla_metadata")
+            var[f"{p}kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             # Per-ubatch global (un-sharded) kv_indptr for round-robin CP (see the
             # shared "g_kv_indptr" buffer). Filled in _build_ubatch when dcp>1.
-            var[f"{p}g_kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}g_kv_indptr"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}kv_indices"] = CpuGpuBuffer(
                 self.max_bs * self.max_num_blocks_per_seq,
                 **i32_kwargs,
             )
-            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **i32_kwargs)
-            var[f"{p}kv_last_page_lens"] = CpuGpuBuffer(ub_max_bs, **i32_kwargs)
+            var[f"{p}context_lens"] = CpuGpuBuffer(ub_max_bs, **host_i32)
+            var[f"{p}kv_last_page_lens"] = CpuGpuBuffer(ub_max_bs, **host_i32)
             var[f"{p}kv_last_page_lens"].cpu.fill_(0)
             var[f"{p}kv_last_page_lens"].copy_to_gpu()
             var[f"{p}slot_mapping"] = CpuGpuBuffer(
                 ub_max_bs * max_seqlen_qo,
-                **i64_kwargs,
+                **host_i64,
             )
             var[f"{p}block_tables"] = CpuGpuBuffer(
-                ub_max_bs, self.block_table_cols, **i32_kwargs
+                ub_max_bs, self.block_table_cols, **host_i32
             )
-            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
+            var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **host_i32)
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
                     0,
@@ -791,7 +883,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.is_sparse:
                 var[f"{p}sparse_kv_indptr"] = CpuGpuBuffer(
                     ub_max_bs + 1,
-                    **i32_kwargs,
+                    **host_i32,
                 )
 
             # MLA work buffers per ubatch (GPU only)
@@ -894,6 +986,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sparse_decode: bool = False,
         is_cp_round_robin: bool = False,
     ):
+        if self.kv_shuffled:
+            return {}
         assert num_reject_tokens is None or num_reject_tokens.shape[0] >= bs, (
             f"num_reject_tokens covers {num_reject_tokens.shape[0]} sequences "
             f"but this asks for {bs}; the update kernel loads one per work item "
@@ -1141,6 +1235,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 sparse_decode=True,
             )
             result["sparse_kv_indptr"] = sparse_kv_indptr
+            if self._indexer_fp4:
+                # one query row a sequence: its key bound is its context
+                result["index_row_ends"] = var["context_lens"].gpu[:running_bs]
         else:
             # `bs`, not `running_bs`, and paired with `num_reject_tokens`: this count
             # becomes `cu_num`, and the update kernel loads
@@ -1336,20 +1433,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
     def get_kv_transfer_tensors(self):
+        from atom.kv_transfer.disaggregation.page_region import page_region
         from atom.kv_transfer.disaggregation.types import (
             INDEX_CACHE_ROLE,
             MLA_KV_ROLE,
             KVTransferRegion,
             KVTransferTensors,
+            PageRegion,
         )
 
         runner = self.model_runner
         if self.kv_pool is None:
             return None
-        if self._indexer_fp4:
-            # A connector is handed one `INDEX_CACHE_ROLE` region per layer --
-            # the whole vocabulary it and its DCP shard plan have for the
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        if (
+            self._indexer_fp4
+            and not KVConnectorFactory.topology_region_readers_copy_whole_blocks(
+                runner.config
+            )
+        ):
+            # A P/D connector is handed one `INDEX_CACHE_ROLE` region per layer
+            # -- the whole vocabulary it and its DCP shard plan have for the
             # indexer -- and the FP4 cache is two planes neither parses.
+            # A transport registered with `copies_whole_block_regions`
+            # (`lmcache_mp`) is the exception, admitted above: it copies whole
+            # blocks of every published region, so the FP4 data and its e8m0
+            # scale plane travel as two regions per layer (see below).
             #
             # That is a statement about the REGION MAP, so it only binds the
             # transports that read one. Dense offload does not: it never looks
@@ -1364,17 +1474,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # answers whether a backend needs compressor P/D staging, and
             # `lmcache_mp` declares that False while still requiring these
             # regions. Ask the question actually being asked.
-            from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-
             if KVConnectorFactory.topology_reads_block_regions(runner.config):
                 raise NotImplementedError(
                     "KV transfer that addresses the cache through the PAGE "
-                    "region map is unsupported with the FP4 sparse indexer: "
-                    "the map cannot describe its separate e8m0 scale plane. "
-                    "That is every P/D backend, lmcache_mp, and the hybrid/m3/"
-                    "kimi_k3 offload layouts. Pass --index_cache_dtype fp8 to "
-                    "use one; dense CPU/NVMe offload (lmcache_offload) carries "
-                    "both planes and needs no change."
+                    "region map is unsupported with the FP4 sparse indexer "
+                    "unless lmcache_mp is the only transport reading the map: "
+                    "the P/D backends and the hybrid/m3/kimi_k3 offload layouts "
+                    "parse one index region per layer and cannot place its "
+                    "separate e8m0 scale plane. Pass --index_cache_dtype fp8 to "
+                    "use one; lmcache_mp and dense CPU/NVMe offload "
+                    "(lmcache_offload) carry both planes and need no change."
                 )
             return None
         # What the pool was built with, not what the hook would recompute: a
@@ -1388,32 +1497,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # and no per-field override to keep in step with the pooling ones.
         # DCP PD still dispatches on the two collapsed roles (`mla.kv` /
         # `dsa.index_cache`) rather than the pool's per-layer names.
-        region_tensors = self.kv_pool.region_tensors()
-        block_regions: list[KVTransferRegion] = []
-        for role, t in region_tensors:
-            bpb = t.stride(0) * t.element_size()
+        pages: list[PageRegion] = []
+        for role, t in self.kv_pool.region_tensors():
             if role.startswith("index."):
-                block_regions.append(
-                    KVTransferRegion(
-                        base_addr=t.data_ptr(),
-                        total_bytes=t.numel() * t.element_size(),
-                        unit_bytes=bpb,
-                        semantic_role=INDEX_CACHE_ROLE,
-                    )
-                )
+                pages.append(page_region(t, semantic_role=INDEX_CACHE_ROLE))
                 index_tensors.append(t)
                 continue
-            block_regions.append(
-                KVTransferRegion(
-                    base_addr=t.data_ptr(),
-                    total_bytes=t.numel() * t.element_size(),
-                    unit_bytes=bpb,
+            pages.append(
+                page_region(
+                    t,
                     semantic_role=(
                         MLA_KV_ROLE if role.startswith("kv.") else f"mla.{role}"
                     ),
                 )
             )
-        block_tensor_views = [t for _, t in region_tensors]
 
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
@@ -1506,6 +1603,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
                 for layer_id in local_index_layer_ids
             ]
+            if self._indexer_fp4:
+                # `region_tensors` publishes the FP4 scale planes after the
+                # index data planes, one per index layer; number them after
+                # every consumer's index regions so the list still names one
+                # consumer region per published PAGE region.
+                block_region_consumer_indices += [
+                    num_global_kv_layers
+                    + len(global_index_layer_ids)
+                    + global_compact_index_slot_by_layer[layer_id]
+                    for layer_id in local_index_layer_ids
+                ]
 
         index_staging_region = None
         index_staging_pool_size = 0
@@ -1576,9 +1684,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 return slot.data_ptr(), pages
 
         return KVTransferTensors(
-            block_regions=block_regions,
-            slot_regions=[],
-            block_tensor_views=block_tensor_views,
+            pages=pages,
             block_region_consumer_indices=block_region_consumer_indices,
             index_staging_region=index_staging_region,
             index_staging_pool_size=index_staging_pool_size,
@@ -1681,6 +1787,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             slots.astype(np.int32)
         ).to(dev, non_blocking=True)
 
+        # Page / row / e8m0 row for the DCP FP4 staging gather. They depend only
+        # on `slots` and `total_kv`, so build them once per forward, not per layer.
+        read, stage = "dcp_indexer_fp4_read", "dcp_indexer_fp4_stage"
+        slots_dev = attn_metadata.dcp_indexer_fp4_local_slots
+        lut = getattr(self, "_fp4_scale_row_lut", None)
+        if lut is not None:
+            idx = decompose_slots_triton(slots_dev, total_kv, block, lut)
+        else:
+            # Torch fallback (CPU / test builders); also the kernel's reference.
+            token = torch.arange(total_kv, dtype=torch.int32, device=dev)
+            idx = []
+            for src in (slots_dev, token):
+                page, row = src // block, src % block
+                idx += [page, row, fp4_index_scale_rows(row, block)]
+        names = [
+            f"{side}_{part}"
+            for side in (read, stage)
+            for part in ("page", "row", "scale_row")
+        ]
+        for name, tensor in zip(names, idx):
+            setattr(attn_metadata, name, tensor)
+
         # Fixed width, not `pages`: the scorer specializes on this table's
         # stride, so a per-batch width recompiles it. Sized at a whole batch's
         # summed context rather than `block_tables`' one-sequence allowance --
@@ -1713,7 +1841,18 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         history = np.minimum(pools, self.index_topk // kpool) * kpool
         return (history + seq_lens % kpool).astype(np.int32)
 
+    def _prefill_block_table_rows(self, scheduled_bs, running_bs, has_cached):
+        if hasattr(self.model_runner, "drafter") or has_cached:
+            # Prepare the final padded range before the first upload. Later
+            # consumers reuse it, without rewriting a borrowed host tail.
+            block_table_state(self.model_runner.forward_vars["block_tables"]).pad(
+                scheduled_bs, running_bs
+            )
+            return running_bs
+        return None
+
     def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+        self._check_metadata_writable("mla_csr", "mla_sparse")
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
             self, batch, running_bs
         )
@@ -1729,13 +1868,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             and self.index_kpool > 1
             and attn_metadata.block_tables is None
         ):
-            self.prepare_block_tables(batch)
-            attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+            # Already packed by the common producer; publish its final layout.
+            attn_metadata.block_tables = block_table_state(var["block_tables"]).publish(
+                bs
+            )
         if self.is_sparse and attn_metadata.max_seqlen_k > self.index_topk:
             if attn_metadata.block_tables is None:
                 # Already marshalled by the base builder; only the upload is
                 # gated on `has_cached`.
-                attn_metadata.block_tables = var["block_tables"].copy_to_gpu(bs)
+                attn_metadata.block_tables = block_table_state(
+                    var["block_tables"]
+                ).publish(bs)
             counts = var["cu_seqlens_q"].np[1 : bs + 1] - var["cu_seqlens_q"].np[:bs]
             local_offsets = np.concatenate(
                 [np.arange(s, dtype=np.int32) for s in counts]
@@ -1804,44 +1947,48 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             if self.dcp_world_size > 1:
                 self._build_dcp_indexer_prefill_meta(attn_metadata, bs, counts, var)
-            get_mla_metadata_v1(
-                attn_metadata.sparse_cu_seqlens_q,
-                attn_metadata.sparse_kv_indptr,
-                attn_metadata.sparse_kv_last_page_lens,
-                self.padded_num_attention_heads,
-                1,  # nhead_kv
-                True,
-                var["sparse_prefill_work_meta_data"],
-                var["sparse_prefill_work_info_set"],
-                var["sparse_prefill_work_indptr"],
-                var["sparse_prefill_reduce_indptr"],
-                var["sparse_prefill_reduce_final_map"],
-                var["sparse_prefill_reduce_partial_map"],
-                page_size=self.block_size,
-                dtype_q=self.dtype_q,
-                dtype_kv=self.dtype_kv,
-                kv_granularity=max(self.block_size, 16),
-                max_seqlen_qo=1,
-                uni_seqlen_qo=1,
-                fast_mode=1,
-                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
-            )
-            attn_metadata.sparse_prefill_work_meta_data = var[
-                "sparse_prefill_work_meta_data"
-            ]
-            attn_metadata.sparse_prefill_work_info_set = var[
-                "sparse_prefill_work_info_set"
-            ]
-            attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
-            attn_metadata.sparse_prefill_reduce_indptr = var[
-                "sparse_prefill_reduce_indptr"
-            ]
-            attn_metadata.sparse_prefill_reduce_final_map = var[
-                "sparse_prefill_reduce_final_map"
-            ]
-            attn_metadata.sparse_prefill_reduce_partial_map = var[
-                "sparse_prefill_reduce_partial_map"
-            ]
+            # The non-persistent DCP sparse prefill reads no work plan.
+            if not self.dcp_sparse_prefill_nonps:
+                get_mla_metadata_v1(
+                    attn_metadata.sparse_cu_seqlens_q,
+                    attn_metadata.sparse_kv_indptr,
+                    attn_metadata.sparse_kv_last_page_lens,
+                    self.padded_num_attention_heads,
+                    1,  # nhead_kv
+                    True,
+                    var["sparse_prefill_work_meta_data"],
+                    var["sparse_prefill_work_info_set"],
+                    var["sparse_prefill_work_indptr"],
+                    var["sparse_prefill_reduce_indptr"],
+                    var["sparse_prefill_reduce_final_map"],
+                    var["sparse_prefill_reduce_partial_map"],
+                    page_size=self.block_size,
+                    dtype_q=self.dtype_q,
+                    dtype_kv=self.dtype_kv,
+                    kv_granularity=max(self.block_size, 16),
+                    max_seqlen_qo=1,
+                    uni_seqlen_qo=1,
+                    fast_mode=1,
+                    max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+                )
+                attn_metadata.sparse_prefill_work_meta_data = var[
+                    "sparse_prefill_work_meta_data"
+                ]
+                attn_metadata.sparse_prefill_work_info_set = var[
+                    "sparse_prefill_work_info_set"
+                ]
+                attn_metadata.sparse_prefill_work_indptr = var[
+                    "sparse_prefill_work_indptr"
+                ]
+                attn_metadata.sparse_prefill_reduce_indptr = var[
+                    "sparse_prefill_reduce_indptr"
+                ]
+                attn_metadata.sparse_prefill_reduce_final_map = var[
+                    "sparse_prefill_reduce_final_map"
+                ]
+                attn_metadata.sparse_prefill_reduce_partial_map = var[
+                    "sparse_prefill_reduce_partial_map"
+                ]
 
             # ---- Prefill Context Parallel: shrink per-query sparse metadata --
             # to this rank's 1/pcp round-robin queries. Gate on
@@ -1852,7 +1999,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if pcp_is_enabled() and not batch.is_dummy_run:
                 self._apply_pcp_reindex(attn_metadata, scheduled_tokens, sparse_counts)
 
-        if hasattr(self.model_runner, "drafter") or attn_metadata.has_cached:
+        # The token-granular paged CSR (kv_indptr / kv_indices /
+        # kv_last_page_lens) is read by the drafter and by the plain-layout
+        # cached-prefix gather. The shuffled gather reads only block-granular
+        # CSR (built below), so a shuffled cached prefill without a drafter
+        # skips it.
+        has_drafter = hasattr(self.model_runner, "drafter")
+        if has_drafter or (attn_metadata.has_cached and not self.kv_shuffled):
             # Populate kv_last_page_lens for full sequence (needed for MLA prefill with
             # prefix cache; decode does the same)
             if self.model_runner.block_size != 1:
@@ -1863,28 +2016,28 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["kv_last_page_lens"].np[:bs] = 1
 
             attn_metadata.kv_indices = var["kv_indices"].gpu
-            kv_indptr = var["kv_indptr"].gpu[: running_bs + 1]
-            attn_metadata.kv_indptr = kv_indptr[: bs + 1]
-            attn_metadata.kv_indptr[0] = 0
+            # Built on the host mirror like the decode path, then one upload.
             # `context_lens` is padded past the requests this indptr counts.
-            attn_metadata.kv_indptr[1 : bs + 1] = torch.cumsum(
-                attn_metadata.context_lens[:bs], 0
-            )
+            kv_indptr = var["kv_indptr"].np
+            kv_indptr[0] = 0
+            np.cumsum(var["context_lens"].np[:bs], out=kv_indptr[1 : bs + 1])
 
             # kv_indices_generate_triton expects logical block_tables (one
-            # entry per block_ratio tokens). The parent packed exactly that
-            # this step, and the only write to the mirror in between is the
-            # tail zeroing below, which starts at `bs`.
+            # entry per block_ratio tokens). The parent published the final
+            # padded table already; its host mirror remains borrowed.
             _pad_prefill_mla_draft_tail(
                 kv_indptr,
                 var["kv_last_page_lens"].np,
-                var["block_tables"].np,
+                None,  # block-table padding was prepared before its only upload
                 bs,
                 running_bs,
             )
+            attn_metadata.kv_indptr = var["kv_indptr"].copy_to_gpu(running_bs + 1)[
+                : bs + 1
+            ]
             var["kv_last_page_lens"].copy_to_gpu(running_bs)
             attn_metadata.kv_last_page_lens = var["kv_last_page_lens"].gpu[:bs]
-            block_tables_for_kv = var["block_tables"].copy_to_gpu(running_bs)[:bs]
+            block_tables_for_kv = var["block_tables"].gpu[:bs]
             kv_indices_generate_triton(
                 block_tables_for_kv,
                 attn_metadata.kv_indices,
@@ -1893,29 +2046,148 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 attn_metadata.max_seqlen_k,
             )
 
-            # Build chunked-context metadata when enabled AND the cached
-            # prefix is large enough to risk OOM in the single-pass path.
-            # The non-cached new-tokens portion is handled separately by the
-            # forward (self-attention via kv_b_proj), so chunks span only the
-            # cached prefix.
-            if self.dcp_world_size > 1 and attn_metadata.has_cached:
-                # DCP always routes the cached-prefix prefill through the chunked
-                # context path (even single-chunk) because the cross-rank
-                # AllGather + reorg live there. attn_prefill_chunk_size still
-                # bounds per-chunk memory.
-                attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta_dcp(batch, bs)
-            elif (
-                self.attn_prefill_chunk_size > 0
-                and attn_metadata.has_cached
-                and sum(batch.num_cached_tokens[:bs]) > self.attn_prefill_chunk_size
-            ):
-                attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta(batch, bs)
+        # Build chunked-context metadata when enabled AND the cached
+        # prefix is large enough to risk OOM in the single-pass path.
+        # The non-cached new-tokens portion is handled separately by the
+        # forward (self-attention via kv_b_proj), so chunks span only the
+        # cached prefix.
+        if self.dcp_world_size > 1 and attn_metadata.has_cached:
+            # DCP always routes the cached-prefix prefill through the chunked
+            # context path (even single-chunk) because the cross-rank
+            # AllGather + reorg live there. attn_prefill_chunk_size still
+            # bounds per-chunk memory.
+            attn_metadata.mla_chunk_meta = self._build_mla_chunk_meta_dcp(batch, bs)
+        elif (
+            self.attn_prefill_chunk_size > 0
+            and attn_metadata.has_cached
+            and sum(batch.num_cached_tokens[:bs]) > self.attn_prefill_chunk_size
+        ):
+            build_chunk_meta = (
+                self._build_mla_chunk_meta_shuffle
+                if self.kv_shuffled
+                else self._build_mla_chunk_meta
+            )
+            attn_metadata.mla_chunk_meta = build_chunk_meta(batch, bs)
 
+        self._attach_kv_shuffled_prefill_meta(attn_metadata, bs)
         attn_metadata.dtype_q = self.dtype_q
         # TBO: publish CPU length copies for zero-sync ubatch splits.
         # Attached last, once all metadata is finalized. No-op unless TBO is on.
         self._attach_tbo_prefill_cpu_lens(attn_metadata, bs)
         return attn_metadata, positions
+
+    def _attach_kv_shuffled_prefill_meta(self, attn_metadata, bs: int) -> None:
+        # Only the single-pass gather reads the full-context CSR; the chunked
+        # path carries its own per-chunk CSR in mla_chunk_meta.
+        if not (self.kv_shuffled and attn_metadata.has_cached):
+            return
+        if getattr(attn_metadata, "mla_chunk_meta", None) is not None:
+            return
+        # The shuffled cached-prefix gather (gather_kv_b_proj with
+        # shuffled_kv_cache=True) reads block_size-token blocks, so it needs
+        # block-granular CSR indices (logical block ids) instead of the
+        # token-granular kv_indices used by the plain layout. Build them from
+        # the full per-seq context (cached + just-written new tokens).
+        block_size = self.model_runner.block_size
+        var = self.model_runner.forward_vars
+        # Counts from the host mirror of context_lens: no device sync, and the
+        # indptr is one upload rather than a chain of tiny kernels.
+        block_counts = cdiv(var["context_lens"].np[:bs].astype(np.int64), block_size)
+        indptr = np.zeros(bs + 1, dtype=np.int32)
+        np.cumsum(block_counts, out=indptr[1:])
+        indptr_gpu = upload_numpy(indptr, self.device)
+        indices = torch.empty(int(indptr[-1]), dtype=torch.int32, device=self.device)
+        kv_indices_generate_triton(
+            var["block_tables"].gpu[:bs],
+            indices,
+            indptr_gpu,
+            1,
+            int(block_counts.max(initial=0)),
+        )
+        attn_metadata.shuffle_kv_block_indptr = indptr_gpu
+        attn_metadata.shuffle_kv_block_indices = indices
+
+    def _build_mla_chunk_meta_shuffle(
+        self, batch: ScheduledBatch, bs: int
+    ) -> MLAChunkContextMetadata | None:
+        """Block-aligned variant of ``_build_mla_chunk_meta`` for the shuffled
+        KV layout.
+
+        The shuffled gather reads whole ``block_size``-token blocks, so chunks
+        are split along the global *block* axis (``attn_prefill_chunk_size //
+        block_size`` blocks per chunk) rather than the token axis. Each chunk
+        carries block-granular CSR (``shuffle_kv_block_indptr/indices``) plus
+        token-granular ``cu_seqlens_k`` (output positions / flash_attn lens).
+
+        All chunks are computed at once on the host as ``[num_chunks, bs]``
+        arrays, then sent in a single upload; the per-chunk tensors are views
+        into it.
+        """
+        block_size = self.model_runner.block_size
+        chunk_blocks = max(1, self.attn_prefill_chunk_size // block_size)
+
+        cached = np.asarray(batch.num_cached_tokens[:bs], dtype=np.int64)
+        per_seq_blocks = cdiv(cached, block_size)
+        blk_offsets = np.zeros(bs + 1, dtype=np.int64)
+        np.cumsum(per_seq_blocks, out=blk_offsets[1:])
+        total_blocks = int(blk_offsets[-1])
+        if total_blocks == 0:
+            return None
+        num_chunks = cdiv(total_blocks, chunk_blocks)
+
+        # Global logical block list in per-seq CSR order: the leading cached
+        # blocks of each row of the host block table (row-major mask order).
+        # Scan only the columns this batch reaches, not the configured max.
+        valid_cols = int(per_seq_blocks.max(initial=0))
+        block_tables = self.model_runner.forward_vars["block_tables"].np[
+            :bs, :valid_cols
+        ]
+        col = np.arange(valid_cols)
+        global_blocks = block_tables[col[None, :] < per_seq_blocks[:, None]]
+
+        # [num_chunks, bs]: intersect each seq's block range with each chunk's.
+        gb_start = np.arange(num_chunks, dtype=np.int64)[:, None] * chunk_blocks
+        gb_end = np.minimum(gb_start + chunk_blocks, total_blocks)
+        seq_lo = np.clip(blk_offsets[None, :-1], gb_start, gb_end)
+        seq_hi = np.clip(blk_offsets[None, 1:], gb_start, gb_end)
+        local_lo = seq_lo - blk_offsets[:-1]
+        local_hi = seq_hi - blk_offsets[:-1]
+        # Full blocks * block_size, clamped to the cached length for the seq's
+        # final (partial) block.
+        chunk_tokens = np.maximum(
+            np.minimum(local_hi * block_size, cached) - local_lo * block_size, 0
+        )
+
+        # One packed upload: [blk_indptr | cu_seqlens_k | global_blocks].
+        packed = np.zeros(2 * num_chunks * (bs + 1) + total_blocks, dtype=np.int32)
+        blk_indptr = packed[: num_chunks * (bs + 1)].reshape(num_chunks, bs + 1)
+        cu_k = packed[num_chunks * (bs + 1) : 2 * num_chunks * (bs + 1)].reshape(
+            num_chunks, bs + 1
+        )
+        np.cumsum(seq_hi - seq_lo, axis=1, out=blk_indptr[:, 1:])
+        np.cumsum(chunk_tokens, axis=1, out=cu_k[:, 1:])
+        packed[2 * num_chunks * (bs + 1) :] = global_blocks
+        packed_gpu = upload_numpy(packed, self.device)
+        blk_indptr_gpu = packed_gpu[: num_chunks * (bs + 1)].view(num_chunks, bs + 1)
+        cu_k_gpu = packed_gpu[num_chunks * (bs + 1) : 2 * num_chunks * (bs + 1)].view(
+            num_chunks, bs + 1
+        )
+        blocks_gpu = packed_gpu[2 * num_chunks * (bs + 1) :]
+
+        blk_indptr_list = list(blk_indptr_gpu.unbind(0))
+        blk_indices_list = list(blocks_gpu.split(chunk_blocks))
+        return MLAChunkContextMetadata(
+            kv_indptr=blk_indptr_list,  # unused by shuffle gather; kept for parity
+            kv_indices=blk_indices_list,
+            cu_seqlens_k=list(cu_k_gpu.unbind(0)),
+            total_tokens=cu_k[:, -1].tolist(),
+            max_seqlen_k=chunk_tokens.max(axis=1).tolist(),
+            num_chunks=num_chunks,
+            k_workspace=self.k_chunk_workspace,
+            v_workspace=self.v_chunk_workspace,
+            shuffle_kv_block_indptr=blk_indptr_list,
+            shuffle_kv_block_indices=blk_indices_list,
+        )
 
     def _build_mla_chunk_meta(
         self, batch: ScheduledBatch, bs: int
@@ -2189,41 +2461,47 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
 
         # --- rebuild the sparse-prefill work buffers for the owned queries.
+        #     The non-persistent DCP sparse prefill reads no work plan.
         var = self.model_runner.forward_vars
-        get_mla_metadata_v1(
-            attn_metadata.sparse_cu_seqlens_q,
-            attn_metadata.sparse_kv_indptr,
-            attn_metadata.kv_last_page_lens,
-            self.padded_num_attention_heads,
-            1,  # nhead_kv
-            True,
-            var["sparse_prefill_work_meta_data"],
-            var["sparse_prefill_work_info_set"],
-            var["sparse_prefill_work_indptr"],
-            var["sparse_prefill_reduce_indptr"],
-            var["sparse_prefill_reduce_final_map"],
-            var["sparse_prefill_reduce_partial_map"],
-            page_size=self.block_size,
-            dtype_q=self.dtype_q,
-            dtype_kv=self.dtype_kv,
-            kv_granularity=max(self.block_size, 16),
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=1,
-            max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
-        )
-        attn_metadata.sparse_prefill_work_meta_data = var[
-            "sparse_prefill_work_meta_data"
-        ]
-        attn_metadata.sparse_prefill_work_info_set = var["sparse_prefill_work_info_set"]
-        attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
-        attn_metadata.sparse_prefill_reduce_indptr = var["sparse_prefill_reduce_indptr"]
-        attn_metadata.sparse_prefill_reduce_final_map = var[
-            "sparse_prefill_reduce_final_map"
-        ]
-        attn_metadata.sparse_prefill_reduce_partial_map = var[
-            "sparse_prefill_reduce_partial_map"
-        ]
+        if not self.dcp_sparse_prefill_nonps:
+            get_mla_metadata_v1(
+                attn_metadata.sparse_cu_seqlens_q,
+                attn_metadata.sparse_kv_indptr,
+                attn_metadata.kv_last_page_lens,
+                self.padded_num_attention_heads,
+                1,  # nhead_kv
+                True,
+                var["sparse_prefill_work_meta_data"],
+                var["sparse_prefill_work_info_set"],
+                var["sparse_prefill_work_indptr"],
+                var["sparse_prefill_reduce_indptr"],
+                var["sparse_prefill_reduce_final_map"],
+                var["sparse_prefill_reduce_partial_map"],
+                page_size=self.block_size,
+                dtype_q=self.dtype_q,
+                dtype_kv=self.dtype_kv,
+                kv_granularity=max(self.block_size, 16),
+                max_seqlen_qo=1,
+                uni_seqlen_qo=1,
+                fast_mode=1,
+                max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
+            )
+            attn_metadata.sparse_prefill_work_meta_data = var[
+                "sparse_prefill_work_meta_data"
+            ]
+            attn_metadata.sparse_prefill_work_info_set = var[
+                "sparse_prefill_work_info_set"
+            ]
+            attn_metadata.sparse_prefill_work_indptr = var["sparse_prefill_work_indptr"]
+            attn_metadata.sparse_prefill_reduce_indptr = var[
+                "sparse_prefill_reduce_indptr"
+            ]
+            attn_metadata.sparse_prefill_reduce_final_map = var[
+                "sparse_prefill_reduce_final_map"
+            ]
+            attn_metadata.sparse_prefill_reduce_partial_map = var[
+                "sparse_prefill_reduce_partial_map"
+            ]
 
         # --- owned slot_mapping for the fused q_out kernel in MLAAttention. The
         #     fused MLA kernel that produces q_out also writes k to these slots;
@@ -2271,67 +2549,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         rows.view(running_bs, max_seqlen_q, -1).copy_(block_tables.unsqueeze(1))
         attn_metadata.dcp_token_block_tables = rows
 
-    def _publish_indexer_fp4_decode_schedule(
-        self, attn_metadata: AttentionMetaData, bs: int, next_n: int, ubatch: int = 0
-    ) -> None:
-        """Refresh the FP4 decode CTA schedule; the captured kernel replays off
-        it, and every indexer layer of a step shares the one answer.
-
-        A replay reads the buffer's CONTENTS, so every decode forward has to
-        call this -- including the MTP draft's, whose rows are its own. The
-        lengths come from the published buffer rather than the metadata's view
-        of it, because a draft following a prefill carries prefill metadata.
-        """
-        if not self._indexer_fp4:
-            return
-        parallel_units = fp4_decode_parallel_units(bs, next_n)
-        cta_info = self._indexer_fp4_cta_info[ubatch][:parallel_units]
-        # `[:n]` past the end truncates rather than raising, while
-        # `indexer_fp4_n_ctas` still hands the kernel `n`. The rows past the end
-        # would then go unscheduled, and the logits buffer they should have
-        # written is `torch.empty` -- aiter only sentinels it when it builds the
-        # schedule itself, which it never does here.
-        assert cta_info.shape[0] == parallel_units
-        if self.dcp_world_size > 1:
-            # DCP scores this rank's shard. Its rows are query tokens carrying
-            # their own local window, so next_n is already flattened out of the
-            # row axis and the width is the sharded one -- `parallel_units`
-            # stays the non-DCP count, which keeps the captured grid identical.
-            from atom.model_ops.dcp_ops import dcp_local_logits_width
-            from atom.utils.forward_context import (
-                get_published_dcp_local_context_lens,
-            )
-
-            # A TBO ubatch owns rows from its own offset, not the batch's first
-            # `bs`, and it already publishes that slice on its metadata -- the
-            # same tensor the scorer reads. The global buffer stays the fallback
-            # so callers that publish nothing keep the prefix they had.
-            context_lens = get_published_dcp_local_context_lens(
-                attn_metadata, bs * next_n
-            )
-            if context_lens is None:
-                context_lens = self.model_runner.forward_vars[
-                    "dcp_local_context_lens"
-                ].gpu[: bs * next_n]
-            schedule_next_n = 1
-            width = dcp_local_logits_width(
-                self.model_runner.config.max_model_len, self.dcp_world_size
-            )
-        else:
-            context_lens = attn_metadata.context_lens[:bs]
-            schedule_next_n = next_n
-            width = self.model_runner.config.max_model_len
-        fp4_decode_schedule(
-            context_lens,
-            FP4_MQA_BLOCK_K,
-            parallel_units,
-            width,
-            schedule_next_n,
-            cta_info,
-        )
-        attn_metadata.indexer_fp4_cta_info = cta_info
-        attn_metadata.indexer_fp4_n_ctas = parallel_units
-
     def _publish_indexer_fp4_prefill_schedule(
         self, attn_metadata: AttentionMetaData, local_ends_np: np.ndarray, total_kv: int
     ) -> None:
@@ -2377,6 +2594,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         running_tokens: int,
         max_seqlen_q: int,
     ):
+        self._check_metadata_writable("mla_csr", "mla_sparse", "prefill", "positions")
         scheduled_bs = batch.total_seqs_num_decode
         dropout_p = 0.0
 
@@ -2395,7 +2613,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # Before the slots, not after: `slot_mapping` reads this packed table.
         # DCP still walks the trimmed ragged rows -- its slot is a per-rank
         # filter, not an address this table can answer.
-        self.prepare_block_tables(batch)
+        self.prepare_block_tables(batch, running_bs)
 
         if not batch.is_dummy_run:
             if max_seqlen_q > 1:
@@ -2422,15 +2640,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                         for block_table, seq_len in zip(block_tables, context_lens)
                     ]
                 else:
-                    # One token per sequence reduces the gather to its last row,
-                    # and `last_block_num_tokens` names the offset directly.
+                    # One token per sequence reduces the gather to its last
+                    # position's block. Indexed by position, not
+                    # `block_table[-1]`: under MTP the table also holds the
+                    # draft round's lookahead blocks past the last token
+                    # (`draft_kv_lookahead`).
+                    bsz = self.model_runner.block_size
                     slots = [
-                        block_table[-1] * self.model_runner.block_size
-                        + last_block_num
-                        - 1
-                        for block_table, last_block_num in zip(
-                            block_tables, batch.last_block_num_tokens
-                        )
+                        block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                        for block_table, n in zip(block_tables, context_lens.tolist())
                     ]
 
         # Use scheduled_bs since in dummy run, total_seqs_num_decode is 1.
@@ -2541,7 +2759,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     scheduled_tokens + 1 : running_tokens + 1
                 ] = var["sparse_kv_indptr"].np[scheduled_tokens]
                 vars_used.append(("sparse_kv_indptr", running_tokens + 1))
-                vars_used.append(("sparse_cu_seqlens_q", running_tokens + 1))
+                # Immutable unit-stride prefix, uploaded once at allocation.
                 metadata_deps.add("sparse_kv_indptr")
             else:
                 sparse_context_lens = self._sparse_selected_counts(
@@ -2556,45 +2774,33 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 vars_used.append(("sparse_kv_indptr", running_bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
+        if self._indexer_fp4:
+            var["index_row_ends"].np[:scheduled_tokens] = positions + 1
+            var["index_row_ends"].np[scheduled_tokens:running_tokens] = 0
+            vars_used.append(("index_row_ends", running_tokens))
+
         vars_for_metadata = [(el, num) for el, num in vars_used if el in metadata_deps]
-        vars_remaining = [(el, num) for el, num in vars_used if el not in metadata_deps]
+        vars_remaining = [
+            (el, num)
+            for el, num in vars_used
+            if el not in metadata_deps and el != "block_tables"
+        ]
         max_seqlen_k = context_lens.max()
 
-        # The side prep_stream overlaps the metadata H2D copies + kv_indices
-        # generation with the main stream. Under intra-GPU disagg the decode runs
-        # on a CU-masked stream, and the prep_stream's wait_stream barriers
-        # serialize against it, adding per-step decode latency. So in disagg mode
-        # do the copies synchronously on the current stream; otherwise keep the
-        # async overlap.
-        disagg = self.model_runner.config.enable_rapidserve
-        ctx = {}
-        ctx["kv_indptr"] = var["kv_indptr"].copy_to_gpu(running_bs + 1)
-        if disagg:
-            ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
-            ctx.update(ctx_rest)
-            ctx["kv_indices"] = var["kv_indices"].gpu
-            kv_indices_generate_triton(
-                ctx["block_tables"],
-                ctx["kv_indices"],
-                ctx["kv_indptr"],
-                self.block_ratio,
-                max_seqlen_k,
-            )
-        else:
-            prep_stream = self.prep_stream
-            current_stream = torch.cuda.current_stream()
-            prep_stream.wait_stream(current_stream)
-            with torch.cuda.stream(prep_stream):
-                ctx_rest = {el: var[el].copy_to_gpu(num) for el, num in vars_remaining}
-                ctx.update(ctx_rest)
-                ctx["kv_indices"] = var["kv_indices"].gpu
-                kv_indices_generate_triton(
-                    ctx["block_tables"],
-                    ctx["kv_indices"],
-                    ctx["kv_indptr"],
-                    self.block_ratio,
-                    max_seqlen_k,
-                )
+        # All persistent metadata publishes on the owner's compute stream.
+        ctx = {
+            "kv_indptr": var["kv_indptr"].copy_to_gpu(running_bs + 1),
+            "block_tables": block_table_state(var["block_tables"]).publish(running_bs),
+        }
+        ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_remaining})
+        ctx["kv_indices"] = var["kv_indices"].gpu
+        kv_indices_generate_triton(
+            ctx["block_tables"],
+            ctx["kv_indices"],
+            ctx["kv_indptr"],
+            self.block_ratio,
+            max_seqlen_k,
+        )
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         # metadata copies on main stream
@@ -2631,8 +2837,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
-        if not disagg:
-            current_stream.wait_stream(prep_stream)
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -2654,10 +2858,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_metadata, k, v)
 
-        if is_sparse_mtp:
+        if is_sparse_mtp or self._indexer_fp4:
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : running_tokens + 1
             ]
+        if is_sparse_mtp:
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_tokens]
@@ -2676,9 +2881,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:running_bs]
         self._publish_dcp_token_block_tables(attn_metadata, running_bs, max_seqlen_q)
-        self._publish_indexer_fp4_decode_schedule(
-            attn_metadata, running_bs, max_seqlen_q
-        )
 
         # running_bs, not scheduled_bs: the padded rows have to be split into the
         # ubatches too, or accuracy drifts.
@@ -2702,6 +2904,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """
         Splits the full-batch data into per-ubatch .
         """
+        self._check_metadata_writable("ub0_mla_metadata", "ub1_mla_metadata")
         var = self.model_runner.forward_vars
         self._tbo_full_running_bs = bs
         N = self._NUM_TBO_UBATCHES
@@ -2738,10 +2941,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             ]
             var[f"{p}slot_mapping"].np[ub_real_tokens:ub_running_tokens] = -1
 
-            var[f"{p}block_tables"].np[:ub_real_reqs] = var["block_tables"].np[
-                req_start : req_start + ub_real_reqs
-            ]
-            var[f"{p}block_tables"].np[ub_real_reqs:running_bs] = 0
+            block_table_state(var["block_tables"]).slice_to(
+                var[f"{p}block_tables"], req_start, ub_real_reqs, pad_to=running_bs
+            )
 
             full_kv_indptr = var["kv_indptr"].np
             base = full_kv_indptr[req_start]
@@ -2802,7 +3004,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 (f"{p}context_lens", running_bs),
                 (f"{p}kv_last_page_lens", running_bs),
                 (f"{p}slot_mapping", ub_running_tokens),
-                (f"{p}block_tables", running_bs),
                 (f"{p}kv_indptr", running_bs + 1),
                 (f"{p}cu_seqlens_q", running_bs + 1),
             ]
@@ -2811,6 +3012,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             if self.is_sparse:
                 vars_used.append((f"{p}sparse_kv_indptr", running_bs + 1))
 
+            block_table_state(var[f"{p}block_tables"]).publish(running_bs)
             for el, num in vars_used:
                 var[el].copy_to_gpu(num)
 
@@ -2875,8 +3077,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_split_per_batch=_MLA_SPLIT_BUDGET_AUTO,
         )
 
+    def _capture_needs_nonempty_kv(self, max_q_len: int) -> bool:
+        return self.block_size > 1 or (self.dcp_world_size > 1 and max_q_len > 1)
+
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
+        self._check_metadata_writable("mla_csr")
         var = self.model_runner.forward_vars
+        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         self._tbo_full_running_bs = bs
         # Self-consistent minimal KV metadata for capture: give every sequence
         # exactly 1 page (kv_indptr = [0,1,...,bs]) pointing at block 0, with a
@@ -2888,14 +3095,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # (only hit when num_kv_splits > 1; passes==1 takes the bf16 fast path).
         # Replay overwrites these buffers with real values, so this only affects
         # capture-time loop termination, not inference correctness.
-        if self.block_size > 1:
+        if self._capture_needs_nonempty_kv(max_q_len):
             kv_indptr_buf = var["kv_indptr"]
             kv_indptr_buf.np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
             kv_indptr_buf.copy_to_gpu(bs + 1)
             var["kv_indices"].gpu[:bs].zero_()
             var["kv_last_page_lens"].gpu[:bs].fill_(1)
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
-        max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         scheduled_tokens = bs * max_q_len
         is_sparse_mtp = self.is_sparse and max_q_len > 1
         # DCP + MTP (max_q_len>1) capture: the cprr kernel masks on GLOBAL
@@ -2905,17 +3111,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         # with real values.
         cp_round_robin = self.dcp_world_size > 1 and max_q_len > 1
         if cp_round_robin:
-            if self.block_size == 1:
-                var["kv_indptr"].np[: bs + 1] = np.arange(bs + 1, dtype=np.int32)
-                var["kv_indptr"].copy_to_gpu(bs + 1)
-                var["kv_indices"].gpu[:bs].zero_()
-                var["kv_last_page_lens"].gpu[:bs].fill_(1)
             # g_kv_indptr is the only thing telling the cprr kernel how long each
             # sequence is GLOBALLY, and nothing else initializes it -- capturing
             # with it left at its allocation value walks the kernel off the KV
             # list (illegal access). The round-robin is token-level whatever the
             # block size, so the one-local-token-per-rank layout set up here (or
-            # by the block_size > 1 branch above) is a global length of
+            # by the common synthetic layout above) is a global length of
             # dcp_world_size in both cases.
             var["g_kv_indptr"].np[: bs + 1] = (
                 np.arange(bs + 1, dtype=np.int32) * self.dcp_world_size
@@ -2964,10 +3165,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_matadata, k, v)
-        if is_sparse_mtp:
+        if is_sparse_mtp or self._indexer_fp4:
             attn_matadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : scheduled_tokens + 1
             ]
+        if self._indexer_fp4:
+            attn_matadata.index_row_ends = var["index_row_ends"].gpu[:scheduled_tokens]
+        if is_sparse_mtp:
             attn_matadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : scheduled_tokens + 1
             ]
@@ -2984,7 +3188,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 "sparse_kv_last_page_lens"
             ].gpu[:bs]
         self._publish_dcp_token_block_tables(attn_matadata, bs, max_q_len)
-        self._publish_indexer_fp4_decode_schedule(attn_matadata, bs, max_q_len)
         positions = var["positions"].copy_to_gpu(scheduled_tokens)
         context = Context(
             positions=positions,
@@ -3006,10 +3209,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         p = f"ub{ubatch_idx}_"
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
+        request_start = ubatch_idx * requests_per_ubatch
         dcp_local_context_lens = None
         if self._publishes_dcp_local_lens:
-            requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
-            request_start = ubatch_idx * requests_per_ubatch
             dcp_local_context_lens = var["dcp_local_context_lens"].gpu[
                 request_start : request_start + running_bs
             ]
@@ -3062,11 +3265,13 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             # DCP, so a ubatch always runs one query per sequence.
             assert max_q_len == 1
             attn.dcp_token_block_tables = attn.block_tables
-        # Slot 0 stays the full-batch schedule, so a ubatch never overwrites
-        # one the other's kernels still read.
-        self._publish_indexer_fp4_decode_schedule(
-            attn, running_bs, max_q_len, ubatch=ubatch_idx + 1
-        )
+        if self._indexer_fp4:
+            attn.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : running_bs * max_q_len + 1
+            ]
+            attn.index_row_ends = var["index_row_ends"].gpu[
+                request_start * max_q_len : (request_start + running_bs) * max_q_len
+            ]
         return attn
 
     def build_ubatch_prefill_metadata(

@@ -41,12 +41,22 @@ from atom.plugin.prepare import _set_framework_backbone
 
 logger = logging.getLogger("atom")
 
+# vLLM 0.29 resolves the MTP draft of DSA-family targets (``deepseek_v32``,
+# ``glm_moe_dsa``, i.e. DeepSeek-V3.2 and GLM-5.x) to "DeepseekV32MTPModel";
+# 0.28 called the very same draft block "DeepSeekMTPModel". Both names map onto
+# ATOM's ``atom.models.deepseek_mtp:DeepSeekMTP``.
+_DEEPSEEK_MTP_ARCHES: set[str] = {
+    "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
+}
 _MTP_MASK_INPUT_ARCH: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "Glm4MoeMTPModel",
 }
 _MTP_DRAFT_MODEL_ARCHES: set[str] = {
     "DeepSeekMTPModel",
+    "DeepseekV32MTPModel",
     "DeepSeekV4MTPModel",
     "DeepseekV4MTPModel",
     "Qwen3NextMTP",
@@ -73,6 +83,15 @@ _DEEPSEEK_V4_ARCHES: set[str] = {
     "DeepseekV4MTPModel",
 }
 _DEEPSEEK_V4_MTP_ARCHES: set[str] = _DEEPSEEK_V4_ARCHES - {_DEEPSEEK_V4_ARCH}
+# DeepSeek-V4.1 (CSA2) is likewise native ATOM, but its pool holds a per-request
+# STATE region alongside the paged history and it binds no per-layer cache --
+# so it gets its own bridge (`deepseek_v41_bridge`) rather than sharing V4's.
+# Text-only: vision and MTP are refused in
+# `atom.models.deepseek_v41.config.validate_runtime_config`. DSpark drafting is
+# supported on this path -- vLLM drives it -- and every other speculative
+# method is refused by `_refuse_unsupported_v41_speculation`.
+_DEEPSEEK_V41_ARCH = "DeepseekV41ForCausalLM"
+_DEEPSEEK_V41_ARCHES: set[str] = {_DEEPSEEK_V41_ARCH}
 
 
 def _probe_v4_routed_expert_dtype(model_path) -> str | None:
@@ -148,6 +167,7 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     "Glm4MoeForCausalLM": "atom.models.glm4_moe:Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM": "atom.models.deepseek_v2:GlmMoeDsaForCausalLM",
     "DeepSeekMTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
+    "DeepseekV32MTPModel": "atom.models.deepseek_mtp:DeepSeekMTP",
     "DeepSeekV4MTPModel": "atom.plugin.vllm.models.deepseek_v4_mtp:DeepseekV4MTP",
     "Glm4MoeMTPModel": "atom.models.glm4_moe_mtp:Glm4MoeMTP",
     "Qwen3NextForCausalLM": "atom.plugin.vllm.models.qwen3_next:Qwen3NextForCausalLM",
@@ -160,6 +180,9 @@ _ATOM_MODEL_CLASSES: dict[str, str] = {
     ),
     "MiniMaxM2ForCausalLM": "atom.models.minimax_m2:MiniMaxM2ForCausalLM",
     "DeepseekV4ForCausalLM": "atom.plugin.vllm.models.deepseek_v4:DeepseekV4ForCausalLM",
+    "DeepseekV41ForCausalLM": (
+        "atom.plugin.vllm.models.deepseek_v41:DeepseekV41RuntimeModelVllm"
+    ),
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3:MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3:MiniMaxM3SparseForConditionalGeneration",
     "Eagle3LlamaModel": "atom.models.eagle3_llama:Eagle3LlamaModel",
@@ -437,11 +460,83 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             )
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
-            # root HF config so --hf-overrides survive without losing multimodal
-            # sub-configs such as Kimi-K2.5's vision_config/text_config.
-            self.atom_config.hf_config = self.config
+            if model_arch in _DEEPSEEK_V41_ARCHES:
+                # V4.1 keeps the hf_config it was built with: the runtime
+                # model, the pool geometry and the attention topology are all
+                # written against `normalize_hf_config`'s flat schema, and
+                # vLLM's root config here is the AutoConfig shim, which by the
+                # time a worker sees it carries `text_config=None` and no
+                # `vision_config` -- so it cannot be normalized at all. See
+                # `v41_text_config`. `--hf-overrides` is refused at startup
+                # rather than silently dropped.
+                pass
+            else:
+                # root HF config so --hf-overrides survive without losing
+                # multimodal sub-configs such as Kimi-K2.5's
+                # vision_config/text_config.
+                self.atom_config.hf_config = self.config
         self.vllm_model_arch = selected_model_arch
         self.model_arch = model_arch
+        if model_arch in _DEEPSEEK_V41_ARCHES:
+            # Every one of these is installed on a class, here rather than at
+            # registration, because this runs in every worker and it returns
+            # before the model it configures can be called -- the object does
+            # not exist until it does.
+            from atom.plugin.vllm.v41_core_overrides import (
+                apply_v41_eager_break,
+                install_vllm_engram_staging,
+            )
+
+            # Engram's prefetch must not hold a fork open across a capture
+            # break; picked before the Engram runtime is built below.
+            install_vllm_engram_staging()
+            # The attention break this frontend needs, applied to the class
+            # before the model below is built out of it. Asked of the
+            # effective graph setting rather than the breakable flag, which
+            # vLLM sets for V4.1 on ROCm whether or not anything is captured.
+            #
+            # The constraints run first, and have to: they are what forces the
+            # mode to NONE when capture is unavailable, and they are not
+            # guaranteed to have run yet -- their config-time site is
+            # `ATOMPlatform`, which vLLM may never activate. Reading the mode
+            # before that decision installed the broken-out forward on an
+            # eager run, which then paid for its extra buffer and copy per
+            # layer, and skewed every eager-against-graph comparison. It is
+            # idempotent; the site below keeps its call.
+            from atom.plugin.vllm.platform import enforce_deepseek_v41_constraints
+            from atom.plugin.vllm.vllm_runtime import graphs_enabled
+
+            enforce_deepseek_v41_constraints(vllm_config)
+            apply_v41_eager_break(graphs_enabled(vllm_config))
+        if model_arch in _DEEPSEEK_V41_ARCHES and getattr(
+            self.atom_config, "enable_decoder_swa_bounded_replay", False
+        ):
+            # Bounded replay re-enters the model with a tail of the rows,
+            # and on this path the step those rows belong to was already
+            # staged -- outside the forward, once, against the full padded
+            # width (`atom_deepseek_v41_forward_context`). The staged step
+            # does not describe the tail, so the two disagree on how many
+            # rows there are:
+            #
+            #     RuntimeError: shape '[1389, -1, 512]' is invalid for input
+            #     of size 1048576        (cache.rope_quant_window)
+            #
+            # measured on the default plugin configuration, no speculation
+            # involved. It also bypasses the layer loop in `model.py` -- its
+            # stages run their own (`_Stage.run`) -- so a draft's aux hidden
+            # states would come back silently empty.
+            #
+            # Native keeps both: its drafter taps the layers with forward
+            # hooks and maps the tail's captures back itself
+            # (`_late_on_tail`). The plugin has neither half, so it does not
+            # get the optimization. Decided here rather than left to the
+            # operator: the alternative is a crash with a flag to pass.
+            self.atom_config.enable_decoder_swa_bounded_replay = False
+            logger.info(
+                "ATOM plugin: decoder SWA bounded replay is off for "
+                "DeepSeek-V4.1; this path stages a step outside the forward, "
+                "which a replayed tail of rows no longer describes."
+            )
         logger.info(
             "ATOM vLLM hf config overrides: use_index_cache=%s, index_topk_freq=%s, "
             "index_topk_pattern=%s",
@@ -539,7 +634,32 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             and not self.is_dspark_draft_model
         ):
             self._enable_eagle3_target_interface()
-        if self.is_mtp:
+        if self.is_mtp and model_arch in _DEEPSEEK_V4_ARCHES:
+            # Only DeepSeek-V4 targets can answer this: the pre-hc_head
+            # residual is produced by the V4 forward branch alone. vLLM's
+            # runner tests for the attribute and then subscripts the result
+            # without a None check, so exposing it on any other MTP target
+            # crashes profile_run:
+            #     spec_hidden_states = pre_hc_hidden_states[: ...]
+            #     TypeError: 'NoneType' object is not subscriptable
+            #
+            # KNOWN DIVERGENCE on vLLM 0.31, latent today. This binds the hook
+            # to the INSTANCE, but model runner V2 decides whether to widen the
+            # drafter's hidden buffer by hc_mult from the CLASS, before the
+            # target exists: _target_feeds_hc_residual() in
+            # vllm/v1/worker/gpu/spec_decode/speculator.py does
+            # `hasattr(get_model_cls(...), "get_mtp_target_hidden_states")`.
+            # The class-level test is False, so the buffer is sized for
+            # `hidden`, while the V2 runner then finds the method on the
+            # instance and feeds it the (T, hc_mult * hidden) pre-hc residual.
+            # DeepSeek-V4 is in ROCM_DEFAULT_MRV1_ARCHITECTURES, so it runs V1
+            # on ROCm and this does not fire; it would under
+            # VLLM_USE_V2_MODEL_RUNNER=1, or if V1 became unsupported for a
+            # config. Making the two agree means exposing the method on the
+            # registered class for the V4 architectures only -- the condition
+            # above is per-instance, and a wider exposure is exactly the
+            # profile_run crash this comment opens with. Not done here because
+            # no CI cell runs V4 under V2, so the change would ship unmeasured.
             self.get_mtp_target_hidden_states = self._get_mtp_target_hidden_states
         if self.is_mtp or self.is_eagle3:
             # Mirror nested attributes required by vLLM speculative decoding.
@@ -579,10 +699,76 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 if self._is_deepseek_v4_mtp
                 else ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
             )
+            # The MTP draft's layers live in the target's slot, as natively:
+            # its proxy only carries the drafter's metadata and reuses the
+            # target proxy's KV, so vLLM gives it no pages of its own.
             register_deepseek_v4_proxy_layer(
                 vllm_config,
                 self._deepseek_v4_proxy_layer_name,
+                kv_sharing_target_layer_name=(
+                    ATOM_DEEPSEEK_V4_PROXY_LAYER_NAME
+                    if self._is_deepseek_v4_mtp
+                    else None
+                ),
             )
+            if not self._is_deepseek_v4_mtp:
+                from atom.plugin.vllm.deepseek_v4_state_checkpoint import (
+                    deepseek_v4_state_checkpoint_copy_funcs,
+                    deepseek_v4_state_checkpoints_on,
+                    register_deepseek_v4_state_checkpoint_layers,
+                )
+
+                if deepseek_v4_state_checkpoints_on(vllm_config):
+                    # Prefix hits restore the slot from k state-checkpoint
+                    # blocks vLLM manages as MambaSpec(align) groups. This
+                    # worker's config has to say "align" before the input
+                    # batch sizes its block tables at KV-cache init.
+                    vllm_config.cache_config.mamba_cache_mode = "align"
+                    register_deepseek_v4_state_checkpoint_layers(vllm_config)
+                    self.get_mamba_state_copy_funcs = (
+                        deepseek_v4_state_checkpoint_copy_funcs
+                    )
+
+        # DeepSeek-V4.1 is bridged the same way, with one extra piece: ATOM's
+        # own metadata builder owns the fixed-address staging buffers every
+        # step writes into, so it is constructed once here (it also loads the
+        # Engram tables) and reused by every forward.
+        self._is_deepseek_v41 = self.model_arch in _DEEPSEEK_V41_ARCHES
+        if self._is_deepseek_v41:
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                make_deepseek_v41_metadata_builder,
+                register_deepseek_v41_proxy_layer,
+            )
+            from atom.plugin.vllm.platform import (
+                enforce_deepseek_v41_constraints,
+            )
+
+            # The config-time site for these is ``ATOMPlatform``, which vLLM
+            # does not always activate. Here the worker holds the config it
+            # will actually run, and this still precedes both cudagraph
+            # capture and the first forward.
+            enforce_deepseek_v41_constraints(vllm_config)
+            register_deepseek_v41_proxy_layer(vllm_config)
+            self._deepseek_v41_builder = make_deepseek_v41_metadata_builder(
+                self.atom_config,
+                vllm_config,
+                self.device_config.device,
+            )
+            # The proxy layer is how the vLLM-facing metadata builder reaches
+            # back: it runs inside `ModelState.prepare_attn`, with no handle on
+            # the wrapper, and it has to bind the pool and stage the step from
+            # there -- outside anything a graph captures. Same shape as V4's
+            # `_atom_v4_model`.
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME,
+            )
+
+            proxy = vllm_config.compilation_config.static_forward_context.get(
+                ATOM_DEEPSEEK_V41_PROXY_LAYER_NAME
+            )
+            if proxy is not None:
+                proxy._atom_v41_model = self.model
+                proxy._atom_v41_builder = self._deepseek_v41_builder
 
     # Attributes whose writes on the outer model must propagate to the
     # inner model so vLLM's weight-sharing reaches the forward path.
@@ -773,9 +959,10 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         otherwise feed the post-logits hidden shape expected by older MTP
         models.
 
-        Exposed under its public name only on MTP targets (see `__init__`):
-        vLLM decides whether to override the drafter's input by testing for the
-        attribute alone, so any speculator carrying it would be fed this.
+        Exposed under its public name only on DeepSeek-V4 MTP targets (see
+        `__init__`): vLLM decides whether to override the drafter's input by
+        testing for the attribute alone and then subscripts what it gets back,
+        so a target that cannot produce the residual must not carry it.
         """
         # Prefer the persistent in-graph residual buffer on the native V4 model.
         # It is refreshed by a captured `copy_` every forward (including FULL
@@ -862,6 +1049,13 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         self.get_eagle3_default_aux_hidden_state_layers = (
             self._resolve_eagle3_aux_hidden_state_layers
         )
+        if self.is_dspark:
+            # A DSpark draft has no output projection of its own and expects
+            # the target's under the name vLLM uses. Nothing fails without it:
+            # the draft keeps an unfilled head and drafts noise.
+            from atom.plugin.vllm.v41_speculative import attach_v41_target_lm_head
+
+            attach_v41_target_lm_head(self, model)
 
     def _resolve_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         # Following ATOM server mode, perfer the draft's configured IDs that
@@ -1007,9 +1201,36 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
                 else:
                     hidden_states = self.model(input_ids=input_ids, positions=positions)
                     self._mtp_target_hidden_states = hidden_states
+        elif self._is_deepseek_v41:
+            # DeepSeek-V4.1, like V4, is a native ATOM model reading ATOM's own
+            # forward context. Bind the proxy pool (a no-op after the first
+            # real forward), then drive one CSA2 step -- Engram rows, state
+            # reset, cursor advance and attention metadata -- and run the
+            # backbone against the positions that step staged. Those positions,
+            # not vLLM's, span the forward's padded width.
+            from atom.plugin.vllm.deepseek_v41_bridge import (
+                atom_deepseek_v41_forward_context,
+                bind_deepseek_v41_proxy_cache,
+            )
+
+            builder = self._deepseek_v41_builder
+            ready = bind_deepseek_v41_proxy_cache(self.model, builder, self.vllm_config)
+            with atom_deepseek_v41_forward_context(
+                atom_config=self.atom_config,
+                builder=builder,
+                input_ids=input_ids,
+                positions=positions,
+                vllm_config=self.vllm_config,
+                force_dummy=not ready,
+            ) as atom_positions:
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=atom_positions,
+                    inputs_embeds=inputs_embeds,
+                )
         else:
             if (
-                self.model_arch in {"Qwen3NextMTP", "DeepSeekMTPModel"}
+                self.model_arch in {"Qwen3NextMTP", *_DEEPSEEK_MTP_ARCHES}
                 and "spec_step_idx" not in model_kwargs
             ):
                 model_kwargs["spec_step_idx"] = (
@@ -1025,7 +1246,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
         if not self.pp_group.is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
 
-        if self.model_arch == "DeepSeekMTPModel":
+        if self.model_arch in _DEEPSEEK_MTP_ARCHES:
             # vLLM's DeepSeek-MTP contract wants (sample_hidden, recycle_hidden).
             # DeepSeekMultiTokenPredictorLayer.forward already returns the
             # post-final-norm hidden, and compute_logits no longer re-norms, so

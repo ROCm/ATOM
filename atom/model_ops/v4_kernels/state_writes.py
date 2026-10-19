@@ -44,8 +44,8 @@ Caller contract (`swa_write`):
                         the ring size `window_size + max_spec_steps` (e.g.
                         128 + 0 = 128 non-MTP; 128 + 1 = 129 MTP-1).
 - `write_per_batch`     int — max tokens to write per seq this fwd
-                        (= `min(max_q_len, window.ring_slots)`). Used as Triton
-                        `constexpr` for grid sizing.
+                        (= `min(max_q_len, window.ring_slots)`). Sets grid Y;
+                        read from the launch grid inside the kernel.
 
 Grid = `(bs, write_per_batch)`; each program writes one (seq, row-in-seq)
 token. Per-seq actual count is `min(token_num_per_seq[bs], write_per_batch)`;
@@ -77,18 +77,19 @@ def _swa_write_kernel(
     pool_ptr,  # this layer's whole unified-pool view, [rows, head_dim]
     pool_row_stride,  # = head_dim
     pool_rows,  # rows in that view; nothing may be written past it
-    head_dim,
+    head_dim: tl.constexpr,
     ring_start,
-    WRITE_PER_BATCH: tl.constexpr,
+    cached_until_ptr,  # [bs] int: positions below it stay as they are
     BLOCK_D: tl.constexpr,
+    CACHED_UNTIL: tl.constexpr,
     RING_SLOTS: tl.constexpr,
     SLOT_ROWS: tl.constexpr,
     RING_STRIDE: tl.constexpr,
     RUN_ROWS: tl.constexpr,
 ):
-    """SWA ring write. 2D grid `(bs, WRITE_PER_BATCH)`. Program `(b, r)`
+    """SWA ring write. 2D grid `(bs, write_per_batch)`. Program `(b, r)`
     writes the `r`-th of the last-N tokens of seq `b`, where
-    `N = min(tok_n_b, WRITE_PER_BATCH)` and
+    `N = min(tok_n_b, grid_y)` and
     `tok_n_b = cu_seqlens_q[b+1] - cu_seqlens_q[b]`. Threads with `r >= N` bail.
 
     `src_id = cu_seqlens_q[b+1] - N + r` — selects directly from `kv` /
@@ -112,7 +113,8 @@ def _swa_write_kernel(
     tok_n = cu_end - cu_start
     if tok_n <= 0:
         return
-    write_n = tl.minimum(tok_n, WRITE_PER_BATCH)
+    # The width varies with prefill length; keep it out of the JIT cache key.
+    write_n = tl.minimum(tok_n, tl.num_programs(1))
     if row_in_batch >= write_n:
         return
 
@@ -123,6 +125,9 @@ def _swa_write_kernel(
     dst_row = window_row(
         slot, pos, ring_start, RING_SLOTS, SLOT_ROWS, RING_STRIDE, RUN_ROWS
     )
+    if CACHED_UNTIL:
+        # a row its ring already holds stays as it is
+        dst_row = tl.where(pos < tl.load(cached_until_ptr + batch_idx), -1, dst_row)
 
     # `cu_seqlens_q` and `write_n` bound the reads; nothing bounded the write.
     # `slot` and `pos` are the row's only inputs and both come from per-forward
@@ -156,6 +161,7 @@ def swa_write(
     k_packed: torch.Tensor | None = None,
     k_rope: torch.Tensor | None = None,
     pool_rope: torch.Tensor | None = None,
+    cached_until: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """SWA ring in-place write, dispatching on the kv-cache layout.
@@ -196,14 +202,19 @@ def swa_write(
         window: this layer's compress class's `WindowParams`
             (`UnifiedPoolGeometry.window_params`).
         write_per_batch: `min(max_q_len, window.ring_slots)` — max tokens written
-            per seq this fwd (grid y dim, kernel `constexpr`).
+            per seq this fwd (grid y dim).
         k_packed: [T, 512] or [T, 1, 512] fp8 NoPE extend K — fp8 2buff path only.
         k_rope: [T, rope_head_dim] or [T, 1, rope_head_dim] bf16 RoPE tail — fp8
             2buff path only.
         pool_rope: [rows, rope_head_dim] bf16 RoPE plane view — presence selects
             the fp8 2buff path.
+        cached_until: [bs] int — bf16 path: per seq, the position below which
+            its ring already holds the rows and keeps them (a forward that
+            recomputes rows it has, V4.1 decoder bounded replay). None writes
+            every row.
     """
     if pool_rope is not None:
+        assert cached_until is None, "the fp8 2buff path writes every row"
         # fp8 2buff: scatter the op-quantized extend K (k_packed/k_rope) into both
         # planes. Flatten the [T, 1, *] quant-kernel views to [T, *]; the bf16
         # `kv` source is unused here.
@@ -256,8 +267,9 @@ def swa_write(
         pool.shape[0],
         head_dim,
         window.ring_start,
-        WRITE_PER_BATCH=write_per_batch,
+        positions if cached_until is None else cached_until,
         BLOCK_D=BLOCK_D,
+        CACHED_UNTIL=cached_until is not None,
         **window_constexprs(window),
     )
 

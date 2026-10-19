@@ -144,11 +144,12 @@ jobs:
             lm_eval_num_fewshot: 20
             accuracy_test_threshold: 0.91
             runner: spur-runner-mi355x-8gpu
-          - display_name: "MiniMax-M3-MXFP4 TP4"
-            model_name: "MiniMax-M3-MXFP4"
+          - display_name: "MiniMax-M3-MXFP4 EAGLE3 TP4"
+            model_name: "MiniMax-M3-MXFP4-EAGLE3"
             model_path: "amd/MiniMax-M3-MXFP4"
+            draft_model_path: "Inferact/MiniMax-M3-EAGLE3-GQA"
             client_command: "lm_eval --model local-chat-completions --apply_chat_template --fewshot_as_multiturn --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/chat/completions,num_concurrent=32,max_gen_toks=2048 --tasks gsm8k --num_fewshot 5 --batch_size 65 --output_path ${OUTPUT_PATH}"
-            extra_args: "--tensor-parallel-size 4 --kv-cache-dtype auto --no-trust-remote-code --gpu-memory-utilization 0.85 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching --no-async-scheduling --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}'"
+            extra_args: "--tensor-parallel-size 4 --kv-cache-dtype fp8 --no-trust-remote-code --gpu-memory-utilization 0.85 --block-size 128 --max-model-len 32768 --max-num-seqs 128 --max-num-batched-tokens 32768 --no-enable_prefix_caching --no-async-scheduling --language-model-only --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' --compilation-config '{\"cudagraph_mode\": \"FULL_AND_PIECEWISE\"}' --speculative-config '{\"method\":\"eagle3\",\"model\":\"/models/Inferact/MiniMax-M3-EAGLE3-GQA\",\"num_speculative_tokens\":3}'"
             env_vars: "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.93
@@ -158,9 +159,39 @@ jobs:
             model_path: "moonshotai/Kimi-K3"
             draft_model_path: "Inferact/Kimi-K3-DSpark"
             client_command: "lm_eval --model local-completions --model_args model=${MODEL_PATH},base_url=http://127.0.0.1:${VLLM_PORT}/v1/completions,num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True --tasks gsm8k --num_fewshot ${LM_EVAL_NUM_FEWSHOT} --output_path ${OUTPUT_PATH}"
-            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --decode-context-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.75 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'"
+            extra_args: "--trust-remote-code --language-model-only --tensor-parallel-size 8 --decode-context-parallel-size 8 --kv-cache-dtype fp8 --max-model-len 16384 --max-num-seqs 64 --max-num-batched-tokens 16384 --gpu-memory-utilization 0.91 --block-size 128 --enable-prefix-caching --mamba-cache-mode align --compilation-config '{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}' --additional-config '{\"online_quant_config\":{\"global_quant_config\":\"ptpc_fp8\",\"exclude_layer\":[\"lm_head\",\"model.embed_tokens\",\"*self_attn.[qkv]_conv1d*\",\"*block_sparse_moe.experts*\",\"*block_sparse_moe.routed_expert_*\",\"*vision_tower*\",\"*mm_projector*\"]}}' --speculative-config '{\"method\":\"dspark\",\"model\":\"/models/Inferact/Kimi-K3-DSpark\",\"num_speculative_tokens\":7}'"
             lm_eval_num_fewshot: 5
             accuracy_test_threshold: 0.94
+            runner: spur-runner-mi355x-8gpu
+          - display_name: "DeepSeek-V4.1-Flash DSpark TP4"
+            model_name: "DeepSeek-V4.1-Flash-DSpark"
+            model_path: "deepseek-ai/DeepSeek-V4.1-Flash"
+            # `--kv-cache-dtype auto`: the V4.1 runtime takes auto/bfloat16/
+            # nvfp4 and refuses fp8, which is what the harness would otherwise
+            # supply. `--no-enable-prefix-caching` comes from the harness and
+            # is also required here: a block-table hit restores the compressed
+            # pages but not the per-request CSA2 state read alongside them.
+            # DSpark is fixed at 5 draft tokens by the model's own config gate,
+            # and the draft is the target checkpoint's `mtp.*` stages, so there
+            # is no separate draft_model_path.
+            extra_args: "--tensor-parallel-size 4 --tokenizer-mode deepseek_v4 --kv-cache-dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 64 --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"kv_cache_dtype\":\"fp8_ds_mla\"}'"
+            env_vars: |
+              VLLM_USE_BREAKABLE_CUDAGRAPH=1
+              ATOM_V41_EXPERIMENTAL_CUDAGRAPH=1
+            lm_eval_num_fewshot: 20
+            accuracy_test_threshold: 0.91
+            # The gate that actually guards the draft. Verification is lossless,
+            # so accuracy stays put when the draft head breaks; measured 0.4729
+            # overall on this recipe, against 0.008 when the target's LM head
+            # was not shared into the draft and 0.02 when the aux hidden states
+            # were the wrong quantity. 0.35 sits well clear of both.
+            mtp_accept_threshold: 0.35
+            # Per position, which the overall rate alone cannot see: a draft
+            # that still lands its first token and nothing after it keeps a
+            # respectable overall number. Measured 0.7785/0.6243/0.4299/
+            # 0.3214/0.2102 and 0.7898/0.6411/0.4248/0.3063/0.1906 over two
+            # runs; these floors sit near 70% of that.
+            mtp_per_pos_threshold: "0.55,0.40,0.25,0.18,0.10"
             runner: spur-runner-mi355x-8gpu
           - display_name: "Qwen3.5-397B-A17B-MXFP4 TP4"
             model_name: "Qwen3.5-397B-A17B-MXFP4"
@@ -210,6 +241,8 @@ jobs:
           MATRIX_ENV_VARS: ${{ matrix.env_vars }}
           MATRIX_LM_EVAL_NUM_FEWSHOT: ${{ matrix.lm_eval_num_fewshot }}
           MATRIX_ACCURACY_TEST_THRESHOLD: ${{ matrix.accuracy_test_threshold }}
+          MATRIX_MTP_ACCEPT_THRESHOLD: ${{ matrix.mtp_accept_threshold }}
+          MATRIX_MTP_PER_POS_THRESHOLD: ${{ matrix.mtp_per_pos_threshold }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           SKIP_DOCKER_LOGIN: ${{ github.event.pull_request.head.repo.fork && '1' || '0' }}

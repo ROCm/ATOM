@@ -39,6 +39,14 @@ Atomesh can also run in an **ATOM standalone** mode. In this mode, Python owns t
   source "$HOME/.cargo/env"
   ```
 
+- **Protocol Buffers compiler (`protoc`)**, only when enabling the optional
+  `ext-proc` Cargo feature, for the vendored Envoy protocol bindings:
+  ```bash
+  sudo apt-get install protobuf-compiler
+  ```
+- **Python development libraries** for the existing PyO3 bridge; select the interpreter
+  with `PYO3_PYTHON` when needed.
+
 ### Build from source
 
 ```bash
@@ -47,7 +55,14 @@ cargo build
 
 # Release build (optimized)
 cargo build --release
+
+# Release build with optional Envoy ext-proc support (requires protoc)
+cargo build --release --features ext-proc
 ```
+
+Default builds exclude ext-proc code, its protobuf generation step, and the
+`--ext-proc*` CLI options. Enabling the Cargo feature makes those options
+available; pass `--ext-proc` at runtime to start the listener.
 
 Artifacts: `target/release/atomesh`, `target/release/libmesh.so`.
 
@@ -68,7 +83,16 @@ ATOM_MESH_BUILD=1 python -m pip install -e .
 ```
 
 The hook runs `cargo build --release` under `atom/mesh` before Python package
-files are collected.
+files are collected. To include ext-proc, pass its Cargo feature explicitly:
+
+```bash
+ATOM_MESH_BUILD=1 ATOM_MESH_FEATURES=ext-proc python -m pip install -e .
+```
+
+`ATOM_MESH_FEATURES` accepts Cargo's comma- or space-separated feature list and
+defaults to empty. Both `docker/Dockerfile` and `docker/atom_release.dockerfile`
+accept `--build-arg ATOM_MESH_FEATURES=ext-proc` for the same opt-in; the build
+image must provide `protoc` when enabling it.
 
 ## Usage
 
@@ -106,6 +130,17 @@ USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only \
   --worker-urls http://worker1:8000 http://worker2:8000 \
   --policy cache_aware
 ```
+
+### Envoy external processing
+
+Build with `--features ext-proc`, then add `--ext-proc` at runtime to use the
+tonic ext-proc gRPC listener for inference. The Axum
+HTTP port retains management, health and auxiliary APIs; direct HTTP inference
+routes are disabled. Envoy forwards Regular requests directly to selected HTTP
+workers; Prefill/Decode mode uses a separate execution listener for the selected
+pair. See [the ext-proc smoke test guide](scripts/ext-proc/README.md) for image
+build and integration test instructions, and the
+[complete Envoy configuration](tests/fixtures/ext-proc/envoy.yaml).
 
 ### Prefill / decode disaggregation
 
@@ -238,13 +273,13 @@ enabled, the router serves HTTPS on the configured `--host` and `--port`.
 
 ### API key
 
-Optional API key protection for router endpoints:
+Set `ATOM_MESH_API_KEY` in your environment, then pass it to the router:
 
 ```bash
-./target/release/atomesh launch --api-key "your-secret-key" \
+./target/release/atomesh launch --api-key "${ATOM_MESH_API_KEY:?Set ATOM_MESH_API_KEY}" \
   --worker-urls http://worker1:8000 http://worker2:8000
 
-USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "your-secret-key" \
+USE_ATOMESH_ENTRYPOINTS=1 python -m atom.entrypoints.openai_server mesh-only --api-key "${ATOM_MESH_API_KEY:?Set ATOM_MESH_API_KEY}" \
   --worker-urls http://worker1:8000 http://worker2:8000
 ```
 

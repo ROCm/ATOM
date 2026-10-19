@@ -79,6 +79,7 @@ from atom.kv_transfer.offload.hybrid.kimi_k3.connector import (
     save_stall_seconds,
 )
 from atom.kv_transfer.offload.hybrid.kimi_k3.state_tier import _JointPark
+from atom.kv_transfer.offload.hybrid.qwen.connector import QwenOffloadScheduler
 from atom.kv_transfer.offload.metadata import (
     ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
@@ -180,6 +181,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     sched._save_inflight_tokens = {}
     sched._load_failed_seqs = {}
     sched.total_suppressed_load_retries = 0
+    sched.total_lookups_skipped_by_memo = 0
     sched.total_load_requests = 0
     sched.total_loaded_tokens = 0
     sched.total_load_failures = 0
@@ -305,7 +307,10 @@ def test_committed_sidecar_capacity_precedence(monkeypatch):
 def test_committed_sidecar_capacity_rejects_invalid_env(monkeypatch, value):
     monkeypatch.setenv("OFFLOAD_COMMITTED_SIDECAR_CAPACITY", value)
 
-    with pytest.raises(ValueError, match="committed sidecar index capacity"):
+    with pytest.raises(
+        ValueError,
+        match="committed sidecar index capacity|OFFLOAD_COMMITTED_SIDECAR_CAPACITY",
+    ):
         connector_module._committed_sidecar_capacity({})
 
 
@@ -922,7 +927,7 @@ def test_build_lmcache_config_validates_extras_and_keeps_gds_disabled(monkeypatc
     assert cfg.local_disk == "/nvme/lmcache"
     assert cfg.max_local_disk_size == 10
     assert cfg.use_gds is False
-    assert cfg.lookup_server_worker_ids == [0]
+    assert cfg.lookup_server_worker_ids == []
 
 
 def test_lmcache_disk_startup_fails_if_backend_was_not_created():
@@ -2222,6 +2227,127 @@ def test_scheduler_consumer_role_only_emits_loads_without_save_deferral():
 
     assert sched.load_finished(loads[0].load_operation) is True
     assert sched.should_defer_free(seq) is False
+
+
+class _CountingLookupClient(_LookupClient):
+    """Records who was asked, so a test can count tier round trips."""
+
+    def __init__(self, hit: int) -> None:
+        super().__init__(hit)
+        self.calls = []
+
+    def lookup(self, token_ids, lookup_id):
+        self.calls.append(lookup_id)
+        return self.hit
+
+
+def _consumer_scheduler(hit: int) -> LMCacheOffloadConnectorScheduler:
+    sched = _scheduler()
+    sched.kv_role = "kv_consumer"
+    sched._do_save = False
+    sched._do_load = True
+    sched._lookup_client = _CountingLookupClient(hit=hit)
+    return sched
+
+
+def _consumer_seq(req_id: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=req_id,
+        num_prompt_tokens=16,
+        token_ids=list(range(16)),
+        num_cached_tokens=0,
+        block_table=[1, 2, 3, 4],
+        has_per_req_cache=False,
+    )
+
+
+def test_a_request_stuck_in_waiting_is_not_looked_up_every_step():
+    """The hybrid scheduler is asked as often as the dense one, and remembers.
+
+    `get_num_new_matched_tokens` runs before allocation, and a request that
+    cannot allocate is returned to the head of the waiting queue unchanged --
+    so a full KV cache turns one lookup into one lookup per scheduler step,
+    each one a prompt copy, a chunk-hash pass and a blocking round trip on the
+    scheduler thread. The hit is a property of the prompt, so it is remembered
+    and only the transfer pays the tier again.
+    """
+
+    sched = _consumer_scheduler(hit=12)
+    seq = _consumer_seq(740)
+
+    for _ in range(8):
+        assert sched.get_num_new_matched_tokens(seq) == (12, True)
+
+    assert sched._lookup_client.calls == ["740"]
+    assert sched.total_lookups_skipped_by_memo == 7
+
+
+def test_a_dispatched_load_pays_the_tier_once_to_re_take_its_pin():
+    """An answer needs no pin; a transfer does.
+
+    `lookup_requests_in_step` is the worker's *unpin* list, so a step that
+    answered from the memo holds nothing. That is fine while the request only
+    waits, but the step that hands the retrieve to the worker must not read an
+    entry nothing is holding -- so the dispatch asks the tier for real, once
+    per load actually committed.
+    """
+
+    sched = _consumer_scheduler(hit=12)
+    seq = _consumer_seq(741)
+
+    for _ in range(4):
+        sched.get_num_new_matched_tokens(seq)
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    meta = sched.build_connector_meta()
+
+    assert len([req for req in meta.requests if req.load_spec is not None]) == 1
+    assert sched._lookup_client.calls == ["741", "741"]
+
+
+def test_a_prefix_the_tier_dropped_is_not_retrieved():
+    """The tier may have evicted the prefix while the request waited.
+
+    Nothing notifies this connector of that, which is exactly why the memo is
+    bounded rather than trusted. The dispatch confirms: if the tier now holds
+    less than the spec promised, the load is dropped and the request prefills,
+    which is what would have happened with no tier at all.
+    """
+
+    sched = _consumer_scheduler(hit=12)
+    seq = _consumer_seq(742)
+
+    sched.get_num_new_matched_tokens(seq)
+    sched.update_state_after_alloc(seq)
+    assert sched.should_park_for_load_after_alloc(seq) is True
+    sched._lookup_client.hit = 4
+    meta = sched.build_connector_meta()
+
+    assert [req for req in meta.requests if req.load_spec is not None] == []
+    assert "742" not in sched._load_specs
+
+
+def test_a_failed_load_leaves_no_remembered_hit_behind():
+    """A hit that the transfer could not honour must not be replayed.
+
+    The memo only ever shortcuts the question "how much does the tier hold";
+    once a load against that answer has failed, replaying it would re-arm the
+    same load without ever asking the tier whether it is still true. (The
+    retry suppression that follows a failure is a separate, older gate: it is
+    why the next call here answers without reaching the tier at all.)
+    """
+
+    sched = _consumer_scheduler(hit=12)
+    seq = _consumer_seq(743)
+
+    sched.get_num_new_matched_tokens(seq)
+    assert sched._last_tier_hit(seq, "743") == 12
+
+    assert sched.load_failed(743) is True
+
+    assert sched._last_tier_hit(seq, "743") is None
+    assert sched.get_num_new_matched_tokens(seq) == (0, False)
+    assert sched._lookup_client.calls == ["743"]
 
 
 def test_lookup_unpin_ids_are_consumed_by_metadata_build():
@@ -5406,6 +5532,7 @@ def test_scheduler_offload_statistics_are_cumulative():
         "loads_pending": 0,
         "saves_pending": 0,
         "suppressed_load_retries": 0,
+        "lookups_skipped_by_memo": 0,
     }
 
 
@@ -5743,6 +5870,9 @@ def test_bounded_saves_are_shared_round_robin_not_head_first():
     s._lookup_in_step = []
     s._save_tracker = {}
     s._save_inflight = {}
+    s._save_previous_frontier = {}
+    s._save_previous_owner = {}
+    s._save_retry_blocked = {}
     s._save_nonce = 0
     s._save_rr_last = None
 
@@ -5898,7 +6028,7 @@ def test_a_stalled_save_releases_blocks_it_never_handed_out(monkeypatch):
 
     # Age the outstanding save rather than the process clock: `time.monotonic`
     # is the stdlib's, and patching it reaches every other test in the run.
-    s._save_inflight_since["9"] -= 2 * save_stall_seconds()
+    s._save_inflight_since[s._save_inflight["9"]] -= 2 * save_stall_seconds()
     s._refresh_save_stall()
     assert s._save_stalled is True
     # Never handed out -> the blocks may go free. `should_defer_free` is a pure
@@ -6106,6 +6236,46 @@ def test_the_key_survives_a_process_restart(lmcache_key):
     assert _codec("L").key(7) == _codec("L").key(7)
 
 
+def test_completed_save_generation_does_not_age_its_successor():
+    s = _k3_scheduler()
+    op = SaveOperationId(9, 1)
+    s._save_inflight = {"9": op}
+    s._refresh_save_stall()
+    s._save_inflight_since[op] -= 1000
+    # No intervening idle metadata build: the same request has a new save.
+    new_op = SaveOperationId(9, 2)
+    s._save_inflight["9"] = new_op
+    s._refresh_save_stall()
+    assert not s._save_stalled
+    assert set(s._save_inflight_since) == {new_op}
+
+
+def test_state_budget_evicts_cold_state_without_removing_kv(lmcache_key, monkeypatch):
+    storage = _FakeStorage()
+    storage.remove = lambda key: storage.objects.pop(key, None)
+    codec = _codec("L", storage)
+    codec._max_entries = 2
+    codec._backend = SimpleNamespace(state_entry_views=lambda slot: [])
+    codec._staged = SimpleNamespace(unpack=lambda obj, views: None)
+    storage.objects["KV"] = object()
+
+    def put(h, units, callback):
+        storage.objects[codec.key(h)] = SimpleNamespace(
+            get_size=lambda: 1024, ref_count_down=lambda: None
+        )
+        return True
+
+    monkeypatch.setattr(codec, "_put", put)
+    assert codec.put(1, [])
+    assert codec.put(2, [])
+    assert codec.get(1, 0)  # Keep the recently loaded checkpoint.
+    assert codec.put(3, [])
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
+    assert len(codec._cache_keys) == 2
+    assert codec.put(3, [])  # Re-store does not evict an unrelated state.
+    assert set(storage.objects) == {"KV", codec.key(1), codec.key(3)}
+
+
 def test_a_state_key_cannot_collide_with_a_kv_chunk_key(lmcache_key):
     """Since one pool holds both (Phase 3a), the key is the only separation.
 
@@ -6283,6 +6453,7 @@ def test_every_member_the_scheduler_reads_is_reachable_through_the_shell():
     # the same change, deliberately.
     must_be_seen = {
         "should_defer_free",
+        "can_partially_deallocate_state",
         "abandon_save",
         "save_abandon_timeout_s",
         "release_stalled_save",
@@ -6501,6 +6672,7 @@ def test_every_unconditional_shell_forward_exists_on_every_impl():
     impls = {
         "dense": DenseOffloadScheduler,
         "kimi_k3": KimiK3OffloadScheduler,
+        "qwen": QwenOffloadScheduler,
         "dsv4": DSV4OffloadScheduler,
     }
     broken = {

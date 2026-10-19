@@ -97,6 +97,7 @@ from atom.model_ops.embed_head import (
     ReplicatedEmbedding,
     VocabParallelEmbedding,
 )
+from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import LayerNorm, RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -105,16 +106,19 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    dcp_qsplit_rows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
     FP4_QUANT_BLOCK_SIZE,
     assert_fp4_indexer_supported,
-    fp4_index_scale_rows,
     fp4_q_scale_shape,
     sparse_indexer_fp4_enabled,
 )
@@ -123,6 +127,7 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    is_neox_rope_style,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -219,7 +224,7 @@ def _install_increment_version_pcp_shim() -> None:
     only surfaces under PCP + torch.compile.
 
     Under Prefill Context Parallel the sparse indexer must run through a
-    Dynamo-opaque custom op (``indexer_with_output``) so its runtime
+    Dynamo-opaque custom op (``sparse_attn_indexer_pcp``) so its runtime
     ``_pcp_active()`` branch is not baked to the warmup value. Inserting that op
     reshapes the pre-attention piecewise submodule, and torch's *inference*
     runtime wrapper (``keep_input_mutations=True``, hard-coded in
@@ -314,23 +319,6 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
     )
-
-
-def _is_neox_rope_style(
-    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
-) -> bool:
-    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
-
-    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
-    an interleave flag of True means ``is_neox_style=False``. A missing or null
-    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
-    that predate the flag, which differs per rope instance (see call sites):
-    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
-    """
-    interleave = getattr(config, interleave_attr, None)
-    if interleave is None:
-        return default_is_neox
-    return not bool(interleave)
 
 
 def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
@@ -516,7 +504,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
 def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
     if use_fp4_non_shuffle_triton_gemm():
         return False, False
-    if use_triton_gemm():
+    if use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2):
         should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
         return should_shuffle, should_shuffle
     return True, True
@@ -1136,8 +1124,10 @@ class DeepseekV2MoE(nn.Module):
         reduce_results: bool = True,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        layer_id: int | None = None,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -1178,6 +1168,8 @@ class DeepseekV2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
+            # EPLB indexes its per-layer tables by the checkpoint layer index.
+            layer_id=layer_id,
             reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
@@ -1485,23 +1477,25 @@ def _dcp_stage_indexer_fp4_prefill(
     The two planes disagree on their row axis, so both the read and the write
     bend through `fp4_index_scale_rows`; see it for what goes wrong otherwise.
     """
-    slots = prefill_metadata.dcp_indexer_fp4_local_slots
-    page, row = slots // block_size, slots % block_size
+    # Built once per forward by the metadata builder.
+    page = prefill_metadata.dcp_indexer_fp4_read_page
+    row = prefill_metadata.dcp_indexer_fp4_read_row
     data = kv_cache[page, :, :, row, :]
-    scale = kv_cache_scale[page, :, :, fp4_index_scale_rows(row, block_size)]
+    scale = kv_cache_scale[page, :, :, prefill_metadata.dcp_indexer_fp4_read_scale_row]
 
     dcp_group = get_dcp_group()
     gather_index = prefill_metadata.dcp_indexer_gather_index
     data = dcp_group.all_gather(data, dim=0).index_select(0, gather_index)
     scale = dcp_group.all_gather(scale, dim=0).index_select(0, gather_index)
 
-    token = torch.arange(total_kv, device=data.device)
-    page, row = token // block_size, token % block_size
+    page = prefill_metadata.dcp_indexer_fp4_stage_page
+    row = prefill_metadata.dcp_indexer_fp4_stage_row
+    scale_row = prefill_metadata.dcp_indexer_fp4_stage_scale_row
     pages = -(-total_kv // block_size)
     staged = kv_cache.new_zeros(pages, *kv_cache.shape[1:])
     staged[page, :, :, row, :] = data
     staged_scale = kv_cache_scale.new_zeros(pages, *kv_cache_scale.shape[1:])
-    staged_scale[page, :, :, fp4_index_scale_rows(row, block_size)] = scale
+    staged_scale[page, :, :, scale_row] = scale
     return staged, staged_scale
 
 
@@ -1594,9 +1588,17 @@ def sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
+    # Room for the DCP prefill all-gather to land in place. It produces
+    # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
+    # than there are prefill rows; giving the allocation that slack is what
+    # lets the gather write straight into this tensor instead of through a
+    # staging buffer. Those trailing rows are never read: the owned-slot filter
+    # sizes its grid from `dsa_kv_indptr` (`num_tokens = shape[0] - 1` in
+    # `triton_filter_and_convert_dcp_index_prefill`), not from this tensor.
+    _dcp_gather_slack = max(get_dcp_world_size() - 1, 0)
     topk_indices = torch.empty(
-        hidden_states.shape[0],
+        hidden_states.shape[0] + _dcp_gather_slack,
         topk_tokens,
         dtype=torch.int32,
         device=hidden_states.device,
@@ -1609,7 +1611,7 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
         context.scheduled_bs * attn_metadata.max_seqlen_q
@@ -1659,12 +1661,13 @@ def sparse_attn_indexer(
             device=q_bf16.device,
             dtype=torch.uint8,
         )
-        # Zeroed, not empty: this call leaves `compute_all_q_rope` default, so
-        # the op skips `slot < 0` rows outright, while the decode scorer reads
-        # the full `batch_size * next_n`. A sequence short of the speculation
-        # width would otherwise weight its pad rows with whatever the allocator
-        # held. Zero is also the right weight for a row whose logits go unread.
-        weights_mqa = torch.zeros_like(weights)
+        # AITER requires contiguous [rows, heads] output. Non-DCP skips
+        # slot<0 rows, whose scorer bounds are empty; DCP computes every row.
+        weights_mqa = torch.empty(
+            weights.shape,
+            dtype=weights.dtype,
+            device=weights.device,
+        )
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_quant,
@@ -1686,13 +1689,6 @@ def sparse_attn_indexer(
             q_scale_out=q_fp4_scale,
             kv_cache_scale=indexer_module.k_cache.kv_cache_scale,
         )
-        # Only this op's fp32 *return* is synthesised. The kernel's `weights_out`
-        # must stay `q.dtype` under FP4 (`aiter/ops/cache.py`), so `weights_mqa`
-        # cannot simply be allocated fp32; converting it instead would put a copy
-        # kernel in all 21 captured layers. Zeroed rather than empty: what makes
-        # it unread is a refusal three files away in `Indexer.__init__`, while
-        # `sparse_attn_indexer_fake` promises torch.compile a real tensor.
-        weights = torch.zeros(weights.shape, device=weights.device, dtype=torch.float32)
     elif use_qk_rope_cache_fusion:
         q_bf16 = q_input
         q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
@@ -1737,7 +1733,7 @@ def sparse_attn_indexer(
         # so prefill runs dense (attention_mla.use_prefill_mla gates on the same
         # threshold).
         if attn_metadata.max_seqlen_k <= topk_tokens:
-            return weights
+            return
         prefill_metadata = attn_metadata
         num_prefills = context.scheduled_bs
         # Size the gathered-KV buffer off the KEY length, not the hidden/query
@@ -1822,11 +1818,20 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # Under DCP every rank holds the whole gathered index cache, so having
+        # all W of them score every row recomputes the SAME top-k W times.
+        # Score only this rank's slice of the QUERY ROWS instead: against the
+        # full key set, so the top-k is the EXACT global one, and the
+        # [rows, topk] selections are all-gathered back below. At dcp=1 this
+        # degenerates to the whole range, which is the original behaviour.
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, get_dcp_rank(), get_dcp_world_size()
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        chunk_tokens = sparse_indexer_row_chunk(
+            max(row_hi - row_lo, 1), row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
+        for chunk_start in range(row_lo, row_hi, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, row_hi)
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -1835,7 +1840,11 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    # `_prefill_mqa_logits_fp4` rebuilds its ragged schedule
+                    # whenever it is handed less than the whole batch, because
+                    # cta_info encodes absolute row ids. Under DCP the row
+                    # range is a rank's slice, which is such a partial batch.
+                    get_dcp_world_size() == 1 and chunk_tokens == num_rows,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
@@ -1880,6 +1889,33 @@ def sparse_attn_indexer(
             # virtual-block layout, and COMPACT them to the front -- the same
             # treatment the decode path gets, with the row unit being a query token
             # instead of a request.
+            # Gather the selections in place. Rank-major concatenation lands
+            # back in ROW order because the split is contiguous with a uniform
+            # stride: rank r scored [r*rows_per_rank, (r+1)*rows_per_rank), so
+            # gathered row i IS row i, and scoring already wrote those rows
+            # here. The gather region is `world_size` whole strides, which runs
+            # up to `_dcp_gather_slack` rows past the prefill rows; the tail is
+            # uninitialised and never read.
+            gather_rows = rows_per_rank * get_dcp_world_size()
+            gather_region = topk_indices[
+                num_decode_tokens : num_decode_tokens + gather_rows, :topk_tokens
+            ]
+            # In-place all-gather: the input is this rank's own slot inside the
+            # output, which is the form RCCL/NCCL supports. Called on the
+            # process group directly because the group wrapper's `all_gather`
+            # only has an out-of-place form, which would allocate and copy --
+            # the two things this is removing.
+            # `slot_lo`, not `row_lo`: the input must be this rank's OWN slot,
+            # and `row_lo` is clamped to the row count for scoring, so a rank
+            # with no rows would hand in a lower rank's slot instead.
+            torch.distributed.all_gather_into_tensor(
+                gather_region,
+                gather_region[slot_lo : slot_lo + rows_per_rank],
+                group=get_dcp_group().device_group,
+            )
+            # The filter below must be handed the WHOLE `topk_indices`: it calls
+            # `.contiguous()` on what it gets, so passing a row slice would
+            # silently copy the very bytes this gather just avoided moving.
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,
@@ -1954,7 +1990,7 @@ def sparse_attn_indexer(
                 ),
                 weights_scale=weights_scale,
             )
-            return weights
+            return
         # Non-DCP: this rank holds the whole plane, so its top-k is already the
         # global one.
         logits = torch.empty(
@@ -1965,22 +2001,24 @@ def sparse_attn_indexer(
 
             flydsl_pa_mqa_logits_fp4(
                 padded_q_decode_tokens,
-                q_fp4_scale[:num_decode_tokens].reshape(
-                    batch_size, next_n, *q_fp4_scale.shape[1:]
-                ),
+                q_fp4_scale[:num_decode_tokens],
                 kv_cache,
                 indexer_module.k_cache.kv_cache_scale,
-                attn_metadata.block_tables,
-                weights_mqa[:num_padded_tokens],
-                decode_metadata.context_lens,
-                max_model_len,
+                weights=weights_mqa[:num_padded_tokens],
+                max_seq_len=max_model_len,
                 weight_scale=weights_scale,
-                next_n=next_n,
-                block_k=FP4_MQA_BLOCK_K,
                 kv_block_size=runner_block_size,
                 out=logits,
-                cta_info=decode_metadata.indexer_fp4_cta_info,
-                total_ctas=decode_metadata.indexer_fp4_n_ctas,
+                **Fp4MqaRaggedMetadata(
+                    decode_metadata.cu_seqlens_q[: batch_size + 1],
+                    next_n,
+                    attn_metadata.block_tables,
+                ).kernel_args(
+                    decode_metadata.index_row_ends[:num_rows],
+                    heads=padded_q_decode_tokens.shape[-2],
+                    page_size=runner_block_size,
+                    max_seq_len=max_model_len,
+                ),
             )
         else:
             deepgemm_fp8_paged_mqa_logits(
@@ -2025,59 +2063,18 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
-    return weights
-
-
-def sparse_attn_indexer_fake(
-    hidden_states: torch.Tensor,
-    k_cache_prefix: str,
-    kv_cache: torch.Tensor,
-    q_input: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    quant_block_size: int,
-    scale_fmt: str | None,
-    topk_tokens: int,
-    head_dim: int,
-    max_model_len: int,
-    total_seq_lens: int,
-    sparse_kv_indices_buffer: torch.Tensor,
-    dcp_sparse_kv_indptr_buffer: torch.Tensor,
-    dcp_owned_counts_buffer: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-    k_norm_bias: torch.Tensor,
-    k_norm_eps: float,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    weights_scale: float,
-    is_neox_style: bool,
-    use_qk_rope_cache_fusion: bool,
-    stable_topk: bool,
-) -> torch.Tensor:
-    # profile run
-    # NOTE(Chen): create the max possible flattened_kv. So that
-    # profile_run can get correct memory usage.
-    _flattened_kv = torch.empty(
-        [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
-    )
-    _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
-    _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer",
     op_func=sparse_attn_indexer,
-    # The DCP compact path rewrites the per-layer offsets/counts alongside the
-    # indices, so both must be declared or inductor may reorder the MLA read
-    # ahead of this write (same hazard as sparse_kv_indices_buffer).
     mutates_args=[
+        "kv_cache",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",
     ],
-    fake_impl=sparse_attn_indexer_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
 
 
@@ -2213,29 +2210,14 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().process_weights_after_loading()
 
 
-def _indexer_with_output_fake(
+def sparse_attn_indexer_pcp(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
     qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
-    # Identity-passthrough contract: the op returns a fresh tensor shaped like
-    # `qr` (see `indexer_with_output`). The caller consumes it as the query into
-    # `mla_attn`, which keeps the op alive and ordered even independent of the
-    # declared buffer mutation.
-    return torch.empty_like(qr)
-
-
-def indexer_with_output(
-    hidden_states: torch.Tensor,
-    qr: torch.Tensor,
-    qr_scale: torch.Tensor | None,
-    positions: torch.Tensor,
-    layer_name: str,
-    sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Dynamo-opaque wrapper around ``Indexer.forward_impl``.
 
     Registered as a REGULAR custom op (like ``sparse_attn_indexer``), NOT a
@@ -2257,9 +2239,9 @@ def indexer_with_output(
     top-k result into ``sparse_kv_indices_buffer`` (via the nested eager
     ``sparse_attn_indexer`` op) and ``mla_attn`` reads that same buffer to know
     which KV to attend to. In the non-PCP path ``sparse_attn_indexer`` runs
-    *directly* in the traced graph and declares ``mutates_args=
-    ["sparse_kv_indices_buffer"]``, so inductor keeps the write ordered before
-    the MLA read. Nesting it inside this opaque op HIDES that write; with
+    *directly* in the traced graph and declares the sparse buffer mutated, so
+    inductor keeps the write ordered before the MLA read. Nesting it inside this
+    opaque op HIDES that write; with
     ``mutates_args=[]`` inductor thinks the buffer is unchanged and the MLA reads
     a stale / mis-ordered copy — visible as token-stutter corruption ("errerr",
     doubled fragments) even on PCP-noop prompts. So the buffer is threaded
@@ -2268,8 +2250,6 @@ def indexer_with_output(
     latent AOT-autograd ``increment_version`` bug on graphs with SymInt args,
     which ``_install_increment_version_pcp_shim`` neutralizes.)
 
-    The identity ``qr`` return, fed by the caller as the ``mla_attn`` query, is
-    kept as belt-and-suspenders ordering + DCE protection.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
@@ -2278,17 +2258,13 @@ def indexer_with_output(
     # sparse_attn_indexer). `self.sparse_kv_indices_buffer` is the same tensor
     # object passed in, so the declared mutation matches the real one.
     self.forward_impl(hidden_states, qr, qr_scale, positions)
-    # Fresh tensor equal to qr; consumed by the caller as the mla_attn query.
-    # Clone (not a bare return of qr) so the runtime output matches the fake's
-    # fresh-tensor contract and never aliases an input.
-    return qr.clone()
 
 
 direct_register_custom_op(
-    op_name="indexer_with_output",
-    op_func=indexer_with_output,
+    op_name="sparse_attn_indexer_pcp",
+    op_func=sparse_attn_indexer_pcp,
     mutates_args=["sparse_kv_indices_buffer"],
-    fake_impl=_indexer_with_output_fake,
+    fake_impl=lambda *_args, **_kwargs: None,
 )
 
 
@@ -2398,7 +2374,7 @@ class Indexer(nn.Module):
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
-        # Rope module used by `forward_impl` (and the `indexer_with_output`
+        # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
         # splitting op, which can't take a module arg). Bound by the owning
         # DeepseekV2MLAAttention right after construction; mirrors V4's
         # `self.indexer.rotary_emb = self.rotary_emb`.
@@ -2413,20 +2389,16 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
+    ) -> None:
         # Under PCP, route the whole indexer through the Dynamo-opaque
-        # `indexer_with_output` splitting op so the runtime `_pcp_active()` branch
+        # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
         # (round-robin k all-gather + separate q/k rope) evaluates live instead of
         # being baked to its warmup value by torch.compile. `pcp_is_enabled()` is
         # a run-level constant (pcp world size is fixed for the process), so this
         # guard is compile-safe and a no-op — a direct `forward_impl` call, graph
         # unchanged — for non-PCP and plugin (SGLang / vLLM / RTP) backends.
         if pcp_is_enabled():
-            # Returns `qr` (identity); the caller feeds it to mla_attn so the
-            # opaque op stays live and ordered. The top-k result travels the
-            # side-buffer (declared mutated, so its write is ordered before the
-            # sparse-MLA read), not this return value.
-            return torch.ops.aiter.indexer_with_output(
+            torch.ops.aiter.sparse_attn_indexer_pcp(
                 hidden_states,
                 qr,
                 qr_scale,
@@ -2434,7 +2406,8 @@ class Indexer(nn.Module):
                 self.prefix,
                 self.sparse_kv_indices_buffer,
             )
-        return self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
+            return
+        self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
 
     def forward_impl(
         self,
@@ -2443,8 +2416,8 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor:
-        # The opaque `indexer_with_output` op can't pass a module, so it relies on
+    ) -> None:
+        # The opaque PCP op can't pass a module, so it relies on
         # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
         # pass their own rope explicitly, which takes precedence.
         if rotary_emb is None:
@@ -2511,7 +2484,7 @@ class Indexer(nn.Module):
         else:
             q_input = q
 
-        return self.sparse_attn_indexer_impl(
+        self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -2728,7 +2701,7 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             # DeepSeek's main MLA rope is interleaved (is_neox_style=False) when
             # unspecified; GLM-5.x sets rope_interleave=true, i.e. also interleaved.
-            is_neox_style=_is_neox_rope_style(
+            is_neox_style=is_neox_rope_style(
                 config, "rope_interleave", default_is_neox=False
             ),
         )
@@ -2752,7 +2725,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 # DeepSeek-V3.2's indexer rope is neox (is_neox_style=True) when
                 # unspecified; GLM-5.x sets indexer_rope_interleave=true to override
                 # it to interleaved.
-                is_neox_style=_is_neox_rope_style(
+                is_neox_style=is_neox_rope_style(
                     config, "indexer_rope_interleave", default_is_neox=True
                 ),
             )
@@ -2780,7 +2753,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     f"{prefix}.indexer",
                 )
                 # Bind the indexer's rope so forward_impl (and the opaque
-                # indexer_with_output splitting op) can rope without receiving a
+                # sparse_attn_indexer_pcp op) can rope without receiving a
                 # module argument. Mirrors deepseek_v4.Attention.__init__.
                 self.indexer.rotary_emb = self.indexer_rope_emb
         else:
@@ -2946,23 +2919,13 @@ class DeepseekV2MLAAttention(nn.Module):
             # The indexer's wk/weights_proj GEMMs run in BF16. When input_layernorm
             # fused the quant it emits a bf16 mirror (indexer_hidden); otherwise
             # hidden_states is already the bf16 normed activation.
-            idx_ret = self.indexer(
+            self.indexer(
                 indexer_hidden if indexer_hidden is not None else hidden_states,
                 hidden_states_or_q_c,
                 hidden_states_or_q_c_scale,
                 positions,
                 self.indexer_rope_emb,
             )
-            if pcp_is_enabled():
-                # Under PCP the indexer runs through the opaque `indexer_with_output`
-                # split op, which returns `hidden_states_or_q_c` unchanged
-                # (identity). Feeding it forward as the mla_attn query is what keeps
-                # the op live under torch.compile — its real result (top-k) is a
-                # hidden write to the sparse buffer that mla_attn reads via `self` —
-                # and orders the write before that read. `pcp_is_enabled()` is a
-                # run-level constant, so baking this branch at trace time is correct
-                # (non-PCP / plugins keep discarding the return, graph unchanged).
-                hidden_states_or_q_c = idx_ret
 
         return self.mla_attn(
             hidden_states_or_q_c,
@@ -3108,6 +3071,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 reduce_results=not self.fuse_ar_input_norm,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
+                layer_id=None if is_mtp_block else layer_idx,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -3600,3 +3564,30 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
+
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+    ):
+        super().__init__(atom_config, prefix, layer_type)
+
+        from atom.models.glm52.mono.dispatch import MonoDecode
+
+        self._mono = MonoDecode(self, atom_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

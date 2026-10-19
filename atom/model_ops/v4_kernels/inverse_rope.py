@@ -47,14 +47,16 @@ def _inverse_rope_gptj_kernel(
     d_cos_offs = d_offs // 2
     cos_offs = pos[:, None] * stride_cos_s + d_cos_offs[None, :] * stride_cos_d
     cos_mask = s_mask[:, None] & (d_cos_offs < BLOCK_RD_HALF)[None, :]
-    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+    # FP32 math whatever the table / activation dtype, as the complex multiply
+    # this kernel replaced
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask).to(tl.float32)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask).to(tl.float32)
 
     x_offs = (
         s_offs[:, None] * stride_x_s + pid_h * stride_x_h + d_offs[None, :] * stride_x_d
     )
     x_mask = s_mask[:, None] & (d_offs < BLOCK_RD)[None, :]
-    x = tl.load(x_ptr + x_offs, mask=x_mask)
+    x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
 
     # GPT-J inverse: swap pairs and negate evens of (x * sin), then add x * cos.
     # Forward: out[2i]   =  x[2i]*cos - x[2i+1]*sin

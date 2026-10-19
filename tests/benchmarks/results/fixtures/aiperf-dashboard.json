@@ -1,0 +1,128 @@
+{
+  "source_commit": "10ab5e8c1995c3e8d9e0674534f093d1e33a04ff",
+  "source": {
+    "model": "fixture-model",
+    "topology": "1p2d",
+    "precision": "fp8",
+    "max_context_length": 262144,
+    "request_throughput": {
+      "avg": 4,
+      "p50": 3.2,
+      "p90": 4.8,
+      "p99": 6.0
+    },
+    "time_to_first_token": {
+      "avg": 150,
+      "p50": 120.0,
+      "p90": 180.0,
+      "p99": 225.0
+    },
+    "inter_token_latency": {
+      "avg": 12,
+      "p50": 9.600000000000001,
+      "p90": 14.399999999999999,
+      "p99": 18.0
+    },
+    "request_latency": {
+      "avg": 950,
+      "p50": 760.0,
+      "p90": 1140.0,
+      "p99": 1425.0
+    },
+    "input_token_throughput": {
+      "avg": 3000,
+      "p50": 2400.0,
+      "p90": 3600.0,
+      "p99": 4500.0
+    },
+    "output_token_throughput": {
+      "avg": 600,
+      "p50": 480.0,
+      "p90": 720.0,
+      "p99": 900.0
+    },
+    "total_token_throughput": {
+      "avg": 3600,
+      "p50": 2880.0,
+      "p90": 4320.0,
+      "p99": 5400.0
+    },
+    "request_count": {
+      "avg": 40,
+      "p50": 32.0,
+      "p90": 48.0,
+      "p99": 60.0
+    },
+    "benchmark_duration": {
+      "avg": 10,
+      "p50": 8.0,
+      "p90": 12.0,
+      "p99": 15.0
+    },
+    "total_usage_prompt_tokens": {
+      "avg": 30000,
+      "p50": 24000.0,
+      "p90": 36000.0,
+      "p99": 45000.0
+    },
+    "total_usage_completion_tokens": {
+      "avg": 6000,
+      "p50": 4800.0,
+      "p90": 7200.0,
+      "p99": 9000.0
+    },
+    "total_usage_prompt_cache_read_tokens": {
+      "avg": 15000,
+      "p50": 12000.0,
+      "p90": 18000.0,
+      "p99": 22500.0
+    }
+  },
+  "environment": {
+    "MODEL_NAME": "fixture-overridden-model",
+    "AIPERF_SCENARIO": "fixture-scenario",
+    "AIPERF_PUBLIC_DATASET": "fixture-dataset",
+    "DISPLAY_TOPOLOGY": "CPP4+DCP4"
+  },
+  "concurrency": 8,
+  "expected": {
+    "benchmark_backend": "atom",
+    "aiperf_artifact_dir": "aiperf",
+    "benchmark_model_name": "fixture-overridden-model",
+    "backend": "atom",
+    "benchmark_kind": "aiperf_agentic",
+    "scenario": "fixture-scenario",
+    "public_dataset": "fixture-dataset",
+    "topology": "1p2d",
+    "display_topology": "CPP4+DCP4",
+    "precision": "fp8",
+    "random_input_len": 262144,
+    "random_output_len": 1024,
+    "max_concurrency": 8,
+    "random_range_ratio": "",
+    "request_throughput": 4,
+    "mean_ttft_ms": 150,
+    "median_ttft_ms": 120.0,
+    "p90_ttft_ms": 180.0,
+    "p99_ttft_ms": 225.0,
+    "mean_itl_ms": 12,
+    "median_itl_ms": 9.600000000000001,
+    "p90_itl_ms": 14.399999999999999,
+    "p99_itl_ms": 18.0,
+    "mean_e2el_ms": 950,
+    "median_e2el_ms": 760.0,
+    "p90_e2el_ms": 1140.0,
+    "p99_e2el_ms": 1425.0,
+    "input_throughput": 3000,
+    "output_throughput": 600,
+    "total_token_throughput": 3600,
+    "successful_requests": 40,
+    "completed": 40,
+    "benchmark_duration_s": 10,
+    "total_input_tokens": 30000,
+    "total_output_tokens": 6000,
+    "cache_hit_tokens": 15000,
+    "cache_total_tokens": 30000,
+    "cache_hit_rate": 0.5
+  }
+}
