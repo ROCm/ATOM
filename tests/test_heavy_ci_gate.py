@@ -37,6 +37,7 @@ def _run_gate(
     jobs=None,
     runs_query_fails=False,
     jobs_query_fails=False,
+    pr_check_job="Offline inference smoke test",
 ):
     event_path = tmp_path / "event.json"
     output_path = tmp_path / "output.txt"
@@ -119,6 +120,7 @@ fi
             "GITHUB_RUN_ID": "200",
             "GITHUB_REPOSITORY": "ROCm/ATOM",
             "CI_GATE_WORKFLOW": "atom-vllm-test.yaml",
+            "CI_GATE_PR_CHECK_JOB": pr_check_job,
             "CI_GATE_LABELS": allowed,
             "CI_GATE_PATHS_IGNORE": "docs/**",
             "FAKE_REVIEW_DECISION": review_decision,
@@ -406,6 +408,159 @@ def test_missing_jobs_in_cancelled_run_do_not_suppress_first_approval(tmp_path):
     assert result["should_run"] == "true"
 
 
+@pytest.mark.parametrize("labels", [(), ("ci:vllm",)])
+def test_approval_that_replaced_pending_pr_run_takes_over_its_checks(tmp_path, labels):
+    result = _approve(
+        tmp_path,
+        labels=labels,
+        runs=[_previous_run(conclusion="cancelled")],
+        jobs={100: [{"jobs": []}, {"jobs": []}]},
+    )
+    assert result["should_run"] == "true"
+    assert result["replaced_pr_run"] == "true"
+    assert result["replaced_run_id"] == "100"
+
+
+def test_replaced_pr_run_is_reported_even_when_approval_is_not_sufficient(tmp_path):
+    result = _approve(
+        tmp_path,
+        review_decision="CHANGES_REQUESTED",
+        runs=[_previous_run(conclusion="cancelled")],
+    )
+    assert result["should_run"] == "false"
+    assert result["replaced_pr_run"] == "true"
+
+
+def test_replaced_run_does_not_hide_heavy_ci_started_by_earlier_run(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[_previous_run(), _previous_run(id=150, conclusion="cancelled")],
+        jobs={100: _jobs(), 150: []},
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == "heavy-ci-already-started"
+    assert result["existing_run_id"] == "100"
+    assert result["replaced_pr_run"] == "true"
+    assert result["replaced_run_id"] == "150"
+
+
+@pytest.mark.parametrize(
+    "runs, jobs",
+    [
+        ([_previous_run(conclusion="cancelled")], {100: _jobs("skipped")}),
+        ([_previous_run(conclusion="success")], {100: []}),
+        ([_previous_run(conclusion=None)], {100: []}),
+        (
+            [
+                _previous_run(conclusion="cancelled"),
+                _previous_run(id=150, conclusion="success"),
+            ],
+            {100: [], 150: _jobs("skipped")},
+        ),
+        ([_previous_run(conclusion="cancelled", event="pull_request_review")], {}),
+        ([_previous_run(conclusion="cancelled", id=201)], {}),
+        ([_previous_run(conclusion="cancelled", head_sha="old-sha")], {}),
+    ],
+)
+def test_pr_run_that_started_or_is_unrelated_is_not_treated_as_replaced(
+    tmp_path, runs, jobs
+):
+    result = _approve(tmp_path, runs=runs, jobs=jobs)
+    assert "replaced_pr_run" not in result
+
+
+@pytest.mark.parametrize("failed_query", ["runs_query_fails", "jobs_query_fails"])
+def test_replacement_check_failure_does_not_claim_replacement(tmp_path, failed_query):
+    result = _approve(
+        tmp_path,
+        runs=[_previous_run(conclusion="cancelled")],
+        **{failed_query: True},
+    )
+    assert result["should_run"] == "false"
+    assert result["reason"] == failed_query.replace("_", "-").replace("fails", "failed")
+    assert "replaced_pr_run" not in result
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"event_name": "pull_request", "action": "synchronize"},
+        {"review_state": "commented"},
+        {"current_pr": _current_pr(head={"sha": "new-sha"})},
+    ],
+)
+def test_only_current_approval_runs_check_for_replaced_pr_run(tmp_path, kwargs):
+    result = _approve(tmp_path, runs=[_previous_run(conclusion="cancelled")], **kwargs)
+    assert "replaced_pr_run" not in result
+
+
+def test_workflow_without_pr_only_check_does_not_look_for_replaced_run(tmp_path):
+    result = _approve(
+        tmp_path, runs=[_previous_run(conclusion="cancelled")], pr_check_job=""
+    )
+    assert result["should_run"] == "true"
+    assert "replaced_pr_run" not in result
+
+
+def _smoke_jobs(conclusion):
+    return [
+        {"jobs": [{"name": "Offline inference smoke test", "conclusion": conclusion}]}
+    ]
+
+
+@pytest.mark.parametrize("conclusion", ["success", "failure", None])
+def test_second_approval_does_not_repeat_takeover(tmp_path, conclusion):
+    result = _approve(
+        tmp_path,
+        runs=[
+            _previous_run(conclusion="cancelled"),
+            _previous_run(id=150, event="pull_request_review", conclusion=None),
+        ],
+        jobs={100: [], 150: _jobs() + _smoke_jobs(conclusion)},
+    )
+    assert result["reason"] == "heavy-ci-already-started"
+    assert "replaced_pr_run" not in result
+
+
+def test_comment_review_between_does_not_hide_replacement(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[
+            _previous_run(conclusion="cancelled"),
+            _previous_run(id=150, event="pull_request_review"),
+        ],
+        jobs={100: [], 150: _smoke_jobs("skipped")},
+    )
+    assert result["should_run"] == "true"
+    assert result["replaced_pr_run"] == "true"
+    assert result["replaced_run_id"] == "100"
+
+
+def test_approval_replaced_while_pending_is_taken_over_again(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[
+            _previous_run(conclusion="cancelled"),
+            _previous_run(id=150, event="pull_request_review", conclusion="cancelled"),
+        ],
+        jobs={100: [], 150: []},
+    )
+    assert result["should_run"] == "true"
+    assert result["replaced_pr_run"] == "true"
+
+
+def test_unreadable_later_review_run_does_not_claim_replacement(tmp_path):
+    result = _approve(
+        tmp_path,
+        runs=[
+            _previous_run(conclusion="cancelled"),
+            _previous_run(id=150, event="pull_request_review"),
+        ],
+        jobs={100: [], 150: [{"jobs": None}]},
+    )
+    assert "replaced_pr_run" not in result
+
+
 @pytest.mark.parametrize("failed_query", ["runs_query_fails", "jobs_query_fails"])
 def test_history_query_failure_fails_closed(tmp_path, failed_query):
     result = _approve(tmp_path, runs=[_previous_run()], **{failed_query: True})
@@ -420,9 +575,20 @@ def test_unreadable_job_history_does_not_allow_duplicate_work(tmp_path):
 
 
 def test_explicit_rerun_bypasses_automatic_deduplication(tmp_path):
-    result = _approve(tmp_path, run_attempt=2, runs_query_fails=True)
+    result = _approve(
+        tmp_path, run_attempt=2, runs=[_previous_run()], jobs={100: _jobs()}
+    )
     assert result["should_run"] == "true"
-    assert "/actions/workflows/" not in (tmp_path / "api.log").read_text()
+    assert result["reason"] == "current-approval"
+    assert "/actions/runs/" not in (tmp_path / "api.log").read_text()
+
+
+def test_explicit_rerun_of_replacing_approval_repeats_the_smoke_test(tmp_path):
+    result = _approve(
+        tmp_path, run_attempt=2, runs=[_previous_run(conclusion="cancelled")]
+    )
+    assert result["should_run"] == "true"
+    assert result["replaced_pr_run"] == "true"
 
 
 def test_queued_approval_revalidates_head_sha(tmp_path):
@@ -456,9 +622,20 @@ def test_workflow_wiring_preserves_existing_checks_and_separates_noop_reviews():
         )
         assert gate_env["CI_GATE_WORKFLOW"] == filename
         assert config["jobs"]["check-signal"]["name"] == "Check Pre Checkin Signal"
+        if filename != "atom-test.yaml":
+            assert "CI_GATE_PR_CHECK_JOB" not in gate_env
         if filename == "atom-test.yaml":
+            assert gate_env["CI_GATE_PR_CHECK_JOB"] == "Offline inference smoke test"
             smoke = config["jobs"]["offline-smoke-test"]
-            assert smoke["if"] == "${{ github.event_name != 'pull_request_review' }}"
+            assert smoke["needs"] == ["ci-gate"]
+            assert smoke["if"].startswith("${{ !cancelled() && ")
+            assert "github.event_name != 'pull_request_review'" in smoke["if"]
+            assert "needs.ci-gate.outputs.replaced_pr_run == 'true'" in smoke["if"]
+            assert (
+                config["jobs"]["ci-gate"]["outputs"]["replaced_pr_run"]
+                == "${{ steps.gate.outputs.replaced_pr_run }}"
+            )
+            assert "needs.ci-gate.outputs.replaced_pr_run != 'true'" in smoke["name"]
             assert "'Offline smoke not requested'" in smoke["name"]
             assert "'Offline inference smoke test'" in smoke["name"]
             assert config["jobs"]["atom-test"]["name"] == "Accuracy"

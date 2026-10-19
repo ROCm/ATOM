@@ -15,6 +15,8 @@ EVENT_PATH="${GITHUB_EVENT_PATH:-}"
 REPO="${GITHUB_REPOSITORY:-}"
 CI_GATE_LABELS="${CI_GATE_LABELS:-ci:full}"
 CURRENT_PR=""
+PREVIOUS_RUNS=""
+PREVIOUS_RUNS_ERROR=""
 
 trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
@@ -157,9 +159,100 @@ emit_decision() {
   fi
 }
 
+load_previous_runs() {
+  if [ -n "${PREVIOUS_RUNS}" ]; then
+    return 0
+  fi
+
+  local head_sha head_ref head_repo runs
+  head_sha="$(jq -r '.pull_request.head.sha // empty' "${EVENT_PATH}")"
+  head_ref="$(jq -r '.pull_request.head.ref // empty' "${EVENT_PATH}")"
+  head_repo="$(jq -r '.pull_request.head.repo.full_name // empty' "${EVENT_PATH}")"
+  if [ -z "${CI_GATE_WORKFLOW:-}" ] || [ -z "${GITHUB_RUN_ID:-}" ] || [ -z "${head_sha}" ]; then
+    PREVIOUS_RUNS_ERROR="missing-run-context"
+    return 1
+  fi
+
+  if ! runs="$(gh api --paginate --slurp \
+    "repos/${REPO}/actions/workflows/${CI_GATE_WORKFLOW}/runs?head_sha=${head_sha}&per_page=100")"; then
+    PREVIOUS_RUNS_ERROR="runs-query-failed"
+    return 1
+  fi
+  if ! PREVIOUS_RUNS="$(jq -c --arg sha "${head_sha}" --arg branch "${head_ref}" --arg repo "${head_repo}" \
+    --argjson pr "${PR_NUMBER}" --argjson current "${GITHUB_RUN_ID}" '
+    [.[].workflow_runs[]
+    | select(.id < $current and .head_sha == $sha and .head_branch == $branch)
+    | select(.event == "pull_request" or .event == "pull_request_review")
+    | select(any(.pull_requests[]?; .number == $pr) or
+        ((.pull_requests | length) == 0 and $repo != "" and .head_repository.full_name == $repo))]
+    | sort_by(.id)' <<< "${runs}")"; then
+    PREVIOUS_RUNS=""
+    PREVIOUS_RUNS_ERROR="runs-query-failed"
+    return 1
+  fi
+}
+
+query_run_jobs() {
+  gh api --paginate --slurp "repos/${REPO}/actions/runs/$1/jobs?filter=all&per_page=100"
+}
+
+run_published_pr_check() {
+  local jobs published
+  if ! jobs="$(query_run_jobs "$1")" \
+    || ! published="$(jq -r --arg name "${CI_GATE_PR_CHECK_JOB}" \
+      'any(.[].jobs[]; .name == $name and .conclusion != "skipped")' <<< "${jobs}")"; then
+    return 2
+  fi
+  [ "${published}" = "true" ]
+}
+
+detect_replaced_pr_run() {
+  [ -n "${CI_GATE_PR_CHECK_JOB:-}" ] || return 0
+
+  local run_id conclusion jobs job_count later_ids later_id status
+  if ! load_previous_runs; then
+    echo "Could not read earlier runs (${PREVIOUS_RUNS_ERROR}); assuming no PR run was replaced."
+    return 0
+  fi
+
+  run_id="$(jq -r '[.[] | select(.event == "pull_request")] | last | .id // empty' <<< "${PREVIOUS_RUNS}")"
+  [ -n "${run_id}" ] || return 0
+  conclusion="$(jq -r --argjson id "${run_id}" '.[] | select(.id == $id) | .conclusion // empty' <<< "${PREVIOUS_RUNS}")"
+  [ "${conclusion}" = "cancelled" ] || return 0
+
+  if ! jobs="$(query_run_jobs "${run_id}")" \
+    || ! job_count="$(jq -r '[.[].jobs[]] | length' <<< "${jobs}")"; then
+    echo "Could not read jobs of run ${run_id}; assuming it was not replaced."
+    return 0
+  fi
+  [ "${job_count}" = "0" ] || return 0
+
+  later_ids="$(jq -r --argjson id "${run_id}" \
+    '.[] | select(.id > $id and .event == "pull_request_review") | .id' <<< "${PREVIOUS_RUNS}")"
+  while IFS= read -r later_id; do
+    [ -n "${later_id}" ] || continue
+    status=0
+    run_published_pr_check "${later_id}" || status=$?
+    if [ "${status}" = "0" ]; then
+      echo "Run ${later_id} already took over the checks of replaced PR run ${run_id}."
+      return 0
+    fi
+    if [ "${status}" != "1" ]; then
+      echo "Could not read jobs of run ${later_id}; assuming it took over replaced PR run ${run_id}."
+      return 0
+    fi
+  done <<< "${later_ids}"
+
+  echo "replaced_pr_run=true" >> "${OUTPUT_FILE}"
+  echo "replaced_run_id=${run_id}" >> "${OUTPUT_FILE}"
+  echo "Approval replaced pending PR run ${run_id} before it started; this run takes over its PR checks."
+  if [ -n "${SUMMARY_FILE}" ]; then
+    echo "- Replaced pending PR run: https://github.com/${REPO}/actions/runs/${run_id}" >> "${SUMMARY_FILE}"
+  fi
+}
+
 allow_heavy_ci() {
   # Reviews release a gate; they are not requests to retry existing work.
-  # Workflow concurrency serializes these events with the original PR run.
   # Explicit Actions reruns, labels and revision events retain their behavior.
   if [ "${EVENT_NAME}" != "pull_request_review" ] \
     || [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
@@ -167,33 +260,16 @@ allow_heavy_ci() {
     return
   fi
 
-  local head_sha head_ref head_repo runs run_ids run_id jobs started
-  head_sha="$(jq -r '.pull_request.head.sha // empty' "${EVENT_PATH}")"
-  head_ref="$(jq -r '.pull_request.head.ref // empty' "${EVENT_PATH}")"
-  head_repo="$(jq -r '.pull_request.head.repo.full_name // empty' "${EVENT_PATH}")"
-  if [ -z "${CI_GATE_WORKFLOW:-}" ] || [ -z "${GITHUB_RUN_ID:-}" ] || [ -z "${head_sha}" ]; then
-    emit_decision "false" "missing-run-context"
+  local run_ids run_id jobs started
+  if ! load_previous_runs; then
+    emit_decision "false" "${PREVIOUS_RUNS_ERROR}"
     return
   fi
-
-  if ! runs="$(gh api --paginate --slurp \
-    "repos/${REPO}/actions/workflows/${CI_GATE_WORKFLOW}/runs?head_sha=${head_sha}&per_page=100")"; then
-    emit_decision "false" "runs-query-failed"
-    return
-  fi
-  run_ids="$(jq -r --arg sha "${head_sha}" --arg branch "${head_ref}" --arg repo "${head_repo}" \
-    --argjson pr "${PR_NUMBER}" --argjson current "${GITHUB_RUN_ID}" '
-    .[].workflow_runs[]
-    | select(.id < $current and .head_sha == $sha and .head_branch == $branch)
-    | select(.event == "pull_request" or .event == "pull_request_review")
-    | select(any(.pull_requests[]?; .number == $pr) or
-        ((.pull_requests | length) == 0 and $repo != "" and .head_repository.full_name == $repo))
-    | .id' <<< "${runs}")"
+  run_ids="$(jq -r '.[].id' <<< "${PREVIOUS_RUNS}")"
 
   while IFS= read -r run_id; do
     [ -n "${run_id}" ] || continue
-    if ! jobs="$(gh api --paginate --slurp \
-      "repos/${REPO}/actions/runs/${run_id}/jobs?filter=all&per_page=100")"; then
+    if ! jobs="$(query_run_jobs "${run_id}")"; then
       emit_decision "false" "jobs-query-failed"
       return
     fi
@@ -263,6 +339,7 @@ if [ "${EVENT_NAME}" = "pull_request_review" ] \
   fi
   BASE_REF="$(jq -r '.base.ref' <<< "${CURRENT_PR}")"
   IS_DRAFT="$(jq -r '.draft // false' <<< "${CURRENT_PR}")"
+  detect_replaced_pr_run
 fi
 
 if [ "${BASE_REF}" != "main" ]; then

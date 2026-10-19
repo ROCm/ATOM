@@ -64,6 +64,7 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       reason: ${{ steps.gate.outputs.reason }}
+      replaced_pr_run: ${{ steps.gate.outputs.replaced_pr_run }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -72,6 +73,7 @@ jobs:
         id: gate
         env:
           CI_GATE_WORKFLOW: atom-test.yaml
+          CI_GATE_PR_CHECK_JOB: Offline inference smoke test
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
@@ -168,7 +170,8 @@ jobs:
           PY
 
   offline-smoke-test:
-    if: ${{ github.event_name != 'pull_request_review' }}
+    needs: [ci-gate]
+    if: ${{ !cancelled() && (github.event_name != 'pull_request_review' || needs.ci-gate.outputs.replaced_pr_run == 'true') }}
     # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
     # behind `ci-gate`, which only opens on an approval or a ci:* label.
     #
@@ -183,7 +186,7 @@ jobs:
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
     # Do not publish a same-named skipped check over a previous smoke failure.
-    name: ${{ github.event_name == 'pull_request_review' && 'Offline smoke not requested' || 'Offline inference smoke test' }}
+    name: ${{ github.event_name == 'pull_request_review' && needs.ci-gate.outputs.replaced_pr_run != 'true' && 'Offline smoke not requested' || 'Offline inference smoke test' }}
     runs-on: linux-atom-mi35x-1
     timeout-minutes: 45
     env:
