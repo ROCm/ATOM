@@ -387,10 +387,18 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
+# Each Spur worker publishes rank-workload-* on entry and rank-rc-* on exit.
+spur_workers_started() {
+  compgen -G "${LOG_ROOT}/slurm_job-$1/rank-workload-*.json" >/dev/null ||
+    compgen -G "${LOG_ROOT}/slurm_job-$1/rank-rc-*" >/dev/null
+}
+
 # Every Spur worker writes container output to shared storage, regardless of
 # runner label. Stream it from the submitter rather than through Spur RPCs.
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
+  SLURM_STARTUP_PROGRESS_CHECK=spur_workers_started
+  SLURM_STARTUP_TIMEOUT="${ATOMESH_SPUR_STARTUP_TIMEOUT:-900}"
 fi
 install_slurm_cancel_traps
 
