@@ -7,7 +7,9 @@
     "Triton K/V quant sizes and worker counts are runtime args, not constexprs: job 9070 (FQ) paid a ~0.3 s host JIT compile for every new prefill length"
   ],
   "cases": [
-    "V-QD-CPUREF2-FP8ATTN-FQ2"
+    "V-QD-CPUREF2-FP8ATTN-FQ2",
+    "V-QD-CPUREF2-FP8ATTN-FQ2-PQ",
+    "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
   ],
   "files": [
     {

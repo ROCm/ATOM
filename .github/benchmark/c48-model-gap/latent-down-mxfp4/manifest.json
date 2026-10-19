@@ -1,0 +1,19 @@
+{
+  "name": "kimi_k3_latent_down_online_quant",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "routed_expert_down_proj takes the online quantization config instead of quant_config=None (vllm-k3-latent-down-online.patch). Checkpoint weights are BF16; ATOM 6611 quantizes the same layers to MXFP4 at load time",
+    "No online config, or one whose ignore/targets do not select the layer, keeps it BF16 (UnquantizedLinearMethod). routed_expert_up_proj stays BF16: ROCmLatentMoERunner reads its weight for the sharded addmm tail"
+  ],
+  "cases": [
+    "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
+  ],
+  "files": [
+    {
+      "relative_path": "models/kimi_k3/amd/linear.py",
+      "mount_source": "linear.py",
+      "base_sha256": "50783fa2e53e989afe0b97a2eac6026cfac7967d135d20899f583ed7969083a7",
+      "patched_sha256": "aa52cf11f1cd1914c2940515b1b3cfe8cc2e06df899811d38090af6581f3ffaa"
+    }
+  ]
+}

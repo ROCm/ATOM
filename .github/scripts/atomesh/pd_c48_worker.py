@@ -26,8 +26,10 @@ def inspect_model(model):
             tensor = getattr(layer, key, None)
             if tensor is not None and hasattr(tensor, "shape"):
                 tensors[key] = {"shape": list(tensor.shape), "dtype": str(tensor.dtype)}
+        kernel = getattr(method, "kernel", None)
         result.append({"name": name, "layer": classname(layer), "quant_method": classname(method),
                        "fp8_linear": classname(getattr(method, "fp8_linear", None)),
+                       "linear_kernel": classname(kernel), "use_asm_gemm": getattr(kernel, "use_asm_gemm", None),
                        "moe_kernel": classname(getattr(method, "moe_kernel", None)), "tensors": tensors})
     return result
 
@@ -91,3 +93,6 @@ class ManifestWorker(Worker):
         (out / f'{data["role"]}-rank-{self.rank}.json').write_text(json.dumps(data, indent=2) + "\n")
         print(f"[C48] Loaded model quantization manifest rank={self.rank} PTPC={counts}", flush=True)
         assert bool(counts["target"]) == (os.environ["C48_DIAG_PTPC"] == "1"), counts
+        expect = json.loads(os.environ.get("C48_EXPECT_QUANT", "{}"))
+        got = {k: sum(item["quant_method"].endswith("." + k) for item in target) for k in expect}
+        assert got == expect, f"C48 quantization coverage mismatch: got={got} expected={expect}"
