@@ -35,6 +35,7 @@ from atom.kv_transfer.offload.metadata import LMCacheOffloadMetadata, LMCacheReq
 from atom.kv_transfer.offload.mp.deployment import (
     _make_worker_adapter,
     _mp_session_id,
+    _page_block_tokens,
     _published_tp_replication_factor,
     _tp_replication_factor,
     _validate_mp_config,
@@ -68,11 +69,9 @@ class LMCacheMPConnector(KVConnectorBase):
         self.kv_role = validated_kv_role(kvc)
         self._do_save = self.kv_role in ("offload", "kv_both", "kv_producer")
         self._do_load = self.kv_role in ("offload", "kv_both", "kv_consumer")
-        self.block_size = offcfg._strict_integer(
-            "LMCache MP block size",
-            config.kv_cache_block_size,
-            minimum=1,
-        )
+        # Tokens per block-table entry: under DCP a virtual block, of which
+        # this rank's physical block holds its share.
+        self.block_size = _page_block_tokens(config)
         self.chunk_size: int | None = None
         self._adapter: Any = None
         self._is_kv_writer = True

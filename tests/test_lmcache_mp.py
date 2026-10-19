@@ -97,7 +97,6 @@ def _config(
     ("kwargs", "message"),
     [
         ({"pp": 2}, "does not support PP"),
-        ({"dcp": 2}, "does not support DCP"),
         ({"pcp": 2}, "does not support PCP"),
         (
             {"dp": 2, "dp_local": 1, "extra": {"lmcache.mp.host": "tcp://10.0.0.5"}},
@@ -133,6 +132,322 @@ def test_mp_config_accepts_multi_node_dp_with_host_local_server(extra):
         extra=extra,
     )
     assert deployment._validate_mp_config(config) == (1, 1)
+
+
+def test_mp_config_accepts_dcp_and_moves_one_virtual_block_per_entry():
+    # Kimi-K3 TP8 + DCP8: a block-table entry is block_size x dcp global tokens.
+    config = _config(tp=8, dcp=8)
+
+    assert deployment._validate_mp_config(config) == (8, 1)
+    assert deployment._page_block_tokens(config) == 32
+    assert deployment._page_block_tokens(_config(tp=8)) == 4
+
+
+def test_mp_config_rejects_a_dcp_interleave_that_splits_a_block():
+    config = _config(tp=8, dcp=8)
+    config.dcp_config = SimpleNamespace(interleave_size=3)
+
+    with pytest.raises(NotImplementedError, match="interleave size to divide"):
+        deployment._validate_mp_config(config)
+
+
+def test_dcp_never_collapses_tp_ranks():
+    # MLA latent KV is TP-replicated, but under DCP every rank holds only its
+    # interleaved share of the tokens.
+    assert deployment._config_has_fully_replicated_tp_pages(
+        _config(tp=8, kv_lora_rank=512)
+    )
+    assert not deployment._config_has_fully_replicated_tp_pages(
+        _config(tp=8, dcp=8, kv_lora_rank=512)
+    )
+
+
+_TP_HOST_URLS = ["tcp://127.0.0.1:5555", "tcp://10.0.0.2:5555"]
+
+
+def _tp_hosts_config(**kwargs) -> SimpleNamespace:
+    """-tp 8 over two hosts of four ranks (`--tensor-parallel-size-local 4`)."""
+    kwargs.setdefault(
+        "extra",
+        {
+            "lmcache.mp.host": "tcp://127.0.0.1",
+            "lmcache.mp.tp_host_server_urls": _TP_HOST_URLS,
+        },
+    )
+    config = _config(tp=8, **kwargs)
+    config.is_multinode_tp = True
+    config.tp_size_local = 4
+    return config
+
+
+def test_mp_config_accepts_tp_across_hosts_with_a_server_per_host():
+    assert deployment._validate_mp_config(_tp_hosts_config(dcp=8)) == (8, 1)
+    assert deployment._tp_host_count(_tp_hosts_config()) == 2
+    assert deployment._tp_host_server_urls(_tp_hosts_config()) == _TP_HOST_URLS
+    assert (
+        deployment._tp_host_server_urls(
+            _tp_hosts_config(
+                extra={
+                    "lmcache.mp.tp_host_server_urls": "127.0.0.1:5555, 10.0.0.2:5555"
+                }
+            )
+        )
+        == _TP_HOST_URLS
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            {
+                "lmcache.mp.host": "tcp://10.0.0.5",
+                "lmcache.mp.tp_host_server_urls": _TP_HOST_URLS,
+            },
+            "one LMCache server per host",
+        ),
+        ({"lmcache.mp.host": "tcp://127.0.0.1"}, "tp_host_server_urls"),
+        (
+            {
+                "lmcache.mp.host": "tcp://127.0.0.1",
+                "lmcache.mp.tp_host_server_urls": _TP_HOST_URLS[:1],
+            },
+            "lists 1 servers for a TP group spanning 2 hosts",
+        ),
+    ],
+)
+def test_mp_config_rejects_tp_across_hosts_without_a_server_per_host(extra, message):
+    with pytest.raises((NotImplementedError, ValueError), match=message):
+        deployment._validate_mp_config(_tp_hosts_config(extra=extra))
+
+
+def _install_fake_lmcache_adapters(monkeypatch) -> None:
+    class AtomMPParallelConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class AtomMPWorkerAdapter:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class AtomMPSchedulerAdapter:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.lmcache_tokens_per_chunk = 32
+            self._parallel = kwargs["parallel_config"]
+
+    adapter_module = types.ModuleType("lmcache.integration.atom")
+    adapter_module.AtomMPParallelConfig = AtomMPParallelConfig
+    adapter_module.AtomMPWorkerAdapter = AtomMPWorkerAdapter
+    adapter_module.AtomMPSchedulerAdapter = AtomMPSchedulerAdapter
+    monkeypatch.setitem(sys.modules, "lmcache.integration.atom", adapter_module)
+    monkeypatch.setattr(
+        deployment,
+        "_model_namespace",
+        lambda _config, host=None, **_kwargs: f"ns-host{host}",
+    )
+
+
+def test_parallel_strategy_makes_each_host_its_own_world(monkeypatch):
+    _install_fake_lmcache_adapters(monkeypatch)
+    config = _tp_hosts_config(dcp=8)
+
+    strategies = [deployment._parallel_strategy(config, rank) for rank in range(8)]
+
+    assert [strategy.worker_id for strategy in strategies] == [0, 1, 2, 3] * 2
+    assert {strategy.world_size for strategy in strategies} == {4}
+    assert {strategy.tp_size for strategy in strategies} == {4}
+
+
+def test_model_namespace_names_the_host_of_a_tp_group_spanning_hosts(monkeypatch):
+    cfg = object()
+    monkeypatch.setattr(deployment.offcfg, "build_lmcache_config", lambda _kvc: cfg)
+    monkeypatch.setattr(
+        deployment.offcfg,
+        "build_page_namespace",
+        lambda _config, _lmcache_cfg, world: f"page-tp{world}",
+    )
+    config = _tp_hosts_config(dcp=8)
+
+    assert deployment._model_namespace(config, host=0) == (
+        "page-tp8::lmcache-mp-v3::tp-host0-of2"
+    )
+    assert deployment._model_namespace(config, host=1).endswith("::tp-host1-of2")
+    with pytest.raises(ValueError, match="outside"):
+        deployment._model_namespace(config)
+    # A TP group on one host is unchanged.
+    assert deployment._model_namespace(_config(tp=8, dcp=8)) == (
+        "page-tp8::lmcache-mp-v3"
+    )
+
+
+def test_worker_adapter_joins_its_hosts_server_and_world(monkeypatch):
+    _install_fake_lmcache_adapters(monkeypatch)
+
+    adapter = deployment._make_worker_adapter(_tp_hosts_config(dcp=8), rank=6)
+
+    assert adapter.server_url == "tcp://127.0.0.1:5555"
+    assert adapter.model_name == "ns-host1"
+    assert adapter.parallel_config.worker_id == 2
+    assert adapter.parallel_config.world_size == 4
+    assert adapter.block_size == 32
+
+
+def test_scheduler_adapter_asks_every_hosts_server(monkeypatch):
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    _install_fake_lmcache_adapters(monkeypatch)
+
+    adapter = deployment._make_scheduler_adapter(_tp_hosts_config(dcp=8))
+
+    assert isinstance(adapter, TPHostsSchedulerAdapter)
+    assert [host.server_url for host in adapter._hosts] == _TP_HOST_URLS
+    assert [host.model_name for host in adapter._hosts] == ["ns-host0", "ns-host1"]
+    assert {host.parallel_config.world_size for host in adapter._hosts} == {4}
+    assert {host.block_size for host in adapter._hosts} == {32}
+    assert adapter.lmcache_tokens_per_chunk == 32
+
+
+def test_worker_slices_block_ids_by_the_virtual_block_under_dcp():
+    connector = mp_worker.LMCacheMPConnector(_config(tp=8, dcp=2))
+    request = SimpleNamespace(req_id="r", block_ids=[10, 11, 12])
+
+    assert connector.block_size == 8
+    assert connector._block_slice(request, 8, 24) == [11, 12]
+    with pytest.raises(ValueError, match="must align to block size 8"):
+        connector._block_slice(request, 4, 8)
+
+
+class _HostFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def query(self):
+        return True
+
+    def wait(self, timeout=None):
+        return True
+
+    def result(self, timeout=None):
+        return self._value
+
+
+class _FakeHost:
+    """One host's scheduler adapter: answers prefetch statuses from a script."""
+
+    def __init__(self, statuses):
+        self.lmcache_tokens_per_chunk = 16
+        self._parallel = SimpleNamespace(tp_size=4)
+        self._mq_timeout = 1.0
+        self._client = self
+        self._statuses = list(statuses)
+        self.lookups = []
+        self.status_queries = 0
+        self.freed = []
+        self.cleaned = []
+        self.ended = []
+        self.closed = False
+
+    def _create_key(self, token_ids, start, end, request_id, worker_id):
+        return SimpleNamespace(
+            token_ids=tuple(token_ids),
+            start=start,
+            end=end,
+            request_id=request_id,
+            worker_id=worker_id,
+            host=self,
+        )
+
+    def lookup(self, key, tp_size):
+        assert key.host is self and tp_size == 4
+        self.lookups.append(key)
+        return _HostFuture(None)
+
+    def query_prefetch_status(self, request_id):
+        self.status_queries += 1
+        return _HostFuture(self._statuses.pop(0))
+
+    def free_lookup_locks(self, token_ids, start, end, request_id):
+        self.freed.append((start, end, request_id))
+
+    def cleanup_lookup_result(self, request_id):
+        self.cleaned.append(request_id)
+
+    def end_session(self, request_id):
+        self.ended.append(request_id)
+
+    def shutdown(self):
+        self.closed = True
+
+
+def test_tp_hosts_lookup_takes_the_answer_every_host_gives():
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    hosts = [_FakeHost([3]), _FakeHost([None, 3])]
+    adapter = TPHostsSchedulerAdapter(hosts)
+
+    adapter.maybe_submit_lookup_request("r", list(range(70)))
+    assert [len(host.lookups) for host in hosts] == [1, 1]
+    assert hosts[0].lookups[0].end == 64
+    # Host 1 is still prefetching: no answer yet, and host 0 is not asked again.
+    assert adapter.check_lookup_result("r") is None
+    assert adapter.check_lookup_result("r") == 48
+    assert [host.status_queries for host in hosts] == [1, 2]
+    assert [host.freed for host in hosts] == [[], []]
+
+
+def test_tp_hosts_lookup_loads_nothing_when_the_hosts_disagree():
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    hosts = [_FakeHost([3]), _FakeHost([2])]
+    adapter = TPHostsSchedulerAdapter(hosts)
+
+    adapter.maybe_submit_lookup_request("r", list(range(64)))
+
+    assert adapter.check_lookup_result("r") == 0
+    # Every host's read locks are released: the request recomputes.
+    assert hosts[0].freed == [(0, 48, "r")]
+    assert hosts[1].freed == [(0, 32, "r")]
+    assert adapter.host_mismatches == 1
+
+
+def test_tp_hosts_adapter_serves_the_async_lookup_client():
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    hosts = [_FakeHost([None, 2]), _FakeHost([2])]
+    adapter = TPHostsSchedulerAdapter(hosts)
+    client = mp_lookup._MPLookupClient(
+        adapter, config=_config(), timeout=1.0, poll_interval=0.001
+    )
+    tokens = list(range(40))
+
+    assert client.supports_async()
+    assert client.submit(tokens, "7")
+    assert not client.poll("7")
+    assert client.poll("7")
+    assert client.lookup(tokens, "7") == 32
+    client.prepare_retrieve("7", 16, 32)
+    assert [host.freed for host in hosts] == [
+        [(0, 16, "atom-offload-dp0:7")],
+        [(0, 16, "atom-offload-dp0:7")],
+    ]
+
+
+def test_tp_hosts_adapter_fans_cleanup_out_to_every_host():
+    from atom.kv_transfer.offload.mp.tp_hosts import TPHostsSchedulerAdapter
+
+    hosts = [_FakeHost([]), _FakeHost([])]
+    adapter = TPHostsSchedulerAdapter(hosts)
+
+    adapter.free_lookup_locks(token_ids=[1, 2], start=0, end=16, request_id="r")
+    adapter.cleanup_lookup_result("r")
+    adapter.end_session("r")
+    adapter.shutdown()
+
+    assert all(host.freed == [(0, 16, "r")] for host in hosts)
+    assert all(host.cleaned == ["r"] for host in hosts)
+    assert all(host.ended == ["r"] for host in hosts)
+    assert all(host.closed for host in hosts)
 
 
 def test_mp_config_accepts_arbitrary_model_type():

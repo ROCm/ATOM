@@ -179,13 +179,14 @@ class NativeStateLMCacheMPConnector(LMCacheMPConnector):
             reserve(self._restore_descriptor_slots)
         logger.info(
             "LMCache MP native state registered rank=%d images=%s native_image=%d "
-            "units=%d groups=%d chunk=%d",
+            "units=%d groups=%d chunk=%d block_tokens=%d",
             rank,
             images,
             spec.image_bytes,
             spec.units_per_checkpoint,
             len(layout.kernel_groups),
             chunk_size,
+            self.block_size,
         )
 
     def _native_block_ids(

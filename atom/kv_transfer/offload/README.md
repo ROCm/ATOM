@@ -287,7 +287,23 @@ RESTORE
   `ATOM_DP_SESSION_AFFINITY=1` keeps a session's later turns on its owner rank,
   and so on that host. A non-loopback server address under multi-node DP is
   rejected.
-- PP, PCP, DCP, and engine-driven transfers are rejected.
+- A TP group spanning hosts (`--tensor-parallel-size-local`) also runs one
+  server per host, with `lmcache.mp.host` at a loopback address. Each host's
+  ranks form its server's world: worker ID = rank within the host, and the
+  model namespace names the host. The engine's scheduler asks every host's
+  server, listed in `lmcache.mp.tp_host_server_urls` in host order as the
+  engine's host reaches them (the first may stay loopback), so the other hosts'
+  servers must listen on a reachable address (`--host 0.0.0.0`). A prefix loads
+  only when every host reports the same hit; otherwise every host's read locks
+  are released and the request recomputes.
+- DCP: a block-table entry is a virtual block of `block_size * dcp` global
+  tokens, of which each rank's physical block holds its interleaved share. The
+  PAGE groups are registered with `tokens_per_block = block_size * dcp`, which
+  LMCache moves as one compressed block per entry, so the chunk size must be a
+  multiple of it (Kimi-K3 TP8 + DCP8 at block 16: chunk 128). The DCP interleave
+  size must divide the block size. No PAGE block is the same on two ranks under
+  DCP, so TP ranks never collapse.
+- PP, PCP, and engine-driven transfers are rejected.
 - PAGE tensors are registered as zero-copy `uint8` views, preserving FP8/BF16
   bit patterns and avoiding numerical dtype conversion in ROCm pointer paths.
 - DSv4 declares PAGE and native STATE fully TP-replicated. In `auto` mode, one
