@@ -1424,6 +1424,34 @@ models:
               <<: *kimi_k3_pp8_p0_prefill_env
               OFFLOAD_STREAM_PRIORITY: "-1"
 
+        # Test only. The PP8 C4 / C16 cells with a TP8 prefill (TP8xDCP8 with
+        # the LMCache tier at C16) in place of PP8xTP1; the decode, its draft
+        # and quantization are the PP8 cells', so only the prefill differs.
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8-tp8-dspark7-agentic-1m-c4
+          topology: 1p1d
+          display_topology: 1P1D-TP8-TP8-DSPARK7
+          concurrency: [4]
+          prefill:
+            workers: 1
+            tp: 8
+          env:
+            common: *kimi_k3_pp8_env
+            prefill: {}
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-tp8-dcp8-dspark4-agentic-lmcache-1m-c16
+          topology: 1p1d
+          display_topology: 1P1D-TP8-DCP8-DSPARK4
+          concurrency: [16]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+          env:
+            common: *kimi_k3_pp8_replay_env
+            prefill: *kimi_k3_agentic_lmcache128_env
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
