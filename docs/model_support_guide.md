@@ -43,6 +43,7 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 | `Glm4MoeForCausalLM` | `atom.models.glm4_moe` | `Glm4MoeForCausalLM` | Yes | No | GQA, partial RoPE (0.5 factor), QK norm, shared+routed experts, sigmoid scoring, grouped top-k |
 | `Glm5NextForConditionalGeneration` | `atom.models.glm5_next` | `Glm5NextForConditionalGeneration` | Yes | Yes | Text-only GLM-5.3-Flash: hybrid KDA + pooled sparse MLA, mHC, NoPE zero padding; PCP/DCP/MTP/TBO not yet supported |
 | `Qwen3NextForCausalLM` | `atom.models.qwen3_next` | `Qwen3NextForCausalLM` | Yes | No | Hybrid architecture: full attention + Gated DeltaNet linear attention, GQA, QK norm, FusedMoE |
+| `MuseSparkForConditionalGeneration` | `atom.models.muse_spark` | `MuseSparkForConditionalGeneration` | Yes | No | Text-only Muse Spark Open: GQA with output gate and weightless q/k/o norm, SWA + NoPE full layers, per-expert post-norm before the top-k sum, fp32 gated residual stream, logit softcap |
 | `KimiK3ForConditionalGeneration` | `atom.models.kimi_k3` | `KimiK3ForConditionalGeneration` | Yes | Yes | Hybrid architecture: MLA full attention + KDA linear attention, SiTU activation, MXFP4 latent MoE, MoonViT3d vision tower |
 | `DeepseekV41ForCausalLM` | `atom.models.deepseek_v41` | `DeepseekV41ForCausalLM` | Yes | Yes | CSA2 topology, Single-Pass mHC, Engram n-gram memory, FP8 or FP4 index plane with a paged scorer, native W4A8/FP4 weights, vision tower, native DSpark speculation |
 
@@ -114,6 +115,14 @@ ATOM resolves the HuggingFace `architectures` field from a model's `config.json`
 - **MoE:** `MLPBlock` wraps `ReplicatedLinear` router (with bias) + `FusedMoE` with SwiGLU activation and bias support. Custom `weights_mapping` translates checkpoint names (`gate_up_proj_blocks` to `w13_weight`, etc.).
 - **Normalization:** RMSNorm with eps=1e-5, post-attention norm uses `x_pad_to_multiple=256`.
 - **Pipeline parallelism:** Supports auxiliary hidden state layers for EAGLE3 speculative decoding (`get_eagle3_aux_hidden_state_layers`).
+
+### Muse Spark Open (`MuseSparkForConditionalGeneration`)
+
+- **Architecture:** Text stack of a multimodal checkpoint (`muse_spark` root config, `muse_spark_text` sub-config); the vision and audio towers are skipped via `skip_weight_prefixes`. The module tree keeps the checkpoint's `model.language_model.*` names so the Quark exclude list matches without remapping.
+- **Attention:** `QKVParallelLinear` plus a query-sized `gate_proj` (sigmoid output gate). q and k get a weightless per-head RMSNorm (q times `qk_scale_factor`) before RoPE; layers with `layer_rope_theta == 0` are NoPE. `layer_types` selects a 2048-token sliding window. The output gets a weightless per-head RMSNorm before the gate.
+- **MoE:** Replicated `pre_expert_proj`/`post_expert_proj` (8192 <-> 4096). Routing is `sigmoid(logits * output_multiplier)` with a selection-only `e_score_correction_bias`. Every expert output is RMS-normalized before the weighted top-k sum, so the experts run as a top-1 `FusedMoE` over tokens repeated top-k times (all-reduced before the combine under TP, after it under EP).
+- **Normalization / residual:** fp32 residual stream; zero-centred RMSNorm weights (`w + 1`, final norm `w + 0`); norm-preserving gated residuals after each sub-block's post-norm.
+- **Logits:** fp32 lm_head, times `output_multiplier`, then a tanh softcap (`final_logit_softcapping`).
 
 ### GLM-5 / GlmMoeDsa (`GlmMoeDsaForCausalLM`)
 
@@ -411,6 +420,7 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 | `atom/models/deepseek_mtp.py` | DeepSeek MTP draft model: `DeepSeekMTP`, `DeepSeekMultiTokenPredictor`, `DeepSeekMultiTokenPredictorLayer`, `SharedHead` |
 | `atom/models/mixtral.py` | Mixtral model: `MixtralForCausalLM`, `MixtralModel`, `MixtralDecoderLayer`, `MixtralAttention`, `MixtralMoE` |
 | `atom/models/gpt_oss.py` | GPT-OSS model: `GptOssForCausalLM`, `GptOssModel`, `TransformerBlock`, `OAIAttention`, `MLPBlock` |
+| `atom/models/muse_spark.py` | Muse Spark Open model: `MuseSparkForConditionalGeneration`, `MuseSparkTextModel`, `MuseSparkDecoderLayer`, `MuseSparkAttention`, `MuseSparkMoE`, `MuseSparkLMHead` |
 | `atom/models/glm4_moe.py` | GLM4-MoE model: `Glm4MoeForCausalLM`, `Glm4MoeModel`, `Glm4MoeDecoderLayer`, `Glm4MoeAttention`, `Glm4MoE`, `Glm4MoeMLP` |
 | `atom/models/qwen3_5.py` | Qwen3.5 model: `Qwen3_5ForConditionalGenerationTextOnly`, `Qwen3_5MoeForConditionalGenerationTextOnly`, `Qwen3_5Model`, `Qwen3_5MoeModel`, `Qwen3_5DecoderLayer`, `Qwen3_5RMSNorm`, `Qwen3_5Attention`, `Qwen3_5GatedDeltaNet`, `Qwen3_5SparseMoeBlock`, `Qwen3_5MLP` |
 | `atom/models/qwen3_next.py` | Qwen3-Next model: `Qwen3NextForCausalLM`, `Qwen3NextModel`, `Qwen3NextDecoderLayer`, `Qwen3NextAttention`, `Qwen3NextGatedDeltaNet`, `Qwen3NextSparseMoeBlock`, `Qwen3NextMLP` |
