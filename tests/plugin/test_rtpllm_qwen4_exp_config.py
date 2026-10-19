@@ -37,6 +37,108 @@ from atom.plugin.rtpllm.utils.qwen4_exp_context import (
 )
 
 
+@pytest.mark.parametrize("prefill_enabled", [True, False])
+def test_qwen4_exp_rtp_gdn_prefill_policy_keeps_decode_disabled(
+    monkeypatch, prefill_enabled
+):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    layer = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.empty((), dtype=torch.bfloat16),
+    )
+    metadata = SimpleNamespace(
+        num_prefills=2,
+        num_prefill_tokens=5,
+        non_spec_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+        flydsl_prefill_metadata=None,
+    )
+    state = torch.empty((4, 2, 128, 128), dtype=torch.float32)
+    calls = []
+
+    def select(**kwargs):
+        calls.append(kwargs)
+        return GDNFlyDSLPolicy(prefill=prefill_enabled, decode=True)
+
+    monkeypatch.setattr(qwen4_exp_context, "select_policy", select)
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "build_prefill_metadata",
+        lambda lengths, cu: (tuple(lengths), cu),
+    )
+    RTPQwen4ExpContext._configure_gdn_prefill(
+        metadata,
+        {3: layer},
+        {"layer_3": SimpleNamespace(v_cache=state)},
+        SimpleNamespace(input_lengths=torch.tensor([2, 3], dtype=torch.int32)),
+    )
+    assert calls[0]["state"] is state
+    assert calls[0]["lossy_decode"] is True
+    assert layer.gdn_flydsl_policy.prefill is prefill_enabled
+    assert layer.gdn_flydsl_policy.decode is False
+    assert (metadata.flydsl_prefill_metadata is not None) is prefill_enabled
+
+
+def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    layer = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.empty((), dtype=torch.bfloat16),
+    )
+    metadata = SimpleNamespace(num_prefills=0, flydsl_prefill_metadata=None)
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "select_policy",
+        lambda **kwargs: GDNFlyDSLPolicy(prefill=True, decode=True),
+    )
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "build_prefill_metadata",
+        lambda *args: pytest.fail("decode must not prepare prefill metadata"),
+    )
+    RTPQwen4ExpContext._configure_gdn_prefill(
+        metadata,
+        {3: layer},
+        {"layer_3": SimpleNamespace(v_cache=torch.empty((4, 2, 128, 128)))},
+        SimpleNamespace(input_lengths=torch.tensor([1], dtype=torch.int32)),
+    )
+    assert layer.gdn_flydsl_policy.decode is False
+    assert metadata.flydsl_prefill_metadata is None
+
+
+def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region():
+    heads, k_dim, v_dim, conv_dim, conv_length = 2, 4, 4, 6, 2
+    state_elems = heads * k_dim * v_dim
+    raw = torch.zeros(
+        (3, 2 * state_elems + conv_dim * conv_length), dtype=torch.bfloat16
+    )
+    layer = SimpleNamespace(
+        dt_bias=torch.empty(heads),
+        head_k_dim=k_dim,
+        head_v_dim=v_dim,
+        conv1d=SimpleNamespace(weight=torch.empty(conv_dim, 1, conv_length + 1)),
+    )
+    runtime = SimpleNamespace(
+        _rtp_model_config=SimpleNamespace(
+            linear_attention_config=SimpleNamespace(ssm_state_dtype=DataType.TYPE_FP32)
+        ),
+        kv_cache=SimpleNamespace(
+            get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
+        ),
+    )
+    cache = RTPQwen4ExpContext._build_kv_cache_tensors(runtime, ({3: layer}, {}, {}))[
+        "layer_3"
+    ]
+    assert cache.v_cache.dtype == torch.float32
+    assert cache.k_cache.dtype == torch.bfloat16
+    cache.v_cache[1, 0, 0, 0] = 1.25
+    cache.k_cache[1, 0, 0] = 2
+    assert raw.view(torch.float32)[1, 0].item() == 1.25
+    assert raw[1, 2 * state_elems].item() == 2
+    assert cache.v_cache[0].abs().sum().item() == 0
+
+
 def test_qwen4_exp_graph_uses_device_block_tables_only():
     assert _Qwen4ExpAttnPyObj.requires_host_block_table_mirror is False
 
