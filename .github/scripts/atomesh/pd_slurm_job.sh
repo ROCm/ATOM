@@ -509,12 +509,54 @@ if [[ "${1:-}" == "--spur-worker" ]]; then
   exit $?
 fi
 
+spur_controller_job_state() {
+  local -a cmd=(scontrol)
+  if [[ -n "${SPUR_CONTROLLER_ADDR:-}" ]]; then
+    cmd+=(--controller "${SPUR_CONTROLLER_ADDR}")
+  fi
+  timeout "${ATOMESH_SPUR_QUERY_TIMEOUT:-20}" "${cmd[@]}" show job "${JOB_ID}" 2>/dev/null \
+    | awk -v id="${JOB_ID}" '
+        /JobId=/ { selected = 0 }
+        { for (i = 1; i <= NF; i++) {
+            if ($i == "JobId=" id) selected = 1
+            if (selected && $i ~ /^JobState=/) { sub(/^JobState=/, "", $i); print $i; exit }
+        } }'
+}
+
+# Spur can start the batch script while its controller still reports the job
+# as PENDING, and srun then refuses to create the worker step. Wait only on an
+# explicit pending state; an unavailable controller keeps the old behaviour.
+wait_for_spur_job_running() {
+  local timeout="${ATOMESH_SPUR_RUNNING_TIMEOUT:-300}"
+  local interval="${ATOMESH_SPUR_RUNNING_POLL_INTERVAL:-5}"
+  local deadline state waited=0
+  command -v scontrol >/dev/null 2>&1 || return 0
+  deadline=$(( $(date +%s) + timeout ))
+  while true; do
+    state="$(spur_controller_job_state || true)"
+    case "${state%%+*}" in
+      PENDING|CONFIGURING) ;;
+      *) break ;;
+    esac
+    if (( $(date +%s) >= deadline )); then
+      echo "WARNING: Spur job ${JOB_ID} still ${state} after ${timeout}s; dispatching workers anyway" >&2
+      return 0
+    fi
+    waited=1
+    sleep "${interval}"
+  done
+  if [[ "${waited}" -eq 1 ]]; then
+    echo "[spur] job ${JOB_ID} controller state is now ${state:-unknown}"
+  fi
+}
+
 if [[ -n "${SPUR_JOB_ID:-}" || -n "${SPUR_TASK_OFFSET:-}" || -n "${SPUR_PEER_NODES:-}" ]]; then
   # Spur sbatch runs the batch script only on the first allocated node; the
   # other nodes run placeholders until an srun step dispatches their workers.
   # Use an explicit worker argument because the batch shell also has rank 0
   # in SPUR_TASK_OFFSET. srun assigns each worker's rank and inherits the batch
   # environment, including SPUR_PEER_NODES in allocation order.
+  wait_for_spur_job_running
   echo "=== Spur job ${JOB_ID}: dispatching ${NUM_NODES} node workers ==="
   exec srun \
     --nodes="${NUM_NODES}" \
