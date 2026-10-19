@@ -90,6 +90,11 @@ class LMCacheMPConnectorScheduler(ChunkedOffloadSchedulerBase):
         hit = self._last_tier_hit(seq, sid)
         if hit != num_prompt or num_prompt % self.chunk_size:
             return matched
+        if self._recurrent_state_hook is not None:
+            # Recurrent state is restored at the logical hit, which the hook
+            # has already capped below the prompt; a PAGE transfer ending past
+            # it would have no state to continue from.
+            return matched
 
         load_spec = self._load_specs.get(sid)
         if load_spec is None:

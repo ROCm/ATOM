@@ -279,16 +279,23 @@ def apply_vllm_v41_local_hit_cap_patch() -> None:
     if getattr(original, "_atom_v41_hit_cap_patched", False):
         return
 
+    from atom.plugin.vllm.v41_speculative import _is_v41_speculating
+
     @functools.wraps(original)
     def _wrapped(self, request):
         blocks, num_local, boundary, divergent = original(self, request)
-        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
-        # No connector: vLLM has already reduced the hit to a boundary the
-        # checkpoint group holds (its coordinator takes the minimum across
-        # groups), so the hit stands as it is.
-        if num_local <= 0 or planner is None:
+        if num_local <= 0:
             return blocks, num_local, boundary, divergent
-        capped = int(planner.cap_local_hit(request, int(num_local)))
+        planner = getattr(getattr(self, "connector", None), "_v41_planner", None)
+        if planner is not None:
+            capped = int(planner.cap_local_hit(request, int(num_local)))
+        elif int(request.num_tokens) - int(num_local) < 2 and _is_v41_speculating(self):
+            # No connector, so vLLM's hit already sits on a held checkpoint.
+            # Under speculation a one-token tail would still be admitted as a
+            # padded verify row, which V4.1 refuses beside a prefill.
+            capped = 0
+        else:
+            return blocks, num_local, boundary, divergent
         if capped >= num_local:
             return blocks, num_local, boundary, divergent
         block_size = int(self.cache_config.block_size)
