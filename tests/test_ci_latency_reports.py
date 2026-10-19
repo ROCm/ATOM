@@ -631,7 +631,9 @@ def test_mesh_setup_builds_once_and_passes_a_reusable_binary_path(tmp_path):
     assert len(calls.read_text().splitlines()) == 1
 
     log_root = tmp_path / "log root"
-    default_env = {key: value for key, value in env.items() if key != "ATOMESH_MESH_TARGET_DIR"}
+    default_env = {
+        key: value for key, value in env.items() if key != "ATOMESH_MESH_TARGET_DIR"
+    }
     command[3] = str(log_root / "cell-run" / "slurm_job-124")
     command[-1] = "124"
     result = subprocess.run(
