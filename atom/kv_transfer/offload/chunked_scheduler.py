@@ -173,11 +173,22 @@ class ChunkedOffloadSchedulerBase(OffloadSchedulerMixin, KVConnectorSchedulerBas
 
     def _lookup_token_ids(self, seq) -> list[int]:
         """The prompt extent this layout can safely ask the tier to resume."""
-        return list(seq.token_ids[: seq.num_prompt_tokens])
+        return list(seq.token_ids[: self._lookup_len(seq)])
 
     def _lookup_len(self, seq) -> int:
         """`len(self._lookup_token_ids(seq))` without copying the prompt."""
-        return int(seq.num_prompt_tokens)
+        tail = getattr(self, "_lookup_tail", 0)
+        if not tail:
+            return int(seq.num_prompt_tokens)
+        return self._chunk_floor(int(seq.num_prompt_tokens) - tail)
+
+    def truncate_lookup_query(self, tail: int) -> None:
+        """Look up only to the last chunk edge that leaves `tail` tokens.
+
+        The server prefetches the recurrent state of the lookup's endpoint, so
+        a hit shortened after the lookup loads state it never prefetched.
+        """
+        self._lookup_tail = tail
 
     def install_hit_cap_hook(self, hook) -> None:
         """Let a hybrid connector shorten every hit this scheduler reports.

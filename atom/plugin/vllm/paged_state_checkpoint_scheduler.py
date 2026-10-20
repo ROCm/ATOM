@@ -79,13 +79,13 @@ class StateCheckpointPlacement:
             return 0
         return num_prompt_tokens // self.interval * self.interval
 
-    def anchor(self, num_prompt_tokens: int, num_tokens: int) -> int:
+    def anchor(self, num_prompt_tokens: int, num_tokens: int, tail: int = 1) -> int:
         if self.interval == 0:
             return 0
         end = num_prompt_tokens // self.block * self.block
-        # Never past the last block a lookup can match (the last one is always
-        # recomputed for logits).
-        end = min(end, (-(-num_tokens // self.block) - 1) * self.block)
+        # Never past the last block a hit can end on: it leaves `tail` tokens
+        # to compute (one for the logits).
+        end = min(end, (num_tokens - tail) // self.block * self.block)
         return max(end, 0)
 
     def demand_pos(self, hit: int, compressed_hit: int, has_room: bool) -> int:
@@ -190,6 +190,7 @@ class SchedulerStateCheckpoints:
         # ``hash_decode_blocks`` at the committed end) and the worker stores it
         # at the next build.
         self.spec = int(getattr(scheduler, "num_spec_tokens", 0) or 0) > 0
+        self.prefill_tail = 1
         # req_id -> spacing threshold of a decode row in this schedule().
         self.decode_rows: dict[str, int] = {}
         # schedule() count, and each step's requests that continue on their
@@ -223,7 +224,7 @@ class SchedulerStateCheckpoints:
     def on_admission(self, request, blocks, hit: int, shared_prefix_boundary: int):
         p = self.placement
         request._atom_img_anchor = p.anchor(
-            int(request.num_prompt_tokens), int(request.num_tokens)
+            int(request.num_prompt_tokens), int(request.num_tokens), self.prefill_tail
         )
         # The proxy-only hit: vLLM reports it as the shared-prefix junction
         # exactly when the state checkpoint groups cut the hit short.
@@ -712,6 +713,8 @@ def bind_scheduler_state_checkpoints(scheduler) -> SchedulerStateCheckpoints | N
     st = SchedulerStateCheckpoints(
         scheduler, placement, proxy, state_checkpoints, name=adapter.name
     )
+    if st.spec:
+        st.prefill_tail = getattr(adapter, "speculative_prefill_tail", 1)
 
     orig_gcb = kvm.get_computed_blocks
 

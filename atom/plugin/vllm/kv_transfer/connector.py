@@ -802,6 +802,9 @@ class AtomLMCacheOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             is not None,
         )
         self._scheduler.install_hit_cap_hook(self._v41_planner.cap_hit)
+        self._scheduler.truncate_lookup_query(
+            2 if self._v41_planner.keep_a_prefill_tail else 1
+        )
         self._scheduler.install_recurrent_state_hook(
             self._v41_state_for_transfer,
             self._v41_planner.retire_ride_pins,
