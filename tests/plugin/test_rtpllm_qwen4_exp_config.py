@@ -38,8 +38,10 @@ from atom.plugin.rtpllm.utils.qwen4_exp_context import (
 
 
 @pytest.mark.parametrize("prefill_enabled", [True, False])
-def test_qwen4_exp_rtp_gdn_prefill_policy_keeps_decode_disabled(
-    monkeypatch, prefill_enabled
+@pytest.mark.parametrize("vk_layout", [True, False])
+@pytest.mark.parametrize("spec_decodes", [0, 1])
+def test_qwen4_exp_rtp_gdn_policy_requires_vk_decode_state(
+    monkeypatch, prefill_enabled, vk_layout, spec_decodes
 ):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
@@ -50,10 +52,13 @@ def test_qwen4_exp_rtp_gdn_prefill_policy_keeps_decode_disabled(
     metadata = SimpleNamespace(
         num_prefills=2,
         num_prefill_tokens=5,
+        num_spec_decodes=spec_decodes,
         non_spec_query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
         flydsl_prefill_metadata=None,
     )
     state = torch.empty((4, 2, 128, 128), dtype=torch.float32)
+    if vk_layout:
+        state = state.transpose(-1, -2)
     calls = []
 
     def select(**kwargs):
@@ -66,16 +71,16 @@ def test_qwen4_exp_rtp_gdn_prefill_policy_keeps_decode_disabled(
         "build_prefill_metadata",
         lambda lengths, cu: (tuple(lengths), cu),
     )
-    RTPQwen4ExpContext._configure_gdn_prefill(
+    RTPQwen4ExpContext._configure_gdn_backends(
         metadata,
         {3: layer},
         {"layer_3": SimpleNamespace(v_cache=state)},
         SimpleNamespace(input_lengths=torch.tensor([2, 3], dtype=torch.int32)),
     )
     assert calls[0]["state"] is state
-    assert calls[0]["lossy_decode"] is True
+    assert calls[0]["lossy_decode"] is False
     assert layer.gdn_flydsl_policy.prefill is prefill_enabled
-    assert layer.gdn_flydsl_policy.decode is False
+    assert layer.gdn_flydsl_policy.decode is (vk_layout and spec_decodes == 0)
     assert (metadata.flydsl_prefill_metadata is not None) is prefill_enabled
 
 
@@ -97,7 +102,7 @@ def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
         "build_prefill_metadata",
         lambda *args: pytest.fail("decode must not prepare prefill metadata"),
     )
-    RTPQwen4ExpContext._configure_gdn_prefill(
+    RTPQwen4ExpContext._configure_gdn_backends(
         metadata,
         {3: layer},
         {"layer_3": SimpleNamespace(v_cache=torch.empty((4, 2, 128, 128)))},
@@ -107,13 +112,32 @@ def test_qwen4_exp_rtp_gdn_decode_does_not_build_prefill_schedule(monkeypatch):
     assert metadata.flydsl_prefill_metadata is None
 
 
-def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region():
+@pytest.mark.parametrize(
+    ("decode_enabled", "mtp_target", "mtp_draft"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
+def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region(
+    monkeypatch, decode_enabled, mtp_target, mtp_draft
+):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    monkeypatch.setattr(
+        qwen4_exp_context,
+        "select_policy",
+        lambda **kwargs: GDNFlyDSLPolicy(decode=decode_enabled),
+    )
     heads, k_dim, v_dim, conv_dim, conv_length = 2, 4, 4, 6, 2
     state_elems = heads * k_dim * v_dim
     raw = torch.zeros(
         (3, 2 * state_elems + conv_dim * conv_length), dtype=torch.bfloat16
     )
     layer = SimpleNamespace(
+        allow_aiter_flydsl=True,
         dt_bias=torch.empty(heads),
         head_k_dim=k_dim,
         head_v_dim=v_dim,
@@ -121,7 +145,9 @@ def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region():
     )
     runtime = SimpleNamespace(
         _rtp_model_config=SimpleNamespace(
-            linear_attention_config=SimpleNamespace(ssm_state_dtype=DataType.TYPE_FP32)
+            linear_attention_config=SimpleNamespace(ssm_state_dtype=DataType.TYPE_FP32),
+            atom_qwen4_exp_mtp_target=mtp_target,
+            is_mtp=mtp_draft,
         ),
         kv_cache=SimpleNamespace(
             get_layer_cache=lambda _: SimpleNamespace(kv_cache_base=raw)
@@ -132,9 +158,14 @@ def test_qwen4_exp_rtp_gdn_fp32_state_uses_full_byte_region():
     ]
     assert cache.v_cache.dtype == torch.float32
     assert cache.k_cache.dtype == torch.bfloat16
-    cache.v_cache[1, 0, 0, 0] = 1.25
+    vk_layout = decode_enabled and not (mtp_target or mtp_draft)
+    assert cache.v_cache.stride()[1:] == (
+        (k_dim * v_dim, 1, k_dim) if vk_layout else (k_dim * v_dim, v_dim, 1)
+    )
+    cache.v_cache[1, 0, 1, 2] = 1.25
     cache.k_cache[1, 0, 0] = 2
-    assert raw.view(torch.float32)[1, 0].item() == 1.25
+    state_offset = 2 * k_dim + 1 if vk_layout else v_dim + 2
+    assert raw.view(torch.float32)[1, state_offset].item() == 1.25
     assert raw[1, 2 * state_elems].item() == 2
     assert cache.v_cache[0].abs().sum().item() == 0
 

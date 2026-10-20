@@ -213,45 +213,72 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         if model_config is None:
             model_config = getattr(runtime, "model_config", None)
         linear_config = getattr(model_config, "linear_attention_config", None)
-        if getattr(linear_config, "ssm_state_dtype", None) != DataType.TYPE_FP32:
-            return caches
-        for layer_num, layer in layer_maps[0].items():
-            raw = runtime.kv_cache.get_layer_cache(layer_num).kv_cache_base
-            base = raw.reshape(raw.shape[0], -1)
-            if base.dtype != torch.bfloat16 or not base.is_contiguous():
-                raise ValueError("Qwen4Exp FP32 GDN state requires BF16 byte storage")
-            heads = int(layer.dt_bias.numel())
-            k_dim, v_dim = int(layer.head_k_dim), int(layer.head_v_dim)
-            state_elems = heads * k_dim * v_dim
-            conv_dim = int(layer.conv1d.weight.size(0))
-            conv_length = int(layer.conv1d.weight.size(2)) - 1
-            if base.shape[1] < 2 * state_elems + conv_dim * conv_length:
-                raise ValueError("Qwen4Exp FP32 GDN cache is smaller than its layout")
-            fp32_base = base.view(torch.float32)
-            state = torch.as_strided(
-                fp32_base,
-                (base.shape[0], heads, k_dim, v_dim),
-                (fp32_base.stride(0), k_dim * v_dim, v_dim, 1),
-                storage_offset=fp32_base.storage_offset(),
-            )
-            conv = torch.as_strided(
-                base,
-                (base.shape[0], conv_dim, conv_length),
-                (base.stride(0), 1, conv_dim),
-                storage_offset=base.storage_offset() + 2 * state_elems,
-            )
-            caches[f"layer_{layer_num}"].v_cache = state
-            caches[f"layer_{layer_num}"].k_cache = conv
+        if getattr(linear_config, "ssm_state_dtype", None) == DataType.TYPE_FP32:
+            for layer_num, layer in layer_maps[0].items():
+                raw = runtime.kv_cache.get_layer_cache(layer_num).kv_cache_base
+                base = raw.reshape(raw.shape[0], -1)
+                if base.dtype != torch.bfloat16 or not base.is_contiguous():
+                    raise ValueError(
+                        "Qwen4Exp FP32 GDN state requires BF16 byte storage"
+                    )
+                heads = int(layer.dt_bias.numel())
+                k_dim, v_dim = int(layer.head_k_dim), int(layer.head_v_dim)
+                state_elems = heads * k_dim * v_dim
+                conv_dim = int(layer.conv1d.weight.size(0))
+                conv_length = int(layer.conv1d.weight.size(2)) - 1
+                if base.shape[1] < 2 * state_elems + conv_dim * conv_length:
+                    raise ValueError(
+                        "Qwen4Exp FP32 GDN cache is smaller than its layout"
+                    )
+                fp32_base = base.view(torch.float32)
+                state = torch.as_strided(
+                    fp32_base,
+                    (base.shape[0], heads, k_dim, v_dim),
+                    (fp32_base.stride(0), k_dim * v_dim, v_dim, 1),
+                    storage_offset=fp32_base.storage_offset(),
+                )
+                conv = torch.as_strided(
+                    base,
+                    (base.shape[0], conv_dim, conv_length),
+                    (base.stride(0), 1, conv_dim),
+                    storage_offset=base.storage_offset() + 2 * state_elems,
+                )
+                caches[f"layer_{layer_num}"].v_cache = state
+                caches[f"layer_{layer_num}"].k_cache = conv
+
+        # AITER decode expects physical VK storage exposed as a logical KV
+        # view. Bind that view before the first state write; the prefill path
+        # and Triton decode fallback both honor its inner strides. MTP target
+        # verification still uses the original KV state layout.
+        if not getattr(
+            model_config, "atom_qwen4_exp_mtp_target", False
+        ) and not getattr(model_config, "is_mtp", False):
+            for layer_num, layer in layer_maps[0].items():
+                state = caches[f"layer_{layer_num}"].v_cache
+                k_dim, v_dim = state.shape[-2:]
+                policy = select_policy(
+                    allowed=layer.allow_aiter_flydsl,
+                    replayssm=False,
+                    lossy_decode=False,
+                    state=state,
+                    activation_dtype=layer.dt_bias.dtype,
+                )
+                if policy.decode and state.stride()[1:] == (
+                    k_dim * v_dim,
+                    v_dim,
+                    1,
+                ):
+                    caches[f"layer_{layer_num}"].v_cache = state.transpose(-1, -2)
         return caches
 
     @staticmethod
-    def _configure_gdn_prefill(
+    def _configure_gdn_backends(
         metadata: GDNAttentionMetadata | None,
         gdn_layers: dict[int, Any],
         kv_cache_data: dict[str, Any],
         attn_inputs: Any,
     ) -> None:
-        """Match standalone prefill without changing RTP's KV-layout decode pool."""
+        """Match standalone GDN backends when the state layout supports them."""
         if metadata is None or not gdn_layers:
             return
         enabled = False
@@ -268,13 +295,18 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
             policy = select_policy(
                 allowed=layer.allow_aiter_flydsl,
                 replayssm=bool(getattr(metadata, "replayssm", False)),
-                # RTP's decode state remains in physical KV layout. Do not
-                # enable the standalone VK-layout FlyDSL decode path here.
-                lossy_decode=True,
+                lossy_decode=False,
                 state=state,
                 activation_dtype=layer.dt_bias.dtype,
             )
-            layer.gdn_flydsl_policy = GDNFlyDSLPolicy(prefill=policy.prefill)
+            layer.gdn_flydsl_policy = GDNFlyDSLPolicy(
+                prefill=policy.prefill,
+                decode=(
+                    policy.decode
+                    and getattr(metadata, "num_spec_decodes", 0) == 0
+                    and state.stride()[1:] == (128 * 128, 1, 128)
+                ),
+            )
             enabled |= policy.prefill
         if not enabled or metadata.num_prefills == 0:
             return
@@ -485,7 +517,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         ):
             forward_context = get_forward_context()
             metadata = forward_context.attn_metadata
-            cls._configure_gdn_prefill(
+            cls._configure_gdn_backends(
                 metadata.gdn_metadata,
                 resolved_layer_maps[0],
                 forward_context.kv_cache_data,
