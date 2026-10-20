@@ -197,10 +197,13 @@ def _flydsl_explicit_plan_api() -> bool:
     An older aiter would raise on the first call; probing once lets the gate
     fall back to gluon instead.
     """
+    import importlib
     import inspect
 
     try:
-        from aiter.ops.flydsl import pa_decode as mod
+        # The package lazily exports a function with the same name as this
+        # submodule. Resolve the module explicitly, independent of import order.
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
     except ImportError:
         ok = False
     else:

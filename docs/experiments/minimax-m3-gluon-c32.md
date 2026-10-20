@@ -11,7 +11,7 @@ by Gluon instead of gathering a dense BF16 context. The adapter uses real block
 tables and scheduled request metadata without converting the KV pool. Short
 queries can split the context when the query grid cannot fill the GPU.
 
-The AITER source is pinned to `a2e22688ace23667aa717df389d53b7177d0e334` on
+The AITER source is pinned to `5f1da21fe6e89620babf1450847783b8d551ccef` on
 `ROCm/aiter:mengqing/m3-gluon-scaled-unified`. Relative to baseline
 `5eb866a95d66a38d64eecf151ac4ef3567a07ac5`, its changes are confined to unified
 attention, its Gluon configuration, and attention tests. It combines the
@@ -79,3 +79,17 @@ The normal split reduction is still implemented in Triton.
 This experiment does not imply a performance gain. The earlier validated
 Gluon operand loader was slower than gather for a large draft-prefill
 microbenchmark; the end-to-end C32 result is needed to assess the tradeoff.
+
+## CI repair after run 39280266360
+
+The first 14 GPU cases passed. The short-context case incorrectly shared a
+partial page and poisoned valid tokens in the other request. The fixture now
+shares only full prefix pages and checks that its reference is finite before
+launch. Four CPU regressions run in the hosted configuration job before GPU
+allocation; the 17-case GPU gate remains required. Kernel code is unchanged.
+
+The shared FlyDSL capability probe now explicitly imports the module instead
+of the package's lazy function export. Four fresh-process import tests cover
+both import orders and rejection of the old optional-plan API. The pinned
+source is also probed before model startup. Benchmark monitoring recognizes
+ModelRunner death even if the HTTP frontend still responds.

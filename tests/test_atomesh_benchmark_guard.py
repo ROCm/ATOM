@@ -116,6 +116,29 @@ class BenchmarkGuardTests(unittest.TestCase):
         self.append(self.server, " operation timeout: SeqNum=95\n")
         self.assertEqual(self.guard.check(now=2)["reason"], "fatal_worker_error")
 
+    def test_model_runner_death_is_fatal_even_with_healthy_http(self):
+        self.append(self.server, "GET /health HTTP/1.1 200 OK\n")
+        self.append(
+            self.server,
+            "[atom 17:58:26] AsyncIOProcManager(ModelRunner): [ModelRunner0/1] "
+            "proc died unexpectedly (exitcode=1), shutting down.\n",
+        )
+        failure = self.guard.check(now=1)
+        self.assertEqual(failure["reason"], "fatal_worker_error")
+        self.assertIn("exitcode=1", failure["line"])
+
+    def test_fatal_only_mode_allows_slow_requests_but_catches_worker_death(self):
+        self.guard.timeout = 0
+        self.append(self.client, "returned=0/796 | sent=72 | in_flight=72\n")
+        self.assertIsNone(self.guard.check(now=0))
+        self.assertIsNone(self.guard.check(now=100000))
+        self.append(
+            self.server,
+            "AsyncIOProcManager(ModelRunner): [ModelRunner0/1] "
+            "proc died unexpectedly (exitcode=1), shutting down.\n",
+        )
+        self.assertEqual(self.guard.check(now=100001)["reason"], "fatal_worker_error")
+
     def test_transient_lmcache_lookup_error_is_not_fatal(self):
         self.append(
             self.server, "LMCache ERROR Timeout occurred, recreating all sockets\n"
@@ -123,7 +146,10 @@ class BenchmarkGuardTests(unittest.TestCase):
         self.assertIsNone(self.guard.check(now=1))
 
     def test_fatal_worker_stops_live_command_and_returns_failure(self):
-        self.server.write_text("Watchdog caught collective operation timeout\n")
+        self.server.write_text(
+            "AsyncIOProcManager(ModelRunner): [ModelRunner0/1] "
+            "proc died unexpectedly (exitcode=1), shutting down.\n"
+        )
         output = self.root / "failure.json"
         result = subprocess.run(
             [

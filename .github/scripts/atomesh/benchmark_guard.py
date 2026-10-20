@@ -16,11 +16,11 @@ FATAL = re.compile(
     r"Watchdog caught collective operation timeout|"
     r"c10::DistBackendError|HIP error:|CUDA error:|"
     r"Engine core process .* (?:died|exited)|"
+    r"AsyncIOProcManager\(ModelRunner\): .* proc died unexpectedly|"
     r"Torch\.OutOfMemoryError|torch\.OutOfMemoryError"
 )
 PROGRESS = re.compile(
-    r"Scheduled prefill batch:|Engine Core: output send|"
-    r"\[OFFLOAD-SAVE-PROF\]"
+    r"Scheduled prefill batch:|Engine Core: output send|" r"\[OFFLOAD-SAVE-PROF\]"
 )
 COUNTERS = re.compile(r"returned=([\d,]+)/[\d,]+.*sent=([\d,]+).*in_flight=([\d,]+)")
 PHASE = re.compile(r"Phase \S+ \([^)]+\) (started|sending complete|complete)\b")
@@ -98,7 +98,8 @@ class Guard:
                     self.last_progress = now
                 self.returned, self.in_flight = returned, in_flight
         if (
-            self.phase_active
+            self.timeout > 0
+            and self.phase_active
             and self.in_flight
             and now - self.last_progress >= self.timeout
         ):
@@ -147,13 +148,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-log", action="append", type=Path, default=[])
     parser.add_argument("--client-log", type=Path, required=True)
-    parser.add_argument("--stall-timeout", type=float, default=900)
+    parser.add_argument(
+        "--stall-timeout",
+        type=float,
+        default=900,
+        help="Inference inactivity limit in seconds; 0 enables fatal-error checks only",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
-    if not command or args.stall_timeout <= 0:
-        parser.error("command and positive stall timeout are required")
+    if not command or args.stall_timeout < 0:
+        parser.error("command and nonnegative stall timeout are required")
     return run(
         command,
         Guard(args.server_log, args.client_log, args.stall_timeout),
