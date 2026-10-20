@@ -72,9 +72,11 @@ def warm_gemm_m_buckets(worker):
     # Other tuned tables key exact M at multiples of 8 up to 512 (ATOM's linear pass).
     sizes = sorted(set(gemm_m_buckets(max_m)) | set(range(8, min(512, max_m) + 1, 8)) | {max_m - 1})
     sweeps = []
-    for _ in range(2):
+    for sweep in range(2):
         times = []
         for m in sizes:
+            if worker.rank == 0:
+                print(f"[C48] P GEMM warmup sweep={sweep} M={m}", flush=True)
             start = time.perf_counter()
             worker.model_runner._dummy_run(m, skip_eplb=True)
             torch.cuda.synchronize()
