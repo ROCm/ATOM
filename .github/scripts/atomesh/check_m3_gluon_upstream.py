@@ -10,6 +10,22 @@ import urllib.request
 from pathlib import Path
 
 
+def canonical_ast(node):
+    """Use a stable form across Python versions, including 3.12+ type_params."""
+    if isinstance(node, ast.AST):
+        return {
+            "node": type(node).__name__,
+            **{
+                key: canonical_ast(value)
+                for key, value in ast.iter_fields(node)
+                if value is not None and value != []
+            },
+        }
+    if isinstance(node, list):
+        return [canonical_ast(value) for value in node]
+    return node
+
+
 def fingerprint(source, symbols):
     if not symbols:
         return hashlib.sha256(source).hexdigest()
@@ -21,7 +37,7 @@ def fingerprint(source, symbols):
     selected = {node.name: node for node in tree.body if hasattr(node, "name")}
     return {
         name: hashlib.sha256(
-            ast.dump(selected[name], include_attributes=False).encode()
+            json.dumps(canonical_ast(selected[name]), sort_keys=True).encode()
         ).hexdigest()
         for name in symbols
     }

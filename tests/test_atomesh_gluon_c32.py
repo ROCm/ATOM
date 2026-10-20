@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Enforce the user's one-variable experiment against the saved CI matrix."""
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / ".github/scripts/atomesh/check_m3_gluon_c32.py"
@@ -81,6 +83,17 @@ class SingleVariableTest(unittest.TestCase):
         )
         guard = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(guard)
+        # Python 3.12 adds empty type_params; 3.13 changes ast.dump defaults.
+        source_tree = ast.parse("def split(n):\n    return n // 64\n")
+        expected_ast = guard.canonical_ast(source_tree)
+        function = source_tree.body[0]
+        function._fields = (*function._fields, "future_empty_field")
+        function.future_empty_field = []
+        self.assertEqual(guard.canonical_ast(source_tree), expected_ast)
+        with patch.object(
+            guard.ast, "dump", side_effect=AssertionError("Version-specific dump")
+        ):
+            guard.fingerprint(b"def split(n):\n    return n // 64\n", ["split"])
         source = b"def split(n):\n    return n // 64\n"
         manifest = {
             "upstream_commit": "test",
