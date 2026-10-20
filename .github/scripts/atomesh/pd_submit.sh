@@ -395,8 +395,9 @@ fi
 install_slurm_cancel_traps
 
 IFS=',' read -r -a NODE_ARRAY <<< "${NODE_LIST}"
-if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
-  SUBMIT_SCRIPT="${LOG_ROOT}/submit-${ATOMESH_CELL_ID}.sbatch.sh"
+
+write_spur_submit_script() {
+  local nodes="$1"
   cat > "${SUBMIT_SCRIPT}" <<EOF
 #!/usr/bin/env bash
 #SBATCH --job-name=${SLURM_JOB_NAME}
@@ -406,8 +407,8 @@ if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
 #SBATCH --time=${SLURM_TIME_LIMIT}
 #SBATCH --chdir=/tmp
 EOF
-  if [[ -n "${NODE_LIST}" ]]; then
-    printf '#SBATCH -w %s\n' "${NODE_LIST}" >> "${SUBMIT_SCRIPT}"
+  if [[ -n "${nodes}" ]]; then
+    printf '#SBATCH -w %s\n' "${nodes}" >> "${SUBMIT_SCRIPT}"
   fi
   cat >> "${SUBMIT_SCRIPT}" <<EOF
 #SBATCH --output=${SLURM_OUTPUT}
@@ -418,6 +419,11 @@ EOF
     printf 'exec %q\n' "${JOB_SCRIPT}"
   } >> "${SUBMIT_SCRIPT}"
   chmod +x "${SUBMIT_SCRIPT}"
+}
+
+if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+  SUBMIT_SCRIPT="${LOG_ROOT}/submit-${ATOMESH_CELL_ID}.sbatch.sh"
+  write_spur_submit_script "${NODE_LIST}"
   SBATCH_CMD=(sbatch --controller "${SPUR_CONTROLLER_ADDR}" --export=ALL "${SUBMIT_SCRIPT}")
 else
   SBATCH_CMD=(
@@ -458,42 +464,84 @@ else
   )
 fi
 
-echo "=== submitting Slurm job ==="
-# Bind completion evidence to this submission, including job-ID reuse.
-export ATOMESH_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-printf ' %q' "${SBATCH_CMD[@]}"
-echo
-write_slurm_cancel_helper ""
+submit_and_monitor_slurm_job() {
+  echo "=== submitting Slurm job ==="
+  # Bind completion evidence to this submission, including job-ID reuse.
+  export ATOMESH_RUN_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  printf ' %q' "${SBATCH_CMD[@]}"
+  echo
+  write_slurm_cancel_helper ""
 
-set +e
-SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
-SBATCH_RC=$?
-set -e
-echo "${SBATCH_OUTPUT}"
+  set +e
+  SBATCH_OUTPUT="$("${SBATCH_CMD[@]}")"
+  SBATCH_RC=$?
+  set -e
+  echo "${SBATCH_OUTPUT}"
 
-if [[ "${SBATCH_RC}" -ne 0 ]]; then
-  echo "sbatch submit exit code: ${SBATCH_RC}"
-  exit "${SBATCH_RC}"
-fi
+  if [[ "${SBATCH_RC}" -ne 0 ]]; then
+    echo "sbatch submit exit code: ${SBATCH_RC}"
+    exit "${SBATCH_RC}"
+  fi
 
-JOB_ID="$(parse_sbatch_job_id "${SBATCH_OUTPUT}")"
-SLURM_JOB_ACTIVE=1
-echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
-write_slurm_cancel_helper "${JOB_ID}"
+  JOB_ID="$(parse_sbatch_job_id "${SBATCH_OUTPUT}")"
+  SLURM_JOB_ACTIVE=1
+  echo "${JOB_ID}" | tee "${RESULT_DIR}/${ATOMESH_CELL_ID}.slurm-job-id"
+  write_slurm_cancel_helper "${JOB_ID}"
 
-set_slurm_job_log_paths "${JOB_ID}"
-SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
-SLURM_STATUS_RANKS="${NUM_NODES}"
-monitor_slurm_job "${JOB_ID}"
+  set_slurm_job_log_paths "${JOB_ID}"
+  SLURM_STATUS_DIR="${LOG_ROOT}/slurm_job-${JOB_ID}"
+  SLURM_STATUS_RANKS="${NUM_NODES}"
+  monitor_slurm_job "${JOB_ID}"
 
-# Fall back to published results if accounting has no final state.
-read_slurm_exit_code "${JOB_ID}"
-read_slurm_status_files "${LOG_ROOT}/slurm_job-${JOB_ID}" "${NUM_NODES}"
-SLURM_JOB_ACTIVE=0
-SBATCH_RC="${SLURM_JOB_RC}"
-echo "slurm_state=${SLURM_STATE}"
-echo "slurm_exit_code=${SLURM_EXIT_CODE}"
-echo "slurm job exit code: ${SBATCH_RC}"
+  # Fall back to published results if accounting has no final state.
+  read_slurm_exit_code "${JOB_ID}"
+  read_slurm_status_files "${LOG_ROOT}/slurm_job-${JOB_ID}" "${NUM_NODES}"
+  SLURM_JOB_ACTIVE=0
+  SBATCH_RC="${SLURM_JOB_RC}"
+  echo "slurm_state=${SLURM_STATE}"
+  echo "slurm_exit_code=${SLURM_EXIT_CODE}"
+  echo "slurm job exit code: ${SBATCH_RC}"
+}
+
+# Spur ignores --exclusive and may place the job on a node whose GPUs another
+# job holds. The batch script then records the busy hosts in gpu-busy/ before
+# starting any worker; resubmit without them, or wait for the pool to drain
+# when too few candidates remain.
+GPU_BUSY_RETRIES="${ATOMESH_GPU_BUSY_RETRIES:-6}"
+GPU_BUSY_WAIT_SECONDS="${ATOMESH_GPU_BUSY_WAIT_SECONDS:-300}"
+gpu_busy_attempt=0
+declare -A gpu_busy_nodes=()
+while true; do
+  submit_and_monitor_slurm_job
+  [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" && -n "${NODE_LIST}" ]] || break
+  busy_dir="${LOG_ROOT}/slurm_job-${JOB_ID}/gpu-busy"
+  shopt -s nullglob
+  busy_markers=("${busy_dir}"/*)
+  shopt -u nullglob
+  [[ "${#busy_markers[@]}" -gt 0 ]] || break
+  if (( gpu_busy_attempt >= GPU_BUSY_RETRIES )); then
+    echo "ERROR: GPUs still busy after ${GPU_BUSY_RETRIES} resubmissions; giving up" >&2
+    break
+  fi
+  gpu_busy_attempt=$((gpu_busy_attempt + 1))
+  for marker in "${busy_markers[@]}"; do
+    gpu_busy_nodes["$(basename "${marker}")"]=1
+  done
+  free_nodes=()
+  for node in "${NODE_ARRAY[@]}"; do
+    [[ -n "${gpu_busy_nodes[${node}]:-}" ]] || free_nodes+=("${node}")
+  done
+  if [[ "${#free_nodes[@]}" -ge "${NUM_NODES}" ]]; then
+    retry_nodes="$(IFS=,; echo "${free_nodes[*]}")"
+    echo "=== GPUs busy on ${!gpu_busy_nodes[*]}; resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) on ${retry_nodes} ==="
+  else
+    retry_nodes="${NODE_LIST}"
+    gpu_busy_nodes=()
+    echo "=== fewer than ${NUM_NODES} idle candidates; waiting ${GPU_BUSY_WAIT_SECONDS}s before resubmitting (${gpu_busy_attempt}/${GPU_BUSY_RETRIES}) on ${retry_nodes} ==="
+    sleep "${GPU_BUSY_WAIT_SECONDS}"
+  fi
+  write_spur_submit_script "${retry_nodes}"
+done
 
 # Preserve the raw scheduler result and reconcile only a fully completed Spur
 # workload. monitor_slurm_job above must still wait for scheduler termination.
@@ -514,7 +562,17 @@ if [[ -d "${LOG_ROOT}" ]]; then
   # LOG_ROOT as their own artifact, so they stay out of the results copy that
   # every summarize job downloads.
   if [[ "${SLURM_SUBMIT_RUNNER}" == "atomesh-cicd-mi350" ]]; then
+    # Results land on the runner's root disk; a flooding rank log once filled
+    # it. Oversized logs stay on the shared volume and are only referenced.
+    oversized_excludes=()
+    while IFS= read -r -d '' oversized; do
+      echo "WARNING: not copying oversized log ${LOG_ROOT}/${oversized#./}" >&2
+      echo "${LOG_ROOT}/${oversized#./}" >> "${RESULT_DIR}/${ATOMESH_CELL_ID}/oversized-logs.txt"
+      oversized_excludes+=("--exclude=${oversized}")
+    done < <(cd "${LOG_ROOT}" && find . -type f -name '*.log' \
+      -size +"${ATOMESH_RESULT_LOG_MAX_MB:-1024}"M -print0 2>/dev/null)
     tar \
+      "${oversized_excludes[@]}" \
       --exclude='.cache' \
       --exclude='./.cache' \
       --exclude='.aiter' \
