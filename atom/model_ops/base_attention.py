@@ -258,7 +258,9 @@ def _flydsl_explicit_plan_api() -> bool:
     import inspect
 
     try:
-        from aiter.ops.flydsl import pa_decode as mod
+        # By module path: aiter.ops.flydsl lazily exports a `pa_decode`
+        # function, which `from aiter.ops.flydsl import pa_decode` can return.
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
     except ImportError:
         ok = False
     else:

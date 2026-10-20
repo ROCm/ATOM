@@ -1178,6 +1178,20 @@ class TestExplicitPlan:
             ba._flydsl_explicit_plan_api.cache_clear()
         assert ba._flydsl_explicit_plan_api() is True
 
+    def test_api_probe_reads_the_submodule_not_the_package_export(self, monkeypatch):
+        """aiter.ops.flydsl lazily exports a `pa_decode` function of the same name."""
+        from atom.model_ops import base_attention as ba
+
+        pkg = importlib.import_module("aiter.ops.flydsl")
+        mod = importlib.import_module("aiter.ops.flydsl.pa_decode")
+        try:
+            monkeypatch.setattr(pkg, "pa_decode", mod.pa_decode, raising=False)
+            ba._flydsl_explicit_plan_api.cache_clear()
+            assert ba._flydsl_explicit_plan_api() is True
+        finally:
+            monkeypatch.undo()
+            ba._flydsl_explicit_plan_api.cache_clear()
+
     def test_dense_site_leaves_the_bound_to_the_block_table(self):
         """max_seqlen_k differs between graph and eager and picks the kernel."""
         for kw in self._call_kwargs("model_ops/attention_mha.py", "run_pa_decode"):
