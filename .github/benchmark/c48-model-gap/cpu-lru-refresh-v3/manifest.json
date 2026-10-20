@@ -1,0 +1,19 @@
+{
+  "name": "simple_cpu_offload_refresh_gpu_hit_prefix_with_mamba_states",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "Eager mode: once per request, move CPU copies of every GPU-hit full-attention prefix block to the MRU end of the CPU LRU",
+    "Also refresh the CPU Mamba states cached inside that prefix (fine-grained hash boundaries), so siblings forking from the prefix can still resume"
+  ],
+  "cases": [
+    "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM"
+  ],
+  "files": [
+    {
+      "relative_path": "v1/simple_kv_offload/manager.py",
+      "mount_source": "manager.py",
+      "base_sha256": "3d076547bc16729e1c91238315c384fcfddf9cfd1f1e418d430ae542b7b8e1e5",
+      "patched_sha256": "18da014b1eed073f6b227b92fc0163baa1e7a6a5fbcbcb31364a4696fa1cbd3f"
+    }
+  ]
+}
