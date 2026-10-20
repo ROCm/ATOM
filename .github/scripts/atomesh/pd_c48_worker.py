@@ -49,7 +49,50 @@ def inspect_speculative(spec, expected_drafts, expected_al):
             "rejection_sample_method": spec.rejection_sample_method}
 
 
+def gemm_m_buckets(max_m):
+    """ATOM model_runner.gemm_m_buckets: one M per aiter getPaddedM bucket up to max_m."""
+    buckets = [m for m in (1, 2, 4, 8) if m <= max_m]
+    for step, upper in ((16, 256), (32, 1024), (64, 4096), (128, max_m)):
+        start = (buckets[-1] // step + 1) * step if buckets else step
+        buckets.extend(range(start, min(upper, max_m) + 1, step))
+    if max_m > 0 and buckets[-1] != max_m:
+        buckets.append(max_m)
+    return buckets
+
+
+def warm_gemm_m_buckets(worker):
+    """Run dummy forwards at every tuned-GEMM M bucket so first-use FlyDSL builds happen before serving.
+
+    The second sweep times the same sizes with every kernel already built; the
+    difference between the sweeps is the first-use cost a serving prefill would pay.
+    """
+    import time
+    import torch
+    max_m = worker.scheduler_config.max_num_batched_tokens
+    # Other tuned tables key exact M at multiples of 8 up to 512 (ATOM's linear pass).
+    sizes = sorted(set(gemm_m_buckets(max_m)) | set(range(8, min(512, max_m) + 1, 8)) | {max_m - 1})
+    sweeps = []
+    for _ in range(2):
+        times = []
+        for m in sizes:
+            start = time.perf_counter()
+            worker.model_runner._dummy_run(m, skip_eplb=True)
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - start, m))
+        sweeps.append(times)
+    slowest = sorted(((a - b, m) for (a, m), (b, _) in zip(*sweeps)), reverse=True)[:8]
+    print(f"[C48] P GEMM M-bucket warmup rank={worker.rank} sizes={len(sizes)} "
+          f"first={sum(t for t, _ in sweeps[0]):.1f}s second={sum(t for t, _ in sweeps[1]):.1f}s "
+          "first-minus-second " + " ".join(f"M={m}:{d:.2f}s" for d, m in slowest), flush=True)
+
+
 class ManifestWorker(Worker):
+    def compile_or_warm_up_model(self):
+        result = super().compile_or_warm_up_model()
+        if os.environ.get("C48_P_GEMM_WARMUP") == "1":
+            warm_gemm_m_buckets(self)
+        return result
+
     def initialize_from_config(self, kv_cache_config):
         from pd_c48_timeline import startup_stage
         with startup_stage(self, "initialize_from_config"):
