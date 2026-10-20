@@ -1,0 +1,18 @@
+{
+  "name": "mla_prefill_flydsl_fp8_attention_fused_q",
+  "vllm_base_sha": "81198e97ba7eee2a22540caaa756b7fdddcb4d93",
+  "changes": [
+    "mla-prefill-fp8 (FQ2) with Q quantized in the same two-pass Triton launch as K/V, as ATOM's triton_fused_qkv_quant does; ports vllm-project/vllm#62447 commit 0eaa407cf5. FQ2 quantized Q with scaled_fp8_quant on <=256 rows, 37-50% of the FP8 new-token attention call at 4k-16k tokens"
+  ],
+  "cases": [
+    "V-QD-CPUREF2-FP8ATTN-FQ3"
+  ],
+  "files": [
+    {
+      "relative_path": "v1/attention/backends/mla/prefill/aiter_flash_attn.py",
+      "mount_source": "aiter_flash_attn.py",
+      "base_sha256": "4d0e68067d369f6ffd0902d6c046ecdf8bb698a7c31b3a01783f9f84c2d0c44f",
+      "patched_sha256": "d0b8caee05f50a132c7f6915fe0dd3d594f7eef8c5e8f95af6fe39ea24e230c3"
+    }
+  ]
+}
