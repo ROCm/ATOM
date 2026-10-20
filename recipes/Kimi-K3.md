@@ -102,18 +102,22 @@ The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
 it before concluding anything about a run.
 
-**A step is served only if it is at most 8 rows** (batch x query length).
-bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the same
-width is 16, which every step declines back to the production path -- the
-server still answers, just without mono.
+**A step is served only if it is at most 8 rows** (batch x query length), by
+default. bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the
+same width is 16, which every step declines back to the production path -- the
+server still answers, just without mono. The log names a declined row count once
+per distinct count (`Kimi-K3 mono decode declined a step: 16 rows > the 8-row
+buffers`), so the number of such lines is the number of distinct widths turned
+away, not the number of steps.
 
-The cap is a constant (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), not a
-switch. 16 rows is correct -- the kernels stride over their columns rather
-than assuming one pass covers them -- and measurably faster (-13.4 % target
-forward against stock). It stays at 8 because no task-level accuracy run
-exists at any width and K2's latent MoE carries a real, unsettled precision
-cost, so raising it is a decision to make on accuracy evidence rather than on
-speed.
+The cap is `ATOM_MONO_K3_MAX_ROWS` (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`),
+8 or 16, read once at import. 16 rows is correct -- the kernels stride over
+their columns rather than assuming one pass covers them -- and measurably faster
+(-13.4 % target forward against stock); with it the bs=2 CUDA graph runs mono
+too. It stays 8 by default because no task-level accuracy run exists at any
+width and K2's latent MoE carries a real, unsettled precision cost, so raising
+it is a decision to make on accuracy evidence rather than on speed. Anything
+other than 8 or 16 turns mono off with the reason in the log.
 
 For a performance A/B, keep the launch command and the workload identical and
 change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin

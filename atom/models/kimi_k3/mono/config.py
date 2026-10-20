@@ -169,8 +169,11 @@ SUPPORTED_TP = (8,)
 # (rel_L2 1.7e-1 .. 3.0e-1: the expert intermediate is bf16 in the reference and
 # MXFP4 here). Raising the cap also arms mono for every CUDA-graph capture size
 # inside it, so it is a decision to make on accuracy evidence, not on speed.
+# ``ATOM_MONO_K3_MAX_ROWS`` makes that decision per deployment.
 #
-MAX_ROWS = 8
+# the caps whose kernels are built and measured; any other value is refused
+ROW_CAPS = (8, 16)
+MAX_ROWS = envs.ATOM_MONO_K3_MAX_ROWS
 # tokens a request contributes at most (the conv rollback window the kernel
 # tiles for)
 MAX_QLEN = 16
@@ -315,6 +318,10 @@ def config_refusal(atom_config) -> str | None:
         # already states it (`deepseek_v41/mono/config.py`); another method
         # would be admitted here on a path never built or measured for it
         (spec is None or spec.method == "dspark", "not DSpark"),
+        (
+            MAX_ROWS in ROW_CAPS,
+            f"ATOM_MONO_K3_MAX_ROWS={MAX_ROWS} is not one of {ROW_CAPS}",
+        ),
         (
             spec is None or 0 < spec.num_speculative_tokens + 1 <= MAX_ROWS,
             f"speculative width past the {MAX_ROWS}-row buffers",
