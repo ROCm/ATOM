@@ -33,7 +33,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation import (
+    KVConnectorOutput,
+    kv_config_has_producer,
+    pd_timing,
+)
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.dynamic_chunking import (
@@ -2539,6 +2543,10 @@ class Scheduler:
                 f"(done: {num_cached_tokens_list}, new: {num_scheduled_tokens}), "
                 f"req_ids: {tuple(scheduled_seqs.keys())}"
             )
+            if envs.ATOM_PD_TIMING_SAMPLE:
+                now = time.time()
+                for seq in scheduled_seqs.values():
+                    seq._pd_sched_t = now
             self.prev_prompt = True
             # lip: TODO for prefill/decode mixed batch
 
@@ -2689,6 +2697,9 @@ class Scheduler:
                         seq.last_block_num_tokens,
                         seq.num_tokens,
                     )
+                    tid = (seq.kv_transfer_params or {}).get("transfer_id")
+                    if pd_timing.sampled(tid):
+                        pd_timing.log("D_fsched", tid, rid=seq.id)
                 scheduled_seqs[seq.id] = seq
                 seq.type = SequenceType.DECODE
                 num_scheduled_tokens.append(num_new_tokens)
@@ -4315,6 +4326,11 @@ class Scheduler:
             seq.num_finalized_tokens = num_tokens
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
                 seq.first_token_time = time.time()
+                tid = (seq.kv_transfer_params or {}).get("transfer_id")
+                if pd_timing.sampled(tid):
+                    pd_timing.log(
+                        "D_first", tid, rid=seq.id, arr=f"{seq.arrive_time:.3f}"
+                    )
 
             # Counted here, not from `len(token_ids)` above: `new_tokens` is
             # what reaches RequestOutput, and it differs from the forward's
@@ -4592,6 +4608,9 @@ class Scheduler:
             return False
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
+        tid = (seq.kv_transfer_params or {}).get("transfer_id")
+        if pd_timing.sampled(tid):
+            pd_timing.log("D_ready", tid, rid=seq.id)
 
         # Hash received prompt blocks into prefix cache so the next turn
         # transfers only the delta. Decode never runs prefill forward, so

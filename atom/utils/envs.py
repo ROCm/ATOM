@@ -150,6 +150,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
+    # P/D latency probes: log `[PD-TIMING]` lines for every N-th request (by
+    # the producer's request id) on both engines. 0 = off.
+    "ATOM_PD_TIMING_SAMPLE": lambda: _nonnegative_int_env("ATOM_PD_TIMING_SAMPLE", 0),
     # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
     # does not serve): pages per producer slot that repacks MLA KV for a DCP
     # consumer below a page of interleave; 0 writes each token run in place.

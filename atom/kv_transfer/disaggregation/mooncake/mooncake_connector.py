@@ -32,6 +32,7 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 
 from atom.config import Config
 from atom.distributed.dcp_utils import get_dcp_group
+from atom.kv_transfer.disaggregation import pd_timing
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
     KVConnectorSchedulerBase,
@@ -568,6 +569,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
                     num_computed_blocks = seq.num_cached_tokens // self.hash_block_size
             params["num_computed_blocks"] = num_computed_blocks
             params["src_block_skip_factor"] = src_block_skip_factor
+            if pd_timing.sampled(params.get("transfer_id")):
+                pd_timing.log(
+                    "D_alloc",
+                    params.get("transfer_id"),
+                    rid=seq.id,
+                    blocks=len(seq.block_table),
+                    cached=num_computed_blocks,
+                )
             logger.debug(
                 "[SCHEDULER-CONSUMER] Queued req %s for remote KV recv "
                 "(%d blocks, %d locally cached, dst_slot=%d, src_slot=%d), "
@@ -607,6 +616,14 @@ class MooncakeConnectorScheduler(KVConnectorSchedulerBase):
             "do_remote_decode"
         ):
             self._awaiting_send.add(str(seq.id))
+            if pd_timing.sampled(seq.id):
+                pd_timing.log(
+                    "P_done",
+                    seq.id,
+                    arr=f"{seq.arrive_time:.3f}",
+                    sched=f"{getattr(seq, '_pd_sched_t', 0.0):.3f}",
+                    toks=seq.num_prompt_tokens,
+                )
 
         first_token_id = seq.output_tokens[0] if seq.output_tokens else None
         drafts = getattr(seq, "spec_token_ids", None)
@@ -975,6 +992,8 @@ class MooncakeConnector(KVConnectorBase):
 
         # --- Transfer ID mapping (worker side) ---
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
+        # Consumer: receives sampled by ATOM_PD_TIMING_SAMPLE -> transfer_id.
+        self._pd_timing_tids: dict[ReqId, TransferId] = {}
 
         # --- Producer: thread pool for RDMA writes ---
         self._cuda_device = torch.cuda.current_device()
@@ -1719,6 +1738,8 @@ class MooncakeConnector(KVConnectorBase):
                             {**request_body, "mla_landing": advertised}
                         )
 
+            if pd_timing.sampled(meta.transfer_id):
+                self._pd_timing_tids[req_id] = meta.transfer_id
             # Registered before the first send: a producer failure can be
             # notified while this loop is still running, and the handler needs
             # the slot and block records to already be there or it cannot
@@ -1765,6 +1786,14 @@ class MooncakeConnector(KVConnectorBase):
                     remote_addr,
                     off,
                     dst_block_ids[:10],
+                )
+            if pd_timing.sampled(meta.transfer_id) and self.tp_rank == 0:
+                pd_timing.log(
+                    "D_wreq",
+                    meta.transfer_id,
+                    rid=req_id,
+                    blocks=len(dst_block_ids),
+                    landing=int(bool(stage_requests)),
                 )
 
     # -----------------------------------------------------------------
@@ -1886,6 +1915,14 @@ class MooncakeConnector(KVConnectorBase):
                         request_data["_deadline"] = (
                             time.monotonic() + PD_TRANSFER_DEADLINE_S
                         )
+                        if request_data.get(
+                            "consumer_tp_rank", 0
+                        ) == 0 and pd_timing.sampled(request_data.get("transfer_id")):
+                            pd_timing.log(
+                                "P_wreq",
+                                request_data.get("transfer_id"),
+                                stage=self.pp_rank,
+                            )
                         if request_data.get("write_ack"):
                             self._ack_write_request(request_data)
                         logger.debug(
@@ -2010,6 +2047,16 @@ class MooncakeConnector(KVConnectorBase):
             consumers_per_rank = max(1, consumer_tp_size // self.tp_size)
             consumer_dcp_size = max(1, request_data.get("consumer_dcp_size", 1))
             has_slot_data = request_data.get("has_slot_regions", False)
+            timed = request_data.get("consumer_tp_rank", 0) == 0 and pd_timing.sampled(
+                transfer_id
+            )
+            if timed:
+                pd_timing.log(
+                    "P_wstart",
+                    transfer_id,
+                    stage=self.pp_rank,
+                    blocks=len(dst_block_ids),
+                )
 
             logger.debug(
                 "[PRODUCER] _execute_transfer: req_id=%s, transfer_id=%s, "
@@ -2183,6 +2230,8 @@ class MooncakeConnector(KVConnectorBase):
                 self._notify_transfer_result(request_data, success=False)
                 return
 
+            if timed:
+                pd_timing.log("P_wsent", transfer_id, stage=self.pp_rank)
             # Notify consumer — all data (blocks + slot state) is written.
             self._notify_transfer_result(request_data, success=True)
 
@@ -3630,6 +3679,10 @@ class MooncakeConnector(KVConnectorBase):
         way, ranks that acknowledged and then stay silent past their write
         window fail it (``_expire_pending_recvs``).
         """
+        if pd_timing.enabled() and self.tp_rank == 0:
+            tid = self._pd_timing_tids.get(req_id)
+            if tid is not None:
+                pd_timing.log("D_wdone", tid, stage=pp_rank, ok=int(success))
         landing = self._mla_landing
         if landing is not None and landing.stage_done(
             req_id, pp_rank, write_nonce, success, landed_slots
@@ -3795,6 +3848,10 @@ class MooncakeConnector(KVConnectorBase):
         failure (it aborts the request). The staging row and stage-0's page
         table stay held as long.
         """
+        if pd_timing.enabled():
+            tid = self._pd_timing_tids.pop(req_id, None)
+            if tid is not None:
+                pd_timing.log("D_recv", tid, rank=self.tp_rank, failed=int(failed))
         if failed:
             hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
             if hold_s > 0:
