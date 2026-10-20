@@ -258,6 +258,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
 | **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
+| **ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS** | int | 128 | Qwen3-Next / Qwen3.5 routing (softmax top-k plus a sigmoid-gated fused shared expert): batches of at most this many tokens use ATOM's Triton router (`atom/model_ops/triton_topk_softmax.py`) instead of AITER `topk_softmax`; outputs are the same. `0` always uses AITER. |
 
 ### Llama-style
 

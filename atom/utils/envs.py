@@ -937,6 +937,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    # Softmax top-k + sigmoid fused-shared routing (Qwen3-Next / Qwen3.5) runs
+    # the Triton router up to this many tokens, AITER topk_softmax above it;
+    # 0 always uses AITER.
+    "ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX_MAX_TOKENS", "128")
+    ),
     # Fuse into a per-rank replica without EPLB. EPLB always fuses it as routed.
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
