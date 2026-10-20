@@ -954,18 +954,8 @@ purge_lmcache_disk() {
 #    starts on its own memory, joining the prefill node's masters
 #    (pd_worker_layout multi_node, one prefill node and one decode node). The
 #    prefill workers start once every pool counts the owners of both nodes.
-#  - MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS (colon-separated, default the model):
-#    the owners pin huge pages under MPOL_BIND, so the clean page cache of
-#    these goes first; each node must then fit its pins with 128 GiB to spare,
-#    and is compacted for them (numa_memory_budget.py --compact).
-#  - MOONCAKE_STORE_COMPACT_TIMEOUT (default 600 s) stops each NUMA node's
-#    compaction; a node that does not compact in time can leave an owner 4 KiB
-#    pages its NICs refuse to register.
-#  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds each wait for the
-#    Store once this node has compacted: for every pool to count its owners,
-#    and on a decode node for the prefill node's masters. A wait on the other
-#    node's part also allows for that node's compaction, which its Store waits
-#    for: 2 x MOONCAKE_STORE_COMPACT_TIMEOUT, one per NUMA node.
+#  - MOONCAKE_STORE_WAIT_TIMEOUT (default 1200 s) bounds waits for owner
+#    capacity and, on decode nodes, the prefill node's masters.
 # Every Mooncake process runs with MC_NUM_QP_PER_EP=1, the decode workers' P->D
 # transfer engine included (peers with different QP counts cannot connect).
 # The launcher owns the workers' ATOM_KV_OFFLOAD and
@@ -986,7 +976,6 @@ mooncake_store_names=()
 # Exit status of the first Store failure: a process that died before it was
 # stopped, or owner capacity the master lost during the run.
 mooncake_store_failed_rc=""
-mooncake_page_cache_dropper_pid=""
 mooncake_owner_plan_numa=()
 mooncake_owner_plan_gib=()
 mooncake_owner_plan_devices=()
@@ -1221,9 +1210,8 @@ kv_transfer_offload_connector() {
 
 # require_mooncake_store_number <name> <default> <kind>: refuses a numeric
 # Store setting that is not one of its kind, before anything starts. The
-# helpers and bash arithmetic would misread it later: a compaction timeout of 0
-# skips the compaction, and a wait timeout bash cannot add aborts the wait
-# without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
+# helpers and bash arithmetic would misread it later: an invalid wait timeout
+# aborts the wait without stopping what it waited for. Kinds: positive_integer, integer (>= 0)
 # and positive (a decimal).
 require_mooncake_store_number() {
   local name="$1" value valid=0
@@ -1292,7 +1280,6 @@ check_mooncake_store_settings() {
     echo "[mooncake-store][FAIL] MOONCAKE_STORE=1 runs one Store per node for one prefill worker, whose GPUs its owners' NICs are placed around; pd_worker_layout ${layout} starts ${workers_on_a_node} prefill workers on one node" >&2
     exit 2
   fi
-  require_mooncake_store_number MOONCAKE_STORE_COMPACT_TIMEOUT 600 positive
   require_mooncake_store_number MOONCAKE_STORE_WAIT_TIMEOUT 1200 positive_integer
   require_mooncake_store_number MOONCAKE_STORE_MASTER_NUMA 1 integer
   plan_mooncake_store_owners
@@ -1381,34 +1368,6 @@ check_mooncake_owner_devices() {
   done
 }
 
-# Reclaim file cache with base pages before compacting THP. Huge-page faults
-# directly against a cache-saturated node can stall for minutes, then leave
-# base pages that the NIC refuses to register. The bounded preparation helper
-# requires full THP coverage and free capacity before any Store process starts.
-prepare_mooncake_store_memory() {
-  local -a drop_dirs=() pins=()
-  IFS=':' read -r -a drop_dirs <<< "$(mooncake_setting MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS "${MODEL_PATH}")"
-  local i nodes timeout
-  for i in "${!mooncake_owner_plan_numa[@]}"; do
-    pins+=(--pin "${mooncake_owner_plan_numa[i]}:${mooncake_owner_plan_gib[i]}")
-  done
-  # Decode-only nodes may have no local owners.
-  ((${#pins[@]})) || return 0
-  nodes="$(printf '%s\n' "${mooncake_owner_plan_numa[@]}" | sort -u | wc -l)"
-  # Retain the old total preparation allowance, shared by bounded retries.
-  timeout="$(awk -v nodes="${nodes}" \
-    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
-    'BEGIN { print nodes * compact }')"
-  if ! python3 "${ATOMESH_SCRIPT_DIR}/prepare_lmcache_host_memory.py" \
-    --skip-direct --reserve-gib 128 --attempts 3 --step-timeout 90 \
-    --timeout "${timeout}" \
-    --output "${RUNTIME_LOG_DIR}/mooncake-memory-rank-${NODE_RANK}" \
-    "${pins[@]}" "${drop_dirs[@]}"; then
-    echo "[mooncake-store][FAIL] memory preparation did not complete; see ${RUNTIME_LOG_DIR}/mooncake-memory-rank-${NODE_RANK}/summary.json" >&2
-    exit 2
-  fi
-}
-
 mooncake_store_running() {
   local pid
   for pid in ${mooncake_store_pids[@]+"${mooncake_store_pids[@]}"}; do
@@ -1488,10 +1447,6 @@ check_mooncake_store_capacity() {
 # Returns non-zero when a Store process died before it was stopped, or a
 # master lost owner capacity during the run.
 stop_mooncake_store() {
-  if mooncake_page_cache_dropper_running; then
-    terminate_process_group "${mooncake_page_cache_dropper_pid}"
-  fi
-  mooncake_page_cache_dropper_pid=""
   mooncake_store_running || return 0
   save_mooncake_store_metrics
   reap_dead_mooncake_store || true
@@ -1592,41 +1547,6 @@ mooncake_owner_pool() {
   exit 2
 }
 
-# Drops the model's page cache every 45 s for 30 min while the workers load
-# weights, which would refill it; page cache is per file, so this serves every
-# node.
-start_mooncake_page_cache_dropper() {
-  setsid python3 "${ATOMESH_SCRIPT_DIR}/drop_page_cache.py" \
-    --every 45 --for 1800 "${MODEL_PATH}" &
-  mooncake_page_cache_dropper_pid=$!
-  # Until the child execs, its cmdline is this shell's, and a cleanup in that
-  # window would take the dropper for another process and leave it running:
-  # wait for the exec, two seconds at most.
-  local i
-  for ((i = 0; i < 100; i++)); do
-    mooncake_page_cache_dropper_running && return 0
-    kill -0 "${mooncake_page_cache_dropper_pid}" 2>/dev/null || return 0
-    sleep 0.02
-  done
-}
-
-# Whether the page-cache dropper this shell started still runs. It exits on its
-# own after --for, and the kernel may have given its pid to another process
-# since, which no signal of the cleanup may reach: the pid must still run the
-# dropper.
-mooncake_page_cache_dropper_running() {
-  local pid="${mooncake_page_cache_dropper_pid}" cmdline i
-  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
-  # A process's command line reads empty while it execs, and the dropper execs
-  # more than once as it starts (setsid, then python3): read it again.
-  for ((i = 0; i < 50; i++)); do
-    cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)" || return 1
-    [[ -n "${cmdline}" ]] && break
-    sleep 0.01
-  done
-  [[ "${cmdline}" == *"/drop_page_cache.py --every "* ]]
-}
-
 # start_mooncake_store_owners <master addr>: starts this node's owners
 # (mooncake_owner_plan_*), each joining its pool's master on <master addr>.
 start_mooncake_store_owners() {
@@ -1673,22 +1593,6 @@ report_mooncake_store_owners() {
   done
 }
 
-# mooncake_store_cross_node_timeout <owner setting>: the wait for the other
-# node's part of the Store, whose owners <owner setting> lists:
-# MOONCAKE_STORE_WAIT_TIMEOUT plus that node's bounded memory preparation,
-# whose total deadline is the number of owner NUMA nodes times
-# MOONCAKE_STORE_COMPACT_TIMEOUT.
-mooncake_store_cross_node_timeout() {
-  local -a numa=() gib=() devices=()
-  parse_mooncake_owner_spec "$1" numa gib devices
-  local nodes
-  nodes="$(printf '%s\n' "${numa[@]}" | sort -u | wc -l)"
-  awk -v wait="$(mooncake_store_wait_timeout)" \
-    -v compact="$(mooncake_setting MOONCAKE_STORE_COMPACT_TIMEOUT 600)" \
-    -v nodes="${nodes}" \
-    'BEGIN { s = wait + nodes * compact; printf "%d", (s > int(s)) ? int(s) + 1 : s }'
-}
-
 # The connector's mooncake_store.pools for per_nic pools: each pool's NIC and
 # its master.
 mooncake_pools_json() {
@@ -1723,8 +1627,6 @@ start_mooncake_store() {
   mooncake_store_requested || return 0
   check_mooncake_store_settings
   check_mooncake_owner_devices
-  prepare_mooncake_store_memory
-  start_mooncake_page_cache_dropper
   mooncake_store_pids=()
   mooncake_store_logs=()
   mooncake_store_names=()
@@ -1761,13 +1663,7 @@ start_mooncake_store() {
     capacity=$(( capacity + mooncake_pool_capacity[pool] ))
   done
   echo "[wait] mooncake-store pools=${#mooncake_pool_devices[@]} owners here=${#mooncake_owner_plan_numa[@]} capacity=${capacity} bytes"
-  local owners_timeout
-  owners_timeout="$(mooncake_store_wait_timeout)"
-  if [[ -n "$(mooncake_setting MOONCAKE_STORE_DECODE_OWNERS)" ]]; then
-    # The decode node mounts its owners only once it has compacted its memory.
-    owners_timeout="$(mooncake_store_cross_node_timeout MOONCAKE_STORE_DECODE_OWNERS)"
-  fi
-  wait_for_mooncake_store "owners" "${owners_timeout}" \
+  wait_for_mooncake_store "owners" "$(mooncake_store_wait_timeout)" \
     mooncake_store_capacity_reaches "${host_ip}"
   mooncake_store_ready=1
   report_mooncake_store_owners
@@ -1794,17 +1690,13 @@ start_mooncake_store_decode_owners() {
   plan_mooncake_store_pools
   plan_mooncake_store_owners MOONCAKE_STORE_DECODE_OWNERS
   check_mooncake_owner_devices
-  prepare_mooncake_store_memory
-  start_mooncake_page_cache_dropper
   mooncake_store_pids=()
   mooncake_store_logs=()
   mooncake_store_names=()
   mooncake_store_master_count=0
   local timeout
   timeout="$(mooncake_store_wait_timeout)"
-  # The prefill node starts its masters only once it has compacted its memory.
-  wait_for_mooncake_store "prefill-node masters" \
-    "$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)" \
+  wait_for_mooncake_store "prefill-node masters" "${timeout}" \
     mooncake_masters_ready "${NODE0_ADDR}"
   start_mooncake_store_owners "${NODE0_ADDR}"
   echo "[wait] mooncake-store decode owners=${#mooncake_owner_plan_numa[@]} joining ${NODE0_ADDR}"

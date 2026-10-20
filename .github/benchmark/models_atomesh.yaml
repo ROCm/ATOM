@@ -774,10 +774,6 @@ models:
               # ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS, at most 832 GiB per
               # owner (an ionic NIC's registration limit).
               MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
-              # The clean page cache of every model on the node goes before the
-              # owners pin huge pages, not just this one's: compaction would
-              # reclaim it otherwise.
-              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
               # P/D only; the launcher adds mooncake_store through ATOM_KV_OFFLOAD.
               PREFILL_KV_TRANSFER_CONFIG: >-
                 {"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}
@@ -1455,7 +1451,6 @@ models:
               # Match InferenceX #4045: one shared 1536 GiB pool. TW owners
               # use rdma4-7, the existing tested fabric mapping for this CI.
               MOONCAKE_STORE_OWNERS: "0:768:rdma4,rdma5;1:768:rdma6,rdma7"
-              MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS: "${ATOMESH_MODEL_ROOT}"
               ATOMESH_M3_STORE_FUNCTIONAL_CHECK: '1'
               ATOMESH_PAGED_PREFILL_NUMERICAL_CHECK: '1'
               PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}'

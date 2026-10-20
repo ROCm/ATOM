@@ -139,14 +139,9 @@ as warnings and started the owners. Owner 1 failed RDMA registration with
 `Cannot allocate memory`, then aborted with exit 134. The logs do not contain
 a successful owner THP measurement or any GSM8K / performance result.
 
-The Store now uses the existing bounded memory-preparation helper with
-explicit owner NUMA budgets. It reclaims file cache using base pages before
-THP compaction, requires full THP coverage and sufficient free capacity, and
-stops startup if preparation fails. It retains 128 GiB per-node reserve and
-the previous total preparation deadline (600 seconds per owner NUMA node),
-with at most three attempts and bounded child cleanup. Store preparation
-skips VM sysctl writes. Snapshots, child logs and the outcome are saved under
-`logs/<phase>/mooncake-memory-rank-<rank>/`. Store size remains 1536 GiB.
+Following that failure, the launcher initially added the bounded memory-preparation
+helper with owner NUMA budgets, full THP coverage checks, and three retries. The
+October 20 change below removes that startup preparation from Mooncake Store.
 
 Paged run `39208890418` / job `117918188182` passed all 33 AITER numerical
 cases, then failed the two cached/uncached TBO straddle fixture cases with
@@ -199,3 +194,23 @@ FlyDSL module still require an image that provides it.
 Paged run `39231588890` failed with the same inherited GSM8K chat flag conflict
 as gather run `39231577736`; both experiment branches carry the case-level
 flag correction and these checks.
+
+## October 20: start Mooncake Store without host memory preparation
+
+Run `39351494133` / Slurm `9283` passed all 33 paged GPU numerical cases and
+39 adapter/related checks, then stopped before model startup because NUMA 1
+THP preparation timed out three times. The Store now starts its masters and
+owners directly. Its launcher no longer invokes the LMCache memory-preparation
+helper, drops file cache, faults temporary huge-page allocations, or runs a
+background page-cache dropper. The removed preparation settings are no longer
+part of the generated matrix; owner readiness uses `MOONCAKE_STORE_WAIT_TIMEOUT`
+without a compaction allowance.
+
+The Store retains its 1536 GiB capacity, owner NUMA/NIC mapping, allocation and
+RDMA options, process health and mounted-capacity checks, and GPU/Store round
+trip. LMCache's separate host memory preparation remains in place.
+
+Validation: all 191 CPU tests selected by `test_atomesh_*.py` pass, along with
+shell syntax and whitespace checks. Expanding the C72 matrix with the previous
+run's inputs changes only the removed page-cache directory setting. GPU/RDMA
+startup has not been rerun for this change.
