@@ -26,7 +26,7 @@ from atom.model_ops.linear import (
     BAParallelLinear,
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    MergedReplicatedLinear,
+    MergedReplicatedRouterLinear,
     QKVGParallelLinear,
     QKVParallelLinear,
     QKVZBAParallelLinear,
@@ -200,12 +200,17 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         #     self.physical_expert_start + self.n_local_physical_experts
         # )
 
-        self.gate = MergedReplicatedLinear(
+        self.gate = MergedReplicatedRouterLinear(
             config.hidden_size,
             [config.num_experts, config.n_shared_experts],
             bias=False,
             quant_config=None,
             prefix=f"{prefix}.gate",
+        )
+        # None: logits in the activation dtype, as the bf16 router has always
+        # produced them.
+        self.router_logits_dtype = (
+            torch.float32 if envs.ATOM_ROUTER_LOGITS_FP32 else None
         )
         self.is_rocm_aiter_fusion_shared_expert_enabled = (
             is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -261,7 +266,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts + 1)
-        logits = self.gate(hidden_states)
+        logits = self.gate(
+            hidden_states, otype=self.router_logits_dtype or hidden_states.dtype
+        )
         if not self.is_rocm_aiter_fusion_shared_expert_enabled:
             router_logits = logits[:, : self.n_routed_experts]
         else:
@@ -274,7 +281,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             # Apply shared expert gate: the merged gate output contains
             # [routed_logits, shared_expert_gate_logits], extract the tail
             shared_gate_logits = logits[:, self.n_routed_experts :]
-            shared_output = F.sigmoid(shared_gate_logits) * shared_output
+            # Cast back: fp32 router logits must not widen the hidden state.
+            shared_output = (
+                F.sigmoid(shared_gate_logits).to(shared_output.dtype) * shared_output
+            )
             final_hidden_states = shared_output + routed_output
         else:
             final_hidden_states = routed_output
