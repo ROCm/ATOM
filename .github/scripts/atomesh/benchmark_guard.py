@@ -17,6 +17,8 @@ FATAL = re.compile(
     r"c10::DistBackendError|HIP error:|CUDA error:|"
     r"Engine core process .* (?:died|exited)|"
     r"AsyncIOProcManager\(ModelRunner\): .* proc died unexpectedly|"
+    # multiprocessing emits this header for an uncaught worker exception.
+    r"^\s*Process ModelRunner\d+(?:/\d+)?:\s*$|"
     r"Torch\.OutOfMemoryError|torch\.OutOfMemoryError"
 )
 PROGRESS = re.compile(

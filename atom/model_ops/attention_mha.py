@@ -892,10 +892,12 @@ class PagedAttentionImpl(nn.Module):
 
                 logging.getLogger("atom").info(
                     "[gluon-c32] cached prefill backend=gluon draft=%s "
-                    "q=%s kv=%s; baseline decode and KV budgeting retained",
+                    "q=%s kv=%s scales=%s/%s; baseline decode and KV budgeting retained",
                     fwd_ctx.context.is_draft,
                     tuple(q.shape),
                     tuple(k_cache.shape),
+                    "scalar" if k_scale.numel() == 1 else "per-token",
+                    "scalar" if v_scale.numel() == 1 else "per-token",
                 )
                 self._logged_gluon_c32 = True
             return output

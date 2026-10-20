@@ -139,6 +139,27 @@ class BenchmarkGuardTests(unittest.TestCase):
         )
         self.assertEqual(self.guard.check(now=100001)["reason"], "fatal_worker_error")
 
+    def test_uncaught_model_runner_exception_is_fatal_without_manager_message(self):
+        self.append(self.server, "GET /health HTTP/1.1 200 OK\nProcess ModelRun")
+        self.assertIsNone(self.guard.check(now=1))
+        self.append(
+            self.server,
+            "ner3/4:\nTraceback (most recent call last):\n"
+            '  File "gluon_prefill.py", line 83, in run_gluon_prefill\n'
+            "ValueError: Gluon C32 requires float32 per-token scales\n",
+        )
+        failure = self.guard.check(now=2)
+        self.assertEqual(failure["reason"], "fatal_worker_error")
+        self.assertEqual(failure["line"], "Process ModelRunner3/4:")
+
+    def test_logged_traceback_without_worker_death_is_not_fatal(self):
+        self.append(
+            self.server,
+            "LMCache lookup failed; retrying\n"
+            "Traceback (most recent call last):\nValueError: temporary error\n",
+        )
+        self.assertIsNone(self.guard.check(now=1))
+
     def test_transient_lmcache_lookup_error_is_not_fatal(self):
         self.append(
             self.server, "LMCache ERROR Timeout occurred, recreating all sockets\n"

@@ -34,3 +34,5 @@ PY
 # Gate this kernel experiment before either model replica is loaded. The
 # checker asserts real Gluon execution, split coverage and numerical accuracy.
 python3 "${scatter_source}/op_tests/triton_tests/attention/check_m3_gluon.py"
+# Exercise ATOM's actual target/draft writers and cached-prefill adapter too.
+python3 "$(dirname "${BASH_SOURCE[0]}")/check_m3_gluon_adapter.py"

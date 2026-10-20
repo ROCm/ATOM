@@ -523,7 +523,7 @@ jobs:
         if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') }}
         run: python3 .github/scripts/atomesh/check_m3_gluon_c32.py --matrix atomesh-matrix.json
 
-      - name: Validate Gluon page fixtures before GPU allocation
+      - name: Validate Gluon adapter and page fixtures before GPU allocation
         if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') }}
         timeout-minutes: 10
         run: |
@@ -548,6 +548,7 @@ jobs:
           print(f"[gluon-c32-fixture] validating pinned aiter {ref} on CPU")
           PYFIXTURE
           /tmp/m3-fixture-venv/bin/python -m pytest -q /tmp/m3-fixture-tests/test_m3_gluon_fixtures.py
+          PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" /tmp/m3-fixture-venv/bin/python -m pytest --noconftest -q tests/test_gluon_prefill.py
 
       - name: Group benchmark matrix by configuration
         id: groups

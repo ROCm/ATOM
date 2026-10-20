@@ -6,8 +6,9 @@ job 117400829563. This branch starts at that run's exact ATOM commit,
 `ebeb0f925289619cb0630b3d70a6f600412af6bb`.
 
 The treatment is the cached-prefill attention implementation for both target
-and EAGLE3 draft: native paged FP8 KV plus physical per-token scales are consumed
-by Gluon instead of gathering a dense BF16 context. The adapter uses real block
+and EAGLE3 draft: Gluon consumes native paged FP8 KV with the scales returned
+by each writer (target per-token, draft scalar), instead of gathering a dense
+BF16 context. The adapter uses real block
 tables and scheduled request metadata without converting the KV pool. Short
 queries can split the context when the query grid cannot fill the GPU.
 
@@ -93,3 +94,71 @@ of the package's lazy function export. Four fresh-process import tests cover
 both import orders and rejection of the old optional-plan API. The pinned
 source is also probed before model startup. Benchmark monitoring recognizes
 ModelRunner death even if the HTTP frontend still responds.
+
+## CI repair after run 39351509328
+
+All 17 AITER GPU cases passed, but real EAGLE3 cached prefill failed because
+`ATOM_FORCE_ATTN_TRITON=1` selects a rotary-only cache writer that returns a
+single FP32 `kv_scale`. The earlier adapter incorrectly required per-token
+scales even though this writer leaves the preallocated scale planes unused.
+
+The adapter now accepts the writer's scalar or per-token scale independently
+for K and V. A scalar becomes a zero-stride `(blocks, heads, page_size)` view
+through `scale.view(()).expand(...)`: it retains the same pointer and four
+bytes of storage, even for 53602 draft blocks. No scalar readback, scale-plane
+initialization, cache conversion, or change to the writer is involved. This
+uses the pinned Gluon BF16/FP8 operand loader, preserving BF16 dequantization
+as in gather. Passing only `k_descale/v_descale` would not suffice: that pinned
+Gluon dispatch supports BF16 Q / FP8 KV only through its scale-cache path.
+
+CPU adapter regressions run before GPU allocation, including the actual draft
+Python `rope_cache` branch with a stub GPU writer and poisoned unused scale
+planes. In addition to the original 17 kernel cases, a nine-case GPU gate calls
+real ATOM `rope_cache` and `prefill_attention`: target Gemma/per-token and draft
+rotary/scalar, scale 1.0 and 0.375, single-token, short and large queries,
+permuted physical pages, split/unsplit and buffer/global loads. It compares
+against Torch dense causal attention and rejects Triton attention fallback.
+These GPU cases must pass in the target CI image before loading the models.
+
+The benchmark guard also recognizes the multiprocessing
+`Process ModelRunner3/4:` uncaught-exception header, including split log reads.
+It does not treat arbitrary logged tracebacks as worker death. This prevents
+the observed 900-second stall wait while the HTTP frontend remains healthy.
+AITER stays at `5f1da21fe6e89620babf1450847783b8d551ccef`; the experiment matrix
+and original draft quantization remain unchanged.
+
+Local validation for this repair: 16 CPU adapter cases passed; 193 ATOMesh
+unittests completed with one skip and no failures. Six actual adapter/dispatch
+argument sets compiled offline for gfx950, covering scalar/per-token,
+split/unsplit and buffer/global loads. The regenerated matrix is identical to
+run 39351509328 and still passes the gather-C32 baseline comparison. Ruff,
+Black, shell syntax and workflow YAML checks pass. The new GPU numerical gate
+has not yet run on gfx950; no new performance result is available.
+
+## Additional preflight review
+
+The standalone adapter gate now pins this checkout before importing ATOM.
+A container reproduction showed that `python -c` used the mounted checkout,
+while a standalone script imported the image's editable `/app/ATOM` instead.
+A CPU regression runs the gate from another cwd with a conflicting `PYTHONPATH`.
+The gate also resolves its monitoring hooks from ATOM's actual unified-attention
+callable: importing AITER's canonical module before its legacy alias can leave
+a stale module object whose patches would not observe ATOM's launches.
+
+Each numerical case now writes the cached prefix first, then appends only the
+scheduled query tokens and uses the real `dispatch_backend` result. The earlier
+fixture wrote all context tokens in one call; it missed the draft writer's
+`BLOCK_H=1` path for 1/4 new tokens. Offline meta-tensor tracing reached the real
+target and draft prefix/append kernels, and all eight writer launches compiled
+for gfx950. Three additional meta-tensor checks exercised the actual ATOM
+`prefill_attention` method with scalar scales and a 53602-block pool; the gate
+captured the expected Gluon launches. These are routing and compilation checks,
+not GPU numerical results.
+
+The native zero-based prefix metadata, padded request slicing, unchanged decode
+path, and runtime overlay order were reviewed. The Gluon return precedes the
+bounded-gather overlay. No further deterministic runtime defect was found in
+these checked paths. Target gfx950 numerical validation remains pending.
+
+Review validation completed: 194 ATOMesh tests, 193 passed and one skipped;
+process exit code 0. Ruff, Black, shell syntax and whitespace checks pass.

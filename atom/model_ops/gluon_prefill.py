@@ -14,6 +14,23 @@ if TYPE_CHECKING:
     from atom.utils.forward_context import ForwardContext
 
 
+def _scale_cache_view(scale, shape, device):
+    """Keep writer scales in place, broadcasting scalar storage without a copy.
+
+    The pinned Gluon BF16/FP8 loader accepts physical per-token scale views.
+    Draft rope_cache instead returns kv_scale, leaving its pool scale planes
+    unused. Zero strides let that same loader read the scalar for every token;
+    this also preserves the gather path's BF16 dequantized operand precision.
+    """
+    if scale is None or scale.dtype != torch.float32 or scale.device != device:
+        raise ValueError("Gluon C32 requires float32 KV scales on the query device")
+    if scale.numel() == 1:
+        return scale.view(()).expand(shape)
+    if tuple(scale.shape) != shape:
+        raise ValueError(f"Gluon C32 requires scalar or per-token KV scales {shape}")
+    return scale
+
+
 def run_gluon_prefill(
     attention: Callable,
     q: torch.Tensor,
@@ -75,15 +92,8 @@ def run_gluon_prefill(
         raise ValueError("Paged prefill requires real per-request KV metadata")
 
     expected_scales = (blocks, heads, page_size)
-    if any(
-        scale is None
-        or tuple(scale.shape) != expected_scales
-        or scale.dtype != torch.float32
-        for scale in (k_scale, v_scale)
-    ):
-        raise ValueError(
-            f"Gluon C32 requires float32 per-token scales {expected_scales}"
-        )
+    k_scale = _scale_cache_view(k_scale, expected_scales, q.device)
+    v_scale = _scale_cache_view(v_scale, expected_scales, q.device)
     output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     attention(
         q,

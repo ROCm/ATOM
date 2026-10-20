@@ -5,6 +5,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -50,9 +53,29 @@ class SingleVariableTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Non-kernel"):
             checker.compare(data)
 
-    def test_baseline_runtime_instrumentation_still_applies(self):
-        import subprocess
+    def test_adapter_gate_uses_checkout_with_conflicting_editable_install(self):
+        with tempfile.TemporaryDirectory() as temp:
+            decoy = Path(temp)
+            (decoy / "atom").mkdir()
+            (decoy / "atom/__init__.py").write_text(
+                'raise AssertionError("Imported the image ATOM")\n'
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT.with_name("check_m3_gluon_adapter.py")),
+                    "--check-source",
+                ],
+                cwd=decoy,
+                env={**os.environ, "PYTHONPATH": str(decoy)},
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            self.assertIn(f"atom_source={ROOT}/atom/__init__.py", result.stdout)
 
+    def test_baseline_runtime_instrumentation_still_applies(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             subprocess.run(
