@@ -652,17 +652,19 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             v_scale_cache=optional("v_scale"),
             compressed_key_scale=optional("index_compressed_scale"),
         )
+        # The transfer codecs move exactly what is registered here. A quantized
+        # cache's scale planes must ride with its rows: FP8 K/V restored under
+        # another prefix's scales decode to garbage without any error.
         return KVCacheTensor(
             layer_num=module.layer_num,
             k_cache=key,
             v_cache=value,
-            k_scale=None,
-            v_scale=None,
-            index_raw=arena.view("index_raw")[row],
-            index_compressed=arena.view("index_compressed")[row],
-            rope_positions=(
-                arena.view("rope_positions")[row] if self.cache_rope_positions else None
-            ),
+            k_scale=optional("k_scale"),
+            v_scale=optional("v_scale"),
+            index_raw=optional("index_raw"),
+            index_compressed=optional("index_compressed"),
+            rope_positions=optional("rope_positions"),
+            index_compressed_scale=optional("index_compressed_scale"),
         )
 
     # ------------------------------------------------------------------ #

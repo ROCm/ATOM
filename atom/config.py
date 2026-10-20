@@ -69,6 +69,9 @@ class KVCacheTensor:
     index_raw: torch.Tensor | None = None
     index_compressed: torch.Tensor | None = None
     rope_positions: torch.Tensor | None = None
+    # The scale plane of a quantized ``index_compressed`` (``--index_cache_dtype
+    # fp8`` / ``fp4``), None for BF16. Last, for the same byte-order reason.
+    index_compressed_scale: torch.Tensor | None = None
     # ReplaySSM record buffers for linear-attention layers: this layer's slice
     # of the (k, u, g) pools.  None for every other attention type.  Carried
     # here because the layer-id -> linear-attn-index mapping already lives in

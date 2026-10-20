@@ -97,6 +97,59 @@ def test_fp8_pool_fits_more_blocks():
     assert _builder("fp8", "bf16", 1, 64, rope=True)._page_bytes() == 1216000
 
 
+class _QsaLayer:
+    is_qsa_attention = True
+
+    def __init__(self, layer_num, row_space="qsa"):
+        self.layer_num = layer_num
+        self.qsa_row_space = row_space
+
+    def bind_caches(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("kv", "index", "draft_rows"),
+    [("bf16", None, 0), ("fp8", "bf16", 1), ("fp8", "fp8", 1), ("fp8", "fp4", 1)],
+)
+def test_registered_tensors_cover_every_paged_field(kv, index, draft_rows):
+    # The offload codec moves exactly what `build_kv_cache_tensor` registers.
+    # Leaving a scale plane out stores FP8 rows without their scales, and a
+    # prefix restored from CPU then decodes under whatever scales the reused
+    # block held.
+    from atom.kv_transfer.offload.dense.kv_byte_codec import DenseKVByteCodec
+    from atom.model_ops.attentions.pool_layout.entry_arena import LayerMajorArena
+
+    blocks = 3
+    builder = _builder(kv, index, draft_rows, block=64, rope=True)
+    fields = builder._qsa_fields()
+    builder.qsa_arena = LayerMajorArena(fields, blocks, torch.device("cpu"))
+    target = [_QsaLayer(i) for i in range(12)]
+    draft = [_QsaLayer(12 + i, "qsa_draft") for i in range(draft_rows)]
+    builder._pool_rows = {
+        "qsa": {m: i for i, m in enumerate(target)},
+        "qsa_draft": {m: i for i, m in enumerate(draft)},
+    }
+    kv_caches = {
+        f"layer_{m.layer_num}": builder.build_kv_cache_tensor(m) for m in target + draft
+    }
+
+    for m in draft:
+        kvt = kv_caches[f"layer_{m.layer_num}"]
+        for name in ("k", "v", "index_raw", "index_compressed"):
+            attr = name + ("_cache" if name in ("k", "v") else "")
+            assert getattr(kvt, attr).data_ptr() == (
+                builder.qsa_arena.view(f"{name}_draft")[0].data_ptr()
+            )
+    codec = DenseKVByteCodec(kv_caches, blocks, permit_per_request_state=True)
+    arena = builder.qsa_arena
+    per_block = sum(
+        arena.view(f.name).numel() * arena.view(f.name).element_size() // blocks
+        for f in fields
+    )
+    assert codec.bytes_per_block == per_block
+
+
 def _store(fmt, values, page_rows):
     rows, heads, dim = values.shape
     pages = -(-rows // page_rows)
