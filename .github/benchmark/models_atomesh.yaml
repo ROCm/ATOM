@@ -1243,6 +1243,23 @@ models:
           name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c4
           concurrency: [4]
 
+        # Test-only: #4307's mono decode at CONC 1 behind the PP8 prefill.
+        # Mono reads the KDA state as fp32, so both servers allocate it so,
+        # and refuses the decode's in_proj, f_b_proj, o_proj and shared-expert
+        # projections quantized. The prefill keeps its own quant config.
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c1-mono
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark7_args
+              online_quant_config: '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*","layers.*.self_attn.fused_qkv_a_proj","layers.*.self_attn.q_b_proj","layers.*.self_attn.kv_b_proj","layers.*.self_attn.o_proj","layers.*.mlp.gate_up_proj","layers.*.mlp.down_proj","context_proj","*self_attn.in_proj*","*self_attn.f_b_proj*","*self_attn.o_proj*","*shared_experts.gate_up_proj*","*shared_experts.down_proj*"]}'
+          env:
+            common:
+              <<: *kimi_k3_pp8_env
+              ATOM_MONO_ENABLE: "1"
+              ATOM_GDN_SSM_DTYPE: fp32
+            prefill: *kimi_k3_pp8_prefill_env
+
         - &kimi_k3_1p1d_pp8_dcp8
           <<: *kimi_k3_1p1d_pp8_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c16
