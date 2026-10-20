@@ -138,7 +138,7 @@ def check_case(draft, qlen, klen, scalar=1.0):
     else:
         assert kscale is ks and vscale is vs
     # Read the actual writer's native pages using independent Torch indexing.
-    # BF16 rounding matches the original gather operands for both scale modes.
+    # Round the dequantized values to the BF16 operands used by attention.
     dense_k = kc.permute(0, 3, 1, 2, 4).reshape(blocks, page, kv_heads, dim).float()
     dense_v = vc.permute(0, 2, 4, 1, 3).reshape(blocks, page, kv_heads, dim).float()
     page_ids, offsets = slots // page, slots % page
@@ -189,11 +189,15 @@ def main():
         ua.DEVICE_ARCH == "gfx950"
     ), "Writer/attention gate requires the target gfx950 GPU"
     launches = []
+    configs = []
     original = ua._unified_attention_gfx950
     kernel = ua._unified_attention_kernel_gfx950
 
     def record(*args, **kwargs):
         launches.append(kwargs.get("NUM_SEGMENTS", 1))
+        configs.append(
+            {key: kwargs[key] for key in ("BLOCK_M", "TILE_SIZE", "num_warps")}
+        )
         return original(*args, **kwargs)
 
     def forbid(*args, **kwargs):
@@ -231,7 +235,7 @@ def main():
                 assert len(launches) == before + 1
     assert 1 in launches and any(n > 1 for n in launches), launches
     print(
-        f"[gluon-adapter-gate] {len(launches)} real writer/adapter cases passed; splits={launches}",
+        f"[gluon-adapter-gate] {len(launches)} real writer/adapter cases passed; splits={launches}; official configs={configs}",
         flush=True,
     )
 

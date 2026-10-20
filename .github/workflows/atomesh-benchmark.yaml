@@ -534,11 +534,13 @@ jobs:
           python3 - <<'PYFIXTURE'
           import json
           import re
+          import subprocess
           import urllib.request
           from pathlib import Path
           cell = json.loads(Path("atomesh-matrix.json").read_text())["include"][0]
           ref = cell["env"]["common"]["ATOM_AITER_SCATTER_REF"]
           assert re.fullmatch(r"[0-9a-f]{40}", ref), ref
+          subprocess.run(["python3", ".github/scripts/atomesh/check_m3_gluon_upstream.py", "--ref", ref], check=True)
           destination = Path("/tmp/m3-fixture-tests")
           destination.mkdir(exist_ok=True)
           for name in ("test_unified_attention_scale_cache.py", "test_m3_gluon_fixtures.py"):

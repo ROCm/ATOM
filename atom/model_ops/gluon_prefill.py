@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Gluon cached-prefill kernel for the isolated M3 C32 experiment."""
+"""Official v0.1.26 Gluon cached prefill with native ATOM KV scale views."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ if TYPE_CHECKING:
 def _scale_cache_view(scale, shape, device):
     """Keep writer scales in place, broadcasting scalar storage without a copy.
 
-    The pinned Gluon BF16/FP8 loader accepts physical per-token scale views.
+    The KV format adapter accepts physical per-token scale views.
     Draft rope_cache instead returns kv_scale, leaving its pool scale planes
     unused. Zero strides let that same loader read the scalar for every token;
-    this also preserves the gather path's BF16 dequantized operand precision.
+    the FP8 pool and its quantization remain unchanged.
     """
     if scale is None or scale.dtype != torch.float32 or scale.device != device:
         raise ValueError("Gluon C32 requires float32 KV scales on the query device")

@@ -1,0 +1,54 @@
+{
+  "upstream_tag": "v0.1.26",
+  "upstream_commit": "84077b3c0461dac1f0f3f8b9590a9282e2035a2f",
+  "files": {
+    "aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json": {
+      "sha256": "1f0c6fc1e3e3117add7d3f49ce5e473272712f5f3940ce7126a5241d0c06e1df"
+    },
+    "aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json": {
+      "sha256": "614d3bdfa03bdff19baded009ab74fc239ecded540125a3f4e85d206bd5b37a0"
+    },
+    "aiter/ops/triton/_triton_kernels/attention/unified_attention.py": {
+      "sha256": "7dedacb5eeddefc030886dbdba3142e8f256f1b6f332d30cec274b154dcb92ab"
+    },
+    "aiter/ops/triton/utils/unified_attention_utils.py": {
+      "sha256": "2fc53d9490b9b69b293c16f754782a268e3a38e0e0ea94f33ee579e543eaecd3"
+    },
+    "aiter/ops/triton/attention/unified_attention.py": {
+      "sha256": {
+        "_gfx950_split_params": "65f39f85672dfa2067eb18e8db7d44171ebe46986fbef7e8b5895761d6444055",
+        "_gfx950_split_grid": "643f3f70b123ff832f083d153f1846f3c34e1fb27b8851eb4cba64b6a5fa84b9",
+        "use_2d_kernel": "bc04fca2031735f5eb817f37a63d0e80d5b5a271b1e6ffc97311a8a593e96725",
+        "_unified_attention_2d_gfx950": "d1130e38041294a50e012614bc2fed2cfd2f8b8aefac2159a9081cb44b34878d",
+        "_unified_attention_3d_gfx950": "cf95c55acaeee4da8255faa7ad66409d3ad8def147de8af3bc3f3afacabd74f5",
+        "_reduce_segments_triton": "f69685394fb6bd8689cd76795e26c5365e06428276b62b1b910e6ee31e64cd91"
+      },
+      "symbols": [
+        "_gfx950_split_params",
+        "_gfx950_split_grid",
+        "use_2d_kernel",
+        "_unified_attention_2d_gfx950",
+        "_unified_attention_3d_gfx950",
+        "_reduce_segments_triton"
+      ]
+    },
+    "aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py": {
+      "sha256": {
+        "AttentionConfig": "923b83f1fc5db26a2b6d828e2c160213aac3db24086c1007ef8cf83423135bb9",
+        "AttentionProgram": "b8b2f52ca8853daca406b9822e289137ca7bc899465ae38680cd1b922d1dc4d0",
+        "_shuffled_kv_layouts": "1d3cbf582e38f34f7c668ab582606a57547d14c7e008369f945a5beb6cdec45e",
+        "_make_cdna4_kv_load_layouts": "8499032a17970e77bbf8ad87ca3574f76c0c1cd57dee6dafcc0e9fbf34cb2c3b",
+        "attention_loop_single_buffer": "891703aa6c689140067a5a93c86e6d7f343b7d32bfdbb4035642297a60fb01ea",
+        "attention_loop_standard": "53ed348b3eefcb20210c4fe7d86fc9d1fc450cb78b085559412228ddb1f646e8"
+      },
+      "symbols": [
+        "AttentionConfig",
+        "AttentionProgram",
+        "_shuffled_kv_layouts",
+        "_make_cdna4_kv_load_layouts",
+        "attention_loop_single_buffer",
+        "attention_loop_standard"
+      ]
+    }
+  }
+}

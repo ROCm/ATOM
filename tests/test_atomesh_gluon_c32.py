@@ -75,6 +75,31 @@ class SingleVariableTest(unittest.TestCase):
             )
             self.assertIn(f"atom_source={ROOT}/atom/__init__.py", result.stdout)
 
+    def test_upstream_guard_rejects_tuning_and_math_changes(self):
+        spec = importlib.util.spec_from_file_location(
+            "gluon_upstream_check", SCRIPT.with_name("check_m3_gluon_upstream.py")
+        )
+        guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        source = b"def split(n):\n    return n // 64\n"
+        manifest = {
+            "upstream_commit": "test",
+            "files": {
+                "split.py": {
+                    "symbols": ["split"],
+                    "sha256": guard.fingerprint(source, ["split"]),
+                }
+            },
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            guard.verify(lambda _: source, manifest)
+        with self.assertRaisesRegex(ValueError, "Official v0.1.26"):
+            guard.verify(lambda _: source.replace(b"64", b"128"), manifest)
+        config = b'{"NUM_BUFFERS": 2}'
+        manifest["files"] = {"config.json": {"sha256": guard.fingerprint(config, [])}}
+        with self.assertRaisesRegex(ValueError, "Official v0.1.26"):
+            guard.verify(lambda _: config.replace(b"2", b"1"), manifest)
+
     def test_baseline_runtime_instrumentation_still_applies(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -31,6 +31,9 @@ assert _flydsl_explicit_plan_api(), "Pinned AITER lacks the required FlyDSL plan
 print("[attention-api] FlyDSL module and required work-plan API verified")
 PY
 
+# Keep the official v0.1.26 scheduling, tuning and math intact.
+python3 "$(dirname "${BASH_SOURCE[0]}")/check_m3_gluon_upstream.py" --source "${scatter_source}"
+
 # Gate this kernel experiment before either model replica is loaded. The
 # checker asserts real Gluon execution, split coverage and numerical accuracy.
 python3 "${scatter_source}/op_tests/triton_tests/attention/check_m3_gluon.py"
