@@ -808,6 +808,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_QSA_STACKED_DECODE_SCORER": lambda: _flag_env(
         "ATOM_QSA_STACKED_DECODE_SCORER", "1"
     ),
+    # Qwen QSA: the MTP draft layer keeps BF16 KV / index caches while the
+    # target's are FP8 / FP4 (an FP8 draft KV lowers the acceptance length).
+    "ATOM_QSA_DRAFT_KV_BF16": lambda: _flag_env("ATOM_QSA_DRAFT_KV_BF16", "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
