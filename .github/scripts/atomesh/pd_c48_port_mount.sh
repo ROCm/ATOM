@@ -43,6 +43,6 @@ c48_append_port_mount() {
   c48_fix_target="/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py"
   [[ -f "${c48_fix_source}" && -r "${c48_fix_source}" ]] || return 2
   c48_fix_digest="$(sha256sum "${c48_fix_source}")" || return $?
-  [[ "${c48_fix_digest%% *}" == "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c" ]] || return 2
+  [[ "${c48_fix_digest%% *}" == "625c3c17e331463847d594d17087d8ff25c459b96b558a8602b884cc7f27c3d2" ]] || return 2
   docker_args+=(--mount "type=bind,source=${c48_fix_source},target=${c48_fix_target},readonly")
 }

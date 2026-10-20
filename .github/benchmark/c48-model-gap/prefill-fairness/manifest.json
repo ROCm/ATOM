@@ -1,14 +1,15 @@
 {
-  "scope": "Experimental C48 Prefill fairness; runtime base 81198e97b; only running rotation and waiting Mamba alignment bypass gated by instance attribute.",
-  "source_worktree": "/app/vllm-c48-cpu-prefill-fairness-20261019",
-  "source_parent_sha": "dfd87d33eca669b6023c1a6ce3e490605c914a7b",
-  "base_scheduler_sha256": "8bf1909e14569e1cb2bc5884a8e98e5dbc09e6b71bb095035898eb3033828630",
-  "patched_sha256": "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c",
+  "scope": "Experimental C48 Prefill fairness plus one-step reservation after observed Mamba-alignment failure; instance-gated",
+  "source_worktree": "/app/vllm-c48-cpu-waiter-retry-20261020",
+  "source_parent_sha": "58fa4b90b51567a6b74fffd473b7a4062291d1b6",
+  "base_scheduler_sha256": "5e29800ef253c11ce4870eb0fe20cd4a35da3030d77c0724dd63911c0059467c",
+  "patched_sha256": "625c3c17e331463847d594d17087d8ff25c459b96b558a8602b884cc7f27c3d2",
   "target": "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py",
   "enabled_roles": [
     "prefill"
   ],
-  "tests": "/app/test_scripts/dspark_pd/c48-gap-round1-20261012/dispatch-prefill-fairness-20261019/test_prefill_fairness.py",
+  "tests": "/app/test_scripts/dspark_pd/c48-gap-round1-20261012/dispatch-waiter-retry-20261020",
   "performance_validated": false,
-  "source_commit": "58fa4b90b51567a6b74fffd473b7a4062291d1b6"
+  "source_commit": "f7965a46590527b92116512505dcaa68165b9f50",
+  "known_limit": "Prior compute readiness can become a CPU load between schedules; counted explicitly, not ruled out."
 }

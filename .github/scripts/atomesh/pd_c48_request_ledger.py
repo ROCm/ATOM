@@ -163,6 +163,9 @@ class RequestLedger:
             "schedule_host_ms": (end_ns - begin_ns) / 1e6,
             "rows": rows,
             "pressure_after_schedule": self.pressure(),
+            "waiter_budget_retry_stats": dict(
+                getattr(self.scheduler, "_c48_waiter_budget_stats", {})
+            ),
         }
         self.pending[id(output)] = record
         for rid, computed, count in rows:
@@ -316,6 +319,9 @@ class RequestLedger:
                         "observer_calls": self.observer_calls,
                         "observer_total_ns": self.observer_total_ns,
                         "observer_max_ns": self.observer_max_ns,
+                        "waiter_budget_retry_stats": dict(
+                            getattr(self.scheduler, "_c48_waiter_budget_stats", {})
+                        ),
                     }
                 )
                 + "\n"

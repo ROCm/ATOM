@@ -353,6 +353,17 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        self._c48_waiter_budget_retry: tuple[Request, int, int] | None = None
+        self._c48_waiter_budget_stats = {
+            "armed": 0,
+            "applied": 0,
+            "reserved_tokens": 0,
+            "cpu_load_after_reserve": 0,
+            "cpu_load_reserved_tokens": 0,
+            "admitted_after_reserve": 0,
+            "admitted_first_tokens": 0,
+            "reserved_tokens_still_available_at_end": 0,
+        }
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -649,6 +660,38 @@ class Scheduler(SchedulerInterface):
         if prefill_fairness and len(self.running) > 1:
             self.running.append(self.running.pop(0))
 
+        waiter_reserved_request = None
+        waiter_token_reserve = 0
+        waiter_input_reserve = 0
+        retry = getattr(self, "_c48_waiter_budget_retry", None)
+        self._c48_waiter_budget_retry = None
+        if (
+            getattr(self, "_c48_reserve_waiter_budget", False)
+            and retry is not None
+            and self.need_mamba_block_aligned_split
+            and self._pause_state == PauseState.UNPAUSED
+            and not defer_prefills
+            and self.waiting
+            and not self.kv_holding_waiting
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_active_reqs
+        ):
+            head = self.waiting.peek_request()
+            if (
+                head is retry[0]
+                and head.num_tokens == retry[1]
+                and head.status == RequestStatus.WAITING
+                and head.num_computed_tokens == 0
+                and not head.has_encoder_inputs
+                and not head.num_stale_output_tokens
+                and retry[2] <= min(token_budget, input_budget - draft_slots)
+            ):
+                waiter_reserved_request = head
+                self._c48_waiter_budget_stats["applied"] += 1
+                self._c48_waiter_budget_stats["reserved_tokens"] += retry[2]
+                waiter_token_reserve = retry[2]
+                waiter_input_reserve = retry[2] + draft_slots
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -705,6 +748,13 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+
+            if waiter_token_reserve:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    max(token_budget - waiter_token_reserve, 0),
+                    max(input_budget - draft_slots - waiter_input_reserve, 0),
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -1170,6 +1220,37 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            if (
+                                getattr(self, "_c48_reserve_waiter_budget", False)
+                                and self._c48_waiter_budget_retry is None
+                                and request.status == RequestStatus.WAITING
+                                and request.num_computed_tokens == 0
+                                and not request.has_encoder_inputs
+                                and not request.num_stale_output_tokens
+                            ):
+                                probe = min(
+                                    self.cache_config.block_size,
+                                    request.num_tokens - num_computed_tokens,
+                                    self.max_num_scheduled_tokens,
+                                    self.scheduler_config.max_num_batched_tokens
+                                    - draft_slots,
+                                )
+                                needed = self._mamba_block_aligned_split(
+                                    request,
+                                    probe,
+                                    num_new_local_computed_tokens,
+                                    num_external_computed_tokens,
+                                )
+                                needed = self._reserve_prefill_lookahead(
+                                    request, num_computed_tokens, needed
+                                )
+                                if needed > 0:
+                                    self._c48_waiter_budget_stats["armed"] += 1
+                                    self._c48_waiter_budget_retry = (
+                                        request,
+                                        request.num_tokens,
+                                        needed,
+                                    )
                             if prefill_fairness:
                                 skip_request(request_queue)
                                 continue
@@ -1315,6 +1396,11 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if request is waiter_reserved_request:
+                        self._c48_waiter_budget_stats["cpu_load_after_reserve"] += 1
+                        self._c48_waiter_budget_stats["cpu_load_reserved_tokens"] += (
+                            waiter_token_reserve
+                        )
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1335,6 +1421,11 @@ class Scheduler(SchedulerInterface):
                     skip_request(request_queue)
                     continue
 
+                if request is waiter_reserved_request:
+                    self._c48_waiter_budget_stats["admitted_after_reserve"] += 1
+                    self._c48_waiter_budget_stats["admitted_first_tokens"] += (
+                        num_new_tokens
+                    )
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
@@ -1397,6 +1488,14 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        if waiter_token_reserve:
+            self._c48_waiter_budget_stats["reserved_tokens_still_available_at_end"] += (
+                min(
+                    waiter_token_reserve,
+                    token_budget,
+                    max(input_budget - draft_slots, 0),
+                )
+            )
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
