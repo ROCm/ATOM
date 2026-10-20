@@ -136,6 +136,32 @@ def gluon_decode_supports_arch() -> bool:
     return get_gfx() in ("gfx942", "gfx950")
 
 
+@functools.cache
+def pa_fwd_asm_supports_arch() -> bool:
+    """Whether aiter ships pa_fwd_asm kernels for the current GPU."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx() in ("gfx942", "gfx950")
+
+
+@functools.cache
+def unified_attention_reads_per_token_kv_scales() -> bool:
+    """Whether aiter unified_attention applies per-token KV scales.
+
+    An older aiter reads only the first element of a per-token scale and
+    returns wrong numbers without an error, so callers must refuse it.
+    """
+    from aiter.ops.triton.attention import unified_attention
+
+    return hasattr(unified_attention, "_is_per_token_kv_scale")
+
+
+def is_per_token_kv_scale(k_scale, v_scale) -> bool:
+    return (k_scale is not None and k_scale.numel() > 1) or (
+        v_scale is not None and v_scale.numel() > 1
+    )
+
+
 def run_pa_fwd_asm(
     q: torch.Tensor,
     k_cache: torch.Tensor,

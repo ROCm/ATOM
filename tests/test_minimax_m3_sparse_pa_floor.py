@@ -106,7 +106,7 @@ def test_gfx1250_sparse_fallback_uses_unified_attention(monkeypatch):
         seen["args"] = args
         seen["kwargs"] = kwargs
 
-    module = importlib.import_module("aiter.ops.triton.unified_attention")
+    module = importlib.import_module("aiter.ops.triton.attention.unified_attention")
     monkeypatch.setattr(module, "unified_attention", fake_unified)
 
     q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
@@ -138,14 +138,62 @@ def test_gfx1250_sparse_fallback_uses_unified_attention(monkeypatch):
     assert kwargs["shuffled_kv_cache"] is True
 
 
-def test_gfx1250_sparse_fallback_rejects_per_token_fp8_scales():
+def _fp8_sparse_inputs():
     q = torch.empty((4, 16, 128), dtype=torch.bfloat16, device="meta")
-    k_cache = torch.empty((32, 1, 16, 16, 8), dtype=torch.bfloat16, device="meta")
-    v_cache = torch.empty((32, 1, 2, 128, 8), dtype=torch.bfloat16, device="meta")
+    k_cache = torch.empty((32, 1, 8, 16, 16), dtype=torch.uint8, device="meta")
+    v_cache = torch.empty((32, 1, 1, 128, 16), dtype=torch.uint8, device="meta")
     sparse_bt = torch.empty((4, 128), dtype=torch.int32, device="meta")
     sparse_ctx = torch.empty((4,), dtype=torch.int32, device="meta")
+    # page-16 scales of the uncollapsed cache: [pages, num_kv_heads, 16]
+    k_scale = torch.empty((32, 1, 16), dtype=torch.float32, device="meta")
+    v_scale = torch.empty((32, 1, 16), dtype=torch.float32, device="meta")
+    return q, k_cache, v_cache, sparse_bt, sparse_ctx, k_scale, v_scale
 
-    with pytest.raises(NotImplementedError, match="per-token fp8 KV scales"):
+
+def test_gfx1250_sparse_fallback_passes_per_token_fp8_scales(monkeypatch):
+    import importlib
+
+    from atom.model_ops import base_attention
+
+    seen = {}
+    module = importlib.import_module("aiter.ops.triton.attention.unified_attention")
+    monkeypatch.setattr(
+        module, "unified_attention", lambda *a, **kw: seen.update(kwargs=kw)
+    )
+    monkeypatch.setattr(
+        base_attention, "unified_attention_reads_per_token_kv_scales", lambda: True
+    )
+
+    q, k_cache, v_cache, sparse_bt, sparse_ctx, k_scale, v_scale = _fp8_sparse_inputs()
+    sparse_attn._sparse_unified_per_row(
+        q,
+        k_cache,
+        v_cache,
+        sparse_bt,
+        sparse_ctx,
+        128**-0.5,
+        torch.empty_like(q),
+        k_scale,
+        v_scale,
+    )
+
+    kwargs = seen["kwargs"]
+    assert kwargs["k_descale"].shape == (32, 1, 16)
+    assert kwargs["v_descale"].shape == (32, 1, 16)
+    assert kwargs["shuffled_kv_cache"] is True
+
+
+def test_gfx1250_sparse_fallback_rejects_per_token_scales_on_old_aiter(
+    monkeypatch,
+):
+    """An aiter that reads one descale would return wrong numbers silently."""
+    from atom.model_ops import base_attention
+
+    monkeypatch.setattr(
+        base_attention, "unified_attention_reads_per_token_kv_scales", lambda: False
+    )
+    q, k_cache, v_cache, sparse_bt, sparse_ctx, k_scale, v_scale = _fp8_sparse_inputs()
+    with pytest.raises(NotImplementedError, match="per-token KV scales"):
         sparse_attn._sparse_unified_per_row(
             q,
             k_cache,
@@ -154,6 +202,6 @@ def test_gfx1250_sparse_fallback_rejects_per_token_fp8_scales():
             sparse_ctx,
             128**-0.5,
             torch.empty_like(q),
-            torch.empty((32, 16), dtype=torch.float32, device="meta"),
-            torch.empty((32, 16), dtype=torch.float32, device="meta"),
+            k_scale,
+            v_scale,
         )

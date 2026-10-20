@@ -33,6 +33,7 @@ pytest.importorskip("aiter", reason="base_attention imports the AITER runtime")
 # The gate compares against aiter's own fp8 alias, which differs by arch
 # (e4m3fnuz on gfx942, e4m3fn on gfx950); take it from aiter, never hardcode.
 import aiter as _aiter
+import torch
 
 _FP8 = _aiter.dtypes.fp8
 
@@ -1676,3 +1677,47 @@ class TestFlyDSLConstantsMatchAiter:
         assert (
             str(_FLYDSL_PLAN_MAX_BATCH) in plan_src
         ), "aiter's planner batch cap moved"
+
+
+class TestUnifiedPerTokenKvScales:
+    """Dense decode hands per-token fp8 scales to unified_attention."""
+
+    def _layer(self):
+        from atom.model_ops import attention_mha as mha
+
+        layer = SimpleNamespace(layer_num=3, kv_scale=torch.ones(1))
+        for name in ("_unified_kv_descales", "_reject_per_token_scales_on_unified"):
+            setattr(layer, name, getattr(mha.PagedAttentionImpl, name).__get__(layer))
+        return mha, layer
+
+    def test_per_token_scales_reach_the_kernel(self):
+        _mha, layer = self._layer()
+        k_scale, v_scale = torch.ones(4, 1, 128), torch.ones(4, 1, 128)
+        assert layer._unified_kv_descales(k_scale, v_scale) == (k_scale, v_scale)
+
+    def test_tensor_scale_stays_for_bf16(self):
+        _mha, layer = self._layer()
+        assert layer._unified_kv_descales(None, None) == (
+            layer.kv_scale,
+            layer.kv_scale,
+        )
+
+    def test_decode_accepts_per_token_scales_on_new_aiter(self, monkeypatch):
+        mha, layer = self._layer()
+        monkeypatch.setattr(
+            mha, "unified_attention_reads_per_token_kv_scales", lambda: True
+        )
+        scale = torch.ones(4, 1, 128)
+        layer._reject_per_token_scales_on_unified(scale, scale, "decode")
+
+    @pytest.mark.parametrize("phase, new_aiter", [("decode", False), ("prefill", True)])
+    def test_rejects_where_the_kernel_cannot_read_them(
+        self, monkeypatch, phase, new_aiter
+    ):
+        mha, layer = self._layer()
+        monkeypatch.setattr(
+            mha, "unified_attention_reads_per_token_kv_scales", lambda: new_aiter
+        )
+        scale = torch.ones(4, 1, 128)
+        with pytest.raises(NotImplementedError, match="per-token KV scales"):
+            layer._reject_per_token_scales_on_unified(scale, scale, phase)
