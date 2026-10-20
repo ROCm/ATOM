@@ -63,16 +63,20 @@ def gemm_m_buckets(max_m):
 def warm_gemm_m_buckets(worker):
     """Run dummy forwards at every tuned-GEMM M bucket so first-use FlyDSL builds happen before serving.
 
-    The second sweep times the same sizes with every kernel already built; the
-    difference between the sweeps is the first-use cost a serving prefill would pay.
+    The optional second sweep (C48_P_GEMM_WARMUP_SWEEPS=2, the default) times the
+    same sizes with every kernel already built; the difference between the sweeps
+    is the first-use cost a serving prefill would pay.
     """
     import time
     import torch
+    num_sweeps = int(os.environ.get("C48_P_GEMM_WARMUP_SWEEPS", "2"))
+    if num_sweeps not in (1, 2):
+        raise ValueError(f"C48_P_GEMM_WARMUP_SWEEPS must be 1 or 2, got {num_sweeps}")
     max_m = worker.scheduler_config.max_num_batched_tokens
     # Other tuned tables key exact M at multiples of 8 up to 512 (ATOM's linear pass).
     sizes = sorted(set(gemm_m_buckets(max_m)) | set(range(8, min(512, max_m) + 1, 8)) | {max_m - 1})
     sweeps = []
-    for sweep in range(2):
+    for sweep in range(num_sweeps):
         times = []
         for m in sizes:
             if worker.rank == 0:
@@ -82,10 +86,15 @@ def warm_gemm_m_buckets(worker):
             torch.cuda.synchronize()
             times.append((time.perf_counter() - start, m))
         sweeps.append(times)
-    slowest = sorted(((a - b, m) for (a, m), (b, _) in zip(*sweeps)), reverse=True)[:8]
-    print(f"[C48] P GEMM M-bucket warmup rank={worker.rank} sizes={len(sizes)} "
-          f"first={sum(t for t, _ in sweeps[0]):.1f}s second={sum(t for t, _ in sweeps[1]):.1f}s "
-          "first-minus-second " + " ".join(f"M={m}:{d:.2f}s" for d, m in slowest), flush=True)
+    summary = (f"[C48] P GEMM M-bucket warmup rank={worker.rank} sizes={len(sizes)} "
+               f"first={sum(t for t, _ in sweeps[0]):.1f}s ")
+    if num_sweeps == 2:
+        slowest = sorted(((a - b, m) for (a, m), (b, _) in zip(*sweeps)), reverse=True)[:8]
+        summary += f"second={sum(t for t, _ in sweeps[1]):.1f}s first-minus-second "
+    else:
+        slowest = sorted(sweeps[0], reverse=True)[:8]
+        summary += "slowest-first "
+    print(summary + " ".join(f"M={m}:{d:.2f}s" for d, m in slowest), flush=True)
 
 
 class ManifestWorker(Worker):
