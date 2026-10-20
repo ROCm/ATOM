@@ -464,16 +464,29 @@ class PagedAttentionImpl(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        aiter.reshape_and_cache_with_pertoken_quant(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            k_scale,
-            v_scale,
-            attn_metadata.slot_mapping,
-            asm_layout=True,
-        )
+        if self.kv_cache_dtype == "fp8":
+            aiter.reshape_and_cache_with_pertoken_quant(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                attn_metadata.slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            aiter.reshape_and_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
         return q, k, v
 
     def _gather_prefix_and_concat_kv(
