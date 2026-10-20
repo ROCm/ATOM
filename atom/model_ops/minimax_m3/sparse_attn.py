@@ -1416,6 +1416,41 @@ def _sparse_unified_per_row(
     )
 
 
+def _sparse_flydsl_takes(
+    q_view, k_cache_view, v_cache_view, sparse_bt, sparse_ctx, k_cache
+):
+    """Whether run_pa_decode would run FlyDSL for these rows.
+
+    Same arguments as the call in _sparse_pa_per_row. Rows it refuses (for
+    example a prefill past the FlyDSL planner's batch limit) go to unified
+    attention on a GPU without gluon decode.
+    """
+    from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+
+    from atom.model_ops.base_attention import flydsl_decode_seqs
+
+    is_fp8 = _is_fp8_kv_cache_tensor(k_cache)
+    return bool(
+        flydsl_decode_seqs(
+            output=q_view,
+            q=q_view,
+            k_cache=k_cache_view,
+            v_cache=v_cache_view,
+            block_tables=sparse_bt,
+            context_lens=sparse_ctx,
+            max_seqlen_q=1,
+            max_context_partition_num=get_recommended_splits(q_view.shape[0], 1),
+            context_partition_size=256,
+            compute_type=aiter.dtypes.fp8 if is_fp8 else torch.bfloat16,
+            q_scale=None,
+            alibi_slopes=None,
+            sinks=None,
+            sliding_window=-1,
+            ps=True,
+        )
+    )
+
+
 @torch.no_grad()
 def _sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1474,7 +1509,10 @@ def _sparse_pa_per_row(
     ):
         return
 
-    if not gluon_decode_supports_arch():
+    # Without gluon decode (gfx1250), FlyDSL takes the rows it accepts.
+    if not gluon_decode_supports_arch() and not _sparse_flydsl_takes(
+        q_view, k_cache_view, v_cache_view, sparse_bt, sparse_ctx, k_cache
+    ):
         _sparse_unified_per_row(
             q_view,
             k_cache_view,
