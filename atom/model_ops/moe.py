@@ -85,6 +85,7 @@ from atom.quant_spec import (
 )
 from atom.quantization.quark.utils import (
     dequant_moe_weight_online,
+    dequant_mxfp8,
     dequant_weight_online,
     dequantize_nvfp4,
     quant_weight_online,
@@ -3383,6 +3384,25 @@ class FusedMoE(torch.nn.Module):
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
         )
 
+        # MXFP4 routed experts fused with an MXFP8 shared expert, which the
+        # fusion decision allows only under ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4
+        # (the Quark MXFP4 export of MiniMax-M3.1): stage the shared expert in
+        # MXFP8 and re-quantize it into its MXFP4 slot after loading.
+        self.stage_shared_mxfp8 = False
+        if (
+            num_fused_shared_experts
+            and layer_quant_config is not None
+            and layer_quant_config.quant_type == QuantType.per_1x32
+            and layer_quant_config.quant_dtype == dtypes.fp4x2
+        ):
+            shared_spec = quant_config.get_layer_quant_config(
+                shared_expert_prefix, check_children=True
+            )
+            self.stage_shared_mxfp8 = (
+                shared_spec.quant_type == QuantType.per_1x32
+                and shared_spec.quant_dtype == dtypes.fp8
+            )
+
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
         num_redundant_experts = (
             int(getattr(atom_config.eplb_config, "num_redundant_experts", 0))
@@ -3622,6 +3642,10 @@ class FusedMoE(torch.nn.Module):
         )
         self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
+        if self.stage_shared_mxfp8:
+            self._alloc_staged_shared_mxfp8(
+                hidden_size, self.intermediate_size_per_partition
+            )
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -3708,7 +3732,141 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
+        self._fuse_staged_shared_into_mxfp4()
         self._validate_moe_backend()
+
+    _STAGED_SHARED_MXFP8_TENSORS = (
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
+    )
+
+    def _alloc_staged_shared_mxfp8(self, hidden_size: int, inter: int) -> None:
+        """Staging for a fused shared expert the checkpoint ships in MXFP8 while
+        the routed buffers hold MXFP4 (ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4). Plain
+        tensors, not parameters: weight_loader redirects the shared slot's
+        arrivals here, and the fused slot is filled from them after loading."""
+        n_shared = self.num_fused_shared_experts
+        device = self.w13_weight.device
+        f8, u8 = torch.float8_e4m3fn, torch.uint8
+        self.staged_shared_mxfp8 = {
+            "w13_weight": torch.empty(
+                n_shared, 2 * inter, hidden_size, dtype=f8, device=device
+            ),
+            "w13_weight_scale": torch.empty(
+                n_shared, 2 * inter, hidden_size // 32, dtype=u8, device=device
+            ),
+            "w2_weight": torch.empty(
+                n_shared, hidden_size, inter, dtype=f8, device=device
+            ),
+            "w2_weight_scale": torch.empty(
+                n_shared, hidden_size, inter // 32, dtype=u8, device=device
+            ),
+        }
+        self.staged_shared_mxfp8_loaded = set()
+
+    def _load_staged_shared_mxfp8(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+    ) -> bool:
+        """Stage one MXFP8 shared-expert tensor of an MXFP4 MoE.
+
+        Returns whether ``expert_id`` (local) is the fused shared slot; its
+        arrivals never touch the MXFP4 buffers. Weights and E8M0 scales are
+        TP-sharded like any per_1x32 expert tensor.
+        """
+        shared_lo = self.expert_layout.routed_physical_per_rank
+        if expert_id < shared_lo:
+            return False
+        name = next(
+            (n for n in self._STAGED_SHARED_MXFP8_TENSORS if getattr(self, n) is param),
+            None,
+        )
+        if name is None:
+            raise ValueError(
+                f"{self.layer_name}: unexpected fused MXFP8 shared-expert tensor "
+                f"for expert {expert_id} (shard {shard_id!r})."
+            )
+        if shard_id not in ("w1", "w2", "w3"):
+            raise ValueError(f"shard_id must be w1/w2/w3, got {shard_id!r}.")
+        self._load_model_weight_or_group_weight_scale(
+            shard_dim=expert_shard_dim(shard_id, False),
+            expert_data=self.staged_shared_mxfp8[name][expert_id - shared_lo],
+            shard_id=shard_id,
+            loaded_weight=loaded_weight,
+            tp_rank=self.tp_rank,
+        )
+        self.staged_shared_mxfp8_loaded.add((name, expert_id, shard_id))
+        return True
+
+    def _fuse_staged_shared_into_mxfp4(self) -> None:
+        """Fill the fused shared slot of an MXFP4 MoE from its staged MXFP8
+        checkpoint weights (ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4).
+
+        Runs after loading and before the quant method's own post-processing
+        (shuffle) covers every expert: each shared expert is dequantized MXFP8 ->
+        bf16 and quantized to MXFP4 with the online quantizer, its gate/up halves
+        laid out as the routed experts' (``[0, I)`` and ``[half, half + I)``)."""
+        staged = getattr(self, "staged_shared_mxfp8", None)
+        if staged is None:
+            return
+        shared_lo = self.expert_layout.routed_physical_per_rank
+        expected = {
+            (name, shared_lo + i, shard)
+            for i in range(self.num_fused_shared_experts)
+            for name, shards in (
+                ("w13_weight", ("w1", "w3")),
+                ("w13_weight_scale", ("w1", "w3")),
+                ("w2_weight", ("w2",)),
+                ("w2_weight_scale", ("w2",)),
+            )
+            for shard in shards
+        }
+        missing = expected - self.staged_shared_mxfp8_loaded
+        if missing:
+            raise RuntimeError(
+                f"{self.layer_name}: fused MXFP8 shared expert tensors were not "
+                f"loaded from the checkpoint: {sorted(missing)}"
+            )
+        del self.staged_shared_mxfp8, self.staged_shared_mxfp8_loaded
+        self.stage_shared_mxfp8 = False
+
+        def quant_weight(w):
+            return quant_weight_online(
+                w, online_quant_type=QuantType.per_1x32, online_quant_dtype=dtypes.fp4x2
+            )
+
+        for i in range(self.num_fused_shared_experts):
+            expert_id = shared_lo + i
+            w13 = dequant_mxfp8(
+                staged["w13_weight"][i], staged["w13_weight_scale"][i]
+            ).to(torch.bfloat16)
+            w13_dst = self.w13_weight.data[expert_id]
+            w13_scale_dst = self.w13_weight_scale.data[expert_id]
+            half, dst_half = w13.shape[0] // 2, w13_dst.shape[0] // 2
+            for src_off, dst_off in ((0, 0), (half, dst_half)):
+                q, sc = quant_weight(w13[src_off : src_off + half])
+                self._copy_quant_storage(
+                    w13_dst[dst_off : dst_off + q.shape[0], : q.shape[1]], q
+                )
+                self._copy_quant_storage(
+                    w13_scale_dst[dst_off : dst_off + sc.shape[0], : sc.shape[1]], sc
+                )
+            del w13
+            w2 = dequant_mxfp8(staged["w2_weight"][i], staged["w2_weight_scale"][i]).to(
+                torch.bfloat16
+            )
+            q, sc = quant_weight(w2)
+            self._copy_quant_storage(
+                self.w2_weight.data[expert_id, : q.shape[0], : q.shape[1]], q
+            )
+            self._copy_quant_storage(
+                self.w2_weight_scale.data[expert_id, : sc.shape[0], : sc.shape[1]], sc
+            )
 
     def _validate_moe_backend(self) -> None:
         if get_current_atom_config().moe_backend != "mega":
@@ -4899,6 +5057,10 @@ class FusedMoE(torch.nn.Module):
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
+            return
+        if getattr(
+            self, "stage_shared_mxfp8", False
+        ) and self._load_staged_shared_mxfp8(param, loaded_weight, shard_id, expert_id):
             return
         if is_nvfp4 and self._load_nvfp4_global_scale(
             param, loaded_weight, shard_id, expert_id

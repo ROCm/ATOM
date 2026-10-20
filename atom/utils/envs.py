@@ -864,6 +864,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4
+    # export of MiniMax-M3.1) by re-quantizing the shared expert MXFP8 -> MXFP4
+    # at load, so the MoE runs as one 129-expert / top-5 fused MoE. Off by
+    # default: the shared expert, which every token uses, then carries MXFP4
+    # rounding error. Without it the shared expert stays an MXFP8 MLP.
+    "ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4": lambda: (
+        os.getenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", "0") == "1"
+    ),
     # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
     # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
     # dispatcher, so this moves V2/V3.2/K3 too. See docs.
