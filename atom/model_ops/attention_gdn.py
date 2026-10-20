@@ -540,25 +540,32 @@ class GatedDeltaNet(nn.Module):
                 )
 
                 h = flydsl_h if use_flydsl_prefill else pop_last_intermediate_states()
-                if h is not None:
-                    # One launch for both halves. `conv_state` is
-                    # [slot, conv_dim, state_len] by here (see the transpose
-                    # above) and shares `slots` with the SSM half, so the two
-                    # always describe the same token position.
-                    write_state_checkpoints(
-                        h,
-                        ssm_state,
-                        mixed_qkv_non_spec,
-                        conv_state,
-                        ckpt["rows"],
-                        ckpt["slots"],
-                        ckpt["offs"],
-                        ckpt["is_end"],
-                        ckpt["runtime"],
-                        gdn_metadata.ssm_chunk_offsets,
-                        non_spec_query_start_loc,
-                        CHUNK_SIZE,
+                # Raise rather than skip: the scheduler publishes every target
+                # after this forward, written or not.
+                if h is None:
+                    raise RuntimeError(
+                        "GDN state checkpoints reserved but the prefill kernel "
+                        "kept no intermediate states to copy them from"
                     )
+                # One launch for both halves. `conv_state` is
+                # [slot, conv_dim, state_len] by here (see the transpose
+                # above) and shares `slots` with the SSM half, so the two
+                # always describe the same token position.
+                write_state_checkpoints(
+                    h,
+                    ssm_state,
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    ckpt["rows"],
+                    ckpt["slots"],
+                    ckpt["offs"],
+                    ckpt["is_end"],
+                    ckpt["runtime"],
+                    gdn_metadata.ssm_chunk_offsets,
+                    non_spec_query_start_loc,
+                    CHUNK_SIZE,
+                    gdn_metadata.ssm_conv_state_len,
+                )
         elif gdn_metadata.num_decodes > 0 and use_replayssm:
             nd = gdn_metadata.num_decodes
             core_attn_out_non_spec = replayssm_gated_delta_rule(

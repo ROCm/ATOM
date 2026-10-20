@@ -217,6 +217,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.block_table_cols,
             self.device,
             pages=self._page_bound(model_runner.config.gpu_memory_utilization),
+            # A candidate-consuming layer's plane is as wide as the candidate
+            # list, which the checkpoint fixes and `max_model_len` does not
+            # bound. Short contexts make it the widest plane in the model.
+            candidate_blocks=int(getattr(self.config, "candidate_topk_blocks", 0) or 0),
         )
         logger.info(
             "V4.1 score workspace: %s logits, %.2f GiB",

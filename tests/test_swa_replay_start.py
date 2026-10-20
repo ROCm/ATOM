@@ -165,7 +165,11 @@ def test_a_backed_off_forward_places_checkpoints_from_where_it_resumed():
         return 0
 
     scheduler = SimpleNamespace(
-        block_manager=SimpleNamespace(checkpoint_cut=checkpoint_cut),
+        block_manager=SimpleNamespace(
+            checkpoint_cut=checkpoint_cut,
+            # not a midstep-readable class: an uncut chunk keeps its length
+            align_midstep_chunk=lambda seq, start, chunk: chunk,
+        ),
         _requires_atomic_prefill=lambda seq: False,
     )
     seq = SimpleNamespace(replay_until=6784, replays_hit=False, state_fork_src=-1)
