@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792430405480,
+  "lastUpdate": 1792515017252,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4275,6 +4275,57 @@ window.BENCHMARK_DATA = {
             "value": 0.8946,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39284621096 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610191501 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1676 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "junyyang-amd",
+            "username": "junyyang-amd",
+            "email": "junyyang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "e875ed3e3379b96f08b25589733c2a898d3b2245",
+          "message": "ci(atomesh): stabilize MI350 Spur P/D benchmarks (#2648)\n\n* ci(atomesh): use /data/junyyang/models as MI350 model root for debugging\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): only stop stale containers in Spur pre-cleanup\n\nSpur can co-schedule several jobs on one node despite --exclusive. The\nblanket docker stop in pre_cleanup_local killed the workers of jobs that\nstarted earlier on the same node (SIGKILL, rc=137). Stop only this job's\nleftovers and atomesh containers whose job squeue no longer reports.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): drop unreachable fabric-8 from MI350 node lists\n\nfabric-8 does not answer SSH while Spur still reports it IDLE, so workers\ndispatched there never start and the job fails with exit code 127.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): dispatch Spur workers from a single batch copy\n\nSpur sometimes runs the batch script on every allocated node. Each copy\ndispatched its own srun, so two workers per rank raced on the same\ncontainer name: one docker run failed with a name conflict (rc=125) and its\ncleanup killed the other (rc=137). Take an atomic mkdir lock on the shared\nRUN_DIR so only one copy dispatches; the others stay alive and exit with\nthe dispatcher's rc, falling back to the per-rank rc files.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): cap GLM LMCache CPU tier at 210 GiB/rank on MI350\n\nSpur MI350X hosts have 1007 GiB per NUMA node and GPUs 0-3 share NUMA0,\nso four prefill ranks at 256 GiB/rank plus MoE staging buffers exceed the\nnode and the last rank is OOM-killed (exitcode=-9).\n\nAdd env_by_runner to pd_matrix so model/suite env can be overridden per\nslurm submit runner, and set LMCACHE_MAX_LOCAL_CPU_SIZE=210 for GLM-5.2\nprefill on atomesh-cicd-mi350. MI355X keeps 256.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): re-extract corrupt cargo registry sources and retry mesh build\n\nCargo never re-extracts a crate whose .cargo-ok marker exists, so an\nextraction cut short leaves registry/src broken for every later build in\nthat host's mesh cache (fabric-14: foreign-types-0.3.2 has only\nCargo.toml, failing every router build there with 'no targets specified\nin the manifest').\n\nWhen the failed build log points into registry/src, drop it (cargo\nregenerates it from registry/cache) and build once more. Ordinary compile\nerrors still fail after a single attempt.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* ci(atomesh): harden MI350 mesh retry, LMCache 160, and node pool\n\nRun 38693548309 showed the first mesh retry only cleared registry/src;\nthe second pass then failed on stale target/release/build outputs on all\n15 retried hosts. Wipe the profile target dir with registry/src and\nalways retry once.\n\nGLM LMCache at 210 still overflowed NUMA0 because MoE staging alone is\n~360 GiB for cpp4; cap prefill LMCACHE_MAX_LOCAL_CPU_SIZE at 160 on\natomesh-cicd-mi350. Drop fabric-5/15 from the default Spur candidate\npool, and fail Spur workers early when VRAM is already occupied.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: register GLM LMCache decode KV on every HCA\n\nSingle-node and packed GLM LMCache cells run prefill on GPUs 0-3 and decode\non GPUs 4-7. Their decode registered KV only on its own rail (ionic_4-7), and\nSpur MI350X rails do not route to each other, so every P->D Mooncake handshake\ntimed out (QP->RTR) and all requests failed. Enable ib_enable_alternate_hca so\nMC_ENABLE_DEST_DEVICE_AFFINITY can land each write on the prefill GPU's rail,\nas the GLM TP4 single-node cell and the Mooncake RDMA smoke test already do.\nThe mooncake_store suite keeps its existing decode config.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: preflight Spur GPUs and resubmit away from busy nodes\n\nSpur ignores --exclusive and keeps placing jobs on nodes whose GPUs another\njob holds, while other candidates sit idle. The per-rank VRAM check then\nfailed the cell outright, and in multi-node jobs the healthy rank waited\n90 min for a peer that had already exited.\n\nRun the check as a preflight srun step on every node before any worker\nstarts, after letting stopped containers release VRAM for up to 90 s. Busy\nhosts are recorded in gpu-busy/, and pd_submit.sh resubmits without them,\nor waits and retries the full pool when too few candidates remain (6\nattempts by default).\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* tests: cover the Spur GPU preflight step\n\nThe fake srun allowed one call per job, so the preflight srun broke every\nbatch dispatch test. Record preflight calls separately, and check that the\npreflight spans every node, that a failed preflight starts no worker, and\nthat a busy GPU host is recorded for resubmission.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: cap runaway container logs and skip oversized logs in results copy\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: one Mooncake QP per endpoint for MI350 GLM cpp4-dcp4 P/D\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: wait up to 300 s for VRAM to drain before marking a Spur node busy\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: single Mooncake worker per context for MI350 GLM cpp4-dcp4 P/D\n\nOne QP per endpoint alone still hit ionic \"wqe is not posted\" under DCP4\nload. With MC_WORKERS_PER_CTX=1, MC_MAX_WR=64 and PCIe relaxed ordering off\nthe c48 cell runs through warmup and profiling with no CQ errors.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n* atomesh: mark cap_log.py executable to match its shebang\n\nRuff EXE001 flags a shebang on a non-executable file; the other\natomesh scripts with a shebang are already 100755.\n\nCo-authored-by: Cursor <cursoragent@cursor.com>\n\n---------\n\nCo-authored-by: Cursor <cursoragent@cursor.com>",
+          "timestamp": "2026-10-20T10:37:28Z",
+          "url": "https://github.com/ROCm/ATOM/commit/e875ed3e3379b96f08b25589733c2a898d3b2245"
+        },
+        "date": 1792515016428,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9484,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39456445490 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610201520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9454 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.953,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39456445490 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610201520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.96,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39456445490 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610201520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8999,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39456445490 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610201520 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.2017 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
