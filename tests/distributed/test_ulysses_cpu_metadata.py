@@ -39,7 +39,15 @@ def runner_type():
         for node in runner.body
         if isinstance(node, ast.FunctionDef)
         and node.name
-        in {"sp_local_tokens", "sp_graph_input_ids", "prepare_inputs", "warmup_model"}
+        in {
+            "sp_local_tokens",
+            "sp_graph_input_ids",
+            "prepare_inputs",
+            "warmup_model",
+            # main split these out of the two above; the extracted bodies now call them
+            "warmup_max_tokens",
+            "_verifies_drafts",
+        }
     ]
     module.body = [ast.parse("from __future__ import annotations").body[0], runner]
     namespace = {

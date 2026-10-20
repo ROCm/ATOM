@@ -276,6 +276,8 @@ def test_apply_passes_only_supported_sp_options(
     method.fused_experts = None
     method.use_triton = method.use_triton_decode = method.use_triton_ep = False
     method.is_guinterleave = False
+    # main's Mxfp4MoEMethod.apply reads it; the test bypasses __init__, which is what sets it
+    method.fp8_activations = False
     weights, ids, hidden, output = (object() for _ in range(4))
     input_scale = object() if prequantized else None
     method.select_experts_with_record = Mock(return_value=(weights, ids))

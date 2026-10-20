@@ -1652,7 +1652,7 @@ class GemmFusionConfig:
 
     def __post_init__(self):
         if not isinstance(self.profile, str):
-            raise ValueError("gemm_fusion.profile must be a string")
+            raise TypeError("gemm_fusion.profile must be a string")
 
     @property
     def enabled(self) -> bool:
@@ -2904,12 +2904,19 @@ class Config:
         # flag below.
         factors.append(self.prefill_context_parallel_size)
         # SP and PCP use the same rank dimension but different head shapes.
-        factors.append(self.sequence_parallel_size)
+        # getattr below: the fields this branch ADDED to the key read with their neutral default, so
+        # the minimal config stand-ins the cache-key tests build (and any caller that predates
+        # the SP series) still hash; a real Config always has them, so its key is unchanged.
+        factors.append(getattr(self, "sequence_parallel_size", 1))
         if getattr(self, "m3_tp_replicated_o_proj", False):
             factors.append("m3_tp_replicated_o_proj_v2")
         # Expert layout and transport also change compiled shapes/subgraphs.
         factors.append(
-            (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)
+            (
+                getattr(self, "enable_expert_parallel", False),
+                getattr(self, "moe_all2all_backend", None),
+                getattr(self, "moe_backend", None),
+            )
         )
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
@@ -2972,15 +2979,16 @@ class Config:
         factors.append(
             None if spec is None else (spec.method, spec.num_speculative_tokens)
         )
-        if self.sequence_parallel_size > 1:
+        if getattr(self, "sequence_parallel_size", 1) > 1:
             # Automatic FP8 dispatch changes the attention output schema to
             # (activation, scale). Do not reuse graphs from older SP paths.
             factors.append("ulysses_sp_v2")
-        if self.gemm_fusion.enabled:
+        gemm_fusion = getattr(self, "gemm_fusion", None)
+        if gemm_fusion is not None and gemm_fusion.enabled:
             # An enabled profile moves the QKV GEMM inside the attention op
             # and changes its schema; never share artifacts with the OFF path.
             # Appended only when ON so OFF hashes stay byte-identical.
-            factors.append(("gemm_fusion", self.gemm_fusion.profile))
+            factors.append(("gemm_fusion", gemm_fusion.profile))
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False
