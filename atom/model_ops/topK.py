@@ -5,12 +5,36 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
+from aiter import QuantType, dtypes
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
 from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
+
+
+def _same_weight_format(a, b) -> bool:
+    return (
+        a.quant_dtype == b.quant_dtype
+        and a.quant_type == b.quant_type
+        and a.is_dynamic == b.is_dynamic
+    )
+
+
+def _mxfp8_shared_into_mxfp4(shared, routed) -> bool:
+    """Opt-in fusion of an MXFP8 shared expert into MXFP4 routed experts.
+
+    FusedMoE then re-quantizes the shared expert to MXFP4 at load, which costs
+    accuracy -- hence ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4, off by default.
+    """
+    return (
+        envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4
+        and shared.quant_type == QuantType.per_1x32
+        and shared.quant_dtype == dtypes.fp8
+        and routed.quant_type == QuantType.per_1x32
+        and routed.quant_dtype == dtypes.fp4x2
+    )
 
 
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
@@ -58,11 +82,11 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
             if routed_expert_prefix is not None
             else quant_config.global_quant_config
         )
-        return (
-            shared_spec.quant_dtype == routed_spec.quant_dtype
-            and shared_spec.quant_type == routed_spec.quant_type
-            and shared_spec.is_dynamic == routed_spec.is_dynamic
-        )
+        if _same_weight_format(shared_spec, routed_spec):
+            return True
+        # MXFP4 routed experts next to an MXFP8 shared expert (MiniMax-M3.1
+        # Quark MXFP4 export): opt-in, re-quantized at load.
+        return _mxfp8_shared_into_mxfp4(shared_spec, routed_spec)
 
     # Resolve actual dtypes for shared experts vs routed experts.
     # Find a representative shared expert entry from the exclude list to
