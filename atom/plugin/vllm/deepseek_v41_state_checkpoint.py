@@ -345,6 +345,8 @@ class DeepseekV41StateCheckpointAdapter(PagedStateCheckpointAdapter):
     block_size = 256
     backend_cls = AtomDeepseekV41StateCheckpointBackend
     state_checkpoint_drafters = "no drafter, or speculative method 'dspark'"
+    # Under speculation a hit leaves two tokens (`V41BoundaryPlanner`).
+    speculative_prefill_tail = 2
 
     @property
     def proxy_layer_name(self) -> str:
