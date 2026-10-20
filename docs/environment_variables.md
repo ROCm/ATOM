@@ -2,6 +2,12 @@
 
 This document describes the environment variables used in the ATOM project.
 
+## Metadata H2D
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_H2D_BACKEND** | str | `packed` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
+
 ## Data parallelism
 
 | Variable | Type | Default | Description |
@@ -13,6 +19,9 @@ This document describes the environment variables used in the ATOM project.
 | **ATOM_DP_MASTER_PORT** | int | 29500 | Master port for DP ranks coordination. |
 | **ATOM_DP_LB_REQ_EQUIV** | int | 512 | Token-equivalent decode pressure assigned to each in-flight request by `least_tokens` routing. |
 | **ATOM_DP_SESSION_AFFINITY** | bool | false | Load-place each new session, then keep later turns on the same prefix-cache owner. Reads `X-Dynamo-Session-ID`, falling back to `X-Correlation-ID`. |
+| **ATOM_DP_PREFILL_BALANCE_TOKEN_WEIGHT** | int | 360000 | DP prefill cost balancing (always on under DP attention with more than one rank; needs the prefill delayer): each lockstep prefill step aims at min(costliest, mean x (1 + slack)) of the ranks' estimated chunk costs, and a costlier rank takes fewer tokens. This is the per-token term of the chunk cost, in attended-context tokens: cost = new tokens x (weight + prior context + new / 2). |
+| **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
+| **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 
@@ -69,6 +78,18 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_PREFILL_DELAYER_DEBUG** | bool | false | Per-tick FIRE/HOLD debug logging. |
 | **ATOM_PREFILL_DELAYER_LOG_EVERY** | int | 1000 | Emit aggregate stats (per-exit fire counts + hold rate) every N decisions (0 disables). |
 
+## Dynamic chunking
+
+Interpolates pipeline-parallel chunk sizes between the configured batch budget
+and the equal-latency size solved from the calibrated chunk model. Used when
+neither `--dynamic-chunking-smooth-factor` nor `Config.dynamic_chunking_smooth_factor`
+is given, and read only when dynamic chunking is enabled, so a malformed value
+cannot affect a server that does not use the feature.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_DYNAMIC_CHUNKING_SMOOTH_FACTOR** | float | 0.75 | Blend from the initial chunk (`0`) to the equal-latency chunk (`1`). Must be in `[0, 1]` when dynamic chunking is enabled. |
+
 ## Model loading
 
 | Variable | Type | Default | Description |
@@ -76,8 +97,8 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_DISABLE_MMAP** | bool | false | If set to `true`, disable memory-mapped file loading for model weights. Useful in containerized environments where mmap may cause issues. |
 | **ATOM_LOADER_NUM_THREADS** | int | 16 | Worker threads for weight loading. `>1` (default `16`) enables the batched parallel loader (routed expert weights staged in a CPU buffer, flushed with a single H2D copy when every routed expert of that parameter has arrived) with that many threads; set to `1` to fall back to the original sequential per-expert path. Raise on high-core hosts if loading is CPU-bound. |
 | **ATOM_LOADER_STRICT_COVERAGE** | bool | `true` | Fail loading when a fused MoE parameter does not receive every routed expert from the checkpoint. Set to `false` to downgrade to a warning and load anyway, leaving those expert slots at their init values — useful when bringing up a checkpoint known to be partial, misleading otherwise (the symptom is an accuracy drop much later). |
-| **ATOM_LOADER_PREFETCH** | bool | `true` | Warm the page cache by reading this rank's share of the checkpoint sequentially on a background thread, instead of leaving it to demand faults through the mmap. The fault pattern sustains ~3.2 GB/s on a local NVMe that a single sequential reader drives at 6.06 GB/s, so this is an access-pattern fix, not a queue-depth one. Measured on DeepSeek-R1 MXFP4 (350 GiB, TP=4): cold load 154s → 69s. Set to `false` to restore demand faulting. Has no effect when `ATOM_DISABLE_MMAP=true`. |
-| **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
+| **ATOM_LOADER_PREFETCH** | bool | `true` | Warm the page cache by reading this rank's share of the checkpoint sequentially on a background thread, instead of leaving it to demand faults through the mmap. The fault pattern sustains ~3.2 GB/s on a local NVMe that a single sequential reader drives at 6.06 GB/s, so this is an access-pattern fix, not a queue-depth one. Measured on DeepSeek-R1 MXFP4 (350 GiB, TP=4): cold load 154s → 69s. Set to `false` to restore demand faulting. Also applies with `ATOM_DISABLE_MMAP=true`, whose whole-file reads go through the same page cache (DeepSeek-V4.1-Flash, TP=4, cold: 282–315s without it, 169–207s with it). |
+| **ATOM_LOADER_PREFETCH_THREADS** | int | 4 | Concurrent sequential readers per rank used by the prefetcher. The device saturates at ~2 streams, so raising this mostly adds contention with the loader; `0` is clamped to `1` (use `ATOM_LOADER_PREFETCH=false` to switch prefetching off). |
 | **ATOM_LOADER_PREFETCH_BLOCK_MB** | int | 16 | Read block size for the prefetcher, in MiB. |
 | **ATOM_LOADER_FADVISE** | bool | `false` | Issue `posix_fadvise(SEQUENTIAL\|WILLNEED)` per shard before reading it. Off by default and ignored while `ATOM_LOADER_PREFETCH` is on: `WILLNEED` is a hint the kernel drops for most of a 350 GiB checkpoint, and running both makes the kernel read ahead over random-ish ranges while the prefetcher streams the same files, so the two compete for the device. Only useful with prefetching disabled. |
 | **ATOM_ONLINE_QUANT_STREAMING** | bool | `false` | Opt in to quantizing eligible online-quant modules as soon as their checkpoint weights are complete, then release source storage to reduce load-time peak memory. Only active with a valid online quantization config. See the [streaming online quantization guide](./online_quantization_streaming_guide.md). |
@@ -89,17 +110,24 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
+| **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
 
 ## Kernel / backend selection
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_USE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 weight preshuffled GEMM. Otherwise use AITER ASM FP4 weight preshuffled GEMM. |
+| **ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE** | bool | unset (per checkpoint) | E8M0 rather than FP32 128x128 FP8 block scales, for the weight and the activation quantized for it; on gfx950 E8M0 operands take the AITER FlyDSL GEMM. Unset: E8M0 on every arch but gfx942 when the checkpoint declares `scale_fmt: ue8m0` (DeepSeek-V4), whose power-of-two scales E8M0 restates exactly; FP32 otherwise. `1`/`0` force it on/off; forcing it on for a checkpoint with non-power-of-two FP32 scales rounds them. |
+| **ATOM_GROUP32_WEIGHT_PRESHUFFLE** | bool | 1 (true) | On gfx950, (16, 16)-shuffle native FP8 32x32 group32 weights (DeepSeek-V4.1) at load and after a weight sync, so AITER's preshuffled group32 GEMM (FlyDSL) reads them; that GEMM emits BF16 only. Set to `0` to keep checkpoint bytes and the row-major group32 GEMM. V4.1's grouped `wo_a` is shuffled either way. |
 | **ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM** | bool | 0 (false) | If set to `1`, use AITER Triton FP4 GEMM with non-shuffled weights. Takes precedence over the FP4 preshuffled GEMM path selected by `ATOM_USE_TRITON_GEMM`. |
 | **ATOM_MHC_USE_BF16** | bool | 1 (true) | Use AITER BF16 hi/lo mHC computation for attention, FFN and head. After loading, replace FP32 fn storage with `mhc_shuffle_fn` output; no FP32 copy is retained. Set to `0` for FP32 mHC. Takes effect at model load; restart to change modes. On gfx1250, AITER enables shuffled residuals only while its runtime `mhc_fused_post_pre` policy remains fused (`M < 1024`); larger M uses ordinary residual layout and the standalone post/pre fallback. |
 | **ATOM_USE_TRITON_MXFP4_BMM** | bool | 0 (false) | If set to `1`, use FP4 BMM in MLA attention module. |
 | **ATOM_USE_FLYDSL_GATHER_KV_B_PROJ** | bool | 1 (true) | Use the FlyDSL fused gather + `kv_b_proj` GEMM for MLA's cached-prefix path. Covers page_size-1 fp8 (e4m3) KV with an fp8 weight on gfx950 — i.e. Kimi-K3 / DeepSeek MLA under `--kv-cache-dtype fp8`. Unavailable imports or unsupported tensor configurations use Triton; kernel execution errors propagate. Set `0` to force Triton. |
 | **ATOM_USE_FLYDSL_FP8_PREFILL_ATTN** | bool | 0 (false) | Enable FlyDSL FP8 MLA prefill on gfx950, including fused K concatenation with QKV quantization and direct FP8 output from FlyDSL gather where supported. AITER capability checks are cached per layer. Missing FP8 attention support or unsupported device/model configurations select BF16 attention before quantization and emit a warning once per process. FP16 activations and synthetic RoPE-padding configurations also use the normal attention path. Cached K/V reuse descales `max(new_token_descale, 1e-6) * 2`; larger outliers saturate. Unsupported FP8 gather configurations use BF16 gather followed by fused K/V dynamic quantization when FP8 attention is supported. Kernel execution errors propagate without retry. Added 2026-09-10. |
+| **ATOM_PA_FLYDSL** | bool | 0 (false) | Route the MHA paged decode to aiter's FlyDSL kernel, with its work planner, instead of gluon. Shapes outside FlyDSL's domain, calls over 4096 sequences and calls whose context bound is below the query window fall back to gluon. Applies to the vLLM bridge too. **Needs aiter with #5809**; upgrade ATOM and aiter together. Plans use aiter's default workgroup budget (2×CU) and partition ceiling (CU count), except at head_dim 256 (Qwen3.5), where they use 64 partitions and a 256-workgroup budget to keep aiter's head-256 reducer on its fast path (until aiter #5949). In native ATOM, captured batch sizes use a plan built by the metadata builder (shared by target and EAGLE draft); other calls, and every vLLM bridge call, get a runtime plan, and a new row count compiles the planner once. Other native dense plans use aiter's default partition ceiling; MiniMax-M3 sparse and the vLLM bridge keep their static split count. MiniMax-M3 sparse decode refreshes its plan once per step. `ATOM_PA_FLYDSL_PLAN` was removed and is ignored with a warning. |
+| **ATOM_V4_HCA_PERSIST** | bool | 1 (true) | DeepSeek-V4 HCA (`compress_ratio` 128) fp8 decode through aiter's persistent V4-NM kernel (`aiter.mla.mla_decode_fwd_v4_nm_ps`): one launch that splits the KV on the GPU and merges in-kernel, instead of the decode ASM plus a host-built split plan. Taken only with fp8 KV, 128 local heads, gfx950, row-dense KV pools and `ATOM_V4_HCA_PERSIST_MIN_ROWS <= rows <= 32768`; everything else stays on the ASM path. An aiter without the kernel keeps the ASM path (logged once). One workspace per device (about 64 MiB) is allocated at model load, before KV sizing and CUDA-graph capture. Set `0` to force the ASM path. |
+| **ATOM_V4_HCA_PERSIST_MIN_ROWS** | int | 15 | Smallest decode call (q rows) that uses `ATOM_V4_HCA_PERSIST`; smaller calls stay on the ASM path. |
+| **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 
 ### GLM-5.3
 
@@ -108,6 +136,31 @@ make duplicate prefill useful. Pure-attention models do not use checkpoint waits
 | **ATOM_GLM5_KPOOL** | bool | 1 (true) | Enable the pooled sparse indexer. Setting `0` is an exact token-granular A/B only at or below `index_topk`; longer requests are refused. |
 | **ATOM_GLM5_FORCE_DENSE_MLA** | bool | 0 (false) | Disable sparse MLA for short-context bring-up comparisons. |
 | **ATOM_GLM5_DISABLE_FUSED_MHC** | bool | 0 (false) | Force the PyTorch mHC reference path instead of AITER's fused kernels. |
+
+### Native model decode
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, and DeepSeek-V4.1 deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. |
+
+### MiniMax-M3
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_MONO_CHECK** | bool | 0 (false) | Debug aid for `ATOM_MONO_ENABLE`. MiniMax-M3: the dense layers run mono and then the original modules, compared where they hand the first sparse layer its input; every sparse layer also runs the original decoder layer on the same input (after the mono layer, so mono reads only the cache entries it inserted) and rank 0 logs the per-layer, per-token difference of the residual and of the reduced output. DeepSeek-V4.1: K2a and K2b are launched apart and every layer's kernel outputs are compared with the original modules run on the same inputs (K1: seam, query, window row, indexer query / weights; the indexer's selection and candidate blocks against the original scorer; K2a: its inverse-RoPE quant, `wo_a`, residual and FFN seam; K2b: router logits and the reduced MoE output, the reference also run twice to show its own run-to-run change), logged on rank 0 as the fraction of differing elements, the largest difference and the relative error (`atom/mono/runtime/compare.py`; MiniMax-M3 logs the same three). Run it with `--enforce-eager`. |
+| **ATOM_MONO_TRACE** | path | unset | Debug aid for `ATOM_MONO_ENABLE`: rank 0 appends every mono step's input tokens, positions, top-2 logits and greedy pick to this file (one JSON line per step), with a fingerprint of every stage (dense layers, each sparse layer's output, the cache history it reads). Two runs of the same prompt then align token by token. Run it with `--enforce-eager`. |
+| **ATOM_MONO_DEBUG** | bool | 0 (false) | Debug aid for `ATOM_MONO_ENABLE`: the mono kernels are built with bounded mailbox waits. A wait still unmet after 10 s gives up and records its region, pair index, expected and seen tags and CTA; at the end of the step the runner raises with every record (a region recorded by its `region_id`, the CRC-32 of its name, and reported by name: the kernels' hand-off tables; DeepSeek-V4.1 adds its kernels' scratch regions, the peer regions and K2's readiness flags) instead of the GPU hanging on a peer or stage that never delivers; the step's peer fence (`atom/mono/runtime/step_begin.py`, after each zeroing of the peer buffer) likewise gives up and names the ranks that never arrived. Run it with `--enforce-eager`: the records are read after a synchronize, which a graph replay does not run. |
+| **ATOM_MONO_TIMELINE** | path prefix | unset | Debug aid for `ATOM_MONO_ENABLE`: the mono layer kernels are built with their per-phase `s_memrealtime` stamps, each sparse layer into its own buffer, and after 20 warm-up steps of every decode token count S the next 5 steps are saved per rank as `<prefix>_r<rank>_s<S>_<i>.pt` (int64 [layer][CTA][stamp], 100 MHz ticks, 0 = not reached); DeepSeek-V4.1 saves its K1 and K2 stamps apart, as `<prefix>_k1_r...` and `<prefix>_k2_r...` (K2a's points, then K2b's; with `ATOM_MONO_CHECK` `<prefix>_k2a_r...` and `<prefix>_k2b_r...`). Run it with `--enforce-eager`: a graph replay runs no Python. |
+| **ATOM_GLM52_FUSED_INDEXER** | bool | 0 (false) | GLM-5.2 only. Moves the sparse indexer *inside* the mono decode launch on the 18 "full" layers that actually select: index Q/K/W projection, the paged FP8 index-cache update, scoring and the exact top-2048 all run in one kernel instead of `_refresh_indexer`'s separate pass. Off leaves the external-indexer mono path untouched. Requires `--index_cache_dtype fp8` (the default when `--kv_cache_dtype fp8`), `--block-size 16` exactly (the index plane shares `block_tables` with the KV cache), and `--max-model-len` at or under `FUSED_INDEX_MAX_SEQ`, which is **1048576** tokens. 16384 is not a ceiling but the build granularity: `fused_index_capacity()` rounds each deployment UP to a whole 16384-token leaf and builds at that, because the scoring work map is enumerated from the compiled capacity rather than from the request — a 16 k deployment built against a 1 M capacity inflates that table 64x to do identical work (measured: +11.14 % against the external indexer at a 1 M build, -0.09 % at a 16 k build). Anything else is refused by name in `atom.models.glm52.mono.config.fused_indexer_refusal` and falls back to the external indexer unchanged; "shared" layers (57 of 78) never use this kernel either way. |
+| **ATOM_GLM52_INDEXER_CP** | bool | 0 (false) | GLM-5.2 only, and strictly narrower than `ATOM_GLM52_FUSED_INDEXER` — on its own it does nothing. Shards index scoring and selection across the TP ranks inside the fused indexer: each rank scores a contiguous 64-token-aligned shard of the query's live context and the ranks exchange score shards through in-kernel peer mailboxes. Selection stays exact and the index caches stay replicated — CP distributes computation, not storage. Refusals in `atom.models.glm52.mono.config.indexer_cp_refusal`; a refusal leaves the fused indexer running exactly as it does with CP off. |
+
+#### Mono decode routing
+
+**DeepSeek-V4.1** (`atom/models/deepseek_v41/mono/`): two kernels a layer -- K1 (mHC seam, attention norm, q / kv projections, the indexer query) and K2, one launch of K2a (the indexer's scores and top-k at any context length, the sparse decode attention, the output projections and their all-reduce, the FFN seam) then K2b (the MoE and its all-reduce) -- with the compressor and Engram left to the original modules. It routes a decode step of up to 48 rows, however they split into requests (a DSpark verify of any length a request, confidence-scheduled or ragged included, or one token a request without a drafter; each row's window from its own batch id; one kernel build per width) and the DSpark draft's block backbone of up to 8 requests at the full block width (`draft_runner.py`; after a prefill as after a decode), the draft's LM head and Markov sampler unchanged. It needs TP2, TP4 or TP8 without EP (the routed experts sharded across TP; every per-rank width from `kernels/dims.py`; TP8's kernels are compile-checked only, since the original path does not start at TP8), DP / PP / CP 1, no TBO, no plugin mode, FULL cudagraph or eager, bf16 KV and an fp8 or fp4 index cache (fp4: K1 quantizes the indexer query to E2M1 and K2a scores with `index_score_fp4`), no speculative decoding, or DSpark with a request's verify (speculative tokens + 1) of at most 48 rows (another drafter's hooks on the target layers would not fire under mono), `ATOM_DSV41_SIDE_STREAMS=0`, routed experts in A8W4 (MXFP4 weights, MXFP8 activations, gate / up interleaved: checked when the weights bind), at most 1024 attention keys a token (sliding window + index top-k) and the indexer shape the kernels are written for (top-512, 2048 candidate blocks of 8 rows, 32 index heads of 128).
+
+**MiniMax-M3** (`atom/models/minimax_m3/mono/`): decode steps of up to 16 tokens (requests x speculative query tokens; a verify's tokens one row each), dense and sparse layers, Eagle3 aux hidden states included. It needs TP4, ptpc-FP8 attention linears, fp8 KV and index cache, KV block size 128, `max_model_len` up to 1M, no TBO / DP / PP / plugin mode, and FULL cudagraph or eager. A layer that reuses an earlier layer's selection is served, as long as the first sparse layer selects. The same entry class serves both paths.
+
+**GLM-5.2** (`atom/models/glm52/mono/`): the MoE suffix of the layers, at decode widths of 1 token (no speculation) or an MTP verify of 4, 5 or 6, batched 1 or 2. It needs TP4, ptpc-FP8 attention linears, fp8 KV, `ATOM_MLA_PAGE_SIZE=1`, and no DP attention / plugin mode / shuffled MLA cache. Unlike DeepSeek-V4.1 and MiniMax-M3 it does **not** require FULL cudagraph: it routes inside the *uncompiled* outer `GlmMoeDsaForCausalLM` and bypasses the compiled inner `DeepseekV2Model` entirely, so a piecewise-compiled graph of that module never runs underneath mono and cannot conflict with it (`piecewise_cudagraph_required=False`). PIECEWISE — which plugin-mode configs resolve to (`atom/config.py:2393`; the CLI itself defaults `cudagraph_mode` to FULL, `model_engine/arg_utils.py:145`) — is accepted, as is FULL and eager. By default the indexer runs outside the kernel (`_refresh_indexer`); `ATOM_GLM52_FUSED_INDEXER=1` moves it inside the launch on the 18 full layers, with the extra requirements listed in the table above, and `ATOM_GLM52_INDEXER_CP=1` additionally shards its scoring across the four ranks. Which one a width ended up on is named in the `GLM-5.2 MonoKernel on: S=.. chunk=.. indexer=..` line, not inferred.
 
 ## MoE all2all (MoRI) wire format
 
@@ -122,7 +175,21 @@ combine knob as a quality/throughput tradeoff.
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_MORI_FP4_DISPATCH** | bool | 0 (false) | If set to `1`, quantize activations to packed FP4 (E2M1, `per_1x32`) before the MoE all2all instead of sending bf16 — a quarter of the bytes on the dispatch wire — which selects `EpDispatchIntraNodeKernel_fp4`. MoRI picks its dispatch kernel from the dtype of the tensor handed to `dispatch()` but sizes its staging buffers from the config built at init, so this also switches `scale_dim` to `hidden_dim/32` and the scale type to e8m0. All three are resolved together by `mori_prepare_finalize.resolve_mori_dispatch()`; never set one without the others, as a mismatch strides the staging scale buffer wrong and faults on the first real batch instead of erroring cleanly. |
+| **ATOM_MEGA_STAGE2_FUSED** | bool | 1 (true) | Under `ATOM_MORI_V2=1`, run the MoE layer on aiter's `MegaMoEGfx1250` (MegaMoE): the gemm2 epilogue P2P-writes each weighted route into the peers' combine staging, so combine only barriers and sums. `0` falls back to mori's v2 op-layer with plain gather combine. Formerly `ATOM_MORI_V2_FUSED`. |
+| **ATOM_MEGA_STAGE1_FUSED** | bool | 1 (true) | MegaMoE compact stage 1 (aiter `stage1_fused`): routing/layout planning fused with the flydsl TDM dispatch, which writes the grouped GEMM's per-expert rows directly. Only takes effect with `ATOM_MEGA_STAGE2_FUSED=1` and `MEGA_DISPATCH_WIRE=fp8`/`fp4`; a bf16 wire keeps the token-major path. Not supported together with the Triton experts. |
+| **ATOM_MEGA_COMBINE_WIRE** | str | `bf16` | MegaMoE (`ATOM_MEGA_STAGE2_FUSED=1`) combine wire: `bf16`, `fp8` (mxfp8) or `fp4` (mxfp4). Prefill-only: decode steps always combine in bf16, and the choice is DP-agreed so every rank reduces in the same format. |
+| **ATOM_MEGA_DECODE_MTPR** | int | 128 | Capacity (rows per rank) of the small MegaMoEV2 instance that DP-unified decode / verify / draft passes reuse (`ATOM_MEGA_DECODE_FAST_PATH=1`); one of 128, 256, 512, 1024. A pass with more rows falls back to the instance sized for `max_num_batched_tokens`. Size it to cover the DP-padded decode graphs (`running_bs * (num_speculative_tokens + 1)` rows); above 128 the instance stays on aiter's fixed-slot path only if `AITER_MEGA_FIXED_SLOT_MAX_MTPR` admits it (511 / 1023 / 2047), otherwise it runs compact. |
+| **ATOM_MEGA_MASK_PAD_ROWS** | bool | 1 (true) | By default, the MegaMoE backend (`--moe-backend mega`) and the fused MoRI v2 transport (`ATOM_MORI_V2_FUSED=1`, FlyDSL experts) route this rank's DP pad rows (past `scheduled_tokens` on a step padded to the DP group's `running_tokens`) to expert `-1`: they are not dispatched or computed and come back as zeros, so identical pad rows also stop piling onto the same experts. Covers target and draft passes, eager and CUDA graph. With an aiter whose MegaMoEV2 masks `-1` slots in combine (`supports_combine_mask`) the op returns the zeros; otherwise ATOM zeroes only the padded rows with a small Triton kernel. Set to `0` to disable. Not used by plugin frontends. |
 | **ATOM_MORI_COMBINE_QUANT** | str | `none` | Combine-side codec passed into the MoRI config. `none` returns bf16; `fp8_blockwise` selects `EpCombineIntraNodeKernel_*_fp8bwq_*`; MoRI also accepts `fp8_direct_cast`. |
+
+## EPLB
+
+Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
+(`load_window_size`, `rebalance_interval`, `rebalance_min_balancedness`, ...).
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not. The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
 
 ## Fusion passes
 
@@ -166,6 +233,7 @@ materializes two `[B, V]` fp32 tensors that only an `argmax` reads. See
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION** | bool | 0 (false) | If set to `1`, fuse QK norm, RoPE, and cache quantization into one kernel for Qwen3 dense and MoE models. |
+| **ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS** | int | 8192 | With the fusion above on, Gemma-norm models (Qwen3-Next, Qwen3.5) run the q/k norm, RoPE and cache write as separate kernels when a batch has more tokens than this; the fused kernel is slower at prefill sizes. |
 
 ### Llama-style
 
@@ -263,6 +331,21 @@ land. See `atom/model_ops/v4_backend_gate.py` for the selector.
 | **ATOM_V4_BACKEND** | str | `legacy` | `legacy` keeps the per-seq dispatch loop. `new` routes through `V4AttentionBackend`. Layer-restricted by `ATOM_V4_BACKEND_LAYERS` if set. |
 | **ATOM_V4_BACKEND_LAYERS** | csv int | "" (= all) | Comma-separated layer ids that use the new backend (others stay legacy). Empty means: apply `ATOM_V4_BACKEND` uniformly. Used for layer-by-layer bisect during migration (e.g. `0,3,15,30`). |
 
+## Prefix cache lookup
+
+All three default on and move work off the scheduler thread.
+`ATOM_FRONTEND_PREFIX_HASH=0` and `ATOM_PREFIX_WALK_MEMO=0` give the same hits.
+`ATOM_PREFIX_FAST_WALK=0` does not always: the fast walk compares tokens only on the last hit block, so a
+64-bit xxhash chained-hash collision on an interior block reuses another
+prompt's KV with no error (wrong output). `0` compares every hit block's tokens
+and catches it; set it when chasing a corruption that does not reproduce.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_FRONTEND_PREFIX_HASH** | bool | true | Hash the prompt's block chain while the request is built (API server preprocessing executor) and ship it to the engine with a fingerprint of the prompt tokens, beside the request in the ADD message (never inside a pickled `Sequence`; with `DisaggCoreManager` only the decode engine, which allocates, gets it). The engine adopts it if block size, seed, length and fingerprint match and its first, middle and last links rehash equal, then uses it for the prefix walk, `allocate` and publishing the prompt blocks after prefill, so prefill hashes no prompt block on the scheduler thread (it hashes the prompt bytes once for the fingerprint, about 26 us at 186k tokens; the LMCache/offload and PD-transfer publish paths still hash their blocks). Any mismatch falls back to engine-side hashing. Read in the API server process. |
+| **ATOM_PREFIX_FAST_WALK** | bool | true | Look the prompt's chain up with C-speed `map` rounds (the first block alone, then 16, 64, ... blocks, so a cold prompt costs one lookup), compare tokens on the last hit block only (all blocks if that one differs), and let `allocate` claim the blocks `can_allocate` found instead of walking the prompt again; any block that changed in between sends it back to the block-by-block walk. `0` walks block by block with a token compare per block. |
+| **ATOM_PREFIX_WALK_MEMO** | bool | true | Reuse a waiting request's prefix walk across the probes that run every scheduler tick: the delayer's head check and probe, and the DP chunk-cost estimate (`BlockManager.can_allocate_memoized`). It walks again when a hash the walk read is evicted, remapped to another block or revoked by a republish of its block, the hash at its first miss is published, `clear_cache` runs, more than 8192 such changes happened since its last check, or the request's token count or seed changed. The fit, state gates and replay are re-asked on every tick, so the answer equals the exact probe; admission still probes exactly. `0` re-walks every tick. |
+
 ## State checkpoints
 
 For models carrying per-request recurrent state (GDN: Qwen3-Next / Qwen3.5;
@@ -276,19 +359,45 @@ flag below. Details in the state-checkpoint section of the
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_STATE_CHECKPOINT_DEMAND** | bool | 1 (true) | Set to `0` to stop a prefix hit that was refused for want of a checkpoint from placing a rung of its own, leaving the prompt-end anchor as the only placement. Overrides `--state-checkpoint-demand`, so the policy can be A/B'd without editing a launch script. The rung is most of the checkpoint write traffic and little of the read-back, and every write evicts something — `StateSlotPool.mark_speculative` carries the measurement. |
+| **ATOM_STATE_CHECKPOINT_END_MARGIN** | int | 0 | Minimum number of prompt tokens left after the prompt-end anchor. The anchor goes on the last hash-block boundary at least `max(successor room, min final prefill rows, margin)` tokens before the prompt end: the largest of the three, not their sum. A chat template can re-render the tail of a prompt when the next user turn is appended: Qwen3.5's generation prompt ends in `<think>\n`, which the next turn drops, so the next prompt diverges at P-2 and an anchor whose last block covers P-2 (every prompt with P % 16 == 1) is never matched again. Set it to the template's generation-prompt length (`5` for Qwen3.5) to keep the anchor before that suffix. `0` keeps the old placement. Cost when the next turn does resend the prompt verbatim: the anchor moves back by up to `ceil((margin - room) / block)` hash blocks of recompute, where room is the larger of the other two terms: at most one block while the margin exceeds the room by no more than one block (Qwen3.5: margin 5, PAGE room 0, block 16), several for a larger margin. A prompt shorter than `margin + one block` keeps no anchor at all. |
+| **ATOM_DSV4_STATE_REPLAY** | bool | 0 (false) | DeepSeek-V4: keep a prefix hit that reaches past the nearest state checkpoint by more than the window's receptive field (7,748 tokens on V4-Pro, 7,875 with MTP or DSpark) and recompute only that field below it, which rebuilds the state exactly, instead of resuming at the checkpoint (`Config.state_replay_tokens`). Off on anything but the DeepSeek-V4 trunk with compress ratios 4 / 128, and with context parallelism, a speculative method other than MTP or the model's own DSpark layers (not a separate `--draft-model`), prefix caching off, or a KV connector other than LMCache MP offload alone. With that one LMCache saves carry the PAGE KV alone, no state image (the native layout registers the PAGE group alone, under a namespace of its own, so a stock LMCache server's hit is how far that KV reaches), and a hit whose PAGE KV LMCache holds past the HBM prefix loads that KV alone and replays below it. Every other model, and DeepSeek-V4 without the replay, keeps storing images. |
+| **ATOM_STATE_CHECKPOINT_INTERVAL_TOKENS** | int | — (the model's native interval) | vLLM plugin (DeepSeek-V4 state checkpoints): overrides the checkpoint interval in tokens, snapped down to a multiple of the block size. `>0` a rung every N tokens plus the prompt-end anchor and the demand rung; `-1` no rungs, anchor and demand only; `0` no state checkpoint is published, so there is no prefix hit at all (vLLM reports a hit only when every state checkpoint group is cached; the state checkpoint groups still allocate their working blocks). |
+| **ATOM_STATE_CHECKPOINT_CHECK_BLOCKS** | bool | 0 (false) | vLLM plugin (state checkpoints) diagnostic: after every schedule, raise if a request holds more than two blocks in any state checkpoint group. |
+| **ATOM_GDN_STATE_MIDSTEP** | bool | 0 (false) | Set to `1` to take Qwen3-Next / Qwen3.5 GDN state checkpoints inside a prefill forward, from the chunk kernel's per-64-token states, instead of cutting the prefill into several forwards that end on them. PAGE checkpoint path only. Checkpoint positions move back onto the forward's 64-token grid, so a resume recomputes up to 48 more tokens. |
 
 ### LMCache offload tier
 
-The LMCache source-pin timeout and ATOM's pending-save bound are read directly
-via `os.environ` rather than through `atom.utils.envs`. Their behavior is
-defined in `atom/kv_transfer/offload/_offload_common.py` and documented in full
-in `atom/kv_transfer/offload/README.md`; they are also listed here so they are
-discoverable from the central env reference despite bypassing the registry.
+ATOM's own offload knobs are defined in `atom/utils/envs.py`; their behavior is
+documented in `atom/kv_transfer/offload/README.md`. Where a
+`kv_connector_extra_config` key also exists, it takes precedence over the env
+var. `LMCACHE_EC_PIN_TIMEOUT_SEC` belongs to LMCache and is read only to
+derive a bound.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered — a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own; when unset it assumes LMCache's. |
-| **OFFLOAD_MAX_PENDING_SAVES** | int | **2**, flat, for the engine-side/state-tier reader (`scheduler.py`); `max(2, 2 × OFFLOAD_COPY_WORKERS)` for the KV-leg reader (`_offload_common.py`) | Bound on total in-flight offload transfers (running + queued) held before a SLOT snapshot or executor submission. A KV save and a state store both pin bytes out of the same pool while they run, so the KV leg and the K3 state tier share this one number rather than each carrying its own. Two readers compute it, though: the KV leg's canonical `_offload_common.max_pending_saves` derives the shown default from `OFFLOAD_COPY_WORKERS` and **raises** on an unparseable value, while the scheduler's state-tier reader (`_offload_max_pending_saves`) has a simpler fallback — a flat default of **2** (no `OFFLOAD_COPY_WORKERS` scaling) that **warns and uses 2** on an unparseable value rather than raising. Set the env to an explicit integer to pin both. |
+| **ATOM_KV_OFFLOAD** | str | "" (off) | Enables KV offload without `--kv-transfer-config`, so a launcher that owns that flag for P/D can still add offload. `lmcache` selects the in-process `lmcache_offload` connector, `lmcache_mp` the standalone-server `lmcache_mp` connector (start `lmcache server` first), `mooncake_store` the `mooncake_store` connector, which puts and gets KV chunks straight to a Mooncake Store with no LMCache (start the Store's master and owners first; dense layout only). With a P/D connector in `--kv-transfer-config`, both run behind a `multi` connector. Setting it while `--kv-transfer-config` already names an offload connector is an error. |
+| **ATOM_KV_OFFLOAD_EXTRA_CONFIG** | JSON object | "" | The offload connector's `kv_connector_extra_config`: `lmcache.<field>` overrides (e.g. `{"lmcache.chunk_size": 256}`), for `lmcache_mp` `lmcache.mp.*` options (e.g. `{"lmcache.mp.port": 5556}`), and for `mooncake_store` the `mooncake_store.*` settings (e.g. `{"mooncake_store.master": "10.0.0.1:26051", "mooncake_store.metadata": "http://10.0.0.1:26080/metadata"}`; all of them are listed in `atom/kv_transfer/offload/README.md`). Requires `ATOM_KV_OFFLOAD`. |
+| **OFFLOAD_COPY_WORKERS** | int | 1 | Save executor threads per offload worker. Also scales the default `OFFLOAD_MAX_PENDING_SAVES`. |
+| **OFFLOAD_LOAD_WORKERS** | int | 1 | Load executor threads per offload worker. DSV4's in-process path ignores it (its SLOT load path needs a serial load executor). |
+| **OFFLOAD_MAX_PENDING_SAVES** | int | unset: `max(2, 2 × OFFLOAD_COPY_WORKERS)` for connectors, **2** for the scheduler's state tier | Bound on running-plus-queued saves. KV and state saves share it because both pin the same pool. A non-integer raises on the connector path and warns (using 2) on the state-tier path. Overridden by `max_pending_saves` in `kv_connector_extra_config`. While both are unset, `mooncake_store` leaves its saves unbounded (one per request in flight at most). |
+| **OFFLOAD_MIN_LOAD_TOKENS** | int | 8192 | Smallest external-tier hit worth loading; shorter hits are recomputed. Negative values clamp to 0. |
+| **OFFLOAD_MIN_SAVE_TOKENS** | int | 8192 | Shortest prefix native `lmcache_mp` stores, as an absolute boundary for normal and late saves. With the default equal to `OFFLOAD_MIN_LOAD_TOKENS`, a shorter prefix could never be loaded back. Other connectors ignore it. |
+| **OFFLOAD_LOOKUP_MEMO_STEPS** | int | 32 | Scheduler steps a memoised tier-lookup answer is replayed before the tier is asked again. |
+| **OFFLOAD_LOOKUP_RETRY_STEPS** | int | 32 | Scheduler steps a failed tier lookup suppresses the next attempt. |
+| **OFFLOAD_ASYNC_LOOKUP_DEPTH** | int | 16 | `lmcache_mp` sends tier lookups for the head of the waiting queue before admission, as non-blocking requests, and admission consumes the answer; a request whose answer has not arrived is passed over (in arrival order) instead of blocking the scheduler. This is how many waiting requests per scheduling pass get a prefetched lookup. |
+| **OFFLOAD_LOOKUP_DEFER_S** | float | 2.0 | How long `lmcache_mp` admission may pass over a request whose prefetched lookup is still in flight before it waits for the answer (finite, ≥ 0). |
+| **OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT** | bool | 1 (true) | On by default; set to `0` to always wait for the lookup. Admit a prefill without waiting for its external-tier lookup when the lookup cannot change what is loaded: the HBM prefix leaves fewer than `OFFLOAD_MIN_LOAD_TOKENS` tokens uncached, so every load path would refuse the tier hit. Requires an asynchronous lookup (LMCache MP) and is not applied with joint KV/state offload. The lookup is still sent, because it refreshes the prefix's L1 LRU recency and opens the MP session whose end touches the request's chunks; its answer is not used as a load hit. The save floor starts at the HBM prefix and is lowered to the tier's contiguous hit when the answer arrives (or to 0 if it never does), so chunks the tier evicted are stored again. Read locks are released when the answer arrives; the MP session ends after that, and an unanswered lookup is given up after 120 s, leaving its locks to the read TTL. |
+| **OFFLOAD_PROFILE** | bool | 0 | Emit `[OFFLOAD-SAVE-PROF]` / `[OFFLOAD-LOAD-PROF]` per-transfer records, and once a minute an `[OFFLOAD-PERF]` line per scheduler with lookup/save/load-skip counters and per-step timings. An empty value reads as off. |
+| **OFFLOAD_SINGLE_STREAM** | bool | 0 | Experimental: run the staging pack and copy legs on one stream. |
+| **OFFLOAD_GPU_STAGING_CHUNKS** | int | derived from KV geometry | GPU staging buffer size in LMCache chunks (≥ 1). |
+| **OFFLOAD_GPU_STAGING_MAX_BYTES** | int | unset | Upper bound on the GPU staging buffer in bytes; must hold at least one chunk. Unset, `mooncake_store` bounds it at 48 MiB, which it holds back from the KV budget per save and load thread. |
+| **OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER** | bool | 0 | Free the GPU staging buffer after each transfer instead of keeping it. |
+| **OFFLOAD_SLOT_STAGING_SLOTS** | int | 1 | DSV4 in-process SLOT sidecar staging rows. Overridden by `slot_sidecar_staging_slots`. |
+| **OFFLOAD_COMMITTED_SIDECAR_CAPACITY** | int | 65536 | DSV4 in-process committed SLOT sidecar index capacity. Overridden by `committed_sidecar_index_capacity`. |
+| **OFFLOAD_PUBLICATION_TIMEOUT_S** | float | 5.0 | DSV4 in-process wait for a saved SLOT sidecar to become visible (finite, ≥ 0). |
+| **OFFLOAD_PUBLICATION_POLL_INTERVAL_S** | float | 0.01 | Poll period of that wait (finite, > 0). |
+| **LMCACHE_MP_TRANSFER_MODE** | str | auto | `lmcache_mp` transfer mode: `auto` or `lmcache_driven` (`engine_driven` is rejected). Overridden by `lmcache.mp.mp_transfer_mode`. |
+| **LMCACHE_EC_PIN_TIMEOUT_SEC** | float | LMCache's own (300) | LMCache's source-pin timeout. ATOM reads it only to derive the engine's save-abandon window (`pin + 30s`), so the two stay ordered: a lost store report is reclaimed only after LMCache would already have force-unpinned its source. Non-positive disables ATOM's reclamation. ATOM sets no default of its own and, when unset, assumes LMCache's. |
 
 ## KV cache events
 
@@ -321,6 +430,12 @@ the host, give each its own endpoints.
 | **ATOM_KV_EVENTS_REPLAY_ENDPOINT** | str | `""` | ZMQ ROUTER bind address for replay requests. Empty disables replay (PUB-only). A consumer sends an 8-byte big-endian start sequence and receives every retained batch with `seq >= start`, followed by a `REPLAY_DONE` terminal frame carrying the retained `[oldest, latest]` window. Offset per DP rank the same way as the PUB endpoint. Replay is serviced on the sender thread with non-blocking sends: a client that stops reading has its replay abandoned (counted in `replay_aborted`) rather than stalling live publication. |
 | **ATOM_KV_EVENTS_REPLAY_BUFFER_STEPS** | int | 10000 | Number of most recently *sent* batches retained for replay. Independent of `ATOM_KV_EVENTS_BUFFER_STEPS`; each entry holds an encoded payload including token ids, so size it against the event rate and memory budget. Must be >= 1 when replay is enabled. |
 
+## Shutdown
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_SHUTDOWN_TIMEOUT_S** | float | 5 | Seconds that shutdown waits for child processes to exit on their own before terminating them (SIGTERM, then SIGKILL): the server process waits this long for its EngineCores, and each EngineCore for its ModelRunner workers. All the children of one process share the same deadline. Must be finite and positive. Raise it when workers need longer to finish on exit, for example to write a profiler's output (`rocprofv3` writing a thread trace can take minutes). Set it before starting the server; every process reads it. |
+
 ## Profiling & debugging
 
 | Variable | Type | Default | Description |
@@ -328,7 +443,10 @@ the host, give each its own endpoints.
 | **ATOM_METRICS_UPDATE_INTERVAL_S** | float | 1.0 | Shared interval in seconds for ordinary/DP/PP engine metrics pushes and API snapshot refresh. Must be finite and positive; read when each loop starts, so set it before starting every service process. Prometheus scraping is configured independently. Does not cache rendered `/metrics` responses or change when histogram observations are recorded. |
 | **ATOM_ENABLE_METRICS_DEVICE_TIMER** | bool | 0 (false) | Set to `1` before starting the service to collect GPU forward duration and cumulative request prefill GPU time. Uses CUDA/HIP events, a reusable pool capped at 256 pending pairs, and FIFO polling that stops at the first incomplete event. Adds event recording and query overhead; disabled services emit no GPU timing samples. Agentic dashboard CI explicitly enables it. |
 | **ATOM_TORCH_PROFILER_DIR** | str | — | When set, enables PyTorch profiler and writes traces to this directory. Create subdirectories per rank (e.g., `rank_0`, `dp0_tp0`). |
-| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. |
+| **ATOM_PROFILER_MORE** | bool | 0 (false) | When `ATOM_TORCH_PROFILER_DIR` is set and this is `1`, enables detailed profiling: `record_shapes`, `with_stack`, and `profile_memory`. Applies to both the run-phase profiler and the CUDA-graph capture profiler. Each option can be overridden individually by the per-option flags below. |
+| **ATOM_PROFILER_RECORD_SHAPES** | bool | `ATOM_PROFILER_MORE` | Set to `1`/`0` to enable/disable `record_shapes`. Takes precedence over `ATOM_PROFILER_MORE`; unset or empty falls back to it. |
+| **ATOM_PROFILER_WITH_STACK** | bool | `ATOM_PROFILER_MORE` | Set to `1`/`0` to enable/disable `with_stack` (Python stack capture). Takes precedence over `ATOM_PROFILER_MORE`; unset or empty falls back to it. |
+| **ATOM_PROFILER_PROFILE_MEMORY** | bool | `ATOM_PROFILER_MORE` | Set to `1`/`0` to enable/disable `profile_memory`. Takes precedence over `ATOM_PROFILER_MORE`; unset or empty falls back to it. |
 | **ATOM_ENABLE_DETAILED_ANNOTATION** | bool | 0 (false) | When profiling is active, appends detailed attention aggregates to the `prefill[]`/`decode[]` trace labels: `sqsq` (Σ N_Q²), `sqsk` (Σ N_Q·N_KV), and `sk` (Σ N_KV), where N_Q is the scheduled query tokens and N_KV the KV length per request. Used to estimate attention FLOPs for downstream roofline analysis. |
 | **ATOM_LOG_MORE** | bool | 0 (false) | If set to `1`, use verbose logging format (includes process name, PID, path, line number, function name). |
 
@@ -459,3 +577,18 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 
 See [Mooncake matched rails](mooncake_matched_rails.md) for independent P/D
 rank configuration, deployment requirements, and registration lifetime.
+
+## Mooncake PD MLA staging
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_STAGING** | bool | 1 | Prefill (`kv_producer`, plain `mooncake` connector) only. When the decode side runs DCP, gather the MLA tokens each decode rank owns into a GPU staging slot laid out as its destination pages, then RDMA one descriptor per run of adjacent destination pages instead of one per 576-byte token. Destination bytes are identical. The pool holds one 8 MiB slot per send worker (`num_worker_threads`, default 16), capped at 256 MiB per producer GPU, and is held back from the KV cache budget. A prefill learns the decode's DCP size only per request, so every Mooncake producer of a plain MLA model (not DeepSeek-V4 or an MLA hybrid such as Kimi) without producer DCP reserves the pool while this is on; set 0 where no decode runs DCP. 0 restores the per-token path. |
+| **ATOM_PD_FAILED_WRITE_HOLD_S** | float | 60 | Mooncake P/D. Mooncake gives up on a sync RDMA write at `MC_TRANSFER_TIMEOUT` without cancelling the work it posted, so a failed write may still land afterwards; a prefill therefore never retries one. A decode holds a failed receive's KV pages (and its staging row) this many seconds before reporting the failure; the scheduler then aborts the request and frees its pages, which no late write can reach any more. A prefill keeps a landing slot whose write failed out of use for as long. 60 s covers a write Mooncake keeps re-posting while the network is down (each of its 9 tries waits at most a 5 s connect); behind a decode whose handshake hangs it can take about 10 minutes. 0 releases at once. |
+
+## Mooncake PD MLA landing
+
+Set on the decode side; the prefill side follows what each write request offers and needs MLA staging enabled.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PD_MLA_LANDING** | bool | 1 | Decode (`kv_consumer`, plain `mooncake` connector, DCP > 1, a plain MLA model) only. Allocate a GPU landing pool per rank and give prefill stages partitions of it. A stage writes a rank's MLA rows packed in rank order into a landing slot with one RDMA descriptor per slot (instead of one per destination page); the decode rank scatters the slot into its paged KV cache on a side stream and returns the slot. A request completes only after its slots are scattered. Destination bytes are identical to the staged path. The pool is 256 MiB of 8 MiB slots per decode rank; it and the scatter's segment table (about 12 MiB at block size 1, less for larger blocks) are held back from the KV cache budget. Only a non-DCP MLA prefill with `ATOM_PD_MLA_STAGING=1` lands, so set 0 where none does (for example symmetric DCP P/D) to give the pool back to the KV cache. Partitions go first come, first served: a prefill stage endpoint gets `32 // its PP size` slots on first contact and keeps them while the decode runs, so with several prefill instances per decode rank a later one may get fewer slots, or none and keep the staged path. A stage that reports it cannot land returns its partition at its first write-done and is not offered slots again. A prefill sends a transfer needing fewer than 2 slots, or the rest of one after waiting 10 ms for a free slot, through the staged per-page path. 0 keeps the staged per-page writes. |

@@ -238,10 +238,11 @@ def test_gpu_kv_round_trip_through_local_disk_backend(tmp_path: Path):
         assert engine.storage_manager is not None
         assert "LocalDiskBackend" in engine.storage_manager.list_backends()
 
-        _synchronize_producer_stream()
+        producer_event = torch.cuda.Event()
+        producer_event.record(torch.cuda.current_stream())
         operation = SaveOperationId("gpu-e2e", 0)
         with gpu_connector.track_save_source(operation):
-            engine.store(tokens, block_ids=block_ids)
+            engine.store(tokens, block_ids=block_ids, producer_event=producer_event)
         deadline = time.monotonic() + 5
         while len(source_safe) < 2 and time.monotonic() < deadline:
             time.sleep(0.001)

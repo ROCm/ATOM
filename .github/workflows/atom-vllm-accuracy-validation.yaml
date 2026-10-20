@@ -449,7 +449,7 @@ jobs:
       scheduled_beijing_date: ${{ steps.meta.outputs.scheduled_beijing_date }}
     steps:
       - name: Checkout selected ATOM branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Load vLLM version
         run: cat atom/plugin/vllm/vllm-version.env >> "$GITHUB_ENV"
@@ -932,7 +932,7 @@ jobs:
 
       - name: Checkout ATOM repo
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Docker Login
         if: ${{ steps.validation-window.outputs.should_run == 'true' }}
@@ -1433,55 +1433,16 @@ jobs:
         run: |
           # MTP acceptance is recorded into the result JSON by atom_oot_test.sh
           # (scraped from the live vLLM /metrics endpoint during the gsm8k run).
-          # gsm8k accuracy alone CANNOT guard MTP: speculative decoding is loss-
-          # less w.r.t. the target model, so a broken draft head leaves accuracy
-          # unchanged and only craters acceptance/throughput. This step is the
-          # only gate that catches an MTP regression. Uses jq+awk (no python on
-          # the host runner), mirroring the gsm8k accuracy check above.
+          # The gate itself is shared with the PR path -- it was written twice
+          # and the copies diverged, the PR one having dropped the
+          # per-position check.
           result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
-          if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+          if [ -z "$result_file" ]; then
             echo "ERROR: No results JSON file found for MTP acceptance check."
             exit 2
           fi
-          echo "RESULT_FILE: $result_file"
-
-          overall=$(jq -r '.atom_ci_metadata.mtp_acceptance_overall // empty' "$result_file")
-          if [ -z "$overall" ]; then
-            echo "ERROR: mtp_acceptance_overall missing — spec-decode /metrics were not captured during the run. Treating as a failure."
-            exit 1
-          fi
-
-          fail=0
-          echo "MTP overall acceptance: $overall (threshold ${MTP_ACCEPT_THRESHOLD})"
-          if awk -v v="$overall" -v t="${MTP_ACCEPT_THRESHOLD}" 'BEGIN {exit !(v < t)}'; then
-            echo "FAIL: overall acceptance $overall < threshold ${MTP_ACCEPT_THRESHOLD}"
-            fail=1
-          fi
-
-          if [ -n "${MTP_PER_POS_THRESHOLD}" ]; then
-            IFS=',' read -ra pos_thresholds <<< "${MTP_PER_POS_THRESHOLD}"
-            idx=0
-            for th in "${pos_thresholds[@]}"; do
-              p=$(jq -r ".atom_ci_metadata.mtp_per_pos_acceptance[$idx] // empty" "$result_file")
-              if [ -z "$p" ]; then
-                echo "FAIL: position $idx acceptance missing (expected >= $th)"
-                fail=1
-              else
-                echo "MTP position $idx acceptance: $p (threshold $th)"
-                if awk -v v="$p" -v t="$th" 'BEGIN {exit !(v < t)}'; then
-                  echo "FAIL: position $idx acceptance $p < threshold $th"
-                  fail=1
-                fi
-              fi
-              idx=$((idx + 1))
-            done
-          fi
-
-          if [ "$fail" -eq 1 ]; then
-            echo "MTP acceptance gate FAILED."
-            exit 1
-          fi
-          echo "MTP acceptance gate PASSED."
+          .github/scripts/check_mtp_acceptance.sh \
+            "$result_file" "${MTP_ACCEPT_THRESHOLD}" "${MTP_PER_POS_THRESHOLD}"
 
       - name: Collect summary
         if: ${{ steps.validation-window.outputs.should_run == 'true' && success() }}
@@ -1499,7 +1460,7 @@ jobs:
 
       - name: Upload model artifacts
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: oot-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
@@ -1514,7 +1475,7 @@ jobs:
 
       - name: Upload accuracy results for dashboard
         if: ${{ always() && steps.validation-window.outputs.should_run == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: accuracy-${{ matrix.model_name }}
           path: oot_accuracy_results/*.json
@@ -1580,9 +1541,9 @@ jobs:
       actions: read
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
 
@@ -1590,7 +1551,7 @@ jobs:
         run: mkdir -p /tmp/accuracy-results
 
       - name: Download accuracy artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/accuracy-results
           pattern: accuracy-*
@@ -1630,7 +1591,7 @@ jobs:
 
       - name: Store OOT accuracy result to dashboard
         if: steps.downloaded.outputs.json_count != '0'
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           tool: customBiggerIsBetter
           output-file-path: accuracy-benchmark-input.json

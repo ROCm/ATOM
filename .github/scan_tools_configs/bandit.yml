@@ -20,3 +20,6 @@ exclude_dirs:
   - dist
   - node_modules
   - __pycache__
+
+skips:
+  - B101

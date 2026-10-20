@@ -102,9 +102,10 @@ jobs:
     steps:
       - name: Resolve lines
         id: lines
+        env:
+          OVERRIDE: ${{ inputs.base_image_override || '' }}
         run: |
           set -euo pipefail
-          OVERRIDE="${{ inputs.base_image_override || '' }}"
           if [ -n "${OVERRIDE}" ]; then
             # A one-off build on a literal image reference, nothing else.
             printf 'lines=["%s"]\n' "${OVERRIDE}" >> "${GITHUB_OUTPUT}"
@@ -165,15 +166,15 @@ jobs:
       RCCL_BRANCH: "29e1567b95e28823b0beb1a988adc587bfab5b4f"
       GPU_ARCH: "gfx942;gfx950"
       SGLANG_REPO: "https://github.com/sgl-project/sglang.git"
-      SGLANG_REF: "v0.5.17"
-      SGLANG_VERSION: "0.5.17"
+      SGLANG_REF: "v0.5.20"
+      SGLANG_VERSION: "0.5.20"
 
     steps:
       - name: Set HF_TOKEN
         run: echo "HF_TOKEN=${HF_TOKEN:-${{ secrets.AMD_HF_TOKEN }}}" >> $GITHUB_ENV
 
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Load vLLM version
         run: cat atom/plugin/vllm/vllm-version.env >> "$GITHUB_ENV"
@@ -198,22 +199,36 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Echo environment variables
+        env:
+          ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}
+          ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}
+          AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}
+          AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}
+          RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}
+          RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}
+          OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}
+          SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}
+          CUSTOM_TAG: ${{ inputs.custom_tag || '' }}
+          SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}
+          SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}
+          SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}
+          BASE_IMAGE_FLAVOR: ${{ matrix.base_image }}
         run: |
-          echo "ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}"
-          echo "ATOM_BRANCH: ${{ github.ref_name }}"
-          echo "ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}"
-          echo "AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}"
-          echo "AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}"
-          echo "RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}"
-          echo "RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}"
-          echo "OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}"
-          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
-          echo "CUSTOM_TAG: ${{ inputs.custom_tag || '' }}"
-          echo "SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}"
-          echo "SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}"
-          echo "SGLANG_VERSION: ${{ inputs.sglang_version || env.SGLANG_VERSION }}"
-          echo "SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}"
-          echo "BASE_IMAGE_FLAVOR: ${{ matrix.base_image }}"
+          echo "ATOM_REPO: ${ATOM_REPO}"
+          echo "ATOM_BRANCH: ${GITHUB_REF_NAME}"
+          echo "ATOM_COMMIT: ${ATOM_COMMIT}"
+          echo "AITER_REPO: ${AITER_REPO}"
+          echo "AITER_COMMIT: ${AITER_COMMIT}"
+          echo "RCCL_REPO: ${RCCL_REPO}"
+          echo "RCCL_BRANCH: ${RCCL_BRANCH}"
+          echo "OOT_TAG_SUFFIX: ${OOT_TAG_SUFFIX}"
+          echo "SGLANG_TAG_SUFFIX: ${SGLANG_TAG_SUFFIX}"
+          echo "CUSTOM_TAG: ${CUSTOM_TAG}"
+          echo "SGLANG_REPO: ${SGLANG_REPO}"
+          echo "SGLANG_REF: ${SGLANG_REF}"
+          echo "SGLANG_VERSION: ${SGLANG_VERSION}"
+          echo "SGLANG_TAG_SUFFIX: ${SGLANG_TAG_SUFFIX}"
+          echo "BASE_IMAGE_FLAVOR: ${BASE_IMAGE_FLAVOR}"
 
       # One place that turns a line name into everything the rest of the job
       # needs: which base image to build on, which extra build-args that line
@@ -272,24 +287,30 @@ jobs:
 
       - name: Build Docker image
         timeout-minutes: 180
+        env:
+          ATOM_REPO: ${{ inputs.atom_repo || env.ATOM_REPO }}
+          ATOM_COMMIT: ${{ inputs.atom_commit || env.ATOM_COMMIT }}
+          AITER_REPO: ${{ inputs.aiter_repo || env.AITER_REPO }}
+          AITER_COMMIT: ${{ inputs.aiter_commit || env.AITER_COMMIT }}
+          RCCL_REPO: ${{ inputs.rccl_repo || env.RCCL_REPO }}
+          RCCL_BRANCH: ${{ inputs.rccl_branch || env.RCCL_BRANCH }}
         run: |
-          ATOM_COMMIT="${{ inputs.atom_commit || env.ATOM_COMMIT }}"
           if [ "${ATOM_COMMIT}" = "HEAD" ]; then
-            ATOM_CHECKOUT="${{ github.ref_name }}"
+            ATOM_CHECKOUT="${GITHUB_REF_NAME}"
           else
             ATOM_CHECKOUT="${ATOM_COMMIT}"
           fi
-          echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${{ github.ref_name }})"
+          echo "ATOM checkout ref: ${ATOM_CHECKOUT} (branch: ${GITHUB_REF_NAME})"
           echo "Building flavor ${FLAVOR} on BASE_IMAGE ${BASE_IMAGE}"
           DOCKER_BUILDKIT=1 docker build --pull --network=host -t "${CI_IMAGE}" \
           --build-arg BASE_IMAGE="${BASE_IMAGE}" \
           --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
-          --build-arg ATOM_REPO="${{ inputs.atom_repo || env.ATOM_REPO }}" \
+          --build-arg ATOM_REPO="${ATOM_REPO}" \
           --build-arg ATOM_COMMIT="${ATOM_CHECKOUT}" \
-          --build-arg AITER_REPO="${{ inputs.aiter_repo || env.AITER_REPO }}" \
-          --build-arg AITER_COMMIT="${{ inputs.aiter_commit || env.AITER_COMMIT }}" \
-          --build-arg RCCL_REPO="${{ inputs.rccl_repo || env.RCCL_REPO }}" \
-          --build-arg RCCL_BRANCH="${{ inputs.rccl_branch || env.RCCL_BRANCH }}" \
+          --build-arg AITER_REPO="${AITER_REPO}" \
+          --build-arg AITER_COMMIT="${AITER_COMMIT}" \
+          --build-arg RCCL_REPO="${RCCL_REPO}" \
+          --build-arg RCCL_BRANCH="${RCCL_BRANCH}" \
           ${EXTRA_BUILD_ARGS} \
           --build-arg CACHEBUST=$(date +%s) \
           -f docker/atom_release.dockerfile .
@@ -536,6 +557,8 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          CUSTOM_TAG: ${{ inputs.custom_tag || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           # Record every tag this job creates, so Clean Up can remove exactly
           # those. The old cleanup removed by glob (nightly_*, latest*), which
@@ -546,7 +569,6 @@ jobs:
             echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
           }
           FLAVOR_SUFFIX="${TAG_SUFFIX}"
-          CUSTOM_TAG="${{ inputs.custom_tag || '' }}"
           if [ -n "${CUSTOM_TAG}" ]; then
             if [[ ! "${CUSTOM_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
               echo "Invalid custom_tag '${CUSTOM_TAG}'. Allowed characters: letters, numbers, '.', '_' and '-'."
@@ -556,8 +578,7 @@ jobs:
             .github/scripts/docker_push_retry.sh rocm/atom-dev:${CUSTOM_TAG}
             echo "Custom tag: rocm/atom-dev:${CUSTOM_TAG}. Skipping latest update."
           else
-            BRANCH="${{ github.ref_name }}"
-            DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+            BRANCH="${GITHUB_REF_NAME}"
             TAG=nightly_$(date +%Y%m%d%H%M)${FLAVOR_SUFFIX}
             if [ "${BRANCH}" != "${DEFAULT_BRANCH}" ]; then
               SAFE_BRANCH=$(echo "${BRANCH}" | sed 's/[^A-Za-z0-9._-]/-/g')
@@ -623,6 +644,7 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          OOT_TAG_SUFFIX: ${{ inputs.oot_tag_suffix || '' }}
         run: |
           set -euo pipefail
           # The vLLM and SGLang layers belong to the stable line only. They
@@ -643,7 +665,6 @@ jobs:
             echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
           }
           VLLM_VER="${VLLM_VERSION}"
-          OOT_TAG_SUFFIX="${{ inputs.oot_tag_suffix || '' }}"
           OOT_TAG="vllm-v${VLLM_VER}-nightly_$(date +%Y%m%d)"
           OOT_LATEST_TAG="vllm-latest"
           if [ -n "${OOT_TAG_SUFFIX}" ]; then
@@ -665,6 +686,9 @@ jobs:
       - name: Build SGLang Docker image
         if: ${{ success() && steps.gates.outputs.sglang == 'true' }}
         timeout-minutes: 180
+        env:
+          SGLANG_REPO: ${{ inputs.sglang_repo || env.SGLANG_REPO }}
+          SGLANG_REF: ${{ inputs.sglang_ref || env.SGLANG_REF }}
         run: |
           # The vLLM and SGLang layers belong to the stable line only. They
           # are owned and tagged by someone else, so a second line must not
@@ -680,8 +704,8 @@ jobs:
           docker build --network=host -t "${CI_SGLANG_IMAGE}" \
             --build-arg SGLANG_BASE_IMAGE="${SGLANG_BASE_IMAGE}" \
             --build-arg GPU_ARCH="${{ env.GPU_ARCH }}" \
-            --build-arg SGLANG_REPO="${{ inputs.sglang_repo || env.SGLANG_REPO }}" \
-            --build-arg SGLANG_REF="${{ inputs.sglang_ref || env.SGLANG_REF }}" \
+            --build-arg SGLANG_REPO="${SGLANG_REPO}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
             -f docker/sglang_release.dockerfile .
           docker inspect "${CI_SGLANG_IMAGE}"
 
@@ -699,6 +723,8 @@ jobs:
         env:
           DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          SGLANG_VER: ${{ inputs.sglang_version || env.SGLANG_VERSION }}
+          SGLANG_TAG_SUFFIX: ${{ inputs.sglang_tag_suffix || '' }}
         run: |
           set -euo pipefail
           # The vLLM and SGLang layers belong to the stable line only. They
@@ -718,8 +744,6 @@ jobs:
             docker tag "$1" "$2"
             echo "$2" >> "${RUNNER_TEMP}/pushed_tags.txt"
           }
-          SGLANG_VER="${{ inputs.sglang_version || env.SGLANG_VERSION }}"
-          SGLANG_TAG_SUFFIX="${{ inputs.sglang_tag_suffix || '' }}"
           SGLANG_TAG="sglang-v${SGLANG_VER}-nightly_$(date +%Y%m%d)"
           SGLANG_LATEST_TAG="sglang-latest"
           if [ -n "${SGLANG_TAG_SUFFIX}" ]; then

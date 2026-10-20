@@ -10,9 +10,9 @@ range concatenated in sequence order.
 
 The slot each of these positions maps to is `.slots`, shared with `.prefill`:
 the gather reads a position and a packed table, and neither cares which side
-shaped the axis. What stays with the builders is the one-token step, which they
-derive from `last_block_num_tokens` and the last block-table entry rather than
-from a position at all, and around which the MLA one wraps a DCP variant.
+shaped the axis. What stays with the builders is the one-token step, one
+position per row computed inline from the ragged rows, around which the MLA one
+wraps a DCP variant.
 """
 
 from __future__ import annotations

@@ -17,6 +17,33 @@ is pageable, so torch synchronizes the stream before it copies.
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _commit_cursors(
+    cursor,
+    staging,
+    anchors,
+    starts,
+    slots,
+    slot_stride,
+    request_stride,
+    prefix_stride,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One request per program: its accepted prefix's cursor into its slot."""
+    i = tl.program_id(0)
+    prefix = tl.load(anchors + i) - tl.load(starts + i)
+    slot = tl.load(slots + i).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    keep = cols < WIDTH
+    row = tl.load(
+        staging + i * request_stride + prefix * prefix_stride + cols, mask=keep
+    )
+    tl.store(cursor + slot * slot_stride + cols, row, mask=keep)
 
 
 class TentativeState:
@@ -24,7 +51,6 @@ class TentativeState:
         self.cache, self.step = cache, step
         self.request_indices = {span.slot: i for i, span in enumerate(step.requests)}
         self.staging = cache.tentative_staging
-        self.width = step.max_q_len
         self.histories = histories
         self.written = set()
         # Set instead of `written` when a kernel filled the plane: one launch
@@ -55,26 +81,37 @@ class TentativeState:
         )[1:]
         self.written.add(span.slot)
 
-    def commit(self, accepted_lengths):
-        """Lengths include the guaranteed target input: zero drafts means one."""
+    def commit(self, anchors):
+        """`anchors`: each request's flat row of its last accepted token."""
         if not self.staged_on_device and self.written != set(self.request_indices):
             raise RuntimeError("Tentative state is missing an Engram prefix")
 
         count = self.step.scheduled_bs
-        lengths = torch.as_tensor(
-            accepted_lengths, dtype=torch.int64, device=self.staging.gpu.device
-        )
-        if lengths.shape != (count,):
-            raise ValueError("Accepted lengths must match the scheduled requests")
+        if anchors.shape != (count,):
+            raise ValueError("Anchors must match the scheduled requests")
         cursors = (
             self.staging.gpu[:count]
             if self.staged_on_device
             else self.staging.copy_to_gpu(count)
-        )[:, : self.width]
-        # An accepted length outside `[1, staged span]` is silent here -- 0
-        # indexes row -1 and an over-long one reads an earlier round's row --
-        # so a wrong length shows up as wrong tokens, not as a fault.
-        batch = torch.arange(count, device=lengths.device)
+        )
+        # An anchor outside its own segment is silent here: it reads another
+        # prefix's row, so a wrong anchor shows up as wrong tokens, not a fault.
         # The scheduled prefix, not the forward's width: a padding request owns
         # no slot, and the 0 standing in for one is a live request's.
-        self.cache.cursor[self.step.slots[:count].long()] = cursors[batch, lengths - 1]
+        starts, slots = self.step.cu_seqlens_q[:count], self.step.slots[:count]
+        cursor = self.cache.cursor
+        if not cursor.is_cuda:
+            cursor[slots.long()] = cursors[torch.arange(count), anchors - starts]
+            return
+        _commit_cursors[(count,)](
+            cursor,
+            cursors,
+            anchors,
+            starts,
+            slots,
+            cursor.stride(0),
+            cursors.stride(0),
+            cursors.stride(1),
+            WIDTH=cursor.shape[1],
+            BLOCK=triton.next_power_of_2(cursor.shape[1]),
+        )

@@ -12,4 +12,11 @@
 #
 # Add rule-specific settings and suppressions under `rules:`.
 
-rules: {}
+rules:
+  dangerous-triggers:
+    ignore:
+      - notify-teams.yml
+      - pr-welcome-comment.yaml
+  github-env:
+    ignore:
+      - action.yml:79

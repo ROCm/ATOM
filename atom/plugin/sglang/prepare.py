@@ -36,6 +36,17 @@ def prepare_model(config: Any):
 
     source_model_arch = (getattr(config, "architectures", None) or [""])[0]
     model_arch, model_adapter = resolve_model_arch_spec(config)
+    from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
+        note_qwen4_exp_from_identity,
+    )
+
+    text_cfg = getattr(config, "text_config", None)
+    note_qwen4_exp_from_identity(
+        source_model_arch,
+        model_arch,
+        getattr(config, "model_type", ""),
+        getattr(text_cfg, "model_type", "") if text_cfg is not None else "",
+    )
     if model_arch == "DeepseekV4ForCausalLM":
         from atom.plugin.sglang.deepseek_v4_bridge import (
             install_deepseek_v4_proxy_pool_patch,
@@ -48,6 +59,17 @@ def prepare_model(config: Any):
         # Model construction precedes ModelRunner.init_memory_pool(), so install
         # the K3-only pool hooks here after the architecture is known.
         install_kimi_k3_pool_patch()
+    elif model_arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ):
+        from atom.plugin.sglang.minimax_m3_bridge import (
+            install_minimax_m3_pool_patch,
+            install_minimax_mono_plugin_refusal,
+        )
+
+        install_minimax_mono_plugin_refusal()
+        install_minimax_m3_pool_patch()
 
     # Import here to avoid partial initialization while SGLang discovers models.
     from atom.plugin.register import (

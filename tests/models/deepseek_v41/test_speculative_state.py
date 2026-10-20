@@ -4,11 +4,12 @@
 import pytest
 import torch
 
+from tests.attentions.deepseek_v41.helpers import PagedRequest, begin_step
+
 pytest.importorskip("aiter", reason="the paged cache reaches AITER")
 
 from atom.model_ops.attentions.deepseek_v41.cache import PagedAttentionCache
 from atom.model_ops.attentions.deepseek_v41.checkpoints import StateCopies
-from atom.model_ops.attentions.deepseek_v41.metadata import RequestSpan
 from atom.model_ops.attentions.pool_layout.v41_pool_geometry import V41PoolGeometry
 from atom.models.deepseek_v41.config import AttentionMode, LayerAttentionSpec
 
@@ -21,6 +22,12 @@ def encoded_rows(positions, layer, geometry, device):
         + torch.arange(width, device=device)
     ) % 251
     return values.to(torch.uint8 if geometry.packed else torch.bfloat16)
+
+
+def anchors(step, lengths):
+    """The flat row each request's accepted prefix ends at."""
+    starts = step.cu_seqlens_q[: len(lengths)]
+    return starts + torch.tensor(lengths, dtype=starts.dtype, device=starts.device) - 1
 
 
 def write_window(cache, layer, step, rows):
@@ -64,8 +71,8 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     )
     cache = PagedAttentionCache(geometry, 40, 5, device)
     spans = (
-        RequestSpan(11, position, 0, 6, 4, tuple(range(20))),
-        RequestSpan(22, position - 4, 6, 3, 1, tuple(range(20, 40))),
+        PagedRequest(11, position, 0, 6, 4, tuple(range(20))),
+        PagedRequest(22, position - 4, 6, 3, 1, tuple(range(20, 40))),
     )
     history = torch.tensor([41, -1, 43], device=device)
     for span in spans:
@@ -80,7 +87,7 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
             )
     untouched = cache.state_bytes[0].clone()
     old_cursors = cache.cursor.clone()
-    step = cache.begin_step(spans, tentative=True)
+    step = begin_step(cache, spans, tentative=True)
     cache.prepare_state(step)
     expected_histories = []
     accepted_lengths = (accepted, min(accepted, 3))
@@ -94,12 +101,12 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
         )
     assert torch.equal(cache.cursor, old_cursors)
     with pytest.raises(RuntimeError, match="Commit the accepted prefix"):
-        cache.begin_step(spans)
+        begin_step(cache, spans)
     copies = StateCopies.__new__(StateCopies)
     copies.cache = cache
     with pytest.raises(RuntimeError, match="Commit the accepted prefix"):
         copies.entry(4)
-    cache.commit_tentative(step, torch.tensor(accepted_lengths, device=device))
+    cache.commit_tentative(step, anchors(step, accepted_lengths))
     assert torch.equal(cache.state_bytes[0], untouched)
     for i, (span, count) in enumerate(zip(spans, accepted_lengths)):
         end = span.position + count
@@ -113,12 +120,12 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
     # Reorder requests after acceptance. Addressing must use each noncontiguous
     # STATE slot, and logical visibility must stay at 128, not the 133-row ring.
     next_spans = tuple(
-        RequestSpan(
+        PagedRequest(
             span.request_id, span.position + count, i * 2, 2, span.slot, span.block_ids
         )
         for i, (span, count) in enumerate(reversed(list(zip(spans, accepted_lengths))))
     )
-    next_step = cache.begin_step(next_spans)
+    next_step = begin_step(cache, next_spans)
     cache.prepare_state(next_step)
     if device == "cuda":
         for layer in range(2):
@@ -144,26 +151,24 @@ def test_every_prefix_survives_ring_wrap_and_ragged_request_order(
 def test_tentative_state_refuses_missing_prefixes_and_a_stale_step():
     """The two things `commit` still refuses.
 
-    An out-of-range accepted length is no longer one of them: that bound cost
-    four launches a step and is commented out in `commit`, so a length past
-    the staged span now writes an earlier round's cursor in silence. The
-    check is still spelled out there for whoever suspects it.
+    An anchor outside its own segment is not one of them: bounding it costs
+    launches every step, so it reads another prefix's row in silence.
     """
     geometry = V41PoolGeometry(1, ((0, 2),), 32, 128, 128, 32, speculative_tokens=5)
     cache = PagedAttentionCache(geometry, 1, 1, "cpu")
     cache.cursor[0, 0] = 3
-    span = RequestSpan(1, 3, 0, 6, 0, (0,))
-    stale = cache.begin_step((span,))
-    step = cache.begin_step((span,), tentative=True)
+    span = PagedRequest(1, 3, 0, 6, 0, (0,))
+    stale = begin_step(cache, (span,))
+    step = begin_step(cache, (span,), tentative=True)
     cache.prepare_state(step)
     with pytest.raises(RuntimeError, match="missing"):
-        cache.commit_tentative(step, [1])
+        cache.commit_tentative(step, anchors(step, [1]))
     cache.pending.stage_history(span, [1, 2, 3, 4, 5, 6])
-    # The accepted prefix belongs to one forward. Another step's lengths would
+    # The accepted prefix belongs to one forward. Another step's anchors would
     # index this one's staged cursors and commit a row nobody verified.
     with pytest.raises(RuntimeError, match="not prepared for this step"):
-        cache.commit_tentative(stale, [1])
-    cache.commit_tentative(step, [1])
+        cache.commit_tentative(stale, anchors(step, [1]))
+    cache.commit_tentative(step, anchors(step, [1]))
     assert cache.cursor[0, 0] == 4
 
 
@@ -180,13 +185,13 @@ def test_commit_moves_the_scheduled_cursors_and_no_padding_requests():
     cache = PagedAttentionCache(geometry, 1, 4, "cpu")
     for slot in range(4):
         cache.cursor[slot, 0] = 3
-    spans = (RequestSpan(1, 3, 0, 2, 3, (0,)), RequestSpan(2, 3, 2, 2, 1, (0,)))
-    step = cache.begin_step(spans, tentative=True, running_bs=3, running_tokens=6)
+    spans = (PagedRequest(1, 3, 0, 2, 3, (0,)), PagedRequest(2, 3, 2, 2, 1, (0,)))
+    step = begin_step(cache, spans, tentative=True, running_bs=3, running_tokens=6)
     assert step.scheduled_bs == 2 and step.slots.tolist() == [3, 1, 0]
     cache.prepare_state(step)
     for span in spans:
         cache.pending.stage_history(span, [7, 9])
-    cache.commit_tentative(step, [2, 1])
+    cache.commit_tentative(step, anchors(step, [2, 1]))
     assert cache.cursor[3, 0] == 5 and cache.cursor[1, 0] == 4
     # The slot the padding named, untouched: it belongs to nobody in this step.
     assert cache.cursor[0, 0] == 3 and cache.cursor[2, 0] == 3
@@ -224,19 +229,19 @@ def test_a_rejected_round_leaves_the_next_one_as_if_it_never_drafted(
     def round_one(length):
         cache = PagedAttentionCache(geometry, 20, 1, "cuda")
         cache.cursor[0, 0] = position
-        span = RequestSpan(7, position, 0, length, 0, blocks)
-        step = cache.begin_step((span,), tentative=True)
+        span = PagedRequest(7, position, 0, length, 0, blocks)
+        step = begin_step(cache, (span,), tentative=True)
         cache.prepare_state(step)
         cache.compress(
             0, compressor, *compressor.project(hidden[:, :length]), step, rope
         )
         cache.pending.stage_history(span, [-1] * length)
-        cache.commit_tentative(step, [accepted])
+        cache.commit_tentative(step, anchors(step, [accepted]))
         return cache
 
     def round_two(cache):
-        span = RequestSpan(7, position + accepted, 0, 3, 0, blocks)
-        step = cache.begin_step((span,))
+        span = PagedRequest(7, position + accepted, 0, 3, 0, blocks)
+        step = begin_step(cache, (span,))
         cache.prepare_state(step)
         latent = cache.compress(
             0, compressor, *compressor.project(following), step, rope
@@ -275,10 +280,10 @@ def test_block_context_read_decodes_only_the_selected_request_windows(packed):
     )
     cache = PagedAttentionCache(geometry, 24, 4, "cuda")
     spans = (
-        RequestSpan(1, 0, 0, 145, 3, tuple(range(10))),
-        RequestSpan(2, 0, 145, 142, 1, tuple(range(10, 20))),
+        PagedRequest(1, 0, 0, 145, 3, tuple(range(10))),
+        PagedRequest(2, 0, 145, 142, 1, tuple(range(10, 20))),
     )
-    step = cache.begin_step(spans)
+    step = begin_step(cache, spans)
     cache.prepare_state(step)
     torch.manual_seed(95)
     values = torch.randn(1, 287, 512, device="cuda", dtype=torch.bfloat16)
@@ -301,7 +306,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     from atom.model_ops.attentions.deepseek_v41.packed_attention import packed_decode
     from atom.model_ops.attentions.deepseek_v41.packed_rows import pack_rows
     from atom.model_ops.blockscale import quantize_fp8
-    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
+    from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
 
     torch.manual_seed(863)
     geometry = V41PoolGeometry(
@@ -322,7 +327,7 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
     stored = pack_rows(*quantized) if packed else keys
     cache.state.view("window")[0, 0, :7] = stored[:7]
     cache.cursor[0, 0] = 7
-    step = cache.begin_step((RequestSpan(1, 7, 0, 6, 0, (0,)),), tentative=True)
+    step = begin_step(cache, (PagedRequest(1, 7, 0, 6, 0, (0,)),), tentative=True)
     cache.prepare_state(step)
     assert step.decode
     cache.write_window(
@@ -331,10 +336,18 @@ def test_verify_decode_kernel_is_causal_after_writing_the_whole_block(packed):
         step,
     )
     spec = LayerAttentionSpec(0, 0, AttentionMode.WINDOW)
-    indices, ptr, _, _ = cache.attention_indices(spec, step)
+    indices, ptr, window, wptr = cache.attention_indices(spec, step)
     query = torch.randn(6, 8, 512, device="cuda", dtype=torch.bfloat16)
     sink = torch.randn(8, device="cuda")
-    function = packed_decode if packed else sparse_attn_v4_paged_decode
+
+    def function(query, pool, indices, ptr, sink, scale):
+        if packed:
+            return packed_decode(query, pool, indices, ptr, sink, scale)
+        ring = cache.ring_view(0)
+        return sparse_attn_v4_paged_2src(
+            query, pool, indices, ptr, ring, window, wptr, sink, scale
+        )
+
     output = function(query, cache.pool, indices, ptr, sink, 512**-0.5)
     expected = []
     for t, position in enumerate(range(7, 13)):

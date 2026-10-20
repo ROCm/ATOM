@@ -419,11 +419,9 @@ def test_failed_pd_transfer_does_not_record_successful_cache_admission():
     seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     scheduler._count_inflight_load(seq)
     scheduler._update_from_kv_xfer_finished(KVConnectorOutput(failed_recving={seq.id}))
-    assert scheduler.engine_stats.total_requests == 0
-    # At the failure/success branch, choose fallback without counting a PD hit.
-    # Local prefill admission is covered separately; block recovery is not part
-    # of this metrics change.
-    assert scheduler._resolve_waiting_remote_kv(seq, deque()) is False
+    # The request is aborted, not prefilled here, and counts no PD hit.
+    assert seq.leave_reason == "aborted"
+    assert scheduler.take_rejected() == [seq]
     assert scheduler.engine_stats.total_requests == 0
     assert scheduler.engine_stats.total_full_tokens == 0
     assert scheduler.engine_stats.total_cached_tokens == 0
@@ -458,9 +456,12 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
         call_func=lambda name, *a, **k: dispatched.append(name)
     )
     proc.pp_transport = SimpleNamespace(
-        send_metadata=lambda _: None, recv_tokens=lambda **_: None
+        send_metadata=lambda _: None, recv_completion=lambda **_: None
     )
     proc._poll_kv_transfer_progress = lambda: None
+    # Dynamic chunking off, as it is for any pp_size == 1 deployment: the head
+    # step polls for a calibrated model, and this double answers that poll.
+    proc._dynamic_chunking_enabled = False
     proc._pp_head_step()
     proc._pp_head_step()  # full pipeline: collect only; no second submission
     assert dispatched == ["forward", "flush_pp_send"]

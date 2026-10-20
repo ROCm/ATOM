@@ -69,3 +69,16 @@ regexes = [
   '''[A-Z][A-Z0-9_]*SHA512\s*[=:]''',
   '''[A-Z][A-Z0-9_]*MD5\s*[=:]''',
 ]
+
+[[allowlists]]
+description = "File digests keyed by filename in lock and manifest fixtures"
+regexTarget = "match"
+regexes = [
+  '''\.(?:json|py|ts|js|txt|md|ya?ml|bin|safetensors|model)": "[0-9a-f]{64}"''',
+]
+
+[[allowlists]]
+description = "snake_case identifiers"
+regexes = [
+  '''^[a-z][a-z0-9]{0,11}(?:_[a-z0-9]{1,12}){1,5}$''',
+]

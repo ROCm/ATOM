@@ -109,7 +109,7 @@ jobs:
       scheduled_sglang_resolution: ${{ steps.wait.outputs.scheduled_sglang_resolution }}
     steps:
       - name: Checkout selected branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Wait for today's SGLang nightly tag
         id: wait
@@ -350,7 +350,7 @@ jobs:
       use_workspace_atom: ${{ steps.resolve.outputs.use_workspace_atom }}
     steps:
       - name: Checkout selected branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Resolve benchmark source
         id: resolve
@@ -623,7 +623,7 @@ jobs:
       has_enabled_models: ${{ steps.load.outputs.has_enabled_models }}
       selected_group: ${{ steps.load.outputs.selected_group }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - id: load
         env:
           MODEL_MI355: ${{ inputs.model_mi355 || 'none' }}
@@ -1003,7 +1003,7 @@ jobs:
       SGLANG_IMAGE_REPO: rocm/atom-dev
     steps:
       - name: Checkout benchmark ATOM source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ${{ env.ATOM_SOURCE_REPOSITORY }}
           ref: ${{ env.ATOM_SOURCE_REF }}
@@ -1030,7 +1030,7 @@ jobs:
         run: |
           cat > Dockerfile.sglang-base <<EOF
           FROM ${SGLANG_BASE_IMAGE}
-          RUN pip install -U lm-eval[api]
+          RUN pip install -U "lm-eval[api]" "datasets==5.0.0"
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
           RUN pip show hf_transfer || true
@@ -1166,10 +1166,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download all benchmark results
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: 'sglang-benchmark-*'
           merge-multiple: true
@@ -1244,7 +1244,7 @@ jobs:
           echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
 
       - name: Upload SGLang benchmark summary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sglang-benchmark-summary
           path: sglang_benchmark_summary.json
@@ -1272,7 +1272,7 @@ jobs:
 
       - name: Checkout LLM-Booster dashboard repo
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           repository: ROCm/LLM-Booster
           ref: main
@@ -1520,7 +1520,7 @@ jobs:
 
       - name: Upload LLM-Booster dashboard preview artifact
         if: needs.resolve-atom-source.outputs.upload_to_custom_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.llmbooster-key.outputs.available == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sglang-benchmark-llm-booster-preview
           path: |
@@ -1627,7 +1627,7 @@ jobs:
 
       - name: Upload regression report
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0' && steps.check-regression.outputs.has_regression == 'true'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sglang-benchmark-regression-report
           path: regression_report.json
@@ -1650,7 +1650,7 @@ jobs:
 
       - name: Store benchmark result to dashboard
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@4322e5726e6334590d251fc4f92bec0efafc45dc # v1.22.2
         with:
           tool: customBiggerIsBetter
           output-file-path: benchmark-action-input.json

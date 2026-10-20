@@ -217,12 +217,14 @@ def test_install_warns_when_target_method_is_gone(dflash_module, caplog):
 
 
 def _fake_server_args(monkeypatch, *, algorithm, tp_size):
-    """Make ``sglang.srt.server_args.get_global_server_args`` importable."""
-    module = types.ModuleType("sglang.srt.server_args")
-    module.get_global_server_args = lambda: types.SimpleNamespace(
-        speculative_algorithm=algorithm, tp_size=tp_size
-    )
-    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", module)
+    """Make SGLang ServerArgs readable via the 0.5.20 runtime_context getter."""
+    args = types.SimpleNamespace(speculative_algorithm=algorithm, tp_size=tp_size)
+    runtime_ctx = types.ModuleType("sglang.srt.runtime_context")
+    runtime_ctx.get_server_args = lambda: args
+    monkeypatch.setitem(sys.modules, "sglang.srt.runtime_context", runtime_ctx)
+    server_args_mod = types.ModuleType("sglang.srt.server_args")
+    server_args_mod.get_global_server_args = lambda: args
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args_mod)
 
 
 @pytest.mark.parametrize("algorithm", ["DFLASH", "SpeculativeAlgorithm.DFLASH"])

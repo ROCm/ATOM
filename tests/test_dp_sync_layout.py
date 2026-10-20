@@ -111,6 +111,18 @@ def test_the_prefill_flag_still_reads_as_a_flag_after_the_batch_row(monkeypatch)
     assert r.any_rank_has_prefill and r.max_bs_across_dp == 5
 
 
+def test_the_eager_flag_is_its_own_row_after_the_prefill_flag(monkeypatch):
+    """Both OR-reduce and sit side by side, so a one-row shift would read one
+    as the other: a peer needing eager would turn on prefill for everyone, or
+    a peer prefilling would stop every rank replaying. Pinned with each set
+    alone."""
+    eager = _sync(monkeypatch, peers=[_with(3, 1)], **_base())
+    assert eager.any_rank_needs_eager and not eager.any_rank_has_prefill
+    prefill = _sync(monkeypatch, peers=[_with(2, 1)], **_base())
+    assert prefill.any_rank_has_prefill and not prefill.any_rank_needs_eager
+    assert _sync(monkeypatch, peers=[], **_base(needs_eager=True)).any_rank_needs_eager
+
+
 def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
     """TBO's four fields shifted down with everything else.
 
@@ -133,7 +145,7 @@ def test_the_tbo_rows_survive_the_batch_being_folded_in(monkeypatch):
     # One rank that cannot split vetoes the whole group.
     vetoed = _sync(
         monkeypatch,
-        peers=[_with(4, 0)],
+        peers=[_with(5, 0)],
         **_base(
             tbo_on=True,
             local_meets_min_tokens=True,
@@ -153,7 +165,7 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
     shifted offset reads one of the head's fields and reports it.
     """
     for tbo_on in (False, True):
-        head = 7 if tbo_on else 3
+        head = 8 if tbo_on else 4
         r = _sync(
             monkeypatch,
             peers=[_with(head, 9)],
@@ -162,3 +174,64 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
         assert r.max_seqlen_q_across_dp == 9, f"tbo_on={tbo_on}"
         alone = _sync(monkeypatch, peers=[], **_base(tbo_on=tbo_on, max_seqlen_q=3))
         assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
+
+
+# ── stage rows (DeepSeek-V4.1 decoder bounded replay) ─────────────────────
+
+
+def test_stage_rows_ride_the_same_collective(monkeypatch):
+    """A replaying prefill rank beside a decoding peer: the table comes back
+    in DP order, and the step still issues one all_gather."""
+    calls = []
+
+    def peer(local):
+        calls.append(1)
+        out = local.clone()
+        out[2] = 0  # the peer decodes
+        out[-4:] = torch.tensor([0, 1, 40, 40], dtype=torch.int32)
+        return out
+
+    sync = _sync(
+        monkeypatch,
+        peers=[peer],
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 128, 1)),
+    )
+    assert sync.dp_stage_rows == ((1, 0), (1, 1), (128, 40), (1, 40))
+    assert len(calls) == 1
+
+
+def test_no_replaying_rank_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, dp_stage_row=(0, 1, 500, 500)),
+    )
+    assert sync.dp_stage_rows is None
+
+
+def test_a_decode_only_group_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch, peers=[_with(0, 10)], **_base(dp_stage_row=(1, 0, 10, 10))
+    )
+    assert sync.dp_stage_rows is None
+
+
+def test_stage_rows_follow_the_dspark_row(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, max_seqlen_q=6, dp_stage_row=(1, 1, 128, 1)),
+    )
+    assert sync.max_seqlen_q_across_dp == 6
+    assert sync.dp_stage_rows[2] == (128, 128)
+
+
+def test_a_stage_row_is_as_long_as_the_model_makes_it(monkeypatch):
+    """The shared sync knows nothing of a model's stages: it carries whatever
+    row the model reports and only reads its leading applies flag."""
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 7, 6, 5)),
+    )
+    assert sync.dp_stage_rows == ((1, 1), (1, 1), (7, 7), (6, 6), (5, 5))

@@ -50,6 +50,7 @@ is one of:
 |---|---|
 | _(none, i.e. BF16/FP16 model)_ | Quantized directly from float weights. |
 | `fp8` (block FP8, `QuantType.per_1x128`) | FP8 block weights are dequantized to BF16 first, then re-quantized. |
+| `quark` / `modelopt` with NVFP4 layers | Packed group-16 NVFP4 weights are decoded with their E4M3 block scales and required FP32 global weight scales, then converted to MXFP4. This source currently supports only an `mxfp4` online target; direct NVFP4 inference is rejected. |
 | `mxfp4` | **Not re-quantized.** Source MXFP4 weights are currently passed through unchanged — there is no dequant path for `per_1x32`, so the requested target format does not take effect on these layers. |
 
 ## Configuration syntax
@@ -236,8 +237,7 @@ vllm serve deepseek-ai/DeepSeek-R1-0528 \
 The schema, target formats, pattern semantics, and resolution order are
 identical to the `--online_quant_config` flag documented in § 2. Omitting it
 leaves weights at their source precision. As with the standalone flag, online
-quantization only activates when the source checkpoint's `quant_method` is
-unquantized or per-block FP8 (see § 1).
+quantization activates only for a supported source format (see § 1).
 
 ## Verifying the result
 
@@ -303,8 +303,19 @@ Online quantization info saved to /root/online_quant_info_20260525_033839_112444
 
 ### When online quantization activates
 
-`--online_quant_config` is only applied when the source checkpoint's
-`quant_method` is unquantized or per-block FP8 (see § 1).
+`--online_quant_config` is applied to unquantized, supported FP8, and NVFP4
+source layers (see § 1). NVFP4 requires an MXFP4 target on every NVFP4 layer; a
+checkpoint without `--online_quant_config`, or an NVFP4 layer excluded from it,
+is rejected at startup, before weights load. Linear K must be
+divisible by 32; MoE conversion pads each TP-local target shard independently.
+NVFP4 expert checkpoints must expose split w1/w2/w3 tensors so each projection's
+global weight scale can be validated before conversion.
+For ModelOpt mixed-precision checkpoints, the source projections fused into one
+ATOM parameter (for example q/k/v or gate/up) must use the same source
+quantization spec and share the same exclusion state; conflicting packed-layer
+configurations are rejected during model setup. A projection the config omits
+entirely is not detected -- the fused parameter is built from whichever
+projections are listed.
 
 ### Tensor-parallel behavior
 
@@ -318,6 +329,9 @@ the full unpartitioned weight. Concretely:
 - `mxfp4` (`per_1x32`): scales are within 32-element blocks along the input
   dimension; for `RowParallelLinear` this requires a gather on the input dim
   before quantization, then re-sharding. This is the most expensive case.
+- NVFP4 → MXFP4 MoE: each TP-local w2 shard is padded and quantized locally.
+  Gathering first and appending padding globally changes rank boundaries and is
+  invalid. This conversion therefore adds no w2 all-gather.
 
 If load time grows linearly with TP size, your recipe is hitting the gather
 path.

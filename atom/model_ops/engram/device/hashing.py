@@ -18,6 +18,24 @@ import triton
 import triton.language as tl
 
 
+@dataclass(frozen=True)
+class EngramBatch:
+    """One forward as the kernels see it: every field already on device.
+
+    `compressed` is derived from the very tensor the model embeds, so the rows
+    Engram looks up and the tokens the model runs cannot disagree. `history` is
+    any `[n, max_ngram_size - 1]` int64 plane with `history_index` naming a row
+    per request, which is how the committed cursor is read where it lies rather
+    than gathered out first.
+    """
+
+    compressed: torch.Tensor
+    batch_ids: torch.Tensor
+    cu_seqlens: torch.Tensor
+    history: torch.Tensor
+    history_index: torch.Tensor
+
+
 @triton.jit
 def _compress_kernel(
     input_ids,
@@ -25,14 +43,20 @@ def _compress_kernel(
     dead_mask,
     out,
     tokens,
+    live_count,
     HAS_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
+    COUNTED: tl.constexpr,
 ):
     """Raw ids to compressed ids, DEAD where the mask says so.
 
     Once per forward rather than once per lookback per layer: both kernels
     below walk the same ids, and neither needs the vocabulary table to do it.
+    ``COUNTED``: the count is read from ``live_count`` (a replay's, not the
+    capture's).
     """
+    if COUNTED:
+        tokens = tl.load(live_count)
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = offsets < tokens
     raw = tl.load(input_ids + offsets, mask=live, other=0)
@@ -123,9 +147,18 @@ def _engram_snapshot_kernel(
     tokens,
     padded_tokens,
     history_stride,
+    cursor_positions,
+    cursor_out,
+    cursor_slot_stride,
+    cursor_row_stride,
+    live_count,
     NGRAM: tl.constexpr,
     BLOCK: tl.constexpr,
+    STAGE_CURSOR: tl.constexpr,
+    COUNTED: tl.constexpr,
 ):
+    if COUNTED:
+        tokens = tl.load(live_count)
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = token < tokens
     batch = tl.load(batch_ids + token, live, 0)
@@ -148,13 +181,35 @@ def _engram_snapshot_kernel(
             tl.where(live, source, -2),
             token < padded_tokens,
         )
+        if STAGE_CURSOR and shift < NGRAM - 1:
+            # Snapshot is newest-first; a cursor stores oldest-first history
+            # AFTER this token. Both use these same committed lookbacks.
+            tl.store(
+                cursor_out
+                + batch * cursor_slot_stride
+                + local * cursor_row_stride
+                + NGRAM
+                - 1
+                - shift,
+                source,
+                live,
+            )
+    if STAGE_CURSOR:
+        position = tl.load(cursor_positions + token - local, live, 0)
+        tl.store(
+            cursor_out + batch * cursor_slot_stride + local * cursor_row_stride,
+            position + local + 1,
+            live,
+        )
 
 
-def engram_snapshot(tables, batch, out):
-    """Freeze lookbacks before the runner advances the committed cursor.
+def engram_snapshot(
+    tables, batch, out, *, cursor_positions=None, cursor_out=None, live=None
+):
+    """Freeze lookbacks before the committed cursor advances.
 
-    The output has a stable address across graph buckets and replays. Only
-    this small input copy runs in prepare; per-layer hashing runs in forward.
+    `live`: the live leading tokens on the device; without it every token of
+    `batch.batch_ids` is.
     """
     _check_plane(batch.history, tables)
     tokens = batch.batch_ids.numel()
@@ -162,6 +217,22 @@ def engram_snapshot(tables, batch, out):
         raise ValueError("Engram snapshot must cover all tokens and lookbacks")
     if not out.is_contiguous():
         raise ValueError("Engram snapshot must be contiguous")
+    stage_cursor = cursor_out is not None
+    if stage_cursor:
+        _check_plane(batch.history, tables, cursor_out)
+        if (
+            cursor_out.ndim != 3
+            or cursor_out.shape[0] < batch.history_index.numel()
+            or cursor_out.shape[-1] != tables.ngram
+            or cursor_positions is None
+            or cursor_positions.numel() < tokens
+        ):
+            raise ValueError("Engram snapshot requires per-request cursor candidates")
+        if (
+            cursor_out.untyped_storage().data_ptr()
+            == batch.history.untyped_storage().data_ptr()
+        ):
+            raise ValueError("Engram snapshot cursor candidates must not alias history")
     if out.shape[0]:
         _engram_snapshot_kernel[(triton.cdiv(out.shape[0], 128),)](
             batch.compressed,
@@ -173,8 +244,15 @@ def engram_snapshot(tables, batch, out):
             tokens,
             out.shape[0],
             batch.history.stride(0),
+            cursor_positions,
+            cursor_out,
+            cursor_out.stride(0) if stage_cursor else 0,
+            cursor_out.stride(1) if stage_cursor else 0,
+            live,
             NGRAM=tables.ngram,
             BLOCK=128,
+            STAGE_CURSOR=stage_cursor,
+            COUNTED=live is not None,
         )
     return out
 
@@ -220,9 +298,11 @@ def _engram_cursor_kernel(
     history_stride,
     out_slot_stride,
     out_row_stride,
+    live_count,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
     ALL: tl.constexpr,
+    COUNTED: tl.constexpr,
 ):
     """A request's cursor after accepting `index + 1` of this forward's tokens.
 
@@ -235,11 +315,15 @@ def _engram_cursor_kernel(
     a row it is overwriting: at `ALL=False` the destination IS the history
     plane offset by one column, so the windows overlap for every `L < WIDTH`.
     """
+    if COUNTED:  # noqa: SIM102 (a constexpr, then a device load)
+        if tl.load(live_count) == 0:
+            return
     batch = tl.program_id(0)
     start = tl.load(cu_seqlens + batch)
     length = tl.load(cu_seqlens + batch + 1) - start
     index = tl.program_id(1) if ALL else length - 1
-    if index >= length:
+    # a padded request (length 0) must not write prefix 0 into slot 0
+    if (index >= length) | (length == 0):
         return
     prefix = index + 1
     slot = tl.load(history_index + batch)
@@ -315,11 +399,12 @@ class EngramHashTables:
         )
 
 
-def engram_compress(tables, input_ids, dead_mask=None, out=None):
+def engram_compress(tables, input_ids, dead_mask=None, out=None, live=None):
     """`[tokens]` int32 compressed ids, `-1` where `dead_mask` is set.
 
     `dead_mask` is true where a token carries no id of its own -- an image row,
     which the attention metadata already publishes in exactly this sense.
+    `live`: the live leading tokens on the device, the rest untouched.
     """
     tokens = input_ids.numel()
     if out is None:
@@ -332,8 +417,10 @@ def engram_compress(tables, input_ids, dead_mask=None, out=None):
             dead_mask,
             out,
             tokens,
+            live,
             HAS_MASK=dead_mask is not None,
             BLOCK=block,
+            COUNTED=live is not None,
         )
     return out
 
@@ -387,7 +474,15 @@ def engram_row_indices(
 
 
 def engram_cursor_rows(
-    tables, compressed, cu_seqlens, positions, history, history_index, out, candidates=0
+    tables,
+    compressed,
+    cu_seqlens,
+    positions,
+    history,
+    history_index,
+    out,
+    candidates=0,
+    live=None,
 ):
     """Write each request's next cursor row, or every prefix a verify may take.
 
@@ -396,9 +491,9 @@ def engram_cursor_rows(
     `[:, 1:]` view -- and a positive width writes `out[request, prefix - 1]`
     for every prefix, which is the plane `commit_tentative` selects from.
 
-    Launched where `advance_cursor` ran, and for its reason: a checkpoint store
-    runs ahead of the batch, so the image it takes pairs the ring and cursor of
-    the step before this one.
+    After the checkpoint store, whose image pairs the ring and cursor of the
+    step before. `live`: the forward's live tokens on the device; 0 writes
+    nothing.
     """
     requests = history_index.numel()
     if not requests:
@@ -416,9 +511,11 @@ def engram_cursor_rows(
         history.stride(0),
         out.stride(0) if candidates else 0,
         out.stride(1) if candidates else out.stride(0),
+        live,
         WIDTH=tables.width,
         BLOCK=triton.next_power_of_2(tables.ngram),
         ALL=bool(candidates),
+        COUNTED=live is not None,
     )
     return out
 

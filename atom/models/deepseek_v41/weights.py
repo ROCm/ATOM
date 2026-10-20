@@ -329,6 +329,15 @@ class CheckpointReader:
 
     def __init__(self, directory, schema):
         self.directory = Path(directory)
+        if not self.directory.is_dir():
+            # A hub id joins into `org/name/model.safetensors.index.json`, a
+            # relative path whose absence reads as a missing checkpoint rather
+            # than as a name nobody resolved. Say which it is here: the caller
+            # wants `atom.model_loader.weight_utils.local_model_dir`.
+            raise NotADirectoryError(
+                f"{directory!r} is not a checkpoint directory; resolve a hub id "
+                f"with local_model_dir() before reading a checkpoint from it"
+            )
         index = json.loads(
             (self.directory / "model.safetensors.index.json").read_text()
         )

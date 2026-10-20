@@ -130,7 +130,7 @@ on:
 # below, exactly as it was when the trigger lived here.
 
 permissions:
-  contents: write  # create the GitHub Release and upload assets
+  contents: read
 
 concurrency:
   group: atom-release-${{ github.ref }}
@@ -172,14 +172,14 @@ jobs:
 
     steps:
       - name: Checkout ATOM repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0  # full history + tags for setuptools_scm versioning
 
       - name: Checkout to user-specified ref (if provided)
         run: |
           set -ex
-          if [ -n "${BUILD_REF}" ] && [ "${BUILD_REF}" != "${{ github.ref }}" ]; then
+          if [ -n "${BUILD_REF}" ] && [ "${BUILD_REF}" != "${GITHUB_REF}" ]; then
             echo "Checking out to ref: ${BUILD_REF}"
             git fetch --all --tags
             git checkout "${BUILD_REF}"
@@ -370,7 +370,7 @@ jobs:
           cat "dist/provenance-${{ matrix.flavor }}.txt"
 
       - name: Upload wheel as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: atom-whl-${{ matrix.flavor }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -414,7 +414,7 @@ jobs:
 
     steps:
       - name: Checkout the commit that was built
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Not the default ref: a dispatch can name any commit, and the tag
           # has to land on the one the wheels actually came from.
@@ -422,7 +422,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download every flavor's wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: atom-whl-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-wheels

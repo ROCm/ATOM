@@ -20,6 +20,7 @@ from atom.utils.forward_context import (
     get_forward_context,
     set_forward_context,
 )
+from atom.utils.h2d import h2d_producer
 
 logger = logging.getLogger("atom")
 
@@ -174,14 +175,26 @@ class Drafter(abc.ABC):
         self._captures_aux = False
         self._aux_buffers: list[torch.Tensor] = []
 
-        i32_kwargs = {"dtype": torch.int32, "device": self.device}
-        i64_kwargs = {"dtype": torch.int64, "device": self.device}
-        max_bs = self.config.max_num_seqs
-        self.cu_num_draft_tokens = CpuGpuBuffer(max_bs, **i32_kwargs)
-        self.target_logits_indices = CpuGpuBuffer(max_bs * self.mtp_k, **i64_kwargs)
-        self.bonus_logits_indices = CpuGpuBuffer(max_bs, **i64_kwargs)
+        self.metadata_buffers = self._allocate_metadata_buffers(
+            self.config.max_num_seqs, self.mtp_k, self.device
+        )
 
         self._build_draft_graphs()
+
+    @staticmethod
+    def _allocate_metadata_buffers(max_bs, mtp_k, device):
+        kwargs = {
+            "device": device,
+            "publication_group": "spec_decode",
+            "pin_memory": torch.device(device).type != "cpu",
+        }
+        return {
+            "cu_num_draft_tokens": CpuGpuBuffer(max_bs, dtype=torch.int32, **kwargs),
+            "target_logits_indices": CpuGpuBuffer(
+                max_bs * mtp_k, dtype=torch.int64, **kwargs
+            ),
+            "bonus_logits_indices": CpuGpuBuffer(max_bs, dtype=torch.int64, **kwargs),
+        }
 
     # ---- draft passes ----
     def _declare_draft_graphs(self) -> tuple[DraftGraph, ...]:
@@ -393,6 +406,15 @@ class Drafter(abc.ABC):
             else:
                 module.register_forward_hook(hook)
         self._captures_aux = True
+        # A target that runs some layers on a subset of rows (V4.1 bounded
+        # replay) moves those layers' captures to their forward rows itself.
+        # The hooks above bind these buffers now, so the target gets the same
+        # tensors.
+        rows_hook = _descend_wrappers(
+            target_model, lambda m: getattr(m, "set_aux_hidden_state_rows", None)
+        )
+        if rows_hook is not None:
+            rows_hook(tuple(spec.layer_ids), tuple(self._aux_buffers))
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
@@ -438,6 +460,8 @@ class Drafter(abc.ABC):
         """
         n = len(anchors)
         buf = self.runner.forward_vars["draft_next_tokens"]
+        if buf._publication is not None:
+            buf._publication.acquire_write()
         buf.np[:n] = anchors
         return buf.copy_to_gpu(n)
 
@@ -615,48 +639,31 @@ class Drafter(abc.ABC):
             running_tokens,
             unified=running_tokens_are_unified,
         )
+        context.running_tokens_across_dp = tuple(
+            forward_context.dp_metadata.get_sizes_across_dp()
+        )
 
-    def prepare_inputs(
-        self,
-        scheduled_bs: int,
-        # [scheduled_bs] each request's anchor offset WITHIN its own segment;
-        # for a verified request that is its accepted-draft count. None ->
-        # every segment's last row, what a step that verified nothing wants.
-        anchor_in_seq: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Anchor row per request = its segment start + `anchor_in_seq`.
+    def prepare_inputs(self, scheduled_bs: int) -> torch.Tensor:
+        """Anchor row per request when nothing was verified: its segment's last.
 
-        Reading forward from the start is what keeps this length-free; counting
-        back from the segment end needs the segment length, which DSpark's
-        ragged verify makes a per-request number.
+        A verified step takes its anchors from the rejection verdict instead.
         """
         cu_seqlens_q = get_forward_context().attn_metadata.cu_seqlens_q
-        cu_seqlens_q = cu_seqlens_q[: scheduled_bs + 1]
+        return cu_seqlens_q[1 : scheduled_bs + 1] - 1
 
-        if anchor_in_seq is None:
-            anchor_in_seq = cu_seqlens_q[1:] - cu_seqlens_q[:-1] - 1
-        token_indices = cu_seqlens_q[:-1] + anchor_in_seq
-
-        # Defensive clamp to the valid flat-token range [0, total_tokens-1].
-        # Under DSpark flat-ragged CUDA graph, the drain-phase corner (tiny /
-        # mixed batches) can drive an anchor index just out of range; the anchor
-        # only seeds the DRAFT (a wrong anchor lowers acceptance but never
-        # corrupts the verified/target output — losslessness is preserved), so
-        # clamping is safe and avoids an index_select GPU fault. No-op on the
-        # normal path where indices are already in range.
-        if self.is_block_drafter:
-            upper = (cu_seqlens_q[-1] - 1).clamp_(min=0)
-            token_indices = token_indices.clamp_(min=0)
-            torch.minimum(token_indices, upper, out=token_indices)
-
-        return token_indices
-
-    def calc_spec_decode_metadata(
+    @h2d_producer("spec_decode", runner="runner")
+    def prepare_spec_decode_indices(
         self,
         num_sampled_tokens: np.ndarray,
         cu_num_sampled_tokens: np.ndarray,
-        input_ids: torch.Tensor,
-    ) -> SpecDecodeMetadata:
+        publication_group,
+    ) -> tuple[np.ndarray, int]:
+        """Fill host indices/counts before their group's first GPU consumer.
+
+        This uses only the settled query lengths, so it can share token input
+        publication. The caller must publish the group before verification
+        reads them.
+        """
         scheduled_bs = len(num_sampled_tokens)
 
         # num_draft = num_sampled - 1 per request. num_sampled_tokens is the
@@ -685,22 +692,40 @@ class Drafter(abc.ABC):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # Do the CPU -> GPU copy.
-        self.target_logits_indices.np[:sum_drafted_tokens] = target_logits_indices
-        self.cu_num_draft_tokens.np[:scheduled_bs] = cu_num_draft_tokens
-        self.bonus_logits_indices.np[:scheduled_bs] = bonus_logits_indices
-        target_logits_indices = self.target_logits_indices.copy_to_gpu(
-            sum_drafted_tokens
-        )
-        cu_num_draft_tokens = self.cu_num_draft_tokens.copy_to_gpu(scheduled_bs)
-        bonus_logits_indices = self.bonus_logits_indices.copy_to_gpu(scheduled_bs)
+        var = self.runner.forward_vars
+        var["target_logits_indices"].np[:sum_drafted_tokens] = target_logits_indices
+        var["cu_num_draft_tokens"].np[:scheduled_bs] = cu_num_draft_tokens
+        var["bonus_logits_indices"].np[:scheduled_bs] = bonus_logits_indices
+        group = publication_group
+        counts = group.counts
+        counts[group.indices["target_logits_indices"]] = sum_drafted_tokens
+        counts[group.indices["cu_num_draft_tokens"]] = scheduled_bs
+        counts[group.indices["bonus_logits_indices"]] = scheduled_bs
+        return num_draft_tokens, sum_drafted_tokens
 
-        # Compute the draft token ids.
-        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = torch.index_select(input_ids[1:], 0, target_logits_indices)
+    def calc_spec_decode_metadata(
+        self,
+        num_sampled_tokens: np.ndarray,
+        cu_num_sampled_tokens: np.ndarray,
+        input_ids: torch.Tensor,
+        *,
+        prepared_indices: tuple[np.ndarray, int] | None = None,
+    ) -> SpecDecodeMetadata:
+        if prepared_indices is None:
+            group = self.runner.h2d_groups["spec_decode"]
+            prepared_indices = self.prepare_spec_decode_indices(
+                num_sampled_tokens, cu_num_sampled_tokens, group
+            )
+            group.publish(group.counts)
+        num_draft_tokens, sum_drafted_tokens = prepared_indices
+        scheduled_bs = len(num_draft_tokens)
+        var = self.runner.forward_vars
+        target_logits_indices = var["target_logits_indices"].gpu[:sum_drafted_tokens]
+        cu_num_draft_tokens = var["cu_num_draft_tokens"].gpu[:scheduled_bs]
+        bonus_logits_indices = var["bonus_logits_indices"].gpu[:scheduled_bs]
 
         metadata = SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
+            input_ids=input_ids,
             num_spec_steps=self.mtp_k,
             num_draft_tokens_np=num_draft_tokens,
             cu_num_draft_tokens=cu_num_draft_tokens,

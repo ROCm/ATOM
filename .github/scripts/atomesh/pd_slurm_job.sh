@@ -24,14 +24,21 @@ mkdir -p "${RUN_DIR}"
 chmod 0777 "${RUN_DIR}" 2>/dev/null || true
 
 EXECUTION_PHASES=(combined)
-if [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
+if [[ "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
+  if [[ "${RUN_EVAL:-false}" != "true" && "${RUN_EVAL:-false}" != "1" ]]; then
+    echo "ERROR: EVAL_ONLY requires RUN_EVAL=true" >&2
+    exit 2
+  fi
+  # Enter the existing fresh eval phase, which also removes synthetic AL.
+  EXECUTION_PHASES=(eval)
+elif [[ "${BENCHMARK_KIND:-random}" == "aiperf_agentic" \
   && ( "${EVAL_TASK:-gsm8k}" == "swebench_lite" \
     || "${EVAL_TASK:-gsm8k}" == "gsm8k" ) \
   && ( "${RUN_EVAL:-false}" == "true" || "${RUN_EVAL:-false}" == "1" ) ]]; then
   EXECUTION_PHASES=(benchmark eval)
 fi
 ATOMESH_RESTART_PORT_OFFSET="${ATOMESH_RESTART_PORT_OFFSET:-1000}"
-if [[ "${#EXECUTION_PHASES[@]}" -gt 1 && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
+if [[ " ${EXECUTION_PHASES[*]} " == *" eval "* && ! "${ATOMESH_RESTART_PORT_OFFSET}" =~ ^[1-9][0-9]*$ ]]; then
   echo "ERROR: ATOMESH_RESTART_PORT_OFFSET must be a positive integer" >&2
   exit 2
 fi
@@ -145,6 +152,39 @@ pre_cleanup_local() {
   set -e
 }
 
+# The image ships every tuned FlyDSL kernel AOT-compiled under
+# /app/aiter-test/aiter/jit/flydsl_cache, but as root-only (0600) files the
+# --user container cannot read. Without them each new prefill M bucket compiles
+# at runtime and stalls the engine for 8-60 s. Extract them once per node, uid
+# and image (~90 MB, ~2 s); FlyDSL's per-key file locks make the directory safe
+# to share between workers and jobs. Prints the directory, or nothing on failure.
+prepare_flydsl_aot_cache() {
+  [[ "${ATOMESH_FLYDSL_AOT:-1}" == "1" ]] || return 0
+  local image_id root dir
+  image_id="$(docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" 2>/dev/null)" || return 0
+  image_id="${image_id#sha256:}"
+  [[ -n "${image_id}" ]] || return 0
+  root="${ATOMESH_FLYDSL_AOT_ROOT:-${TMPDIR:-/tmp}/atomesh-flydsl-aot-$(id -u)}"
+  dir="${root}/${image_id:0:16}"
+  mkdir -p "${root}" 2>/dev/null || return 0
+  (
+    flock -w 600 9 || exit 1
+    [[ -f "${dir}/.complete" ]] && exit 0
+    tmp="$(mktemp -d "${root}/.extract.XXXXXX")" || exit 1
+    # shellcheck disable=SC2016
+    if docker run --rm --user 0 --entrypoint /bin/bash "${DOCKER_IMAGE}" -c '
+        d="$(python3 -c "import importlib.util as u, os; s = u.find_spec(\"aiter\"); print(os.path.join(os.path.dirname(s.origin), \"jit\", \"flydsl_cache\"))")" \
+          && [ -d "$d" ] && tar -C "$d" -cf - .' | tar -xf - -C "${tmp}"; then
+      rm -rf "${dir}"
+      mv "${tmp}" "${dir}" && touch "${dir}/.complete"
+    else
+      rm -rf "${tmp}"
+      exit 1
+    fi
+  ) 9>"${root}/.lock" >&2 || return 0
+  echo "${dir}"
+}
+
 run_container_rank() {
   local rank="$1"
   local env_file="$2"
@@ -205,8 +245,16 @@ EOF
   echo "[network] rank=${rank} ip=${node_ip} NCCL_SOCKET_IFNAME=${nccl_socket_ifname} MORI_SOCKET_IFNAME=${mori_socket_ifname}"
 
   bounded_docker_rm "${container}"
-  if [[ "${execution_phase}" != "eval" ]]; then
+  if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
     docker pull "${DOCKER_IMAGE}"
+  fi
+
+  local flydsl_aot_dir
+  flydsl_aot_dir="$(prepare_flydsl_aot_cache)"
+  if [[ -n "${flydsl_aot_dir}" ]]; then
+    echo "[flydsl-aot] rank=${rank} shared cache ${flydsl_aot_dir}"
+  else
+    echo "[flydsl-aot] rank=${rank} no shared cache; workers fall back to copying or runtime JIT"
   fi
 
   local mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"
@@ -314,6 +362,12 @@ EOF
   [[ -e /etc/libibverbs.d/ionic.driver ]] && docker_args+=(-v /etc/libibverbs.d/ionic.driver:/etc/libibverbs.d/ionic.driver:ro)
   [[ -d /it-share ]] && docker_args+=(-v /it-share:/it-share)
   [[ -d /shared_nfs ]] && docker_args+=(-v /shared_nfs:/shared_nfs)
+  if [[ -n "${flydsl_aot_dir}" ]]; then
+    docker_args+=(
+      -v "${flydsl_aot_dir}:/opt/atomesh/flydsl-aot"
+      -e ATOMESH_FLYDSL_AOT_DIR=/opt/atomesh/flydsl-aot
+    )
+  fi
 
   docker_args+=(
     "${DOCKER_IMAGE}"
@@ -615,7 +669,7 @@ for execution_phase in "${EXECUTION_PHASES[@]}"; do
         docker kill "${container}" >/dev/null 2>&1 || true
         docker rm -f "${container}" >/dev/null 2>&1 || true
       fi
-      if [[ "${execution_phase}" != "eval" ]]; then
+      if [[ "${execution_phase}" != "eval" || "${EVAL_ONLY:-false}" == "true" || "${EVAL_ONLY:-false}" == "1" ]]; then
         docker pull "'"${DOCKER_IMAGE}"'"
       fi
       mesh_binary="${ATOMESH_MESH_BINARY:-/app/ATOM/atom/mesh/target/release/atomesh}"

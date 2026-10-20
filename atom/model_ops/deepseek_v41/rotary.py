@@ -48,19 +48,23 @@ class RotaryEmbedding(nn.Module):
             frequencies = frequencies / factor * ramp + frequencies * (1 - ramp)
         angles = torch.outer(torch.arange(max_position), frequencies)
         frequencies = torch.polar(torch.ones_like(angles), angles)
-        # The cached AITER API expects contiguous real caches. Keep FP32 YaRN
-        # frequencies, including for BF16 activations, as on the original path.
+        # The cached AITER API expects contiguous real caches. BF16, as every
+        # other model's RoPE tables (V4's included).
         self.register_buffer(
-            "cos_cache", frequencies.real.contiguous(), persistent=False
+            "cos_cache",
+            frequencies.real.to(torch.bfloat16).contiguous(),
+            persistent=False,
         )
         self.register_buffer(
-            "sin_cache", frequencies.imag.contiguous(), persistent=False
+            "sin_cache",
+            frequencies.imag.to(torch.bfloat16).contiguous(),
+            persistent=False,
         )
 
     @property
     def frequencies(self):
         """Complex view for CPU/reference callers; GPU execution uses the caches."""
-        return torch.complex(self.cos_cache, self.sin_cache)
+        return torch.complex(self.cos_cache.float(), self.sin_cache.float())
 
     @property
     def rope_dim(self):

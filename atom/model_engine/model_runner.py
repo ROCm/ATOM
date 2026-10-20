@@ -9,7 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from functools import partial
+from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
 import numpy as np
@@ -41,8 +41,13 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
-from atom.kv_transfer.disaggregation import KVConnectorOutput
+from atom.kv_transfer.disaggregation import (
+    KVConnectorFactory,
+    KVConnectorOutput,
+    kv_config_has_producer,
+)
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
@@ -95,6 +100,7 @@ from atom.utils.forward_context import (
     set_kv_cache_data,
 )
 from atom.utils.gc_utils import freeze_gc_heap
+from atom.utils.h2d import h2d_producer
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
@@ -139,9 +145,18 @@ support_model_arch_dict = {
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
 }
-# seed = 34567
-# np.random.seed(seed)
-# torch.cuda.manual_seed_all(seed)
+# Mono decode by wrapping the loaded model: the installer runs after the drafter
+# armed its hooks on the unwrapped layers, and may add per-step buffers to the
+# metadata builder before they are bound. Architectures not listed here route
+# mono decode inside their own model class instead.
+mono_decode_installers = {
+    "DeepseekV41ForCausalLM": (
+        "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
+    ),
+    "KimiK3ForConditionalGeneration": (
+        "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
+    ),
+}
 
 
 def max_schedulable_decode_bs(
@@ -161,6 +176,11 @@ def max_schedulable_decode_bs(
     `tokens_per_decode_seq`.
     """
     return min(max_num_seqs, max_num_batched_tokens // full_q_len)
+
+
+# Re-exported under the old private name: this module is where the predicate
+# used to live and where callers (and tests) still import it from.
+_kv_config_has_producer = kv_config_has_producer
 
 
 class TokenLocations(NamedTuple):
@@ -191,18 +211,41 @@ class tokenIDProcessor:
         num_spec_tokens: int = 0,
     ):
         """Asynchronously copy the sampled_token_ids tensor to the host."""
-        self.is_deferred_out = getattr(runner.config, "pipeline_parallel_size", 1) == 1
+        kv_cfg = getattr(runner.config, "kv_transfer_config", {}) or {}
+        self.is_pipeline_parallel = (
+            getattr(runner.config, "pipeline_parallel_size", 1) > 1
+        )
+        # The scheduler never speculates for a P/D producer, though the runner
+        # keeps its drafter loaded: every decode it runs is q=1.
+        self.is_pd_producer = _kv_config_has_producer(kv_cfg)
+        # P/D hands off prompt-end state plus the first sampled token. Deferred
+        # output makes the producer decode once more to surface that token, so
+        # the consumer applies T0 to a state that already has it. Only a
+        # recurrent state notices -- a paged write lands at T0's own position,
+        # so repeating it is idempotent.
+        hands_off_recurrent_state = (
+            self.is_pd_producer and runner.attn_family.has_recurrent_state
+        )
+        self.is_deferred_out = (
+            not self.is_pipeline_parallel and not hands_off_recurrent_state
+        )
 
         self.runner = runner
         device = runner.device
         self.input_ids = CpuGpuBuffer(
-            max_num_batched_tokens + 1, dtype=torch.int32, device=device
+            max_num_batched_tokens + 1,
+            dtype=torch.int32,
+            device=device,
+            publication_group="input_ids",
         )
         # One per request, not per token: where each request's anchor comes
         # from. Sized by tokens -- a batch can never hold more requests. The
         # matching prefix sum is `forward_vars["cu_seqlens_q"]`.
         self.decode_src = CpuGpuBuffer(
-            max_num_batched_tokens, dtype=torch.int32, device=device
+            max_num_batched_tokens,
+            dtype=torch.int32,
+            device=device,
+            publication_group="input_ids",
         )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
@@ -456,10 +499,21 @@ class tokenIDProcessor:
         ), f"{n_deferred} deferred + {n_new} new != {num_cur} requests"
         return TokenLocations(deferred_curr, deferred_prev, new_curr)
 
+    def _publish_input_ids(self, count, group):
+        if group is None:
+            return self.input_ids.copy_to_gpu(count)
+        group.counts[group.indices["input_ids"]] = count
+        group.counts[group.indices["decode_src"]] = None
+        group.publish(group.counts)
+        return self.input_ids.gpu[:count]
+
+    @h2d_producer("input_ids", runner="runner")
     def prepare_input_ids(
         self,
         batch: ScheduledBatch,
         max_seqlen_q: int,
+        *,
+        publication_group=None,
     ) -> torch.Tensor:
         """Prepare the input IDs for the current batch.
 
@@ -468,16 +522,9 @@ class tokenIDProcessor:
         GPU need to be copied into the corresponding slots into input_ids.
         """
         scheduled_tokens = batch.scheduled_tokens  # tokens per req
-        total_tokens = batch.total_tokens_num
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        """for prefill: all input ids are new"""
-        self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
-            :total_tokens_prefill
-        ]
-        self.input_ids.copy_to_gpu(total_tokens_prefill)
-
         # The MTP status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
@@ -489,19 +536,37 @@ class tokenIDProcessor:
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
-            return self.input_ids.gpu[:total_tokens_prefill]
+            # Decode does not publish an empty prefill prefix: an explicit
+            # zero copy is still a publication in this forward's ledger.
+            self.input_ids.np[:total_tokens_prefill] = scheduled_tokens[
+                :total_tokens_prefill
+            ]
+            return self._publish_input_ids(total_tokens_prefill, publication_group)
 
         if not self.is_deferred_out:
             token_ids = scheduled_tokens[
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
-            if self.use_spec:
-                # Reached only under pipeline parallel, which no spec path
-                # supports yet; wants the deferred branch's per-request staging.
+            # No spec path supports pipeline parallel yet; it wants the deferred
+            # branch's per-request staging. Gate on PP itself rather than on
+            # `use_spec`: a P/D producer also reaches this branch, and the flag
+            # is still set there (the runner keeps the drafter loaded to write
+            # the draft's context KV at prefill) even though the scheduler
+            # turned speculation off for it.
+            if self.use_spec and self.is_pipeline_parallel:
                 raise NotImplementedError("pipeline parallel + speculative decode")
+            # PP verifies nothing locally and a P/D producer never speculates
+            # (its DP dummy included), so no row here carries drafts. One that
+            # did would need the deferred branch's per-request staging: under
+            # DP a block drafter's `max_seqlen_q` is the group's maximum, not
+            # this batch's row width.
+            assert batch.num_spec_step == 0, (
+                "non-deferred decode got a speculative batch "
+                f"(num_spec_step={batch.num_spec_step})"
+            )
 
             self.input_ids.np[:total_tokens_decode] = token_ids
-            return self.input_ids.copy_to_gpu(total_tokens_decode)
+            return self._publish_input_ids(total_tokens_decode, publication_group)
 
         # PD consumer first decode: no prior prefill step initialized
         # prev_batch, so use scheduled_tokens directly for this step.
@@ -510,7 +575,7 @@ class tokenIDProcessor:
                 total_tokens_prefill : total_tokens_prefill + total_tokens_decode
             ]
             self.input_ids.np[:total_tokens_decode] = token_ids
-            return self.input_ids.copy_to_gpu(total_tokens_decode)
+            return self._publish_input_ids(total_tokens_decode, publication_group)
 
         """for decode: input ids are from prev_sampled_token_ids"""
         locs = self.get_token_locations(batch)
@@ -553,42 +618,36 @@ class tokenIDProcessor:
         # A newly admitted request has no row in `prev_token_ids`, so
         # `fill_deferred_decode_ids` skips it (`src < 0`) and its draft columns
         # must be staged here -- `scheduled_tokens` gave it committed history,
-        # correct only at column 0.
+        # correct only at column 0. A batch without drafts (`num_spec_step ==
+        # 0`: a P/D producer's decodes and DP dummies) has no draft table.
         #
         # Looped, not scattered: measured, the loop wins below ~24 admissions
         # per step (1.2us at 2) and a ragged scatter is a flat ~8us; above it
         # the scatter wins (12us vs 88us at bs=256). Swap if admissions stop
         # being few.
-        if self.use_spec and num_new_seqs > 0:
+        if self.use_spec and batch.num_spec_step > 0 and num_new_seqs > 0:
             spec = batch.scheduled_spec_decode_tokens
             for i in new_curr_indices:
                 n_draft = int(lens[i]) - 1
                 if n_draft > 0:
                     s = int(cu_np[i]) + 1
                     self.input_ids.np[s : s + n_draft] = spec[i, :n_draft]
-        self.input_ids.copy_to_gpu(total_tokens_decode)
-
         src_np = self.decode_src.np[:bs]
         src_np.fill(NEW_SEQUENCE)
         src_np[deferred_curr_indices] = deferred_prev_indices
-        fill_deferred_decode_ids(
-            self.input_ids.gpu,
-            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
-            self.decode_src.copy_to_gpu(bs),
-            self.prev_token_ids,
-            self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
-            max_tokens_per_seq=int(lens.max()) if bs else 1,
+        group = (
+            self.runner.h2d_groups["input_ids"]
+            if publication_group is None
+            else publication_group
         )
-
-        # CUDAGraph tail padding. A replayed decode graph reads a fixed
-        # `running_bs * tokens_per_seq` tokens out of this buffer, but a step
-        # writes only what it scheduled, and `bs` sits between two
-        # captured buckets on most steps -- a 65-request batch replays the 128
-        # graph, so 63 requests' worth of slots are never written. Nobody else
-        # fills them: `run_model` pads `cu_seqlens_q` so the padded sequences are
-        # empty for attention, but the ids stay whatever the previous forward
-        # left, and the MoE path does consume padded rows. Zero is a legal vocab
-        # id, so the embedding gather stays in bounds either way.
+        counts = group.counts
+        counts[group.indices["input_ids"]] = total_tokens_decode
+        counts[group.indices["decode_src"]] = bs
+        group.publish(counts)
+        # How wide the forward reads: a replayed decode graph takes a fixed
+        # `running_bs * tokens_per_seq` whatever the batch scheduled, and `bs`
+        # sits between two captured buckets on most steps -- a 65-request batch
+        # replays the 128 graph. The kernel zeroes the difference.
         fill_to = total_tokens_decode
         if not self.runner.enforce_eager:
             gbs = next(
@@ -596,10 +655,21 @@ class tokenIDProcessor:
             )
             if gbs is not None:
                 fill_to = max(fill_to, int(gbs) * tokens_per_seq)
-        if fill_to > total_tokens_decode:
-            self.input_ids.gpu[total_tokens_decode:fill_to].zero_()
+        fill_deferred_decode_ids(
+            self.input_ids.gpu,
+            self.runner.forward_vars["cu_seqlens_q"].gpu[: bs + 1],
+            self.decode_src.gpu[:bs],
+            self.prev_token_ids,
+            self.draft_token_ids if self.pre_num_decode_token_per_seq > 1 else None,
+            max_tokens_per_seq=int(lens.max()) if bs else 1,
+            width=fill_to,
+        )
 
-        input_ids = self.input_ids.gpu[:total_tokens]
+        # Slice by the width this path actually staged. Prefill returned above,
+        # so the decode total is the whole batch; a worker-side speculative q
+        # shrink rewrites it, and reading any other total here would leave the
+        # attention metadata wider than input_ids.
+        input_ids = self.input_ids.gpu[:total_tokens_decode]
         return input_ids
 
     def prepare_draft_ids(
@@ -620,6 +690,29 @@ class tokenIDProcessor:
                 else np.array([], dtype=np.int32)
             )
         return ret
+
+
+def _profile_runner_stage(method):
+    """Annotate runner stages only while its torch profiler is active."""
+    name = method.__name__
+    label = f"ATOM::{name}"
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if getattr(self, "profiler", None) is None:
+            return method(self, *args, **kwargs)
+        stage_label = label
+        if name == "forward":
+            batch = args[0] if args else kwargs["batch"]
+            stage_label += (
+                f" tokens={batch.total_tokens_num}"
+                f" prefill={batch.total_seqs_num_prefill}"
+                f" decode={batch.total_seqs_num_decode}"
+            )
+        with record_function(stage_label):
+            return method(self, *args, **kwargs)
+
+    return wrapped
 
 
 class ModelRunner:
@@ -646,6 +739,7 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -805,12 +899,24 @@ class ModelRunner:
             logger.info("TBO enabled: model wrapped with UBatchWrapper")
         if getattr(self, "drafter", None) is not None:
             self.drafter.arm_aux_capture(self.model)
+        installer = mono_decode_installers.get(hf_config.architectures[0])
+        if installer is not None:
+            self.model = resolve_obj_by_qualname(installer)(
+                self.model,
+                config,
+                getattr(self, "drafter", None),
+                self.attn_metadata_builder,
+            )
         self._init_forward_vars_ring()
+        self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
         self._maybe_warmup()
 
-        torch.set_default_device("cpu")
+        # Restore the implicit CPU default. An explicit "cpu" leaves a
+        # DeviceContext intercepting every torch call during serving, including
+        # tensor views and Triton's pointer/stride specialization queries.
+        torch.set_default_device(None)
         torch.set_default_dtype(default_dtype)
 
         if self.config.compilation_config.level == 1:
@@ -888,6 +994,9 @@ class ModelRunner:
         dp_rank_local = config.parallel_config.data_parallel_rank_local or 0
         pp_rank = config.parallel_config.pipeline_parallel_rank
         pp_size = config.pipeline_parallel_size
+        if pp_size > 1:
+            # Reject before any collective can wait for nonexistent ranks.
+            reject_simulated_tp(config, "pipeline parallel")
         # tp_world_size: how many GPUs this stage actually occupies.
         stage_span = config.tp_world_size * config.prefill_context_parallel_size
         engine_index = dp_rank_local * pp_size + pp_rank
@@ -912,16 +1021,30 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
-        # Both branches handle simulated TP: the PP path only to reject it,
-        # since it would otherwise deadlock on a group sized for absent ranks.
+        dp_size = config.parallel_config.data_parallel_size
+        world_size = dp_size * pp_size * stage_span
+        dp_rank = config.parallel_config.data_parallel_rank
+        global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
+        if (
+            config.parallel_config._managed_distributed_store
+            and not torch.distributed.is_initialized()
+        ):
+            # Preserve AITER's environment setup when preinitializing its group.
+            os.environ.setdefault(
+                "HIP_VISIBLE_DEVICES", ",".join(map(str, range(world_size)))
+            )
+            store = torch.distributed.TCPStore(
+                config.parallel_config.data_parallel_master_ip,
+                config.parallel_config.data_parallel_base_port,
+                is_master=False,
+            )
+            torch.distributed.init_process_group(
+                backend="nccl", store=store, rank=global_rank, world_size=world_size
+            )
+        # AITER reuses the default group and creates the model-parallel groups.
         if config.pipeline_parallel_size > 1:
             from atom.distributed.pp_comm import init_pp_aware_dist_env
 
-            reject_simulated_tp(config, "pipeline parallel")
-            dp_size = config.parallel_config.data_parallel_size
-            world_size = dp_size * pp_size * stage_span
-            dp_rank = config.parallel_config.data_parallel_rank
-            global_rank = (dp_rank * pp_size + pp_rank) * stage_span + rank
             # No local_rank here, unlike the non-PP branch below. Safe only
             # because PP is single-node today: CoreManager rejects multi-node
             # DP when pp_size > 1, and asserts PP+DP out entirely, so
@@ -1034,12 +1157,15 @@ class ModelRunner:
         """
         Start profiling for this rank.
 
-        The ATOM_PROFILER_MORE environment variable controls detailed profiling features:
-        - Set to "1" to enable record_shapes, with_stack, and profile_memory.
-        - Set to "0" or unset to disable these features (default).
+        Set ATOM_PROFILER_RECORD_SHAPES, ATOM_PROFILER_WITH_STACK, or
+        ATOM_PROFILER_PROFILE_MEMORY to "1"/"0" to enable/disable the matching
+        profiler option. Any left unset falls back to ATOM_PROFILER_MORE, which
+        enables all three when "1" (default: all disabled).
         """
         if self.profiler_dir is not None and self.profiler is None:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             model_name = os.path.basename(self.config.model.rstrip("/"))
             safe_model_name = "".join(
                 c if c.isalnum() or c in ("_", "-", ".") else "_" for c in model_name
@@ -1097,16 +1223,19 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CPU,
                     torch_profiler.ProfilerActivity.CUDA,
                 ],
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=_on_trace_ready,
             )
             self.profiler.__enter__()
             logger.info(
-                "Rank %d: profiler started (detailed=%s, dir=%s)",
+                "Rank %d: profiler started "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s, dir=%s)",
                 self.rank,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
                 self.profiler_dir,
             )
         return True
@@ -1148,8 +1277,15 @@ class ModelRunner:
         overwrites. What -1 must NOT do is look like a request --
         `get_token_locations`.
         """
-        has_drafter = hasattr(self, "drafter")
-        mtp_k = self.drafter.mtp_k if has_drafter else 0
+        # The scheduler's spec width, not the drafter's. On a P/D producer the
+        # real decodes are q=1, and under DP an idle rank's dummy is unified
+        # with them: a q=mtp_k+1 dummy would hand the uniform decode
+        # collectives a different `running_tokens` than its peers'.
+        mtp_k = (
+            self.drafter.mtp_k
+            if hasattr(self, "drafter") and not self.tokenID_processor.is_pd_producer
+            else 0
+        )
         mtp_factor = mtp_k + 1
         num_tokens_original = mtp_factor
 
@@ -1181,23 +1317,23 @@ class ModelRunner:
         )
         return True
 
+    def warmup_max_tokens(self) -> int:
+        """Tokens one warmup forward carries: the activation peak KV sizing allows."""
+        max_tokens = self.config.max_num_batched_tokens
+        if not self.config.enable_dp_attention:
+            max_tokens //= get_dp_group().world_size
+        pcp_size = self.config.prefill_context_parallel_size
+        if pcp_size > 1:
+            max_tokens = max(1, max_tokens // pcp_size)
+        return max_tokens
+
     def warmup_model(self):
         start_time = time.time()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = (
-            self.config.max_num_batched_tokens,
-            self.config.max_model_len,
-        )
+        max_model_len = self.config.max_model_len
         dp_size = get_dp_group().world_size
-        if self.config.enable_dp_attention:
-            warmup_max_tokens = max_num_batched_tokens
-        else:
-            warmup_max_tokens = max_num_batched_tokens // dp_size
-
-        pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
-            warmup_max_tokens = max(1, warmup_max_tokens // pcp_size)
+        warmup_max_tokens = self.warmup_max_tokens()
 
         num_seqs = min(warmup_max_tokens // max_model_len, self.config.max_num_seqs)
 
@@ -1248,6 +1384,14 @@ class ModelRunner:
             f"{self.label}: warmup_model {time.time() - start_time:.2f} seconds with {num_seqs} reqs {total_tokens_num} tokens"
         )
 
+    def profile_dynamic_chunking(self):
+        """Fit chunk overhead from startup dummy forwards (engine RPC)."""
+        return self._dynamic_chunking.profile()
+
+    def take_dynamic_chunking_fit(self):
+        """Return newly calibrated chunk latency coefficients (engine RPC)."""
+        return self._dynamic_chunking.take_fit()
+
     def allocate_forward_vars(self):
         config = self.config
         hidden_size = config.hf_config.hidden_size
@@ -1261,10 +1405,19 @@ class ModelRunner:
         # TODO: remove it in forward_context
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
-            "positions": CpuGpuBuffer(self.max_num_batched_tokens, **i64_kwargs),
-            "temperatures": CpuGpuBuffer(self.max_bs, **f32_kwargs),
-            "top_ks": CpuGpuBuffer(self.max_bs, **i32_kwargs),
-            "top_ps": CpuGpuBuffer(self.max_bs, **f32_kwargs),
+            "decode_src": self.tokenID_processor.decode_src,
+            "positions": CpuGpuBuffer(
+                self.max_num_batched_tokens, publication_group="positions", **i64_kwargs
+            ),
+            "temperatures": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
+            "top_ks": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **i32_kwargs
+            ),
+            "top_ps": CpuGpuBuffer(
+                self.max_bs, publication_group="sampling", **f32_kwargs
+            ),
             # Keep enough space for MTP decode (max_q_len > 1).
             # `extra_output_dims` lets a model insert dims between N and dim
             # (e.g. DeepSeek-V4 returns the un-reduced mHC residual
@@ -1279,16 +1432,21 @@ class ModelRunner:
         }
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
-                3, self.max_num_batched_tokens, **i64_kwargs
+                3,
+                self.max_num_batched_tokens,
+                publication_group="mrope",
+                publication_unit="elements",
+                **i64_kwargs,
             )
         if hasattr(self, "drafter"):
             self.forward_vars["mtp_k"] = self.drafter.mtp_k
+            self.forward_vars.update(self.drafter.metadata_buffers)
             self.forward_vars["num_accepted_tokens"] = CpuGpuBuffer(
                 self.max_bs, **i32_kwargs
             )
             # Per in-flight slot via forward_vars; PP ring clones it.
             self.forward_vars["draft_next_tokens"] = CpuGpuBuffer(
-                self.max_bs, **i32_kwargs
+                self.max_bs, publication_group="draft_anchors", **i32_kwargs
             )
 
     def _init_forward_vars_ring(self):
@@ -1345,6 +1503,69 @@ class ModelRunner:
         self._fv_slot_events = [torch.cuda.Event() for _ in range(pp_size)]
         logger.info(f"forward_vars ring: {pp_size} slots (pipeline parallel)")
 
+    def _init_h2d_publication(self):
+        from atom.utils.h2d import PublicationOwner, PublicationRegistry
+
+        registry = PublicationRegistry()
+        self.publication_registry = registry
+        transport = envs.ATOM_H2D_BACKEND
+        if transport not in ("direct", "packed"):
+            raise ValueError("ATOM_H2D_BACKEND must be direct or packed")
+        self._h2d_owners = []
+        self._h2d_groups = []
+        for index, variables in enumerate(self._fv_ring):
+            event = (
+                self._stage_h2d_done
+                if self._fv_slot_events is None
+                else self._fv_slot_events[index]
+            )
+            owner = PublicationOwner(self.device, event, registry=registry)
+            members = {}
+            for name, buffer in variables.items():
+                if isinstance(buffer, CpuGpuBuffer) and buffer.publication_group:
+                    binding = owner.bind(buffer, name, unit=buffer.publication_unit)
+                    members.setdefault(buffer.publication_group, []).append(binding)
+            groups = {name: owner.group(name, items) for name, items in members.items()}
+            if transport == "packed":
+                # One upload immediately before token assembly's first GPU
+                # consumer. Sampling has no earlier device consumer.
+                if all(name in groups for name in ("sampling", "early", "input_ids")):
+                    token_members = ("sampling", "early", "input_ids")
+                    if "spec_decode" in groups:
+                        token_members += ("spec_decode",)
+                    groups["token_inputs"] = owner.group(
+                        "token_inputs",
+                        [b for name in token_members for b in groups[name].members],
+                    )
+                if "prefill" in groups and "positions" in groups:
+                    groups["prefill_inputs"] = owner.group(
+                        "prefill_inputs",
+                        groups["prefill"].members + groups["positions"].members,
+                    )
+            # Some buffers also publish together at a later consumer boundary
+            # (e.g. MHA decode shares block tables with the prefill group).
+            for name, names in getattr(
+                getattr(self, "attn_metadata_builder", None), "h2d_group_members", {}
+            ).items():
+                groups[name] = owner.group(
+                    name, [variables[item]._publication for item in names]
+                )
+            if transport == "packed":
+                for group in owner.use_packed_transport():
+                    logger.info(
+                        "H2D group %s: %s%s",
+                        group.name,
+                        group.transport,
+                        f" ({group.fallback_reason})" if group.fallback_reason else "",
+                    )
+            # Cover constructor uploads, ring clones and transport pointer
+            # tables before the first preparation, even on another stream.
+            event.record()
+            self._h2d_owners.append(owner)
+            self._h2d_groups.append(groups)
+        self.h2d_owner = self._h2d_owners[self._fv_idx]
+        self.h2d_groups = self._h2d_groups[self._fv_idx]
+
     def _advance_forward_vars(self):
         """Rotate to the next in-flight slot before any buffer is written.
 
@@ -1354,15 +1575,17 @@ class ModelRunner:
         if len(self._fv_ring) == 1:
             return
         self._fv_idx = (self._fv_idx + 1) % len(self._fv_ring)
-        # Block until this slot's previous forward finished reading it on the
-        # GPU before we overwrite its host-pinned staging buffers. No-op unless
-        # the CPU has raced > ring-size forwards ahead of the GPU.
-        self._fv_slot_events[self._fv_idx].synchronize()
+        # Select the slot now; _gate_staging_reuse waits on its existing event
+        # before any producer writes. Avoid waiting twice on the same event.
         self.forward_vars = self._fv_ring[self._fv_idx]
-        # `input_ids` is the one forward_vars buffer aliased outside the dict
-        # (tokenID_processor writes into it directly); repoint it at this slot.
+        self.h2d_owner = self._h2d_owners[self._fv_idx]
+        self.h2d_groups = self._h2d_groups[self._fv_idx]
+        # Token assembly holds aliases outside forward_vars; select both
+        # payload and source-index mirrors from this slot before writing.
         self.tokenID_processor.input_ids = self.forward_vars["input_ids"]
+        self.tokenID_processor.decode_src = self.forward_vars["decode_src"]
 
+    @_profile_runner_stage
     def _gate_staging_reuse(self):
         """Block until the previous forward's staging H2Ds have executed.
 
@@ -1387,33 +1610,34 @@ class ModelRunner:
         their copies are in flight. They must therefore enter this gate and
         record the event just like real forwards.
 
-        The pipeline ring solves the same problem by rotating buffers, which
-        bounds the lead to its depth; `_stage_h2d_done` is None there and this
-        does nothing.
+        The publication owner uses the existing single-slot or PP slot event,
+        then opens one ledger epoch before any producer writes host metadata.
         """
-        if self._stage_h2d_done is not None:
-            self._stage_h2d_done.synchronize()
+        self.h2d_owner.begin()
 
+    @_profile_runner_stage
     def _mark_staging_h2d_enqueued(self):
         """Close the window the gate above waits on.
 
-        Every `_stage` / `copy_to_gpu` a forward does is enqueued inside
-        `prepare_model` -- `build()` fences the current stream behind
-        `prep_stream` before returning -- so one event after it covers them
-        all. `prepare_mtp_decode` is the exception, staging from inside
-        `postprocess`, a path that synchronizes on its own.
+        Covers this preparation phase's source reads, including registered
+        direct copies and grouped publishers. Late V4 TBO preparation resumes
+        this epoch and records the completion again after its uploads.
+        Independent subsystem uploads retain their own completion protocols.
         """
-        if self._stage_h2d_done is not None:
-            self._stage_h2d_done.record()
+        self.h2d_owner.finish()
 
     def _record_forward_vars_event(self):
         """Mark the current slot's forward as done on the GPU stream. Paired
-        with the synchronize() in ``_advance_forward_vars``. Called at the end of
+        with the owner wait in ``_gate_staging_reuse``. Called at the end of
         every forward, including DP-sync dummies. No-op when the ring has a
         single slot."""
         if len(self._fv_ring) == 1:
             return
-        self._fv_slot_events[self._fv_idx].record()
+        try:
+            self._fv_slot_events[self._fv_idx].record()
+        except BaseException:
+            self.h2d_owner.fail()
+            raise
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
@@ -1599,11 +1823,31 @@ class ModelRunner:
 
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
-        available_for_kv_budget -= self._kv_budget_extra_reserve(total)
-        # This prevents OOM when other processes share the GPU.
-        available_for_kv = min(available_for_kv_budget, free)
+        extra_reserve = self._kv_budget_extra_reserve(total)
+        available_for_kv_budget -= extra_reserve
+        # GPU buffers the KV connector allocates after the KV cache is sized.
+        connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)
+        if connector_bytes:
+            logger.info(
+                "Reserving %.2fGB for KV connector buffers", connector_bytes / (1 << 30)
+            )
+            available_for_kv_budget -= connector_bytes
+        # This prevents OOM when other processes share the GPU. Free HBM must
+        # cover the connector buffers too.
+        free_for_kv = free - connector_bytes
+        if connector_bytes and free_for_kv <= 0:
+            # Otherwise the KV cache gets nothing and the connector allocates
+            # from memory that is not there.
+            raise RuntimeError(
+                f"Only {free / (1 << 30):.2f}GB is free on the GPU, less than "
+                f"the {connector_bytes / (1 << 30):.2f}GB the KV connector "
+                "buffers need after the KV cache is sized; free GPU memory or "
+                "turn those buffers off (ATOM_PD_MLA_STAGING=0 / "
+                "ATOM_PD_MLA_LANDING=0)."
+            )
+        available_for_kv = min(available_for_kv_budget, free_for_kv)
 
-        torch.set_default_device("cpu")
+        torch.set_default_device(None)
 
         specs = self._sub_pool_specs()
 
@@ -1621,7 +1865,9 @@ class ModelRunner:
             # Minimum gpu_memory_utilization that makes the budget just cover the
             # per-request pools. Rounded UP to the next 0.01 so the printed value
             # is actually sufficient, not the exact threshold.
-            min_util = (non_kv_overhead + exc.reserved_bytes) / total
+            min_util = (
+                non_kv_overhead + extra_reserve + connector_bytes + exc.reserved_bytes
+            ) / total
             min_util_hint = math.ceil(min_util * 100) / 100
             base_msg = (
                 f"Per-request cache tensor "
@@ -1630,14 +1876,23 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
-            if available_for_kv_budget > free:
-                # The physical free-memory clamp is the binding limit, not the
-                # utilization budget — raising --gpu-memory-utilization won't help.
+            if (
+                available_for_kv_budget > free_for_kv
+                or free_for_kv <= exc.reserved_bytes
+            ):
+                # The physical free-memory clamp is the binding limit, now or
+                # once the budget grows — raising --gpu-memory-utilization won't help.
+                connector_note = (
+                    f"{connector_bytes / (1 << 30):.2f}GB of it reserved for KV "
+                    f"connector buffers; "
+                    if connector_bytes
+                    else ""
+                )
                 fix_msg = (
                     f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
-                    f"(other processes may be holding memory); raising "
-                    f"--gpu-memory-utilization will NOT help. Free GPU memory or "
-                    f"reduce --max-num-seqs (currently {config.max_num_seqs})."
+                    f"({connector_note}other processes may be holding memory); "
+                    f"raising --gpu-memory-utilization will NOT help. Free GPU memory "
+                    f"or reduce --max-num-seqs (currently {config.max_num_seqs})."
                 )
             elif min_util_hint <= 1.0:
                 fix_msg = (
@@ -1698,8 +1953,26 @@ class ModelRunner:
             slot_bytes = int(plan.entry_bytes[STATE_SLOT_CLASS])
             # None means the backend has not narrowed its image: carry it all.
             narrowed = self.attn_metadata_builder.checkpoint_image_bytes()
+            # The charged entry can be larger than the bytes a transfer
+            # publishes: MHA alignment padding is not a region, and a draft
+            # pool merged into the same class is ordinary KV after the
+            # checkpoint regions. The backend names the published unit.
+            page_unit_bytes = int(plan.entry_bytes[plan.paged_class])
+            published_unit = getattr(
+                self.attn_metadata_builder, "checkpoint_page_unit_bytes", None
+            )
+            if callable(published_unit):
+                published = published_unit()
+                if published is not None:
+                    published = int(published)
+                    if published <= 0 or published > page_unit_bytes:
+                        raise RuntimeError(
+                            f"checkpoint PAGE unit is {published} B but the "
+                            f"paged pool entry is {page_unit_bytes} B"
+                        )
+                    page_unit_bytes = published
             checkpoint_spec = PagedStateCheckpointSpec(
-                page_unit_bytes=int(plan.entry_bytes[plan.paged_class]),
+                page_unit_bytes=page_unit_bytes,
                 slot_bytes=slot_bytes,
                 image_bytes=slot_bytes if narrowed is None else int(narrowed),
                 layout_id=transfer.paged_layout_id,
@@ -1962,9 +2235,9 @@ class ModelRunner:
             # place the builder and the connector are both in scope.
             transfer_tensors.state_backend = self.attn_metadata_builder
         if hasattr(self, "draft_kv_builder") and transfer_tensors is not None:
-            draft_regions = self.draft_kv_builder.get_kv_transfer_tensors()
-            if draft_regions:
-                transfer_tensors.block_regions.extend(draft_regions)
+            transfer_tensors.merge_pages(
+                self.draft_kv_builder.get_kv_transfer_tensors()
+            )
         if transfer_tensors is not None:
             # After the draft's regions are in, and here because this is the
             # only place holding both the complete region list and the
@@ -2133,107 +2406,21 @@ class ModelRunner:
         Mutates only the worker's batch copy (counts + scheduled_spec_decode_
         tokens truncated to q-1); KV stays reserved at mtp_k+1. No-op unless
         DSpark confidence scheduling is on and this is a pure-decode batch.
+        The bucket math lives in `apply_q_bucket` so CPU CI can run it without
+        importing this module (which loads AITER).
         """
-        # No idempotency guard: `prepare_model` is the one caller and runs
-        # this once per batch. It used to be two, and the guard returned
-        # early on the second -- which now means returning None, i.e. the
-        # FULL length, undoing the shrink it was written to protect.
-        if not (hasattr(self, "drafter") and self.drafter.uses_confidence_schedule):
-            return None
-        if batch.total_tokens_num_prefill > 0:
-            return None  # mixed/prefill step: keep full length
-        scheduled_bs = batch.total_seqs_num_decode
-        if scheduled_bs <= 0:
-            return
-        full_q = self.drafter.mtp_k + 1
+        from atom.spec_decode.dspark_scheduler import apply_q_bucket
 
-        # {req_id: ell} from an EARLIER step's propose() (verify_scheduler, same
-        # process) — the freshest one whose async D2H has landed, which is a step
-        # or two back while the CPU runs ahead; reading it never syncs. The
-        # worker batch copy has req_ids but NOT the scheduler-side `seqs` dict,
-        # so look ell up by req_id. A request with no ell yet (new this step, or
-        # its copy still in flight) -> full length (never under-verify).
-        verify_scheduler = self.drafter.verify_scheduler
-        by_req = (
-            verify_scheduler.ell_by_req if verify_scheduler is not None else None
-        ) or {}
-        if not by_req:
-            return
-
-        # ==== RAGGED path (paper §5.2 avoid-padding) — FULLY INDEPENDENT =====
-        # This branch is hoisted ABOVE the q-bucket early-return so it never
-        # depends on dspark.q_buckets. Each decode seq forwards its own
-        # ell_r+1 tokens (no batch-level pad to a single q). num_scheduled_tokens
-        # becomes a true ragged array; all V4 attn metadata/kernels are already
-        # per-token + marker-driven, so this is the only construction change.
-        # Graph replay picks a (bs, q_eff) graph captured from the independent
-        # dspark.ragged_graph_sizes set. Anchor lower bound (q>=num_bonus+1)
-        # is applied PER REQUEST so each seg can hold its own anchor.
-        if self.config.dspark.ragged:
-            return self._dspark_apply_ragged(batch, scheduled_bs, full_q, by_req)
-        # ====================================================================
-
-        # ---- Q-BUCKET path (older batch-uniform padding scheme) ------------
-        from atom.spec_decode.dspark_scheduler import (
-            quantize_to_bucket,
-            resolve_q_buckets,
+        drafter = getattr(self, "drafter", None)
+        dspark = getattr(getattr(self, "config", None), "dspark", None)
+        return apply_q_bucket(
+            batch,
+            drafter,
+            dspark,
+            apply_ragged=lambda scheduled_bs, full_q, by_req: self._dspark_apply_ragged(
+                batch, scheduled_bs, full_q, by_req
+            ),
         )
-
-        buckets = resolve_q_buckets(self.config.dspark.q_buckets, full_q)
-        if buckets == [full_q]:
-            return  # no smaller buckets configured -> Phase-1 behavior
-
-        max_ell = 0
-        for rid in batch.req_ids[:scheduled_bs]:
-            ell = by_req.get(rid)
-            max_ell = full_q - 1 if ell is None else max(max_ell, int(ell))
-            if max_ell >= full_q - 1:
-                break
-
-        # Lower bound q >= max_num_bonus + 1: ell is only the PREDICTED accept
-        # count, but the anchor sits at the PREVIOUS step's ACTUAL num_bonus. If
-        # q-1 < num_bonus the anchor falls outside the shrunk segment and the
-        # draft propose scatter/index_select goes OOB. No-op when num_bonus is
-        # unavailable (first decode step).
-        max_num_bonus = 0
-        num_bonus_arr = getattr(batch, "num_bonus", None)
-        if num_bonus_arr is not None:
-            nb = np.asarray(num_bonus_arr)[:scheduled_bs]
-            if nb.size > 0:
-                max_num_bonus = int(nb.max())
-        need = max(max_ell + 1, max_num_bonus + 1)
-        q = quantize_to_bucket(need, buckets)
-        if q >= full_q:
-            return  # no shrink possible this step
-
-        # Rebuild scheduled_tokens (flat [seq0 tokens | seq1 tokens | ...]) to the
-        # new q-per-seq layout BEFORE rewriting the counts (need the old per-seq
-        # lengths to slice). Pure-decode step (we returned early on prefill), so
-        # the array is entirely decode segments. Keep the first q of each seq's
-        # segment: token[0] is the anchor; the rest are placeholders overwritten
-        # by token_ids[:, 1:] = scheduled_spec_decode_tokens downstream.
-        old_nst = batch.num_scheduled_tokens
-        sched = np.asarray(batch.scheduled_tokens)
-        old_cu = np.zeros(scheduled_bs + 1, dtype=np.int64)
-        np.cumsum(old_nst[:scheduled_bs], out=old_cu[1:])
-        new_sched = np.empty(scheduled_bs * q, dtype=sched.dtype)
-        for i in range(scheduled_bs):
-            start = int(old_cu[i])
-            new_sched[i * q : (i + 1) * q] = sched[start : start + q]
-        batch.scheduled_tokens = new_sched
-
-        # Rewrite decode token counts to q (anchor + q-1 drafts) per seq.
-        nst = old_nst.copy()
-        prefill_tok = int(batch.total_tokens_num_prefill)
-        nst[:scheduled_bs] = q
-        batch.num_scheduled_tokens = nst
-        batch.total_tokens_num_decode = int(nst[:scheduled_bs].sum())
-        batch.total_tokens_num = prefill_tok + batch.total_tokens_num_decode
-        # Truncate each request's draft block to q-1 (regular matrix: all seqs q-1).
-        spec = batch.scheduled_spec_decode_tokens
-        if spec is not None and getattr(spec, "size", 0) > 0:
-            batch.scheduled_spec_decode_tokens = np.ascontiguousarray(spec[:, : q - 1])
-        return q
 
     def _dspark_apply_ragged(self, batch, scheduled_bs, full_q, by_req):
         """DSpark per-request RAGGED verify (paper §5.2 avoid-padding).
@@ -2349,11 +2536,27 @@ class ModelRunner:
         # `prepare_input_ids` slices it per request (`spec[i, :len_i - 1]`).
         return int(q_eff)
 
+    def _verifies_drafts(self, batch: ScheduledBatch, is_prefill: bool) -> bool:
+        """Whether this forward scores drafts with the rejection sampler.
+
+        A P/D producer keeps the drafter only to write its context KV; the
+        scheduler never pads drafts for it, so its decodes (the step that
+        surfaces a deferred T0) are q=1 and have nothing to verify.
+        """
+        return (
+            not is_prefill
+            and hasattr(self, "drafter")
+            and not self.tokenID_processor.is_pd_producer
+            and not batch.is_dummy_run
+        )
+
     def prepare_inputs(
         self,
         batch: ScheduledBatch,
         input_ids: torch.Tensor,
         forward_mode: ForwardMode,
+        *,
+        spec_decode_indices: tuple[np.ndarray, int] | None = None,
     ):
         # Always supplied, settled in `prepare_model` (which is where the reason
         # lives). The q-bucket shrink ran there too, so `batch` is already
@@ -2376,6 +2579,14 @@ class ModelRunner:
         # sizes everything per-sequence, `running_tokens` everything per-row.
         running_bs = forward_mode.running_bs
         running_tokens = forward_mode.running_tokens
+        spec_decode_metadata = None
+        if self._verifies_drafts(batch, is_prefill):
+            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+            # Inside the staging window: without the token group it publishes
+            # the indices itself. Packed indices already share the token upload.
+            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
+                lens, cu[1:], input_ids, prepared_indices=spec_decode_indices
+            )
         attn_metadata, positions = self.attn_metadata_builder.build(
             batch=batch,
             running_bs=running_bs,
@@ -2394,15 +2605,6 @@ class ModelRunner:
             running_tokens_are_unified=running_tokens_are_unified,
             forward_mode=forward_mode,
         )
-
-        spec_decode_metadata = None
-        if not is_prefill and hasattr(self, "drafter") and not batch.is_dummy_run:
-            _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
-            # `cu[1:]` is the segment ENDS, which is what
-            # `cu_num_sampled_tokens` means.
-            spec_decode_metadata = self.drafter.calc_spec_decode_metadata(
-                lens, cu[1:], input_ids
-            )
 
         pcp_size = self.config.prefill_context_parallel_size
         _pcp_tbo_balanced = (
@@ -2440,9 +2642,12 @@ class ModelRunner:
             ub_tokens_across_dp=ub_tokens_across_dp,
         )
 
+    @h2d_producer("sampling")
     def prepare_sample(
-        self, batch: ScheduledBatch
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool, bool]:
+        self, batch: ScheduledBatch, *, publication_group=None
+    ) -> tuple[
+        torch.Tensor, int | torch.Tensor | None, float | torch.Tensor | None, bool, bool
+    ]:
         bs = batch.total_seqs_num
 
         # Check on CPU whether all requests are greedy (temperature=0)
@@ -2450,44 +2655,56 @@ class ModelRunner:
 
         # Check on CPU whether any fan-out sibling needs per-row random noise.
         # Missing attribute (e.g. dummy runs, older callers) -> False.
-        needs_independent_noise = bool(
-            getattr(batch, "needs_independent_noise", np.zeros(0, dtype=bool)).any()
-        )
+        noise = getattr(batch, "needs_independent_noise", None)
+        needs_independent_noise = noise is not None and bool(noise.any())
 
         temp_buffer = self.forward_vars["temperatures"]
         # Clamp temperatures on CPU to avoid division by zero in sampler
-        temp_buffer.np[:bs] = np.maximum(batch.temperatures, SAMPLER_EPS)
-        temperatures = temp_buffer.copy_to_gpu(bs)
+        np.maximum(batch.temperatures, SAMPLER_EPS, out=temp_buffer.np[:bs])
 
         # Check on CPU whether filtering is needed to avoid GPU sync in sampler.
         # If no filtering needed, return None to skip GPU copy entirely.
         needs_topk = (batch.top_ks != -1).any()
         needs_topp = (batch.top_ps < 1.0).any()
 
+        # Uniform filters are already known on the CPU. Keep them as scalars
+        # for AITER's fast dispatch instead of uploading and reading them back.
+        top_ks = top_ps = None
+        top_k_count = top_p_count = None
         if needs_topk:
-            top_k_buffer = self.forward_vars["top_ks"]
-            top_k_buffer.np[:bs] = batch.top_ks
-            # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ks == batch.top_ks[0]).all():
-                top_ks = top_k_buffer.copy_to_gpu(1)
+            if bs == 1 or (batch.top_ks == batch.top_ks[0]).all():
+                top_ks = int(batch.top_ks[0])
             else:
-                top_ks = top_k_buffer.copy_to_gpu(bs)
-        else:
-            top_ks = None
+                top_k_buffer = self.forward_vars["top_ks"]
+                top_k_buffer.np[:bs] = batch.top_ks
+                top_ks = top_k_buffer.gpu[:bs]
+                top_k_count = bs
 
         if needs_topp:
-            top_p_buffer = self.forward_vars["top_ps"]
-            top_p_buffer.np[:bs] = batch.top_ps
-            # If all values are the same, only copy one element to save bandwidth
-            if bs > 1 and (batch.top_ps == batch.top_ps[0]).all():
-                top_ps = top_p_buffer.copy_to_gpu(1)
+            if bs == 1 or (batch.top_ps == batch.top_ps[0]).all():
+                top_ps = float(np.float32(batch.top_ps[0]))
             else:
-                top_ps = top_p_buffer.copy_to_gpu(bs)
-        else:
-            top_ps = None
+                top_p_buffer = self.forward_vars["top_ps"]
+                top_p_buffer.np[:bs] = batch.top_ps
+                top_ps = top_p_buffer.gpu[:bs]
+                top_p_count = bs
+
+        group = (
+            self.h2d_groups["sampling"]
+            if publication_group is None
+            else publication_group
+        )
+        counts = group.counts
+        counts[group.indices["temperatures"]] = bs
+        counts[group.indices["top_ks"]] = top_k_count
+        counts[group.indices["top_ps"]] = top_p_count
+        if publication_group is None:
+            group.publish(counts)
+        temperatures = temp_buffer.gpu[:bs]
 
         return temperatures, top_ks, top_ps, all_greedy, needs_independent_noise
 
+    @_profile_runner_stage
     def prepare_model(self, batch: ScheduledBatch):
         shrunk_q = self._dspark_apply_q_bucket(batch)
         # The step's shape, settled once. Here rather than in prepare_inputs
@@ -2500,6 +2717,7 @@ class ModelRunner:
             dp_size=dp_size,
             dp_group=get_dp_group().cpu_group if dp_size > 1 else None,
             enforce_eager=self.enforce_eager,
+            step_needs_eager=self.attn_metadata_builder.step_needs_eager(batch),
             capture_sizes=self.capture_sizes_np,
             captured_tokens=(
                 self._piecewise_sorted_tokens if self._piecewise_cg_active() else None
@@ -2510,6 +2728,12 @@ class ModelRunner:
             tbo_on=self.config.enable_tbo,
             local_tbo=self._local_tbo_eligibility(batch),
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
+            graph_shapes=self._producer_graph_shapes(),
+            dp_stage_report=(
+                self.attn_metadata_builder.dp_stage_report(batch)
+                if dp_size > 1
+                else None
+            ),
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -2521,20 +2745,48 @@ class ModelRunner:
         total_tokens_num = batch.total_tokens_num
         assert total_tokens_num > 0
 
+        token_group = self.h2d_groups.get("token_inputs")
+        spec_decode_indices = None
         temperatures, top_ks, top_ps, all_greedy, needs_independent_noise = (
-            self.prepare_sample(batch)
+            self.prepare_sample(batch, publication_group=token_group)
         )
-        # Publishes the buffer `prepare_input_ids` addresses spans through.
-        self.attn_metadata_builder.publish_cu_seqlens_q(batch, forward_mode)
-        input_ids = self.tokenID_processor.prepare_input_ids(
-            batch, forward_mode.max_seqlen_q
+        if token_group is None:
+            self.attn_metadata_builder.publish_cu_seqlens_q(batch, forward_mode)
+            input_ids = self.tokenID_processor.prepare_input_ids(
+                batch, forward_mode.max_seqlen_q
+            )
+        else:
+            cu_count = self.attn_metadata_builder.prepare_cu_seqlens_q(
+                batch, forward_mode
+            )
+            token_group.counts[token_group.indices["cu_seqlens_q"]] = cu_count
+            spec_group = self.h2d_groups.get("spec_decode")
+            if spec_group is not None:
+                if self._verifies_drafts(batch, batch.total_tokens_num_prefill > 0):
+                    _, lens, cu = self.attn_metadata_builder.decode_spans(batch)
+                    spec_decode_indices = self.drafter.prepare_spec_decode_indices(
+                        lens, cu[1:], token_group
+                    )
+                else:
+                    # A preceding decode may have filled these counts. Forwards
+                    # that verify nothing must not publish its stale indices.
+                    for binding in spec_group.members:
+                        token_group.counts[token_group.indices[binding.name]] = None
+            # No GPU consumer runs between these host producers and this
+            # upload. Token assembly publishes before launching its kernel.
+            input_ids = self.tokenID_processor.prepare_input_ids(
+                batch, forward_mode.max_seqlen_q, publication_group=token_group
+            )
+        self.prepare_inputs(
+            batch,
+            input_ids,
+            forward_mode=forward_mode,
+            spec_decode_indices=spec_decode_indices,
         )
-        self.prepare_inputs(batch, input_ids, forward_mode=forward_mode)
 
-        # Stage the speculative inputs while this forward's normal staging
-        # window is still open.  Both buffers are pinned and reused, so copying
-        # them later from postprocess would fall outside the event recorded by
-        # forward() immediately after prepare_model().
+        # Stage scheduler anchor overrides while this forward's staging window
+        # is still open. This pinned mirror is reused, so copying it later from
+        # postprocess would fall outside the preparation completion event.
         if hasattr(self, "drafter"):
             forward_context = get_forward_context()
             if batch.next_token_ids is not None:
@@ -2763,6 +3015,31 @@ class ModelRunner:
                 self._pp_index_topk,
             )
 
+    def _padded_decode_inputs(self, forward_mode: ForwardMode):
+        """Expose the full decode run, independently of graph replay.
+
+        Metadata and uniform DP collectives already use running_tokens. Keep
+        model activations at that height too, with legal ids/positions in the
+        unused tail. Mixed prefill/decode uses varlen collectives and must not
+        call this helper.
+        """
+        assert not forward_mode.is_prefill
+        assert forward_mode.running_tokens_are_unified
+        scheduled = forward_mode.scheduled_tokens
+        running = forward_mode.running_tokens
+        ids = self.forward_vars["input_ids"].gpu[:running]
+        positions = (
+            self._mrope_positions_view(running)
+            if self.use_mrope
+            else self.forward_vars["positions"].gpu[:running]
+        )
+        assert ids.shape[0] == running and positions.shape[-1] == running
+        if running > scheduled:
+            ids[scheduled:].zero_()
+            positions[..., scheduled:].zero_()
+        return ids, positions
+
+    @_profile_runner_stage
     @record_gpu_forward
     def run_model(
         self,
@@ -2825,6 +3102,8 @@ class ModelRunner:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
+                if not is_prefill and forward_mode.running_tokens_are_unified:
+                    input_ids, positions = self._padded_decode_inputs(forward_mode)
                 # The multimodal runtime owns request leases and span scatter.
                 inputs_embeds = None
                 if (
@@ -2885,6 +3164,8 @@ class ModelRunner:
                         tgt = self.attn_metadata_builder._sparse_kv_indices_gpu
                         tgt[: recv_sparse.numel()].copy_(recv_sparse)
 
+                # Time only the chunk computation between PP receive and send.
+                chunk_sample = self._dynamic_chunking.start_sample(batch)
                 if pp_enabled:
                     model_output = self.model(
                         input_ids,
@@ -2898,6 +3179,7 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids, positions, inputs_embeds=inputs_embeds
                     )
+                self._dynamic_chunking.finish_sample(chunk_sample)
                 if pp_enabled and not pp_group.is_last_rank:
                     # GLM-5.2 IndexShare: carry top-k for next rank's shared layers.
                     if self._pp_send_needs_sparse:
@@ -2927,7 +3209,13 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
-                    hidden_states = model_output
+                    # PP carries the full run between stages. Only the last
+                    # stage returns scheduled rows to sampling/draft consumers.
+                    hidden_states = (
+                        model_output[: context.scheduled_tokens]
+                        if not is_prefill
+                        else model_output
+                    )
                     logits = self.model.compute_logits(hidden_states)
         else:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
@@ -2938,23 +3226,7 @@ class ModelRunner:
                 scheduled_tokens = context.scheduled_tokens
 
                 if self._piecewise_cg_active():
-                    # Pad tail to a legal vocab id / position, from THIS rank's
-                    # own rows out to the width the step settled on. A group-max
-                    # lower bound leaves `[scheduled, max)` holding the previous
-                    # step's ids on every rank below the max, and those reach the
-                    # draft's Markov lookup as out-of-range indices.
-                    if running_tokens > scheduled_tokens:
-                        self.forward_vars["input_ids"].gpu[
-                            scheduled_tokens:running_tokens
-                        ].zero_()
-                        self.forward_vars["positions"].gpu[
-                            scheduled_tokens:running_tokens
-                        ].zero_()
-                    _pos = (
-                        self._mrope_positions_view(running_tokens)
-                        if self.use_mrope
-                        else self.forward_vars["positions"].gpu[:running_tokens]
-                    )
+                    _ids, _pos = self._padded_decode_inputs(forward_mode)
                     forward_context.cudagraph_runtime_mode = (
                         CUDAGraphMode.PIECEWISE
                         if forward_mode.piecewise_captured
@@ -2963,9 +3235,7 @@ class ModelRunner:
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=running_tokens
                     )
-                    model_output = self.model(
-                        self.forward_vars["input_ids"].gpu[:running_tokens], _pos
-                    )
+                    model_output = self.model(_ids, _pos)
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
                     # model_output is always a plain Tensor; drafter aux capture
@@ -3002,13 +3272,14 @@ class ModelRunner:
             commit_pp_send_work(self._pp_pending_send)
         return True
 
+    @_profile_runner_stage
     def postprocess(
         self,
         batch: ScheduledBatch,
         logits: torch.Tensor,
         temperatures: torch.Tensor,
-        top_ks: torch.Tensor | None,
-        top_ps: torch.Tensor | None,
+        top_ks: int | torch.Tensor | None,
+        top_ps: float | torch.Tensor | None,
         all_greedy: bool,
         # following for draft
         hidden_states: torch.Tensor,
@@ -3036,9 +3307,9 @@ class ModelRunner:
             )
             num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
             next_token_locs = num_reject_tokens
-            # No drafts scored -> no accept count; anchor on the segment's last
-            # row. NOT `mtp_k - num_reject_tokens`, which is a zero buffer here.
-            num_bonus_tokens = None
+            # No drafts scored -> no verdict; the drafter anchors on each
+            # segment's last row.
+            anchors = None
         else:
             assert logits is not None
             bonus_logits_indices = spec_decode_metadata.bonus_logits_indices
@@ -3065,16 +3336,7 @@ class ModelRunner:
                 all_greedy=all_greedy,
                 needs_independent_noise=needs_independent_noise or not all_greedy,
             )
-            # Validate shapes match expectations
-            if target_logits.shape[0] != len(spec_decode_metadata.draft_token_ids):
-                raise ValueError(
-                    f"Shape mismatch: target_logits.shape[0]={target_logits.shape[0]} "
-                    f"but len(draft_token_ids)={len(spec_decode_metadata.draft_token_ids)}. "
-                    f"target_logits_indices shape={spec_decode_metadata.target_logits_indices.shape}, "
-                    f"logits.shape[0]={logits.shape[0]}"
-                )
-
-            sampled_tokens, num_bonus_tokens = self.rejection_sampler.forward(
+            sampled_tokens, verdict = self.rejection_sampler.forward(
                 spec_decode_metadata,
                 target_logits,
                 bonus_token_ids,
@@ -3084,15 +3346,12 @@ class ModelRunner:
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
             # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and how many.
+            # decision instead: the ids and the verdict.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
                 _g = get_pcp_group()
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                if torch.is_tensor(num_bonus_tokens):
-                    num_bonus_tokens = _g.broadcast(
-                        num_bonus_tokens.contiguous(), src=0
-                    )
-            num_reject_tokens = self.drafter.mtp_k - num_bonus_tokens
+                verdict = _g.broadcast(verdict, src=0)
+            num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
 
         # Drafter input must agree across TP ranks.
@@ -3143,9 +3402,8 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
-                    num_bonus_tokens,
+                    anchors,
                 )
-                # self.debug(f"{num_bonus_tokens=}")
 
             elif prev_batch is not None:
                 prev_rejected_num = np.zeros(prev_batch.total_seqs_num, dtype=np.int32)
@@ -3157,7 +3415,7 @@ class ModelRunner:
         else:
             prev_rejected_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
             prev_bonus_num = np.zeros(batch.total_seqs_num, dtype=np.int32)
-            # PP stages (is_deferred_out=False) still run the drafter.
+            # PP stages and P/D producers still run the drafter.
             if hasattr(self, "drafter"):
                 # Mid-prompt sequences get their anchor corrected inside
                 # propose_draft_token_ids, from `batch.next_token_ids`.
@@ -3172,7 +3430,7 @@ class ModelRunner:
                     hidden_states,
                     next_token_ids,
                     num_reject_tokens,
-                    num_bonus_tokens,
+                    anchors,
                 )
 
         # DSpark Phase 2: carry this step's per-request ell back to the scheduler
@@ -3217,6 +3475,7 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
+    @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
@@ -3321,13 +3580,35 @@ class ModelRunner:
 
         Only under DP attention -- `_publish_draft_shape` returns early at
         `data_parallel_size <= 1`, where an output-less batch legitimately
-        drafts nothing. PP is excluded via `is_deferred_out`.
+        drafts nothing. PP is excluded, and asked about directly:
+        `is_deferred_out` is also off on a P/D producer, a rank that keeps its
+        drafter loaded and still owes its peers the collectives propose()
+        carries.
         """
         return (
             hasattr(self, "drafter")
             and self.config.parallel_config.data_parallel_size > 1
-            and self.tokenID_processor.is_deferred_out
+            and not self.tokenID_processor.is_pipeline_parallel
         )
+
+    def _producer_graph_shapes(self):
+        """The recorded `(bs, q)` keys, for the one runner allowed to miss them.
+
+        A P/D producer keeps its drafter, so capture records q=mtp_k+1, but
+        every decode it runs is q=1 -- on every rank, its DP dummy included --
+        so the lookup comes out the same on each and the group goes eager
+        together. Anywhere else a missing key is a capture gap, and it stays a
+        `KeyError` at replay.
+        """
+        if (
+            not self.tokenID_processor.is_pd_producer
+            or not hasattr(self, "drafter")
+            or self.enforce_eager
+            or self._piecewise_cg_active()
+            or not hasattr(self, "graphs")
+        ):
+            return None
+        return self.graphs.keys()
 
     @torch.inference_mode()
     def process_kvconnector_output(self, connector_meta_output):
@@ -3367,13 +3648,11 @@ class ModelRunner:
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        # Complements today but against DIFFERENT baselines, which ragged
-        # verify pulls apart -- neither can be dropped for the other.
         # num_reject_tokens: KV rows to release, against the `mtp_k` RESERVATION.
-        # num_bonus_tokens: anchor row within the SEGMENT (`len_i`); None when
-        # nothing was verified.
+        # anchors: each request's flat row of its last emitted token, from the
+        # rejection verdict; None when nothing was verified.
         num_reject_tokens: torch.Tensor,
-        num_bonus_tokens: torch.Tensor | None,
+        anchors: torch.Tensor | None,
         align_only: bool = False,
     ):
         """`align_only` runs the draft purely for its DP collectives.
@@ -3405,11 +3684,10 @@ class ModelRunner:
 
         assert isinstance(self.drafter, Drafter)
 
-        # The sampler's own count, not `mtp_k - num_reject_tokens`: that
-        # identity holds only where `num_reject_tokens` was defined as its
-        # complement, and is a zero buffer on a step that scored no drafts.
-        last_token_indices = self.drafter.prepare_inputs(
-            batch.total_seqs_num, anchor_in_seq=num_bonus_tokens
+        last_token_indices = (
+            self.drafter.prepare_inputs(batch.total_seqs_num)
+            if anchors is None
+            else anchors
         )
         self.attn_metadata_builder.commit_speculative_state(
             forward_context.attn_metadata, last_token_indices
@@ -3451,14 +3729,19 @@ class ModelRunner:
             self.profiler_dir is not None and self.mark_trace
         )
         if self._capture_profile_enabled:
-            enable_detailed_profiling = envs.ATOM_PROFILER_MORE
+            record_shapes = envs.ATOM_PROFILER_RECORD_SHAPES
+            with_stack = envs.ATOM_PROFILER_WITH_STACK
+            profile_memory = envs.ATOM_PROFILER_PROFILE_MEMORY
             self._capture_trace_tag = None
             self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
             logger.info(
-                "%s: Starting CUDA graph capture profiler (detailed=%s)...",
+                "%s: Starting CUDA graph capture profiler "
+                "(record_shapes=%s, with_stack=%s, profile_memory=%s)...",
                 self.label,
-                enable_detailed_profiling,
+                record_shapes,
+                with_stack,
+                profile_memory,
             )
 
             def on_trace_ready(prof):
@@ -3490,9 +3773,9 @@ class ModelRunner:
                 # capture loop lands in its own file with nothing dropped between
                 # them (wait>0 would silently skip alternate batch sizes).
                 schedule=torch_profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
-                record_shapes=enable_detailed_profiling,
-                with_stack=enable_detailed_profiling,
-                profile_memory=enable_detailed_profiling,
+                record_shapes=record_shapes,
+                with_stack=with_stack,
+                profile_memory=profile_memory,
                 on_trace_ready=on_trace_ready,
             )
         else:
@@ -3849,7 +4132,9 @@ class ModelRunner:
                 full_q_len,
             )
 
+        self.h2d_owner.begin()
         self.attn_metadata_builder.blank_cache_write_targets()
+        self.h2d_owner.finish()
 
         # Whether this backend's capture builder supports a dynamic (per-bucket)
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
@@ -3857,6 +4142,34 @@ class ModelRunner:
         supports_dynamic_q_len = "max_q_len" in _build_params
         # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
         supports_ragged_capture = "num_tokens_pad" in _build_params
+
+        raw_build_capture = build_capture
+
+        @wraps(raw_build_capture)
+        def build_capture(*args, **kwargs):
+            # Preparation is outside actual graph capture, including calls
+            # made by the drafter and ragged bucket builder. Each invocation
+            # owns a synthetic transaction; normal forwards never use it.
+            bs = kwargs.get("bs", args[0] if args else None)
+            q_len = kwargs.get("max_q_len", full_q_len)
+            self.h2d_owner.begin()
+            try:
+                if not self.attn_metadata_builder.capture_owns_cu_seqlens_q:
+                    cu = self.forward_vars["cu_seqlens_q"]
+                    cu.np[: bs + 1] = np.arange(
+                        0, (bs + 1) * q_len, q_len, dtype=np.int32
+                    )
+                    cu.copy_to_gpu(bs + 1)
+                tokens = bs * q_len
+                self.forward_vars["positions"].np[:tokens] = (
+                    np.arange(tokens, dtype=np.int64) % q_len
+                )
+                result = raw_build_capture(*args, **kwargs)
+                self.h2d_owner.finish()
+                return result
+            except BaseException:
+                self.h2d_owner.fail()
+                raise
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
             for max_q_len in q_buckets:
@@ -3869,12 +4182,6 @@ class ModelRunner:
                     if self.rank == 0:
                         capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
 
-                    cu_seqlens_q = np.arange(
-                        0, (bs + 1) * max_q_len, max_q_len, dtype=np.int32
-                    )
-                    self.forward_vars["cu_seqlens_q"].np[: bs + 1] = cu_seqlens_q
-                    self.forward_vars["cu_seqlens_q"].copy_to_gpu(bs + 1)
-
                     num_tokens = bs * max_q_len
                     if _piecewise and self._piecewise_skip_capture(num_tokens):
                         continue
@@ -3883,10 +4190,6 @@ class ModelRunner:
                     # its handful of Python statements just fold into the next
                     # iteration's window.
                     self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
-                    # Use a simple, safe position pattern for capture.
-                    self.forward_vars["positions"].np[:num_tokens] = (
-                        np.arange(num_tokens, dtype=np.int64) % max_q_len
-                    )
                     if supports_dynamic_q_len:
                         attn_metadata, context = build_capture(
                             bs=bs, max_q_len=max_q_len
@@ -4143,6 +4446,11 @@ class ModelRunner:
             if graph is None:
                 continue
             B = bs * max_q_len
+            # Every row of the recording is real here: time the whole of it
+            # (the DP pad-row mask reads the real token count from here).
+            cu = self.forward_vars["cu_seqlens_q"]
+            cu.np[: bs + 1] = np.arange(0, B + 1, max_q_len, dtype=np.int32)
+            cu.copy_to_gpu(bs + 1)
             # Warm replay, then timed replays (median for robustness to jitter).
             graph.replay()
             torch.cuda.synchronize()
@@ -4194,7 +4502,7 @@ class RapidServeModelRunner(ModelRunner):
         # Session ID derived from the disagg IPC address so IPC handoff temp
         # files from different engine runs never collide.
         self._disagg_session_id = hashlib.md5(
-            config.disagg_kvcache_ipc_addr.encode()
+            config.disagg_kvcache_ipc_addr.encode(), usedforsecurity=False
         ).hexdigest()[:12]
 
     @staticmethod
@@ -4278,6 +4586,7 @@ class RapidServeModelRunner(ModelRunner):
             return True
         return super().allocate_kv_cache(num_kvcache_blocks)
 
+    @_profile_runner_stage
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Decode runs the model forward on a dynamically selected (optionally
@@ -4289,6 +4598,8 @@ class RapidServeModelRunner(ModelRunner):
         self._done_event.record()
         stream.wait_event(self._done_event)
         with torch.cuda.stream(stream):
+            self._advance_forward_vars()
+            self._gate_staging_reuse()
             (
                 input_ids,
                 temperatures,
@@ -4297,6 +4608,7 @@ class RapidServeModelRunner(ModelRunner):
                 all_greedy,
                 needs_independent_noise,
             ) = self.prepare_model(batch)
+            self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
@@ -4313,6 +4625,7 @@ class RapidServeModelRunner(ModelRunner):
             needs_independent_noise=needs_independent_noise,
         )
 
+        self._record_forward_vars_event()
         reset_forward_context()
         return fwd_output
 
@@ -4642,6 +4955,8 @@ class RapidServeModelRunner(ModelRunner):
         else:
             stream = torch.cuda.current_stream()
         with torch.cuda.stream(stream):
+            self._advance_forward_vars()
+            self._gate_staging_reuse()
             (
                 input_ids,
                 temperatures,
@@ -4650,10 +4965,12 @@ class RapidServeModelRunner(ModelRunner):
                 all_greedy,
                 _needs_independent_noise,
             ) = self.prepare_model(batch)
+            self._mark_staging_h2d_enqueued()
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
+            self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
         self._record_kv_cache_ready(batch)

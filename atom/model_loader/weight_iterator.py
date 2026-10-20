@@ -36,8 +36,8 @@ logger = logging.getLogger("atom")
 # safetensors<=0.7.0 ships a Python `_TYPES` dict missing the `F8_E8M0`
 # (MX scale) entry, even though both torch and the safetensors-rust binary
 # support it. The mmap'd `safe_open` path goes through Rust and works, but
-# the `safetensors.torch.load(bytes)` path used when `ATOM_DISABLE_MMAP=true`
-# raises `KeyError: 'F8_E8M0'` on DeepSeek-V4-Pro shards. Register the
+# the `ATOM_DISABLE_MMAP=true` reader maps dtypes through `_TYPES` and would
+# raise `KeyError: 'F8_E8M0'` on DeepSeek-V4-Pro shards. Register the
 # missing dtype string so both paths behave identically.
 if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"):
     safetensors.torch._TYPES["F8_E8M0"] = torch.float8_e8m0fnu
@@ -46,16 +46,15 @@ if "F8_E8M0" not in safetensors.torch._TYPES and hasattr(torch, "float8_e8m0fnu"
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
 
 
-def _shard_tensor_names(st_file: str) -> list[str] | None:
-    """Tensor names in a safetensors file, from its header alone.
+def _read_header(st_file: str) -> tuple[dict, int] | None:
+    """A safetensors file's header and the file offset its data starts at.
 
     The header is a little-endian u64 byte count followed by that much JSON, so
     this costs one small read and never touches the tensor data.
 
-    Returns None if the header cannot be read, so the caller loads the shard
-    anyway and the real reader produces the real diagnostic -- a truncated or
-    corrupt file should not be reported as a JSON error from a fast path whose
-    only job is to decide whether the file is worth opening.
+    Returns None if the header cannot be read, so the caller falls back to the
+    real reader and that produces the real diagnostic -- a truncated or corrupt
+    file should not be reported as a JSON error from a fast path.
     """
     try:
         with open(st_file, "rb") as f:
@@ -73,7 +72,60 @@ def _shard_tensor_names(st_file: str) -> list[str] | None:
         return None
     if not isinstance(header, dict):
         return None
-    return [name for name in header if name != "__metadata__"]
+    header.pop("__metadata__", None)
+    return header, 8 + header_len
+
+
+def _shard_tensor_names(st_file: str) -> list[str] | None:
+    """Tensor names in a safetensors file, from its header alone."""
+    parsed = _read_header(st_file)
+    return None if parsed is None else list(parsed[0])
+
+
+def _read_shard(
+    st_file: str, wants: Callable[[str], bool] | None
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """The wanted tensors of a shard, read with `read()` rather than mmap.
+
+    One `readinto` of the byte span the wanted tensors cover, into a tensor
+    that every result is a view of. `safetensors.torch.load(f.read())` copies
+    twice -- into `bytes`, then out of it per tensor. DeepSeek-V4.1-Flash,
+    TP=4, cold, prefetching: 169-207s with that, 84-86s with this.
+    """
+    parsed = _read_header(st_file)
+    if parsed is None:
+        with open(st_file, "rb") as f:
+            for name, tensor in safetensors.torch.load(f.read()).items():
+                if wants is None or wants(name):
+                    yield name, tensor
+        return
+    header, data_start = parsed
+    entries = [(n, m) for n, m in header.items() if wants is None or wants(n)]
+    if not entries:
+        return
+    # Start the span on an aligned offset, so a tensor's offset in the buffer
+    # keeps the alignment it has in the data section.
+    lo = min(m["data_offsets"][0] for _, m in entries) & ~63
+    hi = max(m["data_offsets"][1] for _, m in entries)
+    buf = torch.empty(hi - lo, dtype=torch.uint8)
+    view = memoryview(buf.numpy())
+    with open(st_file, "rb", buffering=0) as f:
+        f.seek(data_start + lo)
+        done = 0
+        while done < len(view):
+            n = f.readinto(view[done:])
+            if not n:
+                raise OSError(f"{st_file}: truncated at byte {data_start + lo + done}")
+            done += n
+    for name, meta in entries:
+        start, end = meta["data_offsets"]
+        dtype = safetensors.torch._TYPES[meta["dtype"]]
+        raw = buf[start - lo : end - lo]
+        # safetensors' writer orders tensors so each is aligned; another
+        # writer need not, and `view(dtype)` rejects a misaligned offset.
+        if (start - lo) % dtype.itemsize:
+            raw = raw.clone()
+        yield name, raw.view(dtype).reshape(meta["shape"])
 
 
 def _node_local_rank() -> tuple[int, int]:
@@ -256,7 +308,12 @@ def safetensors_weights_iterator(
     # worse than either: the hint asks the kernel to read-ahead 350 GiB of
     # random-ish ranges while the prefetcher is streaming the same files
     # sequentially, so they compete for the same device.
-    prefetching = envs.ATOM_LOADER_PREFETCH and not disable_mmap
+    #
+    # Prefetching serves the whole-file reads of `disable_mmap` as well: they
+    # go through the same page cache, and without it every rank streams every
+    # shard itself, one shard at a time. DeepSeek-V4.1-Flash, TP=4, cold, on a
+    # local NVMe: 282-315s without it, 169-207s with it.
+    prefetching = envs.ATOM_LOADER_PREFETCH
     if prefetching:
         # Sort only now, and read in the same order below. `glob` returns
         # directory order, which is stable enough within one run but is not a
@@ -311,13 +368,7 @@ def _iter_shards(
                 pass
 
         if disable_mmap:
-            # `safetensors.torch.load` has no partial API, so a shard that
-            # holds anything wanted is still deserialized whole.
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-                for name, param in result.items():
-                    if wants is None or wants(name):
-                        yield name, param
+            yield from _read_shard(st_file, wants)
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 # `.keys()` is not redundant here: `safe_open` is a Rust object

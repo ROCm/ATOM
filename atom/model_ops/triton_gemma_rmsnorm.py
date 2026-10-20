@@ -20,7 +20,7 @@ import triton.language as tl
 # ── Triton kernel ────────────────────────────────────────────────────────────
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_rows"])
 def _gemma_rmsnorm_kernel(
     input_ptr,
     output_ptr,
@@ -34,7 +34,6 @@ def _gemma_rmsnorm_kernel(
     epsilon,
     HAS_RESIDUAL: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    NUM_PRGMS: tl.constexpr,
     GROUPS: tl.constexpr = 1,
 ):
     """Fused add + GemmaRMSNorm (weight offset x * (1 + w)).
@@ -50,7 +49,7 @@ def _gemma_rmsnorm_kernel(
     g = tl.load(g_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
     g = g + 1.0  # Gemma offset
 
-    for row_idx in tl.range(row_start, n_rows, NUM_PRGMS, num_stages=2):
+    for row_idx in tl.range(row_start, n_rows, tl.num_programs(0), num_stages=2):
         if GROUPS > 1:
             # Each group has its own affine weights in the full-width vector.
             g = (
@@ -134,7 +133,6 @@ def gemma_rmsnorm_triton(x, weight, eps, residual, group_size=None):
         eps,
         HAS_RESIDUAL=has_residual,
         BLOCK_SIZE=BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
         GROUPS=groups,
     )
 
