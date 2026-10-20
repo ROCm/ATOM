@@ -304,6 +304,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_base_page_release_allowance_cannot_exceed_total_deadline(self):
         self.args.timeout = 50
+        self.args.base_page_step_timeout = 600
         info = self.state["numa"][0]
         info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
         self.assertEqual(self.prepare(), 2)  # Fake allocation does not recover RAM.
@@ -313,6 +314,29 @@ class PreparationTests(unittest.TestCase):
             if "reclaim_file_cache.py" in str(cmd)
         ]
         self.assertEqual(limits, [50])
+
+    def test_extended_base_page_budget_preserves_ordinary_step_limit(self):
+        self.args.timeout = 1800
+        self.args.step_timeout = 90
+        self.args.base_page_step_timeout = 600
+        info = self.state["numa"][0]
+        info.update(MemFree=748 * PREP.GIB, **{"Inactive(file)": 725 * PREP.GIB})
+
+        def run(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "reclaim_file_cache.py" in str(command):
+                self.assertEqual(seconds, 600)
+                # Include slow unmapping after the recorded 107s population.
+                self.now += 240
+                info["MemFree"] = 1350 * PREP.GIB
+                info["Inactive(file)"] = 123 * PREP.GIB
+            else:
+                self.assertEqual(seconds, 90)
+            return result
+
+        self.assertEqual(self.prepare(run), 0)
+        self.assertEqual(self.result["settings"]["base_page_step_timeout"], 600)
+        self.assertEqual(len(self.result["attempts"]), 1)
 
     def test_small_base_page_allocation_is_resident_then_released(self):
         result = subprocess.run(
@@ -336,9 +360,7 @@ class PreparationTests(unittest.TestCase):
         source = (SCRIPTS / "pd_server_atom.sh").read_text()
         start = source.index("start_prefill() {")
         setup = source[start : source.index("  start_mooncake_store\n", start)]
-        script = (
-            setup
-            + """
+        script = setup + """
   echo START_SERVICES
 }
 apply_role_env() { :; }
@@ -346,7 +368,6 @@ reset_lmcache_disk() { :; }
 python3() { echo UNEXPECTED_CONTAINER_PREPARATION; return 99; }
 start_prefill prefill-rank-0
 """
-        )
         for enabled, prepared, rc in (
             ("true", "true", 0),
             ("true", "false", 2),

@@ -16,6 +16,7 @@ import numa_memory_budget as budget
 
 HERE = Path(__file__).resolve().parent
 GIB = 1 << 30
+CHILD_EXIT_TIMEOUT = 120
 
 
 def read_optional(path):
@@ -202,7 +203,9 @@ def run_step(command, seconds, output):
             timed_out = True
             os.killpg(child.pid, signal.SIGKILL)
             try:
-                child.wait(timeout=5)
+                # Releasing a TiB of base-page mappings can continue in the
+                # kernel after SIGKILL. Still require the child to be reaped.
+                child.wait(timeout=CHILD_EXIT_TIMEOUT)
             except subprocess.TimeoutExpired as exc:
                 # A process in kernel uninterruptible sleep may not exit yet.
                 raise RuntimeError(
@@ -221,6 +224,9 @@ def run_step(command, seconds, output):
 
 def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic):
     args.output.mkdir(parents=True, exist_ok=True)
+    base_page_step_timeout = (
+        getattr(args, "base_page_step_timeout", None) or args.step_timeout + 30
+    )
     result = {
         "status": "preparing",
         "attempts": [],
@@ -230,7 +236,8 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             "timeout": args.timeout,
             "step_timeout": args.step_timeout,
             "reserve_gib": args.reserve_gib,
-            "base_page_step_timeout": args.step_timeout + 30,
+            "base_page_step_timeout": base_page_step_timeout,
+            "child_exit_timeout": CHILD_EXIT_TIMEOUT,
         },
     }
     cache_roots = getattr(args, "cache_roots", [])
@@ -260,13 +267,13 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             result["attempts"].append(row)
             save()
 
-            def step(label, command, *, release_allowance=0, attempt=attempt, row=row):
+            def step(label, command, *, timeout=None, attempt=attempt, row=row):
                 remaining = deadline - clock()
                 if remaining <= 0:
                     raise TimeoutError("host-memory preparation deadline exceeded")
                 completed = run(
                     command,
-                    min(args.step_timeout + release_allowance, remaining),
+                    min(args.step_timeout if timeout is None else timeout, remaining),
                     args.output / f"attempt-{attempt}-{label}.log",
                 )
                 row["steps"].append(completed)
@@ -386,9 +393,9 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                                 str(HERE / "reclaim_file_cache.py"),
                                 str(scratch_gib),
                             ],
-                            # On g35, 1344 GiB populated in 67s, but freeing
-                            # its base-page PTEs was still running at 90s.
-                            release_allowance=30,
+                            # Run 39381990494 populated 1337 GiB in 107s,
+                            # then hit the old 120s bound during release.
+                            timeout=base_page_step_timeout,
                         )
                         row.setdefault("after_base_reclaim", {})[node] = take_snapshot(
                             planned
@@ -469,6 +476,11 @@ def main():
     parser.add_argument("--attempts", type=int, choices=range(1, 4), default=3)
     parser.add_argument("--timeout", type=budget.positive_seconds, default=120)
     parser.add_argument("--step-timeout", type=budget.positive_seconds, default=35)
+    parser.add_argument(
+        "--base-page-step-timeout",
+        type=budget.positive_seconds,
+        help="base-page population and release budget; defaults to step-timeout + 30",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--cache-root",

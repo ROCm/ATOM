@@ -48,9 +48,10 @@ recovery. The code does not claim to restore node state in those cases.
 
 The host then runs `prepare_lmcache_host_memory.py`: direct sync/drop_caches/
 compact_memory where allowed, otherwise file-cache eviction and NUMA-bound THP
-preparation. It permits three serial attempts within 300 seconds, at most 90
-seconds for ordinary commands or 120 seconds for base-page population and
-release, plus up to five seconds to reap a timed-out child. Before
+preparation. It permits three serial attempts within 1800 seconds, at most 90
+seconds for ordinary commands or 600 seconds for base-page population and
+release, plus up to 120 seconds to reap a timed-out child. The total deadline
+clips each command budget; reaping a timed-out child may extend past it. Before
 the bounded allocation, ordinary free memory plus clean active/inactive file
 cache must cover the pool and 128 GiB reserve; dirty/writeback pages are excluded.
 This lets the preparation reclaim cache itself. After preparation, the pool
@@ -190,9 +191,9 @@ is excluded. A NUMA-bound child uses MADV_NOHUGEPAGE and MADV_POPULATE_WRITE on
 disjoint ranges with up to eight threads, so cache reclaim is not coupled to
 THP compaction on each initial fault. It checks actual RSS and frees the entire
 mapping before the existing THP helper starts. No pinning or VM setting changes
-are involved. Failure or timeout prevents model startup; the existing 90-second
-ordinary-step and 300-second total bounds still apply; the base-page step
-includes an additional 30 seconds for release, as described below. The previous g01 exclusion is
+are involved. Failure or timeout prevents model startup. Ordinary commands
+remain bounded at 90 seconds; the current base-page and total budgets are
+600 and 1800 seconds, as described below. The previous g01 exclusion is
 removed so this path can handle that documented fragmentation case as well.
 This is a CI preparation change; runtime improvement still requires validation.
 
@@ -200,6 +201,17 @@ Run 38816595852 on the same g35 filled all 1344 GiB of temporary base pages
 in 66.8 seconds; RSS verification finished at 71.3 seconds with all memory resident and no huge pages.
 The 90-second timer fired during munmap, when RSS had already fallen to 366 GiB,
 and the child did not finish release within the five-second kill/reap allowance.
-No model was started. The base-page step now has a 120-second bound, including
-release, while other steps remain at 90 seconds and the total remains 300 seconds.
+No model was started. That fix increased the base-page bound to 120 seconds,
+including release, while other steps remained at 90 seconds and the total at 300 seconds.
 The child must still finish before THP preparation or model startup can proceed.
+
+
+Run 39381990494 on g38 filled 1337 GiB in 107 seconds, then reached the
+120-second step deadline while releasing its mappings. RSS was still about
+915 GiB at timeout, and the child did not exit in the five-second SIGKILL wait.
+The C32 launcher now gives this step 600 seconds via
+`--base-page-step-timeout`, with an 1800-second overall preparation deadline.
+Ordinary steps remain at 90 seconds. The post-SIGKILL reap allowance is now
+120 seconds, and failure to reap still prevents model startup. These changes
+only extend preparation time; the LMCache allocation, NUMA placement, model,
+workload, AITER pin and attention settings remain those of the C32 comparison.
