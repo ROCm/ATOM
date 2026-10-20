@@ -2500,11 +2500,19 @@ run_aiperf_agentic_benchmark() {
       profile_pid=$!
     fi
     local -a benchmark_guard=()
+    local guard_stall_timeout=""
     if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
+      guard_stall_timeout=900
+    elif mooncake_store_requested && [[ "${SINGLE_NODE_PD}" == "1" ]]; then
+      # Worker death is fatal even while the HTTP frontend stays healthy.
+      # Do not impose an inactivity deadline on long Store prefill requests.
+      guard_stall_timeout=0
+    fi
+    if [[ -n "${guard_stall_timeout}" ]]; then
       benchmark_guard=(python3 "${ATOMESH_SCRIPT_DIR}/benchmark_guard.py"
         --server-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log"
         --server-log "${RUNTIME_LOG_DIR}/decode-rank-0.log"
-        --client-log "${out_dir}/aiperf.log" --stall-timeout 900
+        --client-log "${out_dir}/aiperf.log" --stall-timeout "${guard_stall_timeout}"
         --output "${out_dir}/benchmark-guard.json" --)
     fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
