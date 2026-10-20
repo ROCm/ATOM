@@ -16,10 +16,27 @@ acyclic, so reference counting takes it.
 
 import gc
 import logging
+import sys
 import time
 import types
 
 logger = logging.getLogger("atom")
+
+
+def tune_gil_switch_interval() -> None:
+    """Apply `ATOM_GIL_SWITCH_INTERVAL_US` to this interpreter, if set."""
+    from atom.utils import envs
+
+    us = envs.ATOM_GIL_SWITCH_INTERVAL_US
+    if us <= 0:
+        return
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(us / 1e6)
+    logger.info(
+        "[gil] switch interval %.0f us -> %.0f us",
+        old * 1e6,
+        sys.getswitchinterval() * 1e6,
+    )
 
 
 def tune_gc() -> None:

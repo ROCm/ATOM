@@ -54,7 +54,11 @@ from atom.utils import (
     shutdown_all_processes,
     worker_process_name,
 )
-from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
+from atom.utils.gc_utils import (
+    maybe_attach_gc_debug_callback,
+    tune_gc,
+    tune_gil_switch_interval,
+)
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
@@ -139,6 +143,7 @@ class AsyncIOProc:
         # happens later, via the EngineCore's `freeze_gc_heap` RPC.
         tune_gc()
         maybe_attach_gc_debug_callback(name)
+        tune_gil_switch_interval()
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
