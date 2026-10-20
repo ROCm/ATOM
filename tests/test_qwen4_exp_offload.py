@@ -152,7 +152,7 @@ def test_layout_id_names_ple_and_forks_under_pipeline_parallel(monkeypatch):
 
 
 def test_validate_config_allows_offload_and_rejects_rapidserve():
-    builder, cls = _builder()
+    builder, _ = _builder()
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpBackend
 
     Qwen4ExpBackend.validate_config(builder.model_runner.config)
