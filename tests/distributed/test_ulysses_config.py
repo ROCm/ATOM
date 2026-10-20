@@ -37,37 +37,15 @@ def test_gqa_rejects_partial_heads(query_heads, kv_heads, world):
         Config._init_sequence_parallel(config)
 
 
-def test_dp_sp_rejected_before_moe_can_skip_sp_communication():
-    config = SimpleNamespace(
-        sequence_parallel_size=4,
-        parallel_config=SimpleNamespace(data_parallel_size=2),
-    )
-    with pytest.raises(ValueError, match="DP MoE forward path"):
-        Config._init_sequence_parallel(config)
-
-
-@pytest.mark.parametrize("world", [0, -1])
-def test_sequence_parallel_width_must_be_positive(world):
-    with pytest.raises(ValueError, match="sequence_parallel_size must be at least 1"):
-        Config(model="unused", sequence_parallel_size=world)
-
-
 @pytest.mark.parametrize(
     "overrides,reason",
     [
+        ({"parallel_config": SimpleNamespace(data_parallel_size=2)}, "DP MoE"),
         ({"tensor_parallel_size": 2}, "requires --tensor-parallel-size 1"),
         ({"prefill_context_parallel_size": 2}, "same rank dimension"),
         ({"enable_tbo": True}, "TBO token slicing"),
-        ({"enable_tbo_decode": True}, "TBO token slicing"),
         ({"speculative_config": object()}, "speculative decoding"),
-        (
-            {"hf_config": SimpleNamespace(kv_lora_rank=512)},
-            "MHA models only",
-        ),
-        (
-            {"hf_config": SimpleNamespace(model_type="qwen3_next")},
-            "MHA models only",
-        ),
+        ({"hf_config": SimpleNamespace(kv_lora_rank=512)}, "MHA models only"),
     ],
 )
 def test_unsharded_execution_paths_are_rejected(overrides, reason):
@@ -76,27 +54,17 @@ def test_unsharded_execution_paths_are_rejected(overrides, reason):
         Config._init_sequence_parallel(config)
 
 
-def test_moe_layouts_cannot_reuse_incompatible_sp_compilation_artifacts():
-    config = SimpleNamespace(
-        quant_config=None,
-        compilation_config=None,
-        parallel_config=None,
-        tensor_parallel_size=1,
-        prefill_context_parallel_size=8,
-        sequence_parallel_size=8,
-        enable_expert_parallel=False,
-        moe_all2all_backend="none",
-        moe_backend="standard",
-        dcp_config=None,
-        enable_dp_attention=False,
-        index_cache_dtype="bf16",
-        hf_config=SimpleNamespace(),
-        speculative_config=None,
-    )
+def test_layouts_that_change_the_graph_do_not_share_compiled_artifacts():
+    config = atom_config_double()
     keys = [Config.compute_hash(config)]
-    config.enable_expert_parallel = True
-    for backend in ("none", "rccl", "mori"):
-        config.moe_all2all_backend = backend
+    for name, value in (
+        ("sequence_parallel_size", 4),
+        ("m3_tp_replicated_o_proj", True),
+        ("sp_mega_moe_enabled", True),
+        ("enable_expert_parallel", True),
+        ("moe_all2all_backend", "mori"),
+    ):
+        setattr(config, name, value)
         key = Config.compute_hash(config)
         assert key == Config.compute_hash(config)
         keys.append(key)

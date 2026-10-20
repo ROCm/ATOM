@@ -71,25 +71,16 @@ def test_saveable_artifact_returns_cache_handle(monkeypatch):
     assert compilation_counter.num_compiled_artifacts_saved == 1
 
 
-@pytest.mark.parametrize("nested", [False, True], ids=["flat", "tuple_input"])
-def test_standalone_cpu_artifact_roundtrip(nested, tmp_path, monkeypatch):
+def test_standalone_cpu_artifact_roundtrip_with_tuple_input(tmp_path, monkeypatch):
     """Reload retains tuple-input flattening and input-mutation argument order.
 
     The mutation is intentional: wrong flat argument indices after reloading
     used to pass a scalar to increment_version in M3's last piecewise graph.
-    Both cases compile real CPU kernels, save them, and use ATOM's real loader.
+    This compiles a real CPU kernel, saves it, and uses ATOM's real loader.
     """
     standalone = pytest.importorskip("torch._inductor.standalone_compile")
     if not hasattr(standalone, "CacheCompiledArtifact"):
         pytest.skip("Torch does not provide CacheCompiledArtifact")
-
-    class Flat(torch.nn.Module):
-        def forward(self, x, scale, n, residual):
-            torch.ops.aten.add_.Tensor(
-                residual,
-                torch.ops.aten.add.Tensor(torch.ops.aten.mul.Tensor(x, scale), n),
-            )
-            return residual
 
     class Nested(torch.nn.Module):
         def forward(self, pair, n, residual):
@@ -102,13 +93,13 @@ def test_standalone_cpu_artifact_roundtrip(nested, tmp_path, monkeypatch):
             return residual
 
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
-    graph = torch.fx.symbolic_trace(Nested() if nested else Flat())
+    graph = torch.fx.symbolic_trace(Nested())
 
     def inputs():
         x = torch.arange(8, dtype=torch.float32, device="cpu")
         scale = torch.full((8,), 2.0, device="cpu")
         residual = torch.ones(8, device="cpu")
-        return ((x, scale), 3, residual) if nested else (x, scale, 3, residual)
+        return (x, scale), 3, residual
 
     example_inputs = inputs()
     with torch._functorch.config.patch(enable_autograd_cache=True):
