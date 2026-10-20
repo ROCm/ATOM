@@ -799,6 +799,8 @@ class EagleProposer(Drafter):
                         sample_hidden_states, out=exported
                     )
 
+                if self.model.has_draft_vocab:
+                    next_input_ids = (next_input_ids + self.model.d2t[next_input_ids.long()]).int()
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.
                     from_prefill = context.is_prefill
@@ -873,4 +875,7 @@ class EagleProposer(Drafter):
 
         # self.runner.debug(f"final {draft_token_ids=}")
         # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
-        return draft_token_ids.t().contiguous()
+        result = draft_token_ids.t().contiguous()
+        if self.model.has_draft_vocab:
+            result = (result + self.model.d2t[result.long()]).to(result.dtype)
+        return result

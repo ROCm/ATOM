@@ -299,6 +299,12 @@ def safetensors_weights_iterator(
     hf_weights_files = filter_duplicate_safetensors_files(
         glob(os.path.join(path, "*.safetensors")), path, SAFE_WEIGHTS_INDEX_NAME
     )
+    if not hf_weights_files:
+        raise FileNotFoundError(
+            f"No safetensors files found in {path}. "
+            f"Convert weights to safetensors format before loading."
+        )
+
     hf_weights_files = _shards_worth_reading(hf_weights_files, wants)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

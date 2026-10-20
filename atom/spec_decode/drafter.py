@@ -523,6 +523,12 @@ class Drafter(abc.ABC):
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",
                 spec.model,
             )
+            if getattr(self.model, "has_draft_vocab", False):
+                target_base = getattr(target_model, "language_model", target_model)
+                self.model.embed_tokens.weight.data.copy_(
+                    target_base.model.embed_tokens.weight.data
+                )
+                logger.info("Copied target embed_tokens weights to drafter")
             return
 
         # Resolve the base model (unwrap multimodal wrapper if present)

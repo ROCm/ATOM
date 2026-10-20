@@ -336,6 +336,12 @@ class Eagle3LlamaModel(nn.Module):
         self.num_aux_hidden_states = num_aux
         self.norm_output = getattr(config, "norm_output", False)
 
+        draft_vocab = getattr(config, "draft_vocab_size", config.vocab_size)
+        self.has_draft_vocab = draft_vocab != config.vocab_size
+        if self.has_draft_vocab:
+            self.t2d = nn.Parameter(torch.zeros(config.vocab_size, dtype=torch.bool), requires_grad=False)
+            self.d2t = nn.Parameter(torch.zeros(draft_vocab, dtype=torch.int64), requires_grad=False)
+
         # Independent embedding (vocab matches target model). The draft embed is
         # NOT shared with the (still TP-sharded) lm_head, so it can be replicated
         # full on every rank — a local lookup with no post-embedding all-reduce.
@@ -388,7 +394,7 @@ class Eagle3LlamaModel(nn.Module):
         )
 
         # Independent lm_head (not shared with target model)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        self.lm_head = ParallelLMHead(draft_vocab, config.hidden_size)
 
     def combine_hidden_states(self, aux_hidden_states) -> torch.Tensor:
         """Project the per-layer aux hidden states through fc.
