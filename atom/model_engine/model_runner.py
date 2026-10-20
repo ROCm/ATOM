@@ -798,7 +798,10 @@ class ModelRunner:
             from atom.model_ops.gemm_fusion.model_adapters import install_m3_sites
 
             n_fused_layers = install_m3_sites(self.model)
-            logger.info("gemm_fusion: installed fused QKV+attention on %d layers", n_fused_layers)
+            logger.info(
+                "gemm_fusion: installed fused QKV+attention on %d layers",
+                n_fused_layers,
+            )
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.

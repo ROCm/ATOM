@@ -29,7 +29,11 @@ def plan_owner(plan) -> str:
     their windows up by ``self.owner + "/rx"`` etc., and (since aiter f8a8ebf7) expose the
     same string as ``build_key`` for exactly this purpose, so ATOM must use that key.
     ``vid`` alone is shared by every plan of a variant and would collide."""
-    return getattr(plan, "build_key", None) or getattr(plan, "owner", None) or getattr(plan, "vid", "plan")
+    return (
+        getattr(plan, "build_key", None)
+        or getattr(plan, "owner", None)
+        or getattr(plan, "vid", "plan")
+    )
 
 
 def fusion_resources_cls(gf):
@@ -51,7 +55,9 @@ class FusionResourcesWrapper:
         self.world = world
         self.rank = sp_group.rank_in_group
         # object broadcast / barrier go over the CPU group when present
-        self.pg = getattr(sp_group, "cpu_group", None) or getattr(sp_group, "device_group", None)
+        self.pg = getattr(sp_group, "cpu_group", None) or getattr(
+            sp_group, "device_group", None
+        )
         import torch
 
         device = torch.cuda.current_device()
@@ -61,12 +67,21 @@ class FusionResourcesWrapper:
         # choose one, so omitting it leaves the budget unknown and the first (small, 4 MiB)
         # request sizes every window (E2 new_on02: a later 40 MiB large-M plan is rejected).
         self.inner = fusion_resources_cls(gf)(
-            rank=self.rank, world=world, group=self.pg, device=device, caps=caps, profile=profile
+            rank=self.rank,
+            world=world,
+            group=self.pg,
+            device=device,
+            caps=caps,
+            profile=profile,
         )
         self.caps = frozenset(getattr(self.inner, "caps", ()))
         self._arch = gf.detect_arch()
         self._cu = gf.detect_cu()
-        self._reduce_min = consensus.torch_min_reducer(self.pg, device=_device()) if world > 1 else None
+        self._reduce_min = (
+            consensus.torch_min_reducer(self.pg, device=_device())
+            if world > 1
+            else None
+        )
 
     @property
     def arch(self) -> str:

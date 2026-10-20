@@ -37,7 +37,8 @@ def declare_m3_qkv_site(attn_module, *, prefix: str, sparse: bool):
 
     if not profile_enabled():
         return None
-    from . import ops  # noqa: F401  (registers torch.ops.aiter.gemm_fusion_qkv_attention)
+    # registers torch.ops.aiter.gemm_fusion_qkv_attention
+    from . import ops  # noqa: F401
 
     attn = attn_module.attn
     if not getattr(attn, "_m3_sp_fp8_output_supported", False) or getattr(
@@ -53,9 +54,7 @@ def declare_m3_qkv_site(attn_module, *, prefix: str, sparse: bool):
         return None
     skip = bool(getattr(attn_module, "skip_index_topk", False))
     head_dim = attn_module.head_dim
-    kwargs = dict(
-        q=attn_module.q_size, kv=attn_module.kv_size, head_dim=head_dim
-    )
+    kwargs = {"q": attn_module.q_size, "kv": attn_module.kv_size, "head_dim": head_dim}
     if sparse:
         kwargs.update(
             iq=attn_module.index_q_size,

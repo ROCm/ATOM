@@ -10,10 +10,8 @@ path is exactly the pre-fusion behavior:
   after_prologue  backend only (caches already written) -> gather_heads_fp8
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
-
-import torch
 
 
 @dataclass(frozen=True)

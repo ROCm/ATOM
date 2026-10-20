@@ -37,20 +37,27 @@ from . import consensus, hooks
 from . import stages as S
 from .context import AttnFusionCtx
 from .resources import FusionResourcesWrapper, fusion_resources_cls
-from .site import GemmFusionBindError, GemmFusionSite, Resolution, _ShimFwdCtx  # noqa: F401
+from .site import (
+    GemmFusionBindError,
+    GemmFusionSite,
+    Resolution,
+)
 
 logger = logging.getLogger("atom.gemm_fusion")
 
 # =============================================================================
 # 1. test state helpers
 # =============================================================================
-DECISIONS: list = []  # bounded dispatch evidence, newest last (runtime keeps only the digest)
+DECISIONS: list = (
+    []
+)  # bounded dispatch evidence, newest last (runtime keeps only the digest)
 _MAX_DECISIONS = 4096
 
 
 def reset_for_tests(res=None, profile="test-profile"):
     """Reset the runtime's module state. ``profile`` is what ``hooks.profile()`` returns while
-    ``res`` is set (the harness passes the one it loaded; unit tests with fakes keep the default)."""
+    ``res`` is set (the harness passes the one it loaded; unit tests with fakes keep the default).
+    """
     uninstall_faults()
     hooks._SITES.clear()
     hooks._PLANS.clear()
@@ -81,7 +88,9 @@ def init_with_resources(config, res, sp_group=None):
 
     orig_cls, orig_world = R.FusionResourcesWrapper, S.sp_world
     R.FusionResourcesWrapper = lambda *a, **k: res
-    S.sp_world = lambda: getattr(res, "world", 1)  # the real one needs the distributed runtime
+    S.sp_world = lambda: getattr(
+        res, "world", 1
+    )  # the real one needs the distributed runtime
     try:
         hooks.init_gemm_fusion(config, sp_group)
     finally:
@@ -90,17 +99,32 @@ def init_with_resources(config, res, sp_group=None):
 
 class InjectedResourcesWrapper(FusionResourcesWrapper):
     """``FusionResourcesWrapper`` whose pieces can be injected (``inner``, ``reduce_min``, ``rank``,
-    ``pg``, ``arch``, ``cu``). The runtime constructor takes only ``(sp_group, world, profile)``."""
+    ``pg``, ``arch``, ``cu``). The runtime constructor takes only ``(sp_group, world, profile)``.
+    """
 
-    def __init__(self, sp_group=None, world=1, *, rank=None, pg=None, inner=None, reduce_min=None,
-                 device=None, arch=None, cu=None, profile=None):
+    def __init__(
+        self,
+        sp_group=None,
+        world=1,
+        *,
+        rank=None,
+        pg=None,
+        inner=None,
+        reduce_min=None,
+        device=None,
+        arch=None,
+        cu=None,
+        profile=None,
+    ):
         gf = S.aiter_gf()
         self.group = sp_group
         self.world = world
         if rank is None:
             rank = sp_group.rank_in_group
         if pg is None and sp_group is not None:
-            pg = getattr(sp_group, "cpu_group", None) or getattr(sp_group, "device_group", None)
+            pg = getattr(sp_group, "cpu_group", None) or getattr(
+                sp_group, "device_group", None
+            )
         self.rank, self.pg = rank, pg
         if inner is None:
             device = torch.cuda.current_device() if device is None else device
@@ -108,7 +132,12 @@ class InjectedResourcesWrapper(FusionResourcesWrapper):
             if profile is None:
                 profile = hooks.profile()
             inner = fusion_resources_cls(gf)(
-                rank=rank, world=world, group=pg, device=device, caps=caps, profile=profile
+                rank=rank,
+                world=world,
+                group=pg,
+                device=device,
+                caps=caps,
+                profile=profile,
             )
         self.inner = inner
         self.caps = frozenset(getattr(inner, "caps", ()))
@@ -171,8 +200,16 @@ _STATS = {"alias_checks": 0}
 def stats():
     """What this process's seams did: installed fault specs, kinds that fired, alias checks run.
     A spawned worker can log this to PROVE the seams were installed and executed."""
-    return {"pid": os.getpid(), "faults": dict(_FAULTS), "fired": sorted(_FIRED),
-            "alias_checks": _STATS["alias_checks"], "patches": [f"{p[0].__name__}.{p[1]}" if hasattr(p[0], "__name__") else p[1] for p in _PATCHES]}
+    return {
+        "pid": os.getpid(),
+        "faults": dict(_FAULTS),
+        "fired": sorted(_FIRED),
+        "alias_checks": _STATS["alias_checks"],
+        "patches": [
+            f"{p[0].__name__}.{p[1]}" if hasattr(p[0], "__name__") else p[1]
+            for p in _PATCHES
+        ],
+    }
 
 
 def _patch(obj, attr, value):
@@ -187,7 +224,10 @@ def parse_faults(spec):
     for item in filter(None, (spec or "").split(",")):
         parts = item.strip().split(":")
         rank = parts[1] if len(parts) > 1 and parts[1] not in ("", "*") else None
-        out[parts[0]] = (None if rank is None else int(rank), parts[2] if len(parts) > 2 else None)
+        out[parts[0]] = (
+            None if rank is None else int(rank),
+            parts[2] if len(parts) > 2 else None,
+        )
     return out
 
 
@@ -205,8 +245,13 @@ def fault_active(kind):
         return None
     if kind not in _FIRED:
         _FIRED.add(kind)
-        logger.warning("gemm_fusion test_utils: fault %r FIRED (pid=%d sp_rank=%d arg=%r)",
-                       kind, os.getpid(), _my_rank(), arg)
+        logger.warning(
+            "gemm_fusion test_utils: fault %r FIRED (pid=%d sp_rank=%d arg=%r)",
+            kind,
+            os.getpid(),
+            _my_rank(),
+            arg,
+        )
     return arg or ""
 
 
@@ -214,13 +259,17 @@ def _spin_gpu_us(us):
     """Keep the current stream busy ~``us`` microseconds (E-5)."""
     try:
         torch.cuda._sleep(int(us * 1000))  # cycles; order-of-magnitude is enough
-    except Exception:
+    except Exception:  # noqa: BLE001 - no _sleep on this torch: sync instead
         torch.cuda.synchronize()
 
 
 def _install_poison_rank():
     orig = hooks._poison_local
-    _patch(hooks, "_poison_local", lambda: 1 if fault_active("poison_rank") is not None else orig())
+    _patch(
+        hooks,
+        "_poison_local",
+        lambda: 1 if fault_active("poison_rank") is not None else orig(),
+    )
 
 
 def _install_no_poison_check():
@@ -309,14 +358,22 @@ def install_faults(spec=None):
     parsed = parse_faults(spec)
     unknown = [k for k in parsed if k not in _FAULT_INSTALLERS]
     if unknown:
-        raise ValueError(f"unknown gemm_fusion fault kind(s) {unknown}; known: {sorted(_FAULT_INSTALLERS)}")
+        raise ValueError(
+            f"unknown gemm_fusion fault kind(s) {unknown}; known: {sorted(_FAULT_INSTALLERS)}"
+        )
     for kind, ent in parsed.items():
         if kind not in _FAULTS:
             _FAULT_INSTALLERS[kind]()
-            logger.warning("gemm_fusion test_utils: fault %r installed (pid=%d rank=%s arg=%r)",
-                           kind, os.getpid(), "*" if ent[0] is None else ent[0], ent[1])
+            logger.warning(
+                "gemm_fusion test_utils: fault %r installed (pid=%d rank=%s arg=%r)",
+                kind,
+                os.getpid(),
+                "*" if ent[0] is None else ent[0],
+                ent[1],
+            )
         _FAULTS[kind] = ent
     return parsed
+
 
 def install_from_env():
     """Apply env-selected seams: ``ATOM_GEMM_FUSION_FAULT``, the recover/shutdown timeouts, and the
@@ -326,15 +383,21 @@ def install_from_env():
     if os.environ.get(FAULT_ENV):
         install_faults()
         installed.append(f"faults={os.environ[FAULT_ENV]}")
-    for env, attr in ((RECOVER_TIMEOUT_ENV, "RECOVER_TIMEOUT_S"), (SHUTDOWN_TIMEOUT_ENV, "SHUTDOWN_TIMEOUT_S")):
+    for env, attr in (
+        (RECOVER_TIMEOUT_ENV, "RECOVER_TIMEOUT_S"),
+        (SHUTDOWN_TIMEOUT_ENV, "SHUTDOWN_TIMEOUT_S"),
+    ):
         if os.environ.get(env):
             _patch(hooks, attr, float(os.environ[env]))
             installed.append(f"{attr}={os.environ[env]}")
     if os.environ.get(CHECK_ALIAS_ENV) == "1":
         install_alias_check()
         installed.append("alias_check")
-    logger.warning("gemm_fusion test_utils: install_from_env ran (pid=%d): %s",
-                   os.getpid(), ", ".join(installed) or "nothing selected by the environment")
+    logger.warning(
+        "gemm_fusion test_utils: install_from_env ran (pid=%d): %s",
+        os.getpid(),
+        ", ".join(installed) or "nothing selected by the environment",
+    )
 
 
 def uninstall_faults():
@@ -360,7 +423,8 @@ def uninstall_faults():
 # =============================================================================
 def fallback_reason(site, ctx, x, x_scale, n_fused=2):
     """Why the fused prefix cannot run for this call (None = it can): a view of
-    ``GemmFusionSite.decide_path`` over the call's tensors (``_prepare`` uses the same function)."""
+    ``GemmFusionSite.decide_path`` over the call's tensors (``_prepare`` uses the same function).
+    """
     fp8, ok = site.input_facts(x, x_scale)
     path, why = site.decide_path(
         resolution=Resolution(object(), n_fused, "", ""),
@@ -379,10 +443,25 @@ def binding_key(site, st, state, x_scale=None):
     moved."""
     meta = site.build_meta(st, state)
     ptr = site._ptr
-    d = {"x_scale": ptr(x_scale if x_scale is not None else st.xs),
-         "w_scale": ptr(site.linear.weight_scale)}
-    for k in ("q_norm_w", "k_norm_w", "index_q_norm_w", "index_k_norm_w", "cos_cache", "sin_cache",
-              "positions", "slot_mapping", "k_cache", "v_cache", "k_scale", "v_scale", "index_cache"):
+    d = {
+        "x_scale": ptr(x_scale if x_scale is not None else st.xs),
+        "w_scale": ptr(site.linear.weight_scale),
+    }
+    for k in (
+        "q_norm_w",
+        "k_norm_w",
+        "index_q_norm_w",
+        "index_k_norm_w",
+        "cos_cache",
+        "sin_cache",
+        "positions",
+        "slot_mapping",
+        "k_cache",
+        "v_cache",
+        "k_scale",
+        "v_scale",
+        "index_cache",
+    ):
         if k in meta:
             d[k] = ptr(meta[k])
     for k, v in st.outs.items():
@@ -403,14 +482,16 @@ def check_no_window_alias(named_tensors):
     re-raised as ``GemmFusionBindError``."""
     import importlib
 
-    aiter_test_utils = importlib.import_module("aiter.ops.gemm_fusion.sp_qkv.test_utils")
+    aiter_test_utils = importlib.import_module(
+        "aiter.ops.gemm_fusion.sp_qkv.test_utils"
+    )
 
     items = {n: t for n, t in named_tensors if t is not None and hasattr(t, "data_ptr")}
     try:
         aiter_test_utils.assert_no_window_alias(
             hooks._RES.inner, items, what="gemm_fusion_qkv_attention", force=True
         )
-    except Exception as e:  # noqa: BLE001 - aiter's WindowAliasError
+    except Exception as e:
         raise GemmFusionBindError(f"gemm_fusion: tensor aliases a window: {e}") from e
 
 
@@ -432,13 +513,22 @@ def install_alias_check():
         (out, out_scale), _decision = result
         _STATS["alias_checks"] += 1
         if _STATS["alias_checks"] == 1:
-            logger.warning("gemm_fusion test_utils: alias check EXECUTED for the first time (pid=%d)", os.getpid())
-        check_no_window_alias([("out", out), ("scale", out_scale),
-                               ("impl._index_q", getattr(attn.impl, "_index_q", None))])
+            logger.warning(
+                "gemm_fusion test_utils: alias check EXECUTED for the first time (pid=%d)",
+                os.getpid(),
+            )
+        check_no_window_alias(
+            [
+                ("out", out),
+                ("scale", out_scale),
+                ("impl._index_q", getattr(attn.impl, "_index_q", None)),
+            ]
+        )
         return result
 
     _patch(ops, "run_qkv_attention", run_qkv_attention)
     _ALIAS_INSTALLED = True
+
 
 # =============================================================================
 # 4. direct-bind site (golden harness only)
@@ -488,7 +578,8 @@ class DirectGemmFusionSite(GemmFusionSite):
 
         PADDED BUCKETS (the caller's positions / slot_mapping are shorter than ``tokens`` = T): the
         small-M kernel reads T entries, so the site's own T-length arrays (position 0 / slot -1 in the
-        pad rows) are bound instead and refreshed by copy on every call; x_scale stays direct."""
+        pad rows) are bound instead and refreshed by copy on every call; x_scale stays direct.
+        """
         r = self.resolve(tokens, "eager")
         if r.plan is None:
             return False
@@ -498,16 +589,21 @@ class DirectGemmFusionSite(GemmFusionSite):
         if direct is None and self.direct_provider is not None:
             direct = self.direct_provider(tokens)
         if direct is None:
-            return st.prepared  # no stable tensors to bind; agree_prepared() downgrades uniformly
+            return (
+                st.prepared
+            )  # no stable tensors to bind; agree_prepared() downgrades uniformly
         if st.prepared:
             # Already bound. The KV cache/scale addresses are fixed at KV allocation: if the
             # caller's differ from the ones bound, the plan would write a stale cache.
-            live = self._live_ptrs(direct["x_scale"], direct["positions"], direct["state"])
+            live = self._live_ptrs(
+                direct["x_scale"], direct["positions"], direct["state"]
+            )
             return live[3:] == st.ptrs[3:]
         state = direct["state"]
         st.xs = direct["x_scale"]
         st.own_token_arrays = (
-            int(direct["positions"].shape[-1]) < tokens or int(direct["slot_mapping"].shape[-1]) < tokens
+            int(direct["positions"].shape[-1]) < tokens
+            or int(direct["slot_mapping"].shape[-1]) < tokens
         )
         if not st.own_token_arrays:
             st.pos, st.slot = direct["positions"], direct["slot_mapping"]
@@ -523,11 +619,15 @@ class DirectGemmFusionSite(GemmFusionSite):
             # x_scale / positions / slot_mapping may have moved since prepare: refreshed by copy
             # in _stage_inputs. The KV addresses were checked at prepare, not here.
             live = self._live_ptrs(x_scale, ctx.positions, state)
-            st.rebound = bool(getattr(st, "own_token_arrays", False)) or live[:3] != st.ptrs[:3]
+            st.rebound = (
+                bool(getattr(st, "own_token_arrays", False)) or live[:3] != st.ptrs[:3]
+            )
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
-        if getattr(st, "rebound", False):  # unmoved: st.xs/pos/slot ARE the caller's tensors
+        if getattr(
+            st, "rebound", False
+        ):  # unmoved: st.xs/pos/slot ARE the caller's tensors
             super()._stage_inputs(x_scale, ctx, state, st)
 
     def _bind_label(self, r, path, st):
@@ -547,7 +647,11 @@ def run_prologue(site, x, x_scale, ctx, native_full, native_after_exchange, out_
     ``native_after_exchange(packed)``."""
     r, reason, state, st = site._prepare(ctx, x, x_scale)
     if r.plan is None:
-        return "native", native_full(x, x_scale), site._decision(ctx, r, reason, "native")
+        return (
+            "native",
+            native_full(x, x_scale),
+            site._decision(ctx, r, reason, "native"),
+        )
     outs = site._execute(r, x, x_scale, ctx, state, st, out_dtype)
     if r.n_fused >= 2:
         return "outs", outs, site._decision(ctx, r, reason, "fused", st)
@@ -600,7 +704,8 @@ def configure(profile, *, rank, world=WORLD, pg=None, resources=None):
     gf.load_profile(profile)
     reset_for_tests(
         # profile reaches FusionResources too (window budget / VMM heap), not only the matcher
-        resources or InjectedResourcesWrapper(None, world, rank=rank, pg=pg, profile=profile),
+        resources
+        or InjectedResourcesWrapper(None, world, rank=rank, pg=pg, profile=profile),
         profile=profile,
     )
     _SITES.clear()
@@ -614,7 +719,9 @@ def _maybe_configure_from_env(comm):
 
 def _mode(case):
     m = case.spec.mode
-    return "dense" if m == "qkv_dense" else ("indexer" if m == "qkv_indexer" else "reuse")
+    return (
+        "dense" if m == "qkv_dense" else ("indexer" if m == "qkv_indexer" else "reuse")
+    )
 
 
 def _prologue_supported(mode, impl):
@@ -633,7 +740,11 @@ def _prologue_supported(mode, impl):
     """
     if mode != "dense":
         return True
-    return bool(impl.rotary_emb is not None and impl.q_norm is not None and impl.k_norm is not None)
+    return bool(
+        impl.rotary_emb is not None
+        and impl.q_norm is not None
+        and impl.k_norm is not None
+    )
 
 
 def _caches_state(case, slot_mapping):
@@ -662,12 +773,14 @@ def _kv_page(page):
 class _GoldenSite(DirectGemmFusionSite):
     """Golden-harness site. The harness's weight IS the layout the plan consumes (16x16-preshuffled),
     but golden tensors carry no ``is_shuffled`` marker (ATOM's loader sets it), so the layout verdict
-    is taken from the harness contract while the shape checks (K, N, scale rows) still run."""
+    is taken from the harness contract while the shape checks (K, N, scale rows) still run.
+    """
 
     def _static_weight_reason(self):
         lin = self.linear
         proxy = SimpleNamespace(
-            output_size=lin.output_size, input_size=lin.input_size,
+            output_size=lin.output_size,
+            input_size=lin.input_size,
             weight=SimpleNamespace(is_shuffled=True, shape=lin.weight.shape),
             weight_scale=lin.weight_scale,
         )
@@ -686,9 +799,14 @@ def _site_for(case, comm):
         holder = SimpleNamespace(case=case)
         sparse = mode != "dense"
         impl = SimpleNamespace(
-            num_heads=16, num_kv_heads=1, head_dim=128,
-            rotary_emb=case.rotary, q_norm=case.q_norm, k_norm=case.k_norm,
-            kv_cache_dtype="fp8", layer_num=0,
+            num_heads=16,
+            num_kv_heads=1,
+            head_dim=128,
+            rotary_emb=case.rotary,
+            q_norm=case.q_norm,
+            k_norm=case.k_norm,
+            kv_cache_dtype="fp8",
+            layer_num=0,
             sliding_window=-1,
             gemm_fusion_prologue_state=lambda fwd: _caches_state(
                 holder.case, fwd.attn_metadata.slot_mapping
@@ -702,25 +820,41 @@ def _site_for(case, comm):
             impl.index_cache = (case.caches or {}).get("index_cache")
         attn = SimpleNamespace(impl=impl)
         linear = SimpleNamespace(
-            output_size=case.spec.gemm_nk[0], input_size=case.spec.gemm_nk[1],
-            weight=case.weight, weight_scale=case.weight_scale,
+            output_size=case.spec.gemm_nk[0],
+            input_size=case.spec.gemm_nk[1],
+            weight=case.weight,
+            weight_scale=case.weight_scale,
         )
         with _kv_page(case.spec.cache_page_size):
             fields = S.qkv_fields(
-                q=8192, kv=512, head_dim=128, world=WORLD,
-                **(dict(iq=512, ik=128, idx_head_dim=128) if sparse else {}),
+                q=8192,
+                kv=512,
+                head_dim=128,
+                world=WORLD,
+                **({"iq": 512, "ik": 128, "idx_head_dim": 128} if sparse else {}),
             )
             stages = [
-                S.sp_exchange(fields, drop=("iq", "ik") if mode == "reuse" else (), world=WORLD),
+                S.sp_exchange(
+                    fields, drop=("iq", "ik") if mode == "reuse" else (), world=WORLD
+                ),
                 S.head_norm_rope_cache_from_attention(
                     attn, index="fp8_unit_page128" if mode == "indexer" else None
                 ),
             ]
-        site = _GoldenSite(  # case tensors are address-stable (refresh_input keeps them)
-            f"golden.{mode}.T{case.spec.tokens}", linear, stages, None, attn=attn,
-            q_size=8192 // WORLD, kv_size=512 // WORLD,
-            index_q_size=128 if sparse else 0, index_k_size=128 if sparse else 0,
-            sparse=sparse, skip_index=(mode == "reuse"),
+        site = (
+            _GoldenSite(  # case tensors are address-stable (refresh_input keeps them)
+                f"golden.{mode}.T{case.spec.tokens}",
+                linear,
+                stages,
+                None,
+                attn=attn,
+                q_size=8192 // WORLD,
+                kv_size=512 // WORLD,
+                index_q_size=128 if sparse else 0,
+                index_k_size=128 if sparse else 0,
+                sparse=sparse,
+                skip_index=(mode == "reuse"),
+            )
         )
         ent = _SITES[key] = (site, holder, attn)
     ent[1].case = case
@@ -730,8 +864,12 @@ def _site_for(case, comm):
 def _ctx(case, attn):
     sp = case.spec
     ctx = _HarnessCtx(
-        attn=attn, positions=case.positions, fwd_ctx=None, world=WORLD,
-        real_tokens=sp.tokens, padded_tokens=sp.padded_tokens,
+        attn=attn,
+        positions=case.positions,
+        fwd_ctx=None,
+        world=WORLD,
+        real_tokens=sp.tokens,
+        padded_tokens=sp.padded_tokens,
     )
     ctx.state = _caches_state(case, case.slot_mapping)
     return ctx
@@ -753,7 +891,10 @@ def prepare_cases(cases, comm):
         for (site, _, _), c in zip(ents, cases):
             sp = c.spec
             prepared = site.prepare_bucket(
-                sp.padded_tokens, c.x.device, None, torch.bfloat16,
+                sp.padded_tokens,
+                c.x.device,
+                None,
+                torch.bfloat16,
                 # direct bind: the case's own tensors, no staging copies
                 direct={
                     "x_scale": c.x_scale,
@@ -771,7 +912,8 @@ def prepare_cases(cases, comm):
 def check_poison():
     """Per-sample host check for the harness: read every plan's device poison word and agree across
     ranks, plus the cross-rank decision digest. On poison or mismatch: collective recovery, then
-    raises ``GemmFusionPoisonError``. Call after every measured/checked sample, on every rank."""
+    raises ``GemmFusionPoisonError``. Call after every measured/checked sample, on every rank.
+    """
     hooks.check_step()
 
 
@@ -804,8 +946,13 @@ def qkv_proj_all2all_norm_rope_cache(case, comm):
         return operators.norm_rope_cache(comm.qkv_exchange(raw, mode), case)
 
     kind, payload, d = run_prologue(
-        site, case.x, case.x_scale, ctx, native_full,
-        lambda packed: operators.norm_rope_cache(packed, case), torch.bfloat16,
+        site,
+        case.x,
+        case.x_scale,
+        ctx,
+        native_full,
+        lambda packed: operators.norm_rope_cache(packed, case),
+        torch.bfloat16,
     )
     _LAST = d
     if kind == "native":
@@ -910,9 +1057,13 @@ def register_hf_config(model_type="minimax_m3"):
     return cls
 
 
-VL_MODEL_TYPE = "minimax_m3_vl"  # outer type of the released checkpoint (repo tests + vLLM shim)
+VL_MODEL_TYPE = (
+    "minimax_m3_vl"  # outer type of the released checkpoint (repo tests + vLLM shim)
+)
 TEXT_MODEL_TYPE = "minimax_m3_text"  # nested text_config type (repo tests)
-VL_ARCH = "MiniMaxM3SparseForConditionalGeneration"  # what the recipes' VL checkpoint selects
+VL_ARCH = (
+    "MiniMaxM3SparseForConditionalGeneration"  # what the recipes' VL checkpoint selects
+)
 
 
 def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
@@ -923,8 +1074,13 @@ def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False)
     ships NEXT TO config.json, which is how ATOM's own recipes load M3 (``--trust-remote-
     code``); ATOM's native path registers no class for it. Attention geometry is unchanged.
     """
-    text = m3_config(layers=layers, experts=experts, vocab=vocab, index_topk_freq=index_topk_freq,
-                     moe=moe)
+    text = m3_config(
+        layers=layers,
+        experts=experts,
+        vocab=vocab,
+        index_topk_freq=index_topk_freq,
+        moe=moe,
+    )
     for k in ("architectures", "torch_dtype"):
         text.pop(k, None)
     text["model_type"] = TEXT_MODEL_TYPE
@@ -952,7 +1108,7 @@ def m3_vl_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False)
 
 # Shipped next to config.json. A bare PretrainedConfig keeps every field as an attribute
 # (nested dicts become sub-configs), mirroring atom/plugin/vllm/register.py MiniMaxM3Config.
-CONFIGURATION_PY = '''\
+CONFIGURATION_PY = """\
 from transformers import PretrainedConfig
 
 
@@ -971,7 +1127,7 @@ class MiniMaxM3Config(PretrainedConfig):
         self.vision_config = vision_config
         self.hidden_size = getattr(text_config, "hidden_size", None)
         super().__init__(**kwargs)
-'''
+"""
 
 
 def make_model_dir(path, *, layout="vl", **kw):
@@ -985,7 +1141,9 @@ def make_model_dir(path, *, layout="vl", **kw):
     with open(os.path.join(path, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     if layout == "vl":
-        with open(os.path.join(path, "configuration_minimax_m3.py"), "w", encoding="utf-8") as f:
+        with open(
+            os.path.join(path, "configuration_minimax_m3.py"), "w", encoding="utf-8"
+        ) as f:
             f.write(CONFIGURATION_PY)
     return path
 
@@ -993,20 +1151,42 @@ def make_model_dir(path, *, layout="vl", **kw):
 SPARSE_BLOCK_SIZE = 128  # atom.model_ops.minimax_m3.sparse_attn.SPARSE_BLOCK_SIZE
 
 
-def serve_args(model_dir, *, level=3, profile="", enforce_eager=False, sp=4, extra=(),
-               trust_remote_code=True, block_size=SPARSE_BLOCK_SIZE):
+def serve_args(
+    model_dir,
+    *,
+    level=3,
+    profile="",
+    enforce_eager=False,
+    sp=4,
+    extra=(),
+    trust_remote_code=True,
+    block_size=SPARSE_BLOCK_SIZE,
+):
     """ATOM CLI argv. ``--block-size`` must be a multiple of the sparse block (128):
     the attention metadata builder asserts ``model_runner.block_size % self.block_size == 0``
     (attentions/backends.py:511) and ATOM's CLI default of 16 fails it for M3's sparse layers
     (found by the E2 OFF arm, job-e2_off01). The same value also fixes the KV page size the
     dense layers' fusion signature derives from ``config.kv_cache_block_size``."""
     if block_size % SPARSE_BLOCK_SIZE:
-        raise ValueError(f"block_size must be a multiple of {SPARSE_BLOCK_SIZE}, got {block_size}")
+        raise ValueError(
+            f"block_size must be a multiple of {SPARSE_BLOCK_SIZE}, got {block_size}"
+        )
     argv = [
         # xavier: finite, roughly real-scale random weights (arg_utils --load_dummy)
-        "--model", model_dir, "--load_dummy", "xavier",
-        "-tp", "1", "-sp", str(sp), "--kv-cache-dtype", "fp8",
-        "--level", str(level), "--block-size", str(block_size),
+        "--model",
+        model_dir,
+        "--load_dummy",
+        "xavier",
+        "-tp",
+        "1",
+        "-sp",
+        str(sp),
+        "--kv-cache-dtype",
+        "fp8",
+        "--level",
+        str(level),
+        "--block-size",
+        str(block_size),
     ]
     if trust_remote_code:  # the vl layout resolves its config class through auto_map
         argv.append("--trust-remote-code")
@@ -1052,13 +1232,23 @@ def m3_smoke_main():
     ap.add_argument("--enforce-eager", action="store_true")
     a = ap.parse_args()
     make_model_dir(a.dir, layers=a.layers)
-    print("argv:", " ".join(serve_args(a.dir, level=a.level, profile=a.profile,
-                                       enforce_eager=a.enforce_eager)))
+    print(
+        "argv:",
+        " ".join(
+            serve_args(
+                a.dir, level=a.level, profile=a.profile, enforce_eager=a.enforce_eager
+            )
+        ),
+    )
     print("env:", " ".join(f"{k}={v}" for k, v in serve_env().items()))
-    print("fault env:", FAULT_ENV, "(applied by install_from_env() in the process that runs the model)")
+    print(
+        "fault env:",
+        FAULT_ENV,
+        "(applied by install_from_env() in the process that runs the model)",
+    )
 
 
-__all__ = ["qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj", "check_poison"]
+__all__ = ["check_poison", "qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj"]
 
 
 if __name__ == "__main__":

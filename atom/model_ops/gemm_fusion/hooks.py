@@ -26,7 +26,6 @@ Phases make every per-call decision rank-uniform without a hot-path collective:
 import hashlib
 import logging
 import threading
-from typing import Optional
 
 logger = logging.getLogger("atom.gemm_fusion")
 
@@ -59,7 +58,7 @@ def profile_enabled(config=None) -> bool:
             from atom.config import get_current_atom_config
 
             config = get_current_atom_config()
-        except Exception:
+        except Exception:  # noqa: BLE001 - no current config: treat as OFF
             return False
     gf = getattr(config, "gemm_fusion", None)
     return bool(gf is not None and gf.profile)
@@ -110,7 +109,9 @@ def record_decision(d) -> None:
     """
     global _STEP_CALLS
     reason = d.reason if d.path == "native" else ""
-    _STEP_DIGEST.update(f"{d.site}|{d.tokens}|{d.vid}|{d.n_fused}|{d.path}|{reason};".encode())
+    _STEP_DIGEST.update(
+        f"{d.site}|{d.tokens}|{d.vid}|{d.n_fused}|{d.path}|{reason};".encode()
+    )
     _STEP_CALLS += 1
 
 
@@ -135,7 +136,10 @@ def init_gemm_fusion(config, sp_group) -> None:
     inner = getattr(_RES, "inner", None)
     logger.info(
         "gemm_fusion ON profile=%s world=%d window_bytes=%s max_windows=%s",
-        _PROFILE, _RES.world, getattr(inner, "window_bytes", None), getattr(inner, "max_windows", None),
+        _PROFILE,
+        _RES.world,
+        getattr(inner, "window_bytes", None),
+        getattr(inner, "max_windows", None),
     )
     _prebuild_profile(gf, name, _RES)
 
@@ -163,10 +167,16 @@ def _prebuild_profile(gf, name, res) -> None:
     err = None
     try:
         built = fn(name, arch=res.arch, cu=res.cu, world=res.world)
-        logger.info("gemm_fusion prebuild_profile(%s): %s", name, built if built is not None else "done")
+        logger.info(
+            "gemm_fusion prebuild_profile(%s): %s",
+            name,
+            built if built is not None else "done",
+        )
     except Exception as e:  # noqa: BLE001 - reported to every rank below
         err = e
-        logger.error("gemm_fusion prebuild_profile(%s) failed on this rank: %r", name, e)
+        logger.error(
+            "gemm_fusion prebuild_profile(%s) failed on this rank: %r", name, e
+        )
     ok = 0 if err is not None else 1
     reduce = getattr(res, "_reduce_min", None)
     all_ok = ok if reduce is None else int(reduce([ok])[0])
@@ -179,7 +189,7 @@ def _prebuild_profile(gf, name, res) -> None:
         )
 
 
-def profile_tokens(world: int, arch: Optional[str] = None, cu: Optional[int] = None):
+def profile_tokens(world: int, arch: str | None = None, cu: int | None = None):
     """Padded token counts (m * world) of every exact profile row for this
     world/arch/cu. These are the only buckets the profile can ever fuse."""
     from .stages import aiter_gf
@@ -214,6 +224,7 @@ def prepare_buckets(tokens_list) -> None:
     _RES.finalize()
     if _KV is not None:
         import torch
+
         from atom.config import get_current_atom_config
 
         device = torch.device("cuda", torch.cuda.current_device())
@@ -262,7 +273,13 @@ def before_graph_capture(buckets) -> None:
     for s in _SITES.values():
         for padded, _real in pairs:
             r = s.resolve(padded, graph_mode="capture")
-            logger.debug("gemm_fusion capture bucket %s %d -> %s/%s", s.name, padded, r.vid, r.reason)
+            logger.debug(
+                "gemm_fusion capture bucket %s %d -> %s/%s",
+                s.name,
+                padded,
+                r.vid,
+                r.reason,
+            )
     _RES.quiesce_and_reset()
 
 
@@ -294,11 +311,12 @@ def check_step() -> None:
     recovered error. The digest only catches decision differences among ranks that still
     finish the step (and device poison on completing ranks).
     """
-    global _STEP_DIGEST, _STEP_CALLS
     if _RES is None or _PHASE != "ready":
         return
     if _BROKEN is not None:
-        raise GemmFusionPoisonError(f"gemm_fusion disabled after failed recovery: {_BROKEN}")
+        raise GemmFusionPoisonError(
+            f"gemm_fusion disabled after failed recovery: {_BROKEN}"
+        )
     if not _PLANS and _STEP_CALLS == 0:
         return
     p = _poison_local()
@@ -326,7 +344,7 @@ def _reset_step() -> None:
 
 
 # ---------------------------------------------------------------- recovery
-def recover(timeout_s: Optional[float] = None) -> None:
+def recover(timeout_s: float | None = None) -> None:
     """Collective recovery: device sync -> drain -> barrier -> re-init -> barrier.
 
     EVERY SP rank must call it (``check_step`` makes the decision collective).
@@ -358,7 +376,7 @@ def recover(timeout_s: Optional[float] = None) -> None:
         raise err[0]
 
 
-def shutdown(timeout_s: Optional[float] = None) -> None:
+def shutdown(timeout_s: float | None = None) -> None:
     """Release the CCO resources, best effort and BOUNDED.
 
     ``release()`` does a device sync and a barrier. At exit after a failed start-up (a peer
@@ -383,10 +401,15 @@ def shutdown(timeout_s: Optional[float] = None) -> None:
         t.start()
         t.join(timeout_s)
         if t.is_alive():
-            logger.error("gemm_fusion shutdown: release() did not finish in %.0fs (peer gone?); "
-                         "continuing", timeout_s)
+            logger.error(
+                "gemm_fusion shutdown: release() did not finish in %.0fs (peer gone?); "
+                "continuing",
+                timeout_s,
+            )
         elif err:
-            logger.error("gemm_fusion shutdown: release() failed: %r (continuing)", err[0])
+            logger.error(
+                "gemm_fusion shutdown: release() failed: %r (continuing)", err[0]
+            )
     _PLANS.clear()
     _SITES.clear()
     _PHASE = "pre"

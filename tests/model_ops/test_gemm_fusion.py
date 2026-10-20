@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # CPU-only tests for atom.model_ops.gemm_fusion (fake aiter matcher, no GPU).
-from types import SimpleNamespace
-
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from atom.config import GemmFusionConfig
-from atom.model_ops.gemm_fusion import consensus, hooks, site as site_mod, stages
+from atom.model_ops.gemm_fusion import consensus, hooks, stages
+from atom.model_ops.gemm_fusion import site as site_mod
 from atom.model_ops.gemm_fusion import test_utils as TU
 
 
@@ -17,15 +17,26 @@ def _clean_test_utils_patches():
     TU.uninstall_faults()
 
 
-def _fake_linear(n, k, *, shuffled=True, rows=None, padded=False, ws_rows=None, k_cols=None):
+def _fake_linear(
+    n, k, *, shuffled=True, rows=None, padded=False, ws_rows=None, k_cols=None
+):
     """What the site reads off ATOM's QKV linear: logical N/K, a weight that is (or is not)
     16x16-preshuffled with a given shape, and a weight_scale with N rows."""
-    w = SimpleNamespace(shape=(rows if rows is not None else n, k_cols if k_cols is not None else k))
+    w = SimpleNamespace(
+        shape=(rows if rows is not None else n, k_cols if k_cols is not None else k)
+    )
     if shuffled is not None:
         w.is_shuffled = shuffled
     return SimpleNamespace(
-        output_size=n, input_size=k, weight=w,
-        weight_scale=SimpleNamespace(shape=(ws_rows if ws_rows is not None else (rows if rows is not None else n), 1)),
+        output_size=n,
+        input_size=k,
+        weight=w,
+        weight_scale=SimpleNamespace(
+            shape=(
+                ws_rows if ws_rows is not None else (rows if rows is not None else n),
+                1,
+            )
+        ),
         is_output_padded=padded,
     )
 
@@ -111,11 +122,21 @@ def make_site(monkeypatch):
         TU.set_phase("preparing" if res is not None else "pre")
         TU.inject_aiter(monkeypatch, _fake_gf(res))
         linear = _fake_linear(10240, 3072)
-        stg = [SimpleNamespace(kind="sp_exchange"), SimpleNamespace(kind="head_norm_rope_cache")]
+        stg = [
+            SimpleNamespace(kind="sp_exchange"),
+            SimpleNamespace(kind="head_norm_rope_cache"),
+        ]
         cls = TU.DirectGemmFusionSite if direct else site_mod.GemmFusionSite
         return cls(
-            "L0.qkv", linear, stg, native_fns=None, attn=SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)),
-            q_size=8192, kv_size=128,
+            "L0.qkv",
+            linear,
+            stg,
+            native_fns=None,
+            attn=SimpleNamespace(
+                impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
+            ),
+            q_size=8192,
+            kv_size=128,
         )
 
     yield _make
@@ -146,7 +167,10 @@ def _run_ranks(decisions):
     for vid, n, err in decisions:
         k = consensus.decision_key("s", 64, "ERR" if err else vid, 0 if err else n)
         inputs.append([k, -k, -int(err)])
-    reduce = lambda _: [min(c) for c in zip(*inputs)]
+
+    def reduce(_):
+        return [min(c) for c in zip(*inputs)]
+
     out = []
     for vid, n, err in decisions:
         try:
@@ -218,7 +242,9 @@ def test_resolve_contract_error_raises_and_is_sticky(make_site):
 
 def test_resolve_profile_off_is_native_without_aiter(make_site, monkeypatch):
     s = make_site(None)  # hooks resources None == OFF
-    monkeypatch.setitem(sys.modules, "aiter.gemm_fusion", None)  # aiter must not be needed (import would raise)
+    monkeypatch.setitem(
+        sys.modules, "aiter.gemm_fusion", None
+    )  # aiter must not be needed (import would raise)
     r = s.resolve(64)
     assert (r.plan, r.n_fused, r.reason) == (None, 0, "profile_off")
 
@@ -230,7 +256,9 @@ def test_fallback_reasons_input_layout_and_padded_rows_run_fused(make_site):
     ctx = SimpleNamespace(is_dummy_run=False, real_tokens=62, padded_tokens=64)
     x = torch.zeros((16, 3072), dtype=torch.float8_e4m3fn)
     xs = torch.zeros((16, 1), dtype=torch.float32)
-    assert TU.fallback_reason(s, ctx, x, xs) is None  # 62 real of 64: padded rows run the fused kernel
+    assert (
+        TU.fallback_reason(s, ctx, x, xs) is None
+    )  # 62 real of 64: padded rows run the fused kernel
     ctx.real_tokens = 64
     assert TU.fallback_reason(s, ctx, x, xs) is None
     assert TU.fallback_reason(s, ctx, x, None) == "unquantized_input"
@@ -256,27 +284,46 @@ def _direct_fixture(make_site, res=None):
 
     s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
     s.resolve(64, "eager")
-    t = dict(
-        x=torch.zeros((16, 3072), dtype=torch.float8_e4m3fn),
-        xs=torch.zeros((16, 1), dtype=torch.float32),
-        pos=torch.arange(64),
-        slot=torch.arange(64),
-        kc=torch.zeros(4), vc=torch.zeros(4), ks=torch.zeros(4), vs=torch.zeros(4),
+    t = {
+        "x": torch.zeros((16, 3072), dtype=torch.float8_e4m3fn),
+        "xs": torch.zeros((16, 1), dtype=torch.float32),
+        "pos": torch.arange(64),
+        "slot": torch.arange(64),
+        "kc": torch.zeros(4),
+        "vc": torch.zeros(4),
+        "ks": torch.zeros(4),
+        "vs": torch.zeros(4),
+    }
+    state = {
+        "slot_mapping": t["slot"],
+        "k_cache": t["kc"],
+        "v_cache": t["vc"],
+        "k_scale": t["ks"],
+        "v_scale": t["vs"],
+    }
+    ctx = SimpleNamespace(
+        is_dummy_run=False,
+        real_tokens=64,
+        padded_tokens=64,
+        positions=t["pos"],
+        prologue_state=lambda: state,
     )
-    state = {"slot_mapping": t["slot"], "k_cache": t["kc"], "v_cache": t["vc"],
-             "k_scale": t["ks"], "v_scale": t["vs"]}
-    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
-                          positions=t["pos"], prologue_state=lambda: state)
     return s, t, state, ctx
 
 
 def test_decision_bind_label_is_staged_or_raw_for_the_runtime_site(make_site):
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
-    assert not hasattr(s, "bind_mode") and not hasattr(s, "direct_provider")  # runtime site only stages
+    assert not hasattr(s, "bind_mode") and not hasattr(
+        s, "direct_provider"
+    )  # runtime site only stages
     ctx = SimpleNamespace(padded_tokens=64)
-    d = s._decision(ctx, site_mod.Resolution(FakePlan(), 2, "v", ""), "profile_hit", "fused")
+    d = s._decision(
+        ctx, site_mod.Resolution(FakePlan(), 2, "v", ""), "profile_hit", "fused"
+    )
     assert d.bind_mode == "staged"
-    d1 = s._decision(ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused")
+    d1 = s._decision(
+        ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused"
+    )
     assert d1.bind_mode == "raw"
 
 
@@ -286,8 +333,18 @@ def test_direct_site_labels_its_decisions_and_marks_a_moved_input_as_copy(make_s
     ctx = SimpleNamespace(padded_tokens=64)
     r2 = site_mod.Resolution(FakePlan(), 2, "v", "")
     assert s._decision(ctx, r2, "profile_hit", "fused").bind_mode == "direct"
-    assert s._decision(ctx, r2, "profile_hit", "fused", SimpleNamespace(rebound=True)).bind_mode == "direct+copy"
-    assert s._decision(ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused").bind_mode == "raw"
+    assert (
+        s._decision(
+            ctx, r2, "profile_hit", "fused", SimpleNamespace(rebound=True)
+        ).bind_mode
+        == "direct+copy"
+    )
+    assert (
+        s._decision(
+            ctx, site_mod.Resolution(FakePlan(), 1, "v", ""), "profile_hit", "fused"
+        ).bind_mode
+        == "raw"
+    )
     assert s._decision(ctx, r2, "dummy_run", "native").bind_mode == "direct"
 
 
@@ -358,7 +415,10 @@ def test_native_full_matches_todays_call_sequence(monkeypatch):
     site = SimpleNamespace(
         linear=Lin(),
         split_qkv=lambda qkv: site_mod.GemmFusionSite.split_qkv(
-            SimpleNamespace(sparse=True, q_size=8, kv_size=2, index_q_size=2, index_k_size=1), qkv
+            SimpleNamespace(
+                sparse=True, q_size=8, kv_size=2, index_q_size=2, index_k_size=1
+            ),
+            qkv,
         )[:3],
     )
     ctx = SimpleNamespace(attn="ATTN", positions="POS")
@@ -369,6 +429,7 @@ def test_native_full_matches_todays_call_sequence(monkeypatch):
     assert (seen["q"], seen["k"], seen["v"]) == ("p0", "p1", "p2")
     assert seen["qs"] is None and seen["ot"] == "gather_heads_fp8"
     assert seen["pos"] == "POS" and seen["attn"] == "ATTN"
+
 
 # ------------------------------------------------- phases (L-3, L-2, M-1)
 def test_phase_pre_is_native_not_cached_and_ready_is_late_bucket(make_site):
@@ -381,7 +442,9 @@ def test_phase_pre_is_native_not_cached_and_ready_is_late_bucket(make_site):
     TU.set_phase("ready")
     r = s.resolve(64)
     assert (r.plan, r.reason) == (None, "late_bucket")
-    assert res.agree_calls == 0  # nor after: decided without a collective in the forward
+    assert (
+        res.agree_calls == 0
+    )  # nor after: decided without a collective in the forward
 
 
 def test_resolve_cache_is_keyed_by_graph_mode(make_site):
@@ -398,7 +461,10 @@ def test_static_prologue_ineligible_is_native_on_agreement(make_site):
     s = make_site(res)
     s.attn.impl = SimpleNamespace(gemm_fusion_prologue_supported=lambda: False)
     r = s.resolve(64)
-    assert (r.plan, r.reason) == (None, "prologue_unsupported")  # row covered, prologue cannot fuse
+    assert (r.plan, r.reason) == (
+        None,
+        "prologue_unsupported",
+    )  # row covered, prologue cannot fuse
 
 
 def test_static_prologue_missing_impl_or_method_is_not_eligible(make_site):
@@ -411,7 +477,9 @@ def test_static_prologue_missing_impl_or_method_is_not_eligible(make_site):
     assert s._static_prologue_ok() is False
     r = s.resolve(64)
     assert (r.plan, r.reason) == (None, "prologue_unsupported")
-    s.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True))
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: True)
+    )
     assert s._static_prologue_ok() is True
 
 
@@ -508,15 +576,22 @@ def test_recover_skip_seam_skips_the_collective_recovery_on_the_target_rank():
 
 
 def test_rank_native_seam_makes_only_the_target_rank_decide_native():
-    kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
-              x_dtype_is_fp8=True, x_scale_ok=True)
+    kw = {
+        "resolution": site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+        "is_dummy_run": False,
+        "x_dtype_is_fp8": True,
+        "x_scale_ok": True,
+    }
     orig = site_mod.GemmFusionSite.__dict__["decide_path"]
     res = _ready_hooks(FakeResources())
     res.rank = 1
     TU.install_faults("rank_native:1")
     assert site_mod.GemmFusionSite.decide_path(**kw) == ("native", "fault_rank_native")
     res.rank = 0
-    assert site_mod.GemmFusionSite.decide_path(**kw) == ("fused", "profile_hit")  # other ranks fuse
+    assert site_mod.GemmFusionSite.decide_path(**kw) == (
+        "fused",
+        "profile_hit",
+    )  # other ranks fuse
     TU.uninstall_faults()
     assert site_mod.GemmFusionSite.__dict__["decide_path"] is orig  # restored exactly
 
@@ -524,11 +599,19 @@ def test_rank_native_seam_makes_only_the_target_rank_decide_native():
 def test_slow_remainder_seam_spins_after_the_native_remainder(monkeypatch):
     spun = []
     monkeypatch.setattr(TU, "_spin_gpu_us", lambda us: spun.append(us))
-    monkeypatch.setattr(site_mod, "torch", SimpleNamespace(cuda=SimpleNamespace(current_stream=lambda: "s")),
-                        raising=False)
-    s = _ready_hooks(FakeResources()) and site_mod.GemmFusionSite.__new__(site_mod.GemmFusionSite)
+    monkeypatch.setattr(
+        site_mod,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(current_stream=lambda: "s")),
+        raising=False,
+    )
+    s = _ready_hooks(FakeResources()) and site_mod.GemmFusionSite.__new__(
+        site_mod.GemmFusionSite
+    )
     TU.install_faults("slow_remainder:*:750")
-    out = s._remainder_after_exchange(None, {"packed": 1}, None, lambda packed: packed + 1)
+    out = s._remainder_after_exchange(
+        None, {"packed": 1}, None, lambda packed: packed + 1
+    )
     assert out == 2 and spun == [750]
 
 
@@ -567,10 +650,15 @@ def test_unknown_fault_kind_is_rejected_and_the_env_spec_parses():
     with pytest.raises(ValueError, match="unknown gemm_fusion fault"):
         TU.install_faults("bogus")
     assert TU.parse_faults("poison_rank:1:x,no_poison_check,op_raise:*") == {
-        "poison_rank": (1, "x"), "no_poison_check": (None, None), "op_raise": (None, None)}
+        "poison_rank": (1, "x"),
+        "no_poison_check": (None, None),
+        "op_raise": (None, None),
+    }
 
 
-def test_install_from_env_applies_faults_and_timeouts_and_uninstall_restores(monkeypatch):
+def test_install_from_env_applies_faults_and_timeouts_and_uninstall_restores(
+    monkeypatch,
+):
     monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
     monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "7")
     monkeypatch.setenv(TU.SHUTDOWN_TIMEOUT_ENV, "3")
@@ -585,16 +673,36 @@ def test_install_from_env_applies_faults_and_timeouts_and_uninstall_restores(mon
 
 def test_the_runtime_package_has_no_test_hooks():
     """The runtime keeps only what serving needs: no module imports test_utils, and none carries a
-    fault seam, a debug env branch, a test injection point, or a reset-for-tests helper."""
+    fault seam, a debug env branch, a test injection point, or a reset-for-tests helper.
+    """
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2] / "atom/model_ops/gemm_fusion"
     runtime = [f for f in root.glob("*.py") if f.name != "test_utils.py"]
-    assert {f.name for f in runtime} >= {"hooks.py", "site.py", "ops.py", "resources.py", "stages.py"}
-    forbidden = ("test_utils", "faults", "ATOM_GEMM_FUSION_FAULT", "ATOM_GEMM_FUSION_DEBUG_BIND",
-                 "ATOM_GEMM_FUSION_CHECK_ALIAS", "_aiter_override", "reset_for_tests", "golden_candidate",
-                 "m3_smoke", "hip_triage", "bind_mode=", "direct_provider", "gemm_fusion_kv_page",
-                 "ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S", "ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S")
+    assert {f.name for f in runtime} >= {
+        "hooks.py",
+        "site.py",
+        "ops.py",
+        "resources.py",
+        "stages.py",
+    }
+    forbidden = (
+        "test_utils",
+        "faults",
+        "ATOM_GEMM_FUSION_FAULT",
+        "ATOM_GEMM_FUSION_DEBUG_BIND",
+        "ATOM_GEMM_FUSION_CHECK_ALIAS",
+        "_aiter_override",
+        "reset_for_tests",
+        "golden_candidate",
+        "m3_smoke",
+        "hip_triage",
+        "bind_mode=",
+        "direct_provider",
+        "gemm_fusion_kv_page",
+        "ATOM_GEMM_FUSION_RECOVER_TIMEOUT_S",
+        "ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S",
+    )
     for f in runtime:
         src = f.read_text(encoding="utf-8")
         for word in forbidden:
@@ -622,25 +730,29 @@ def test_model_py_has_no_gemm_fusion_reference_and_runner_gates_install():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    assert "gemm_fusion" not in (root / "atom/models/minimax_m3/model.py").read_text(encoding="utf-8")
+    assert "gemm_fusion" not in (root / "atom/models/minimax_m3/model.py").read_text(
+        encoding="utf-8"
+    )
     runner = (root / "atom/model_engine/model_runner.py").read_text(encoding="utf-8")
     assert "if config.gemm_fusion.enabled:" in runner and "install_m3_sites" in runner
     # every gemm_fusion import in the runner is inside a guard (OFF never imports it)
     for line in runner.splitlines():
         if "gemm_fusion" in line and "import" in line:
-            assert line.startswith(" " * 12) or line.startswith(" " * 16), line
+            assert line.startswith((" " * 12, " " * 16)), line
 
 
 def test_install_swaps_forward_only_when_site_declared(monkeypatch):
     import sys
     import types as _types
 
-    from atom.model_ops.gemm_fusion import model_adapters as MA
     import atom.model_ops.gemm_fusion as G
+    from atom.model_ops.gemm_fusion import model_adapters as MA
 
     class FakeDense:  # stands in for MiniMaxM3Attention
         def __init__(self):
-            self.attn = SimpleNamespace(layer_name="model.layers.0.self_attn.attn", qkv_site=None)
+            self.attn = SimpleNamespace(
+                layer_name="model.layers.0.self_attn.attn", qkv_site=None
+            )
 
         def forward(self):
             return "native"
@@ -653,13 +765,18 @@ def test_install_swaps_forward_only_when_site_declared(monkeypatch):
     monkeypatch.setitem(sys.modules, "atom.models.minimax_m3.model", fake)
 
     calls = []
-    monkeypatch.setattr(G, "declare_m3_qkv_site", lambda m, prefix, sparse: calls.append(prefix) or None)
+    monkeypatch.setattr(
+        G, "declare_m3_qkv_site", lambda m, prefix, sparse: calls.append(prefix) or None
+    )
     m = FakeDense()
     model = SimpleNamespace(modules=lambda: [m])
-    assert MA.install_m3_sites(model) == 0 and m.forward() == "native"  # ineligible: untouched
+    assert (
+        MA.install_m3_sites(model) == 0 and m.forward() == "native"
+    )  # ineligible: untouched
     assert calls == ["model.layers.0.self_attn"]
     monkeypatch.setattr(G, "declare_m3_qkv_site", lambda m, prefix, sparse: object())
     assert MA.install_m3_sites(model) == 1 and m.forward.__func__ is MA._fused_forward
+
 
 # ------------------------- golden adapter: the REAL _site_for, not a hand-built site
 def _golden_case(mode, tokens=64):
@@ -669,8 +786,14 @@ def _golden_case(mode, tokens=64):
     import importlib.util
     from pathlib import Path
 
-    norm = lambda: SimpleNamespace(weight=object(), variance_epsilon=1e-6)
-    gold = Path(__file__).resolve().parents[3] / "sp4-attention-fusion-cases-20261009" / "case_config.py"
+    def norm():
+        return SimpleNamespace(weight=object(), variance_epsilon=1e-6)
+
+    gold = (
+        Path(__file__).resolve().parents[3]
+        / "sp4-attention-fusion-cases-20261009"
+        / "case_config.py"
+    )
     if gold.exists():
         s = importlib.util.spec_from_file_location("golden_case_config", gold)
         m = importlib.util.module_from_spec(s)
@@ -679,21 +802,35 @@ def _golden_case(mode, tokens=64):
     else:  # documented golden values (case_config.py: dense page 128, indexer/reuse 16)
         has_idx = mode != "qkv_dense"
         spec = SimpleNamespace(
-            mode=mode, tokens=tokens, padded_tokens=(tokens + 3) // 4 * 4,
+            mode=mode,
+            tokens=tokens,
+            padded_tokens=(tokens + 3) // 4 * 4,
             cache_page_size=16 if has_idx else 128,
             gemm_nk=((9856 if has_idx else 9216), 6144),
         )
         real = False
     return SimpleNamespace(
-        spec=spec, spec_is_real=real,
-        rotary=SimpleNamespace(rotary_dim=64), q_norm=norm(), k_norm=norm(),
-        index_q_norm=norm(), index_k_norm=norm(), caches={"index_cache": object()},
+        spec=spec,
+        spec_is_real=real,
+        rotary=SimpleNamespace(rotary_dim=64),
+        q_norm=norm(),
+        k_norm=norm(),
+        index_q_norm=norm(),
+        index_k_norm=norm(),
+        caches={"index_cache": object()},
         weight=SimpleNamespace(shape=((9856 if has_idx else 9216), 6144)),
         weight_scale=SimpleNamespace(shape=((9856 if has_idx else 9216), 1)),
     )
 
-@pytest.mark.parametrize("mode,gm", [("qkv_dense", "dense"), ("qkv_indexer", "indexer"),
-                                      ("qkv_indexer_reuse", "reuse")])
+
+@pytest.mark.parametrize(
+    "mode,gm",
+    [
+        ("qkv_dense", "dense"),
+        ("qkv_indexer", "indexer"),
+        ("qkv_indexer_reuse", "reuse"),
+    ],
+)
 def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkeypatch):
     """Regression: the fail-safe eligibility check made every harness site 'uncovered'
     because the adapter's impl lacked gemm_fusion_prologue_supported. Builds the real
@@ -720,12 +857,27 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
         s.loader.exec_module(m)
         return m
 
-    for n in ("aiter", "aiter.gemm_fusion", "aiter.ops", "aiter.ops.gemm_fusion", "aiter.ops.gemm_fusion.sp_qkv"):
+    for n in (
+        "aiter",
+        "aiter.gemm_fusion",
+        "aiter.ops",
+        "aiter.ops.gemm_fusion",
+        "aiter.ops.gemm_fusion.sp_qkv",
+    ):
         monkeypatch.setitem(sys.modules, n, types.ModuleType(n))
         sys.modules[n].__path__ = []
     spec = load("aiter.gemm_fusion.spec", spec_py)
     sys.modules["aiter.gemm_fusion"].__dict__.update(
-        {k: getattr(spec, k) for k in ("FusionSpec", "GemmSpec", "Field", "SPExchange", "HeadNormRopeCache")}
+        {
+            k: getattr(spec, k)
+            for k in (
+                "FusionSpec",
+                "GemmSpec",
+                "Field",
+                "SPExchange",
+                "HeadNormRopeCache",
+            )
+        }
     )
     specs = load("aiter.ops.gemm_fusion.sp_qkv.specs", specs_py)
     TU.inject_aiter(monkeypatch, sys.modules["aiter.gemm_fusion"])
@@ -733,11 +885,16 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     TU.reset_for_tests()
     GC._SITES.clear()
     site, _, _ = GC._site_for(_golden_case(mode), None)
-    assert site._static_prologue_ok() is True  # else every golden cell resolves 'uncovered'
+    assert (
+        site._static_prologue_ok() is True
+    )  # else every golden cell resolves 'uncovered'
     prof_path = aiter_root / "aiter/configs/gemm_fusion/minimax_m3_sp4_gfx950_v1.json"
     try:
         rows = json.loads(prof_path.read_text())["rows"]
-    except (ValueError, OSError):  # aiter worktree mid-regeneration (empty/partial file)
+    except (
+        ValueError,
+        OSError,
+    ):  # aiter worktree mid-regeneration (empty/partial file)
         pytest.skip("aiter profile not readable (being regenerated)")
     # small M: the full 2-stage chain (GEMM + SPExchange + HeadNormRopeCache). The kv_cache
     # string carries the page size, which comes from the REAL golden CaseSpec (dense 128,
@@ -748,19 +905,27 @@ def test_golden_adapter_site_is_eligible_and_matches_aiter_spec(mode, gm, monkey
     assert f"_page{page}_" in site.spec.stages[1].kv_cache
     assert site.declared_page() == page
     sig2 = site.spec.prefix(2).signature()
-    assert sig2 == specs.sp_qkv_spec(gm).signature(), f"{mode}: page-{page} signature differs from aiter's"
-    assert sig2 in {r["sig"] for r in rows if "small" in r["vid"]}    # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
+    assert (
+        sig2 == specs.sp_qkv_spec(gm).signature()
+    ), f"{mode}: page-{page} signature differs from aiter's"
+    assert sig2 in {
+        r["sig"] for r in rows if "small" in r["vid"]
+    }  # large M: GEMM + SPExchange only (HeadNormRopeCache runs natively in ATOM). Large rows
     # are keyed by this 1-stage signature, so the prefix fallback only works if it matches.
     sig1 = site.spec.prefix(1).signature()
     assert sig1 == specs.sp_qkv_spec(gm).prefix(1).signature()
     large = {r["sig"] for r in rows if "large" in r["vid"]}
-    assert sig1 in large, f"{mode}: 1-stage sig {sig1} not among large rows {sorted(large)}"
+    assert (
+        sig1 in large
+    ), f"{mode}: 1-stage sig {sig1} not among large rows {sorted(large)}"
     assert sig1 != sig2
     GC._SITES.clear()
 
+
 class _SigMatcher:
     """Fake aiter: returns a plan only when the spec prefix carries a registered signature,
-    like match_prefix against an exact-row profile. Records every spec it was asked about."""
+    like match_prefix against an exact-row profile. Records every spec it was asked about.
+    """
 
     class Plan:
         vid = "sp_qkv.small.v1"
@@ -781,7 +946,9 @@ class _SigMatcher:
                     return _SigMatcher.Plan(), n
             return None, 0
 
-        return SimpleNamespace(match_prefix=match_prefix, ContractError=FakeContractError)
+        return SimpleNamespace(
+            match_prefix=match_prefix, ContractError=FakeContractError
+        )
 
 
 def _fake_spec_module(matcher):
@@ -846,17 +1013,30 @@ def test_golden_adapter_sites_resolve_to_a_plan_when_a_row_matches(mode, monkeyp
     GC._SITES.clear()
 
 
-def test_golden_dense_gate_is_independent_of_the_decode_flag_and_pinned_to_the_real_impl(monkeypatch):
+def test_golden_dense_gate_is_independent_of_the_decode_flag_and_pinned_to_the_real_impl(
+    monkeypatch,
+):
     """The stand-in dense gate mirrors PagedAttentionImpl.gemm_fusion_prologue_supported: rotary +
     Gemma q_norm + k_norm, and NOTHING about the decode kernel choice (ATOM_FORCE_ATTN_TRITON,
-    sliding window, head_dim). Pin both the behaviour and the source so they cannot drift."""
+    sliding window, head_dim). Pin both the behaviour and the source so they cannot drift.
+    """
     import re
     from pathlib import Path
 
     from atom.model_ops.gemm_fusion import test_utils as GC
 
-    impl = SimpleNamespace(head_dim=128, sliding_window=-1, rotary_emb=object(), q_norm=object(), k_norm=object())
-    for env in (None, "0", "1"):  # the production M3 env sets it to 1: eligibility must not change
+    impl = SimpleNamespace(
+        head_dim=128,
+        sliding_window=-1,
+        rotary_emb=object(),
+        q_norm=object(),
+        k_norm=object(),
+    )
+    for env in (
+        None,
+        "0",
+        "1",
+    ):  # the production M3 env sets it to 1: eligibility must not change
         if env is None:
             monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON", raising=False)
         else:
@@ -864,24 +1044,48 @@ def test_golden_dense_gate_is_independent_of_the_decode_flag_and_pinned_to_the_r
         assert GC._prologue_supported("dense", impl) is True
     monkeypatch.delenv("ATOM_FORCE_ATTN_TRITON", raising=False)
     # decode-kernel inputs do not matter either
-    for ok in (dict(head_dim=64), dict(sliding_window=128)):
-        assert GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **ok})) is True
+    for ok in ({"head_dim": 64}, {"sliding_window": 128}):
+        assert (
+            GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **ok}))
+            is True
+        )
     # what DOES matter: the prologue's own inputs
-    for bad in (dict(rotary_emb=None), dict(q_norm=None), dict(k_norm=None)):
-        assert GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **bad})) is False
+    for bad in ({"rotary_emb": None}, {"q_norm": None}, {"k_norm": None}):
+        assert (
+            GC._prologue_supported("dense", SimpleNamespace(**{**impl.__dict__, **bad}))
+            is False
+        )
     # sparse modes: unconditional True, exactly like SparseMHAPagedAttentionImpl
     assert GC._prologue_supported("indexer", SimpleNamespace()) is True
     assert GC._prologue_supported("reuse", SimpleNamespace()) is True
 
-    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py").read_text(encoding="utf-8")
-    body = src.split("def gemm_fusion_prologue_supported", 1)[1].split("def gemm_fusion_prologue_state", 1)[0]
-    code = re.sub(r'""".*?"""', "", body, flags=re.S)
-    for needle in ("self.rotary_emb is not None", "isinstance(self.q_norm, GemmaRMSNorm)", "self.k_norm is not None"):
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py"
+    ).read_text(encoding="utf-8")
+    body = src.split("def gemm_fusion_prologue_supported", 1)[1].split(
+        "def gemm_fusion_prologue_state", 1
+    )[0]
+    code = re.sub(r'""".*?"""', "", body, flags=re.DOTALL)
+    for needle in (
+        "self.rotary_emb is not None",
+        "isinstance(self.q_norm, GemmaRMSNorm)",
+        "self.k_norm is not None",
+    ):
         assert needle in code, needle
-    for gone in ("ATOM_FORCE_ATTN_TRITON", "sliding_window", "head_dim", "use_triton_attn"):
+    for gone in (
+        "ATOM_FORCE_ATTN_TRITON",
+        "sliding_window",
+        "head_dim",
+        "use_triton_attn",
+    ):
         assert gone not in code, f"eligibility must not read {gone}"
     sparse = src.split("class SparseMHAPagedAttentionImpl", 1)[1]
-    assert re.search(r"def gemm_fusion_prologue_supported\(self\) -> bool:.*?return True", sparse, re.S)
+    assert re.search(
+        r"def gemm_fusion_prologue_supported\(self\) -> bool:.*?return True",
+        sparse,
+        re.DOTALL,
+    )
+
 
 # ---------------------- KV page: derived from the real cache, verified at bind time
 class _FakeK:
@@ -897,8 +1101,13 @@ class _FakeK:
 def _page_site(make_site, declared_page, sparse):
     s = make_site(FakeResources())
     s.sparse = sparse
-    s.stages = (SimpleNamespace(kind="sp_exchange"),
-                SimpleNamespace(kind="head_norm_rope_cache", kv_cache=f"shuffle_page{declared_page}_fp8_ptok"))
+    s.stages = (
+        SimpleNamespace(kind="sp_exchange"),
+        SimpleNamespace(
+            kind="head_norm_rope_cache",
+            kv_cache=f"shuffle_page{declared_page}_fp8_ptok",
+        ),
+    )
     s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3))
     return s
 
@@ -927,7 +1136,9 @@ def test_bind_caches_sparse_reviews_the_pool_as_page16(make_site):
     s.bind_caches(_kv(128))  # page-128 pool re-viewed as 8 x page-16: fine
     s.bind_caches(_kv(16))
     with pytest.raises(site_mod.GemmFusionBindError):
-        _page_site(make_site, 128, sparse=True).bind_caches(_kv(16))  # cannot be coarser than the pool
+        _page_site(make_site, 128, sparse=True).bind_caches(
+            _kv(16)
+        )  # cannot be coarser than the pool
 
 
 def test_kv_block_size_has_no_silent_default(monkeypatch):
@@ -936,17 +1147,21 @@ def test_kv_block_size_has_no_silent_default(monkeypatch):
     import types as _t
 
     cfg = _t.ModuleType("atom.config")
-    cfg.get_current_atom_config = lambda: (_ for _ in ()).throw(RuntimeError("no config"))
+    cfg.get_current_atom_config = lambda: (_ for _ in ()).throw(
+        RuntimeError("no config")
+    )
     monkeypatch.setitem(sys.modules, "atom.config", cfg)
     with pytest.raises(RuntimeError):
         stages._kv_block_size()
     cfg.get_current_atom_config = lambda: SimpleNamespace(kv_cache_block_size=128)
     assert stages._kv_block_size() == 128
 
+
 # ----------------- gate04: eager-prepared plan must be THE plan capture/replay launches
 class _BindingPlan:
     """Like aiter's SpQkvSmall: pointer bindings live in a per-INSTANCE dict, and a launch
-    that needs a binding it does not have raises (the 'new binding required during capture')."""
+    that needs a binding it does not have raises (the 'new binding required during capture').
+    """
 
     vid = "sp_qkv.small.v1"
 
@@ -963,7 +1178,9 @@ class _BindingPlan:
     def launch(self, in_capture):
         if ("k",) not in self._bindings:
             if in_capture:
-                raise RuntimeError("sp_qkv.small: new binding required during graph capture")
+                raise RuntimeError(
+                    "sp_qkv.small: new binding required during graph capture"
+                )
             self._bindings[("k",)] = True
 
 
@@ -979,7 +1196,9 @@ def _fresh_plan_matcher():
     return match_prefix, made
 
 
-def test_resolve_shares_one_plan_instance_between_eager_and_capture(make_site, monkeypatch):
+def test_resolve_shares_one_plan_instance_between_eager_and_capture(
+    make_site, monkeypatch
+):
     res = FakeResources()
     s = make_site(res)
     match_prefix, made = _fresh_plan_matcher()
@@ -1018,17 +1237,37 @@ def test_regression_without_sharing_capture_would_need_a_new_binding(make_site):
         p_capture.launch(in_capture=True)
 
 
-def test_a_plan_other_than_the_prepared_one_is_downgraded_at_agree_not_raised_per_call(make_site):
+def test_a_plan_other_than_the_prepared_one_is_downgraded_at_agree_not_raised_per_call(
+    make_site,
+):
     s = make_site(FakeResources())
     prepared = _BindingPlan()
-    st = SimpleNamespace(prepared=True, plan=prepared, rebound=False, ptrs=(0,) * 7,
-                         xs=None, pos=None, slot=None, outs={}, m=16)
+    st = SimpleNamespace(
+        prepared=True,
+        plan=prepared,
+        rebound=False,
+        ptrs=(0,) * 7,
+        xs=None,
+        pos=None,
+        slot=None,
+        outs={},
+        m=16,
+    )
     s._staging[64] = st
-    s._by_tokens[(64, "eager")] = site_mod.Resolution(_BindingPlan(), 2, "sp_qkv.small.v1", "profile_hit")
-    s._by_tokens[(64, "capture")] = site_mod.Resolution(prepared, 2, "sp_qkv.small.v1", "profile_hit")
+    s._by_tokens[(64, "eager")] = site_mod.Resolution(
+        _BindingPlan(), 2, "sp_qkv.small.v1", "profile_hit"
+    )
+    s._by_tokens[(64, "capture")] = site_mod.Resolution(
+        prepared, 2, "sp_qkv.small.v1", "profile_hit"
+    )
     s.agree_prepared(64, True)
-    assert s._by_tokens[(64, "eager")].plan is None  # other instance: native (uniformly, via agree)
-    assert s._by_tokens[(64, "capture")].plan is prepared  # the prepared one stays fused
+    assert (
+        s._by_tokens[(64, "eager")].plan is None
+    )  # other instance: native (uniformly, via agree)
+    assert (
+        s._by_tokens[(64, "capture")].plan is prepared
+    )  # the prepared one stays fused
+
 
 def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
     class _T:
@@ -1040,22 +1279,33 @@ def test_binding_key_names_every_pointer_aiter_keys_on(make_site):
 
     s = make_site(FakeResources())
     s.linear.weight_scale = _T(1)
-    s.build_meta = lambda st, state: {"q_norm_w": _T(2), "positions": _T(3), "k_cache": _T(4)}
+    s.build_meta = lambda st, state: {
+        "q_norm_w": _T(2),
+        "positions": _T(3),
+        "k_cache": _T(4),
+    }
     st = SimpleNamespace(xs=_T(9), outs={"q": _T(5), "k": _T(6)}, m=16)
     key = TU.binding_key(s, st, {})
-    assert key == {"x_scale": 9, "w_scale": 1, "q_norm_w": 2, "positions": 3, "k_cache": 4,
-                   "out_q": 5, "out_k": 6, "rows": 16}
+    assert key == {
+        "x_scale": 9,
+        "w_scale": 1,
+        "q_norm_w": 2,
+        "positions": 3,
+        "k_cache": 4,
+        "out_q": 5,
+        "out_k": 6,
+        "rows": 16,
+    }
     st.outs["q"] = _T(55)  # a per-call output buffer would show up as a differing key
     assert TU.binding_key(s, st, {}) != key
+
 
 def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monkeypatch):
     """Logic only, against a stand-in transformers (the real 5.16.1 is not installed here):
     registers a PretrainedConfig subclass for the model_type once, tolerates a second call,
     and re-raises unrelated registration errors."""
-    import importlib.util
     import sys
     import types as _t
-    from pathlib import Path
 
     registry = {}
 
@@ -1074,11 +1324,18 @@ def test_m3_smoke_register_hf_config_is_idempotent_and_keeps_architectures(monke
     monkeypatch.setitem(sys.modules, "transformers", fake)
     m = TU  # the smoke-model helpers live in test_utils
     cls = m.register_hf_config()
-    assert registry["minimax_m3"] is cls and cls.model_type == "minimax_m3" and issubclass(cls, _Pre)
+    assert (
+        registry["minimax_m3"] is cls
+        and cls.model_type == "minimax_m3"
+        and issubclass(cls, _Pre)
+    )
     m.register_hf_config()  # second call: already registered -> no error
-    _Auto.register = staticmethod(lambda mt, c: (_ for _ in ()).throw(ValueError("something else")))
+    _Auto.register = staticmethod(
+        lambda mt, c: (_ for _ in ()).throw(ValueError("something else"))
+    )
     with pytest.raises(ValueError, match="something else"):
         m.register_hf_config("other_type")
+
 
 def _load_m3_smoke(name=None):
     return TU  # the smoke-model helpers moved into test_utils
@@ -1088,7 +1345,10 @@ def test_m3_smoke_vl_layout_follows_the_released_checkpoint_and_keeps_geometry()
     m = _load_m3_smoke()
     c = m.m3_vl_config(layers=4)
     # outer / nested model types and the entry class the recipes' VL checkpoint selects
-    assert (c["model_type"], c["text_config"]["model_type"]) == ("minimax_m3_vl", "minimax_m3_text")
+    assert (c["model_type"], c["text_config"]["model_type"]) == (
+        "minimax_m3_vl",
+        "minimax_m3_text",
+    )
     assert c["architectures"] == ["MiniMaxM3SparseForConditionalGeneration"]
     assert c["auto_map"] == {"AutoConfig": "configuration_minimax_m3.MiniMaxM3Config"}
     t = c["text_config"]
@@ -1103,7 +1363,9 @@ def test_m3_smoke_vl_layout_follows_the_released_checkpoint_and_keeps_geometry()
     assert t["moe_layer_freq"][0] == 0
 
 
-def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(tmp_path_factory=None):
+def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(
+    tmp_path_factory=None,
+):
     import os
     import sys
     import types as _t
@@ -1111,12 +1373,18 @@ def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(tmp_path_f
     from pathlib import Path
 
     m = _load_m3_smoke("m3_smoke_vl_dir")
-    d = Path(__file__).resolve().parents[2] / f"_tmp_m3_{uuid.uuid4().hex[:8]}"  # workspace scratch
+    d = (
+        Path(__file__).resolve().parents[2] / f"_tmp_m3_{uuid.uuid4().hex[:8]}"
+    )  # workspace scratch
     try:
         m.make_model_dir(str(d))
         assert sorted(os.listdir(d)) == ["config.json", "configuration_minimax_m3.py"]
         cfg_py = (d / "configuration_minimax_m3.py").read_text(encoding="utf-8")
-        assert "class MiniMaxM3Config" in cfg_py and 'model_type = "minimax_m3_vl"' in cfg_py
+        assert (
+            "class MiniMaxM3Config" in cfg_py
+            and 'model_type = "minimax_m3_vl"' in cfg_py
+        )
+
         # the shipped module must execute and nest text_config as a sub-config
         class _P:
             def __init__(self, **kw):
@@ -1129,27 +1397,36 @@ def test_m3_smoke_vl_dir_ships_a_config_class_and_serve_args_trust_it(tmp_path_f
         sys.modules["transformers"] = fake
         try:
             ns = {}
-            exec(cfg_py, ns)
+            exec(cfg_py, ns)  # noqa: S102 - runs the smoke config module under test
             import json
 
             raw = json.loads((d / "config.json").read_text(encoding="utf-8"))
-            obj = ns["MiniMaxM3Config"](**{k: v for k, v in raw.items() if k != "auto_map"})
+            obj = ns["MiniMaxM3Config"](
+                **{k: v for k, v in raw.items() if k != "auto_map"}
+            )
         finally:
             if saved is None:
                 sys.modules.pop("transformers", None)
             else:
                 sys.modules["transformers"] = saved
-        assert type(obj.text_config).__name__ == "MiniMaxM3TextConfig" and obj.hidden_size == 6144
+        assert (
+            type(obj.text_config).__name__ == "MiniMaxM3TextConfig"
+            and obj.hidden_size == 6144
+        )
         assert obj.architectures == ["MiniMaxM3SparseForConditionalGeneration"]
     finally:
         import shutil
 
         shutil.rmtree(d, ignore_errors=True)
     argv = m.serve_args("D", level=2, profile="p")
-    assert "--trust-remote-code" in argv and argv[argv.index("--gemm-fusion-profile") + 1] == "p"
+    assert (
+        "--trust-remote-code" in argv
+        and argv[argv.index("--gemm-fusion-profile") + 1] == "p"
+    )
     assert "--trust-remote-code" not in m.serve_args("D", trust_remote_code=False)
     # flat layout is still available for the register_hf_config() route
     assert m.m3_config()["model_type"] == "minimax_m3"
+
 
 # ----------------------------------------------- shutdown must never hang or mask an earlier failure
 def test_shutdown_is_bounded_when_release_hangs():
@@ -1158,7 +1435,9 @@ def test_shutdown_is_bounded_when_release_hangs():
 
     res = FakeResources()
     gate = threading.Event()
-    res.release = lambda: gate.wait()  # a peer never arrives: the barrier would block forever
+    res.release = (
+        lambda: gate.wait()
+    )  # a peer never arrives: the barrier would block forever
     TU.reset_for_tests(res)
     t0 = time.monotonic()
     hooks.shutdown(timeout_s=0.2)  # must return, not raise
@@ -1176,7 +1455,9 @@ def test_shutdown_swallows_release_errors_and_still_clears_state():
     res.release = boom
     TU.reset_for_tests(res)
     hooks.register_plan(FakePlan())
-    hooks.shutdown(timeout_s=2)  # does not raise: it would mask the real start-up failure
+    hooks.shutdown(
+        timeout_s=2
+    )  # does not raise: it would mask the real start-up failure
     assert hooks.resources() is None and not hooks._PLANS
 
 
@@ -1190,22 +1471,34 @@ def test_shutdown_normal_path_still_releases_once():
     hooks.shutdown()  # idempotent
     assert calls == [1]
 
+
 def test_m3_smoke_serve_args_use_a_sparse_compatible_block_size():
     """E2 OFF arm: the CLI default --block-size 16 fails the sparse backend's
-    `model_runner.block_size % self.block_size == 0` (block 128). serve_args must pass 128."""
+    `model_runner.block_size % self.block_size == 0` (block 128). serve_args must pass 128.
+    """
     m = _load_m3_smoke("m3_smoke_blocksize")
     argv = m.serve_args("D")
     assert argv[argv.index("--block-size") + 1] == "128"
-    assert m.serve_args("D", block_size=256)[m.serve_args("D", block_size=256).index("--block-size") + 1] == "256"
+    assert (
+        m.serve_args("D", block_size=256)[
+            m.serve_args("D", block_size=256).index("--block-size") + 1
+        ]
+        == "256"
+    )
     with pytest.raises(ValueError, match="multiple of 128"):
         m.serve_args("D", block_size=16)
     # the sparse constant is pinned to the real one in the source
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/model_ops/minimax_m3/sparse_attn.py").read_text(encoding="utf-8")
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/model_ops/minimax_m3/sparse_attn.py"
+    ).read_text(encoding="utf-8")
     assert f"SPARSE_BLOCK_SIZE = {m.SPARSE_BLOCK_SIZE}" in src
-    backends = (Path(__file__).resolve().parents[2] / "atom/model_ops/attentions/backends.py").read_text(encoding="utf-8")
+    backends = (
+        Path(__file__).resolve().parents[2] / "atom/model_ops/attentions/backends.py"
+    ).read_text(encoding="utf-8")
     assert "model_runner.block_size % self.block_size == 0" in backends
+
 
 def test_m3_smoke_default_is_all_dense_ffn_but_keeps_all_three_attention_types():
     """E2 OFF arm (job-e2_off03): any MoE layer raises a stock TypeError (x_scale). The smoke
@@ -1215,12 +1508,20 @@ def test_m3_smoke_default_is_all_dense_ffn_but_keeps_all_three_attention_types()
     for cfg in (m.m3_config(layers=4), m.m3_vl_config(layers=4)["text_config"]):
         assert cfg["moe_layer_freq"] == [0, 0, 0, 0]  # no MoE layer anywhere
         assert cfg["sparse_attention_config"]["sparse_attention_freq"] == [0, 1, 1, 1]
-        assert cfg["num_attention_heads"] * cfg["head_dim"] == 8192 and cfg["hidden_size"] == 6144
+        assert (
+            cfg["num_attention_heads"] * cfg["head_dim"] == 8192
+            and cfg["hidden_size"] == 6144
+        )
         assert cfg["dense_intermediate_size"] == 6144
     # skip-index layers: decided by ATOM's REAL function, not a copy of its formula (see the test below)
     # explicit opt-in restores the old MoE layout
     assert m.m3_config(layers=4, moe=True)["moe_layer_freq"] == [0, 1, 1, 1]
-    assert m.m3_vl_config(layers=4, moe=True)["text_config"]["moe_layer_freq"] == [0, 1, 1, 1]
+    assert m.m3_vl_config(layers=4, moe=True)["text_config"]["moe_layer_freq"] == [
+        0,
+        1,
+        1,
+        1,
+    ]
     assert m.m3_vl_config(layers=3)["text_config"]["moe_layer_freq"] == [0, 0, 0]
 
 
@@ -1230,13 +1531,20 @@ def test_stock_moe_forward_still_lacks_x_scale_so_the_dense_default_is_still_nee
     import re
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py").read_text(encoding="utf-8")
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py"
+    ).read_text(encoding="utf-8")
     assert "hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)" in src
-    moe_cls = src.split("class MiniMaxM3MoE", 1)[1].split("class MiniMaxM3Attention", 1)[0]
-    assert re.search(r"def forward\(self, hidden_states: torch\.Tensor\) -> torch\.Tensor:", moe_cls)
+    moe_cls = src.split("class MiniMaxM3MoE", 1)[1].split(
+        "class MiniMaxM3Attention", 1
+    )[0]
+    assert re.search(
+        r"def forward\(self, hidden_states: torch\.Tensor\) -> torch\.Tensor:", moe_cls
+    )
     assert "x_scale" not in moe_cls
     mlp_cls = src.split("class MiniMaxM3MLP", 1)[1].split("class MiniMaxM3MoE", 1)[0]
     assert "x_scale: torch.Tensor | None = None" in mlp_cls  # the dense path accepts it
+
 
 def test_m3_smoke_serve_env_sets_the_flag_the_real_m3_recipes_require():
     """E2 job-e2_new_on03: without ATOM_FORCE_ATTN_TRITON=1 stock decode runs the ASM paged-attention
@@ -1247,14 +1555,20 @@ def test_m3_smoke_serve_env_sets_the_flag_the_real_m3_recipes_require():
 
     m = _load_m3_smoke("m3_smoke_env")
     assert m.serve_env()["ATOM_FORCE_ATTN_TRITON"] == "1"
-    assert m.serve_env({"X": "1"})["X"] == "1" and m.serve_env()["ATOM_FORCE_ATTN_TRITON"] == "1"
+    assert (
+        m.serve_env({"X": "1"})["X"] == "1"
+        and m.serve_env()["ATOM_FORCE_ATTN_TRITON"] == "1"
+    )
     root = Path(__file__).resolve().parents[2]
-    recipe = (root / "recipes/MiniMax-M3-Agentic-InferenceX.md").read_text(encoding="utf-8")
+    recipe = (root / "recipes/MiniMax-M3-Agentic-InferenceX.md").read_text(
+        encoding="utf-8"
+    )
     assert "ATOM_FORCE_ATTN_TRITON=1" in recipe and "is not optional" in recipe
     envs_src = (root / "atom/utils/envs.py").read_text(encoding="utf-8")
     assert '"ATOM_FORCE_ATTN_TRITON"' in envs_src
     doc = m.serve_env.__doc__
     assert "dense layers ARE eligible" in doc and "NOT fused" not in doc
+
 
 # ------------- dense fusion under ATOM_FORCE_ATTN_TRITON: behaviour of the REAL dense methods
 def _real_dense_impl(monkeypatch, flag, **attrs):
@@ -1269,14 +1583,28 @@ def _real_dense_impl(monkeypatch, flag, **attrs):
     path = Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py"
     src = path.read_text(encoding="utf-8")
     tree = ast.parse(src)
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl")
-    wanted = ("_native_use_triton_attn", "gemm_fusion_prologue_supported", "gemm_fusion_prologue_state")
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl"
+    )
+    wanted = (
+        "_native_use_triton_attn",
+        "gemm_fusion_prologue_supported",
+        "gemm_fusion_prologue_state",
+    )
     # ast.get_source_segment returns each method with its first line un-indented and the rest at
     # class-body indent, so prefixing 4 spaces re-creates a valid class body.
-    methods = ["    " + ast.get_source_segment(src, fn) for fn in cls.body
-               if isinstance(fn, ast.FunctionDef) and fn.name in wanted]
-    assert len(methods) == len(wanted), "dense impl no longer defines all of " + repr(wanted)
+    methods = [
+        "    " + ast.get_source_segment(src, fn)
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name in wanted
+    ]
+    assert len(methods) == len(wanted), "dense impl no longer defines all of " + repr(
+        wanted
+    )
     code = "class Real:\n" + "\n\n".join(methods) + "\n"
+
     class _Gemma:  # the isinstance target the real method imports
         pass
 
@@ -1285,11 +1613,23 @@ def _real_dense_impl(monkeypatch, flag, **attrs):
     monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", fake_ln)
     env = SimpleNamespace(ATOM_FORCE_ATTN_TRITON=flag)
     ns = {"envs": env, "ForwardContext": object}
-    exec(compile(code, "attention_mha_extracted", "exec"), ns)
+    exec(  # noqa: S102 - runs the real impl source extracted by ast
+        compile(code, "attention_mha_extracted", "exec"), ns
+    )
     impl = ns["Real"]()
-    impl.__dict__.update(dict(sliding_window=-1, head_dim=128, rotary_emb=object(),
-                              q_norm=_Gemma(), k_norm=object(), layer_num=0, use_triton_attn=None,
-                              _cache_format=None), **attrs)
+    impl.__dict__.update(
+        {
+            "sliding_window": -1,
+            "head_dim": 128,
+            "rotary_emb": object(),
+            "q_norm": _Gemma(),
+            "k_norm": object(),
+            "layer_num": 0,
+            "use_triton_attn": None,
+            "_cache_format": None,
+        },
+        **attrs,
+    )
     return impl, _Gemma
 
 
@@ -1308,38 +1648,64 @@ class _FakeCache:
 
 
 def _fwd_ctx():
-    layer = SimpleNamespace(k_cache=_FakeCache((4, 1, 8, 128, 16)), v_cache=_FakeCache((4, 1, 128, 128)),
-                            k_scale="ks", v_scale="vs")
-    return SimpleNamespace(kv_cache_data={"layer_0": layer}, attn_metadata=SimpleNamespace(slot_mapping="sm"))
+    layer = SimpleNamespace(
+        k_cache=_FakeCache((4, 1, 8, 128, 16)),
+        v_cache=_FakeCache((4, 1, 128, 128)),
+        k_scale="ks",
+        v_scale="vs",
+    )
+    return SimpleNamespace(
+        kv_cache_data={"layer_0": layer},
+        attn_metadata=SimpleNamespace(slot_mapping="sm"),
+    )
 
 
 @pytest.mark.parametrize("flag", [False, True])
 def test_dense_fusion_eligibility_does_not_depend_on_the_decode_flag(monkeypatch, flag):
     impl, _ = _real_dense_impl(monkeypatch, flag)
-    assert impl.gemm_fusion_prologue_supported() is True  # M3 production sets the flag: still eligible
+    assert (
+        impl.gemm_fusion_prologue_supported() is True
+    )  # M3 production sets the flag: still eligible
     # the prologue's own prerequisites still gate it
-    for bad in (dict(rotary_emb=None), dict(k_norm=None), dict(q_norm=object())):
+    for bad in ({"rotary_emb": None}, {"k_norm": None}, {"q_norm": object()}):
         i2, _ = _real_dense_impl(monkeypatch, flag, **bad)
         assert i2.gemm_fusion_prologue_supported() is False
 
 
-@pytest.mark.parametrize("flag,sliding,hd,expect_triton", [
-    (False, -1, 128, False),   # plain ASM-decode configuration
-    (True, -1, 128, True),     # production M3: ATOM_FORCE_ATTN_TRITON=1 -> Triton decode
-    (False, 4096, 128, True),  # sliding window forces Triton too
-    (False, -1, 64, True),     # head_dim != 128 forces Triton too
-])
+@pytest.mark.parametrize(
+    "flag,sliding,hd,expect_triton",
+    [
+        (False, -1, 128, False),  # plain ASM-decode configuration
+        (
+            True,
+            -1,
+            128,
+            True,
+        ),  # production M3: ATOM_FORCE_ATTN_TRITON=1 -> Triton decode
+        (False, 4096, 128, True),  # sliding window forces Triton too
+        (False, -1, 64, True),  # head_dim != 128 forces Triton too
+    ],
+)
 def test_fused_prologue_sets_use_triton_attn_exactly_as_native_and_writes_shuffle(
-        monkeypatch, flag, sliding, hd, expect_triton):
+    monkeypatch, flag, sliding, hd, expect_triton
+):
     """The fused path must leave the decode dispatch where native rope_cache leaves it: the
-    Triton decode runs on the fused-written SHUFFLE cache under the flag, ASM otherwise."""
+    Triton decode runs on the fused-written SHUFFLE cache under the flag, ASM otherwise.
+    """
     impl, _ = _real_dense_impl(monkeypatch, flag, sliding_window=sliding, head_dim=hd)
     state = impl.gemm_fusion_prologue_state(_fwd_ctx())
     assert state is not None
     assert impl.use_triton_attn is expect_triton is impl._native_use_triton_attn()
-    assert impl._cache_format == "SHUFFLE"  # same layout native's Gemma branch writes in BOTH modes
-    assert state["v_cache_shuffle"] == ("view", (4, 1, 128 // 16, 128, 16))  # SHUFFLE V view
-    assert state["k_cache"].shape == (4, 1, 8, 128, 16) and state["slot_mapping"] == "sm"
+    assert (
+        impl._cache_format == "SHUFFLE"
+    )  # same layout native's Gemma branch writes in BOTH modes
+    assert state["v_cache_shuffle"] == (
+        "view",
+        (4, 1, 128 // 16, 128, 16),
+    )  # SHUFFLE V view
+    assert (
+        state["k_cache"].shape == (4, 1, 8, 128, 16) and state["slot_mapping"] == "sm"
+    )
 
 
 def test_native_rope_cache_writes_shuffle_in_the_gemma_branch_whatever_the_flag():
@@ -1353,40 +1719,101 @@ def test_native_rope_cache_writes_shuffle_in_the_gemma_branch_whatever_the_flag(
     path = Path(__file__).resolve().parents[2] / "atom/model_ops/attention_mha.py"
     src = path.read_text(encoding="utf-8")
     tree = ast.parse(src)
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl")
-    rope = next(f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "rope_cache")
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "PagedAttentionImpl"
+    )
+    rope = next(
+        f for f in cls.body if isinstance(f, ast.FunctionDef) and f.name == "rope_cache"
+    )
     top_if = next(n for n in rope.body if isinstance(n, ast.If))
     cond = ast.get_source_segment(src, top_if.test)
-    assert "self.rotary_emb is not None" in cond and "self.q_norm is not None" in cond \
-        and "self.k_norm is not None" in cond and "use_triton_attn" not in cond  # norms present => this branch
-    gemma_if = next(n for n in top_if.body if isinstance(n, ast.If))
-    assert "isinstance(self.q_norm, GemmaRMSNorm)" in ast.get_source_segment(src, gemma_if.test)
+    assert (
+        "self.rotary_emb is not None" in cond
+        and "self.q_norm is not None" in cond
+        and "self.k_norm is not None" in cond
+        and "use_triton_attn" not in cond
+    )  # norms present => this branch
+    # main added a LONG-BATCH branch in front of the fused one:
+    #   if Gemma and tokens > ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS and asm layout: unfused twin
+    #   elif Gemma: <- the fused Triton branch the small-M prologue replaces
+    long_if = next(
+        n
+        for n in top_if.body
+        if isinstance(n, ast.If)
+        and "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS"
+        in ast.get_source_segment(src, n.test)
+    )
+    assert "_use_asm_cache_layout" in ast.get_source_segment(src, long_if.test)
+    assert "_gemma_norm_rope_then_cache" in "\n".join(
+        ast.get_source_segment(src, n) for n in long_if.body
+    )
+    gemma_if = long_if.orelse[0]
+    assert isinstance(gemma_if, ast.If)
+    assert "isinstance(self.q_norm, GemmaRMSNorm)" in ast.get_source_segment(
+        src, gemma_if.test
+    )
     gemma_src = "\n".join(ast.get_source_segment(src, n) for n in gemma_if.body)
-    assert "triton_fused_norm_rope_cache" in gemma_src and "use_triton_attn" not in gemma_src
+    assert (
+        "triton_fused_norm_rope_cache" in gemma_src
+        and "use_triton_attn" not in gemma_src
+    )
     assert "v_cache_shuffle" in gemma_src
-    assert any(isinstance(n, ast.Assign) and ast.get_source_segment(src, n) == 'self._cache_format = "SHUFFLE"'
-               for n in top_if.body)
+    assert any(
+        isinstance(n, ast.Assign)
+        and ast.get_source_segment(src, n) == 'self._cache_format = "SHUFFLE"'
+        for n in top_if.body
+    )
+    # the long-batch twin writes the same SHUFFLE cache (its docstring says so) and is only reachable
+    # with an asm cache layout; it sits above the small-M buckets (default threshold 8192 tokens)
+    twin = next(
+        f
+        for f in cls.body
+        if isinstance(f, ast.FunctionDef) and f.name == "_gemma_norm_rope_then_cache"
+    )
+    assert "Same SHUFFLE layout" in ast.get_docstring(twin)
     # the NHD layout belongs to the elif branch: a different condition entirely
     elif_if = top_if.orelse[0]
-    assert isinstance(elif_if, ast.If) and "use_triton_attn" in ast.get_source_segment(src, elif_if.test)
+    assert isinstance(elif_if, ast.If) and "use_triton_attn" in ast.get_source_segment(
+        src, elif_if.test
+    )
     assert 'self._cache_format = "NHD"' in ast.get_source_segment(src, elif_if)
+
 
 # ------------- E-3 / M-1: the per-call decision is a pure function of rank-uniform inputs
 def _decide_inputs(**over):
-    base = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
-                is_dummy_run=False, x_dtype_is_fp8=True, x_scale_ok=True)
+    base = {
+        "resolution": site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+        "is_dummy_run": False,
+        "x_dtype_is_fp8": True,
+        "x_scale_ok": True,
+    }
     base.update(over)
     return base
 
 
-@pytest.mark.parametrize("over,expect", [
-    ({}, ("fused", "profile_hit")),
-    ({"is_dummy_run": True}, ("native", "dummy_run")),
-    ({"x_dtype_is_fp8": False}, ("native", "unquantized_input")),
-    ({"x_scale_ok": False}, ("native", "xscale_layout")),
-    ({"resolution": site_mod.Resolution(None, 0, "native", "uncovered")}, ("native", "uncovered")),
-    ({"resolution": site_mod.Resolution(FakePlan(), 1, "fake.large", "profile_hit")}, ("fused", "profile_hit")),
-])
+@pytest.mark.parametrize(
+    "over,expect",
+    [
+        ({}, ("fused", "profile_hit")),
+        ({"is_dummy_run": True}, ("native", "dummy_run")),
+        ({"x_dtype_is_fp8": False}, ("native", "unquantized_input")),
+        ({"x_scale_ok": False}, ("native", "xscale_layout")),
+        (
+            {"resolution": site_mod.Resolution(None, 0, "native", "uncovered")},
+            ("native", "uncovered"),
+        ),
+        (
+            {
+                "resolution": site_mod.Resolution(
+                    FakePlan(), 1, "fake.large", "profile_hit"
+                )
+            },
+            ("fused", "profile_hit"),
+        ),
+    ],
+)
 def test_decide_path_is_the_documented_function_of_its_inputs(over, expect):
     assert site_mod.GemmFusionSite.decide_path(**_decide_inputs(**over)) == expect
 
@@ -1397,8 +1824,16 @@ def test_decide_path_reads_no_rank_env_device_or_fault_state():
     import re
 
     body = inspect.getsource(site_mod.GemmFusionSite.decide_path)
-    code = re.sub(r'""".*?"""', "", body, flags=re.S)
-    for forbidden in ("hooks", "faults", "os.environ", "getenv", "torch", "sp_rank", "self."):
+    code = re.sub(r'""".*?"""', "", body, flags=re.DOTALL)
+    for forbidden in (
+        "hooks",
+        "faults",
+        "os.environ",
+        "getenv",
+        "torch",
+        "sp_rank",
+        "self.",
+    ):
         assert forbidden not in code, forbidden
 
 
@@ -1408,7 +1843,12 @@ def test_prepare_has_no_rank_local_raise(make_site):
     import inspect
     import re
 
-    code = re.sub(r'""".*?"""', "", inspect.getsource(site_mod.GemmFusionSite._prepare), flags=re.S)
+    code = re.sub(
+        r'""".*?"""',
+        "",
+        inspect.getsource(site_mod.GemmFusionSite._prepare),
+        flags=re.DOTALL,
+    )
     assert "raise " not in code
     assert "GemmFusionBindError" not in code
 
@@ -1423,8 +1863,14 @@ class _P:
 
 
 def _kv_layer(base):
-    return {"layer_3": SimpleNamespace(k_cache=_P(base), v_cache=_P(base + 1),
-                                       k_scale=_P(base + 2), v_scale=_P(base + 3))}
+    return {
+        "layer_3": SimpleNamespace(
+            k_cache=_P(base),
+            v_cache=_P(base + 1),
+            k_scale=_P(base + 2),
+            v_scale=_P(base + 3),
+        )
+    }
 
 
 def _staged_prepared_site(make_site, res, base):
@@ -1438,11 +1884,14 @@ def _staged_prepared_site(make_site, res, base):
 class _T:
     """Torch-free tensor stand-in: the attributes site.py reads (shape/dtype/dim/data_ptr)."""
 
-    _next = [10_000]
+    _next = [10_000]  # noqa: RUF012 - one counter shared by all instances, on purpose
 
     def __init__(self, shape=(1,), dtype=None, ptr=None):
         import torch as _torch
-        self.shape, self.dtype = tuple(shape), (dtype if dtype is not None else _torch.float32)
+
+        self.shape, self.dtype = tuple(shape), (
+            dtype if dtype is not None else _torch.float32
+        )
         if ptr is None:
             _T._next[0] += 64
             ptr = _T._next[0]
@@ -1457,26 +1906,54 @@ class _T:
 
 def _fake_direct(make_site, res=None):
     s = make_site(res or FakeResources(plan_n=(FakePlan(), 2)), direct=True)
-    s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True))
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True)
+    )
     import torch as _torch
-    t = dict(x=_T((16, 3072), _torch.float8_e4m3fn), xs=_T((16, 1), _torch.float32),
-             pos=_T((64,), _torch.int64), slot=_T((64,), _torch.int64))
-    state = {"slot_mapping": t["slot"], "k_cache": _T(), "v_cache": _T(), "k_scale": _T(), "v_scale": _T()}
-    ctx = SimpleNamespace(is_dummy_run=False, real_tokens=64, padded_tokens=64,
-                          positions=t["pos"], prologue_state=lambda: state)
+
+    t = {
+        "x": _T((16, 3072), _torch.float8_e4m3fn),
+        "xs": _T((16, 1), _torch.float32),
+        "pos": _T((64,), _torch.int64),
+        "slot": _T((64,), _torch.int64),
+    }
+    state = {
+        "slot_mapping": t["slot"],
+        "k_cache": _T(),
+        "v_cache": _T(),
+        "k_scale": _T(),
+        "v_scale": _T(),
+    }
+    ctx = SimpleNamespace(
+        is_dummy_run=False,
+        real_tokens=64,
+        padded_tokens=64,
+        positions=t["pos"],
+        prologue_state=lambda: state,
+    )
     return s, t, state, ctx
 
 
 def _seed_prepared(s, t, state):
-    st = SimpleNamespace(prepared=True, rebound=False, plan=None,
-                         ptrs=s._live_ptrs(t["xs"], t["pos"], state))
+    st = SimpleNamespace(
+        prepared=True,
+        rebound=False,
+        plan=None,
+        ptrs=s._live_ptrs(t["xs"], t["pos"], state),
+    )
     s._staging[64] = st
-    s._by_tokens[(64, "eager")] = site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit")
-    s._by_tokens[(64, "capture")] = site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit")
+    s._by_tokens[(64, "eager")] = site_mod.Resolution(
+        FakePlan(), 2, "fake.v1", "profile_hit"
+    )
+    s._by_tokens[(64, "capture")] = site_mod.Resolution(
+        FakePlan(), 2, "fake.v1", "profile_hit"
+    )
     return st
 
 
-def test_direct_mode_per_call_path_never_raises_and_never_falls_back_per_rank(make_site):
+def test_direct_mode_per_call_path_never_raises_and_never_falls_back_per_rank(
+    make_site,
+):
     """M-1 / E-3: the per-call path has no rank-local raise. A moved x_scale is self-healed by
     copy (still fused, uniform). What used to raise per call is decided at prepare time and
     agreed across ranks (agree_prepared -> native on ALL ranks)."""
@@ -1493,14 +1970,24 @@ def test_direct_mode_per_call_path_never_raises_and_never_falls_back_per_rank(ma
 
 def test_direct_prepare_reports_moved_kv_so_agree_downgrades_every_rank(make_site):
     res = FakeResources(plan_n=(FakePlan(), 2))
-    s, t, state, ctx = _fake_direct(make_site, res)
+    s, t, state, _ctx = _fake_direct(make_site, res)
     _seed_prepared(s, t, state)
-    direct = {"x_scale": t["xs"], "positions": t["pos"], "slot_mapping": t["slot"], "state": state}
+    direct = {
+        "x_scale": t["xs"],
+        "positions": t["pos"],
+        "slot_mapping": t["slot"],
+        "state": state,
+    }
     assert s.prepare_bucket(64, None, {}, None, direct=direct) is True  # same addresses
     moved = dict(state, k_cache=_T())  # the caller's KV cache moved
-    assert s.prepare_bucket(64, None, {}, None, direct={**direct, "state": moved}) is False
+    assert (
+        s.prepare_bucket(64, None, {}, None, direct={**direct, "state": moved}) is False
+    )
     s.agree_prepared(64, False)  # what prepare_buckets does with that verdict
-    assert s._by_tokens[(64, "eager")].plan is None and s._by_tokens[(64, "eager")].reason == "unprepared"
+    assert (
+        s._by_tokens[(64, "eager")].plan is None
+        and s._by_tokens[(64, "eager")].reason == "unprepared"
+    )
     assert s._by_tokens[(64, "capture")].plan is None
 
 
@@ -1512,21 +1999,33 @@ def test_per_call_decision_is_identical_on_every_simulated_rank(make_site, monke
 
     fp8, bf16 = _torch.float8_e4m3fn, _torch.bfloat16
     cases = [
-        dict(dummy=False, real=64, padded=64, dtype=fp8, scale=(16, 1)),
-        dict(dummy=True, real=64, padded=64, dtype=fp8, scale=(16, 1)),
-        dict(dummy=False, real=40, padded=64, dtype=fp8, scale=(16, 1)),
-        dict(dummy=False, real=64, padded=64, dtype=bf16, scale=(16, 1)),
-        dict(dummy=False, real=64, padded=64, dtype=fp8, scale=(16, 2)),
+        {"dummy": False, "real": 64, "padded": 64, "dtype": fp8, "scale": (16, 1)},
+        {"dummy": True, "real": 64, "padded": 64, "dtype": fp8, "scale": (16, 1)},
+        {"dummy": False, "real": 40, "padded": 64, "dtype": fp8, "scale": (16, 1)},
+        {"dummy": False, "real": 64, "padded": 64, "dtype": bf16, "scale": (16, 1)},
+        {"dummy": False, "real": 64, "padded": 64, "dtype": fp8, "scale": (16, 2)},
     ]
-    expected = [True, False, True, False, False]  # fused for the first and for the PADDED one (40 -> 64)
+    expected = [
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]  # fused for the first and for the PADDED one (40 -> 64)
     for c, want_fused in zip(cases, expected):
         outcomes = set()
         for rank in range(4):
             s, t, state, ctx = _fake_direct(make_site)
             hooks.resources().rank = rank  # the decision must not depend on the rank
             _seed_prepared(s, t, state)
-            ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = c["dummy"], c["real"], c["padded"]
-            r, reason, _, _ = s._prepare(ctx, _T((16, 3072), c["dtype"]), _T(c["scale"]))
+            ctx.is_dummy_run, ctx.real_tokens, ctx.padded_tokens = (
+                c["dummy"],
+                c["real"],
+                c["padded"],
+            )
+            r, reason, _, _ = s._prepare(
+                ctx, _T((16, 3072), c["dtype"]), _T(c["scale"])
+            )
             outcomes.add((r.plan is not None, r.n_fused, reason))
         assert len(outcomes) == 1, (c, outcomes)  # every rank decided identically
         assert next(iter(outcomes))[0] is want_fused, c
@@ -1550,7 +2049,9 @@ def test_rebind_with_moved_kv_fails_before_state_changes(make_site, monkeypatch)
     assert s.kv_moved(_kv_layer(2000)) is True and s.kv_moved(_kv_layer(1000)) is False
 
 
-def test_rebind_guard_is_a_collective_so_one_ranks_move_fails_all_ranks(make_site, monkeypatch):
+def test_rebind_guard_is_a_collective_so_one_ranks_move_fails_all_ranks(
+    make_site, monkeypatch
+):
     """Rank 0's pool did not move, rank 1's did. Both must raise (agreed via the reduce)."""
     _no_prepare(monkeypatch)
     outcomes = []
@@ -1558,7 +2059,11 @@ def test_rebind_guard_is_a_collective_so_one_ranks_move_fails_all_ranks(make_sit
         res = FakeResources()
         _staged_prepared_site(make_site, res, 1000)
         hooks._KV = _kv_layer(1000)
-        res._reduce_min = lambda v, p=peer_moved: [min(v[0], -p), v[1], v[2]]  # MIN over ranks
+        res._reduce_min = lambda v, p=peer_moved: [
+            min(v[0], -p),
+            v[1],
+            v[2],
+        ]  # MIN over ranks
         try:
             hooks.bind_kv_cache(_kv_layer(2000 if local_moved else 1000))
             outcomes.append("ok")
@@ -1576,43 +2081,80 @@ def test_first_bind_runs_no_collective(make_site, monkeypatch):
     s.attn = SimpleNamespace(impl=SimpleNamespace(layer_num=3))
     hooks._SITES[s.name] = s
     hooks._KV = None
-    hooks.bind_kv_cache(_kv_layer(1000))  # first bind: nothing prepared, no agreement needed
+    hooks.bind_kv_cache(
+        _kv_layer(1000)
+    )  # first bind: nothing prepared, no agreement needed
     assert calls == []
+
 
 # ------------- C-S1: a failed fused step must not publish KV or return output as valid
 def test_every_forward_path_checks_the_step_before_publishing_kv_ready():
     """Reviewer C-S1. At each place ModelRunner announces a prefill's KV as ready for transfer
     (``_record_kv_cache_ready``) the step has ALREADY been verified (``_gemm_fusion_check_step``),
     and every forward path (normal, PD decode, PD prefill) verifies its step. A GemmFusionPoisonError
-    therefore propagates out of ``forward`` before the connector is told the KV is ready."""
-    import re
+    therefore propagates out of ``forward`` before the connector is told the KV is ready.
+    """
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py").read_text(encoding="utf-8")
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
+    ).read_text(encoding="utf-8")
     body_lines = src.splitlines()
-    checks = [i for i, l in enumerate(body_lines) if l.strip().startswith("self._gemm_fusion_check_step()")]
-    readies = [i for i, l in enumerate(body_lines) if l.strip() == "self._record_kv_cache_ready(batch)"]
-    assert len(readies) == 3 and len(checks) == 4  # normal x2 returns, PD prefill, PD decode (no ready call)
-    for r in readies:  # the nearest preceding check is within 3 lines: verified right before publishing
+    checks = [
+        i
+        for i, line in enumerate(body_lines)
+        if line.strip().startswith("self._gemm_fusion_check_step()")
+    ]
+    readies = [
+        i
+        for i, line in enumerate(body_lines)
+        if line.strip() == "self._record_kv_cache_ready(batch)"
+    ]
+    assert (
+        len(readies) == 3 and len(checks) == 4
+    )  # normal x2 returns, PD prefill, PD decode (no ready call)
+    for (
+        r
+    ) in (
+        readies
+    ):  # the nearest preceding check is within 3 lines: verified right before publishing
         prior = [c for c in checks if c < r]
-        assert prior and r - max(prior) <= 3, f"KV-ready at line {r + 1} not preceded by a step check"
+        assert (
+            prior and r - max(prior) <= 3
+        ), f"KV-ready at line {r + 1} not preceded by a step check"
     # each forward-like method returns only after a check
-    for name in ("def forward(self, batch: ScheduledBatch)", "def prefill_forward(self, batch: ScheduledBatch)"):
+    for name in (
+        "def forward(self, batch: ScheduledBatch)",
+        "def prefill_forward(self, batch: ScheduledBatch)",
+    ):
         assert name in src
 
 
 def test_poison_error_in_check_step_is_not_swallowed_by_the_runner_wrapper():
     """The wrapper must not catch the error: the worker dies, the engine shuts down (no
-    scheduler retry exists), so no request in the batch is answered from a failed step."""
+    scheduler retry exists), so no request in the batch is answered from a failed step.
+    """
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py").read_text(encoding="utf-8")
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
+    ).read_text(encoding="utf-8")
     start = src.index("def _gemm_fusion_check_step")
-    wrapper = src[start: src.index("@staticmethod", start)]
+    wrapper = src[start : src.index("@staticmethod", start)]
     assert "except" not in wrapper and "try:" not in wrapper
-    busy = (Path(__file__).resolve().parents[2] / "atom/model_engine/async_proc.py").read_text(encoding="utf-8")
-    loop = busy[busy.index("def busy_loop"): busy.index("def get_func")]
-    assert "except" not in loop and "try:" not in loop  # a step error ends the worker process
+    busy = (
+        Path(__file__).resolve().parents[2] / "atom/model_engine/async_proc.py"
+    ).read_text(encoding="utf-8")
+    loop = busy[busy.index("def busy_loop") : busy.index("def _run_generic_rpc")]
+    # Main added (a) a generic-RPC path (`_run_generic_rpc`, only for RpcPayload calls: it turns an
+    # outcome into a reply) and (b) a barrier handler. The model step is a PLAIN rpc (payload None):
+    # its call is not inside any try, and the only handler in the loop is the barrier's, which
+    # re-raises when payload is None. A GemmFusionPoisonError therefore still ends the worker.
+    assert loop.count("except") == 1 and "except threading.BrokenBarrierError:" in loop
+    assert "if payload is None:\n                            raise" in loop
+    plain = loop[loop.index("func = getattr(runner, func_name, None)") :]
+    plain = plain[: plain.index("if need_barrier")]
+    assert "out = func(*call_args)" in plain and "try:" not in plain
 
 
 # ------------- C-S4: nothing returned or stored by the op may alias a shared window
@@ -1638,10 +2180,13 @@ def _inject_aiter_test_utils(monkeypatch, helper):
     return mod
 
 
-def test_alias_check_calls_aiters_test_utils_helper_with_its_real_signature(make_site, monkeypatch):
+def test_alias_check_calls_aiters_test_utils_helper_with_its_real_signature(
+    make_site, monkeypatch
+):
     """aiter's helper is ``test_utils.assert_no_window_alias(res, obj, what=<str>, force=<bool>)``
     (moved out of FusionResources). ATOM passes the wrapper's ``.inner`` as ``res``, a dict keyed by
-    label, and force=True; aiter's WindowAliasError is re-raised as GemmFusionBindError."""
+    label, and force=True; aiter's WindowAliasError is re-raised as GemmFusionBindError.
+    """
     res = FakeResources()
     make_site(res)
     seen = {}
@@ -1650,16 +2195,32 @@ def test_alias_check_calls_aiters_test_utils_helper_with_its_real_signature(make
         seen.update(res=res_, obj=obj, what=what, force=force)
 
     _inject_aiter_test_utils(monkeypatch, helper)
-    t_out, t_scale, t_iq = _Span(0x40000, 0x100), _Span(0x41000, 0x10), _Span(0x42000, 0x20)
-    TU.check_no_window_alias([("out", t_out), ("scale", t_scale), ("impl._index_q", t_iq), ("skipped", None)])
-    assert seen["res"] is res.inner and seen["force"] is True and isinstance(seen["what"], str)
-    assert seen["obj"] == {"out": t_out, "scale": t_scale, "impl._index_q": t_iq}  # None entries dropped
+    t_out, t_scale, t_iq = (
+        _Span(0x40000, 0x100),
+        _Span(0x41000, 0x10),
+        _Span(0x42000, 0x20),
+    )
+    TU.check_no_window_alias(
+        [("out", t_out), ("scale", t_scale), ("impl._index_q", t_iq), ("skipped", None)]
+    )
+    assert (
+        seen["res"] is res.inner
+        and seen["force"] is True
+        and isinstance(seen["what"], str)
+    )
+    assert seen["obj"] == {
+        "out": t_out,
+        "scale": t_scale,
+        "impl._index_q": t_iq,
+    }  # None entries dropped
 
     def boom(res_, obj, what="", force=False):
         raise RuntimeError("out points into a CCO window")
 
     _inject_aiter_test_utils(monkeypatch, boom)
-    with pytest.raises(site_mod.GemmFusionBindError, match="out points into a CCO window"):
+    with pytest.raises(
+        site_mod.GemmFusionBindError, match="out points into a CCO window"
+    ):
         TU.check_no_window_alias([("out", _Span(0x10800, 0x100))])
 
 
@@ -1671,7 +2232,9 @@ def test_install_alias_check_wraps_the_op_and_checks_its_outputs(monkeypatch):
     fake_ops.run_qkv_attention = lambda attn, x, xs, pos: ((out, scale), "decision")
     monkeypatch.setitem(sys.modules, "atom.model_ops.gemm_fusion.ops", fake_ops)
     checked = []
-    monkeypatch.setattr(TU, "check_no_window_alias", lambda named: checked.append(dict(named)))
+    monkeypatch.setattr(
+        TU, "check_no_window_alias", lambda named: checked.append(dict(named))
+    )
     attn = SimpleNamespace(impl=SimpleNamespace(_index_q=_Span(0x3000, 2)))
     TU.install_alias_check()
     TU.install_alias_check()  # idempotent: one wrapper, one check per call
@@ -1688,7 +2251,10 @@ def test_alias_check_is_opt_in_through_the_environment_only(monkeypatch):
     import types
 
     fake_ops = types.ModuleType("atom.model_ops.gemm_fusion.ops")
-    orig = lambda attn, x, xs, pos: ((None, None), "d")  # noqa: E731
+
+    def orig(attn, x, xs, pos):
+        return ((None, None), "d")
+
     fake_ops.run_qkv_attention = orig
     monkeypatch.setitem(sys.modules, "atom.model_ops.gemm_fusion.ops", fake_ops)
     monkeypatch.delenv(TU.CHECK_ALIAS_ENV, raising=False)
@@ -1706,13 +2272,26 @@ def _real_skip_functions():
     import ast
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py").read_text(encoding="utf-8")
-    want = {"_sparse_attention_layer_ids", "_sparse_attention_layer_ordinals", "_should_skip_minimax_m3_index_topk"}
-    code = "\n\n".join(ast.get_source_segment(src, n) for n in ast.parse(src).body
-                         if isinstance(n, ast.FunctionDef) and n.name in want)
-    assert code.count("def ") == 3, "model.py no longer defines the three skip functions"
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py"
+    ).read_text(encoding="utf-8")
+    want = {
+        "_sparse_attention_layer_ids",
+        "_sparse_attention_layer_ordinals",
+        "_should_skip_minimax_m3_index_topk",
+    }
+    code = "\n\n".join(
+        ast.get_source_segment(src, n)
+        for n in ast.parse(src).body
+        if isinstance(n, ast.FunctionDef) and n.name in want
+    )
+    assert (
+        code.count("def ") == 3
+    ), "model.py no longer defines the three skip functions"
     ns = {"PretrainedConfig": object}
-    exec(compile(code, "model_extracted", "exec"), ns)
+    exec(  # noqa: S102 - runs ATOM's real skip functions extracted by ast
+        compile(code, "model_extracted", "exec"), ns
+    )
     return ns["_should_skip_minimax_m3_index_topk"]
 
 
@@ -1723,7 +2302,12 @@ def _skip_flags(cfg_text, outer=None):
 
     should_skip = _real_skip_functions()
     text = NS(**cfg_text)
-    for a in ("use_index_cache", "index_topk_freq", "index_topk_pattern", "index_skip_topk_offset"):
+    for a in (
+        "use_index_cache",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "index_skip_topk_offset",
+    ):
         v = (outer or {}).get(a)
         if v is not None:
             setattr(text, a, v)
@@ -1737,12 +2321,26 @@ def test_smoke_config_has_a_skip_index_sparse_layer_under_atoms_real_function():
     outer->text copy-down."""
     m = _load_m3_smoke("m3_smoke_skip")
     vl = m.m3_vl_config(layers=4)
-    outer = {k: vl[k] for k in ("use_index_cache", "index_topk_freq", "index_skip_topk_offset") if k in vl}
-    assert vl["use_index_cache"] is True and "use_index_cache" not in vl["text_config"]  # outer, as the recipes set it
+    outer = {
+        k: vl[k]
+        for k in ("use_index_cache", "index_topk_freq", "index_skip_topk_offset")
+        if k in vl
+    }
+    assert (
+        vl["use_index_cache"] is True and "use_index_cache" not in vl["text_config"]
+    )  # outer, as the recipes set it
     flags = _skip_flags(vl["text_config"], outer)
     sparse = vl["text_config"]["sparse_attention_config"]["sparse_attention_freq"]
-    assert flags == [False, False, True, False]  # layer 0 dense; 1 indexed; 2 SKIP; 3 indexed
-    kinds = ["dense" if not sparse[i] else ("skip" if flags[i] else "indexed") for i in range(4)]
+    assert flags == [
+        False,
+        False,
+        True,
+        False,
+    ]  # layer 0 dense; 1 indexed; 2 SKIP; 3 indexed
+    kinds = [
+        "dense" if not sparse[i] else ("skip" if flags[i] else "indexed")
+        for i in range(4)
+    ]
     assert set(kinds) == {"dense", "indexed", "skip"}
     # the flat layout carries the flag on the one config object
     flat = m.m3_config(layers=4)
@@ -1751,10 +2349,13 @@ def test_smoke_config_has_a_skip_index_sparse_layer_under_atoms_real_function():
 
 def test_without_use_index_cache_no_layer_skips_which_is_the_bug_this_fixes():
     """Control: the earlier smoke config (use_index_cache absent) gives all False under the REAL
-    function even with index_topk_freq 2, so a test on a formula copy could not see the bug."""
+    function even with index_topk_freq 2, so a test on a formula copy could not see the bug.
+    """
     m = _load_m3_smoke("m3_smoke_skip_control")
     vl = m.m3_vl_config(layers=4)
-    outer = {k: vl[k] for k in ("index_topk_freq", "index_skip_topk_offset")}  # use_index_cache missing
+    outer = {
+        k: vl[k] for k in ("index_topk_freq", "index_skip_topk_offset")
+    }  # use_index_cache missing
     assert _skip_flags(vl["text_config"], outer) == [False, False, False, False]
     # and a freq of 1 means "never share", even with the cache on
     flat = m.m3_config(layers=4, index_topk_freq=1)
@@ -1764,11 +2365,25 @@ def test_without_use_index_cache_no_layer_skips_which_is_the_bug_this_fixes():
 def test_skip_layers_scale_with_depth_and_frequency_in_the_smoke_config():
     m = _load_m3_smoke("m3_smoke_skip_scale")
     flat = m.m3_config(layers=8, index_topk_freq=2)
-    assert _skip_flags(flat) == [False, False, True, False, True, False, True, False]  # ordinals 1,3,5 skip
+    assert _skip_flags(flat) == [
+        False,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]  # ordinals 1,3,5 skip
     # freq 4 (the recipes' value) over sparse ordinals 0,1,2: only ordinal 0 recomputes its indexer,
     # ordinals 1 and 2 share it. I first expected NO skip here; the real function says otherwise
     # (max(ordinal - offset, 0) % freq != 0), which is why these tests run it instead of a formula copy.
-    assert _skip_flags(m.m3_config(layers=4, index_topk_freq=4)) == [False, False, True, True]
+    assert _skip_flags(m.m3_config(layers=4, index_topk_freq=4)) == [
+        False,
+        False,
+        True,
+        True,
+    ]
 
 
 # ------------- staged (runtime) vs direct (test_utils) input handling
@@ -1782,7 +2397,14 @@ class _Rec:
         self.log.append((self.name, "copy", src))
 
     def __getitem__(self, idx):
-        return _Rec(f"{self.name}[{idx.stop}]" if idx.stop is not None else f"{self.name}[{idx.start}:]", self.log)
+        return _Rec(
+            (
+                f"{self.name}[{idx.stop}]"
+                if idx.stop is not None
+                else f"{self.name}[{idx.start}:]"
+            ),
+            self.log,
+        )
 
     def zero_(self):
         self.log.append((self.name, "zero"))
@@ -1794,16 +2416,26 @@ class _Rec:
 def _inputs_fixture(make_site, direct):
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)), direct=direct)
     log = []
-    st = SimpleNamespace(xs=_Rec("xs", log), pos=_Rec("pos", log), slot=_Rec("slot", log), rebound=False)
+    st = SimpleNamespace(
+        xs=_Rec("xs", log), pos=_Rec("pos", log), slot=_Rec("slot", log), rebound=False
+    )
     state = {"slot_mapping": _Rec("sm", log)}
-    ctx = SimpleNamespace(real_tokens=40, padded_tokens=40, positions=_Rec("positions", log))
+    ctx = SimpleNamespace(
+        real_tokens=40, padded_tokens=40, positions=_Rec("positions", log)
+    )
     return s, st, state, ctx, log
 
 
-def test_the_runtime_site_always_copies_the_per_call_inputs_into_its_staging_buffers(make_site):
+def test_the_runtime_site_always_copies_the_per_call_inputs_into_its_staging_buffers(
+    make_site,
+):
     s, st, state, ctx, log = _inputs_fixture(make_site, direct=False)
     s._stage_inputs("X_SCALE", ctx, state, st)
-    assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]  # x_scale whole, positions/slot [:real]
+    assert [e[0] for e in log] == [
+        "xs",
+        "pos[40]",
+        "slot[40]",
+    ]  # x_scale whole, positions/slot [:real]
     assert log[0][2] == "X_SCALE"
 
 
@@ -1816,13 +2448,15 @@ def test_the_direct_site_copies_only_when_an_input_moved(make_site):
     assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]"]  # self-heal by copy
 
 
-def test_seams_leave_proof_in_the_log_that_they_were_installed_and_fired(monkeypatch, caplog):
+def test_seams_leave_proof_in_the_log_that_they_were_installed_and_fired(
+    monkeypatch, caplog
+):
     """Spawned workers must PROVE the seams ran, not assume the env activated them: install_from_env
     always logs one summary line (its absence means it was never called), each installed kind logs
     once, a fault logs once when it first takes effect, and stats() reports the same."""
     import logging
 
-    res = _ready_hooks(FakeResources())
+    _ready_hooks(FakeResources())
     monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
     monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "5")
     with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
@@ -1830,48 +2464,81 @@ def test_seams_leave_proof_in_the_log_that_they_were_installed_and_fired(monkeyp
         assert hooks._poison_local() == 1
         assert hooks._poison_local() == 1  # fires twice, logs once
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "install_from_env ran" in text and "faults=poison_rank" in text and "RECOVER_TIMEOUT_S=5" in text
+    assert (
+        "install_from_env ran" in text
+        and "faults=poison_rank" in text
+        and "RECOVER_TIMEOUT_S=5" in text
+    )
     assert text.count("fault 'poison_rank' installed") == 1
     assert text.count("fault 'poison_rank' FIRED") == 1
     s = TU.stats()
-    assert s["fired"] == ["poison_rank"] and "poison_rank" in s["faults"] and s["alias_checks"] == 0
+    assert (
+        s["fired"] == ["poison_rank"]
+        and "poison_rank" in s["faults"]
+        and s["alias_checks"] == 0
+    )
     TU.uninstall_faults()
     assert TU.stats()["fired"] == [] and TU.stats()["faults"] == {}
 
 
-def test_install_from_env_logs_even_when_the_environment_selects_nothing(monkeypatch, caplog):
+def test_install_from_env_logs_even_when_the_environment_selects_nothing(
+    monkeypatch, caplog
+):
     import logging
 
-    for env in (TU.FAULT_ENV, TU.RECOVER_TIMEOUT_ENV, TU.SHUTDOWN_TIMEOUT_ENV, TU.CHECK_ALIAS_ENV):
+    for env in (
+        TU.FAULT_ENV,
+        TU.RECOVER_TIMEOUT_ENV,
+        TU.SHUTDOWN_TIMEOUT_ENV,
+        TU.CHECK_ALIAS_ENV,
+    ):
         monkeypatch.delenv(env, raising=False)
     with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
         TU.install_from_env()
-    assert any("nothing selected by the environment" in r.getMessage() for r in caplog.records)
+    assert any(
+        "nothing selected by the environment" in r.getMessage() for r in caplog.records
+    )
 
 
 # ------------- task-265: the site refuses a weight or activation aiter's plan cannot take as-is
-@pytest.mark.parametrize("n_fused", [2, 1])  # both plans read w: the check is not 2-stage only
-@pytest.mark.parametrize("kw,reason", [
-    (dict(shuffled=False), "weight_layout"),  # ATOM_USE_TRITON_GEMM=1: stored unshuffled
-    (dict(shuffled=None), "weight_layout"),  # no marker at all
-    (dict(k_cols=6144), "weight_shape"),  # weight K != input_size
-    (dict(rows=10000), "weight_shape"),  # fewer rows than N
-    (dict(rows=10368), "weight_shape"),  # more rows, but not a padded weight
-    (dict(rows=10000, padded=True), "weight_shape"),  # padded weights still need >= N rows
-    (dict(ws_rows=10000), "weight_shape"),  # w_scale with fewer than N rows
-])
-def test_static_weight_checks_make_the_bucket_native_and_are_agreed(make_site, kw, reason, n_fused):
+@pytest.mark.parametrize(
+    "n_fused", [2, 1]
+)  # both plans read w: the check is not 2-stage only
+@pytest.mark.parametrize(
+    "kw,reason",
+    [
+        (
+            {"shuffled": False},
+            "weight_layout",
+        ),  # ATOM_USE_TRITON_GEMM=1: stored unshuffled
+        ({"shuffled": None}, "weight_layout"),  # no marker at all
+        ({"k_cols": 6144}, "weight_shape"),  # weight K != input_size
+        ({"rows": 10000}, "weight_shape"),  # fewer rows than N
+        ({"rows": 10368}, "weight_shape"),  # more rows, but not a padded weight
+        (
+            {"rows": 10000, "padded": True},
+            "weight_shape",
+        ),  # padded weights still need >= N rows
+        ({"ws_rows": 10000}, "weight_shape"),  # w_scale with fewer than N rows
+    ],
+)
+def test_static_weight_checks_make_the_bucket_native_and_are_agreed(
+    make_site, kw, reason, n_fused
+):
     res = FakeResources(plan_n=(FakePlan(), n_fused))
     s = make_site(res)
     s.linear = _fake_linear(10240, 3072, **kw)
     r = s.resolve(64, "eager")
     assert (r.plan, r.n_fused, r.reason) == (None, 0, reason)
-    assert res.agree_calls == 1  # the collective still ran on this rank: the verdict is AGREED, not local
+    assert (
+        res.agree_calls == 1
+    )  # the collective still ran on this rank: the verdict is AGREED, not local
 
 
 def test_a_padded_weight_with_extra_rows_is_still_fused(make_site):
     """is_output_padded: N padded up to the GEMM tile for the preshuffle kernel. aiter reads exactly N
-    rows (a 16-row-block shuffle keeps the first N rows contiguous), so more rows than N is fine."""
+    rows (a 16-row-block shuffle keeps the first N rows contiguous), so more rows than N is fine.
+    """
     s = make_site(FakeResources(plan_n=(FakePlan(), 2)))
     s.linear = _fake_linear(10240, 3072, rows=10368, padded=True, ws_rows=10368)
     r = s.resolve(64, "eager")
@@ -1881,25 +2548,46 @@ def test_a_padded_weight_with_extra_rows_is_still_fused(make_site):
 def test_the_weight_check_names_the_layout_before_the_prologue_reason(make_site):
     res = FakeResources(plan_n=(FakePlan(), 2))
     s = make_site(res)
-    s.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False))
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False)
+    )
     s.linear = _fake_linear(10240, 3072, shuffled=False)
     assert s.resolve(64, "eager").reason == "weight_layout"
     s2 = make_site(FakeResources(plan_n=(FakePlan(), 2)))
-    s2.attn = SimpleNamespace(impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False))
-    assert s2.resolve(64, "eager").reason == "prologue_unsupported"  # unchanged when the weight is fine
+    s2.attn = SimpleNamespace(
+        impl=SimpleNamespace(gemm_fusion_prologue_supported=lambda: False)
+    )
+    assert (
+        s2.resolve(64, "eager").reason == "prologue_unsupported"
+    )  # unchanged when the weight is fine
 
 
 def test_decide_path_rejects_a_k_mismatch_after_the_other_input_facts():
-    kw = dict(resolution=site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"), is_dummy_run=False,
-              x_dtype_is_fp8=True, x_scale_ok=True)
+    kw = {
+        "resolution": site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+        "is_dummy_run": False,
+        "x_dtype_is_fp8": True,
+        "x_scale_ok": True,
+    }
     decide = site_mod.GemmFusionSite.decide_path
-    assert decide(**kw) == ("fused", "profile_hit")  # x_k_ok defaults to True: existing callers unchanged
+    assert decide(**kw) == (
+        "fused",
+        "profile_hit",
+    )  # x_k_ok defaults to True: existing callers unchanged
     assert decide(**kw, x_k_ok=False) == ("native", "x_k_mismatch")
-    assert decide(**{**kw, "x_scale_ok": False}, x_k_ok=False) == ("native", "xscale_layout")
-    assert decide(**{**kw, "is_dummy_run": True}, x_k_ok=False) == ("native", "dummy_run")
+    assert decide(**{**kw, "x_scale_ok": False}, x_k_ok=False) == (
+        "native",
+        "xscale_layout",
+    )
+    assert decide(**{**kw, "is_dummy_run": True}, x_k_ok=False) == (
+        "native",
+        "dummy_run",
+    )
 
 
-def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_rank(make_site):
+def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_rank(
+    make_site,
+):
     import torch as _torch
 
     fp8 = _torch.float8_e4m3fn
@@ -1913,9 +2601,13 @@ def test_a_call_whose_x_k_differs_from_the_layer_is_native_on_every_simulated_ra
             outcomes.add((r.plan is not None, reason))
         assert len(outcomes) == 1, (k, outcomes)  # identical on every rank
         got = next(iter(outcomes))
-        assert got[0] is want_fused and (want_fused or got[1] == "x_k_mismatch"), (k, got)
-    assert TU.fallback_reason(
-        s, ctx, _T((16, 2048), fp8), _T((16, 1))) == "x_k_mismatch"  # the test view agrees
+        assert got[0] is want_fused and (want_fused or got[1] == "x_k_mismatch"), (
+            k,
+            got,
+        )
+    assert (
+        TU.fallback_reason(s, ctx, _T((16, 2048), fp8), _T((16, 1))) == "x_k_mismatch"
+    )  # the test view agrees
 
 
 # ------------- task-265: padded rows run the fused kernel (small-M plan reads all T rows)
@@ -1925,8 +2617,17 @@ def test_pad_rows_are_rewritten_to_position_0_slot_minus_1_on_every_call(make_si
         st.rebound = True  # (direct site) an input moved: the copy path runs
         ctx.padded_tokens = 64  # 40 real rows of a 64-row bucket
         s._stage_inputs("X_SCALE", ctx, state, st)
-        assert [e[0] for e in log] == ["xs", "pos[40]", "slot[40]", "pos[40:]", "slot[40:]"]
-        assert log[3][1:] == ("zero",) and log[4][1:] == ("fill", -1)  # the decode pad-row values
+        assert [e[0] for e in log] == [
+            "xs",
+            "pos[40]",
+            "slot[40]",
+            "pos[40:]",
+            "slot[40:]",
+        ]
+        assert log[3][1:] == ("zero",) and log[4][1:] == (
+            "fill",
+            -1,
+        )  # the decode pad-row values
         log.clear()
         ctx.padded_tokens = 40  # no padding in this call: nothing to rewrite
         s._stage_inputs("X_SCALE", ctx, state, st)
@@ -1945,25 +2646,33 @@ def test_staging_buffers_are_t_long_and_start_as_pad_rows(make_site, monkeypatch
         empty=lambda shape, dtype=None, device=None: _Arr(shape, dtype, None),
         zeros=lambda shape, dtype=None, device=None: _Arr(shape, dtype, 0),
         full=lambda shape, v, dtype=None, device=None: _Arr(shape, dtype, v),
-        float32="f32", int64="i64",
+        float32="f32",
+        int64="i64",
     )
     monkeypatch.setattr(site_mod, "torch", fake)
     s = make_site(FakeResources())
-    s.attn = SimpleNamespace(impl=SimpleNamespace(num_heads=16, head_dim=128, num_kv_heads=1))
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(num_heads=16, head_dim=128, num_kv_heads=1)
+    )
     st = s._stage(64, "dev", "bf16")
     assert st.pos.shape == (64,) and st.pos.fill == 0 and st.pos.dtype == "i64"
     assert st.slot.shape == (64,) and st.slot.fill == -1 and st.slot.dtype == "i64"
-    assert st.xs.shape == (16, 1) and st.outs["q"].shape[0] == 64  # outputs are T rows too
+    assert (
+        st.xs.shape == (16, 1) and st.outs["q"].shape[0] == 64
+    )  # outputs are T rows too
 
 
 def test_the_post_prologue_attention_drops_pad_rows_like_native(monkeypatch):
     """q/k/v/index_q are sliced to the real rows before attention, and the output is re-padded to the
-    SP-divisible row count (finish_attention): what native ``attend_packed`` does for the packed path."""
+    SP-divisible row count (finish_attention): what native ``attend_packed`` does for the packed path.
+    """
     import types
 
     calls = []
     ulysses = types.ModuleType("atom.distributed.ulysses_sp")
-    ulysses.finish_attention = lambda out, padded, real, tf: calls.append((out, padded, real, tf)) or "RESULT"
+    ulysses.finish_attention = (
+        lambda out, padded, real, tf: calls.append((out, padded, real, tf)) or "RESULT"
+    )
     attn8 = types.ModuleType("atom.model_ops.minimax_m3.attention_fp8")
     attn8.gather_heads_fp8 = "GATHER"
     monkeypatch.setitem(sys.modules, "atom.distributed.ulysses_sp", ulysses)
@@ -1971,19 +2680,41 @@ def test_the_post_prologue_attention_drops_pad_rows_like_native(monkeypatch):
     from atom.model_ops.gemm_fusion import stages_native
 
     seen = {}
-    impl = SimpleNamespace(forward_after_prologue=lambda q, k, v, kc, vc, ks, vs, fc, index_q=None:
-                           seen.update(q=q, k=k, v=v, iq=index_q) or "ATTN")
-    ctx = SimpleNamespace(real_tokens=61, padded_tokens=64, attn=SimpleNamespace(impl=impl), fwd_ctx="F")
+    impl = SimpleNamespace(
+        forward_after_prologue=lambda q, k, v, kc, vc, ks, vs, fc, index_q=None: seen.update(
+            q=q, k=k, v=v, iq=index_q
+        )
+        or "ATTN"
+    )
+    ctx = SimpleNamespace(
+        real_tokens=61, padded_tokens=64, attn=SimpleNamespace(impl=impl), fwd_ctx="F"
+    )
     log = []
-    outs = {"q": _Rec("q", log), "k": _Rec("k", log), "v": _Rec("v", log), "index_q": _Rec("iq", log)}
-    out = stages_native.attend_after_prologue(None, outs, {"k_cache": 1, "v_cache": 2}, ctx)
+    outs = {
+        "q": _Rec("q", log),
+        "k": _Rec("k", log),
+        "v": _Rec("v", log),
+        "index_q": _Rec("iq", log),
+    }
+    out = stages_native.attend_after_prologue(
+        None, outs, {"k_cache": 1, "v_cache": 2}, ctx
+    )
     assert out == "RESULT"
-    assert (seen["q"].name, seen["k"].name, seen["v"].name, seen["iq"].name) == ("q[61]", "k[61]", "v[61]", "iq[61]")
+    assert (seen["q"].name, seen["k"].name, seen["v"].name, seen["iq"].name) == (
+        "q[61]",
+        "k[61]",
+        "v[61]",
+        "iq[61]",
+    )
     assert calls == [("ATTN", 64, 61, "GATHER")]  # re-padded to 64 rows, like native
     # indexer layers have no k/v outputs
     seen.clear()
-    stages_native.attend_after_prologue(None, {"q": _Rec("q", log), "index_q": _Rec("iq", log)},
-                                        {"k_cache": 1, "v_cache": 2}, ctx)
+    stages_native.attend_after_prologue(
+        None,
+        {"q": _Rec("q", log), "index_q": _Rec("iq", log)},
+        {"k_cache": 1, "v_cache": 2},
+        ctx,
+    )
     assert seen["k"] is None and seen["v"] is None and seen["iq"].name == "iq[61]"
 
 
@@ -1992,28 +2723,59 @@ def test_native_packed_path_also_drops_the_pad_rows_it_is_pinned_in_the_source()
     re-pads: pinned to the source so the two entry depths cannot drift apart."""
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parents[2] / "atom/distributed/ulysses_sp.py").read_text(encoding="utf-8")
-    assert "if real_tokens < padded_tokens:\n        packed = packed[:real_tokens]" in src
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/distributed/ulysses_sp.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "if real_tokens < padded_tokens:\n        packed = packed[:real_tokens]" in src
+    )
     assert "padded_tokens - real_tokens" in src and "out.new_zeros" in src
 
 
-def test_direct_site_binds_its_own_t_long_arrays_when_the_callers_are_shorter(make_site):
+def test_direct_site_binds_its_own_t_long_arrays_when_the_callers_are_shorter(
+    make_site,
+):
     import torch as _torch
 
     for caller_len, own in ((61, True), (64, False)):
-        s, t, state, ctx = _fake_direct(make_site)
-        staged = SimpleNamespace(xs=None, pos=_T((64,), _torch.int64), slot=_T((64,), _torch.int64),
-                                 prepared=False, plan=None, kv_ptrs=None, m=16, ptrs=None,
-                                 rebound=False, own_token_arrays=False)
-        s._stage = lambda tokens, device, dtype, _st=staged: s._staging.setdefault(tokens, _st)
+        s, t, state, _ctx = _fake_direct(make_site)
+        staged = SimpleNamespace(
+            xs=None,
+            pos=_T((64,), _torch.int64),
+            slot=_T((64,), _torch.int64),
+            prepared=False,
+            plan=None,
+            kv_ptrs=None,
+            m=16,
+            ptrs=None,
+            rebound=False,
+            own_token_arrays=False,
+        )
+        s._stage = (
+            lambda tokens, device, dtype, _st=staged, _s=s: _s._staging.setdefault(
+                tokens, _st
+            )
+        )
         s._bind_plan = lambda *a, **k: True
-        caller_pos, caller_slot = _T((caller_len,), _torch.int64), _T((caller_len,), _torch.int64)
-        direct = {"x_scale": t["xs"], "positions": caller_pos, "slot_mapping": caller_slot, "state": state}
+        caller_pos, caller_slot = _T((caller_len,), _torch.int64), _T(
+            (caller_len,), _torch.int64
+        )
+        direct = {
+            "x_scale": t["xs"],
+            "positions": caller_pos,
+            "slot_mapping": caller_slot,
+            "state": state,
+        }
         assert s.prepare_bucket(64, None, {}, None, direct=direct) is True
         assert staged.own_token_arrays is own
-        if own:  # the caller's 61-long arrays would be read out of bounds: bind the site's 64-long ones
+        if (
+            own
+        ):  # the caller's 61-long arrays would be read out of bounds: bind the site's 64-long ones
             assert staged.pos.shape == (64,) and staged.slot.shape == (64,)
-            assert staged.ptrs[1] == staged.pos.data_ptr() and staged.ptrs[2] == staged.slot.data_ptr()
+            assert (
+                staged.ptrs[1] == staged.pos.data_ptr()
+                and staged.ptrs[2] == staged.slot.data_ptr()
+            )
         else:  # full-length caller arrays are bound as-is
             assert staged.pos is caller_pos and staged.slot is caller_slot
 
@@ -2023,7 +2785,7 @@ def test_direct_site_always_copies_for_a_padded_bucket(make_site):
     st = _seed_prepared(s, t, state)
     st.own_token_arrays = True  # bound to site-owned arrays: the caller's tensors never ARE the bound ones
     fp8 = __import__("torch").float8_e4m3fn
-    r, reason, _, got = s._prepare(ctx, _T((16, 3072), fp8), t["xs"])
+    r, _reason, _, got = s._prepare(ctx, _T((16, 3072), fp8), t["xs"])
     assert r.plan is not None and got.rebound is True
     st.own_token_arrays = False
     _, _, _, got = s._prepare(ctx, _T((16, 3072), fp8), t["xs"])
@@ -2037,29 +2799,48 @@ def test_golden_adapter_returns_only_the_real_rows_of_a_padded_case(monkeypatch)
     monkeypatch.setitem(sys.modules, "operators", types.ModuleType("operators"))
     monkeypatch.setattr(TU, "_site_for", lambda c, comm: ("S", "H", "A"))
     monkeypatch.setattr(TU, "_ctx", lambda c, a: "CTX")
-    monkeypatch.setattr(TU, "run_prologue", lambda *a, **k: ("outs", {"q": _Rec("q", log), "k": _Rec("k", log)}, "D"))
+    monkeypatch.setattr(
+        TU,
+        "run_prologue",
+        lambda *a, **k: ("outs", {"q": _Rec("q", log), "k": _Rec("k", log)}, "D"),
+    )
     for tokens, padded in ((61, 64), (64, 64)):
-        case = SimpleNamespace(spec=SimpleNamespace(tokens=tokens, padded_tokens=padded, mode="qkv_dense"),
-                               x="X", x_scale="XS", caches={"k_cache": "KC"})
+        case = SimpleNamespace(
+            spec=SimpleNamespace(tokens=tokens, padded_tokens=padded, mode="qkv_dense"),
+            x="X",
+            x_scale="XS",
+            caches={"k_cache": "KC"},
+        )
         out = TU.qkv_proj_all2all_norm_rope_cache(case, SimpleNamespace(rank=0))
         if tokens < padded:
-            assert (out["q"].name, out["k"].name) == ("q[61]", "k[61]")  # baseline shape: real rows only
+            assert (out["q"].name, out["k"].name) == (
+                "q[61]",
+                "k[61]",
+            )  # baseline shape: real rows only
         else:
             assert (out["q"].name, out["k"].name) == ("q", "k")  # untouched, no slicing
         assert out["k_cache"] == "KC"
 
 
-def test_golden_prepare_cases_prepares_padded_cases_instead_of_skipping_them(monkeypatch):
+def test_golden_prepare_cases_prepares_padded_cases_instead_of_skipping_them(
+    monkeypatch,
+):
     calls = []
-    fake_site = SimpleNamespace(resolve=lambda *a, **k: None,
-                                prepare_bucket=lambda *a, **k: calls.append((a, k)) or True,
-                                agree_prepared=lambda *a: None)
+    fake_site = SimpleNamespace(
+        resolve=lambda *a, **k: None,
+        prepare_bucket=lambda *a, **k: calls.append((a, k)) or True,
+        agree_prepared=lambda *a: None,
+    )
     monkeypatch.setattr(TU, "_site_for", lambda c, comm: (fake_site, None, None))
     TU.reset_for_tests(FakeResources())
     case = SimpleNamespace(
-        spec=SimpleNamespace(tokens=61, padded_tokens=64), x=SimpleNamespace(device="dev"), x_scale="XS",
-        positions="POS", slot_mapping="SLOT",
-        caches={"k_cache": 1, "v_cache": 2, "k_scale": 3, "v_scale": 4})
+        spec=SimpleNamespace(tokens=61, padded_tokens=64),
+        x=SimpleNamespace(device="dev"),
+        x_scale="XS",
+        positions="POS",
+        slot_mapping="SLOT",
+        caches={"k_cache": 1, "v_cache": 2, "k_scale": 3, "v_scale": 4},
+    )
     TU.prepare_cases([case], SimpleNamespace(rank=0))
     assert len(calls) == 1
     args, kw = calls[0]
@@ -2070,10 +2851,14 @@ def test_golden_prepare_cases_prepares_padded_cases_instead_of_skipping_them(mon
 # ------------- task-265: profile-wide prebuild at init
 def _init_with_fake_gf(monkeypatch, res, **gf_attrs):
     calls = []
-    gf = SimpleNamespace(load_profile=lambda name: calls.append(("load", name)), **gf_attrs)
+    gf = SimpleNamespace(
+        load_profile=lambda name: calls.append(("load", name)), **gf_attrs
+    )
     TU.inject_aiter(monkeypatch, gf)
     TU.reset_for_tests()
-    TU.init_with_resources(SimpleNamespace(gemm_fusion=GemmFusionConfig(profile="prof_x")), res)
+    TU.init_with_resources(
+        SimpleNamespace(gemm_fusion=GemmFusionConfig(profile="prof_x")), res
+    )
     return calls
 
 
@@ -2081,8 +2866,13 @@ def test_init_prebuilds_the_profile_once_with_the_detected_target(monkeypatch):
     res = FakeResources()
     built = []
     calls = _init_with_fake_gf(
-        monkeypatch, res,
-        prebuild_profile=lambda name, *, arch=None, cu=None, world=None: built.append((name, arch, cu, world)) or ["v1"])
+        monkeypatch,
+        res,
+        prebuild_profile=lambda name, *, arch=None, cu=None, world=None: built.append(
+            (name, arch, cu, world)
+        )
+        or ["v1"],
+    )
     assert built == [("prof_x", "gfx950", 256, 4)]
     assert calls == [("load", "prof_x")]  # fail-fast profile load stays first
     assert hooks.phase() == "pre"  # before any forward / bucket resolution
@@ -2116,7 +2906,9 @@ def test_prebuild_success_runs_the_agreement_collective_exactly_once(monkeypatch
     assert reports == [[1]]
 
 
-def test_an_aiter_without_prebuild_is_logged_and_skipped_without_a_collective(monkeypatch, caplog):
+def test_an_aiter_without_prebuild_is_logged_and_skipped_without_a_collective(
+    monkeypatch, caplog
+):
     import logging
 
     res = FakeResources()
@@ -2125,4 +2917,6 @@ def test_an_aiter_without_prebuild_is_logged_and_skipped_without_a_collective(mo
     with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
         _init_with_fake_gf(monkeypatch, res)  # no prebuild_profile on the fake aiter
     assert any("no prebuild_profile" in r.getMessage() for r in caplog.records)
-    assert reports == [] and hooks.resources() is res  # uniform skip: nothing to agree on
+    assert (
+        reports == [] and hooks.resources() is res
+    )  # uniform skip: nothing to agree on

@@ -44,6 +44,7 @@ def run_qkv_attention(attn, x, x_scale, positions):
         hooks.recover()
         raise
 
+
 def _fake(
     x: torch.Tensor,
     x_scale: torch.Tensor | None,

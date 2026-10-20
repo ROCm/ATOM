@@ -8,7 +8,7 @@ still imports (and the OFF path still runs) without it.
 """
 
 import importlib
-from typing import Optional
+
 
 def aiter_gf():
     """The ``aiter.gemm_fusion`` module."""
@@ -29,7 +29,7 @@ def qkv_fields(
     iq: int = 0,
     ik: int = 0,
     idx_head_dim: int = 0,
-    world: Optional[int] = None,
+    world: int | None = None,
 ):
     """Column ranges of the (tp=1) fused QKV[+indexer] GEMM output.
 
@@ -52,10 +52,12 @@ def qkv_fields(
     return tuple(fields)
 
 
-def sp_exchange(fields, drop=(), world: Optional[int] = None):
+def sp_exchange(fields, drop=(), world: int | None = None):
     gf = aiter_gf()
     return gf.SPExchange(
-        world=sp_world() if world is None else world, fields=tuple(fields), drop=tuple(drop)
+        world=sp_world() if world is None else world,
+        fields=tuple(fields),
+        drop=tuple(drop),
     )
 
 
@@ -70,7 +72,7 @@ def _kv_block_size() -> int:
     return int(get_current_atom_config().kv_cache_block_size)
 
 
-def head_norm_rope_cache_from_attention(attn, index: Optional[str] = None):
+def head_norm_rope_cache_from_attention(attn, index: str | None = None):
     """``HeadNormRopeCache`` describing what ``attn.impl.rope_cache`` computes.
 
     ``numerics``/``kv_cache`` are the golden-order family names; they are part

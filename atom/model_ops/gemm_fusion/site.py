@@ -94,8 +94,8 @@ class GemmFusionSite:
         self.sparse, self.skip_index = sparse, skip_index
         gemm = gf.GemmSpec(
             quant="fp8_ptpc",
-            n=getattr(linear, "output_size"),
-            k=getattr(linear, "input_size"),
+            n=linear.output_size,
+            k=linear.input_size,
         )
         self.spec = gf.FusionSpec(gemm, self.stages)
         self._by_tokens: dict = {}
@@ -108,7 +108,13 @@ class GemmFusionSite:
         """Views of q/k/v as today's model forward produces them."""
         if self.sparse:
             q, k, v, _, _ = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size, self.index_q_size, self.index_k_size],
+                [
+                    self.q_size,
+                    self.kv_size,
+                    self.kv_size,
+                    self.index_q_size,
+                    self.index_k_size,
+                ],
                 dim=-1,
             )
         else:
@@ -219,15 +225,21 @@ class GemmFusionSite:
             # profile passed EXPLICITLY (config.gemm_fusion.profile via hooks), never left to
             # aiter's AITER_GEMM_FUSION_PROFILE env fallback (absent in spawned workers)
             plan, n = gf.match_prefix(
-                self.spec, res.match_ctx(res.local_m(tokens), graph_mode), hooks.profile()
+                self.spec,
+                res.match_ctx(res.local_m(tokens), graph_mode),
+                hooks.profile(),
             )
         except contract_err as e:  # covered but contract fails
             errored, msg = True, str(e)
-        static_reason = None  # why a covered row is still not fusable (static, per layer)
+        static_reason = (
+            None  # why a covered row is still not fusable (static, per layer)
+        )
         if plan is not None:
             # Both are properties of the layer, not of the call, so every rank computes the same
             # answer; they are folded into the agreement below (plan=None => native on all ranks).
-            static_reason = self._static_weight_reason()  # applies to 1- and 2-stage plans: both read w
+            static_reason = (
+                self._static_weight_reason()
+            )  # applies to 1- and 2-stage plans: both read w
             if static_reason is None and n >= 2 and not self._static_prologue_ok():
                 static_reason = "prologue_unsupported"
             if static_reason is not None:
@@ -247,7 +259,9 @@ class GemmFusionSite:
                 reason = static_reason or "uncovered"
             r = Resolution(None, 0, "native", reason)
         elif not res.can_ensure(plan):
-            r = Resolution(None, 0, "native", "after_finalize")  # uniform: same order on all ranks
+            r = Resolution(
+                None, 0, "native", "after_finalize"
+            )  # uniform: same order on all ranks
         else:
             # ONE plan object per (site, bucket), shared by the eager and capture keys.
             # match_prefix builds a NEW plan each call and a small-M plan keeps its
@@ -255,7 +269,9 @@ class GemmFusionSite:
             # would be a different, unbound object when the capture/replay path asks
             # for "capture" ("new binding required during capture"). The profile row
             # does not depend on graph_mode, so the first match is the one to keep.
-            other = self._by_tokens.get((tokens, "capture" if graph_mode == "eager" else "eager"))
+            other = self._by_tokens.get(
+                (tokens, "capture" if graph_mode == "eager" else "eager")
+            )
             if (
                 other is not None
                 and not isinstance(other, Exception)
@@ -273,7 +289,11 @@ class GemmFusionSite:
 
     @staticmethod
     def _runtime_mode() -> str:
-        return "capture" if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing() else "eager"
+        return (
+            "capture"
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            else "eager"
+        )
 
     def _prepared_ok(self, tokens: int, r: Resolution, prepared: bool) -> bool:
         """This rank's local verdict that bucket ``tokens`` is safe to launch for resolution
@@ -288,13 +308,19 @@ class GemmFusionSite:
         if not prepared:
             return False
         if r.n_fused < 2:
-            return True  # 1-stage large-M: raw per-launch pointers, nothing bound per site
+            return (
+                True  # 1-stage large-M: raw per-launch pointers, nothing bound per site
+            )
         st = self._staging.get(tokens)
         if st is None or not st.prepared:
             return False
         prepared_plan = st.plan
         if prepared_plan is not None and prepared_plan is not r.plan:
-            logger.error("%s: bucket %d resolves to a plan instance other than the one prepared", self.name, tokens)
+            logger.error(
+                "%s: bucket %d resolves to a plan instance other than the one prepared",
+                self.name,
+                tokens,
+            )
             return False
         return True
 
@@ -311,7 +337,10 @@ class GemmFusionSite:
             outcome = res.agree(self.name + "#prepared", tokens, None, int(bool(ok)))
             if outcome != "agree" or not ok:
                 self._by_tokens[(tokens, mode)] = Resolution(
-                    None, 0, "native", "prepare_disagree" if outcome != "agree" else "unprepared"
+                    None,
+                    0,
+                    "native",
+                    "prepare_disagree" if outcome != "agree" else "unprepared",
                 )
 
     # -- KV pointer guard (bind time, collective) --------------------------------
@@ -320,7 +349,10 @@ class GemmFusionSite:
         layer = kv_cache_data.get(f"layer_{self.attn.impl.layer_num}")
         if layer is None:
             return None
-        return tuple(self._ptr(getattr(layer, n, None)) for n in ("k_cache", "v_cache", "k_scale", "v_scale"))
+        return tuple(
+            self._ptr(getattr(layer, n, None))
+            for n in ("k_cache", "v_cache", "k_scale", "v_scale")
+        )
 
     def kv_moved(self, kv_cache_data) -> bool:
         """True when a bucket was already prepared against KV caches whose addresses differ
@@ -329,7 +361,8 @@ class GemmFusionSite:
         and agreed across ranks there; it is never evaluated per call."""
         now = self.kv_ptrs(kv_cache_data)
         return any(
-            st.prepared and st.kv_ptrs not in (None, now) for st in self._staging.values()
+            st.prepared and st.kv_ptrs not in (None, now)
+            for st in self._staging.values()
         )
 
     # -- persistent staging (aiter binds raw pointers once per tensor set) ------
@@ -343,11 +376,20 @@ class GemmFusionSite:
         if st is None:
             impl = self.attn.impl
             m = tokens // max(1, hooks.world_or_1())
-            outs = {"q": torch.empty((tokens, impl.num_heads, impl.head_dim), dtype=dtype, device=device)}
+            outs = {
+                "q": torch.empty(
+                    (tokens, impl.num_heads, impl.head_dim), dtype=dtype, device=device
+                )
+            }
             if self.sparse and not self.skip_index:  # indexer: index_q, NO k/v
                 outs["index_q"] = torch.empty(
-                    (tokens, impl.index_q_size // impl.index_head_dim, impl.index_head_dim),
-                    dtype=dtype, device=device,
+                    (
+                        tokens,
+                        impl.index_q_size // impl.index_head_dim,
+                        impl.index_head_dim,
+                    ),
+                    dtype=dtype,
+                    device=device,
                 )
             else:  # dense / reuse
                 kv = (tokens, impl.num_kv_heads, impl.head_dim)
@@ -403,7 +445,9 @@ class GemmFusionSite:
         return 0 if t is None else t.data_ptr()
 
     @staticmethod
-    def decide_path(*, resolution, is_dummy_run, x_dtype_is_fp8, x_scale_ok, x_k_ok=True):
+    def decide_path(
+        *, resolution, is_dummy_run, x_dtype_is_fp8, x_scale_ok, x_k_ok=True
+    ):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
         (resolution agreed at resolve, the broadcast batch's dummy flag, and the input's
         dtype/shape facts, including whether x's K equals the layer's ``input_size``). No rank,
@@ -412,7 +456,8 @@ class GemmFusionSite:
 
         Padded rows (``real_tokens < padded_tokens``) are NOT a reason to go native: both plan
         kinds run them. The small-M plan reads positions/slot_mapping for all T = 4*M rows, so the
-        site stages T-length arrays whose pad rows are (position 0, slot -1); see ``_stage_inputs``."""
+        site stages T-length arrays whose pad rows are (position 0, slot -1); see ``_stage_inputs``.
+        """
         if resolution.plan is None:
             return "native", resolution.reason
         if is_dummy_run:
@@ -422,7 +467,10 @@ class GemmFusionSite:
         if not x_scale_ok:
             return "native", "xscale_layout"
         if not x_k_ok:
-            return "native", "x_k_mismatch"  # the plan's K is the spec's (input_size); never feed it another
+            return (
+                "native",
+                "x_k_mismatch",
+            )  # the plan's K is the spec's (input_size); never feed it another
         return "fused", resolution.reason
 
     @staticmethod
@@ -442,16 +490,26 @@ class GemmFusionSite:
     def _bind_plan(self, r, tokens, st, state, device, kv_cache_data):
         """Create aiter's pointer binding for a 2-stage plan outside capture and mark the
         bucket prepared. ``st.xs/pos/slot`` are the buffers the binding is made on."""
-        x = torch.zeros((st.m, self.linear.input_size), dtype=torch.float8_e4m3fn, device=device)
+        x = torch.zeros(
+            (st.m, self.linear.input_size), dtype=torch.float8_e4m3fn, device=device
+        )
         res = hooks.resources()
         res.finalize()
         prep = getattr(r.plan, "prepare", None)
         if prep is not None:
-            prep(x=x, x_scale=st.xs, w_scale=self.linear.weight_scale, outs=st.outs,
-                 meta=self.build_meta(st, state), res=res.bound)
+            prep(
+                x=x,
+                x_scale=st.xs,
+                w_scale=self.linear.weight_scale,
+                outs=st.outs,
+                meta=self.build_meta(st, state),
+                res=res.bound,
+            )
         st.prepared = True
         st.plan = r.plan  # the exact plan instance whose binding was just created
-        st.kv_ptrs = self.kv_ptrs(kv_cache_data) if kv_cache_data else None  # for kv_moved()
+        st.kv_ptrs = (
+            self.kv_ptrs(kv_cache_data) if kv_cache_data else None
+        )  # for kv_moved()
         return True
 
     @staticmethod
@@ -528,7 +586,9 @@ class GemmFusionSite:
         if r.n_fused < 2:
             return r, reason, None, None
         st = self._staging[ctx.padded_tokens]  # prepared on every rank (agree_prepared)
-        state = ctx.prologue_state()  # eligibility was agreed at resolve; never None here
+        state = (
+            ctx.prologue_state()
+        )  # eligibility was agreed at resolve; never None here
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
@@ -541,7 +601,8 @@ class GemmFusionSite:
         which is the GLOBAL tail (so only the last rank(s) hold pad rows in x, but every rank's
         kernel reads all T entries): they get position 0 and slot -1, the values ATOM already uses
         for decode batch-padding rows, and the kernel skips cache writes for slot < 0. The tail is
-        rewritten on every call because the same bucket can be reached with a different ``real``."""
+        rewritten on every call because the same bucket can be reached with a different ``real``.
+        """
         n = ctx.real_tokens
         st.xs.copy_(x_scale)
         st.pos[:n].copy_(ctx.positions[:n])
@@ -563,8 +624,14 @@ class GemmFusionSite:
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
         r.plan.run(
-            x=x, x_scale=xs, w=self.linear.weight, w_scale=self.linear.weight_scale,
-            outs=outs, meta=meta, res=res.bound, stream=torch.cuda.current_stream(),
+            x=x,
+            x_scale=xs,
+            w=self.linear.weight,
+            w_scale=self.linear.weight_scale,
+            outs=outs,
+            meta=meta,
+            res=res.bound,
+            stream=torch.cuda.current_stream(),
         )
         if r.n_fused < 2:
             # Zero-copy view of the plan's receive window; valid until this rank
@@ -585,8 +652,15 @@ class GemmFusionSite:
         return "raw" if (path == "fused" and r.n_fused < 2) else "staged"
 
     def _decision(self, ctx, r, reason, path, st=None):
-        d = Decision(self.name, ctx.padded_tokens, r.vid, r.n_fused, path, reason,
-                     self._bind_label(r, path, st))
+        d = Decision(
+            self.name,
+            ctx.padded_tokens,
+            r.vid,
+            r.n_fused,
+            path,
+            reason,
+            self._bind_label(r, path, st),
+        )
         hooks.record_decision(d)
         return d
 
@@ -611,7 +685,10 @@ class GemmFusionSite:
             out = self.native.after_prologue(self, outs, state, ctx)
         else:
             out = self._remainder_after_exchange(
-                r, outs, ctx, lambda packed: self.native.after_exchange(self, packed, ctx)
+                r,
+                outs,
+                ctx,
+                lambda packed: self.native.after_exchange(self, packed, ctx),
             )
         return out, self._decision(ctx, r, reason, "fused", st)
 

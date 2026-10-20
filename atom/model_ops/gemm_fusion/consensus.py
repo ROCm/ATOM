@@ -10,7 +10,7 @@ on CPU in unit tests.
 
 import hashlib
 import logging
-from typing import Callable, Optional, Sequence
+from collections.abc import Callable, Sequence
 
 logger = logging.getLogger("atom.gemm_fusion")
 
@@ -31,7 +31,7 @@ class RankDisagreement(RuntimeError):
 
 
 def agree(
-    reduce_min: Optional[Reducer],
+    reduce_min: Reducer | None,
     site: str,
     tokens: int,
     vid: str,
@@ -45,7 +45,9 @@ def agree(
     on every rank, because "covered but contract fails" must never be hidden
     by a fallback on only some ranks.
     """
-    key = decision_key(site, tokens, "ERR" if errored else vid, 0 if errored else n_fused)
+    key = decision_key(
+        site, tokens, "ERR" if errored else vid, 0 if errored else n_fused
+    )
     if reduce_min is None:
         return "error" if errored else "agree"
     kmin, nkmax, nerr_max = reduce_min([key, -key, -int(errored)])
