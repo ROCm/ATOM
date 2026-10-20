@@ -45,7 +45,11 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
+from atom.model_ops.qwen4_exp.ops.gated import (
+    is_per_token_fp8_linear,
+    sigmoid_mul,
+    sigmoid_mul_quant,
+)
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
@@ -341,10 +345,20 @@ class Qwen4ExpAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """`quantized` is an optional `(fp8, scale)` copy of `hidden_states`
+        that an FP8 `qkv_proj` takes instead of quantizing it again; the
+        indexer still reads the BF16 `hidden_states`."""
         num_tokens = hidden_states.shape[0]
-        qkv = self.qkv_proj(hidden_states)
+        qkv = (
+            self.qkv_proj(hidden_states)
+            if quantized is None
+            else self.qkv_proj(quantized[0], x_scale=quantized[1])
+        )
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
@@ -391,6 +405,11 @@ class Qwen4ExpAttention(nn.Module):
                 ),
             )
 
+        if is_per_token_fp8_linear(self.o_proj):
+            gated, gated_scale = sigmoid_mul_quant(
+                attn_out.reshape(num_tokens, -1), gate, self.o_proj.params_dtype
+            )
+            return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
 

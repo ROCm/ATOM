@@ -32,6 +32,7 @@ from atom.model_ops.qwen4_exp.ops.gated import (
 from atom.model_ops.qwen4_exp.ops.hc_fused import (
     hc_combine_norm,
     hc_gated_mean,
+    hc_gated_mean_quant,
     hc_rows,
 )
 
@@ -42,6 +43,10 @@ from atom.model_ops.qwen4_exp.ops.hc_fused import (
 # Up to this many tokens the two fused kernels beat norm + GEMMs; each row
 # re-reads the (cache resident) weights, so the cost grows with the batch.
 HC_ROWS_MAX = 2
+# Up to this many tokens `mix_fused_quant` emits the FP8 activation from the
+# gated-mean kernel itself (see `hc_gated_mean_quant`); above it the consumer
+# GEMM quantizes the BF16 output on its own.
+HC_QUANT_ROWS_MAX = 1024
 from atom.model_ops.triton_gemma_rmsnorm import gemma_rmsnorm_triton
 from atom.model_ops.utils import atom_parameter
 
@@ -159,6 +164,28 @@ class Qwen4ExpHyperConnection(nn.Module):
         hyper-connection. Returns the mixed activation and `(streams,
         inject_logits)`; the logits are None when there is no block injection.
         """
+        mixed, _, residuals = self._mix_fused(hyper_input, pending, None)
+        return mixed, residuals
+
+    def mix_fused_quant(
+        self,
+        hyper_input: torch.Tensor,
+        pending: tuple[torch.Tensor, torch.Tensor] | None,
+        quant_dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor] | None,
+        tuple[torch.Tensor, torch.Tensor | None],
+    ]:
+        """`mix_fused` that also returns `(fp8, scale)`, the per-token quant of
+        the mixed activation, for a per_Token FP8 consumer. None outside
+        (HC_ROWS_MAX, HC_QUANT_ROWS_MAX], where that consumer quantizes for
+        itself."""
+        if hyper_input.shape[0] > HC_QUANT_ROWS_MAX:
+            quant_dtype = None
+        return self._mix_fused(hyper_input, pending, quant_dtype)
+
+    def _mix_fused(self, hyper_input, pending, quant_dtype):
         block_out, raw_prev = pending if pending is not None else (None, None)
         has_inject = self.block_inject_weight is not None
         w_up = self.input_mix_weight_up.weight
@@ -175,7 +202,7 @@ class Qwen4ExpHyperConnection(nn.Module):
                 block_out,
                 raw_prev,
             )
-            return mixed, (h, raw)
+            return mixed, None, (h, raw)
         h, normed = hc_combine_norm(
             hyper_input, self.hc_norm.weight, eps, self.hc_count, block_out, raw_prev
         )
@@ -183,9 +210,16 @@ class Qwen4ExpHyperConnection(nn.Module):
         d = tgemm.mm(normed, self.fused_w_cat, otype=normed.dtype)
         gate = scaled_silu(d[:, :rank], self.hc_count)
         up = tgemm.mm(gate, w_up, otype=gate.dtype)
-        mixed = hc_gated_mean(normed, up, self.hc_count)
+        quantized = None
+        if quant_dtype is None:
+            mixed = hc_gated_mean(normed, up, self.hc_count)
+        else:
+            mixed, mixed_q, mixed_scale = hc_gated_mean_quant(
+                normed, up, self.hc_count, quant_dtype
+            )
+            quantized = (mixed_q, mixed_scale)
         raw = d[:, rank : rank + self.hc_count] if has_inject else None
-        return mixed, (h, raw)
+        return mixed, quantized, (h, raw)
 
     def apply_pending(
         self, hyper_input: torch.Tensor, pending: tuple[torch.Tensor, torch.Tensor]
