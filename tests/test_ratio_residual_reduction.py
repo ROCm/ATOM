@@ -116,17 +116,12 @@ def test_mixed_reduction_walk_can_select_a_zero_mass_index():
     )
 
 
-# The kernel itself needs triton and a real GPU. Guard the import the way the
-# rest of the suite does -- a bare import here is a collection ERROR on the
-# non-GPU CI job, which fails the whole run rather than skipping.
-pytest.importorskip("triton")
-torch = pytest.importorskip("torch")
-
-
-@pytest.mark.skipif(
-    not getattr(torch, "cuda", None) or not torch.cuda.is_available(),
-    reason="residual kernel needs a GPU",
-)
+# The kernel itself needs triton and a real GPU, so the import must be guarded
+# -- a bare import is a collection ERROR on the non-GPU CI job, which fails the
+# whole run rather than skipping. But the guard has to sit INSIDE this test, not
+# at module scope: a module-scope `pytest.importorskip` raises during import and
+# skips every test in the file, including the two numpy models above that need
+# neither triton nor a GPU and are the only coverage the non-GPU job can give.
 def test_residual_draw_never_returns_zero_mass_token():
     """Volume check on the real kernel: every rejected position has mass.
 
@@ -141,6 +136,11 @@ def test_residual_draw_never_returns_zero_mass_token():
     have produced. Without the reduction fix those ids are a multiple of
     `_RATIO_BLOCK_V`, or `vocab - 1` when the miss lands in the final tile.
     """
+    pytest.importorskip("triton")
+    torch = pytest.importorskip("torch")
+    if not getattr(torch, "cuda", None) or not torch.cuda.is_available():
+        pytest.skip("residual kernel needs a GPU")
+
     from atom.model_ops import rejection_sampler as rs
     from atom.model_ops.rejection_sampler import rejection_sample
 
