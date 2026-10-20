@@ -948,6 +948,13 @@ def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
     if not _is_minimax_m3_config(hf_config):
         return
     text_config = getattr(hf_config, "text_config", None)
+    if isinstance(text_config, dict):
+        # The remote MiniMaxM3VLConfig bundled with some exports (MiniMax-M3.1)
+        # coerces text_config in a way transformers 5 undoes, leaving the raw
+        # dict. The text block has no model_type, so keep every field as a
+        # plain PretrainedConfig attr.
+        text_config = PretrainedConfig.from_dict(text_config)
+        hf_config.text_config = text_config
     if text_config is not None and text_config is not hf_config:
         # Some exports (Quark NVFP4) carry the layer layout on the VL root; it
         # replaces the text config's own, then is checked like any other.
