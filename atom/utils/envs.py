@@ -803,6 +803,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
     "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
+    # Qwen QSA: score decode-sized index calls (<= 256 rows) with the MFMA
+    # kernel that stacks the index heads into M; 0 keeps the CUDA-core one.
+    "ATOM_QSA_STACKED_DECODE_SCORER": lambda: _flag_env(
+        "ATOM_QSA_STACKED_DECODE_SCORER", "1"
+    ),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
