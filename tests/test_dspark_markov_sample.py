@@ -128,3 +128,151 @@ def test_fused_reads_and_writes_the_strided_columns_it_is_given(dtype):
         embed = dspark_markov_argmax(base, prev, w1, w2, out_ids[:, k + 1])
         assert torch.equal(embed, ref_embed), k
         assert torch.equal(out_ids[:, k + 1], ref_ids), k
+
+
+class _TpGroup:
+    """`dspark_markov_argmax_tp`'s group, over shards run one after another:
+    `all_gather` returns every shard's `(max, id)` pack, rank order."""
+
+    def __init__(self, packs):
+        self.world_size = len(packs)
+        self._packs = packs
+
+    def all_gather(self, packed, dim, use_custom):
+        assert dim == 0
+        return torch.cat(self._packs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("tp", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 32, 160])
+def test_sharded_sampling_matches_the_whole_vocab(tp, rows):
+    """Each rank's `(max, id)` over its vocab shard, reduced across ranks, is
+    the whole-vocab op's id and gathered row, bit for bit -- including a
+    maximum tied across two shards, where the lower id must win."""
+    from atom.model_ops.dspark_markov_sample import _launch, dspark_markov_argmax_tp
+
+    vocab, rank = 129280, 256
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    w1, w2 = w1 * 0.05, w2 * 0.05
+    # an exact tie between ids in the first and last shard: same base logit,
+    # same Markov column, so the same biased logit -- the lower id must win
+    base[0, 1000] = base[0, vocab - 7] = 80.0
+    w2[vocab - 7] = w2[1000]
+    ref = _ids(rows, "cuda", torch.int32)
+    ref_embed = dspark_markov_argmax(base, prev, w1, w2, ref)
+    assert ref[0].item() == 1000
+    shard = vocab // tp
+    packs = []
+    for r in range(tp):
+        packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
+        _launch(
+            base[:, r * shard : (r + 1) * shard],
+            prev,
+            w1,
+            w2,
+            ref,
+            r * shard,
+            packed,
+        )
+        packs.append(packed)
+    for r in range(tp):
+        out = _ids(rows, "cuda", torch.int32)
+        embed = dspark_markov_argmax_tp(
+            base[:, r * shard : (r + 1) * shard],
+            prev,
+            w1,
+            w2,
+            out,
+            r * shard,
+            _TpGroup(packs),
+        )
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+        torch.testing.assert_close(embed, ref_embed, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("num_j", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 32, 160, 2048])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_argmax_gather_is_the_three_ops_it_replaces(num_j, rows, dtype):
+    """`argmax_gather` against `argmax` over j, the id gather at the winner
+    and the copy -- with ties across j and NaN values, written into a strided
+    integer column."""
+    from atom.model_ops.dspark_markov_sample import argmax_gather
+
+    g = torch.Generator(device="cuda").manual_seed(rows * num_j)
+    vals = torch.randint(0, 4, (num_j, rows), device="cuda", generator=g).float()
+    ids = torch.randint(0, 129280, (num_j, rows), device="cuda", generator=g).float()
+    vals[torch.rand(num_j, rows, device="cuda", generator=g) < 0.1] = float("nan")
+    pairs = torch.stack((vals, ids), dim=-1).contiguous()
+    winner = pairs[:, :, 0].argmax(dim=0)
+    ref = pairs[:, :, 1].gather(0, winner.unsqueeze(0)).squeeze(0).to(dtype)
+
+    block = torch.full((rows, 3), -1, dtype=dtype, device="cuda")
+    argmax_gather(pairs, block[:, 1])
+    assert torch.equal(block[:, 1], ref)
+    # the neighbouring columns are untouched
+    assert torch.all(block[:, 0] == -1) and torch.all(block[:, 2] == -1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+@pytest.mark.parametrize("rows", [1, 5, 160])
+def test_confidence_head_matches_the_fp32_reference(rows):
+    """The head's GPU path (concat, BF16 GEMV with FP32 output, sigmoid)
+    against the FP32 reference it replaces, on a [B, T, H] strided hidden."""
+    from atom.models.deepseek_v4_dspark import DSparkConfidenceHead
+
+    hidden_size, rank = 5120, 256
+    head = DSparkConfidenceHead(hidden_size, rank).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        head.proj.weight.normal_(std=0.02)
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    big = torch.randn(rows, 5, 2, hidden_size, device="cuda", generator=g)
+    hidden = big.to(torch.bfloat16)[:, :, 1]
+    embeds = torch.randn(rows, 5, rank, device="cuda", generator=g).bfloat16()
+    ref = torch.sigmoid(
+        torch.nn.functional.linear(
+            torch.cat([hidden, embeds], dim=-1).float(), head.proj.weight.float()
+        ).squeeze(-1)
+    )
+    out = head(hidden, embeds)
+    assert out.dtype == torch.float32 and out.shape == (rows, 5)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_sharded_step_writes_its_embed_column_in_place():
+    """`embed_out` receives the step's W1[x] rows: a [B, T, r] block filled
+    column by column equals the stack of fresh results."""
+    from atom.model_ops.dspark_markov_sample import dspark_markov_argmax_tp
+
+    rows, steps, vocab, rank, tp = 32, 5, 129280, 256, 2
+    base, prev, w1, w2 = _tables(rows, vocab, rank, "cuda")
+    shard = vocab // tp
+    block = w1.new_empty(rows, steps, rank)
+    fresh = []
+    for k in range(steps):
+        packed = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
+        from atom.model_ops.dspark_markov_sample import _launch
+
+        _launch(
+            base[:, :shard], prev, w1, w2, _ids(rows, "cuda", torch.int32), 0, packed
+        )
+        group = _TpGroup([packed, packed])
+        fresh.append(
+            dspark_markov_argmax_tp(
+                base[:, :shard], prev, w1, w2, _ids(rows, "cuda", torch.int32), 0, group
+            )
+        )
+        dspark_markov_argmax_tp(
+            base[:, :shard],
+            prev,
+            w1,
+            w2,
+            _ids(rows, "cuda", torch.int32),
+            0,
+            group,
+            embed_out=block[:, k],
+        )
+    assert torch.equal(block, torch.stack(fresh, dim=1))

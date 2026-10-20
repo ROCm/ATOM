@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -135,6 +135,24 @@ def new_block_table(block_ids=()) -> BlockTable:
     return BlockTable(block_ids)
 
 
+class Replay(NamedTuple):
+    """A prefill forward starting below the point its seq resumed at: that
+    point -- the cache holds every row below it --, whether the rows below are
+    the seq's state (a `replay` state transfer brought none; otherwise the
+    state is the one at `until`), the tokens just before the forward, for
+    state a backend derives from the preceding tokens (V4.1's Engram n-gram
+    history, `Config.replay_history_tokens` of them), and where the replay's
+    first forward started: a DeepSeek-V4 bounded replay may span forwards, and
+    no row below that start is in the state it rebuilds. `Scheduler.
+    _resume_prefill` always records it; 0 (no floor) is for a record built
+    elsewhere, which no V4 forward reads."""
+
+    until: int
+    rebuilds: bool
+    history_ids: tuple[int, ...]
+    start: int = 0
+
+
 class SequenceStatus(Enum):
     WAITING_FOR_REMOTE_KVS = auto()
     WAITING = auto()
@@ -160,6 +178,20 @@ def get_exit_sequence():
     return exit_seq
 
 
+def resumes_offload_prefill(seq) -> bool:
+    """True when an offload load already settled and `seq` keeps its blocks.
+
+    Such a request resumes its suffix prefill without matching the prefix
+    again. Shared by the scheduler's admission and the offload connector's
+    lookup prefetch, which must agree: a lookup sent for a request that skips
+    the match is never consumed and only holds read locks.
+    """
+    return (
+        getattr(seq, "offload_loaded", False)
+        or getattr(seq, "offload_load_failed", False)
+    ) and len(seq.block_table) > 0
+
+
 @dataclass
 class OffloadJointRecord:
     """The KV-transfer offload/joint-load protocol state for one sequence.
@@ -180,6 +212,11 @@ class OffloadJointRecord:
     # reported it -- the KV leg's ceiling. Written before `can_allocate`, which
     # is where the two legs agree on one boundary. 0 = no lookup.
     kv_prefix_tokens: int = 0
+    # The LMCache-resident KV prefix with no regard for window state, in
+    # tokens: how far the full-attention KV alone reaches, at or past
+    # `kv_prefix_tokens`. Asked only where a bounded replay could use it
+    # (`Sequence.replay_kv_load`). 0 = not asked or not answered.
+    kv_only_tokens: int = 0
     # The boundary both legs of a joint load are aimed at, or 0. Chosen by
     # `can_allocate`: the rightmost checkpoint rung the LMCache KV prefix
     # covers. `num_cached_tokens` stays at the HBM prefix until both legs
@@ -286,6 +323,10 @@ class Sequence:
         self.prefill_gpu_complete = False
         self.num_rejected = 0
         self.num_cached_tokens = 0
+        # The prefill forward scheduled last, where it backed off below the
+        # point it resumed at (`BlockManager.replay_start`); None when it did
+        # not.
+        self.replay: Replay | None = None
         # Tokens whose blocks are registered in the prefix cache: through the
         # prompt as chunks finalize, then on through decode as generated blocks
         # fill (BlockManager.hash_decode_blocks). Distinct from
@@ -300,6 +341,15 @@ class Sequence:
         # the reuse a checkpoint would have delivered — what the EngineStats
         # cache section reports as recoverable.
         self.num_wanted_hit_blocks = 0
+        # DeepSeek-V4 bounded replay: whether the hit `BlockManager.can_allocate`
+        # admitted last has no checkpoint behind its state, so its prefill
+        # starts `Config.state_replay_tokens` below it and rebuilds the state
+        # there (`BlockManager.replay_start`; the forward is a `Replay`).
+        self.replays_hit = False
+        # That replay ends past the HBM hit, at LMCache MP's KV-only reach
+        # (`OffloadJointRecord.kv_only_tokens`): the connector loads that KV
+        # alone first, and once it lands the forward replays below the reach.
+        self.replay_kv_load = False
         # That gap as a prompt position, once it is worth a forward: the one
         # place off the checkpoint grid where this seq's prefill is cut so a
         # checkpoint can be kept. 0 = nowhere. Both written by
@@ -336,6 +386,11 @@ class Sequence:
         # `BlockManager._extend_hash_chain` for why it cannot simply be the
         # `block_hashes` the admission scan built.
         self.block_hashes: list[int] = []
+        # `prefix_hash.ShippedChain`, consumed by
+        # `BlockManager._adopt_shipped_chain`; None = the engine hashes it. It
+        # rides beside the seq in the ADD frame (`take_shipped_chains`), never
+        # inside a pickled seq (`__getstate__`).
+        self.prompt_hash_chain: tuple | None = None
         # Slots taken for midstep checkpoints of the forward now in flight,
         # as `(slot, position, hash)` — one slot each, since a checkpoint never
         # carries speculation scratch. Filled by `BlockManager.plan_midstep`
@@ -343,6 +398,10 @@ class Sequence:
         # handed back by `cancel_midstep` if that forward never runs. Non-empty
         # only between those two points.
         self.midstep_reservations: list[tuple] = []
+        # `checkpoint_end_pos` as the forward holding these reservations files
+        # it: moved back onto that forward's snapshot grid. 0 when the forward
+        # does not reach the anchor. Read by `StateSlotPool._anchor_of`.
+        self.midstep_anchor_pos = 0
         # Where this seq last kept a checkpoint. Prefill lands on the grid so
         # this tracks it, but a speculative decode step lands wherever
         # `1 + accepted` puts it, and there the grid is unreachable — see
@@ -469,6 +528,12 @@ class Sequence:
         return self.token_ids[key]
 
     @property
+    def replay_until(self) -> int:
+        """Where the prefill forward scheduled last resumed, 0 when it did not
+        back off below it."""
+        return 0 if self.replay is None else self.replay.until
+
+    @property
     def num_tokens(self):
         """The total number of tokens in the sequence. i.e. prompt + completion"""
         return self._num_tokens
@@ -539,6 +604,12 @@ class Sequence:
         self.last_token = token_id
         self.output_tokens.append(token_id)
         self.num_tokens += 1
+
+    def __getstate__(self):
+        # The shipped prompt chain rides beside the seq (`prompt_hash_chain`).
+        state = self.__dict__.copy()
+        state["prompt_hash_chain"] = None
+        return state
 
     # def __getstate__(self):
     #     return (

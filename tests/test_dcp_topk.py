@@ -617,6 +617,21 @@ def test_nothing_published_off_the_dcp_sparse_path():
     assert _publish(bs=4, q=2, world=4, is_sparse=False).dcp_token_block_tables is None
 
 
+def test_every_backend_answers_the_draft_s_dcp_table_publish():
+    """`EagleProposer` publishes the per-token DCP table on whatever builder the
+    target uses -- unconditionally, since a prefill target never built one --
+    and only the MLA builder has a DCP sparse indexer to feed. The rest answer
+    without writing: the draft reuses the target's metadata object, so a write
+    here would reach the verify step."""
+    from atom.model_ops.attentions import backends
+
+    base = backends.CommonAttentionBuilder._publish_dcp_token_block_tables
+    assert AiterMLAMetadataBuilder._publish_dcp_token_block_tables is not base
+    metadata = SimpleNamespace()
+    base(object(), metadata, 4, 1)
+    assert not vars(metadata)
+
+
 def test_fused_exchange_passes_the_kernels_one_row_per_query_token(monkeypatch):
     """Pin what the ops receive: the flatten to next_n=1 is invisible to every
     assertion above, and getting it wrong faults nothing and produces no NaN."""

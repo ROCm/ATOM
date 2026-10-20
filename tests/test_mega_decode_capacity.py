@@ -13,6 +13,8 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip("triton", reason="MegaMoE imports its Triton row-zeroing kernel")
+
 from atom.model_ops.fused_moe import flydsl_mega_experts as mega
 from atom.plugin import prepare as plugin_prepare
 

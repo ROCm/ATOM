@@ -795,7 +795,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
 
     def refresh_flydsl_plan(self, context_lens, *, create=False):
-        """Build or refresh aiter #5546's work plan for this forward.
+        """Build or refresh aiter's FlyDSL work plan for this forward.
 
         Depends only on context_lens, which every layer of one forward shares,
         so it is built here rather than per pa_decode call. Decode replays a
@@ -803,17 +803,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         (see build_for_cudagraph_capture) and its tensors must never be
         reallocated afterwards -- hence one entry per batch, kept forever, and
         refreshed in place before each replay. The refresh is a GPU kernel with
-        no readback. None when FlyDSL or the planner is off, or when the batch
-        is out of range.
+        no readback. None when FlyDSL is off, or when the batch is out of range.
         """
         # The plan only feeds FlyDSL; building one with FlyDSL off is a
         # refresh kernel per step that nothing reads.
-        if not (envs.ATOM_PA_FLYDSL and envs.ATOM_PA_FLYDSL_PLAN):
+        if not envs.ATOM_PA_FLYDSL:
             return None
         # From base_attention, not duplicated: the op checks the same bound.
         from aiter.ops.flydsl.pa_decode import plan_pa_decode
 
-        from atom.model_ops.base_attention import _FLYDSL_PLAN_MAX_BATCH
+        from atom.model_ops.base_attention import (
+            _FLYDSL_PLAN_MAX_BATCH,
+            flydsl_plan_shape,
+        )
 
         n = int(context_lens.shape[0])
         if not 1 <= n <= _FLYDSL_PLAN_MAX_BATCH:
@@ -828,33 +830,46 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         ):
             return None
 
-        # `max_partitions` omitted on purpose: that takes plan_pa_decode's own
-        # default. Setting it from the static split count clamps every request
-        # alike and removes the planner's mechanism -- this tree did that once.
+        # `max_partitions` is never the static split count: that clamps every
+        # request alike and removes the planner's mechanism -- this tree did
+        # that once. It takes plan_pa_decode's own default, except at head_dim
+        # 256, where `flydsl_plan_shape` caps it at 64 with a 256-workgroup
+        # budget to keep aiter's reducer off its slow serial path; remove that
+        # once aiter #5949 is in the image. The shape is fixed per builder (its
+        # KV pools are), so the key needs no part of it; the op's runtime plans
+        # take the same shape from the call's own head size.
         key = (n, self._flydsl_kv_heads, context_lens.device.index)
         plan = self._flydsl_plans.get(key)
         if plan is None and not create:
-            # Plans are only ever minted during cudagraph capture, where the
+            # This builder mints plans only during cudagraph capture, where the
             # batch is a ladder rung and the cost lands at startup. aiter's
             # planner takes batch as a tl.constexpr, so a new value is a kernel
             # specialization -- 65-72 ms cold -- and a plan that is never freed
             # because some captured graph may have baked its pointers in. A
-            # runtime batch with no plan is one no graph will replay, so the
-            # static path is the right answer for it rather than a stall.
+            # runtime batch with no capture-owned plan gets a runtime plan in
+            # run_pa_decode.
             # Only once a capture has happened: before the first one every
             # call lands here (profile run, eager warmup), and logging then
             # burns the one shot on a step that says nothing.
             if self._flydsl_plans and not self._flydsl_plan_unplanned:
                 self._flydsl_plan_unplanned = True
                 logger.info(
-                    "flydsl: batch %d has no plan, running the static path; "
+                    "flydsl: batch %d has no capture-owned plan; an explicit "
+                    "runtime plan will be used; "
                     "captured batches are %s",
                     n,
                     sorted({k[0] for k in self._flydsl_plans}),
                 )
             return None
         if plan is None:
-            plan = plan_pa_decode(context_lens, self._flydsl_kv_heads, query_length=1)
+            # One head size across this builder's pools, or aiter's defaults.
+            head_dims = {geometry.head_dim for geometry in self.kv_pools}
+            plan = plan_pa_decode(
+                context_lens,
+                self._flydsl_kv_heads,
+                query_length=1,
+                **flydsl_plan_shape(head_dims.pop() if len(head_dims) == 1 else None),
+            )
             self._flydsl_plans[key] = plan
             logger.info(
                 "flydsl work plan: num_seqs=%d kv_heads=%d max_partitions=%d "
@@ -1205,14 +1220,16 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 self.model_runner.block_size,
                 scratch=self.token_axis_scratch,
             )
-        else:
-            # One token per sequence reduces the gather to its last row, and
-            # `last_block_num_tokens` names the offset without a position.
+        elif not batch.is_dummy_run:
+            # One token per sequence reduces the gather to its last position's
+            # block. Indexed by position, not `block_table[-1]`: under MTP the
+            # table also holds the draft round's lookahead blocks past the last
+            # token (`draft_kv_lookahead`). A dummy run's synthetic lengths can
+            # point past its rows, and it writes nowhere anyway.
+            bsz = self.model_runner.block_size
             slots = [
-                block_table[-1] * self.model_runner.block_size + last_block_num - 1
-                for block_table, last_block_num in zip(
-                    block_tables, batch.last_block_num_tokens
-                )
+                block_table[(n - 1) // bsz] * bsz + (n - 1) % bsz
+                for block_table, n in zip(block_tables, context_lens.tolist())
             ]
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:scheduled_tokens] = slots[:scheduled_tokens]

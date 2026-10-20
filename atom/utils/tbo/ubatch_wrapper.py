@@ -4,6 +4,7 @@
 import logging
 import threading
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -91,7 +92,10 @@ class UBatchWrapper(nn.Module):
 
     def _ensure_comm_stream(self):
         if self.comm_stream is None:
-            self.comm_stream = torch.cuda.Stream()
+            priority = getattr(
+                self.attn_metadata_builder, "tbo_comm_stream_priority", 0
+            )
+            self.comm_stream = torch.cuda.Stream(priority=priority)
 
     def forward(
         self, input_ids: torch.Tensor, positions: torch.Tensor
@@ -194,8 +198,12 @@ class UBatchWrapper(nn.Module):
                     # thread is unblocked via TBOContext.partner.done (set in
                     # __exit__) so the main thread's done-wait returns promptly
                     # and re-raises errors[idx].
-                    logger.exception("[TBO] ubatch %d crashed: %s", idx, e)
+                    logger.exception("[TBO] ubatch %d crashed", idx)
                     errors[idx] = e
+                finally:
+                    # The worker thread outlives the forward; do not let its
+                    # thread-local context keep this microbatch's step alive.
+                    _forward_context_local.ctx = None
 
             return _job
 
@@ -204,20 +212,42 @@ class UBatchWrapper(nn.Module):
         _forward_context_local.ctx = None
 
         try:
-            # Hand each ubatch job to its persistent worker and wake it.
-            for i in range(N):
-                self._worker_job_done[i].clear()
-                self._worker_jobs[i] = _make_job(i)
-                self._worker_job_ready[i].set()
+            # The backend owns resources shared by both microbatches.
+            parent_forward = (
+                self.attn_metadata_builder.ubatch_forward(ctx.attn_metadata)
+                if self.attn_metadata_builder is not None
+                else nullcontext()
+            )
+            with parent_forward:
+                # Hand each ubatch job to its persistent worker and wake it.
+                for i in range(N):
+                    self._worker_job_done[i].clear()
+                    self._worker_jobs[i] = _make_job(i)
+                    self._worker_job_ready[i].set()
 
-            # Same handshake as before: all reach the barrier, then wake thread 0.
-            self.ready_barrier.wait()
-            tbo_ctxs[0].cpu_wait_event.set()
+                # Same handshake as before: all reach the barrier, then wake thread 0.
+                self.ready_barrier.wait()
+                tbo_ctxs[0].cpu_wait_event.set()
 
-            # Wait for this step's jobs to finish (replaces Thread.join()).
-            for i in range(N):
-                self._worker_job_done[i].wait()
+                # Wait for this step's jobs to finish (replaces Thread.join()).
+                for i in range(N):
+                    self._worker_job_done[i].wait()
         finally:
+            # The contexts point at each other (`partner`), a cycle that
+            # outlives the forward until Python's cycle collector runs, and
+            # each holds its microbatch's ForwardContext -- the attention
+            # metadata and every GPU tensor the step memoized. The collector
+            # runs on object counts and never sees that memory, so those
+            # steps piled up until the GPU ran out. Break the cycle here, with
+            # every worker done.
+            for tbo_ctx in tbo_ctxs:
+                tbo_ctx.partner = None
+                tbo_ctx.forward_context = None
+            # Order everything the workers left on the comm stream before any
+            # later work on the compute stream. A comm section normally rejoins
+            # (`switch_to_compute_sync`), but one that raised did not, and the
+            # next forward republishes the microbatch buffers on this stream.
+            compute_stream.wait_stream(self.comm_stream)
             # Restore original forward context
             _forward_context_local.ctx = saved_ctx
 

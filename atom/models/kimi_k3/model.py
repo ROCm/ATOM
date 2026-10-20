@@ -45,7 +45,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
-    use_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
 )
 from atom.model_ops.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -219,7 +219,7 @@ class KimiRMSNormGated(nn.Module):
         self.quant_type = quant_type
         self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor, gate: torch.Tensor):
+    def forward(self, x: torch.Tensor, gate: torch.Tensor, *, is_prefill: bool = False):
         from atom.model_ops.kimi_k3 import rmsnorm_gated
 
         return rmsnorm_gated(
@@ -229,6 +229,7 @@ class KimiRMSNormGated(nn.Module):
             self.variance_epsilon,
             quant_type=self.quant_type,
             quant_dtype=self.quant_dtype,
+            is_prefill=is_prefill,
         )
 
 
@@ -400,12 +401,18 @@ class KimiSparseMoeBlock(nn.Module):
                 quant_config, up_proj_prefix
             )
             latent_moe_use_norm = getattr(config, "latent_moe_use_norm", False)
-            # AITER RMSNorm+quant emits the activation layout consumed directly by
-            # the routed up-projection. FP4 Triton paths choose an M-dependent
-            # shuffled/non-shuffled scale layout, so keep those on their existing
-            # standalone quant path until the fused kernel supports both layouts.
             fp4_triton_active = up_proj_quant_type == QuantType.per_1x32 and (
-                use_triton_gemm() or use_fp4_non_shuffle_triton_gemm()
+                use_fp4_non_shuffle_triton_gemm()
+                or use_mxfp4_preshuffle_triton_gemm(up_proj_quant_dtype)
+            )
+            # RMSNorm's generic MXFP4 fusion always emits shuffled scales. Triton
+            # needs an M-dependent layout, so its routed path uses the existing
+            # layout-aware fused producer explicitly in forward.
+            self.fuse_routed_triton_mxfp4_quant = (
+                latent_moe_use_norm
+                and up_proj_quant_type == QuantType.per_1x32
+                and up_proj_quant_dtype == dtypes.fp4x2
+                and fp4_triton_active
             )
             self.fuse_routed_norm_quant = latent_moe_use_norm and (
                 (
@@ -456,6 +463,38 @@ class KimiSparseMoeBlock(nn.Module):
         self._defer_shared_add = self.shared_experts is not None and (
             self.use_latent_moe or self.tp_size == 1
         )
+
+    def _apply_routed_norm_and_up_proj(
+        self, routed_output: torch.Tensor
+    ) -> torch.Tensor:
+        if self.routed_expert_norm is not None:
+            if self.fuse_routed_triton_mxfp4_quant:
+                from atom.models.deepseek_v2 import (
+                    _fuse_rmsnorm_quant,
+                    _mxfp4_activation_quant_layout,
+                )
+
+                shuffle, scale_shuffle_padding = _mxfp4_activation_quant_layout(
+                    routed_output.shape[0]
+                )
+                (routed_output, routed_output_scale), _, _, _ = _fuse_rmsnorm_quant(
+                    routed_output,
+                    self.routed_expert_norm.weight,
+                    self.routed_expert_norm.eps,
+                    dtype_quant=dtypes.fp4x2,
+                    shuffle=shuffle,
+                    scale_shuffle_padding=scale_shuffle_padding,
+                )
+                return self.routed_expert_up_proj(
+                    routed_output, x_scale=routed_output_scale
+                )
+            routed_output = self.routed_expert_norm(routed_output)
+        if isinstance(routed_output, tuple):
+            routed_output, routed_output_scale = routed_output
+            return self.routed_expert_up_proj(
+                routed_output, x_scale=routed_output_scale
+            )
+        return self.routed_expert_up_proj(routed_output)
 
     def forward(
         self, hidden_states: torch.Tensor
@@ -512,15 +551,7 @@ class KimiSparseMoeBlock(nn.Module):
             # routed_expert_norm/up_proj are replicated, so the result stays full.
             if self.tp_size > 1:
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
-            if self.routed_expert_norm is not None:
-                routed_output = self.routed_expert_norm(routed_output)
-            if isinstance(routed_output, tuple):
-                routed_output, routed_output_scale = routed_output
-                routed_output = self.routed_expert_up_proj(
-                    routed_output, x_scale=routed_output_scale
-                )
-            else:
-                routed_output = self.routed_expert_up_proj(routed_output)
+            routed_output = self._apply_routed_norm_and_up_proj(routed_output)
         return routed_output
 
     def single_stream_moe_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -639,16 +670,7 @@ class KimiSparseMoeBlock(nn.Module):
                 current.wait_stream(alt)
                 routed_output = tensor_model_parallel_all_reduce(routed_output)
 
-            if self.routed_expert_norm is not None:
-                routed_output = self.routed_expert_norm(routed_output)
-            if isinstance(routed_output, tuple):
-                routed_output, routed_output_scale = routed_output
-                routed_output = self.routed_expert_up_proj(
-                    routed_output,
-                    x_scale=routed_output_scale,
-                )
-            else:
-                routed_output = self.routed_expert_up_proj(routed_output)
+            routed_output = self._apply_routed_norm_and_up_proj(routed_output)
 
             if self.tp_size == 1:
                 current.wait_stream(alt)
@@ -1235,12 +1257,20 @@ class KimiKDAAttention(nn.Module):
             f_a, f_a_scale = strided_per_token_quant(f_a_view, dtypes.fp8)
             gate = self.f_b_proj(f_a, x_scale=f_a_scale)
         else:
-            gate = self.f_b_proj(f_a_view.contiguous())
+            # Not .contiguous(): it returns a one-row view as is (size-1 dims
+            # ignore strides), handing the GEMM the fused row stride, which
+            # the gfx950 FlyDSL bf16 path rejects. A fresh buffer is aligned.
+            f_a = torch.empty(
+                f_a_view.shape, dtype=f_a_view.dtype, device=f_a_view.device
+            )
+            gate = self.f_b_proj(f_a.copy_(f_a_view))
         gate = rearrange(gate, "t (h d) -> 1 t h d", d=self.head_dim)
-        # Allocate from fused_in (bf16), not hidden_states, which may be fp8.
-        out = fused_in.new_empty(
-            (num_actual_tokens, self.num_local_heads, self.head_dim)
-        )
+        # Prefill returns its own contiguous output. Allocate this buffer only
+        # for decode/spec-decode, where the recurrence writes into it directly.
+        if kda_metadata.num_prefills <= 0:
+            out = fused_in.new_empty(
+                (num_actual_tokens, self.num_local_heads, self.head_dim)
+            )
 
         conv_weights = self.conv_weight
         state_indices = kda_metadata.non_spec_state_indices_tensor
@@ -1298,7 +1328,14 @@ class KimiKDAAttention(nn.Module):
             # initial_state dtype; the gathered initial is allocated as such),
             # so no .to() cast is needed.
             ssm_state[state_indices] = last_state
-            out.copy_(kda_out.squeeze(0))
+            # o_norm only reads this tensor, so keep the contiguous KDA output
+            # instead of materializing an identical copy into `out`.
+            assert kda_out.dtype == fused_in.dtype, (
+                "KDA output dtype must match the former fused_in-backed output "
+                f"buffer: got {kda_out.dtype} vs {fused_in.dtype}"
+            )
+            assert kda_out.is_contiguous(), "KDA output must be contiguous for o_norm"
+            out = kda_out.squeeze(0)
         elif kda_metadata.num_decodes > 0:
             # Slice the per-token cache-slot indices once (used for both the
             # conv update and the fused recurrence below).
@@ -1452,7 +1489,9 @@ class KimiKDAAttention(nn.Module):
             out.zero_()
 
         normed = self.o_norm(
-            out, rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim)
+            out,
+            rearrange(out_gate, "t (h d) -> t h d", d=self.head_dim),
+            is_prefill=kda_metadata.num_prefills > 0,
         )
         # A fused per-token quant makes o_norm return (quantized, scale); feed it
         # straight to o_proj's x_scale path. Otherwise it is a bf16 tensor.
