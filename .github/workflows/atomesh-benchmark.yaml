@@ -555,7 +555,7 @@ jobs:
           print(f"[gluon-c32-fixture] validating pinned aiter {ref} on CPU")
           PYFIXTURE
           /tmp/m3-fixture-venv/bin/python -m pytest -q /tmp/m3-fixture-tests/test_m3_gluon_fixtures.py
-          PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" /tmp/m3-fixture-venv/bin/python -m pytest --noconftest -q tests/test_gluon_prefill.py tests/test_m3_gqa_store_ci.py
+          PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" /tmp/m3-fixture-venv/bin/python -m pytest --noconftest -q tests/test_gluon_prefill.py tests/test_gluon_rope_fixture.py tests/test_m3_gqa_store_ci.py
 
       - name: Group benchmark matrix by configuration
         id: groups
