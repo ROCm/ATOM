@@ -42,11 +42,11 @@ from atom.model_ops.linear import (
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
 
-# AR+RMSNorm fusion: the final down_proj -> output norm may fuse its all-reduce.
-# The attention o_proj -> post-attention norm deliberately does not: on TP4 the
-# fused reduction changes the single-layer drafter enough to collapse M3 GQA
-# acceptance (about 68% -> 23%), while the ordinary all-reduce preserves the
-# checkpoint's reference behavior. The final fusion does not have that issue.
+# AR+RMSNorm fusion: when on (default), RowParallel o_proj/down_proj skip their
+# own all-reduce (reduce_results=False) and the downstream RMSNorm fuses
+# all-reduce + residual-add + norm into one kernel. Only active at TP>1; the
+# RMSNorm/RowParallel paths fall back to plain behavior at TP1. Same env and
+# kernel as ATOM's mainline TP models (deepseek_v2, qwen3_moe, ...).
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 
 
@@ -166,10 +166,13 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # Keep the attention reduction explicit for draft-model fidelity. Point 2
-        # (norm_output only) remains fused: down_proj skips its all-reduce so the
-        # model's final self.norm performs it with residual-add + norm.
-        attn_reduce = True
+        # Point 1 (always): o_proj skips its all-reduce so post_attention_layernorm
+        # fuses all-reduce + residual-add + norm. Point 2 (norm_output only):
+        # down_proj skips its all-reduce so the model's final self.norm fuses it;
+        # for the legacy (norm_output=False) path the output norm is deferred to
+        # compute_logits with no adjacent residual-add, so down_proj all-reduces
+        # normally.
+        attn_reduce = not ENABLE_ALLREDUCE_RMSNORM_FUSION
         mlp_reduce = not (ENABLE_ALLREDUCE_RMSNORM_FUSION and norm_output)
 
         self.self_attn = Eagle3LlamaAttention(
@@ -198,7 +201,7 @@ class Eagle3LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=False,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
         )
 
     def _dual_norm_cat(
