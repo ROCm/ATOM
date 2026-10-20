@@ -5672,6 +5672,32 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
+def _server_config(port: int, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.port = port
+    return cfg
+
+
+def test_engine_id_is_distinct_per_server_on_one_host():
+    # One TP1 server per GPU: every one is DP rank 0, and the lookup socket
+    # sits under one host directory. Without the port, the eight schedulers
+    # would connect to whichever server bound the shared path last.
+    ids = [offcfg.lmcache_engine_id(_server_config(22010 + gpu)) for gpu in range(8)]
+    assert len(set(ids)) == 8
+
+
+def test_engine_id_with_port_still_pairs_one_replica_and_splits_replicas():
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config(22010, 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-p22010-dp3"}
+    ids = [offcfg.lmcache_engine_id(_server_config(22010, rank)) for rank in range(8)]
+    assert len(set(ids)) == 8
+
+
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     # Worker ids index the replica-local PP x TP grid. Folding DP in would push
     # every replica but the first past lookup_server_worker_ids=[0], leaving

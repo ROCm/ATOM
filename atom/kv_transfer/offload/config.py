@@ -469,6 +469,16 @@ def lmcache_engine_id(config) -> str:
     Under ``--enable-dp-attention`` this is the normal case, not a corner case:
     ``CoreManager`` folds TP into DP, so each GPU becomes its own replica with
     ``tensor_parallel_size == 1``.
+
+    The DP rank alone only separates replicas of one server. The socket lives
+    under a fixed host directory (``/tmp/vllm_rpc`` without vLLM), so two
+    servers on one host -- one per GPU is the usual way to serve a TP1 model --
+    both bind ``dp0``; each bind takes the path over, and a scheduler connects
+    to whichever server bound last. Its loads then follow another server's
+    hits. ``config.port`` is the model runner's rendezvous port (MASTER_PORT),
+    which no two servers on a host can share, and every process of one server
+    carries the same value, so it tells servers apart without splitting a
+    replica.
     """
     dp_rank = int(
         getattr(
@@ -478,6 +488,9 @@ def lmcache_engine_id(config) -> str:
         )
         or 0
     )
+    port = getattr(config, "port", None)
+    if isinstance(port, int) and port > 0:
+        return f"atom-offload-p{port}-dp{dp_rank}"
     return f"atom-offload-dp{dp_rank}"
 
 
