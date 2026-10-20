@@ -126,10 +126,10 @@ def _keep_hooked_layers(plans, inner):
     if not hooked:
         return plans
     kept = [
-        replace(p, kda=None, moe=None) if p.layer_id in hooked and p.mono else p
+        replace(p, kda=None, moe=None) if p.layer_id in hooked and p.moe else p
         for p in plans
     ]
-    dropped = sorted(hooked & {p.layer_id for p in plans if p.mono})
+    dropped = sorted(hooked & {p.layer_id for p in plans if p.moe})
     if dropped:
         logger.info(
             "Kimi-K3 mono: layers %s keep the original modules, something other"

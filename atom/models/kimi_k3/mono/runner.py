@@ -17,7 +17,9 @@ kernels:
 Layer 0 and the full-attention layers take the original modules: the kernels
 have no attention of their own, so an MLA layer keeps its paged KV cache and its
 own path, and layer 0 has no AttnRes block behind it to mix. ``weights.bind_model``
-decides which is which; the two paths hand each other the same tensors.
+decides which is which; the two paths hand each other the same tensors. With
+``ATOM_MONO_K3_MLA_K2`` a full-attention layer also runs K2 for everything after
+its attention (``_layer_ffn_only``).
 
 The block-residual buffer is the one place the mono loop cannot reuse
 ``KimiDecoderLayer.forward``: ``AttnRes.maybe_close_block`` grows the candidates
@@ -130,7 +132,13 @@ class K3MonoDecodeRunner:
         self.debug = envs.ATOM_MONO_DEBUG
         self.inner = inner_model(model)
         self.plans = _keep_hooked_layers(
-            bind_model(self.inner, self.dims, self.rank), self.inner
+            bind_model(
+                self.inner,
+                self.dims,
+                self.rank,
+                mla_k2=envs.ATOM_MONO_K3_MLA_K2,
+            ),
+            self.inner,
         )
         self.num_blocks = num_blocks(len(self.inner.layers))
         # K3 mono requires DSpark (`config_refusal`), so in an armed deployment
@@ -280,7 +288,7 @@ class K3MonoDecodeRunner:
                 diag=self.debug,
             )
             for p in self.plans
-            if p.mono
+            if p.moe is not None
         }
 
     def _build_width(self, key: int) -> WidthBuild:
@@ -346,6 +354,10 @@ class K3MonoDecodeRunner:
         raise_if_given_up("Kimi-K3 mono", self.rank, rows, waits, self.mailboxes)
 
     def _layer(self, build, plan, positions, prefix, blocks, add, add2, metadata):
+        if plan.ffn_only:
+            return self._layer_ffn_only(
+                build, plan, positions, prefix, blocks, add, add2
+            )
         if not plan.mono:
             rows = prefix.size(0)
             out = self._fallback(plan, positions, prefix, blocks, add, add2)
@@ -364,6 +376,38 @@ class K3MonoDecodeRunner:
             # K2 updates ``prefix`` in place: on a block-write layer it restarts
             # it at the all-reduced o_proj output, which K1 has already banked
             out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
+        self._write_aux(plan.layer_id, out)
+        return out
+
+    def _layer_ffn_only(self, build, plan, positions, prefix, blocks, add, add2):
+        """A full-attention layer under ``ATOM_MONO_K3_MLA_K2``: the production
+        attention up to ``o_proj``'s input, then K2 for the rest of the layer.
+
+        ``bind_model`` refuses a layer that closes a block, so ``before`` mixes
+        the same candidates K2's MLP seam does and nothing is banked here. The
+        seam's ``prefix`` is a fresh tensor (the previous layer always hands an
+        FFN output, so it takes the ``add`` branch), which K2 updates in place
+        exactly as it does on a KDA layer."""
+        layer = self.inner.layers[plan.layer_id]
+        before, _ = layer_block(plan.layer_id)
+        normed, prefix = layer.self_attention_attn_res(
+            prefix, blocks[:, :before], add, add2
+        )
+        core = layer.self_attn.forward_pre_o(positions, normed)
+        rows = prefix.size(0)
+        if (
+            core.dim() != 2
+            or core.size(0) < rows
+            or core.size(1) != self.dims.proj
+            or core.dtype != torch.bfloat16
+            or core.stride() != (self.dims.proj, 1)
+        ):
+            # K2 reads the first ``rows`` rows of a plain [rows, proj] bf16 core
+            raise MonoUnsupported(
+                f"layer {plan.layer_id}: attention core {tuple(core.shape)} "
+                f"{core.dtype} stride {core.stride()} for an {rows}-row step"
+            )
+        out = (prefix, self._k2(build, plan, core, prefix, blocks), None)
         self._write_aux(plan.layer_id, out)
         return out
 

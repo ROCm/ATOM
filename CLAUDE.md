@@ -75,7 +75,8 @@ Key entry points:
   kernel and its CPU I3 test. Kimi-K3 runs only its KDA layers — K1 (the
   attention seam through the KDA recurrence) and K2 (`o_proj` + the latent MoE)
   — and only on a uniform speculative verify of at most 8 rows; the MLA layers
-  keep the original paged path. Which steps it serves and how a served step is
+  keep the original paged path (their attention does; `ATOM_MONO_K3_MLA_K2=1`
+  also runs K2 on them, off by default). Which steps it serves and how a served step is
   keyed live in `kimi_k3/mono/plan.py`, apart from `runner.py` so the CPU test
   gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
   whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /

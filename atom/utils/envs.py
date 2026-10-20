@@ -493,6 +493,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and 16 are built and measured, anything else turns mono off by name. Off
     # (8) by default until a task-level accuracy run exists.
     "ATOM_MONO_K3_MAX_ROWS": lambda: int(os.getenv("ATOM_MONO_K3_MAX_ROWS", "8")),
+    # Kimi-K3 mono: also run K2 (o_proj, its all-reduce, the MLP AttnRes seam and
+    # the latent MoE) on the 24 full-attention (MLA) layers. Their attention stays
+    # on the production path. Off by default until a task-level accuracy run
+    # exists: K2's latent MoE carries an unsettled MXFP4 precision cost, and this
+    # applies it to 24 more layers.
+    "ATOM_MONO_K3_MLA_K2": lambda: os.getenv("ATOM_MONO_K3_MLA_K2", "0") == "1",
     # GLM-5.2 mono: run the "full" indexer layers (18 of 78) through the fused
     # MonoKernel (atom/models/glm52/mono/kernels/{kernel,layout,op}.py, built
     # with with_indexer=True), which does index Q/K/W projection, paged FP8
