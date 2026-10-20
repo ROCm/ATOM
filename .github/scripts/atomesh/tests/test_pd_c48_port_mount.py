@@ -24,6 +24,8 @@ CPUREF = {
     "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4-INPAD-WARM": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-FQ3": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-FP8ATTN-FQ2-WARM": "cpu-lru-refresh-v2",
+    "V-QD-CPUREF2-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM": "cpu-lru-refresh-v2",
 }
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 LDFP4_CASE = "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
@@ -52,7 +54,7 @@ class PortMountTest(unittest.TestCase):
         for case, fix_dir in CPUREF.items():
             rc, cpuref = mounts(case)
             self.assertEqual(rc, 0)
-            inpad = case.startswith(INPAD_CASE)
+            inpad = "-INPAD" in case
             kda_dir = "inproj-pad128" if inpad else "online-quant-fix"
             self.assertIn(f"/c48-model-gap/{kda_dir}/kda.py,", cpuref[1])
             self.assertEqual(cpuref[1].split(",")[2:], base[1].split(",")[2:])
@@ -60,11 +62,11 @@ class PortMountTest(unittest.TestCase):
             self.assertTrue(cpuref[3].endswith(MANAGER))
             self.assertIn(f"/c48-model-gap/{fix_dir}/manager.py,", cpuref[3])
             fp8 = "-FP8ATTN" in case
-            ldfp4 = case.startswith(LDFP4_CASE)
+            ldfp4 = "-PQ-LDFP4" in case
             self.assertEqual(len(cpuref), 4 + fp8 + ldfp4)
             if fp8:
                 self.assertTrue(cpuref[4].endswith(FP8ATTN))
-                fp8_dir = "mla-prefill-fp8-fusedq" if case == FQ3_CASE else "mla-prefill-fp8"
+                fp8_dir = "mla-prefill-fp8-fusedq" if case.startswith(FQ3_CASE) else "mla-prefill-fp8"
                 self.assertIn(f"/c48-model-gap/{fp8_dir}/", cpuref[4])
             if ldfp4:
                 self.assertTrue(cpuref[5].endswith(LDFP4))
