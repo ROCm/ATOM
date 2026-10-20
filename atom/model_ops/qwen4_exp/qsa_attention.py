@@ -32,6 +32,8 @@ arithmetically once the group is behind the current chunk. That is what
 raw index keys so pooling can read them back.
 """
 
+import functools
+import logging
 from types import SimpleNamespace
 
 import aiter
@@ -63,6 +65,20 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
+
+logger = logging.getLogger(__name__)
+
+# Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
+# four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
+_FLYDSL_WIDTHS = (1027, 2051, 3075, 4099)
+
+
+@functools.cache
+def _flydsl_attention_op():
+    # Imported on first use so the flag-off path needs no FlyDSL QSA in aiter.
+    from aiter.ops.flydsl.kernels.qsa.attention import qsa_sparse_attention_flydsl
+
+    return qsa_sparse_attention_flydsl
 
 
 def build_qwen4_exp_rope(config, head_size: int):
@@ -458,17 +474,24 @@ class Qwen4ExpAttention(nn.Module):
             qsa = qsa.for_tokens(num_tokens)
             self._store_kv(key, value, qsa.slot_mapping)
             selected = self._select_tokens(hidden_states, positions, qsa)
-            attn_out = self._attend(
-                query,
-                selected,
-                qsa.block_tables,
-                qsa.token_to_req,
-                (
-                    None
-                    if forward_context.context.is_prefill
-                    else qsa.block_tables.shape[0]
-                ),
-            )
+            attn_out = None
+            if forward_context.context.is_prefill:
+                attn_out = self._flydsl_attention(query, key, value, selected, qsa)
+            if attn_out is None or envs.ATOM_QSA_FLYDSL_ATTN_CHECK:
+                native = self._attend(
+                    query,
+                    selected,
+                    qsa.block_tables,
+                    qsa.token_to_req,
+                    (
+                        None
+                        if forward_context.context.is_prefill
+                        else qsa.block_tables.shape[0]
+                    ),
+                )
+                if attn_out is not None:
+                    self._log_flydsl_difference(attn_out, native, qsa)
+                attn_out = native
 
         if is_per_token_fp8_linear(self.o_proj):
             gated, gated_scale = sigmoid_mul_quant(
@@ -477,6 +500,56 @@ class Qwen4ExpAttention(nn.Module):
             return self.o_proj(gated, x_scale=gated_scale)
         gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
+
+    def _flydsl_attention(self, query, key, value, selected, qsa):
+        """aiter FlyDSL sparse attention for an eager prefill, or None for the native kernel."""
+        width = next((w for w in _FLYDSL_WIDTHS if w >= selected.shape[1]), None)
+        if (
+            not envs.ATOM_QSA_FLYDSL_ATTN
+            or qsa.host_lens is None
+            or width is None
+            or torch.cuda.is_current_stream_capturing()
+            or self.num_kv_heads != 1
+            or self.num_heads not in (12, 6, 3)
+            or self.head_dim != 256
+            or query.dtype != torch.bfloat16
+        ):
+            return None
+        query_lens, seq_lens = qsa.host_lens
+        if sum(query_lens) != query.shape[0]:
+            return None
+        if qsa.context_slots is None:
+            k, v = key.contiguous(), value.contiguous()
+        else:
+            k = self.k_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+            v = self.v_cache.flatten(0, 1).index_select(0, qsa.context_slots)
+        # The expansion drops columns no row can reach; the kernel reads them as -1.
+        # It does not validate the layout: a malformed selection gives wrong output.
+        indices = torch.nn.functional.pad(
+            selected, (0, width - selected.shape[1]), value=-1
+        )
+        return _flydsl_attention_op()(
+            query.contiguous(),
+            k,
+            v,
+            indices,
+            query_lens=query_lens,
+            prefix_lens=tuple(s - q for q, s in zip(query_lens, seq_lens)),
+            softmax_scale=self.scaling,
+        )
+
+    def _log_flydsl_difference(self, flydsl, native, qsa):
+        difference = (flydsl.float() - native.float()).abs()
+        logger.info(
+            "QSA FlyDSL check layer=%d queries=%s seqs=%s max_abs=%.3e mean_abs=%.3e "
+            "native_max=%.3e",
+            self.layer_num,
+            qsa.host_lens[0],
+            qsa.host_lens[1],
+            difference.max().item(),
+            difference.mean().item(),
+            native.float().abs().max().item(),
+        )
 
     def _profile_attention(self, query, key, value, hidden_states, positions):
         """Exercise real indexer, cache and sparse workspaces before pool sizing.
