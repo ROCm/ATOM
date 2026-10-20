@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Exercise the GPU gate's real RoPE and writer dispatch on CPU.
 
-Only GPU primitives are replaced; the fixture constructor, RotaryEmbedding
-forward and PagedAttentionImpl writer selection execute their real code.
+GPU primitives and tracing are replaced; the fixture constructor,
+RotaryEmbedding forward and PagedAttentionImpl writer selection execute
+their real code.
 """
 
 import ast
@@ -52,6 +53,15 @@ def test_target_prefix_writer_invokes_real_rotary_above_threshold(
         reshape_and_cache_with_pertoken_quant=cache_gpu,
     )
     monkeypatch.setitem(sys.modules, "aiter", aiter)
+    # Tracing is outside this CPU writer test. Importing its runtime module
+    # pulls in atom.utils, model loading and distributed dependencies that
+    # are deliberately absent from the torch/pytest-only CI environment.
+    # Keep the real RoPE constructor and forward body unchanged.
+    monkeypatch.setitem(
+        sys.modules,
+        "atom.utils.decorators",
+        SimpleNamespace(mark_trace=lambda **kwargs: lambda fn: fn),
+    )
     rotary_module = load(
         ROOT / "atom/model_ops/rotary_embedding.py", "real_fixture_rotary"
     )
