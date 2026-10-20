@@ -34,11 +34,29 @@ def load_attention_dispatch():
     return module
 
 
+def make_rotary(dim, max_positions, device):
+    import torch
+
+    from atom.model_ops.rotary_embedding import RotaryEmbedding
+
+    # Both the fused writer and long-prefix fallback consume this same cache.
+    # BF16 matches RotaryEmbedding.forward, which casts caches to Q's dtype.
+    return RotaryEmbedding(
+        head_size=dim,
+        rotary_dim=dim,
+        max_position_embeddings=max_positions,
+        base=5_000_000.0,
+        is_neox_style=True,
+        dtype=torch.bfloat16,
+    ).to(device)
+
+
 def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
     import torch
 
     from atom.model_ops.attention_mha import PagedAttentionImpl
     from atom.model_ops.layernorm import GemmaRMSNorm
+    from atom.utils import envs
 
     device = torch.device("cuda")
     heads, kv_heads, dim, page = 16, 16 if draft else 1, 128, 128
@@ -60,15 +78,7 @@ def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
     # The draft writer must leave these unused planes poisoned.
     ks = torch.full((blocks, kv_heads, page), float("nan"), device=device)
     vs = torch.full_like(ks, float("nan"))
-    angles = positions.float()[:, None] * torch.linspace(
-        0.001, 0.1, dim // 2, device=device
-    )
-    rope = SimpleNamespace(
-        cos_cache=angles.cos(),
-        sin_cache=angles.sin(),
-        is_neox_style=True,
-        rotary_dim=dim,
-    )
+    rope = make_rotary(dim, klen, device)
     norm_args = (
         {}
         if draft
@@ -126,9 +136,18 @@ def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
         ]
         meta.slot_mapping = slots[begin:end]
         meta.has_cached = begin > 0
-        q, k, v, kc_out, vc_out, kscale, vscale = layer.rope_cache(
-            q, k, v, chunk, positions[begin:end], ctx
-        )
+        with patch.object(
+            layer,
+            "_gemma_norm_rope_then_cache",
+            wraps=layer._gemma_norm_rope_then_cache,
+        ) as unfused:
+            q, k, v, kc_out, vc_out, kscale, vscale = layer.rope_cache(
+                q, k, v, chunk, positions[begin:end], ctx
+            )
+            assert unfused.call_count == int(
+                not draft
+                and end - begin > envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS
+            ), "Unexpected target cache-writer path"
         assert kc_out.data_ptr() == kc.data_ptr() and vc_out.data_ptr() == vc.data_ptr()
         written.append((k, v))
     all_keys = torch.cat([pair[0] for pair in written])
@@ -304,11 +323,12 @@ def main():
     with (
         patch.object(envs, "ATOM_FORCE_ATTN_TRITON", True),
         patch.object(envs, "ATOM_USE_UNIFIED_ATTN", False),
+        patch.object(envs, "ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", 8192),
         patch.object(ua, "_unified_attention_gfx950", record),
         patch.object(ua, "_unified_attention_2d_triton", forbid),
         patch.object(ua, "_unified_attention_3d_triton", forbid),
     ):
-        cases = [(False, 4, 513, 1.0)]
+        cases = [(False, 4, 513, 1.0), (False, 4, 8196, 1.0), (False, 4, 8197, 1.0)]
         cases += [
             (True, q, 16385 if q < 5 else 2049, scale)
             for q in (1, 4, 1024)
@@ -330,7 +350,7 @@ def main():
                 assert any(n > 1 for n in launches[before:]), launches[before:]
     assert 1 in launches and any(n > 1 for n in launches), launches
     print(
-        f"[gluon-adapter-gate] 9 writer cases and 4 decode graph cases passed; "
+        f"[gluon-adapter-gate] 11 writer cases and 4 decode graph cases passed; "
         f"observed launches={len(launches)}; splits={launches}; official configs={configs}",
         flush=True,
     )
