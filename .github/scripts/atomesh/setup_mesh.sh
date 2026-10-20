@@ -21,10 +21,7 @@ artifact_dir="${run_dir}/mesh-build"
 container_dir="/run_logs/slurm_job-${job_id}/mesh-build"
 # The same job's benchmark and eval phases consume the same build artifact.
 if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]]; then
-  # Not the usual atomesh-mesh-cache-<uid>: on pit2-p03-g12/g34 the CI user's
-  # one holds a half-extracted crate (adler2-2.0.1 without its Cargo.toml)
-  # that fails every Mesh build; this experiment branch builds in its own.
-  cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)-optin}"
+  cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
   mkdir -p "${artifact_dir}" "${cache_dir}"
   source_commit="$(git -C "${repo_root}" rev-parse HEAD)"
   source_dirty=false

@@ -203,9 +203,10 @@ jobs:
 
       - name: Run Slurm benchmark cell
         env:
-          # Build the reviewed source in a separate setup container. Use the
-          # existing release profile for both benchmark and eval services.
-          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          # This experiment branch leaves atom/mesh alone, so every cell runs
+          # the image's prebuilt atomesh: the CI user's Mesh build cache on
+          # pit2-p03-g12/g34 is broken (adler2-2.0.1 without its Cargo.toml).
+          ATOMESH_BUILD_MESH: 'false'
           ATOMESH_MESH_BUILD_PROFILE: release
           ATOMESH_ATOM_SOURCE: ${{ inputs.atom_source }}
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
