@@ -217,6 +217,47 @@ def test_a_hooked_layer_keeps_its_own_module():
     assert [p.mono for p in kept] == [True, True, False, True]
 
 
+def _aux_hook(*args):
+    """A drafter aux-capture hook: ``Drafter._make_aux_hook`` marks its hooks."""
+
+
+_aux_hook.is_aux_capture = True
+
+
+def test_the_drafter_s_aux_hooks_do_not_hold_a_layer_back():
+    """``_write_aux`` fills the tap on a mono step, so the drafter's own hooks
+    (forward and pre-forward) must not cost a tapped layer its kernels."""
+    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
+
+    plans, inner = _plans_and_layers(4, ())
+    inner.layers[2].register_forward_hook(_aux_hook)
+    inner.layers[1].register_forward_pre_hook(_aux_hook)
+    assert _keep_hooked_layers(plans, inner) is plans
+
+
+def test_a_foreign_hook_beside_the_drafter_s_still_holds_the_layer_back():
+    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
+
+    plans, inner = _plans_and_layers(4, (2,))
+    inner.layers[2].register_forward_hook(_aux_hook)
+    inner.layers[0].register_forward_hook(_aux_hook)
+    kept = _keep_hooked_layers(plans, inner)
+    assert [p.mono for p in kept] == [True, True, False, True]
+
+
+def test_the_drafter_marks_the_hooks_mono_exempts():
+    """The mark is an attribute set in ``spec_decode/drafter.py`` and read in
+    ``plan._keep_hooked_layers``; pin that the two still agree."""
+    try:
+        from atom.spec_decode.drafter import Drafter
+    except ImportError as error:  # the drafter imports the loader and triton ops
+        pytest.skip(f"atom.spec_decode.drafter needs the GPU stack: {error}")
+
+    fake = SimpleNamespace(_aux_buffers=[torch.zeros(2, 2)])
+    hook = Drafter._make_aux_hook(fake, 0, lambda output, module: output)
+    assert getattr(hook, "is_aux_capture", False)
+
+
 def test_no_hooks_leaves_every_plan_alone():
     from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
 
