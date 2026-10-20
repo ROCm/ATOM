@@ -43,7 +43,6 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sp_moe_sort import supports_m3_sp_tiled_sort
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
@@ -330,9 +329,6 @@ class MiniMaxM3MoE(nn.Module):
             # padded intermediate avoids backend pad-skip precision issues.
             self.experts.quant_method.intermediate_pad = 0
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
-        self.experts._sp_tiled_sort_enabled = supports_m3_sp_tiled_sort(
-            self.experts, tp_replicated_o_proj=self._tp_replicated_o_proj
-        )
         self.fuse_shared_experts = (
             getattr(self.experts, "num_fused_shared_experts", 0) > 0
         )
@@ -916,6 +912,8 @@ class MiniMaxM3Model(nn.Module):
                         next_fp8,
                     )
                 )
+                if not next_fp8:
+                    hidden_states_scale = None
                 input_normalized = True
             else:
                 # A tail may feed a dense layer too. Its input norm has already

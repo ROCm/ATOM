@@ -8,9 +8,17 @@ as for the existing QuickAllReduce implementation. There is only one payload
 communication phase and one quantization; no full all-reduce is performed.
 """
 
-from importlib import import_module
-
 import torch
+
+try:
+    import aiter.ops.quick_reduce_scatter as _qrs_ops
+except ModuleNotFoundError as exc:
+    if exc.name not in {"aiter", "aiter.ops", "aiter.ops.quick_reduce_scatter"}:
+        raise
+    _qrs_ops = None
+
+# Resolve optional AITER support before dispatch; execution failures propagate.
+_qr_reduce_scatter = getattr(_qrs_ops, "qr_reduce_scatter", None)
 
 
 def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
@@ -21,7 +29,9 @@ def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     failures while building or executing an available kernel propagate.
     """
     comm = getattr(getattr(group, "device_communicator", None), "qr_comm", None)
-    if comm is None or comm.disabled or comm.world_size != 4:
+    if _qr_reduce_scatter is None or comm is None or comm.disabled:
+        return None
+    if comm.world_size != 4:
         return None
     if getattr(comm.qr_quant_level, "name", None) != "INT4":
         return None
@@ -38,16 +48,6 @@ def try_quick_reduce_scatter(x: torch.Tensor, group) -> torch.Tensor | None:
     if arch != "gfx950":
         return None
 
-    try:
-        module = import_module("aiter.ops.quick_reduce_scatter")
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"aiter", "aiter.ops", "aiter.ops.quick_reduce_scatter"}:
-            raise
-        return None
-    qr_reduce_scatter = getattr(module, "qr_reduce_scatter", None)
-    if qr_reduce_scatter is None:
-        return None
-
     out = x.new_empty((x.shape[0] // comm.world_size, *x.shape[1:]))
-    qr_reduce_scatter(comm._ptr, x, out, bool(comm.use_fp16_kernels))
+    _qr_reduce_scatter(comm._ptr, x, out, bool(comm.use_fp16_kernels))
     return out

@@ -2328,8 +2328,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "flydsl fused_moe cannot serve as a fallback because the FlyDSL "
                 "scale layout is skipped under use_triton_ep."
             )
-            if getattr(layer, "_sp_tiled_sort_enabled", False):
-                moe_extra_args["use_tiled_sort"] = True
             if sp_input_scale is not None:
                 moe_extra_args["dtype"] = torch.bfloat16
             return fused_moe(
@@ -5396,7 +5394,6 @@ class FusedMoE(torch.nn.Module):
         router_logits: torch.Tensor,
         *,
         token_group=None,
-        sp_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         assert self.quant_method is not None
 
@@ -5414,15 +5411,6 @@ class FusedMoE(torch.nn.Module):
         # Gather SP token shards for local expert computation, then sum partials
         # back to each owner. Routed all2all handles token movement itself.
         sp_moe = sp_is_enabled() and not self.moe_parallel_config.use_all2all_kernels
-        if sp_topk is not None:
-            assert sp_moe and type(self.quant_method) is Mxfp4MoEMethod
-            assert self.moe_parallel_config.dp_logical_ratio == 1 and not self.use_ep
-        mega = getattr(self, "_sp_mega_moe", None)
-        if sp_moe and mega is not None and mega.supports(self, hidden_states):
-            # MegaMoE owns both collectives and returns this rank's token shard.
-            if sp_topk is not None:
-                return mega.forward(self, hidden_states, router_logits, sp_topk=sp_topk)
-            return mega.forward(self, hidden_states, router_logits)
         sp_input_kwargs = {}
         if sp_moe or token_group is not None:
             world = (
@@ -5438,8 +5426,7 @@ class FusedMoE(torch.nn.Module):
                 and self.moe_parallel_config.dp_logical_ratio == 1
             )
             local_topk = (
-                sp_topk is None
-                and mxfp4_input
+                mxfp4_input
                 and not self.use_ep
                 and not self.expert_layout.shared_is_routed
                 and not self.use_grouped_topk
@@ -5469,9 +5456,7 @@ class FusedMoE(torch.nn.Module):
                 sp_input_kwargs["sp_input_scale"] = input_scale
             else:
                 hidden_states = gather(hidden_states)
-            if sp_topk is not None:
-                sp_input_kwargs["sp_topk"] = tuple(gather(t) for t in sp_topk)
-            elif not local_topk:
+            if not local_topk:
                 router_logits = gather(router_logits)
 
         # Simulated DP with no peers to gather from: the absent ranks' token

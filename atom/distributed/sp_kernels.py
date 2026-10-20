@@ -11,8 +11,8 @@ import triton.language as tl
 def _pack_fields_kernel(
     source,
     output,
-    TOKENS: tl.constexpr,
-    STRIDE: tl.constexpr,
+    TOKENS,
+    STRIDE,
     WIDTH: tl.constexpr,
     WORLD: tl.constexpr,
     SPEC: tl.constexpr,

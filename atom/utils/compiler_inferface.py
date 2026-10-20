@@ -758,12 +758,15 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # forwarding that tuple shifts subsequent mutation/shape argument
         # indices in the loaded callable. AOTCompiledArtifact owns its own
         # serialized call convention and must not receive this adaptation.
-        from torch._inductor.standalone_compile import CacheCompiledArtifact
         from torch.utils._pytree import arg_tree_leaves
 
-        flatten_inputs = isinstance(
-            inductor_compiled_graph, CacheCompiledArtifact
-        ) and any(isinstance(x, (list, tuple, dict)) for x in example_inputs)
+        flatten_inputs = False
+        if is_torch_equal_or_newer("2.10"):
+            from torch._inductor.standalone_compile import CacheCompiledArtifact
+
+            flatten_inputs = isinstance(
+                inductor_compiled_graph, CacheCompiledArtifact
+            ) and any(isinstance(x, (list, tuple, dict)) for x in example_inputs)
 
         def compiled_graph_wrapper(*args):
             call_args = arg_tree_leaves(*args) if flatten_inputs else args

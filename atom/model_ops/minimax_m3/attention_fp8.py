@@ -75,7 +75,7 @@ def _quantize_global_amax_kernel(
     AMAX,
     Q,
     SCALE,
-    TOKENS: tl.constexpr,
+    TOKENS,
     WIDTH: tl.constexpr,
     STRIDE: tl.constexpr,
     WORLD: tl.constexpr,

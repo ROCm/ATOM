@@ -2942,10 +2942,6 @@ class Config:
         factors.append(
             None if spec is None else (spec.method, spec.num_speculative_tokens)
         )
-        if self.sequence_parallel_size > 1:
-            # Automatic FP8 dispatch changes the attention output schema to
-            # (activation, scale). Do not reuse graphs from older SP paths.
-            factors.append("ulysses_sp_v2")
 
         hash_str = hashlib.md5(
             str(factors).encode(), usedforsecurity=False

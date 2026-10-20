@@ -7,19 +7,18 @@ import logging
 import os
 import pprint
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
-from torch import fx
-from torch._dispatch.python import enable_python_dispatcher
-
+import torch.fx as fx
 from atom.config import CompilationConfig, Config, CUDAGraphMode
 from atom.utils import (
     compilation_counter,
     is_torch_equal_or_newer,
 )
+from torch._dispatch.python import enable_python_dispatcher
 
 from .compiler_inferface import (
     CompilerInterface,

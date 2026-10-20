@@ -8,6 +8,15 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_H2D_BACKEND** | str | `packed` | `packed` combines forward metadata into one H2D and GPU scatter per consumer group. `direct` copies each member separately. Both preserve source reuse gates and full cudagraph padding. Set before starting the runner. See [metadata publication](h2d_publication.md). |
 
+## Experimental MiniMax-M3 SP MegaMoE
+
+`ATOM_SP_MOE_MEGA=1` runs native MiniMax-M3 MXFP4 prefill MoE through AITER `MegaMoeTP`
+with `--tensor-parallel-size 1 --sequence-parallel-size 4` on gfx950. It needs AITER with
+the big-M path ([ROCm/aiter#6514](https://github.com/ROCm/aiter/pull/6514)) and MORI built
+with `BUILD_CCO_SDMA=ON`. Each launch covers `min(ceil(max_num_batched_tokens / 4), 8192)`
+local rows; small batches keep the native MoE. `ATOM_SP_MOE_MEGA_COMM_DTYPE` selects the
+token transport, `fp8` (default) or `bf16`. Default: `0`.
+
 ## Experimental MiniMax-M3 replicated o-projection
 
 `ATOM_M3_TP_REPLICATED_O_PROJ=1` selects TP-sharded QKV and replicated `o_proj`

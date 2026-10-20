@@ -146,9 +146,8 @@ large-batch FP8 path; it is not a guarantee for every batch or quantization reci
 
 MoE reuses the existing capability checks for local MXFP4 quantization and local
 top-k, with explicit TP-group gathers. Inline/small-batch kernels can gather BF16
-inputs and logits instead. The existing tiled sorter remains eligible for the
-same supported expert geometry and distributions; this change adds no new sorting
-algorithm or AITER kernel.
+inputs and logits instead. MoE sorting is unchanged; this change adds no new
+sorting algorithm or AITER kernel.
 
 ## Residual semantics and numerical validation
 
@@ -197,8 +196,9 @@ equivalence run was performed.
 The 128K / output=20 / C16 rank-0 trace contains 64 prefill chunks. Each of the
 60 layers has one FP8 head exchange and one INT4 all-reduce: 3840 of each, plus
 64 existing TP embedding all-reduces. QKV packing/exchange and MoE reduce-scatter
-are absent. The 57 MoE layers use MXFP4/scale/top-k gathers and the existing tiled
-sorter (histogram, prefix_tiles, prefix_experts, scatter). Small batches retain
+are absent. The 57 MoE layers use MXFP4/scale/top-k gathers and, in this measured
+build, the tiled sorter of AITER #5822 (histogram, prefix_tiles, prefix_experts,
+scatter), which ATOM no longer selects. Small batches retain
 the existing BF16 transport and ordinary reduction fallbacks.
 
 The server and all four workers were stopped after the run, and GPU memory was
