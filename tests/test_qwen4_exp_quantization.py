@@ -15,7 +15,7 @@ from aiter import QuantType, dtypes
 from atom.config import QuantizationConfig
 from atom.model_ops import embed_head
 from atom.model_ops.qwen4_exp import ple_layer
-from atom.models import qwen4_exp
+from atom.models.qwen4_exp import model as qwen4_exp
 from atom.quant_spec import LayerQuantConfig
 
 
