@@ -1225,7 +1225,7 @@ class TestPlanBatchLimit:
 
         from atom.model_ops import base_attention as ba
 
-        n = ba._FLYDSL_PLAN_MAX_BATCH + 1
+        n = ba._flydsl_plan_max_batch() + 1
         # gluon's fallback exists on gfx942/gfx950 only; pin it whatever runs this.
         monkeypatch.setattr(ba, "gluon_decode_supports_arch", lambda: True)
         monkeypatch.setattr(ba.envs, "ATOM_PA_FLYDSL", True)
@@ -1260,6 +1260,52 @@ class TestPlanBatchLimit:
             temporary_output=meta(n, 1, 8, 16, 128),
         )
         assert seen, "gluon was not called"
+
+    def test_cap_is_4096_without_max_batch_size(self, monkeypatch):
+        from atom.model_ops import base_attention as ba
+
+        monkeypatch.setattr(ba, "_flydsl_plan_takes_max_batch_size", lambda: False)
+        ba._flydsl_plan_max_batch.cache_clear()
+        try:
+            assert ba._flydsl_plan_max_batch() == 4096
+        finally:
+            ba._flydsl_plan_max_batch.cache_clear()
+
+    @pytest.mark.parametrize("num_seqs", [4096, 4097])
+    def test_large_plans_set_max_batch_size(self, monkeypatch, num_seqs):
+        """A refresh keeps max_batch_size, so a plan past 4096 must set it."""
+        import aiter.ops.flydsl.pa_decode as fly
+
+        from atom.model_ops import base_attention as ba
+
+        seen = {}
+
+        def plan_pa_decode(lengths, num_kv_heads, **kw):
+            seen.update(kw)
+            return SimpleNamespace(max_partitions=1, capacity=1)
+
+        monkeypatch.setattr(fly, "plan_pa_decode", plan_pa_decode)
+        monkeypatch.setattr(ba, "_flydsl_plan_takes_max_batch_size", lambda: True)
+        monkeypatch.setattr(ba, "_FLYDSL_RUNTIME_PLANS", {})
+        monkeypatch.setattr(
+            ba.torch.cuda,
+            "current_stream",
+            lambda device=None: SimpleNamespace(cuda_stream=0),
+        )
+        ba._flydsl_prepare_explicit_plan(
+            q=SimpleNamespace(device=SimpleNamespace(index=0)),
+            k_cache=SimpleNamespace(shape=(1, 1)),
+            context_lens=list(range(num_seqs)),
+            num_seqs=num_seqs,
+            query_length=1,
+            plan_partition_cap=None,
+            context_bound=2048,
+            existing_plan=None,
+        )
+        if num_seqs > 4096:
+            assert seen["max_batch_size"] == num_seqs
+        else:
+            assert "max_batch_size" not in seen
 
     def test_dense_call_leaves_the_plan_ceiling_to_aiter(self, monkeypatch):
         """The static split count must not become the runtime plan's ceiling."""
@@ -1789,19 +1835,35 @@ class TestNoGluonFlyDSLRouting:
                 temporary_output=m(4, 1, 8, 16, 128),
             )
 
-    @pytest.mark.parametrize("has_backend", [True, False])
-    def test_gfx1250_support_is_probed_from_aiter(self, monkeypatch, has_backend):
+    @pytest.mark.parametrize("layout", ["module", "compile_fn", "none"])
+    def test_gfx1250_support_is_probed_from_aiter(self, monkeypatch, layout):
+        """Both aiter layouts of the gfx1250 backend count; neither means no."""
+        import importlib
         import importlib.util
 
         from aiter.jit.utils import chip_info
 
         from atom.model_ops import base_attention as ba
 
+        has_backend = layout != "none"
         monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx1250")
         monkeypatch.setattr(
             importlib.util,
             "find_spec",
-            lambda name: object() if has_backend else None,
+            lambda name: object() if layout == "module" else None,
+        )
+        kernel_mod = SimpleNamespace()
+        if layout == "compile_fn":
+            kernel_mod.compile_gfx1250_pa_decode = lambda *a, **kw: None
+        real_import = importlib.import_module
+        monkeypatch.setattr(
+            importlib,
+            "import_module",
+            lambda name, *a: (
+                kernel_mod
+                if name == "aiter.ops.flydsl.kernels.pa_decode_kernel"
+                else real_import(name, *a)
+            ),
         )
         ba._flydsl_arch_supported.cache_clear()
         ba._flydsl_bf16_kv_supported.cache_clear()

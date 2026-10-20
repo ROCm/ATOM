@@ -226,13 +226,18 @@ def _flydsl_arch_supported() -> bool:
 
     arch = get_gfx_runtime()
     if arch == "gfx1250":
+        # The backend first shipped as kernels/pa_decode/gfx1250.py, then moved
+        # into pa_decode_kernel.compile_gfx1250_pa_decode; accept either layout.
         try:
-            spec = importlib.util.find_spec(
-                "aiter.ops.flydsl.kernels.pa_decode.gfx1250"
-            )
+            if importlib.util.find_spec("aiter.ops.flydsl.kernels.pa_decode.gfx1250"):
+                return True
         except ModuleNotFoundError:
             return False
-        return spec is not None
+        try:
+            mod = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
+        except ImportError:
+            return False
+        return hasattr(mod, "compile_gfx1250_pa_decode")
     return arch in _FLYDSL_PA_ARCHS
 
 
@@ -389,7 +394,40 @@ def _flydsl_pa_decode_num_seqs(
 
 
 _FLYDSL_PLAN_MAX_BATCH = 4096
+# aiter's planner keeps one LDS int32 per sequence plus this much scan storage.
+_FLYDSL_PLAN_SCAN_LDS_BYTES = 512
 _FLYDSL_PLAN_SCRATCH: dict[tuple, tuple] = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_plan_takes_max_batch_size() -> bool:
+    """Whether plan_pa_decode accepts max_batch_size (raises the 4096 cap)."""
+    import inspect
+
+    try:
+        mod = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_plan")
+    except ImportError:
+        return False
+    return "max_batch_size" in inspect.signature(mod.plan_pa_decode).parameters
+
+
+@functools.lru_cache(maxsize=1)
+def _flydsl_plan_max_batch() -> int:
+    """Most sequences one FlyDSL plan takes on this GPU.
+
+    4096 on an aiter without max_batch_size. With it, the planner's own bound:
+    the 16-byte-rounded task_ends array plus scan storage must fit one block's
+    LDS.
+    """
+    if not _flydsl_plan_takes_max_batch_size():
+        return _FLYDSL_PLAN_MAX_BATCH
+    lds = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block
+    by_lds = (lds - _FLYDSL_PLAN_SCAN_LDS_BYTES) // 16 * 16 // 4
+    return max(_FLYDSL_PLAN_MAX_BATCH, by_lds)
+
+
 _FLYDSL_RUNTIME_PLANS: dict[tuple, object] = {}
 
 
@@ -529,11 +567,18 @@ def _flydsl_prepare_explicit_plan(
             return plan
         refreshed.add(mark)
     if plan is None:
+        # A refresh keeps the plan's max_batch_size, so set it at creation.
+        extra = (
+            {"max_batch_size": num_seqs}
+            if num_seqs > _FLYDSL_PLAN_MAX_BATCH and _flydsl_plan_takes_max_batch_size()
+            else {}
+        )
         plan = plan_pa_decode(
             lengths,
             num_kv_heads,
             max_partitions=max_partitions,
             query_length=query_length,
+            **extra,
         )
         _FLYDSL_RUNTIME_PLANS[plan_key] = plan
         logger.info(
@@ -564,8 +609,8 @@ def flydsl_decode_seqs(*, max_context_length=None, **kwargs):
     take unified attention when it is falsy.
     """
     flydsl_seqs = envs.ATOM_PA_FLYDSL and _flydsl_pa_decode_num_seqs(**kwargs)
-    # aiter's planner rejects more than _FLYDSL_PLAN_MAX_BATCH sequences.
-    if flydsl_seqs and flydsl_seqs > _FLYDSL_PLAN_MAX_BATCH:
+    # aiter's planner rejects more sequences than one plan holds.
+    if flydsl_seqs and flydsl_seqs > _flydsl_plan_max_batch():
         flydsl_seqs = None
     # Only on the FlyDSL path; a bound below the query window goes to gluon.
     if flydsl_seqs:
