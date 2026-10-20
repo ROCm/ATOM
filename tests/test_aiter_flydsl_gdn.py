@@ -248,12 +248,13 @@ def test_triton_decode_vk_fallback():
     torch.testing.assert_close(vk, state, rtol=0.008, atol=2e-6)
 
 
+@pytest.mark.parametrize("state_vk", [False, True])
 @pytest.mark.parametrize("replayssm", [False, True])
 @pytest.mark.parametrize("supported_arch", [False, True])
 @pytest.mark.parametrize("decode_backend", ["auto", "triton", "flydsl"])
 @pytest.mark.parametrize("allowed", [False, True])
 def test_qwen_backend_binds_zero_copy_vk_state(
-    monkeypatch, replayssm, supported_arch, decode_backend, allowed
+    monkeypatch, replayssm, supported_arch, decode_backend, allowed, state_vk
 ):
     from types import SimpleNamespace
 
@@ -268,6 +269,9 @@ def test_qwen_backend_binds_zero_copy_vk_state(
     )
     builder = object.__new__(Qwen4ExpMetadataBuilder)
     builder.replayssm = replayssm
+    # a consumer that reads the state as VK in place (the Qwen3.8 mono) asks
+    # for VK storage whatever the decode policy
+    builder.gdn_state_vk = state_vk
     from atom.utils import envs
 
     monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
@@ -282,11 +286,12 @@ def test_qwen_backend_binds_zero_copy_vk_state(
         allowed and not replayssm and supported_arch and decode_backend != "triton"
     )
     assert attention.gdn_flydsl_policy.decode == expected
-    assert result.v_cache.stride()[-2:] == ((1, 128) if expected else (128, 1))
+    vk = expected or state_vk
+    assert result.v_cache.stride()[-2:] == ((1, 128) if vk else (128, 1))
     if replayssm:
         assert not attention.gdn_flydsl_policy.prefill
         assert not builder._flydsl_prefill_enabled
-        assert result.v_cache is raw
+        assert (result.v_cache is raw) == (not state_vk)
 
 
 @requires_gfx942

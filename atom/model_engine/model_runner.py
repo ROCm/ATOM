@@ -156,6 +156,9 @@ mono_decode_installers = {
     "KimiK3ForConditionalGeneration": (
         "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
     ),
+    "Qwen4ExpForConditionalGeneration": (
+        "atom.models.qwen4_exp.mono.dispatch.install_mono_decode"
+    ),
 }
 
 
