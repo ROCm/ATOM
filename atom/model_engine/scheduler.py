@@ -2041,19 +2041,40 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         prefix_waiters: deque[Sequence] = deque()
         prefix_bypass_left = min(16, self.max_num_seqs)
+        # Load prefetch: once the batch is full or its next request does not
+        # fit, the rest of the scan only parks requests for their tier load,
+        # and everything else it passes keeps its place. Bounded to the head
+        # whose lookups `prefetch_lookups` sent, so it never waits on one.
+        prefetch_cap = (
+            envs.OFFLOAD_PREFETCH_LOADS if self._connector_flag("is_offload") else 0
+        )
+        prefetch_depth = envs.OFFLOAD_ASYNC_LOOKUP_DEPTH
+        prefetching = False
+        prefetch_held: deque[Sequence] = deque()
+        scanned = 0
         while (
             delayer_allows
             and (self.delay_factor <= 0 or self._passed_delay(time.time()))
             and self.waiting
-            and num_seqs_prefill < self.max_num_seqs
-            and num_batched_tokens < self.max_num_batched_tokens
-            and self._tick_cost < self._tick_cost_limit
         ):
+            if not prefetching and not (
+                num_seqs_prefill < self.max_num_seqs
+                and num_batched_tokens < self.max_num_batched_tokens
+                and self._tick_cost < self._tick_cost_limit
+            ):
+                if not prefetch_cap or self._num_parked_remote_kv >= prefetch_cap:
+                    break
+                prefetching = True
+            if prefetching and (
+                scanned >= prefetch_depth or self._num_parked_remote_kv >= prefetch_cap
+            ):
+                break
             if prefix_waiters:
                 if prefix_bypass_left == 0:
                     break
                 prefix_bypass_left -= 1
             seq = self.waiting.popleft()
+            scanned += 1
 
             # Client disconnected before this seq ever ran: it holds no KV yet
             # and needs no forward pass, so finish it outright and route via
@@ -2123,12 +2144,23 @@ class Scheduler:
                 and self.kv_connector is not None
                 and self._offload_lookup_pending(seq)
             ):
-                prefix_waiters.append(seq)
+                (prefetch_held if prefetching else prefix_waiters).append(seq)
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
                 skip=remote_ready_for_decode or offload_resume or lookup_detachable,
             )
+            if (
+                prefetching
+                and not remote_ready_for_decode
+                and (
+                    offload_resume
+                    or not needs_remote_load
+                    or getattr(seq, "_load_prefetch_refused", False)
+                )
+            ):
+                prefetch_held.append(seq)
+                continue
 
             if remote_ready_for_decode:
                 self._schedule_first_decode_after_remote_kv(seq)
@@ -2190,6 +2222,10 @@ class Scheduler:
                 if chunk is None or self._waits_below_resume(
                     seq, start, chunk, seq.num_cached_tokens
                 ):
+                    if prefetch_cap and self._num_parked_remote_kv < prefetch_cap:
+                        prefetching = True
+                        prefetch_held.append(seq)
+                        continue
                     self.waiting.appendleft(seq)
                     break
                 self._resume_prefill(seq, start, hit=replayed)
@@ -2281,7 +2317,7 @@ class Scheduler:
                     ),
                 )
             ):
-                prefix_waiters.append(seq)
+                (prefetch_held if prefetching else prefix_waiters).append(seq)
                 continue
             atomic_prefill = self._requires_atomic_prefill(seq)
             budget_remaining = self._prefill_room(num_batched_tokens, start)
@@ -2303,8 +2339,22 @@ class Scheduler:
                 or (atomic_prefill and chunk < num_new_tokens)
                 or self._waits_below_resume(seq, start, chunk, resume)
             ):
-                self.waiting.appendleft(seq)
-                break
+                if (
+                    not prefetching
+                    and prefetch_cap
+                    and self._num_parked_remote_kv < prefetch_cap
+                ):
+                    prefetching = True
+                if not prefetching:
+                    self.waiting.appendleft(seq)
+                    break
+                if not needs_remote_load or getattr(
+                    seq, "_load_prefetch_refused", False
+                ):
+                    prefetch_held.append(seq)
+                    continue
+                # A load parks without a chunk; `offload_resume` sizes the
+                # first one once it lands.
             self.block_manager.record_allocation(seq, num_cached_blocks, block_hashes)
             if not self.block_manager.allocate(seq, num_cached_blocks):
                 # A state-less joint boundary could not be privatised without
@@ -2374,6 +2424,8 @@ class Scheduler:
                         break
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
+                if prefetching:
+                    self._log_load_prefetch(seq, scanned)
                 continue
 
             if seq.offload_joint.boundary_tokens:
@@ -2411,7 +2463,18 @@ class Scheduler:
                 # a transfer into blocks this request already holds.
                 self._park_for_remote_load(seq, skipped_waiting_requests)
                 self._inflight_prefix_wait.pop(seq.id, None)
+                if prefetching:
+                    self._log_load_prefetch(seq, scanned)
                 continue
+
+            if prefetching:
+                # Allocated only to start a load, which the connector refused.
+                # Nothing prefills out of turn, so the blocks go back, and the
+                # request waits for its turn instead of being tried again.
+                seq._load_prefetch_refused = True
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
 
             # Refresh, not a duplicate of the set above: that one is guarded
             # on the field being empty, so a seq re-admitted after `preempt()`
@@ -2476,6 +2539,8 @@ class Scheduler:
                 len(skipped_waiting_requests),
             )
             self.waiting.extend(skipped_waiting_requests)
+        if prefetch_held:
+            self.waiting.extendleft(reversed(prefetch_held))
         if prefix_waiters:
             # Keep deferred requests in arrival order while bounded lookahead
             # admits independent work without extending their deadlines.
@@ -3683,6 +3748,15 @@ class Scheduler:
         skipped_waiting_requests.append(seq)
         seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
         self._count_inflight_load(seq)
+
+    def _log_load_prefetch(self, seq: Sequence, queue_pos: int) -> None:
+        logger.info(
+            "[OFFLOAD-PREFETCH] seq=%s queue_pos=%d parked=%d waiting=%d",
+            seq.id,
+            queue_pos,
+            self._num_parked_remote_kv,
+            len(self.waiting),
+        )
 
     def _count_inflight_load(self, seq: Sequence) -> None:
         if not getattr(seq, "_counted_as_inflight_load", False):

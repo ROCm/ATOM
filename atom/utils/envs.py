@@ -1173,6 +1173,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
+    # Experimental: once admission stops for the batch budget, keep scanning
+    # the async-lookup head of the waiting queue and park requests whose tier
+    # load can start now, so the load overlaps their wait for a budget slot.
+    # The value caps parked loads; 0 disables.
+    "OFFLOAD_PREFETCH_LOADS": lambda: _nonnegative_int_env("OFFLOAD_PREFETCH_LOADS", 0),
     # Admit a prefill without waiting for its external-tier lookup when the HBM
     # prefix leaves fewer than OFFLOAD_MIN_LOAD_TOKENS uncached, so no tier hit
     # could be loaded. The lookup is still sent to refresh the tier's LRU.
