@@ -18,6 +18,7 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     gluon_decode_over_limit,
+    gluon_decode_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )
@@ -1041,7 +1042,7 @@ class PagedAttentionImpl(nn.Module):
         # Clamped once here so both gates see the same value; the predicate
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
-        over_gluon = gluon_decode_over_limit(
+        over_gluon = not gluon_decode_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (
