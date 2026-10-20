@@ -5,11 +5,10 @@
 prefill workers' mooncake_store offload env.
 
 No Mooncake process starts: a ``python3`` stub on PATH stands in for
-numa_exec.py (and so for mooncake_master / mooncake_client), drop_page_cache.py
-and numa_memory_budget.py, and a ``curl`` stub for the master's metadata and
-metrics servers. The stub master listens on its RPC port, as the readiness
-check needs; each owner the stub starts adds its segment to the capacity the
-metrics stub reports. The stub also answers the image check's
+numa_exec.py (and so for mooncake_master / mooncake_client), and a ``curl``
+stub for the master's metadata and metrics servers. The stub master listens
+on its RPC port, as the readiness check needs; each owner the stub starts adds
+its segment to the capacity the metrics stub reports. The stub also answers the image check's
 ``python3 -c 'import mooncake.store'``.
 """
 
@@ -56,9 +55,10 @@ PYTHON_STUB = textwrap.dedent("""\
         echo "${master} ${bytes}" >> "${STUB_DIR}/segments"
         exec sleep 60
         ;;
-      # The page-cache dropper keeps its command line, as python3 would.
-      *" --every "*) exec -a "$0 $*" sleep 60 ;;
-      *"/numa_memory_budget.py "*) exit "${STUB_BUDGET_RC:-0}" ;;
+      *"/prepare_lmcache_host_memory.py "*|*"/numa_memory_budget.py "*|*"/compact_huge_pages.py "*|*"/drop_page_cache.py "*)
+        echo "Unexpected host memory preparation for Mooncake Store" >&2
+        exit 97
+        ;;
     esac
     exit 0
     """)
@@ -281,19 +281,8 @@ stop_mooncake_store
 """,
             MOONCAKE_STORE_OWNERS="0:64;1:96",
         )
-        # The page cache goes before anything allocates, then the budget of the
-        # owners' pins.
-        drop, budget = [
-            line.split(" ", 1)[1]
-            for line in self.calls.read_text().splitlines()
-            if "drop_page_cache.py /" in line or "numa_memory_budget.py" in line
-        ]
-        self.assertTrue(drop.endswith("/scripts/drop_page_cache.py /models/m"), drop)
-        self.assertIn(
-            "/scripts/numa_memory_budget.py --reserve-gib 128 --compact "
-            "--compact-timeout 600 0:64 1:96",
-            budget,
-        )
+        # Store startup reaches ready capacity without host memory helpers.
+        self.assertEqual(len(self.calls.read_text().splitlines()), 3)
         (master,) = self.store_calls("mooncake_master")
         self.assertIn("HIP=-1 QP=1 ", master)
         self.assertIn("/scripts/numa_exec.py 1 mooncake_master", master)
@@ -330,8 +319,7 @@ stop_mooncake_store
             (64 * GIB, 96 * GIB),
         ):
             self.assertIn(
-                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1 BIND={HOST} "
-                "MR=68719476736 ",
+                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1 BIND={HOST} MR=68719476736 ",
                 call,
             )
             self.assertIn(f"/scripts/numa_exec.py {numa} mooncake_client ", call)
@@ -370,7 +358,8 @@ stop_mooncake_store
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers + """
+            servers
+            + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"
@@ -690,15 +679,8 @@ stop_mooncake_store
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:96:rdma1;0:96:rdma0",
         )
         self.assertIn("MASTERS=0", result.stdout)
-        # No prefill GPU here: the budget counts the owners only.
-        (budget,) = [
-            line
-            for line in self.calls.read_text().splitlines()
-            if "numa_memory_budget.py" in line
-        ]
-        self.assertIn(
-            "--reserve-gib 128 --compact --compact-timeout 600 0:96 0:96", budget
-        )
+        # Only the two simulated remote masters and two local owners run.
+        self.assertEqual(len(self.calls.read_text().splitlines()), 4)
         owners = self.store_calls("mooncake_client")
         self.assertEqual(len(owners), 2)
         for device, pool in (("rdma0", 0), ("rdma1", 1)):
@@ -731,19 +713,14 @@ stop_mooncake_store
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_OWNERS="0:8:rdma0",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1;0:8:rdma2",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="4",
-            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="1",
         )
-        # The wait, plus the prefill node's compaction of its one NUMA node.
-        self.assertIn("prefill-node masters not ready after 5s", result.stderr)
+        self.assertIn("prefill-node masters not ready after 4s", result.stderr)
         self.assertEqual(self.store_calls("mooncake_client"), [])
-        # The page cache dropper is stopped with the rest.
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
-    def test_the_prefill_node_allows_for_the_decode_nodes_compaction(self):
-        # The decode node mounts its owners only once it has compacted its
-        # memory: here 5 s into a 2 s wait, inside the 10 s it allows for the
-        # compaction of that node's one NUMA node.
+    def test_prefill_waits_for_decode_owner_capacity_within_configured_timeout(self):
+        # Remote owners mount after the local owners; readiness waits for both.
         self.run_shell(
             f"""
 (
@@ -758,8 +735,7 @@ stop_mooncake_store
 """,
             MOONCAKE_STORE_OWNERS="0:8;1:8",
             MOONCAKE_STORE_DECODE_OWNERS="0:8:rdma1",
-            MOONCAKE_STORE_WAIT_TIMEOUT="2",
-            MOONCAKE_STORE_COMPACT_TIMEOUT="10",
+            MOONCAKE_STORE_WAIT_TIMEOUT="10",
         )
         self.assertEqual(len(self.store_calls("mooncake_client")), 2)
         for pid in self.stub_pids():
@@ -784,31 +760,14 @@ stop_mooncake_store
                 )
                 self.assertIn(f"WAIT owners {seconds}\n", result.stdout)
 
-    def test_a_decode_node_reads_the_wait_timeouts_in_decimal(self):
+    def test_a_decode_node_reads_the_wait_timeout_in_decimal(self):
         result = self.run_shell(
-            'echo "WAIT=$(mooncake_store_wait_timeout) '
-            'CROSS=$(mooncake_store_cross_node_timeout MOONCAKE_STORE_OWNERS)"\n',
+            'echo "WAIT=$(mooncake_store_wait_timeout)"\n',
             MOONCAKE_STORE="0",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE="1",
             ATOMESH_PREFILL_ENV_MOONCAKE_STORE_WAIT_TIMEOUT="0900",
-            ATOMESH_PREFILL_ENV_MOONCAKE_STORE_COMPACT_TIMEOUT="0600",
         )
-        # The default owners sit on two NUMA nodes: two compactions of 600 s.
-        self.assertIn("WAIT=900 CROSS=2100", result.stdout)
-
-    def test_the_cross_node_wait_counts_the_other_nodes_numa_nodes(self):
-        # That node compacts each NUMA node its owners pin, one at a time:
-        # four under NPS4, one however many owners share it.
-        for owners, cross in (("0:8;1:8;2:8;3:8", 900 + 4 * 600), ("0:8;0:8", 1500)):
-            with self.subTest(owners=owners):
-                result = self.run_shell(
-                    'echo "CROSS=$(mooncake_store_cross_node_timeout '
-                    'MOONCAKE_STORE_DECODE_OWNERS)"\n',
-                    MOONCAKE_STORE_DECODE_OWNERS=owners,
-                    MOONCAKE_STORE_WAIT_TIMEOUT="900",
-                    MOONCAKE_STORE_COMPACT_TIMEOUT="600",
-                )
-                self.assertIn(f"CROSS={cross}\n", result.stdout)
+        self.assertIn("WAIT=900", result.stdout)
 
     def test_several_prefill_workers_on_a_node_are_refused_before_anything_starts(
         self,
@@ -864,24 +823,6 @@ cleanup_processes $!
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
-    def test_cleanup_signals_the_page_cache_dropper_only_while_it_runs(self):
-        # The dropper exits on its own after --for; by cleanup, its pid may
-        # name another process, here one the shell started after it.
-        result = self.run_shell("""
-start_mooncake_page_cache_dropper
-mooncake_page_cache_dropper_running && echo "DROPPER RUNS"
-kill -KILL "${mooncake_page_cache_dropper_pid}"
-wait "${mooncake_page_cache_dropper_pid}" 2>/dev/null || true
-setsid sleep 60 &
-other=$!
-mooncake_page_cache_dropper_pid="${other}"
-stop_mooncake_store
-kill -0 "${other}" && echo "OTHER SURVIVES"
-kill -KILL "${other}"
-""")
-        self.assertIn("DROPPER RUNS", result.stdout)
-        self.assertIn("OTHER SURVIVES", result.stdout)
-
     def test_an_owner_dying_before_ready_stops_the_store(self):
         self.run_shell(
             "start_mooncake_store\n",
@@ -918,27 +859,6 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
         self.run_shell(
             'plan_mooncake_store_pools\ntouch "${STUB_DIR}/master-up"\n'
             '! mooncake_masters_ready "${host_ip}"\n'
-        )
-
-    def test_pins_that_do_not_fit_stop_the_start_before_the_master(self):
-        result = self.run_shell(
-            "start_mooncake_store\n", expect_rc=2, STUB_BUDGET_RC="2"
-        )
-        self.assertIn("must fit their NUMA nodes", result.stderr)
-        self.assertEqual(self.store_calls("mooncake_master"), [])
-
-    def test_page_cache_drop_covers_the_configured_directories(self):
-        self.run_shell(
-            "prepare_mooncake_store_memory\n",
-            MOONCAKE_STORE_PAGE_CACHE_DROP_DIRS="/share/models:/data/cache",
-            # A fragmented node may need longer than the default 600 s.
-            MOONCAKE_STORE_COMPACT_TIMEOUT="1800",
-        )
-        calls = self.calls.read_text()
-        self.assertIn("/scripts/drop_page_cache.py /share/models /data/cache\n", calls)
-        self.assertIn(
-            "--reserve-gib 128 --compact --compact-timeout 1800\n",
-            calls,
         )
 
     def test_owner_devices_must_be_active_and_on_one_numa_node(self):
@@ -999,14 +919,10 @@ if stop_mooncake_store; then echo "STOP rc=0"; else echo "STOP rc=$?"; fi
             ),
             ({"MC_NUM_QP_PER_EP": "2"}, "MC_NUM_QP_PER_EP=2"),
             ({"MC_MS_AUTO_DISC": "1"}, "MC_MS_AUTO_DISC=1 makes the Store's"),
-            # Each would be misread later: by the compaction's timeout, bash
-            # arithmetic in the waits, or a Store process.
+            # Each would be misread by wait arithmetic or a Store process.
             *(
                 ({f"MOONCAKE_STORE_{name}": value}, f"{name}={value} is not a {kind}")
                 for name, value, kind in (
-                    ("COMPACT_TIMEOUT", "0", "positive number"),
-                    ("COMPACT_TIMEOUT", "-600", "positive number"),
-                    ("COMPACT_TIMEOUT", "nan", "positive number"),
                     ("WAIT_TIMEOUT", "20m", "positive integer number"),
                     ("MASTER_NUMA", "-1", "integer number"),
                 )

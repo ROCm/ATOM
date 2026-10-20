@@ -1342,7 +1342,7 @@ models:
           concurrency:
           - 40
           server: &minimax_m3_scatter_bounds_server
-            common_args:
+            common_args: &minimax_m3_scatter_bounds_common_args
               kv_cache_dtype: fp8
               block_size: 128
               enable_prefix_caching: true
@@ -1405,6 +1405,92 @@ models:
           - 8
           accuracy:
             threshold: 0.8
+      # Dispatch-only GQA + mean AL 2.78 + Mooncake Store experiments.
+      gluon_gqa_store:
+        - &minimax_m3_gluon_gqa_store_c32
+          name: minimax-m3-gluon-gqa-mcstore-tp4-c32
+          topology: 1p1d_eagle3
+          display_topology: 1P1D-TP4-EAGLE3-GQA-GLUON-AL2.78-MCSTORE
+          pd_worker_layout: single_node
+          nodes: "${ATOMESH_1P1D_NODES}"
+          isl: [1048576]
+          osl: 1024
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *minimax_m3_scatter_bounds_common_args
+              draft_model: /share_nfs/models/Inferact/MiniMax-M3-EAGLE3-GQA
+              spec_decode_acceptance_length: 2.78
+          prefill: &minimax_m3_gluon_gqa_graph
+            <<: *minimax_m3_scatter_bounds_prefill
+            # Cover the fixed server capacity on both sides, including C72.
+            cudagraph: '[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,20,22,24,26,28,30,32,34,36,40,48,56,64,72,80]'
+          decode: *minimax_m3_gluon_gqa_graph
+          env:
+            common: &minimax_m3_gluon_gqa_store_common
+              PYTHONNOUSERSITE: '1'
+              PYTHONHASHSEED: '0'
+              MC_DISABLE_HIP: '1'
+              MC_NUM_QP_PER_EP: '1'
+              AITER_SITUV2_A4W4: '1'
+              AITER_FLYDSL_STAGE2_FP8: '1'
+              ATOM_PA_FLYDSL: '1'
+              ATOM_PA_FLYDSL_PLAN: '1'
+              ATOM_M3_INDEXER_CP: '1'
+              ATOM_MONO_ENABLE: '0'
+              ATOM_DRAFT_CUDAGRAPH: '1'
+              ATOM_PREFIX_CACHE_POLICY: slru
+              ATOM_PREFIX_CACHE_PROTECTED_RATIO: '0.5'
+              ATOM_AITER_SCATTER_REF: 4fe2800a5c252adff8ee28d199bea66f8b18efac
+              ATOMESH_M3_GQA_DRAFT_DIR: /share_nfs/models/Inferact/MiniMax-M3-EAGLE3-GQA
+            prefill: &minimax_m3_gluon_gqa_store_prefill
+              HIP_VISIBLE_DEVICES: 0,1,2,3
+              OFFLOAD_PROFILE: '1'
+              OFFLOAD_MIN_LOAD_TOKENS: '0'
+              OFFLOAD_LOAD_WORKERS: '1'
+              MOONCAKE_STORE: '1'
+              ATOMESH_M3_STORE_FUNCTIONAL_CHECK: '1'
+              MOONCAKE_STORE_OWNERS: '0:768:rdma4,rdma5;1:768:rdma6,rdma7'
+              PREFILL_KV_TRANSFER_CONFIG: '{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":${HANDSHAKE_PORT},"protocol":"rdma"}'
+            decode:
+              HIP_VISIBLE_DEVICES: 4,5,6,7
+          runner:
+            time_limit: '08:00:00'
+            exclude_nodes: [pit2-p03-g34, pit2-p03-g12, pit2-p03-g53]
+          benchmark:
+            <<: *agentic_1m_aiperf
+            wait_server_timeout: 7200
+            prepare_lmcache_host_memory: false
+            prepare_m3_gqa_draft: true
+            mesh_source: image
+          run_eval: false
+
+        - <<: *minimax_m3_gluon_gqa_store_c32
+          name: minimax-m3-gluon-gqa-mcstore-tp8-c72
+          display_topology: 1P1D-TP8-EAGLE3-GQA-GLUON-AL2.78-MCSTORE
+          pd_worker_layout: multi_node
+          concurrency: [72]
+          prefill:
+            <<: *minimax_m3_gluon_gqa_graph
+            tp: 8
+          decode:
+            <<: *minimax_m3_gluon_gqa_graph
+            tp: 8
+          env:
+            common:
+              <<: *minimax_m3_gluon_gqa_store_common
+              # Indexer CP currently requires TP == the four global KV heads.
+              ATOM_M3_INDEXER_CP: '0'
+            prefill:
+              <<: *minimax_m3_gluon_gqa_store_prefill
+              HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+              # P uses every NIC: independent per-NIC pools avoid shared-pool
+              # owner/requester NIC conflicts. All 8 x 192 GiB are reachable.
+              MOONCAKE_STORE_POOLS: per_nic
+              MOONCAKE_STORE_OWNERS: '0:192:rdma0;0:192:rdma1;0:192:rdma2;0:192:rdma3;1:192:rdma4;1:192:rdma5;1:192:rdma6;1:192:rdma7'
+            decode:
+              HIP_VISIBLE_DEVICES: 0,1,2,3,4,5,6,7
+
       nightly:
         # Reuse the verified 32K-warmup service and pinned scatter-bounds aiter.
         # Keep server capacity fixed at 80; each AgentX concurrency starts fresh.

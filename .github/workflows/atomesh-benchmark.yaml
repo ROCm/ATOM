@@ -40,6 +40,7 @@ on:
           - weekly
           - agentic_multi_decode
           - mooncake_store
+          - gluon_gqa_store
           - accuracy
           - profile
           - scatter_bounds
@@ -523,14 +524,18 @@ jobs:
         if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') }}
         run: python3 .github/scripts/atomesh/check_m3_gluon_c32.py --matrix atomesh-matrix.json
 
+      - name: Verify GQA Store experiment configuration
+        if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-gluon-gqa-mcstore-') }}
+        run: python3 .github/scripts/atomesh/check_m3_gqa_store.py --matrix atomesh-matrix.json
+
       - name: Validate Gluon adapter and page fixtures before GPU allocation
-        if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') }}
+        if: ${{ contains(steps.matrix.outputs.matrix_json, 'minimax-m3-fp4-1p1d-tp4-eagle3-agentic-lmcache-1m-c32') || contains(steps.matrix.outputs.matrix_json, 'minimax-m3-gluon-gqa-mcstore-') }}
         timeout-minutes: 10
         run: |
           set -euo pipefail
           python3 -m venv /tmp/m3-fixture-venv
           /tmp/m3-fixture-venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-          /tmp/m3-fixture-venv/bin/pip install pytest
+          /tmp/m3-fixture-venv/bin/pip install pytest pyyaml
           python3 - <<'PYFIXTURE'
           import json
           import re
@@ -550,7 +555,7 @@ jobs:
           print(f"[gluon-c32-fixture] validating pinned aiter {ref} on CPU")
           PYFIXTURE
           /tmp/m3-fixture-venv/bin/python -m pytest -q /tmp/m3-fixture-tests/test_m3_gluon_fixtures.py
-          PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" /tmp/m3-fixture-venv/bin/python -m pytest --noconftest -q tests/test_gluon_prefill.py
+          PYTHONPATH="${PWD}${PYTHONPATH:+:${PYTHONPATH}}" /tmp/m3-fixture-venv/bin/python -m pytest --noconftest -q tests/test_gluon_prefill.py tests/test_atomesh_m3_gqa_store.py
 
       - name: Group benchmark matrix by configuration
         id: groups

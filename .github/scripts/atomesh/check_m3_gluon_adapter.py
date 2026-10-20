@@ -34,14 +34,16 @@ def load_attention_dispatch():
     return module
 
 
-def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
+def check_case(
+    draft, qlen, klen, scalar=1.0, decode_graph=False, heads=16, draft_kv_heads=16
+):
     import torch
 
     from atom.model_ops.attention_mha import PagedAttentionImpl
     from atom.model_ops.layernorm import GemmaRMSNorm
 
     device = torch.device("cuda")
-    heads, kv_heads, dim, page = 16, 16 if draft else 1, 128, 128
+    kv_heads, dim, page = draft_kv_heads if draft else 1, 128, 128
     torch.manual_seed(42)
     pages = (klen + page - 1) // page
     blocks = pages + 3
@@ -328,9 +330,23 @@ def main():
                 before = len(launches)
                 check_case(draft, q, 16385, 0.375 if draft else 1.0, decode_graph=True)
                 assert any(n > 1 for n in launches[before:]), launches[before:]
+        # EAGLE3-GQA shares target's global four KV heads. TP4 gives
+        # Q16/KV1, TP8 gives Q8/KV1 with pairs of replicated KV heads.
+        for heads in (16, 8):
+            for draft in (False, True):
+                for q in (1, 4, 1024):
+                    check_case(
+                        draft,
+                        q,
+                        16385 if q < 5 else 2049,
+                        0.375 if draft else 1.0,
+                        decode_graph=q < 5,
+                        heads=heads,
+                        draft_kv_heads=1,
+                    )
     assert 1 in launches and any(n > 1 for n in launches), launches
     print(
-        f"[gluon-adapter-gate] 9 writer cases and 4 decode graph cases passed; "
+        f"[gluon-adapter-gate] old draft and GQA TP4/TP8 writer/decode graph cases passed; "
         f"observed launches={len(launches)}; splits={launches}; official configs={configs}",
         flush=True,
     )

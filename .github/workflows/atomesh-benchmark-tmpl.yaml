@@ -145,6 +145,19 @@ jobs:
               output.write(f"cell_json={json.dumps(cell, separators=(',', ':'))}\n")
           PY
 
+      - name: Prepare pinned GQA draft with Python SDK before GPU allocation
+        if: ${{ matrix.benchmark.prepare_m3_gqa_draft == true }}
+        timeout-minutes: 60
+        env:
+          GQA_DRAFT_DIR: ${{ matrix.server_args.draft_model }}
+          HF_HUB_ETAG_TIMEOUT: '60'
+          HF_HUB_DOWNLOAD_TIMEOUT: '300'
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/m3-gqa-hf-sdk"
+          "${RUNNER_TEMP}/m3-gqa-hf-sdk/bin/pip" install 'huggingface_hub==0.36.0'
+          "${RUNNER_TEMP}/m3-gqa-hf-sdk/bin/python" .github/scripts/atomesh/prepare_m3_gqa_draft.py --directory "${GQA_DRAFT_DIR}"
+
       - name: Print benchmark config
         env:
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
