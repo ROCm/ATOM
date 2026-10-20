@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Official v0.1.26 Gluon cached prefill with native ATOM KV scale views."""
+"""Official v0.1.26 Gluon dense attention with native ATOM KV scale views."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _scale_cache_view(scale, shape, device):
     return scale
 
 
-def run_gluon_prefill(
+def _run_gluon_paged(
     attention: Callable,
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -43,13 +43,14 @@ def run_gluon_prefill(
     softmax_scale: float,
     sliding_window: int = -1,
     sinks: torch.Tensor | None = None,
+    decode: bool = False,
 ) -> torch.Tensor:
-    """Use real block tables and pool aliases for target and draft prefill.
+    """Use real block tables and pool aliases for target and draft attention.
 
     The native MHA builder starts requests at logical position zero, and its
     context_lens includes both cached and new tokens. rope_cache has already
     written new KV on this stream. No pool conversion, gather or CPU readback
-    occurs here. Only output is allocated; unified attention may use split-K
+    occurs here. Decode also adapts O(batch) padding metadata; attention uses split-K
     scratch proportional to queries rather than a full-context K/V expansion.
     """
     if (
@@ -63,9 +64,20 @@ def run_gluon_prefill(
     ):
         raise ValueError("Gluon C32 requires native M3 BF16/FP8 page-128 KV")
     meta = fwd_ctx.attn_metadata
-    n_seqs = fwd_ctx.context.scheduled_bs
-    if not (fwd_ctx.context.is_prefill and meta.has_cached):
-        raise ValueError("Paged cached prefill requires a cached prefill batch")
+    if decode:
+        # Decode is rectangular, including Eagle's first q=4 pass and its
+        # later q=1 passes. Derive the launch shape from tensors, never from
+        # scheduled_bs: a captured graph replays with a different live batch.
+        qlen = int(meta.max_seqlen_q)
+        if fwd_ctx.context.is_prefill or qlen not in (1, 4) or q.shape[0] % qlen:
+            raise ValueError("Gluon C32 decode requires rectangular q=1 or q=4")
+        n_seqs = q.shape[0] // qlen
+        if meta.slot_mapping is None or meta.slot_mapping.numel() < q.shape[0]:
+            raise ValueError("Gluon decode requires per-token slot metadata")
+    else:
+        n_seqs = fwd_ctx.context.scheduled_bs
+        if not (fwd_ctx.context.is_prefill and meta.has_cached):
+            raise ValueError("Paged cached prefill requires a cached prefill batch")
     if k_cache.dtype != v_cache.dtype:
         raise ValueError("Paged prefill K/V dtypes must match")
     blocks, heads, d_chunks, page_size, pack = k_cache.shape
@@ -84,12 +96,31 @@ def run_gluon_prefill(
         n_seqs <= 0
         or meta.block_tables is None
         or meta.block_tables.shape[0] < n_seqs
-        or meta.cu_seqlens_q is None
-        or meta.cu_seqlens_q.numel() < n_seqs + 1
+        or (
+            not decode
+            and (meta.cu_seqlens_q is None or meta.cu_seqlens_q.numel() < n_seqs + 1)
+        )
         or meta.context_lens is None
         or meta.context_lens.numel() < n_seqs
     ):
         raise ValueError("Paged prefill requires real per-request KV metadata")
+
+    if decode:
+        # Native BlockTableState zeroes every padded row (physical page 0).
+        # Give those rows a nonempty dummy context: the official split reduce
+        # cannot divide an empty context into segments. Query offsets cover
+        # ALL padded rows; the target's published cumsum has a flat tail and
+        # must not be passed to the official per-query reduction.
+        # These device operations are replayed and never modify scheduler
+        # metadata or KV. Dummy output is discarded below, even if page 0 is
+        # uninitialized. Only O(batch) metadata is allocated, no KV gather.
+        cu_q = torch.arange(
+            0, (n_seqs + 1) * qlen, qlen, dtype=torch.int32, device=q.device
+        )
+        context_lens = meta.context_lens[:n_seqs].clamp_min(qlen)
+    else:
+        cu_q = meta.cu_seqlens_q[: n_seqs + 1]
+        context_lens = meta.context_lens[:n_seqs]
 
     expected_scales = (blocks, heads, page_size)
     k_scale = _scale_cache_view(k_scale, expected_scales, q.device)
@@ -100,8 +131,8 @@ def run_gluon_prefill(
         k_cache,
         v_cache,
         output,
-        cu_seqlens_q=meta.cu_seqlens_q[: n_seqs + 1],
-        seqused_k=meta.context_lens[:n_seqs],
+        cu_seqlens_q=cu_q,
+        seqused_k=context_lens,
         max_seqlen_q=meta.max_seqlen_q,
         max_seqlen_k=meta.max_seqlen_k,
         softmax_scale=softmax_scale,
@@ -119,4 +150,20 @@ def run_gluon_prefill(
         k_scale_cache=k_scale,
         v_scale_cache=v_scale,
     )
+    if decode:
+        # Slot -1 is the cache writer's no-op sentinel. Eagle reapplies it to
+        # padding after advancing contexts, so it remains valid even when a
+        # padded draft context has grown above zero. masked_fill, not multiply,
+        # removes NaNs read from an unused physical page.
+        output.masked_fill_((meta.slot_mapping[: q.shape[0]] < 0)[:, None, None], 0)
     return output
+
+
+def run_gluon_prefill(*args, **kwargs):
+    """Cached dense prefill; preserve the existing P-side implementation."""
+    return _run_gluon_paged(*args, **kwargs)
+
+
+def run_gluon_decode(*args, **kwargs):
+    """Dense target verification and draft decode, including graph padding."""
+    return _run_gluon_paged(*args, decode=True, **kwargs)

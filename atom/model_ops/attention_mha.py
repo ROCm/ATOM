@@ -618,6 +618,40 @@ class PagedAttentionImpl(nn.Module):
         )
         return o
 
+    @mark_trace(prefix="paged_attention_gluon", torch_compile=False)
+    def paged_attention_gluon(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        """P+D C32 experiment: official v0.1.26 unified Gluon dense decode."""
+        from atom.model_ops.gluon_prefill import run_gluon_decode
+
+        output = run_gluon_decode(
+            unified_attention,
+            q,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
+            fwd_ctx,
+            softmax_scale=self.scale,
+            sliding_window=self.sliding_window,
+            sinks=self.sinks,
+        )
+        if not getattr(self, "_logged_gluon_decode_c32", False):
+            import logging
+
+            logging.getLogger("atom").info(
+                "[gluon-pd-c32] dense decode backend=gluon draft=%s "
+                "q=%s kv=%s scales=%s/%s; official unified split policy",
+                fwd_ctx.context.is_draft,
+                tuple(q.shape),
+                tuple(k_cache.shape),
+                "scalar" if k_scale.numel() == 1 else "per-token",
+                "scalar" if v_scale.numel() == 1 else "per-token",
+            )
+            self._logged_gluon_decode_c32 = True
+        return output
+
     @mark_trace(prefix="paged_attention_triton", torch_compile=False)
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -869,9 +903,9 @@ class PagedAttentionImpl(nn.Module):
 
         # variable lenth attention use key value as input
         attn_metadata = fwd_ctx.attn_metadata
-        # Isolated C32 experiment: replace cached dense attention only. Keep
-        # uncached profiling, decode, cache allocation and the baseline CI
-        # instrumentation unchanged so the comparison has one runtime change.
+        # P+D C32 experiment: retain the P-side cached dense Gluon path.
+        # Uncached profiling, KV allocation and baseline instrumentation stay
+        # unchanged; dense decode uses paged_attention_gluon below.
         if attn_metadata.has_cached:
             from atom.model_ops.gluon_prefill import run_gluon_prefill
 
@@ -892,7 +926,7 @@ class PagedAttentionImpl(nn.Module):
 
                 logging.getLogger("atom").info(
                     "[gluon-c32] cached prefill backend=gluon draft=%s "
-                    "q=%s kv=%s scales=%s/%s; baseline decode and KV budgeting retained",
+                    "q=%s kv=%s scales=%s/%s; baseline KV budgeting retained",
                     fwd_ctx.context.is_draft,
                     tuple(q.shape),
                     tuple(k_cache.shape),
@@ -1135,9 +1169,10 @@ class PagedAttentionImpl(nn.Module):
             if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
                 return self.prefill_attention_triton
             return self.prefill_attention
-        attn_metadata = fwd_ctx.attn_metadata
-        max_qlen = 1 if attn_metadata is None else attn_metadata.max_seqlen_q
-        return self._dispatch_decode(max_qlen)
+        # SparseMHAPagedAttentionImpl overrides dispatch_backend, retaining its
+        # specialized sparse kernels. Both target and draft dense decode use
+        # the same official unified Gluon implementation as cached prefill.
+        return self.paged_attention_gluon
 
     def forward(
         self,

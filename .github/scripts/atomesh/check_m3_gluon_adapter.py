@@ -34,7 +34,7 @@ def load_attention_dispatch():
     return module
 
 
-def check_case(draft, qlen, klen, scalar=1.0):
+def check_case(draft, qlen, klen, scalar=1.0, decode_graph=False):
     import torch
 
     from atom.model_ops.attention_mha import PagedAttentionImpl
@@ -45,7 +45,9 @@ def check_case(draft, qlen, klen, scalar=1.0):
     torch.manual_seed(42)
     pages = (klen + page - 1) // page
     blocks = pages + 3
-    table = torch.randperm(blocks, device=device)[:pages].to(torch.int32)[None, :]
+    table = (torch.randperm(blocks - 1, device=device)[:pages] + 1).to(torch.int32)[
+        None, :
+    ]
     positions = torch.arange(klen, device=device, dtype=torch.int64)
     slots = table[0, positions // page].long() * page + positions % page
     kc = torch.full(
@@ -160,6 +162,94 @@ def check_case(draft, qlen, klen, scalar=1.0):
     scores.masked_fill_(mask, -float("inf"))
     expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), values).bfloat16()
     assert expected.isfinite().all()
+    if decode_graph:
+        # Three graph rows, with a changing number of live requests. Page 0
+        # stays poisoned; only padding may read it and its output must be zero.
+        ctx.context.is_prefill = False
+        ctx.context.scheduled_bs = 99  # must never be baked into the graph
+        qpad = torch.empty(3 * qlen, heads, dim, device=device, dtype=query.dtype)
+        tables = table.expand(3, -1).clone()
+        lengths = torch.empty(3, device=device, dtype=torch.int32)
+        slots_pad = torch.empty(3 * qlen, device=device, dtype=torch.int64)
+        cu = torch.empty(4, device=device, dtype=torch.int32)
+        meta.block_tables, meta.context_lens = tables, lengths
+        meta.slot_mapping, meta.cu_seqlens_q = slots_pad, cu
+        attention = layer.dispatch_backend(ctx, qpad, k, v)
+        assert attention.__func__ is PagedAttentionImpl.paged_attention_gluon
+
+        def setup(live, variant):
+            qpad.copy_(query.repeat(3, 1, 1) * (1 + variant * 0.125))
+            tables.copy_(table.expand(3, -1))
+            if variant:
+                # Permute complete pages, keeping the partial final page last.
+                tables[:, :2] = tables[:, :2].flip(1)
+            tables[live:] = 0
+            lengths.fill_(klen - variant * 17)
+            lengths[live:] = variant  # padded draft lengths may be positive
+            slots_pad.fill_(-1)
+            slots_pad[: live * qlen] = 128
+            cu.copy_(
+                torch.tensor(
+                    [min(i, live) * qlen for i in range(4)],
+                    device=device,
+                    dtype=torch.int32,
+                )
+            )
+
+        def reference(live):
+            result = torch.zeros_like(qpad)
+            for seq in range(live):
+                length = int(lengths[seq])
+                pos = torch.arange(length, device=device)
+                ids, offs = tables[seq, pos // page].long(), pos % page
+                key = dense_k[ids, offs] * (
+                    kscale if draft else kscale[ids, :, offs].unsqueeze(-1)
+                )
+                val = dense_v[ids, offs] * (
+                    vscale if draft else vscale[ids, :, offs].unsqueeze(-1)
+                )
+                key = key.bfloat16().float().repeat_interleave(heads // kv_heads, 1)
+                val = val.bfloat16().float().repeat_interleave(heads // kv_heads, 1)
+                query_seq = qpad[seq * qlen : (seq + 1) * qlen].float()
+                score = torch.einsum("qhd,khd->hqk", query_seq, key) * dim**-0.5
+                score.masked_fill_(
+                    pos[None, :]
+                    > (length - qlen + torch.arange(qlen, device=device))[:, None],
+                    -float("inf"),
+                )
+                result[seq * qlen : (seq + 1) * qlen] = torch.einsum(
+                    "hqk,khd->qhd", score.softmax(-1), val
+                ).bfloat16()
+            return result
+
+        def launch():
+            return attention(qpad, k, v, kc, vc, kscale, vscale, ctx)
+
+        setup(2, 0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                launch()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = launch()
+        for live, variant in ((2, 0), (1, 1), (3, 2), (0, 0)):
+            setup(live, variant)
+            before = (lengths.clone(), cu.clone(), tables.clone())
+            graph.replay()
+            expected = reference(live)
+            torch.testing.assert_close(graph_output, expected, atol=0.02, rtol=0.02)
+            torch.testing.assert_close(launch(), expected, atol=0.02, rtol=0.02)
+            for source, saved in zip((lengths, cu, tables), before):
+                torch.testing.assert_close(source, saved)
+        print(
+            f"[gluon-adapter-gate] decode graph draft={draft} q={qlen} kv={klen} "
+            "live batches=2/1/3/0; changed contexts, pages and queries passed",
+            flush=True,
+        )
+        return
     attention = layer.dispatch_backend(ctx, query, k, v)
     assert attention.__func__ is PagedAttentionImpl.prefill_attention
     out = attention(query, k, v, kc, vc, kscale, vscale, ctx)
@@ -233,9 +323,15 @@ def main():
                 before = len(launches)
                 check_case(True, q, 16385 if q == 1 else 2049, 0.375)
                 assert len(launches) == before + 1
+        for draft in (False, True):
+            for q in (1, 4):
+                before = len(launches)
+                check_case(draft, q, 16385, 0.375 if draft else 1.0, decode_graph=True)
+                assert any(n > 1 for n in launches[before:]), launches[before:]
     assert 1 in launches and any(n > 1 for n in launches), launches
     print(
-        f"[gluon-adapter-gate] {len(launches)} real writer/adapter cases passed; splits={launches}; official configs={configs}",
+        f"[gluon-adapter-gate] 9 writer cases and 4 decode graph cases passed; "
+        f"observed launches={len(launches)}; splits={launches}; official configs={configs}",
         flush=True,
     )
 

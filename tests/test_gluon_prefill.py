@@ -196,3 +196,53 @@ def test_real_draft_rope_cache_selects_scalar_instead_of_unused_pool_scales():
     )
     torch.testing.assert_close(out, q)
     assert calls == ["writer", "attention"]
+
+
+@pytest.mark.parametrize("qlen", [1, 4])
+@pytest.mark.parametrize("draft", [False, True])
+def test_decode_padding_uses_device_slots_and_preserves_native_pool(qlen, draft):
+    from atom.model_ops.gluon_prefill import run_gluon_decode
+
+    heads = 16 if draft else 1
+    q = torch.randn(3 * qlen, 16, 128, dtype=torch.bfloat16)
+    k = torch.empty(8, heads, 8, 128, 16, dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    scales = torch.tensor(0.375) if draft else torch.rand(8, heads, 128)
+    meta = SimpleNamespace(
+        has_cached=False,
+        block_tables=torch.tensor([[4, 1], [6, 2], [0, 0]], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, qlen, 2 * qlen, 2 * qlen], dtype=torch.int32),
+        context_lens=torch.tensor([129, 255, 0], dtype=torch.int32),
+        slot_mapping=torch.tensor([128] * (2 * qlen) + [-1] * qlen),
+        max_seqlen_q=qlen,
+        max_seqlen_k=255,
+    )
+    # Deliberately wrong host count: the live mask must come from device data.
+    ctx = SimpleNamespace(
+        context=SimpleNamespace(is_prefill=False, is_draft=draft, scheduled_bs=99),
+        attn_metadata=meta,
+    )
+    saved_cu = meta.cu_seqlens_q.clone()
+
+    def attention(query, kc, vc, output, **kw):
+        assert kc is k and vc is v
+        assert kw["backend"] == "gluon" and kw["shuffled_kv_cache"]
+        assert kw["block_table"].data_ptr() == meta.block_tables.data_ptr()
+        assert kw["k_scale_cache"].data_ptr() == scales.data_ptr()
+        assert kw["cu_seqlens_q"].tolist() == [0, qlen, 2 * qlen, 3 * qlen]
+        assert kw["seqused_k"].tolist() == meta.context_lens.clamp_min(qlen).tolist()
+        output.copy_(query)
+        output[meta.slot_mapping < 0] = float("nan")
+
+    for lengths, live in (([129, 255, 0], 2), ([200, 1, 1], 1), ([128, 129, 255], 3)):
+        # A padded draft context can become positive after Eagle advances it.
+        meta.context_lens.copy_(torch.tensor(lengths))
+        meta.slot_mapping.fill_(-1)
+        meta.slot_mapping[: live * qlen] = 128
+        out = run_gluon_decode(
+            attention, q, k, v, scales, scales, ctx, softmax_scale=0.125
+        )
+        torch.testing.assert_close(out[: live * qlen], q[: live * qlen])
+        assert torch.count_nonzero(out[live * qlen :]) == 0
+        assert meta.context_lens.tolist() == lengths
+        torch.testing.assert_close(meta.cu_seqlens_q, saved_cu)
