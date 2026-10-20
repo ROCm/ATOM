@@ -753,6 +753,10 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
+# Standalone DSpark draft architectures whose name does not follow the
+# `*DSparkModel` pattern the K3 draft set.
+_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset({"DSparkMiniMaxDraftModel"})
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
@@ -1214,12 +1218,20 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       their DSpark fields at the config top level: ``target_layer_ids``,
       ``mask_token_id``, ``markov_rank``, and optionally a training block width.
     """
-    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    # MiniMax-M3.1's `DSparkMiniMaxDraftModel` already uses the `dspark_*`
+    # names, with the DFlash geometry under `dflash_config`; take those when
+    # the K3-style top-level names are absent.
+    dflash = getattr(hf_config, "dflash_config", None) or {}
+    target_layer_ids = (
+        getattr(hf_config, "target_layer_ids", None)
+        or getattr(hf_config, "dspark_target_layer_ids", None)
+        or dflash.get("target_layer_ids")
+    )
     if not target_layer_ids:
         raise ValueError(
-            "K3DSparkModel config is missing `target_layer_ids` (the target "
-            "decoder layers whose hidden states the draft consumes). Without "
-            "it the draft has no context input."
+            "Standalone DSpark draft config is missing `target_layer_ids` (the "
+            "target decoder layers whose hidden states the draft consumes). "
+            "Without it the draft has no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
@@ -1228,13 +1240,21 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     mask_token_id = getattr(hf_config, "mask_token_id", None)
     if mask_token_id is None:
+        mask_token_id = getattr(hf_config, "dspark_noise_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = dflash.get("mask_token_id")
+    if mask_token_id is None:
         raise ValueError(
-            "K3DSparkModel config is missing `mask_token_id` (the noise token "
-            "the draft block is seeded with)."
+            "Standalone DSpark draft config is missing `mask_token_id` (the "
+            "noise token the draft block is seeded with)."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
-    hf_config.dspark_markov_rank = int(getattr(hf_config, "markov_rank", 0) or 0)
+    hf_config.dspark_markov_rank = int(
+        getattr(hf_config, "markov_rank", 0)
+        or getattr(hf_config, "dspark_markov_rank", 0)
+        or 0
+    )
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
@@ -1246,7 +1266,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # DSparkProposer._resolve_mtp_k falls back to that.
 
     logger.info(
-        "Detected MLA DSpark drafter with a separate draft model "
+        "Detected DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
         f"mask_token_id={hf_config.dspark_noise_token_id})"
@@ -1442,7 +1462,15 @@ class SpeculativeConfig:
             )
         # For multimodal models, extract text_config
         if hasattr(self.draft_model_hf_config, "text_config"):
-            self.draft_model_hf_config = self.draft_model_hf_config.text_config
+            root = self.draft_model_hf_config
+            self.draft_model_hf_config = root.text_config
+            # A multimodal draft (MiniMax-M3.1 DSpark) records its quantization
+            # on the root only; the text config is what the draft reads.
+            root_qc = getattr(root, "quantization_config", None)
+            if root_qc and not getattr(
+                self.draft_model_hf_config, "quantization_config", None
+            ):
+                self.draft_model_hf_config.quantization_config = root_qc
         self.hf_config_override(self.draft_model_hf_config, self.model)
 
         if self.method == "eagle3":
@@ -1470,7 +1498,7 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        if arch.endswith("DSparkModel"):
+        if arch.endswith("DSparkModel") or arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":

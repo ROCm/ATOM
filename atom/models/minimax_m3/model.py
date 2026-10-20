@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -673,6 +674,21 @@ class MiniMaxM3DecoderLayer(nn.Module):
         if aux_hidden_state is not None:
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
+
+    @staticmethod
+    def aux_hidden_state(output: tuple) -> torch.Tensor:
+        """This layer's output as a DSpark draft reads it: the residual stream
+        after the layer, ``hidden + residual``.
+
+        ``hidden`` is TP-partial -- o_proj and the FFN skip their all-reduce,
+        which the next layer's fused all-reduce RMSNorm performs -- so it is
+        reduced here first. That costs one all-reduce per tapped layer per
+        target forward, only when a DSpark drafter taps this layer.
+        """
+        hidden_states, residual = output[0], output[1]
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states + residual
 
 
 @support_torch_compile
