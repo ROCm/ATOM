@@ -167,6 +167,7 @@ class _AdvancingPass:
     """
 
     name = "step"
+    will_capture = True  # read by the warm-up log line
 
     def __init__(self, var):
         self.var = var

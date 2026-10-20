@@ -158,6 +158,35 @@ def test_speculative_config_detects_dspark():
     assert hf.architectures == ["DeepseekV4DSparkModel"]
 
 
+def test_speculative_config_detects_minimax_m31_standalone_dspark():
+    """MiniMax-M3.1's standalone draft keeps the `dspark_*` names and a
+    `dflash_config`, with an architecture outside the `*DSparkModel` pattern; it
+    must still route to the separate-draft flavor, not the inline V4 one."""
+    import types
+
+    import pytest
+
+    SpeculativeConfig = _real_hf_config_override()
+    if SpeculativeConfig is None:
+        pytest.skip("atom.config not importable in this sandbox")
+
+    hf = types.SimpleNamespace(
+        model_type="",
+        architectures=["DSparkMiniMaxDraftModel"],
+        dspark_block_size=7,
+        dspark_markov_rank=256,
+        dspark_noise_token_id=200058,
+        dspark_target_layer_ids=[3, 17, 31, 45, 59],
+        dflash_config={"target_layer_ids": [3, 17, 31, 45, 59], "mask_token_id": 1},
+    )
+    SpeculativeConfig.hf_config_override(hf, model_path=None)
+    assert hf.architectures == ["DSparkMiniMaxDraftModel"]
+    assert hf.dspark_with_draft is True
+    assert hf.dspark_target_layer_ids == [3, 17, 31, 45, 59]
+    assert hf.dspark_noise_token_id == 200058
+    assert hf.dspark_markov_rank == 256
+
+
 def test_speculative_config_mtp_not_misrouted_to_dspark():
     """A plain V4 MTP config (no dspark_block_size) still routes to MTP."""
     import types
@@ -2392,3 +2421,17 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     )
     assert ids.tolist() == [5, 0, 99, 7, 7, 7]
     assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+
+
+def test_page16_table_expands_every_page_into_its_eight_sub_pages():
+    """MiniMax-M3.1 DSpark block rows read a page-16 table built from the
+    page-128 block table: page p -> 8p .. 8p+7, in column order."""
+    import torch
+
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    bt = torch.tensor([[0, 1, 0], [5, 7, 2]], dtype=torch.int32)
+    out = torch.full((2, 24), -1, dtype=torch.int32)
+    DSparkProposer._page16_table(bt, out, torch.arange(8, dtype=torch.int32))
+    expect = (bt.repeat_interleave(8, dim=1) * 8) + torch.arange(8).repeat(3)
+    assert torch.equal(out, expect.to(torch.int32))
