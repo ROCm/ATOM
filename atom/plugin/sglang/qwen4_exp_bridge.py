@@ -1227,8 +1227,8 @@ def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
         mamba_cap = getattr(sched, "max_mamba_cache_size", None)
         if mamba_cap:
             slots = max(slots, int(mamba_cap))
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:
+        logger.debug("Flash PLE: schedule mamba capacity unavailable", exc_info=True)
     backend = resolve_attn_backend(forward_batch)
     linear = getattr(backend, "linear_attn_backend", None) or backend
     pool = resolve_mamba_req_pool(forward_batch, linear)
@@ -1236,11 +1236,9 @@ def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
         pool = getattr(linear, "req_to_token_pool", None)
     slots = max(slots, _mamba_physical_slots(pool))
     try:
-        slots = max(
-            slots, _mamba_physical_slots(_req_to_token_pool(forward_batch))
-        )
-    except Exception:  # noqa: BLE001 - batch may lack the pool during early warmups
-        pass
+        slots = max(slots, _mamba_physical_slots(_req_to_token_pool(forward_batch)))
+    except Exception:
+        logger.debug("Flash PLE: req_to_token_pool not attached yet", exc_info=True)
     # Host indices only. A GPU ``idx.max().item()`` drains verify, which is
     # still queued when eager draft builds PLE state. Pool capacity above
     # already matches Native's whole-pool allocation.
