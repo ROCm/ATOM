@@ -990,9 +990,20 @@ class ModelRunner:
         run the graph's side branch (the dual-stream shared experts) behind its
         main branch instead of beside it. Only the stream a graph is launched
         from matters, not the one it was captured on, so making this the runner
-        thread's current stream covers FULL, PIECEWISE, draft and TBO alike.
+        thread's current stream covers FULL, PIECEWISE and draft graphs.
         """
         if not envs.ATOM_HIGH_PRIORITY_COMPUTE_STREAM:
+            return None
+        if self.config.enable_tbo or self.config.enable_tbo_decode:
+            # UBatchWrapper computes on this stream, and a builder's
+            # tbo_comm_stream_priority (High on V4.1) puts comm ahead of the
+            # other ubatch's compute. ROCm has a single level above Normal, so
+            # a High compute stream would erase that ordering and share comm's
+            # queue pool.
+            logger.warning(
+                "ATOM_HIGH_PRIORITY_COMPUTE_STREAM is ignored with TBO enabled: "
+                "the compute stream would match the TBO comm stream's priority."
+            )
             return None
         _, high = torch.cuda.Stream.priority_range()
         stream = torch.cuda.Stream(self.device, priority=high)
