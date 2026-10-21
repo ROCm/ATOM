@@ -271,7 +271,9 @@ For small-concurrency runs, `C1` and `C2` run the GLM-5.2 MonoKernel decode
 with three speculative tokens, `C4`-`C8` use five and `C10` uses four; the
 script resolves the draft depth, its golden AL and whether mono is on from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
-offload is only used from `C16` upwards.
+offload is only used from `C16` upwards. `C1` and `C2` cap the server at exactly
+`CONC` running sequences (`--max-num-seqs` 1 and 2); the other points admit
+2x `CONC`.
 
 Mono's per-step cost grows with the verify width, so it is fastest at the
 shallowest served draft, while the production path is fastest at MTP5. In a C2
@@ -299,13 +301,17 @@ export CONC=${CONC:-8}
 export ENABLE_MONO=${ENABLE_MONO:-1}
 ATOM_MONO_ENABLE=0
 
+# Admission is 2x CONC, except C1/C2, which admit exactly CONC sequences and
+# capture graphs only up to it.
+MAX_NUM_SEQS=$((CONC * 2))
+
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
   1)
-    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MTP_K=5; MTP_AL=3.61
+    CUDAGRAPH_CAPTURE_SIZES='[1]'; MAX_NUM_SEQS=1; MTP_K=5; MTP_AL=3.61
     ;;
   2)
-    CUDAGRAPH_CAPTURE_SIZES='[1,2,4]'; MTP_K=5; MTP_AL=3.61
+    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MAX_NUM_SEQS=2; MTP_K=5; MTP_AL=3.61
     ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
@@ -338,7 +344,7 @@ python -m atom.entrypoints.openai_server \
   --online_quant_config \
     '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate","model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*","model.layers.78.*"]}' \
   --tensor-parallel-size "${TP}" \
-  --max-num-seqs "$((CONC * 2))" \
+  --max-num-seqs "${MAX_NUM_SEQS}" \
   --cudagraph-capture-sizes "${CUDAGRAPH_CAPTURE_SIZES}" \
   --num-speculative-tokens "${MTP_K}" \
   --method mtp \
