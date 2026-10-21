@@ -2,6 +2,7 @@
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -437,15 +438,23 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         and its scales). Each plane is published whole as one region, in that
         order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
-        Nothing else is published: no SLOT and no P/D staging, since the only
-        transport admitted (`validate_runtime_config`) is the native-state MP
-        path, which moves STATE through `execute_paged_state_copies`.
+
+        For P/D: the request's whole STATE slot, through a staging pool
+        (`staging_region`, `gather_slot`, `scatter_slot`). A slot is contiguous and holds every
+        layer's window ring -- the decoder's bounded-replay tail and the DSpark
+        context layers included -- plus the compressor rings and the cursor, so
+        it is all a consumer needs to decode and draft from the prompt's end.
+        No staging region: unlike DeepSeek-V4 there is no separate compressor
+        pool to gather.
         """
         runner = self.model_runner
         if not getattr(runner.config, "kv_transfer_config", None):
             return None
         from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
 
         if self.cache is None:
             raise RuntimeError(
@@ -458,21 +467,73 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             for name, plane in zip(names, owned)
         ]
         pages = [page_region(plane, semantic_role=role) for role, plane in planes]
+        # None under encoder SWA bounded replay, which keeps no checkpoint
+        # (`state_transfer`); P/D needs none -- it moves the live STATE slot.
         spec = runner.state_runtime.checkpoint_spec
         published = [page.region.unit_bytes for page in pages]
-        if (
-            published != [size for _, size in self.cache.unit_regions()]
-            or sum(published) != spec.page_unit_bytes
+        if published != [size for _, size in self.cache.unit_regions()] or (
+            spec is not None and sum(published) != spec.page_unit_bytes
         ):
             raise RuntimeError(
-                "DeepSeek-V4.1 transfer regions do not match the checkpoint's "
-                f"PAGE unit: regions={published}, unit={spec.page_unit_bytes}"
+                "DeepSeek-V4.1 transfer regions do not match the PAGE unit: "
+                f"regions={published}, cache={self.cache.unit_regions()}, "
+                f"checkpoint={None if spec is None else spec.page_unit_bytes}"
             )
         # No cache dimension is split across TP: every rank holds the same PAGE
         # and STATE bytes, as DeepSeek-V4's compressed cache does.
         tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
+        # The STATE slot crosses through a staging pool, as DeepSeek-V4's
+        # compressor state does: the producer gathers the slot into a staging
+        # row and RDMAs it into the consumer's staging row, and the consumer
+        # scatters that row into the request's slot on its compute stream once
+        # the write is done. Writing the slot directly would race the step the
+        # consumer still has in flight for the slot's previous tenant (deferred
+        # output learns of a finish one step late): RDMA is outside the
+        # stream's ordering, so that step could land after the transfer and
+        # overwrite it.
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
+        slot_unit = int(state.shape[1])
+        if not KVConnectorFactory.topology_uses_pd_staging(
+            runner.config.kv_transfer_config
+        ):
+            # `lmcache_mp` moves STATE through `execute_paged_state_copies`.
+            return KVTransferTensors(
+                pages=pages,
+                num_slots=int(state.shape[0]),
+                tp_replication_factor=tp_size,
+                native_state_tp_replication_factor=tp_size,
+                paged_state_checkpoint_spec=spec,
+                execute_paged_state_copies=self.execute_paged_state_copies,
+                paged_state_region_count=len(pages),
+            )
+        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
+        staging = getattr(self, "_pd_state_staging", None)
+        if staging is None or tuple(staging.shape) != (pool_size, slot_unit):
+            staging = torch.zeros(
+                (pool_size, slot_unit), dtype=torch.uint8, device=state.device
+            )
+            self._pd_state_staging = staging
+
+        def gather_slot(compute_slot: int, pool_idx: int) -> None:
+            staging[pool_idx].copy_(state[compute_slot])
+
+        def scatter_slot(compute_slot: int, pool_idx: int) -> None:
+            state[compute_slot].copy_(staging[pool_idx])
+
         return KVTransferTensors(
             pages=pages,
+            num_slots=int(state.shape[0]),
+            staging_region=KVTransferRegion(
+                staging.data_ptr(),
+                pool_size * slot_unit,
+                slot_unit,
+                semantic_role="dsv41.pd_staging.state_slot",
+            ),
+            staging_pool_size=pool_size,
+            gather_slot=gather_slot,
+            scatter_slot=scatter_slot,
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,

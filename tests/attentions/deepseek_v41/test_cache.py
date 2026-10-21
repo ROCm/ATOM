@@ -232,6 +232,43 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
+def test_pd_transfer_stages_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the STATE slot through a staging pool.
+
+    The connector RDMAs staging row to staging row; gather/scatter move a slot
+    in and out of a row, byte for byte. Encoder bounded replay keeps no
+    checkpoint, so the spec may be None.
+    """
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = cache
+    transfer = builder.get_kv_transfer_tensors()
+    assert not transfer.slot_regions and not transfer.swa_block_regions
+    assert transfer.num_slots == 4
+    assert transfer.staging_region.unit_bytes == geo.state_bytes
+    assert transfer.staging_pool_size > 1
+
+    image = torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
+    cache.state_bytes[2].copy_(image)
+    transfer.gather_slot(2, 1)
+    cache.state_bytes[2].zero_()
+    transfer.scatter_slot(3, 1)
+    torch.testing.assert_close(cache.state_bytes[3], image, rtol=0, atol=0)
+    assert not cache.state_bytes[2].any()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])
