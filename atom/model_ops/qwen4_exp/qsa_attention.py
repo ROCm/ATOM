@@ -33,7 +33,6 @@ raw index keys so pooling can read them back.
 """
 
 import functools
-import logging
 from types import SimpleNamespace
 
 import aiter
@@ -65,8 +64,6 @@ from atom.model_ops.qwen4_exp.ops.qsa import (
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
-
-logger = logging.getLogger(__name__)
 
 # Selection widths the aiter FlyDSL kernel accepts: 4T + 3 for T complete
 # four-token groups (T = 256, 512, 768, 1024), then the 0..3 causal tail.
@@ -477,8 +474,8 @@ class Qwen4ExpAttention(nn.Module):
             attn_out = None
             if forward_context.context.is_prefill:
                 attn_out = self._flydsl_attention(query, key, value, selected, qsa)
-            if attn_out is None or envs.ATOM_QSA_FLYDSL_ATTN_CHECK:
-                native = self._attend(
+            if attn_out is None:
+                attn_out = self._attend(
                     query,
                     selected,
                     qsa.block_tables,
@@ -489,9 +486,6 @@ class Qwen4ExpAttention(nn.Module):
                         else qsa.block_tables.shape[0]
                     ),
                 )
-                if attn_out is not None:
-                    self._log_flydsl_difference(attn_out, native, qsa)
-                attn_out = native
 
         if is_per_token_fp8_linear(self.o_proj):
             gated, gated_scale = sigmoid_mul_quant(
@@ -536,19 +530,6 @@ class Qwen4ExpAttention(nn.Module):
             query_lens=query_lens,
             prefix_lens=tuple(s - q for q, s in zip(query_lens, seq_lens)),
             softmax_scale=self.scaling,
-        )
-
-    def _log_flydsl_difference(self, flydsl, native, qsa):
-        difference = (flydsl.float() - native.float()).abs()
-        logger.info(
-            "QSA FlyDSL check layer=%d queries=%s seqs=%s max_abs=%.3e mean_abs=%.3e "
-            "native_max=%.3e",
-            self.layer_num,
-            qsa.host_lens[0],
-            qsa.host_lens[1],
-            difference.max().item(),
-            difference.mean().item(),
-            native.float().abs().max().item(),
         )
 
     def _profile_attention(self, query, key, value, hidden_states, positions):
