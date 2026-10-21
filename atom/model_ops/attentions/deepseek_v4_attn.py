@@ -2840,9 +2840,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     def prepare_mixed(self, batch: ScheduledBatch, bs: int):
         """Build split-dispatch metadata for a V4 mixed prefill+decode batch.
 
-        Mirrors the dense-MLA `prepare_mixed` (aiter_mla.py) pattern but for
-        V4's much larger metadata surface. The batch layout is
-        ``[prefill rows | decode rows]`` (prefill first, M1 scheduler order).
+        The batch layout is ``[prefill rows | decode rows]`` (prefill first,
+        M1 scheduler order).
 
         Strategy: reuse the existing, validated `prepare_prefill` and
         `prepare_decode` unmodified.

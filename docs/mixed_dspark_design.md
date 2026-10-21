@@ -10,13 +10,13 @@
 
 | 维度 | 支持 | 不支持（仍在启动时拒绝） |
 |---|---|---|
-| 模型族 | V4（`Family.V4`，DeepSeek-V4-Pro-DSpark） | dense MLA（R1）+ 任何 spec；Kimi-K3（本就不在 mixed 白名单） |
+| 模型族 | V4（`Family.V4`，DeepSeek-V4-Pro-DSpark） | 非 V4 的所有模型族（mixed 只支持 V4） |
 | spec 方法 | `dspark` | `mtp` / `eagle`（数据流相同，Phase 2 顺带放开） |
 | TBO | `--enable-tbo` + `ATOM_TBO_MIXED=1`（见 §4.8） | DCP + decode TBO + spec（main 已拒绝，不动） |
 | DSpark ragged / q-bucket | 纯 decode step 照常生效 | mixed step 上自动退化为全宽 K+1（现有代码已如此，见 §4.6） |
 | PP | — | PP>1（reserve 口径不一致，见 §4.1） |
 
-dense MLA 不做的原因：`aiter_mla.py` 的 `prepare_mixed` 在 decode 段整体写死 1 token/行（`max_q_d=1`、`slot_d`、`positions_d = ctx-1`、无 `num_rejected` 回滚、persistent worker buffer 按 q=1 建），要重写成与 `prepare_decode` 等价的 spec 形状，工作量独立，放 Phase 2。V4 的 decode 段是直接调用未修改的 `prepare_decode`（经 `_MixedDecodeView`），本身已是宽度无关的，这是选 V4 先做的理由。
+mixed 只实现了 V4（dense MLA 的 mixed 支持已删除）。V4 的 decode 段是直接调用未修改的 `prepare_decode`（经 `_MixedDecodeView`），本身已是宽度无关的，所以 spec 形状不用另写。
 
 ## 2. 现状：三道拒绝
 
@@ -46,7 +46,7 @@ logits 行 = [ 每个 prefill seq 的最后一个 token (n_p_seqs 行) | 每个 
 
 - **Validator**：把 spec 那一条拆成细粒度拒绝——
   - 允许：`family == V4 and method == "dspark" and pp_size == 1`（TBO 开关不限，见 §4.8）
-  - 拒绝：dense MLA + 任何 spec；`mtp`/`eagle`（Phase 1）；PP>1。理由文案逐条写明。
+  - 拒绝：非 V4 模型族；`mtp`/`eagle`（Phase 1）；PP>1。理由文案逐条写明。
 - **Decode reserve**（`scheduler.py` decode-first 预留）：`n_decode_inflight * (self.mtp_k + 1)` → `* (self.spec_width + 1)`，与 decode 循环真实花费同口径。PP 被 validator 挡住，这里只是消除 validator 里那条理由的根源。
 - **Reserve 饱和风险**：K=7 时每个 decode 行预留 8 token。`max_num_seqs=256` 满载时 reserve = 2048，若 `--max-num-batched-tokens 2048` 则 `prefill_budget = 0`，mixed 永远不形成、prefill 饿死。Phase 1 行为：**不改调度策略**，但在 validator 里当 `max_num_batched_tokens <= max_num_seqs * (K+1)` 时打 warning 并说明原因；是否加 prefill 保底预算作为 §7 的开放问题。
 - 其余调度逻辑无需改：decode 行已按 `spec_width+1` 排进 `num_scheduled_tokens`，`scheduled_spec_decode_tokens` 已是 `[bs, K]`（prefill 行为 0 行），`_settle_prefill_chunks` 只作用于 prefill 前缀，DSpark 的 `drafter_needs_next_token=False` 所以 `next_token_ids=None`。
@@ -117,7 +117,7 @@ merged.state_slot_out = _pad_to(running_bs, torch.cat([prefill_meta.state_slot_o
   - LM head：只读前缀 `cu_seqlens_q[1:n_p+1]`。
   - DSpark block pass：只读 `state_slot_out[:B]`；`prepare_block` / `mask_pad_tail` 读的是 builder 的静态 `row_ids` arange，不碰 `forward_vars`。
   - TBO mixed 重建：`split_attn_metadata` / `_build_ubatch_mixed_metadata` 读 `prefill_attn_metadata` / `ub_pref`，不读 carrier。
-  - 其余命中都在 dense MLA/MHA（`attention_mla.py` / `attention_mha.py`），V4 不走。
+  - 其余命中在 MHA（`attention_mha.py`，只做拒绝），V4 不走。
   - 结论：方案 A 成立；方案 B 降为不需要的备选。
 
 方案 B（备选）：保持 carrier 语义不变，新增 `cu_seqlens_q_all` / `state_slot_out_all`，让 `write_context_kv` 与 `Drafter.prepare_inputs` 优先读 `_all`。改动面更散（`deepseek_v4_dspark.py` 的 `write_context_kv` 是 eager 方法、不在 `@support_torch_compile` 的 `_DSparkInner` 里，可以改），但不改变已有读者看到的语义。读者审计（上文）已确认 A 成立，B 仅作记录。
@@ -243,4 +243,4 @@ V4-Flash-DSpark tp4 + dp-attention，K=5，`--max-num-batched-tokens 2048`（强
 2. **mixed step 放弃 ragged**：mixed step 每个 decode 行都 verify 满 K+1，浪费一部分算力；mixed 本来就算力受限（见 CUDAGraph/mixed 测量结论）。值不值得在 mixed 上支持 ragged，取决于 mixed step 占比，先测再说。
 3. **单次运行的噪声**：B' 比 A 接受率低 2.6 个点，只跑了一次。mixed 组的接受率要和 B' 比，需要各组重复 2-3 次才能区分实现问题和噪声。
 4. **decode 占多数时的 mixed TBO 切分**（§4.8-2）：是否支持切点落在 decode 区，取决于 arm2 测得的 `gate:split` 比例。
-5. **Phase 2**：dense MLA `prepare_mixed` 的 spec 化（R1 + MTP）、`mtp`/`eagle` 放开。
+5. **Phase 2**：`mtp`/`eagle` 放开。

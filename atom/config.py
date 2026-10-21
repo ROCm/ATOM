@@ -2733,19 +2733,16 @@ class Config:
         discovers. That is the whole reason they can be checked here: they come
         off the HF config and the CLI, both settled before a model loads.
 
-        The runtime sites are kept as backstops, because two of the conditions
-        are only NEARLY expressible here -- `MLAAttention.is_sparse_mla` also
-        takes `mla_modules.is_sparse`, which this cannot see, and the fp4x2
-        activation-scale layout additionally depends on `use_triton_gemm()`.
-        A backstop that never fires is the intended outcome; one that fires
-        means this table has a gap worth closing rather than a check worth
-        deleting.
+        Mixed batching is implemented for DeepSeek-V4 only. Every other
+        attention family is refused here; the base builder's `prepare_mixed`
+        and the MHA forward keep a runtime refusal as a backstop, which firing
+        means this table has a gap.
         """
         if not self.enable_mixed_prefill_decode:
             return
 
         from atom.utils import get_hf_text_config
-        from atom.utils.selector import Family, attn_family, has_mla_indexer
+        from atom.utils.selector import Family, attn_family
 
         # `hf_config` is set earlier in `__post_init__`; the text sub-config is
         # derived, not stored (multimodal configs nest it). ModelRunner keeps
@@ -2754,22 +2751,22 @@ class Config:
         # every launch that enabled the flag.
         hf = get_hf_text_config(self.hf_config)
         family = attn_family(hf)
-        # A WHITELIST of families, not `not is_mla`. `Family.is_mla` is
-        # `self in (MLA, KIMI_MLA)` -- it deliberately excludes V4, which is
-        # its own, more specific family despite also carrying a latent rank.
-        # Testing `not is_mla` therefore refused DeepSeek-V4, the model this
-        # feature was built for and is validated on, and (because
-        # `has_mla_indexer` is itself gated on `is_mla`) made the sparse check
-        # below dead for V4 at the same time. Both were caught by a server
-        # refusing to start, not by a test.
-        _MIXED_FAMILIES = (Family.V4, Family.MLA)
         spec = self.speculative_config
         spec_method = None if spec is None else spec.method
         cg_mode = self.compilation_config.cudagraph_mode
-        dense_mla = family == Family.MLA
-        rope_parameters = getattr(hf, "rope_parameters", None) or {}
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
+            # Only the V4 builder implements `prepare_mixed`. Compared by
+            # family, not `is_mla`: V4 is its own family despite its latent
+            # rank, and dense MLA (DeepSeek-V2/V3/R1, Kimi) is not supported.
+            (
+                family != Family.V4,
+                f"the {family} attention family",
+                (
+                    "mixed prefill+decode batching is implemented for "
+                    "DeepSeek-V4 only"
+                ),
+            ),
             # The same predicate `DeepseekV4Attention.forward` routes on: a
             # piecewise-compiled V4 layer takes its narrow split order on EVERY
             # forward, captured or not, and that order has no mixed form -- it
@@ -2801,37 +2798,11 @@ class Config:
                 ),
             ),
             (
-                spec is not None and family != Family.V4,
-                f"speculative decoding on the {family} attention family",
-                (
-                    "only the V4 builder's decode half is spec-shaped; dense "
-                    "MLA's `prepare_mixed` still stages one token per decode row"
-                ),
-            ),
-            (
                 spec is not None and self.pipeline_parallel_size > 1,
                 "speculative decoding with pipeline parallel",
                 (
                     "under PP the decode loop spends no draft rows "
                     "(spec_width 0), so the spec-shaped mixed split never forms"
-                ),
-            ),
-            (
-                family not in _MIXED_FAMILIES,
-                f"the {family} attention family",
-                (
-                    "only the two builders that implement `prepare_mixed` can "
-                    "form one -- `AiterMLA` (dense MLA) and the V4 builder; "
-                    "every other lands on the base class's NotImplementedError"
-                ),
-            ),
-            (
-                has_mla_indexer(hf),
-                "sparse MLA (the V3.2 indexer)",
-                (
-                    "the indexer's top-k selection is built for the whole "
-                    "batch and the prefill-MLA path it enables has no "
-                    "per-segment form"
                 ),
             ),
             # The decode-first `prefill_budget` holds only while prefill is
@@ -2845,66 +2816,12 @@ class Config:
                     "decode-first prefill budget, which then cannot hold"
                 ),
             ),
-            # `prepare_prefill` builds M-RoPE positions over every request in
-            # the batch, decode rows included, and the mixed builders take
-            # only 1-D positions for their decode half.
-            (
-                "mrope_section" in rope_parameters,
-                "M-RoPE",
-                (
-                    "the prefill builder lays M-RoPE positions over the whole "
-                    "mixed batch, decode rows included"
-                ),
-            ),
             (
                 self.prefill_context_parallel_size > 1,
                 "prefill context parallel",
                 (
                     "the PCP round-robin query split and its attention reindex "
                     "run over the whole batch, decode rows included"
-                ),
-            ),
-            # Dense MLA's mixed split is narrower than V4's: V4's decode half is
-            # the unmodified `prepare_decode`, while `AiterMLA.prepare_mixed`
-            # builds its own and handles none of the following.
-            (
-                dense_mla and self.decode_context_parallel_size > 1,
-                "decode context parallel on dense MLA",
-                (
-                    "the mixed decode half reads global context lengths and "
-                    "skips the DCP query-head gather and partial-output merge"
-                ),
-            ),
-            (
-                dense_mla and self.enable_tbo and envs.ATOM_TBO_MIXED,
-                "ATOM_TBO_MIXED on dense MLA",
-                (
-                    "only the V4 builder rebuilds the mixed carrier per "
-                    "micro-batch; dense MLA's generic rebuild drops its nested "
-                    "prefill/decode metadata"
-                ),
-            ),
-            (
-                dense_mla
-                and (
-                    envs.ATOM_MLA_PAGE_SIZE > 1
-                    or envs.ATOM_MLA_KV_SHUFFLED
-                    or envs.ATOM_USE_TRITON_MLA
-                ),
-                "the segmented, shuffled or Triton MLA KV path on dense MLA",
-                (
-                    "the mixed forward writes KV with plain "
-                    "`concat_and_cache_mla` and decodes through AITER, so a "
-                    "non-default cache layout or decode backend is bypassed"
-                ),
-            ),
-            (
-                dense_mla
-                and (self.kv_transfer_config or {}).get("kv_role") == "kv_consumer",
-                "a P/D decode instance on dense MLA",
-                (
-                    "the mixed decode half lacks `prepare_decode`'s first "
-                    "decode without a local prefill"
                 ),
             ),
         ]

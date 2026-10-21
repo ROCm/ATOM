@@ -24,7 +24,6 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[1]
 _BUILDERS = [
     "atom/model_ops/attentions/deepseek_v4_attn.py",
-    "atom/model_ops/attentions/aiter_mla.py",
 ]
 _BACKENDS = "atom/model_ops/attentions/backends.py"
 

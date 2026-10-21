@@ -212,7 +212,7 @@ class PagedAttentionImpl(nn.Module):
         if getattr(fwd_ctx.context, "is_mixed", False):
             raise NotImplementedError(
                 "MHA models do not support mixed prefill+decode batches yet "
-                "(split dispatch is implemented only for dense MLA). "
+                "(split dispatch is implemented only for DeepSeek-V4). "
                 "Disable --enable-mixed-prefill-decode."
             )
 

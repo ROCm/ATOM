@@ -57,7 +57,7 @@ def test_no_mixed_refusal_is_an_assert():
 def test_there_are_refusals_at_all():
     """Guards the test above from passing because it found nothing."""
     found = _mixed_refusals()
-    assert len(found) >= 5, (
+    assert len(found) >= 4, (
         f"only {len(found)} mixed refusal(s) found; the scan probably stopped "
         "matching (it keys off the message wording), which would make the "
         "assert-free check above vacuous"
@@ -107,7 +107,8 @@ def test_the_table_returns_early_when_the_flag_is_off():
 
 
 class _FakeHF:
-    """Minimal HF text config. MLA is 'has a latent rank' (see selector)."""
+    """Minimal HF text config. MLA is 'has a latent rank' (see selector); set
+    `model_type` to pick a more specific family."""
 
     def __init__(self, *, kv_lora_rank=512, index_topk=None):
         self.kv_lora_rank = kv_lora_rank
@@ -133,23 +134,17 @@ class _FakeConfig:
         max_num_batched_tokens=16384,
         cudagraph_mode=None,
         chunked_prefill=True,
-        dcp=1,
         pcp=1,
-        enable_tbo=False,
-        kv_transfer_config=None,
     ):
         self.enable_mixed_prefill_decode = enabled
-        self.hf_config = hf if hf is not None else _FakeHF()
+        self.hf_config = hf if hf is not None else _v4_hf()
         self.speculative_config = spec
         self.pipeline_parallel_size = pp
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.compilation_config = SimpleNamespace(cudagraph_mode=cudagraph_mode)
         self.enable_chunked_prefill = chunked_prefill
-        self.decode_context_parallel_size = dcp
         self.prefill_context_parallel_size = pcp
-        self.enable_tbo = enable_tbo
-        self.kv_transfer_config = kv_transfer_config or {}
 
 
 def _v4_hf():
@@ -173,8 +168,8 @@ def _bind():
 def test_validator_runs_against_a_real_config_surface():
     """The regression: it read an attribute Config does not have."""
     _bind()
-    # Dense MLA, no spec -> supported, must not raise (and must not
-    # AttributeError on the way to deciding that).
+    # V4, no spec -> supported, must not raise (and must not AttributeError
+    # on the way to deciding that).
     _FakeConfig()._validate_mixed_prefill_decode()
 
 
@@ -189,14 +184,6 @@ def test_validator_refuses_other_spec_methods(method):
     _bind()
     cfg = _FakeConfig(hf=_v4_hf(), spec=_spec(method))
     with pytest.raises(ValueError, match=f"speculative decoding via '{method}'"):
-        cfg._validate_mixed_prefill_decode()
-
-
-def test_validator_refuses_spec_on_dense_mla():
-    """Dense MLA's `prepare_mixed` stages one token per decode row."""
-    _bind()
-    cfg = _FakeConfig(spec=_spec())
-    with pytest.raises(ValueError, match="speculative decoding on the"):
         cfg._validate_mixed_prefill_decode()
 
 
@@ -226,88 +213,22 @@ def test_validator_is_quiet_when_prefill_keeps_budget(caplog):
     assert "leaving prefill no budget" not in caplog.text
 
 
-def test_validator_refuses_sparse_mla():
-    _bind()
-    cfg = _FakeConfig(hf=_FakeHF(index_topk=2048))
-    with pytest.raises(ValueError, match="sparse MLA"):
-        cfg._validate_mixed_prefill_decode()
-
-
 # ---- what the mixed split does not cover (PR #2037 review) ----------------
 
 
-@pytest.mark.parametrize("hf_factory", [_FakeHF, _v4_hf], ids=["mla", "v4"])
-def test_validator_refuses_unchunked_prefill(hf_factory):
+def test_validator_refuses_unchunked_prefill():
     """Unchunked admission takes a prompt whole, past the decode reserve."""
     _bind()
-    cfg = _FakeConfig(hf=hf_factory(), chunked_prefill=False)
+    cfg = _FakeConfig(chunked_prefill=False)
     with pytest.raises(ValueError, match="chunked prefill off"):
         cfg._validate_mixed_prefill_decode()
 
 
-@pytest.mark.parametrize("hf_factory", [_FakeHF, _v4_hf], ids=["mla", "v4"])
-def test_validator_refuses_mrope(hf_factory):
+def test_validator_refuses_pcp():
+    """PCP's round-robin query split covers the whole batch, decode rows too."""
     _bind()
-    hf = hf_factory()
-    hf.rope_parameters = {"mrope_section": [16, 24, 24]}
-    with pytest.raises(ValueError, match="M-RoPE"):
-        _FakeConfig(hf=hf)._validate_mixed_prefill_decode()
-
-
-@pytest.mark.parametrize("v4", [False, True])
-def test_validator_refuses_pcp(v4):
-    """PCP's round-robin query split covers the whole batch on every family."""
-    _bind()
-    hf = _v4_hf() if v4 else None
     with pytest.raises(ValueError, match="prefill context parallel"):
-        _FakeConfig(hf=hf, pcp=2)._validate_mixed_prefill_decode()
-
-
-def test_validator_refuses_dcp_on_dense_mla_only():
-    """Dense MLA's own decode half skips DCP; V4's is `prepare_decode`."""
-    _bind()
-    with pytest.raises(ValueError, match="decode context parallel on dense MLA"):
-        _FakeConfig(dcp=2)._validate_mixed_prefill_decode()
-    _FakeConfig(hf=_v4_hf(), dcp=2)._validate_mixed_prefill_decode()
-
-
-def test_validator_refuses_mixed_tbo_on_dense_mla_only(monkeypatch):
-    """Only the V4 builder rebuilds a mixed carrier per micro-batch."""
-    _bind()
-    monkeypatch.setenv("ATOM_TBO_MIXED", "1")
-    with pytest.raises(ValueError, match="ATOM_TBO_MIXED on dense MLA"):
-        _FakeConfig(enable_tbo=True)._validate_mixed_prefill_decode()
-    _FakeConfig(hf=_v4_hf(), enable_tbo=True)._validate_mixed_prefill_decode()
-    # Plain TBO keeps vetoing mixed batches, which dense MLA supports.
-    monkeypatch.setenv("ATOM_TBO_MIXED", "0")
-    _FakeConfig(enable_tbo=True)._validate_mixed_prefill_decode()
-
-
-@pytest.mark.parametrize(
-    "env,value",
-    [
-        ("ATOM_MLA_PAGE_SIZE", "2"),
-        ("ATOM_MLA_KV_SHUFFLED", "1"),
-        ("ATOM_USE_TRITON_MLA", "1"),
-    ],
-)
-def test_validator_refuses_non_default_mla_kv_paths(monkeypatch, env, value):
-    """The mixed forward writes and decodes through the default layout only."""
-    _bind()
-    monkeypatch.setenv(env, value)
-    with pytest.raises(ValueError, match="segmented, shuffled or Triton MLA"):
-        _FakeConfig()._validate_mixed_prefill_decode()
-    _FakeConfig(hf=_v4_hf())._validate_mixed_prefill_decode()
-
-
-def test_validator_refuses_pd_consumer_on_dense_mla_only():
-    _bind()
-    consumer = {"kv_role": "kv_consumer"}
-    with pytest.raises(ValueError, match="P/D decode instance on dense MLA"):
-        _FakeConfig(kv_transfer_config=consumer)._validate_mixed_prefill_decode()
-    _FakeConfig(
-        hf=_v4_hf(), kv_transfer_config=consumer
-    )._validate_mixed_prefill_decode()
+        _FakeConfig(pcp=2)._validate_mixed_prefill_decode()
 
 
 # Every member of the taxonomy, named. The first version of this table tested
@@ -317,7 +238,7 @@ def test_validator_refuses_pd_consumer_on_dense_mla_only():
 _FAMILY_CASES = [
     # (model_type, kv_lora_rank, supported?)
     ("deepseek_v4", 512, True),  # the feature's reason to exist
-    ("deepseek_v3", 512, True),  # dense MLA, the other prepare_mixed
+    ("deepseek_v3", 512, False),  # dense MLA; mixed is V4-only
     ("kimi_linear", 512, False),  # hybrid; no prepare_mixed
     ("qwen3_next", None, False),  # GDN
     ("llama", None, False),  # MHA
@@ -342,7 +263,7 @@ def test_v4_is_not_refused_as_non_mla():
 
     `Family.is_mla` is `self in (MLA, KIMI_MLA)` and V4 is deliberately absent
     from it -- so `not is_mla` reads as "refuse V4". The validator must key off
-    a whitelist of families that implement `prepare_mixed`, not off `is_mla`.
+    the V4 family, not off `is_mla`.
     """
     _bind()
     from atom.utils.selector import Family
@@ -366,11 +287,11 @@ def test_validator_is_inert_when_the_flag_is_off():
 def test_all_reasons_are_reported_not_just_the_first():
     """A user fixing one conflict should not discover the next on relaunch."""
     _bind()
-    cfg = _FakeConfig(hf=_FakeHF(index_topk=2048), spec=_spec("mtp"))
+    cfg = _FakeConfig(spec=_spec("mtp"), chunked_prefill=False)
     with pytest.raises(ValueError) as e:
         cfg._validate_mixed_prefill_decode()
     assert "speculative decoding" in str(e.value)
-    assert "sparse MLA" in str(e.value)
+    assert "chunked prefill off" in str(e.value)
 
 
 @pytest.mark.parametrize(
@@ -395,14 +316,3 @@ def test_v4_refuses_every_piecewise_compiled_mode(mode, refused):
             cfg._validate_mixed_prefill_decode()
     else:
         cfg._validate_mixed_prefill_decode()
-
-
-def test_piecewise_refusal_is_v4_only():
-    """Scoped to V4, whose narrow split order was seen to take mixed batches.
-    Whether dense MLA under PIECEWISE has the same gap is not established;
-    widening this refusal needs that evidence first."""
-    _bind()
-    from atom.config import CUDAGraphMode
-
-    cfg = _FakeConfig(cudagraph_mode=CUDAGraphMode.PIECEWISE)
-    cfg._validate_mixed_prefill_decode()
