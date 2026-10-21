@@ -17,7 +17,9 @@ from atom.model_ops.base_attention import (
     PA_ASM_MAX_QUERY_GROUP_SIZE,
     cp_mha_gather_cache,
     dense_decode_splits,
+    flydsl_decode_seqs,
     gluon_decode_over_limit,
+    gluon_decode_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )
@@ -574,6 +576,51 @@ class PagedAttentionImpl(nn.Module):
         x = int(k_cache.shape[-1])
         return v_cache.view(n, nh, block_size // x, head_dim, x)
 
+    def _shuffle_v_for_flydsl(self, v_cache, k_cache):
+        # FlyDSL on gfx1250 reads a 4D V as the plain layout; this cache is
+        # SHUFFLE, so pass its 5D view. gluon takes the 4D view as it always has.
+        if gluon_decode_supports_arch() or v_cache.dim() != 4 or k_cache.dim() != 5:
+            return v_cache
+        return self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
+
+    def _flydsl_takes_decode(self, q, k_cache, v_cache, attn_metadata) -> bool:
+        """Without gluon decode (gfx1250): whether FlyDSL accepts this call.
+
+        ATOM_USE_UNIFIED_ATTN keeps the call on unified_attention.
+        """
+        if (
+            envs.ATOM_USE_UNIFIED_ATTN
+            or gluon_decode_supports_arch()
+            or self.sliding_window > 0
+        ):
+            return False
+        num_seqs = attn_metadata.context_lens.shape[0]
+        return bool(
+            flydsl_decode_seqs(
+                output=q,
+                q=q,
+                k_cache=k_cache,
+                v_cache=self._shuffle_v_for_flydsl(v_cache, k_cache),
+                block_tables=attn_metadata.block_tables,
+                context_lens=attn_metadata.context_lens,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_context_partition_num=dense_decode_splits(
+                    num_seqs, k_cache.shape[1]
+                ),
+                context_partition_size=256,
+                compute_type=(
+                    torch.bfloat16
+                    if self.kv_cache_dtype == "bf16"
+                    else aiter.dtypes.fp8
+                ),
+                q_scale=None,
+                alibi_slopes=None,
+                sinks=self.sinks,
+                sliding_window=self.sliding_window,
+                ps=True,
+            )
+        )
+
     @mark_trace(prefix="paged_attention_unified", torch_compile=False)
     def paged_attention_unified(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
@@ -585,6 +632,10 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
+        if self._flydsl_takes_decode(q, k_cache, v_cache, attn_metadata):
+            return self.paged_attention_triton(
+                q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx
+            )
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
@@ -622,8 +673,10 @@ class PagedAttentionImpl(nn.Module):
     def paged_attention_triton(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-        """Decode through the gluon paged kernel. Callers must have cleared
-        gluon_decode_over_limit -- _dispatch_decode is where that happens."""
+        """Decode through run_pa_decode: gluon, or FlyDSL where ATOM_PA_FLYDSL
+        routes it (always FlyDSL on gfx1250). Callers must have cleared
+        gluon_decode_over_limit -- _dispatch_decode is where that happens --
+        or, without gluon, _flydsl_takes_decode."""
 
         attn_metadata = fwd_ctx.attn_metadata
 
@@ -674,7 +727,7 @@ class PagedAttentionImpl(nn.Module):
             output=o,
             q=q,
             k_cache=k_cache,
-            v_cache=v_cache,
+            v_cache=self._shuffle_v_for_flydsl(v_cache, k_cache),
             context_lens=attn_metadata.context_lens,
             block_tables=attn_metadata.block_tables,
             softmax_scale=self.scale,
@@ -1037,11 +1090,16 @@ class PagedAttentionImpl(nn.Module):
         checked here rather than inside its runner: past its envelope
         get_heuristic_kernel silently re-runs with mtp=1, a kernel built for
         another query length, and computes a wrong answer instead of refusing.
+
+        One exception: without gluon decode (gfx1250) this picks unified, and
+        paged_attention_unified hands FlyDSL the calls it accepts. That check
+        needs the cache and metadata, which this method does not see.
         """
         # Clamped once here so both gates see the same value; the predicate
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
-        over_gluon = gluon_decode_over_limit(
+        # No gluon decode (gfx1250): unified, which hands FlyDSL what it takes.
+        over_gluon = not gluon_decode_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (

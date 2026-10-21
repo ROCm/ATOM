@@ -241,12 +241,14 @@ def _sparse_pa_ran_on_asm(
     """
     from atom.model_ops.base_attention import (
         PA_ASM_MAX_QUERY_GROUP_SIZE,
+        pa_fwd_asm_supports_arch,
         run_pa_fwd_asm,
     )
 
     rows, group, head_dim = q.shape
     if (
-        k_scale is None
+        not pa_fwd_asm_supports_arch()
+        or k_scale is None
         or not _is_fp8_kv_cache_tensor(k_cache)
         or group > PA_ASM_MAX_QUERY_GROUP_SIZE
         or rows <= _gluon_one_pass_max_rows(q.device.index)
