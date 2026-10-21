@@ -1,6 +1,7 @@
 #!/bin/bash
 # Kimi-K3 on two HeliosM trays (2 x 4 MI455, gfx1250 B0) as one tensor-parallel group of 8: attention TP8 with
-# decode context parallel 8, MoE expert-parallel over the same 8 GPUs, RCCL for every collective.
+# decode context parallel 8, MoE expert-parallel over the same 8 GPUs. aiter's custom all-reduce spans the trays for
+# decode-sized all-reduces; RCCL does every other collective.
 #
 # Self-contained: it needs only a container of rocm/fw-bringup:gfx1250-atom-k3-20261016 (aiter, mori, Triton,
 # torch) and the Kimi-K3 checkpoint. It fetches the ATOM it serves, ROCm/ATOM branch gyu/k3-455-tp8 at the commit
@@ -41,14 +42,17 @@
 #   K3_ATOM_DIR  the ATOM checkout (default /root/.cache/atom-gyu-k3-455-tp8); fetched from GitHub on first use
 #   K3_MODEL     checkpoint directory (default /models/Kimi-K3)
 #   K3_PORT      API port on node0 (default 8000)
+#   AITER_CUSTOM_AR_USE_SYMM_MEM
+#                1 (default) | 0. 1 runs aiter's custom all-reduce across the trays (see "communication" below for
+#                what it needs and its caveats); 0 leaves every all-reduce on RCCL, as in the validated runs below.
 #
 # Validated on CT11 (node0) + CT10, driver loaded without perf setup, full GSM8K 5-shot:
 #   2026-10-19, this script at ff07fd8fd (serving ATOM 571d22de7, the same code as here when K3_DSPARK=0), defaults:
 #   gate PASS, strict-match 0.9629 +-0.0052 (2026-10-16, the same configuration: 0.9575; dp8ep8 on the same image
 #   family: 0.9651). The K3_MOE=tp and K3_DSPARK=7 scores above come from runs with this environment.
+#   All of these ran every all-reduce on RCCL (AITER_CUSTOM_AR_USE_SYMM_MEM unset). The custom all-reduce default has
+#   not been validated end to end yet.
 # Not supported here: the recipe's --block-size 128 (untested; 16 is used).
-# Keep aiter's custom all-reduce off across the trays (AITER_CUSTOM_AR_USE_SYMM_MEM, ATOM_USE_CUSTOM_ALL_GATHER):
-# both times it was on, both trays took a fatal CPU error (Processor Context Corrupt) during startup and rebooted.
 set -euo pipefail
 RANK0=${1:-}
 MASTER=${2:-}
@@ -174,11 +178,33 @@ export AITER_USE_GROUPED_GEMM=1
 # --- GEMM and quantization: the online FP8 layers take E8M0 block scales (#2554) on preshuffled weights
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=1 ATOM_FP8_BLOCKSCALE_USE_E8M0_SCALE=1
 export AITER_ROPE_TRITON_BACKEND=1 AITER_USE_SYSTEM_TRITON=1
-# --- communication: RCCL over UALink (without NCCL_MNNVL_ENABLE it falls back to TCP); no custom collectives
+# --- communication: RCCL over UALink (without NCCL_MNNVL_ENABLE it falls back to TCP), plus aiter's custom
+# all-reduce across the trays for decode-sized all-reduces
 export NCCL_MNNVL_ENABLE=1 NCCL_IB_DISABLE=1 NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS NCCL_CUMEM_ENABLE=1
-export MORI_SOCKET_IFNAME=enp1s0f1 NCCL_SOCKET_IFNAME=enp1s0f1 GLOO_SOCKET_IFNAME=enp1s0f1   # the image says lo
+# The NIC that routes to the other tray (`ip route get <other tray's IP>`): enp1s0f1 on these trays. The image says
+# lo, which cannot reach it. RCCL's bootstrap, the ranks' gloo group (custom all-reduce's group) and mori's
+# rendezvous all use it.
+export MORI_SOCKET_IFNAME=enp1s0f1 NCCL_SOCKET_IFNAME=enp1s0f1 GLOO_SOCKET_IFNAME=enp1s0f1
+# Custom all-reduce across the trays runs only on aiter's torch.symm_mem transport (mori backend; aiter #5431, in the
+# image's aiter). IPC and VMM handles are node-local, so without it aiter logs "Custom allreduce is disabled because
+# this process group spans across nodes" and RCCL does every all-reduce. It also needs the two *_SOCKET_IFNAME above
+# and MORI_AMD_SMI_PATH (architecture section; without it mori exits 255: "[AMD-SMI] missing symbol amdsmi_init").
+# - When on, every rank logs "Custom allreduce: using torch.symm_mem transport (mori backend)". If mori's probe fails,
+#   or the other tray's buffers cannot be mapped, every rank falls back to RCCL.
+# - It takes inputs of (AITER_CUSTOM_AR_MIN_SIZE, AITER_CUSTOM_AR_MAX_SIZE] bytes, by default (0, 64 MiB]: all of
+#   decode's all-reduces. A prefill of more than 4,681 tokens ([T, 7168] bf16 > 64 MiB) stays on RCCL.
+#   AITER_CUSTOM_AR_MAX_SIZE=0 sends everything to RCCL. Its symmetric buffers take 1 GiB per GPU.
+# - The transport cannot register CUDA graph buffers, so every captured all-reduce first copies its input (~1.2 us).
+# - Measured on CT15 + CT13 on 2026-10-21 (8 ranks in CUDA graphs, the MLPerf 1016 image's aiter, whose symm_mem code
+#   is the same): correct (exact sums), but 2.4-4.5 us slower per call than RCCL's DDA at decode sizes (32 x 7168
+#   bf16: 18.2 vs 15.7 us). That is about +0.45 ms per decode step at two all-reduces per layer, unless the
+#   all-reduce + RMSNorm fusion that only custom all-reduce enables wins it back. Not yet measured in this server.
+# - Twice before, with it on, both trays took a fatal CPU error (Processor Context Corrupt) during startup and
+#   rebooted; the socket settings of those runs are not known. The 2026-10-21 tests ran clean. Watch the first start;
+#   AITER_CUSTOM_AR_USE_SYMM_MEM=0 goes back to RCCL.
+export AITER_CUSTOM_AR_USE_SYMM_MEM=${AITER_CUSTOM_AR_USE_SYMM_MEM:-1}
+# aiter's custom all-gather (the vocab-parallel LM head) is a separate path, untested across the trays: off
 export ATOM_USE_CUSTOM_ALL_GATHER=0 ATOM_DP_LM_HEAD_MODE=default
-unset AITER_CUSTOM_AR_USE_SYMM_MEM
 # --- loading
 export HSA_USE_SVM=1 HSA_ENABLE_SDMA=1 ATOM_LOADER_NUM_THREADS=4
 export HSA_XNACK=$([ "$(cat /sys/module/amdgpu/parameters/noretry 2>/dev/null)" = 1 ] && echo 0 || echo 1)
@@ -220,6 +246,7 @@ ONLINE_QUANT='{"global_quant_config": "per_block_fp8", "layer_quant_config": {"*
 
 echo "[k3_455_tp8dcp8_server] $(date '+%F %T') $(hostname): TP ranks $RANK0-$((RANK0 + 3)) of 8, master $MASTER," \
   "K3_MODE=${K3_MODE:-accuracy} K3_MOE=${K3_MOE:-ep} K3_DSPARK=${K3_DSPARK:-0} max-num-seqs $MAX_SEQS" \
+  "AITER_CUSTOM_AR_USE_SYMM_MEM=$AITER_CUSTOM_AR_USE_SYMM_MEM" \
   "HSA_XNACK=$HSA_XNACK, ATOM $ATOM_COMMIT"
 exec python3 -m atom.entrypoints.openai_server \
   --model "$MODEL" --served-model-name moonshotai/Kimi-K3 --trust-remote-code --server-port "${K3_PORT:-8000}" \
