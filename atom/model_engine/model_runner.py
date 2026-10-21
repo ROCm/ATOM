@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -49,6 +50,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
+from atom.model_engine.output_transfer import D2HBufferPool, PendingD2H
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -80,6 +82,7 @@ from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
+from atom.spec_decode.output import MTPStatusQueue
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -249,6 +252,9 @@ class tokenIDProcessor:
         )
         self.use_spec = use_spec
         self.num_spec_tokens = num_spec_tokens
+        # Block-drafter warmup fabricates at least two requests, even when
+        # the service admits only one. Real batches/graphs obey max_num_seqs.
+        self._max_output_requests = max(runner.config.max_num_seqs, 2)
 
         self.async_copy_stream = torch.cuda.Stream(runner.device)
         self.default_num_rejected_tokens = torch.zeros(
@@ -296,63 +302,17 @@ class tokenIDProcessor:
         return None
 
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(self.async_copy_stream):
-            self.async_copy_stream.wait_stream(default_stream)
-            cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.async_copy_stream)
-        # No reverse wait here. `gpu_tensor` is a draft pass's captured output,
-        # so its address is fixed and the NEXT replay rewrites it -- but that
-        # replay sits behind a whole target forward on the default stream, while
-        # this copy is a few KB. Ordering the default stream against it would
-        # stall it for the copy every step, which is the overlap the side stream
-        # exists to buy. If a future change ever puts a replay closer than one
-        # forward away, the wait belongs immediately before THAT replay, not
-        # here.
-        self.draft_token_ids_cpu.append((cpu_tensor, event))
+        # The next replay of this draft output follows a whole target forward.
+        # Preserve side-stream overlap; no reverse wait on the forward stream.
+        self._pending_drafts.append(self._draft_buffers.copy(gpu_tensor))
 
     def recv_async_output_draft(self) -> np.ndarray:
-        if not self.draft_token_ids_cpu:
+        if not self._pending_drafts:
             return np.array([], dtype=np.int32)
-        token_ids, event = self.draft_token_ids_cpu.pop(0)
-        event.synchronize()
-        return token_ids.numpy()
+        return self._pending_drafts.popleft().result()
 
-    def send_mtp_status_to_cpu_async(
-        self,
-        num_rejected: torch.Tensor,
-        num_bonus: torch.Tensor,
-        data_ready: torch.cuda.Event,
-    ):
-        # rejected num and bonus num are slightly different info for mtp
-        # take mtp=1 for example:
-        #   first decode after prefill have 0 rej, 0 bonus
-        #   prev acc decode have 0 rej, 1 bonus
-        #   prev rej decode have 1 rej, 0 bonus
-        # It is clear that only rejected number is not sufficient for all status tracking, bonus number is also needed.
-        # Single Event for both copies (vs. per-tensor send_to_cpu_async) so the
-        # consumer pops one queue entry and synchronizes once instead of twice.
-        copy_done = torch.cuda.Event()
-        with torch.cuda.stream(self.async_copy_stream):
-            data_ready.wait(stream=self.async_copy_stream)
-            cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
-            cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
-            copy_done.record(self.async_copy_stream)
-        self.pending_mtp_status_copies.append(
-            (cpu_num_rejected, cpu_num_bonus, copy_done)
-        )
-
-    def recv_mtp_status_async(
-        self,
-    ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        if not self.pending_mtp_status_copies:
-            return None, None
-        cpu_num_rejected, cpu_num_bonus, copy_done = self.pending_mtp_status_copies.pop(
-            0
-        )
-        copy_done.synchronize()
-        return cpu_num_rejected.numpy(), cpu_num_bonus.numpy()
+    def recv_mtp_status_async(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return self.mtp_status.receive()
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -363,13 +323,14 @@ class tokenIDProcessor:
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
-        self.draft_token_ids_cpu: list[torch.Tensor] = []
-        # Queue of (cpu_num_rejected, cpu_num_bonus, copy_done_event) — async
-        # D2H copies fired by send_mtp_status_to_cpu_async, drained by
-        # recv_mtp_status_async after the event syncs.
-        self.pending_mtp_status_copies: list[
-            tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
-        ] = []
+        self._draft_buffers = D2HBufferPool(
+            self._max_output_requests * max(self.num_spec_tokens, 1),
+            self.async_copy_stream,
+        )
+        self._pending_drafts: deque[PendingD2H] = deque()
+        self.mtp_status = MTPStatusQueue(
+            self._max_output_requests, self.async_copy_stream
+        )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
 
@@ -3287,6 +3248,7 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        verdict = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3387,9 +3349,14 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                self.tokenID_processor.send_mtp_status_to_cpu_async(
-                    num_reject_tokens, next_token_locs, self.forward_done_event
-                )  # Async copy to CPU
+                if verdict is None:
+                    self.tokenID_processor.mtp_status.send_counts(
+                        num_reject_tokens, next_token_locs, self.forward_done_event
+                    )
+                else:
+                    self.tokenID_processor.mtp_status.send_verdict(
+                        verdict, self.forward_done_event
+                    )
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)

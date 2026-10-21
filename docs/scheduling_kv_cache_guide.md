@@ -184,21 +184,60 @@ class ScheduledBatch:
 
 Returned by the model runner after a forward pass:
 
-```python
-class ScheduledBatchOutput:
-    def __init__(
-        self,
-        token_ids: dict[int, tuple[int, ...]],
-        draft_token_ids,
-    ):
-        self.req_ids = list(token_ids.keys())
-        self.token_ids = token_ids        # {seq_id: (accepted_token_ids...)}
-        self.draft_token_ids = draft_token_ids  # {seq_id: [draft_ids]} or None
-```
+| Field | Contents |
+| --- | --- |
+| `req_ids` | Request IDs corresponding to the rows of accepted output |
+| `token_ids` | Accepted token tuples, aligned with `req_ids`; `get_idx(req_id)` finds a request's row |
+| `draft_token_ids` | Optional NumPy array of speculative draft tokens |
+| `num_rejected`, `num_bonus` | Optional NumPy arrays of per-request speculative rejection and bonus counts |
+| `is_deferred_out`, `is_prev_prefill` | Deferred-output and previous-prefill state |
+| `logprobs` | Optional sampled-token log probabilities |
+| `dspark_ell` | Optional request-ID-to-verification-length map from the DSpark scheduler |
 
-- `token_ids` maps sequence ID to a tuple of accepted token IDs.
-- `draft_token_ids` maps sequence ID to a list of speculative draft token IDs for the next step (when MTP is active).
-- A special key `-1` in `token_ids` signals deferred output mode.
+The output owns the storage of `draft_token_ids`, `num_rejected`, and
+`num_bonus`. The constructor copies non-owning NumPy views and retains
+already-owned arrays and `None`. This prevents the transport thread from
+holding the last reference to pinned PyTorch storage and paying its allocator
+release cost while replacing a previous result.
+
+#### Deferred output transfers
+
+| Module | Responsibility |
+| --- | --- |
+| `model_engine/output_transfer.py` | Pinned slots, asynchronous copies, completion events, and independent NumPy snapshots |
+| `spec_decode/output.py` | MTP producer layouts, named rejection/bonus results, and FIFO ordering |
+| `model_engine/model_runner.py` | Select the submission path and consume outputs at the existing scheduling boundaries |
+| `model_engine/scheduler.py` | Enforce the output object's storage-ownership contract |
+
+Each D2H slot has fixed capacity based on the server's `max_num_seqs`, with a
+floor of two requests for the existing block-drafter warmup. Draft capacity is
+that request limit times `num_speculative_tokens`; status capacity is twice
+the request limit. Slots are allocated on first use, and their number is bounded
+by peak outstanding outputs. Only the active batch region is copied. Changing
+batch size reuses the same allocation; exceeding capacity is an error. A dtype
+change replaces a free slot. No additional GPU staging buffer is allocated.
+
+A pending transfer owns its completion event and slot. Receiving it waits for
+D2H, takes an independent NumPy snapshot, and only then returns the slot for
+reuse. The completed event is reused with its slot. Already received arrays
+remain valid after later copies or processor cleanup. Each slot caches only
+its current shape's views, so changing batch sizes does not retain a growing
+view cache.
+
+MTP has explicit `send_verdict` and `send_counts` entry points. Verified steps
+copy the post-broadcast verdict's first two contiguous rows (`bonus`, `rejected`)
+once, excluding the GPU-only anchor with no packing kernel. Prefill copies its
+two separate counts into the same two-row host layout with two D2H operations.
+Both paths use one slot and one completion event and return a named
+`MTPStatus(rejected, bonus)` in FIFO order. Each returned row owns its storage,
+so `ScheduledBatchOutput` does not copy it a second time.
+
+Draft IDs use a separate pool. Their transfer waits on the producer stream;
+the next draft graph replay still follows a target forward, preserving the
+existing overlap. Ordinary sampled-token and logprob transfers are unchanged.
+
+`token_ids` contains accepted-token rows, not the runner's intermediate mapping:
+the runner extracts the deferred-output sentinel before constructing this object.
 
 ## Block manager
 

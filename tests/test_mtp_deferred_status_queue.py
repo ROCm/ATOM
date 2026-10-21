@@ -18,6 +18,7 @@ from atom.model_engine.model_runner import (
     tokenIDProcessor,
 )
 from atom.model_engine.scheduler import ScheduledBatch
+from atom.spec_decode.output import MTPStatusQueue
 from atom.utils.selector import Family
 
 
@@ -142,7 +143,9 @@ def test_detects_remote_prefill_producer(kv_config, expected):
 
 def _processor_for(*, kv_config: dict, family: Family) -> tokenIDProcessor:
     runner = SimpleNamespace(
-        config=SimpleNamespace(pipeline_parallel_size=1, kv_transfer_config=kv_config),
+        config=SimpleNamespace(
+            pipeline_parallel_size=1, kv_transfer_config=kv_config, max_num_seqs=8
+        ),
         attn_family=family,
         device="cuda",
     )
@@ -367,7 +370,7 @@ def _deferred_processor(cu_seqlens_q: np.ndarray, new_curr: list[int]):
     processor.prev_rejected_num = None
     processor.prev_bonus_num = None
     processor.pre_num_decode_token_per_seq = 1
-    processor.pending_mtp_status_copies = []
+    processor.mtp_status = MTPStatusQueue(8, mock.Mock())
     processor.prev_token_ids = np.zeros(bs, dtype=np.int32)
     processor.draft_token_ids = None
     forward_vars = {"cu_seqlens_q": SimpleNamespace(np=cu_seqlens_q, gpu=cu_seqlens_q)}
