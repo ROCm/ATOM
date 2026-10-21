@@ -1213,7 +1213,7 @@ models:
           topology: 1p1d_pp8_tp8
           display_topology: 1P1D-PP8-TP1-TP8-DSPARK7
           concurrency: [1]
-          prefill:
+          prefill: &kimi_k3_pp8_prefill
             workers: 1
             tp: 1
             extra_args: >-
@@ -1254,7 +1254,7 @@ models:
               <<: *kimi_k3_pp8_dspark7_args
               num_speculative_tokens: 4
               spec_decode_acceptance_length: 3.36
-          decode:
+          decode: &kimi_k3_pp8_dcp8_decode
             workers: 1
             tp: 8
             dcp: 8
@@ -1433,6 +1433,60 @@ models:
             prefill:
               <<: *kimi_k3_pp8_p0_prefill_env
               OFFLOAD_STREAM_PRIORITY: "-1"
+
+        # Test only. The C56 cell in InferenceX#4047's GB300 throughput shape:
+        # two PP8 prefills feeding three TP8xDCP8 decodes (2P3D, 40 GPUs), 56
+        # sessions per decode. Each prefill keeps its own CPU tier, so the
+        # router pins a session to one prefill (`is_agentic_multi_prefill`);
+        # the decodes hold no prefix, so power_of_two spreads them by load.
+        # The decode batch is capped at 128 and graphs are captured to it, as
+        # #4047's 2P3D does; the prefill keeps the C88 cell's 176.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-2p3d-pp8-dcp8-dspark4-agentic-lmcache-1m-c168
+          topology: 2p3d_pp8_dcp8
+          display_topology: 2P3D-PP8-DCP8-TP1-TP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [168]
+          router:
+            policy: power_of_two
+          prefill:
+            <<: *kimi_k3_pp8_prefill
+            workers: 2
+          decode:
+            <<: *kimi_k3_pp8_dcp8_decode
+            workers: 3
+            cudagraph_max_num_seqs: 128
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+              decode_max_num_seqs: 128
+
+        # Test only. The C48 cell in #4047's capped low-latency shape: one PP8
+        # prefill and two TP8xDCP8 decodes of at most eight sequences each
+        # (1P2D, 24 GPUs), 48 sessions. A request past the cap waits at the
+        # decode while the prefill holds its KV, so the cap bounds decode batch
+        # and ITL and moves the wait into TTFT.
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p2d-pp8-dcp8-dspark4-agentic-lmcache-1m-c48-cap8
+          topology: 1p2d_pp8_dcp8
+          display_topology: 1P2D-PP8-DCP8-TP1-TP8-DSPARK4
+          nodes: "${ATOMESH_2P1D_NODES}"
+          concurrency: [48]
+          router:
+            policy: power_of_two
+          decode:
+            <<: *kimi_k3_pp8_dcp8_decode
+            workers: 2
+            cudagraph_max_num_seqs: 8
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 96
+              decode_max_num_seqs: 8
+          env:
+            common: *kimi_k3_pp8_ondemand_env
+            prefill: *kimi_k3_pp8_state128_prefill_env
 
         # Test only. The PP8 C4 / C16 cells with a TP8 prefill (TP8xDCP8 with
         # the LMCache tier at C16) in place of PP8xTP1; the decode, its draft
