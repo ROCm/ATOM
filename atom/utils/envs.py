@@ -445,6 +445,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 to disable this soft budget; chunking still enforces aiter's hard 2 GiB
     # buffer-descriptor cap, above which the kernel fails to compile and aborts
     # the process (see atom/model_ops/sparse_indexer_chunk.py).
+    # It also sizes the decode logits workspace (`max_model_len` wide, held for
+    # the server's life and counted in the KV budget) and so its band count:
+    # lowering it saves memory but splits decode into more launches.
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
