@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -15,6 +17,43 @@ def test_chunk_cu_seqlens_cuts_sequences_and_drops_empty_segments():
     cu = np.asarray([0, 3, 8, 8, 12], dtype=np.int32)
 
     assert _chunk_cu_seqlens(cu, 2, 10).tolist() == [0, 1, 6, 8]
+
+
+@pytest.mark.parametrize(
+    "layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural", "fp4-gfx950-flydsl", "fp8"]
+)
+@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
+def test_decode_metadata_keeps_opus_plans_separate_from_flydsl(
+    monkeypatch, layout, prefix
+):
+    builder = object.__new__(DeepseekV4AttentionMetadataBuilder)
+    builder.indexer_layout = layout
+    builder._indexer_fp4 = layout != "fp8"
+    metadata = SimpleNamespace(state=attn.AttnState.DECODE)
+    positions = torch.arange(2)
+    plan = object()
+    calls = []
+
+    def refresh(md, pos, meta, *, buf_prefix_ubatch):
+        calls.append((md, pos, buf_prefix_ubatch))
+        meta["fp4_opus_plan"] = plan
+
+    monkeypatch.setattr(builder, "_refresh_fp4_opus_decode_plan", refresh)
+    meta = builder._build_v4_indexer_meta(
+        attn_metadata=metadata,
+        positions_gpu=positions,
+        scheduled_bs=2,
+        total_tokens=2,
+        device=torch.device("cpu"),
+        buf_prefix_ubatch=prefix,
+    )
+    if layout in ("fp4-gfx950-opus", "fp4-gfx1250-natural"):
+        assert meta == {"fp4_opus_plan": plan}
+        assert calls == [(metadata, positions, prefix)]
+    else:
+        # FlyDSL now consumes the step's own boundaries in the batch-keyed core.
+        assert meta == {}
+        assert calls == []
 
 
 @pytest.mark.parametrize("layout", ["fp4-gfx950-opus", "fp4-gfx1250-natural"])

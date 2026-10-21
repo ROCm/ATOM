@@ -2907,9 +2907,10 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         runner_mgr=runner(head_rpcs, store_saves=True),
         # The socket to the downstream stages; no stage ever returns a token.
         pp_transport=SimpleNamespace(
-            send_metadata=sent.append, recv_tokens=lambda **_: None
+            send_metadata=sent.append, recv_completion=lambda **_: None
         ),
         _poll_kv_transfer_progress=lambda: None,
+        _poll_dynamic_chunking_calibration=lambda: None,
     )
     for name, owner in (
         ("_dispatch_connector_only_batch", PPEngineCoreProc),

@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
@@ -161,10 +161,14 @@ class Qwen3NextMLP(nn.Module):
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, config, quant_config, prefix: str = ""):
+    def __init__(
+        self, config, quant_config, prefix: str = "", reduce_results: bool = True
+    ):
         super().__init__()
         # parallel_config = atom_config.parallel_config
         self.prefix = prefix
+        # False when the next norm folds the TP all-reduce in.
+        self.reduce_results = reduce_results
 
         self.tp_size = get_tensor_model_parallel_world_size()
 
@@ -252,7 +256,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
-        num_tokens, hidden_dim = hidden_states.shape
+        _num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts + 1)
@@ -274,7 +278,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         else:
             final_hidden_states = routed_output
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
@@ -286,6 +290,7 @@ class Qwen3NextAttention(nn.Module):
         atom_config,
         quant_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         if hasattr(atom_config.hf_config, "text_config"):
@@ -335,6 +340,7 @@ class Qwen3NextAttention(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.o_proj",
         )
         if is_vllm():
@@ -381,11 +387,11 @@ class Qwen3NextAttention(nn.Module):
 
         fusion_kwargs = {}
         if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
-            fusion_kwargs = dict(
-                rotary_emb=self.rotary_emb,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-            )
+            fusion_kwargs = {
+                "rotary_emb": self.rotary_emb,
+                "q_norm": self.q_norm,
+                "k_norm": self.k_norm,
+            }
 
         self.attn = Attention(
             self.num_heads,
@@ -478,6 +484,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         quant_config=None,
         speculative_config=None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -532,18 +539,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         value_settings = (self.value_dim, 0, False)
 
         delattr(self.conv1d.weight, "weight_loader")
-        setattr(
-            self.conv1d.weight,
-            "weight_loader",
-            mamba_v2_sharded_weight_loader(
-                [
-                    query_key_settings,
-                    query_key_settings,
-                    value_settings,
-                ],
-                self.tp_size,
-                self.tp_rank,
-            ),
+        self.conv1d.weight.weight_loader = mamba_v2_sharded_weight_loader(
+            [query_key_settings, query_key_settings, value_settings],
+            self.tp_size,
+            self.tp_rank,
         )
 
         # selective projection used to make dt, B and C input dependant
@@ -579,6 +578,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             bias=False,
             input_is_parallel=True,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=f"{prefix}.out_proj",
         )
 
@@ -645,9 +645,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ],
             dim=-1,
         )
-        query, key = map(
-            lambda x: rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim),
-            (query, key),
+        query, key = (
+            rearrange(x, "l (h d) -> 1 l h d", d=self.head_k_dim) for x in (query, key)
         )
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
@@ -976,7 +975,7 @@ class Qwen3NextModel(nn.Module):
 
 
 class Qwen3NextForCausalLM(nn.Module):
-    packed_modules_mapping = {
+    packed_modules_mapping: ClassVar[dict[str, tuple[str, str | int]]] = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
         "v_proj": ("qkv_proj", "v"),
@@ -1034,7 +1033,7 @@ class Qwen3NextForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
+    ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -1043,7 +1042,7 @@ class Qwen3NextForCausalLM(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         logits = self.lm_head(hidden_states)
         return logits
 

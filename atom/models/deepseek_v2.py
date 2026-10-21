@@ -106,10 +106,14 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     use_fp4_non_shuffle_triton_gemm,
+    use_mxfp4_preshuffle_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    dcp_qsplit_rows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -123,6 +127,7 @@ from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
+    is_neox_rope_style,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -316,23 +321,6 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     )
 
 
-def _is_neox_rope_style(
-    config: PretrainedConfig, interleave_attr: str, *, default_is_neox: bool
-) -> bool:
-    """Resolve ``is_neox_style`` from a model's ``*_interleave`` rope config flag.
-
-    neox and interleaved (GPT-J) are the two mutually-exclusive rope layouts, so
-    an interleave flag of True means ``is_neox_style=False``. A missing or null
-    flag falls back to ``default_is_neox`` — the layout of DeepSeek checkpoints
-    that predate the flag, which differs per rope instance (see call sites):
-    DeepSeek's main MLA rope is interleaved, but its V3.2 indexer rope is neox.
-    """
-    interleave = getattr(config, interleave_attr, None)
-    if interleave is None:
-        return default_is_neox
-    return not bool(interleave)
-
-
 def _moe_router_dtype(config: PretrainedConfig) -> torch.dtype | None:
     """Dtype the MoE router must run in, or None to keep the model dtype.
 
@@ -516,7 +504,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
 def _mxfp4_activation_quant_layout(num_tokens: int) -> tuple[bool, bool]:
     if use_fp4_non_shuffle_triton_gemm():
         return False, False
-    if use_triton_gemm():
+    if use_mxfp4_preshuffle_triton_gemm(dtypes.fp4x2):
         should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
         return should_shuffle, should_shuffle
     return True, True
@@ -1601,8 +1589,16 @@ def sparse_attn_indexer(
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
 ) -> None:
+    # Room for the DCP prefill all-gather to land in place. It produces
+    # `world_size * ceil(N_q / world_size)` rows, up to `world_size - 1` more
+    # than there are prefill rows; giving the allocation that slack is what
+    # lets the gather write straight into this tensor instead of through a
+    # staging buffer. Those trailing rows are never read: the owned-slot filter
+    # sizes its grid from `dsa_kv_indptr` (`num_tokens = shape[0] - 1` in
+    # `triton_filter_and_convert_dcp_index_prefill`), not from this tensor.
+    _dcp_gather_slack = max(get_dcp_world_size() - 1, 0)
     topk_indices = torch.empty(
-        hidden_states.shape[0],
+        hidden_states.shape[0] + _dcp_gather_slack,
         topk_tokens,
         dtype=torch.int32,
         device=hidden_states.device,
@@ -1822,11 +1818,20 @@ def sparse_attn_indexer(
         # single chunk fits, the loop runs exactly once and matches the original
         # single-shot behavior. ``row_width`` (not total_kv) is the buffer's real
         # column count: the FP4 scorer emits into a padded max-seq-len space.
-        chunk_tokens = sparse_indexer_row_chunk(
-            num_rows, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # Under DCP every rank holds the whole gathered index cache, so having
+        # all W of them score every row recomputes the SAME top-k W times.
+        # Score only this rank's slice of the QUERY ROWS instead: against the
+        # full key set, so the top-k is the EXACT global one, and the
+        # [rows, topk] selections are all-gathered back below. At dcp=1 this
+        # degenerates to the whole range, which is the original behaviour.
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, get_dcp_rank(), get_dcp_world_size()
         )
-        for chunk_start in range(0, num_rows, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, num_rows)
+        chunk_tokens = sparse_indexer_row_chunk(
+            max(row_hi - row_lo, 1), row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        )
+        for chunk_start in range(row_lo, row_hi, chunk_tokens):
+            chunk_end = min(chunk_start + chunk_tokens, row_hi)
             # Per-row window bounds slice 1:1 with this chunk's rows.
             row_starts = cu_seqlen_ks[chunk_start:chunk_end]
             row_ends = cu_seqlen_ke[chunk_start:chunk_end]
@@ -1835,7 +1840,11 @@ def sparse_attn_indexer(
                 logits = _prefill_mqa_logits_fp4(
                     prefill_metadata,
                     chunk,
-                    chunk_tokens == num_rows,
+                    # `_prefill_mqa_logits_fp4` rebuilds its ragged schedule
+                    # whenever it is handed less than the whole batch, because
+                    # cta_info encodes absolute row ids. Under DCP the row
+                    # range is a rank's slice, which is such a partial batch.
+                    get_dcp_world_size() == 1 and chunk_tokens == num_rows,
                     q_prefill[chunk],
                     q_fp4_scale[num_decode_tokens:num_tokens][chunk],
                     weights_prefill[chunk],
@@ -1880,6 +1889,33 @@ def sparse_attn_indexer(
             # virtual-block layout, and COMPACT them to the front -- the same
             # treatment the decode path gets, with the row unit being a query token
             # instead of a request.
+            # Gather the selections in place. Rank-major concatenation lands
+            # back in ROW order because the split is contiguous with a uniform
+            # stride: rank r scored [r*rows_per_rank, (r+1)*rows_per_rank), so
+            # gathered row i IS row i, and scoring already wrote those rows
+            # here. The gather region is `world_size` whole strides, which runs
+            # up to `_dcp_gather_slack` rows past the prefill rows; the tail is
+            # uninitialised and never read.
+            gather_rows = rows_per_rank * get_dcp_world_size()
+            gather_region = topk_indices[
+                num_decode_tokens : num_decode_tokens + gather_rows, :topk_tokens
+            ]
+            # In-place all-gather: the input is this rank's own slot inside the
+            # output, which is the form RCCL/NCCL supports. Called on the
+            # process group directly because the group wrapper's `all_gather`
+            # only has an out-of-place form, which would allocate and copy --
+            # the two things this is removing.
+            # `slot_lo`, not `row_lo`: the input must be this rank's OWN slot,
+            # and `row_lo` is clamped to the row count for scoring, so a rank
+            # with no rows would hand in a lower rank's slot instead.
+            torch.distributed.all_gather_into_tensor(
+                gather_region,
+                gather_region[slot_lo : slot_lo + rows_per_rank],
+                group=get_dcp_group().device_group,
+            )
+            # The filter below must be handed the WHOLE `topk_indices`: it calls
+            # `.contiguous()` on what it gets, so passing a row slice would
+            # silently copy the very bytes this gather just avoided moving.
             triton_filter_and_convert_dcp_index_prefill(
                 attn_metadata.sparse_kv_indptr,
                 attn_metadata.batch_id_per_q_token,
@@ -2665,7 +2701,7 @@ class DeepseekV2MLAAttention(nn.Module):
             rope_scaling=rope_scaling,
             # DeepSeek's main MLA rope is interleaved (is_neox_style=False) when
             # unspecified; GLM-5.x sets rope_interleave=true, i.e. also interleaved.
-            is_neox_style=_is_neox_rope_style(
+            is_neox_style=is_neox_rope_style(
                 config, "rope_interleave", default_is_neox=False
             ),
         )
@@ -2689,7 +2725,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 # DeepSeek-V3.2's indexer rope is neox (is_neox_style=True) when
                 # unspecified; GLM-5.x sets indexer_rope_interleave=true to override
                 # it to interleaved.
-                is_neox_style=_is_neox_rope_style(
+                is_neox_style=is_neox_rope_style(
                     config, "indexer_rope_interleave", default_is_neox=True
                 ),
             )
@@ -3528,3 +3564,30 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         # "indexer.weights_proj".  str.replace translates each exclude entry.
         "indexers_proj": "indexer.weights_proj",
     }
+
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str = "",
+        layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+    ):
+        super().__init__(atom_config, prefix, layer_type)
+
+        from atom.models.glm52.mono.dispatch import MonoDecode
+
+        self._mono = MonoDecode(self, atom_config)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor | IntermediateTensors:
+        if self._mono.supports(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        ):
+            return self._mono.forward(input_ids, positions, inputs_embeds)
+        return super().forward(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )

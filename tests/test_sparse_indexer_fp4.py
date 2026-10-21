@@ -20,6 +20,7 @@ import torch
 
 from atom.model_ops import sparse_indexer_fp4
 from atom.model_ops.attentions.mla_kv_pool import MlaKvPool
+from atom.model_ops.sparse_indexer_chunk import dcp_qsplit_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_KV_BLOCK_SIZE,
     FP4_MQA_BLOCK_K,
@@ -794,42 +795,103 @@ def test_prefill_scores_the_same_cache_seq_locally(on_gfx950, whole_batch):
     _assert_agrees(logits, want, local_ends, topk=256)
 
 
-@pytest.mark.parametrize("rows,capacity", [(8, 8), (64, 64), (64, 16)])
-@pytest.mark.parametrize("prefix", ["", "ub0_", "ub1_"])
-def test_v4_fp4_one_graph_replays_sequence_layouts(
-    on_gfx950, monkeypatch, rows, capacity, prefix
+@pytest.mark.parametrize("row_lo", [256, 512, 768])
+def test_prefill_scores_a_restricted_row_range_the_same_as_the_whole_batch(
+    on_gfx950, row_lo
 ):
-    """One graph, fixed launch, changing GPU metadata (including empty slots)."""
-    from atom.model_ops.attentions.deepseek_v4_attn import (
-        DeepseekV4AttentionMetadataBuilder,
+    """A rank's row slice must score exactly as those rows do in the full batch.
+
+    This is what the DCP query-row split relies on and what the CPU partition
+    tests cannot reach: rank r is handed ``slice(row_lo, row_lo + stride)`` with
+    a NONZERO start, and `_prefill_mqa_logits_fp4` has to rebuild its ragged
+    schedule for that partial batch -- `cta_info` encodes absolute row ids, so a
+    schedule reused or rebuilt wrong shows up as rows scored against the wrong
+    window. Compared bit-for-bit against the same rows of a whole-batch run, on
+    the same cache: both sides are the same kernel on the same bytes, so any
+    difference is an offset bug, not arithmetic.
+    """
+    from atom.models.deepseek_v2 import _prefill_mqa_logits_fp4
+
+    torch.manual_seed(1)
+    batch, ctx_len = 2, 512
+    table, num_blocks, token, seq, slots = _paged_layout(batch, ctx_len)
+    q_fp4, q_scale, weights_out, kv_cache, kv_scale = _fused_fp4(
+        slots, token, num_blocks, weight_gain=0.1
     )
+    rows = batch * ctx_len
+    local_ends = (token + 1).to(torch.int32)
+    row_to_batch = seq.to(torch.int32)
+    cta_info, n_ctas, local_starts = fp4_prefill_schedule(
+        row_to_batch, local_ends, FP4_MQA_BLOCK_K, rows, ctx_len
+    )
+    meta = SimpleNamespace(
+        batch_id_per_q_token=row_to_batch,
+        block_tables=table,
+        indexer_fp4_local_starts=local_starts,
+        indexer_fp4_local_ends=local_ends,
+        indexer_fp4_max_seq_len=ctx_len,
+        indexer_fp4_cta_info=cta_info,
+        indexer_fp4_n_ctas=n_ctas,
+    )
+
+    def score(chunk, whole_batch):
+        return _prefill_mqa_logits_fp4(
+            meta,
+            chunk,
+            whole_batch,
+            q_fp4[chunk],
+            q_scale[chunk],
+            weights_out[chunk],
+            kv_cache,
+            kv_scale,
+            WEIGHTS_SCALE,
+            _BLOCK,
+            table,
+        )
+
+    full = score(slice(0, rows), True)
+    stride = 256
+    part = score(slice(row_lo, row_lo + stride), False)
+    assert part.shape[0] == stride
+
+    # Compare only inside each row's own window. Outside it the buffer is
+    # scratch that no reader looks at -- `top_k_per_row_prefill` is handed the
+    # same starts/ends and never indexes past them -- so a mismatch there says
+    # nothing about the scoring.
+    want = full[row_lo : row_lo + stride]
+    starts = local_starts[row_lo : row_lo + stride].to(torch.int64)
+    ends = local_ends[row_lo : row_lo + stride].to(torch.int64)
+    cols = torch.arange(part.shape[1], device=part.device).unsqueeze(0)
+    in_window = (cols >= starts.unsqueeze(1)) & (cols < ends.unsqueeze(1))
+    assert int(in_window.sum()) > 0, "window mask selected nothing -- test bug"
+    assert torch.equal(part[in_window], want[in_window]), (
+        f"rows [{row_lo}, {row_lo + stride}) scored differently as a partial "
+        f"batch than as part of the whole batch, inside their own windows"
+    )
+
+
+def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
+    """The gfx950 decode scorer over `rows` query rows, each its own KV
+    sequence, with fixed-address step metadata the test republishes. Batch
+    buffers hold `max_bs` sequences, block-table rows past the real ones zero
+    (as `prepare_decode` publishes them out to `running_bs`)."""
     from atom.models import deepseek_v4
-    from atom.utils import CpuGpuBuffer
     from atom.utils.forward_context import AttnState
 
-    width, topk = 768, 512
     table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(
-        rows, 1, width, seed=17
+        rows, 1, width, seed=seed
     )
     weights = weights.bfloat16()
-    ends = torch.empty(rows, dtype=torch.int32, device="cuda")
-    var = {
-        prefix
-        + "cu_seqlens_q": CpuGpuBuffer(capacity + 1, dtype=torch.int32, device="cuda"),
-        prefix
-        + "v4_fp4_query_start_loc": CpuGpuBuffer(
-            capacity + 1, dtype=torch.int32, device="cuda"
-        ),
-        prefix + "block_tables": SimpleNamespace(gpu=table[:capacity]),
-    }
-    builder = DeepseekV4AttentionMetadataBuilder.__new__(
-        DeepseekV4AttentionMetadataBuilder
+    max_bs = max(rows, max_bs or 0)
+    padded_table = torch.zeros(
+        max_bs, table.shape[1], dtype=table.dtype, device=table.device
     )
-    builder.model_runner = SimpleNamespace(forward_vars=var)
-    builder.max_spec_steps = 7
-    builder._indexer_fp4 = True
-    builder.indexer_layout = "gfx950"
-    metadata = SimpleNamespace(state=AttnState.DECODE, csa_n_committed_per_token=ends)
+    padded_table[:rows] = table
+    cu_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
+    ends = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        state=AttnState.DECODE, csa_n_committed_per_token=ends, indexer_meta={}
+    )
     monkeypatch.setattr(
         deepseek_v4,
         "get_forward_context",
@@ -839,170 +901,215 @@ def test_v4_fp4_one_graph_replays_sequence_layouts(
     indexer.kv_cache, indexer.kv_scale = kv, ks
     indexer._max_model_len_idx, indexer._weights_scale = width, WEIGHTS_SCALE
 
-    def publish(counts, empty=False):
-        bs = len(counts)
-        cu = np.r_[np.int32(0), np.cumsum(counts, dtype=np.int32)]
-        metadata.cu_seqlens_q = builder._stage(prefix + "cu_seqlens_q", cu)
-        metadata.max_seqlen_q = max(counts)
-        metadata.block_tables = table[:bs]
+    def publish(counts, running_bs, max_q):
+        """`counts` real sequences padded with empty ones to `running_bs`, as
+        `prepare_cu_seqlens_q` publishes them; per-row bounds zero on the pad
+        rows."""
+        cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)
+        cu[0] = 0
+        cu[1 : len(counts) + 1] = np.cumsum(counts)
+        cu_buf[: running_bs + 1].copy_(torch.from_numpy(cu))
+        metadata.cu_seqlens_q = cu_buf[: running_bs + 1]
+        metadata.max_seqlen_q = max_q
         bounds = [width - c + i + 1 for c in counts for i in range(c)]
         bounds += [0] * (rows - len(bounds))
-        if empty:
-            bounds = [0] * rows
-        ends.copy_(torch.tensor(bounds, dtype=torch.int32, device="cuda"))
-        metadata.indexer_meta = builder._build_v4_indexer_meta(
-            attn_metadata=metadata,
-            positions_gpu=None,
-            scheduled_bs=bs,
-            total_tokens=int(cu[-1]),
-            device="cuda",
-            buf_prefix_ubatch=prefix,
-        )
+        ends.copy_(torch.tensor(bounds, dtype=torch.int32))
         return bounds
 
-    def run():
-        return indexer._score_topk_decode_fp4_flydsl(
-            q, qs, metadata.block_tables, weights, topk
-        )
+    # The fixed buffer `_attn_compress` scores into (`fp4_decode_topk`).
+    out_buf = torch.full((rows, 512), -7, dtype=torch.int32, device="cuda")
 
-    shapes = (
-        [[1] * 8, [8], [3, 1, 4], [4, 4], [1, 0, 3], [0]]
-        if rows == 8
-        else [[1] * 64, [8] * 8, [3, 1, 4] * 8, [4] * 16, [1, 0, 3], [0]]
-    )
-    if capacity < rows:
-        shapes = [[4] * 16, [8] * 8, [3, 1, 4] * 4 + [8] * 4, [1, 0, 3], [0]]
+    def run(running_bs, into=False):
+        got = indexer._score_topk_decode_fp4_flydsl(
+            q,
+            qs,
+            padded_table[:running_bs],
+            weights,
+            512,
+            out=out_buf if into else None,
+        )
+        if into:
+            assert got.data_ptr() == out_buf.data_ptr()
+        return got
+
+    def check(got, counts, bounds):
+        n_real = sum(counts)
+        seq = [b for b, count in enumerate(counts) for _ in range(count)]
+        if n_real:
+            want = _oracle(
+                q[:n_real],
+                qs[:n_real],
+                kv,
+                ks,
+                table[: len(counts)],
+                width,
+                weights[:n_real],
+                lambda keys, seq=seq: keys[seq],
+            )
+            for row, end in enumerate(bounds[:n_real]):
+                chosen = set(got[row][got[row] >= 0].tolist())
+                best = set(want[row, :end].topk(512).indices.tolist())
+                assert len(chosen) == 512 and max(chosen) < end
+                assert len(chosen & best) / 512 > 0.99
+        assert bool((got[n_real:] == -1).all())
+
+    return publish, run, check
+
+
+@pytest.mark.parametrize("running_bs,max_q", [(8, 1), (16, 4), (8, 8)])
+def test_v4_fp4_decode_graph_replays_every_layout_of_its_batch(
+    on_gfx950, monkeypatch, running_bs, max_q
+):
+    """The row-group launch is planned from the sequence count and the query
+    span, so a captured scorer is valid for every step sharing both -- the key
+    FULL graphs and the narrow `_attn_compress` core use: rectangular, ragged,
+    DP/CG-padded with empty sequences, and all-empty."""
+    from atom.models import deepseek_v4
+
+    rows, width = running_bs * max_q, 768
+    publish, run, check = _fp4_decode_scorer(monkeypatch, rows, width, seed=17)
+    ragged = [max_q, 1] * (running_bs // 2)
+    shapes = [
+        [max_q] * running_bs,
+        [max(1, max_q - i % max_q) for i in range(running_bs)],
+        ragged,
+        [max_q] * (running_bs // 2),
+        [1],
+        [],
+    ]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        publish(shapes[0])
+        publish(shapes[0], running_bs, max_q)
         for _ in range(3):
-            run()
+            run(running_bs, into=True)
         stream.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            got = run()
+            got = run(running_bs, into=True)
         stream.synchronize()
-        output_ptr = got.data_ptr()
-        metadata_ptr = metadata.indexer_meta["fp4_decode"].query_start_loc.data_ptr()
 
-        # Python-side launches must never run again: every shape replays the
-        # SAME captured row-group scorer and top-k.
-        def no_recapture(*args, **kwargs):
+        def no_relaunch(*args, **kwargs):
             raise AssertionError("scorer was relaunched instead of replayed")
 
-        monkeypatch.setattr(deepseek_v4, "flydsl_pa_mqa_logits_fp4", no_recapture)
+        monkeypatch.setattr(deepseek_v4, "flydsl_pa_mqa_logits_fp4", no_relaunch)
         for counts in shapes[::-1] + shapes:
-            bounds = publish(counts)
-            ragged = metadata.indexer_meta["fp4_decode"]
-            assert ragged.query_start_loc.data_ptr() == metadata_ptr
-            assert ragged.query_start_loc.numel() == capacity + 1
-            assert ragged.max_qlen == 8
+            bounds = publish(counts, running_bs, max_q)
             graph.replay()
             stream.synchronize()
-            assert got.data_ptr() == output_ptr
-            n_real = sum(counts)
-            seq = [b for b, count in enumerate(counts) for _ in range(count)]
-            if n_real:
-                want = _oracle(
-                    q[:n_real],
-                    qs[:n_real],
-                    kv,
-                    ks,
-                    table[: len(counts)],
-                    width,
-                    weights[:n_real],
-                    lambda keys, seq=seq: keys[seq],
-                )
-                for row, end in enumerate(bounds[:n_real]):
-                    chosen = set(got[row][got[row] >= 0].tolist())
-                    best = set(want[row, :end].topk(topk).indices.tolist())
-                    assert len(chosen) == topk and max(chosen) < end
-                    assert len(chosen & best) / topk > 0.99
-            assert bool((got[n_real:] == -1).all())
-        publish(shapes[0], empty=True)
-        graph.replay()
-        stream.synchronize()
-        assert bool((got == -1).all())
+            check(got, counts, bounds)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_v4_fp4_decode_scores_a_dp_padded_batch_wider_than_its_rows(
+    on_gfx950, monkeypatch
+):
+    """Under DP a prefilling peer keeps `running_bs` at the group's batch while
+    this rank runs only its own rows, so `cu_seqlens_q` carries more sequences
+    (empty ones) than the step has rows: an idle rank's one-row dummy against a
+    16-request peer. The scorer takes them as they are."""
+    publish, run, check = _fp4_decode_scorer(monkeypatch, 4, 768, seed=23, max_bs=16)
+    for counts in ([1], [1, 1, 1]):
+        bounds = publish(counts, 16, 1)
+        torch.cuda.synchronize()
+        check(run(16), counts, bounds)
+
+
+def _qsplit_roundtrip(full_topk, world_size, sentinel=-7):
+    """Replay what the DCP prefill path does to a selection, on one process.
+
+    Modelled the way the path actually runs it: ONE buffer of
+    ``world_size`` strides, each rank writing the rows it scored into its own
+    slot, which is what the in-place all-gather makes the ranks agree on. The
+    first ``num_rows`` rows are then the result. Everything else is filled with
+    a sentinel, so a failure tells us whether an unwritten row leaked into the
+    result rather than just that something moved.
+    """
+    num_rows, topk = full_topk.shape
+    stride = dcp_qsplit_rows(num_rows, 0, world_size)[0]
+    gathered = torch.full((stride * world_size, topk), sentinel, dtype=full_topk.dtype)
+    for rank in range(world_size):
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
+        assert rows_per_rank == stride
+        gathered[slot_lo : slot_lo + (row_hi - row_lo)] = full_topk[row_lo:row_hi]
+    return gathered[:num_rows]
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
 @pytest.mark.parametrize(
-    "rows,counts,running_bs",
+    "num_rows",
     [
-        # An idle DP rank's one-row dummy while a peer prefills 16 requests.
-        (1, [1], 16),
-        # A decoding rank with fewer rows than the group's batch.
-        (4, [1, 1, 1], 8),
-        # Unified: the batch fits the bucket exactly.
-        (8, [1] * 8, 8),
+        4096,  # divides evenly
+        4097,  # one row over -- the last rank carries a single row
+        4095,  # one row under -- the last rank's tail is padding
+        12,  # small but still even
+        7,  # fewer rows than ranks at W=8, uneven at W=4
+        3,  # fewer rows than ranks at both widths
+        1,  # one row, every other rank is empty
     ],
 )
-def test_fp4_decode_bounds_drop_the_dp_padded_empty_tail(rows, counts, running_bs):
-    """Under DP a prefilling peer keeps `running_bs` at the group's batch while
-    this rank runs only its own rows, so `cu_seqlens_q` carries more (empty)
-    sequences than the token bucket holds. They are padding: the published
-    boundaries keep the nonempty ones and repeat the end for the rest."""
-    from atom.model_ops.attentions.deepseek_v4_attn import (
-        DeepseekV4AttentionMetadataBuilder,
-    )
-    from atom.utils import CpuGpuBuffer
+def test_qsplit_reassembles_the_unsplit_selection_exactly(num_rows, world_size):
+    """Reassembly must return the selection the unsplit path would.
 
-    max_bs = 32
-    cu = np.full(running_bs + 1, sum(counts), dtype=np.int32)
-    cu[0] = 0
-    cu[1 : len(counts) + 1] = np.cumsum(counts)
-    var = {
-        "cu_seqlens_q": CpuGpuBuffer(max_bs + 1, dtype=torch.int32, device="cuda"),
-        "v4_fp4_query_start_loc": CpuGpuBuffer(
-            max_bs + 1, dtype=torch.int32, device="cuda"
-        ),
-        "block_tables": SimpleNamespace(
-            gpu=torch.zeros(max_bs, 4, dtype=torch.int32, device="cuda")
-        ),
-    }
-    var["cu_seqlens_q"].np[: cu.size] = cu
-    builder = DeepseekV4AttentionMetadataBuilder.__new__(
-        DeepseekV4AttentionMetadataBuilder
-    )
-    builder.model_runner = SimpleNamespace(forward_vars=var)
-    builder.max_spec_steps = 0
-    metadata = SimpleNamespace(
-        cu_seqlens_q=torch.empty(running_bs + 1),
-        csa_n_committed_per_token=torch.empty(rows),
-    )
-    meta = builder._refresh_fp4_rowgroup_decode_meta(metadata)
-    want = np.full(rows + 1, sum(counts))
-    want[: len(counts) + 1] = cu[: len(counts) + 1]
-    assert meta.query_start_loc.tolist() == want.tolist()
-    assert meta.block_tables.shape[0] == rows
+    Splitting the QUERY rows leaves each rank scoring its rows against the whole
+    key set, so its top-k is the global one; what remains between "scored" and
+    "used" is the partition and the reassembly, which is what this pins.
+    Compared element-wise against the unsplit tensor, not against a tolerance --
+    there is no arithmetic here to be approximate about.
+
+    The scorer under a restricted row range is the other half, and it needs a
+    GPU: see test_prefill_scores_a_restricted_row_range_the_same_as_the_whole_batch.
+    """
+    torch.manual_seed(num_rows * 100 + world_size)
+    full = torch.randint(0, 1 << 20, (num_rows, 2048), dtype=torch.int32)
+    out = _qsplit_roundtrip(full, world_size)
+    assert out.shape == full.shape
+    assert torch.equal(out, full)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
-def test_fp4_decode_bounds_reject_a_sequence_past_the_bucket():
-    """Only the empty tail may be dropped: a nonempty sequence at or past the
-    bucket's capacity still raises rather than losing its rows."""
-    from atom.model_ops.attentions.deepseek_v4_attn import (
-        DeepseekV4AttentionMetadataBuilder,
-    )
-    from atom.utils import CpuGpuBuffer
+@pytest.mark.parametrize("world_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_rows", [1, 3, 7, 12, 4095, 4096, 4097])
+def test_qsplit_rows_partition_covers_every_row_once(num_rows, world_size):
+    """Every row belongs to exactly one rank, and the padding is bounded.
 
-    var = {
-        "cu_seqlens_q": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
-        "v4_fp4_query_start_loc": CpuGpuBuffer(9, dtype=torch.int32, device="cuda"),
-        "block_tables": SimpleNamespace(
-            gpu=torch.zeros(8, 4, dtype=torch.int32, device="cuda")
-        ),
-    }
-    # Two rows, but the second nonempty sequence is the third one.
-    var["cu_seqlens_q"].np[:5] = [0, 1, 1, 2, 2]
-    builder = DeepseekV4AttentionMetadataBuilder.__new__(
-        DeepseekV4AttentionMetadataBuilder
-    )
-    builder.model_runner = SimpleNamespace(forward_vars=var)
-    builder.max_spec_steps = 0
-    metadata = SimpleNamespace(
-        cu_seqlens_q=torch.empty(5), csa_n_committed_per_token=torch.empty(2)
-    )
-    with pytest.raises(ValueError, match="exceed the decode bucket"):
-        builder._refresh_fp4_rowgroup_decode_meta(metadata)
+    The reassembly above would also pass if two ranks claimed the same row and
+    a third claimed none, as long as the concatenation happened to line up, so
+    pin the partition itself: the slices tile [0, num_rows) in order, the
+    stride is uniform, and the gathered payload exceeds num_rows by less than
+    world_size rows (this is the padding the all-gather pays for).
+    """
+    seen = []
+    strides = set()
+    slots = []
+    for rank in range(world_size):
+        rows_per_rank, slot_lo, row_lo, row_hi = dcp_qsplit_rows(
+            num_rows, rank, world_size
+        )
+        strides.add(rows_per_rank)
+        assert row_lo <= row_hi <= num_rows
+        assert row_hi - row_lo <= rows_per_rank
+        # The slot is where the in-place all-gather reads this rank's input
+        # from, so it must be the rank's OWN stride -- including for a rank
+        # with no rows, whose clamped row range sits in a lower rank's slot.
+        assert slot_lo == rank * rows_per_rank
+        # A rank with rows scores at the head of its own slot; one without
+        # rows has a clamped, empty range that must NOT be read as a slot.
+        assert row_lo == row_hi or (
+            row_lo == slot_lo and row_hi <= slot_lo + rows_per_rank
+        )
+        slots.append((slot_lo, slot_lo + rows_per_rank))
+        seen.extend(range(row_lo, row_hi))
+    assert seen == list(range(num_rows))
+    assert len(strides) == 1
+    stride = strides.pop()
+    gathered_rows = stride * world_size
+    assert num_rows <= gathered_rows < num_rows + world_size
+    # The slots tile the gathered buffer exactly, in rank order: no two ranks
+    # read from the same rows, and the last slot ends at the buffer's end.
+    assert slots == [(r * stride, (r + 1) * stride) for r in range(world_size)]
+
+
+def test_qsplit_degenerates_to_the_whole_range_without_dcp():
+    """At dcp=1 the rank's slice is every row, i.e. the pre-DCP behaviour."""
+    assert dcp_qsplit_rows(4096, 0, 1) == (4096, 0, 0, 4096)

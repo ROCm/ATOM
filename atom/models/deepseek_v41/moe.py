@@ -114,14 +114,16 @@ class MoE(V4MoE):
         self,
         x: torch.Tensor,
         shared_partial: torch.Tensor | None = None,
-        before_stage2=None,
+        before_stage2_for_rows=None,
+        before_shared_add=None,
         stage2_stream: torch.cuda.Stream | None = None,
     ) -> tuple[torch.Tensor, bool]:
         routed, is_complete = self.experts.forward_maybe_comm_fused(
             x,
             self.router_logits(x),
             shared_partial,
-            before_stage2=before_stage2,
+            before_stage2_for_rows=before_stage2_for_rows,
+            before_shared_add=before_shared_add,
             stage2_stream=stage2_stream,
         )
         # create_comm_fused_moe_backend excludes TBO (and DP > 1), so TBO

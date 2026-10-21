@@ -3018,9 +3018,9 @@ class MLAAttention(nn.Module):
                     )
 
             if attn_metadata.has_cached:
-                # Shuffled KV: the builder nulls mla_chunk_meta, so cached-prefix
-                # prefill always takes the single-pass gather (which is shuffle
-                # aware). The chunked path stays on the plain layout.
+                # Shuffled KV takes either path too: the builder gives the chunked
+                # path block-granular per-chunk CSR, and the single-pass path a
+                # full-context one.
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
