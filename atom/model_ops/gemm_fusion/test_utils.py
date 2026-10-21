@@ -50,7 +50,7 @@ logger = logging.getLogger("atom.gemm_fusion")
 # =============================================================================
 DECISIONS: list = (
     []
-)  # bounded dispatch evidence, newest last (runtime keeps only the digest)
+)  # bounded dispatch evidence, newest last (the runtime keeps no decision history)
 _MAX_DECISIONS = 4096
 
 
@@ -67,7 +67,9 @@ def reset_for_tests(res=None, profile="test-profile"):
     hooks._PROFILE = profile if res is not None else ""
     hooks._PHASE = "ready" if res is not None else "pre"
     hooks._BROKEN = None
-    hooks._reset_step()
+    hooks._PERIOD = 14
+    hooks._STEP_T = None
+    hooks._reset_check_state()
     install_decision_log()
     install_from_env()  # env-selected seams are re-applied, as the old env-driven seams were
 
@@ -81,7 +83,7 @@ def inject_aiter(monkeypatch, fake):
     monkeypatch.setitem(sys.modules, "aiter.gemm_fusion", fake)
 
 
-def init_with_resources(config, res, sp_group=None):
+def init_with_resources(config, res, sp_group=None, kv_publisher=False):
     """``hooks.init_gemm_fusion`` with ``res`` as the resources object (the runtime builds its own
     ``FusionResourcesWrapper`` and takes no injected one)."""
     from . import resources as R
@@ -92,14 +94,15 @@ def init_with_resources(config, res, sp_group=None):
         res, "world", 1
     )  # the real one needs the distributed runtime
     try:
-        hooks.init_gemm_fusion(config, sp_group)
+        hooks.init_gemm_fusion(config, sp_group, kv_publisher=kv_publisher)
     finally:
         R.FusionResourcesWrapper, S.sp_world = orig_cls, orig_world
 
 
 class InjectedResourcesWrapper(FusionResourcesWrapper):
-    """``FusionResourcesWrapper`` whose pieces can be injected (``inner``, ``reduce_min``, ``rank``,
-    ``pg``, ``arch``, ``cu``). The runtime constructor takes only ``(sp_group, world, profile)``.
+    """``FusionResourcesWrapper`` whose pieces can be injected (``inner``, ``reduce_min``,
+    ``reduce_max``, ``rank``, ``pg``, ``arch``, ``cu``). The runtime constructor takes only
+    ``(sp_group, world, profile)``.
     """
 
     def __init__(
@@ -111,6 +114,7 @@ class InjectedResourcesWrapper(FusionResourcesWrapper):
         pg=None,
         inner=None,
         reduce_min=None,
+        reduce_max=None,
         device=None,
         arch=None,
         cu=None,
@@ -126,6 +130,9 @@ class InjectedResourcesWrapper(FusionResourcesWrapper):
                 sp_group, "device_group", None
             )
         self.rank, self.pg = rank, pg
+        self.cpu_pg = getattr(sp_group, "cpu_group", None)
+        if reduce_max is not None:
+            self.reduce_max = reduce_max  # instance attribute shadows the method
         if inner is None:
             device = torch.cuda.current_device() if device is None else device
             caps = gf.detect_capabilities(sp_group)
@@ -151,19 +158,20 @@ class InjectedResourcesWrapper(FusionResourcesWrapper):
 
 
 def install_decision_log():
-    """Keep the last ``_MAX_DECISIONS`` ``Decision`` records in ``DECISIONS`` (the runtime folds
-    decisions into the step digest only)."""
-    if any(p[1] == "record_decision" for p in _PATCHES):
+    """Keep the last ``_MAX_DECISIONS`` ``Decision`` records in ``DECISIONS`` (the runtime keeps
+    no decision history: ``GemmFusionSite._decision`` only builds the record)."""
+    if any(p[1] == "_decision" for p in _PATCHES):
         return
-    orig = hooks.record_decision
+    orig = GemmFusionSite._decision
 
-    def record(d):
+    def decision(self, *a, **kw):
+        d = orig(self, *a, **kw)
         DECISIONS.append(d)
         if len(DECISIONS) > _MAX_DECISIONS:
             del DECISIONS[: len(DECISIONS) - _MAX_DECISIONS]
-        return orig(d)
+        return d
 
-    _patch(hooks, "record_decision", record)
+    _patch(GemmFusionSite, "_decision", decision)
 
 
 # =============================================================================
@@ -175,20 +183,20 @@ SHUTDOWN_TIMEOUT_ENV = "ATOM_GEMM_FUSION_SHUTDOWN_TIMEOUT_S"
 CHECK_ALIAS_ENV = "ATOM_GEMM_FUSION_CHECK_ALIAS"
 """Kinds (``kind[:sp_rank[:arg]]``, comma separated; empty or ``*`` rank = every rank):
 
-  poison_rank[:r]      check_step behaves as if rank r read a nonzero device poison word (exercises
-                       the HOST agree/recover/raise path; real device poison needs a kernel-side
-                       forced-timeout build).
+  error_word[:r]       rank r's device error word reads as set (exercises the HOST agree / reset /
+                       abort-ids path of check_step; a real error word needs a kernel-side forced
+                       timeout or tag-mismatch build).
   op_raise[:r]         the fused op raises on rank r (E-4: one-rank exception).
   rank_native[:r]      rank r takes a native decision where others fuse. This DELIBERATELY violates
                        cross-rank uniformity (E-3). Expected outcome: FAIL-STOP. Rank r enters the
                        native RCCL all_to_all while its peers wait in the fused CCO kernel, so the
-                       step cannot complete and the step-end digest in check_step is never reached;
+                       step cannot complete and the step-end check in check_step is never reached;
                        the run ends at the process-group timeout. E-3 passes when the failure is
                        bounded, every rank exits non-zero, and no wrong output is returned silently.
   slow_remainder[:r:n] after the native remainder of a 1-stage (large-M) call, rank r spins the GPU
                        ~n microseconds (E-5: WAR window).
   recover_skip[:r]     rank r skips recover() (exercises the recovery timeout).
-  no_poison_check      disable the per-step poison check (E-1 NEGATIVE CONTROL: proves the check has
+  no_error_check       disable the device error check (E-1 NEGATIVE CONTROL: proves the check has
                        power; never set in production)."""
 
 _PATCHES: list = []  # (obj, attr, original, had_own_attr)
@@ -263,25 +271,26 @@ def _spin_gpu_us(us):
         torch.cuda.synchronize()
 
 
-def _install_poison_rank():
-    orig = hooks._poison_local
-    _patch(
-        hooks,
-        "_poison_local",
-        lambda: 1 if fault_active("poison_rank") is not None else orig(),
-    )
+def _install_error_word():
+    orig = FusionResourcesWrapper.error_word
+
+    def error_word(self, timeout_s=30.0):
+        if fault_active("error_word") is not None:
+            return 1
+        return orig(self, timeout_s)
+
+    _patch(FusionResourcesWrapper, "error_word", error_word)
 
 
-def _install_no_poison_check():
+def _install_no_error_check():
     from atom.model_ops import gemm_fusion as pkg
 
     orig = hooks.check_step
 
-    def check_step():
-        if fault_active("no_poison_check") is not None:
-            hooks._reset_step()
+    def check_step(req_ids=()):
+        if fault_active("no_error_check") is not None:
             return None
-        return orig()
+        return orig(req_ids)
 
     _patch(hooks, "check_step", check_step)
     if hasattr(pkg, "check_step"):  # the runner calls it through the package
@@ -342,8 +351,8 @@ def _install_slow_remainder():
 
 
 _FAULT_INSTALLERS = {
-    "poison_rank": _install_poison_rank,
-    "no_poison_check": _install_no_poison_check,
+    "error_word": _install_error_word,
+    "no_error_check": _install_no_error_check,
     "recover_skip": _install_recover_skip,
     "op_raise": _install_op_raise,
     "rank_native": _install_rank_native,
@@ -635,7 +644,7 @@ class DirectGemmFusionSite(GemmFusionSite):
             return "raw"
         bm = "direct"
         if path == "fused" and st is not None and getattr(st, "rebound", False):
-            bm += "+copy"  # rank-local, not in the digest
+            bm += "+copy"  # rank-local
         return bm
 
 
@@ -904,17 +913,19 @@ def prepare_cases(cases, comm):
                 },
             )
             site.agree_prepared(sp.padded_tokens, prepared)  # collective, uniform
-        hooks.resources().quiesce_and_reset()
+        hooks.resources().clean_epoch()
     finally:
         set_phase("ready" if prev != "pre" or hooks.resources() else prev)
 
 
-def check_poison():
-    """Per-sample host check for the harness: read every plan's device poison word and agree across
-    ranks, plus the cross-rank decision digest. On poison or mismatch: collective recovery, then
-    raises ``GemmFusionPoisonError``. Call after every measured/checked sample, on every rank.
-    """
-    hooks.check_step()
+def check_error():
+    """Per-sample device error check for the harness: synchronous, agreed across ranks. On an error
+    the collective reset has run and this raises ``GemmFusionDeviceError``. Call after every
+    measured/checked sample, on every rank."""
+    if hooks.check_now() is not None:
+        raise hooks.GemmFusionDeviceError(
+            "gemm_fusion device error word set; plans re-initialised"
+        )
 
 
 def decisions():
@@ -1248,7 +1259,7 @@ def m3_smoke_main():
     )
 
 
-__all__ = ["check_poison", "qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj"]
+__all__ = ["check_error", "qkv_proj_all2all_norm_rope_cache", "quant_all2all_o_proj"]
 
 
 if __name__ == "__main__":

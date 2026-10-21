@@ -101,6 +101,9 @@ class GemmFusionSite:
         self._by_tokens: dict = {}
         self._wcache: dict = {}
         self._staging: dict = {}
+        # True only on the first registered site (hooks.register_site): it advances the device STEP
+        # counter once per forward. Set before registration; registration decides it.
+        self.ticks_step = False
         hooks.register_site(self)
 
     # -- layout helpers --------------------------------------------------
@@ -564,10 +567,10 @@ class GemmFusionSite:
         while its peers wait in a fused kernel.
 
         What this does NOT make safe: a non-uniform decision caused by a bug or a fault (a
-        one-rank exception before launch). The step-end digest in ``hooks.check_step`` only
-        sees steps that COMPLETE on every rank; a divergence that blocks mid-step (one rank in
-        the native RCCL all_to_all, the others in the fused CCO kernel) never reaches it. Such a
-        divergence is FAIL-STOP at the process-group timeout.
+        one-rank exception before launch). A divergence that blocks mid-step (one rank in the
+        native RCCL all_to_all, the others in the fused CCO kernel) never reaches the step-end
+        device error check in ``hooks.check_step`` and is FAIL-STOP at the process-group timeout;
+        the fused kernels' own tags report a divergence that still completes.
         """
         r = self.resolve(ctx.padded_tokens, self._runtime_mode())
         reason = r.reason
@@ -661,7 +664,6 @@ class GemmFusionSite:
             reason,
             self._bind_label(r, path, st),
         )
-        hooks.record_decision(d)
         return d
 
     def _remainder_after_exchange(self, r, outs, ctx, consumer):
@@ -676,6 +678,9 @@ class GemmFusionSite:
 
     def run(self, x, x_scale, ctx):
         """Full QKV+attention. -> ((output, scale), Decision)."""
+        if self.ticks_step:
+            # once per forward per rank, on every path (fused or native), before anything can return
+            hooks.tick()
         r, reason, state, st = self._prepare(ctx, x, x_scale)
         if r.plan is None:
             out = self.native.full(self, x, x_scale, ctx)

@@ -364,8 +364,16 @@ def test_the_audit_has_power_it_flags_the_exact_call_that_broke_the_gpu_run():
         ),  # removed parameter
         ("gemm_fusion.bind_kv_cache(kv)", True),
         ("gemm_fusion.bind_kv_cache(kv, extra)", False),
+        ("gemm_fusion.init_gemm_fusion(config, grp, kv_publisher=True)", True),
+        ("gemm_fusion.init_gemm_fusion(config, grp, publisher=True)", False),
         ("gemm_fusion.check_step()", True),
-        ("gemm_fusion.check_step(1)", False),
+        ("gemm_fusion.check_step(batch_ids)", True),  # the request ids of the step
+        ("gemm_fusion.check_step(req_ids=ids)", True),
+        ("gemm_fusion.check_step(ids, 1)", False),  # at most the one parameter
+        (
+            "gemm_fusion.check_step(batch=b)",
+            False,
+        ),  # the runner passes ids, not a batch
         ("gemm_fusion.shutdown()", True),
         ("gemm_fusion.shutdown(timeout_s=3)", True),
         ("gemm_fusion.after_graph_capture()", True),

@@ -111,7 +111,30 @@ def test_every_symbol_atom_reads_exists_on_the_real_package_or_its_submodule(rea
     missing = [n for n in ATOM_GF_NAMES if not hasattr(real_gf, n)]
     assert not missing, f"aiter.gemm_fusion lacks: {missing}"
     cls = fusion_resources_cls(real_gf)  # package export OR aiter.gemm_fusion.resources
-    for m in ("ensure", "finalize", "quiesce_and_reset", "release", "poison_local"):
+    for m in ("ensure", "finalize", "release"):
+        assert callable(getattr(cls, m, None)), f"FusionResources.{m} missing"
+
+
+# The R12 host API (design card D2.6). ATOM reaches it ONLY through the adapter block in
+# FusionResourcesWrapper (resources.py). aiter A1 has not landed: until it does this is an expected
+# failure, and it flips to a pass (remove the marker) when the real names exist.
+R12_RESOURCE_API = (
+    "step_tensor",
+    "error_readback_async",
+    "error_readback_result",
+    "reset",
+)
+
+
+@pytest.mark.xfail(
+    reason="needs aiter A1 (R12 host API: error word / STEP / reset); until it lands",
+    strict=False,
+)
+def test_aiter_ships_the_r12_host_api_the_adapter_calls(real_gf):
+    from atom.model_ops.gemm_fusion.resources import fusion_resources_cls
+
+    cls = fusion_resources_cls(real_gf)
+    for m in R12_RESOURCE_API:
         assert callable(getattr(cls, m, None)), f"FusionResources.{m} missing"
 
 
@@ -335,8 +358,8 @@ def test_wrapper_drives_the_real_fusion_resources_end_to_end(real_gf, atu):
     # a plan with a DIFFERENT owner (different params/mode) cannot ensure after finalize
     other = SimpleNamespace(owner="sp_qkv.small/other", vid=plan.vid)
     assert w.can_ensure(other) is False
-    w.quiesce_and_reset()
-    assert w.inner.poison_local() == 0  # no poison hooks registered yet
+    # (the collective reset / error-word API of R12 is covered by
+    # test_aiter_ships_the_r12_host_api_the_adapter_calls once aiter A1 lands)
     w.release()
 
 
@@ -405,9 +428,7 @@ def test_atom_runtime_reads_only_resource_attributes_aiter_keeps(real_gf):
     kept = {
         "ensure",
         "finalize",
-        "quiesce_and_reset",
         "release",
-        "poison_local",
         "windows",
         "finalized",
         "caps",
@@ -416,9 +437,12 @@ def test_atom_runtime_reads_only_resource_attributes_aiter_keeps(real_gf):
         "policy",
         "policy_fallback_reason",
     }
+    r12 = set(
+        R12_RESOURCE_API
+    )  # the adapter's R12 reads; existence: see the xfail test above
     assert (
-        read <= kept
-    ), f"ATOM runtime reads FusionResources attributes aiter dropped: {sorted(read - kept)}"
+        read <= kept | r12
+    ), f"ATOM runtime reads FusionResources attributes aiter dropped: {sorted(read - kept - r12)}"
     removed = {
         "local_m",
         "peers",

@@ -7,11 +7,12 @@ custom op lives in ``ops`` and is imported only by a model that adopts a site.
 """
 
 from .hooks import (  # noqa: F401
-    GemmFusionPoisonError,
+    GemmFusionDeviceError,
     GemmFusionRecoveryTimeout,
     after_graph_capture,
     before_graph_capture,
     bind_kv_cache,
+    check_now,
     check_step,
     init_gemm_fusion,
     profile_enabled,

@@ -12,7 +12,9 @@ Lifecycle (every step is collective and runs identically on every SP rank):
                         (match + consensus + window ensure), finalize, prepare
                         plans, quiesce. phase "ready".
   before/after_graph_capture -> coverage log + clean epoch (no new resolution).
-  check_step         -> end of every model step, outside capture.
+  check_step         -> end of every model step, outside capture: the periodic device error
+                        check; returns the request ids to abort when a rank reported an error.
+  tick               -> the first registered site advances the device STEP counter once per forward.
   recover / shutdown.
 
 Phases make every per-call decision rank-uniform without a hot-path collective:
@@ -23,9 +25,9 @@ Phases make every per-call decision rank-uniform without a hot-path collective:
                                   without running a collective inside the forward.
 """
 
-import hashlib
 import logging
 import threading
+from collections import deque
 
 logger = logging.getLogger("atom.gemm_fusion")
 
@@ -39,12 +41,26 @@ _KV = None  # bound kv_cache_data
 _PHASE = "pre"  # "pre" | "preparing" | "ready"
 _BROKEN = None  # reason string once recovery failed; fused path must not be used
 _PLANS: dict = {}  # owner -> plan (chosen by consensus => identical on all ranks)
-_STEP_DIGEST = hashlib.blake2b(digest_size=4)
-_STEP_CALLS = 0
+# -- device error check (see ``check_step``). All rank-uniform: every rank passes exactly one
+# ``check_step`` per model forward, so the counters below advance identically on every rank.
+_PERIOD = (
+    14  # steps between error snapshots; 1 = synchronous same-step check (KV publishers)
+)
+_STEP_IDX = 0  # number of ``check_step`` calls that ran in the ready phase
+_PENDING = None  # step index of the error snapshot in flight (async mode), else None
+_WINDOW: deque = (
+    deque()
+)  # (step_idx, req_ids) of every step since the last snapshot proven clean
+_STEP_T = None  # device view of the STEP counter, created when the phase becomes ready
+# Evaluate a snapshot this many steps after it was enqueued: the host's per-step sync is on the
+# PREVIOUS step's token copy, and the snapshot sits after the step's own events in stream order, so
+# only two steps later is it certainly complete. The abort window is therefore period + this delay.
+SNAPSHOT_EVAL_DELAY = 2
 
 
-class GemmFusionPoisonError(RuntimeError):
-    """A fused plan reported device poison (or ranks disagreed) during a step."""
+class GemmFusionDeviceError(RuntimeError):
+    """The device error word was set (or fused execution was disabled by a failed recovery) at a
+    point where no request can be aborted; the worker must be treated as failed."""
 
 
 class GemmFusionRecoveryTimeout(RuntimeError):
@@ -65,6 +81,10 @@ def profile_enabled(config=None) -> bool:
 
 
 def register_site(site) -> None:
+    """Register a site. The FIRST site registered (``install_m3_sites`` order, identical on every
+    rank) is the one that advances the device STEP counter, once per forward."""
+    if site.name not in _SITES:
+        site.ticks_step = not _SITES
     _SITES[site.name] = site
 
 
@@ -101,24 +121,14 @@ def register_plan(plan) -> None:
     _PLANS[owner] = plan
 
 
-def record_decision(d) -> None:
-    """Fold the rank-uniform part of a decision into the step digest.
-
-    Digest = (site, tokens, vid, n_fused, path) and, for native paths, the
-    reason. ``bind_mode`` is rank-local and excluded.
-    """
-    global _STEP_CALLS
-    reason = d.reason if d.path == "native" else ""
-    _STEP_DIGEST.update(
-        f"{d.site}|{d.tokens}|{d.vid}|{d.n_fused}|{d.path}|{reason};".encode()
-    )
-    _STEP_CALLS += 1
-
-
 # ----------------------------------------------------------------- lifecycle
-def init_gemm_fusion(config, sp_group) -> None:
-    """After distributed + SP group init, before model construction/KV alloc."""
-    global _RES, _PROFILE, _PHASE
+def init_gemm_fusion(config, sp_group, kv_publisher: bool = False) -> None:
+    """After distributed + SP group init, before model construction/KV alloc.
+
+    ``kv_publisher``: this rank publishes KV to another instance (a P/D producer). It then checks
+    for a device error synchronously in every step, before the step's KV is announced.
+    """
+    global _RES, _PROFILE, _PHASE, _PERIOD
     if not profile_enabled(config):
         return
     from .resources import FusionResourcesWrapper
@@ -133,13 +143,20 @@ def init_gemm_fusion(config, sp_group) -> None:
     # the same profile feeds the resources (window budget / VMM heap), not only the matcher
     _RES = FusionResourcesWrapper(sp_group, sp_world(), profile=name)
     _PHASE = "pre"
+    _PERIOD = (
+        1 if kv_publisher else int(getattr(config.gemm_fusion, "check_period", 14))
+    )
+    _reset_check_state()
     inner = getattr(_RES, "inner", None)
     logger.info(
-        "gemm_fusion ON profile=%s world=%d window_bytes=%s max_windows=%s",
+        "gemm_fusion ON profile=%s world=%d window_bytes=%s max_windows=%s "
+        "check_period=%d%s",
         _PROFILE,
         _RES.world,
         getattr(inner, "window_bytes", None),
         getattr(inner, "max_windows", None),
+        _PERIOD,
+        " (KV publisher: synchronous)" if kv_publisher else "",
     )
     _prebuild_profile(gf, name, _RES)
 
@@ -211,9 +228,9 @@ def profile_tokens(world: int, arch: str | None = None, cu: int | None = None):
 def prepare_buckets(tokens_list) -> None:
     """Collective, outside capture, on every rank in the same order:
     resolve (match + consensus + ensure) every (site, bucket, mode) ->
-    ``finalize`` -> ``plan.prepare`` -> ``quiesce_and_reset`` -> phase "ready".
+    ``finalize`` -> ``plan.prepare`` -> clean epoch -> STEP view -> phase "ready".
     """
-    global _PHASE
+    global _PHASE, _STEP_T
     if _RES is None:
         return
     _PHASE = "preparing"
@@ -233,7 +250,9 @@ def prepare_buckets(tokens_list) -> None:
             for t in tokens_list:
                 prepared = s.prepare_bucket(t, device, _KV, out_dtype)
                 s.agree_prepared(t, prepared)  # collective: uniform prepared state
-    _RES.quiesce_and_reset()
+    _RES.clean_epoch()
+    _STEP_T = _RES.step_tensor()  # created here, outside any capture
+    _reset_check_state()
     _PHASE = "ready"
 
 
@@ -280,74 +299,139 @@ def before_graph_capture(buckets) -> None:
                 r.vid,
                 r.reason,
             )
-    _RES.quiesce_and_reset()
+    _raise_on_device_error("before graph capture")
+    _RES.clean_epoch()
 
 
 def after_graph_capture() -> None:
     if _RES is not None:
-        _RES.quiesce_and_reset()
+        _raise_on_device_error("during graph capture")
+        _RES.clean_epoch()
 
 
 # ----------------------------------------------------------- per-step check
-def _poison_local() -> int:
-    return int(_RES.inner.poison_local())
+def _reset_check_state() -> None:
+    global _STEP_IDX, _PENDING
+    _STEP_IDX = 0
+    _PENDING = None
+    _WINDOW.clear()
 
 
-def check_step() -> None:
-    """Per-step host poison + uniformity check. Call at the END of every model
-    step, outside capture, after the step's sync point, on EVERY rank.
+def tick() -> None:
+    """Advance the device STEP counter by one. Called by the first registered site at the top of its
+    ``run`` (inside the custom op, so it is captured into every graph and executed in eager), once per
+    forward per rank. Not before the phase is ready: the counter does not exist earlier, and the
+    phase is rank-uniform."""
+    if _STEP_T is not None and _PHASE == "ready":
+        _STEP_T.add_(1)
 
-    Reads every fused plan's device poison word (aiter ``poison_local``: 4-byte
-    D2H per plan), and all-reduces ``[-poison, digest, -digest]`` (MIN) so all
-    ranks agree on (a) any poison anywhere, (b) that every rank made identical
-    fused/native decisions this step. On either, runs the collective recovery and
-    raises. A step that made no fused call and has no prepared plan does nothing
-    (uniform across ranks).
 
-    LIMIT: this is a collective at the END of the step, so it only sees steps that
-    COMPLETE on every rank. A non-uniform decision whose collectives do not match (one rank in
-    the native RCCL all_to_all while its peers wait in the fused CCO kernel) blocks the step
-    mid-way and never reaches this call: that is FAIL-STOP at the process-group timeout, not a
-    recovered error. The digest only catches decision differences among ranks that still
-    finish the step (and device poison on completing ranks).
+def _any_rank_error(word: int) -> bool:
+    return int(_RES.reduce_max([int(word != 0)])[0]) != 0
+
+
+def _device_error_now() -> bool:
+    """Synchronous check: snapshot the error word now, wait for it, agree across ranks."""
+    _RES.error_readback_async()
+    return _any_rank_error(_RES.error_word())
+
+
+def _trim_window(upto: int) -> None:
+    while _WINDOW and _WINDOW[0][0] <= upto:
+        _WINDOW.popleft()
+
+
+def _verdict() -> list:
+    """Some rank's error word was set: collective reset, then the ids of every request that ran in a
+    step not yet proven clean. ``recover`` may raise (timeout): the worker is then failed.
     """
+    ids = sorted({rid for _step, rids in _WINDOW for rid in rids})
+    logger.error(
+        "gemm_fusion: device error word set on some rank; collective reset; %d request(s) of the "
+        "last %d unchecked step(s) must be aborted",
+        len(ids),
+        len(_WINDOW),
+    )
+    recover()
+    _reset_check_state()
+    return ids
+
+
+def check_step(req_ids=()):
+    """Periodic device error check. Call once at the END of every model step on EVERY rank, outside
+    capture, after ``postprocess`` and BEFORE the step's KV is announced as ready.
+
+    Returns None when nothing is wrong. When some rank reported an error, runs the collective reset
+    and returns the ids of the requests that ran in the steps since the last snapshot proven clean
+    (the caller must abort them and must not publish this step's KV); the list may be empty.
+
+    Asynchronous mode (``_PERIOD`` >= 3, the default 14): at every ``_PERIOD``-th step enqueue a
+    snapshot of the device error word (no sync); ``SNAPSHOT_EVAL_DELAY`` steps later read it (it is
+    complete by then), agree across ranks with ONE CPU-group MAX all-reduce, and either drop the
+    now-proven-clean part of the window or report. An error in a step is therefore reported at most
+    ``_PERIOD`` + ``SNAPSHOT_EVAL_DELAY`` steps later (16 for the default) and the window never holds
+    more steps than that.
+
+    Synchronous mode (``_PERIOD`` == 1, KV publishers): snapshot, wait and agree in the same step, so
+    the check precedes the KV announcement (the same ordering the former per-step check kept).
+
+    The step counter is rank-uniform because every rank passes exactly one call per forward; a
+    forward that raised on one rank is a fail-stop anyway.
+    """
+    global _STEP_IDX, _PENDING
     if _RES is None or _PHASE != "ready":
-        return
+        return None
     if _BROKEN is not None:
-        raise GemmFusionPoisonError(
+        raise GemmFusionDeviceError(
             f"gemm_fusion disabled after failed recovery: {_BROKEN}"
         )
-    if not _PLANS and _STEP_CALLS == 0:
-        return
-    p = _poison_local()
-    digest = int.from_bytes(_STEP_DIGEST.digest(), "little") & 0x7FFFFFFF
-    reduce = getattr(_RES, "_reduce_min", None)
-    if reduce is None:  # single rank
-        any_poison, uniform = p != 0, True
-    else:
-        out = reduce([-int(p != 0), digest, -digest])
-        any_poison, uniform = out[0] != 0, out[1] == -out[2]
-    _reset_step()
-    if any_poison or not uniform:
-        what = "device poison" if any_poison else "cross-rank decision mismatch"
-        logger.error("gemm_fusion check_step: %s (local poison=%d) -> recover", what, p)
-        recover()
-        raise GemmFusionPoisonError(
-            f"gemm_fusion {what}; outputs of this step are invalid; plans re-initialised"
+    _STEP_IDX += 1
+    step = _STEP_IDX
+    _WINDOW.append((step, tuple(req_ids)))
+    if _PERIOD == 1:
+        if _device_error_now():
+            return _verdict()
+        _WINDOW.clear()
+        return None
+    if _PENDING is not None and step == _PENDING + SNAPSHOT_EVAL_DELAY:
+        if _any_rank_error(_RES.error_word()):
+            return _verdict()
+        _trim_window(_PENDING)
+        _PENDING = None
+    if step % _PERIOD == 0:
+        _RES.error_readback_async()
+        _PENDING = step
+    return None
+
+
+def check_now():
+    """Synchronous check outside the step loop (graph-capture points, test harness). Same return
+    contract as ``check_step``: None when clean, else the reset has run and the ids are returned.
+    """
+    if _RES is None or _PHASE != "ready":
+        return None
+    if _BROKEN is not None:
+        raise GemmFusionDeviceError(
+            f"gemm_fusion disabled after failed recovery: {_BROKEN}"
         )
+    if _device_error_now():
+        return _verdict()
+    return None
 
 
-def _reset_step() -> None:
-    global _STEP_DIGEST, _STEP_CALLS
-    _STEP_DIGEST = hashlib.blake2b(digest_size=4)
-    _STEP_CALLS = 0
+def _raise_on_device_error(where: str) -> None:
+    """At a point with no request to abort (graph capture) an error is fatal."""
+    if check_now() is not None:
+        raise GemmFusionDeviceError(
+            f"gemm_fusion device error word set {where}; plans re-initialised"
+        )
 
 
 # ---------------------------------------------------------------- recovery
 def recover(timeout_s: float | None = None) -> None:
     """Collective recovery: device sync -> drain -> barrier -> re-init -> barrier.
 
-    EVERY SP rank must call it (``check_step`` makes the decision collective).
+    EVERY SP rank must call it (the error check makes the decision collective).
     A rank that never arrives would block the others in the barrier, so the call
     is bounded: after ``timeout_s`` (default ``RECOVER_TIMEOUT_S``) it marks the fused path
     broken and raises ``GemmFusionRecoveryTimeout``; the worker must then be treated as failed.
@@ -361,7 +445,7 @@ def recover(timeout_s: float | None = None) -> None:
 
     def _run():
         try:
-            _RES.quiesce_and_reset()
+            _RES.reset_after_error()
         except BaseException as e:  # noqa: BLE001
             err.append(e)
 
@@ -384,8 +468,10 @@ def shutdown(timeout_s: float | None = None) -> None:
     exit or raise and hide the original failure, so it runs in a daemon thread with a timeout
     and never raises: problems are logged. Normal shutdown (all ranks alive) is unchanged.
     """
-    global _RES, _PHASE
+    global _RES, _PHASE, _STEP_T
     res, _RES = _RES, None
+    _STEP_T = None
+    _reset_check_state()
     if res is not None:
         if timeout_s is None:
             timeout_s = SHUTDOWN_TIMEOUT_S

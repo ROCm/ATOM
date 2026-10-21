@@ -9,6 +9,7 @@ from atom.config import GemmFusionConfig
 from atom.model_ops.gemm_fusion import consensus, hooks, stages
 from atom.model_ops.gemm_fusion import site as site_mod
 from atom.model_ops.gemm_fusion import test_utils as TU
+from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
 
 
 @pytest.fixture(autouse=True)
@@ -66,10 +67,24 @@ class FakeResources:
     def __init__(self, plan_n=(None, 0), outcome="agree", raise_contract=False):
         self.plan_n, self.outcome, self.raise_contract = plan_n, outcome, raise_contract
         self.agree_calls = 0
-        self.resets = 0
-        self.poison = 0
-        self.reset_blocks = None  # set to an Event to make quiesce_and_reset hang
-        self.inner = SimpleNamespace(poison_local=lambda: self.poison)
+        self.resets = 0  # every collective reset, either flavour
+        self.error_resets = 0  # reset_after_error
+        self.epoch_resets = 0  # clean_epoch
+        self.reset_blocks = None  # set to an Event to make a reset hang
+        # device error word / STEP model (the adapter API of FusionResourcesWrapper)
+        self.error_value = 0  # this rank's device error word
+        self.peer_flag = 0  # what the other ranks contribute to reduce_max
+        self.readback_ready = True  # False: error_word has to wait for the copy
+        self.snapshots = []  # error word value at each error_readback_async
+        self.reductions = []  # values handed to each reduce_max
+        self.blocking_waits = 0
+        self.ticks = 0
+        self._snapshot = None
+        self.inner = SimpleNamespace()
+        self._step = SimpleNamespace(add_=self._tick)
+
+    def _tick(self, n):
+        self.ticks += n
 
     def local_m(self, tokens):
         return tokens // self.world
@@ -92,10 +107,37 @@ class FakeResources:
     def finalize(self):
         self.finalized = True
 
-    def quiesce_and_reset(self):
+    def step_tensor(self):
+        return self._step
+
+    def error_readback_async(self, stream=None):
+        self._snapshot = self.error_value
+        self.snapshots.append(self.error_value)
+
+    def error_readback_ready(self):
+        return self._snapshot if self.readback_ready else None
+
+    def error_word(self, timeout_s=30.0):
+        if not self.readback_ready:
+            self.blocking_waits += 1
+        return self._snapshot
+
+    def reduce_max(self, values):
+        self.reductions.append(list(values))
+        return [max(v, self.peer_flag) for v in values]
+
+    def _reset(self):
         if self.reset_blocks is not None:
             self.reset_blocks.wait()
         self.resets += 1
+
+    def reset_after_error(self):
+        self._reset()
+        self.error_resets += 1
+
+    def clean_epoch(self):
+        self._reset()
+        self.epoch_resets += 1
 
     def release(self):
         pass
@@ -493,76 +535,234 @@ def test_agree_prepared_downgrades_unprepared_bucket(make_site):
     assert s._by_tokens[(64, "capture")].plan is None
 
 
-# --------------------------------------------------- S-B2 check_step
-def _ready_hooks(res):
+# --------------------------------------------------- R12 device error check
+def _ready_hooks(res, period=14):
     TU.reset_for_tests(res)
+    hooks._PERIOD = period
     hooks.register_plan(FakePlan())
     return res
 
 
-def test_check_step_clean_does_nothing(make_site):
+def _wrapper_error_word(local=0):
+    """The adapter's real ``error_word`` (as patched by a fault seam, if any) on a stand-in self."""
+    return FusionResourcesWrapper.error_word(
+        SimpleNamespace(error_readback_ready=lambda: local)
+    )
+
+
+def test_check_step_clean_async_schedule_snapshots_every_period_and_evaluates_two_steps_later():
     res = _ready_hooks(FakeResources())
-    hooks.check_step()
+    snapshot_at, evaluated_at = [], []
+    for s in range(1, 31):
+        n_snap, n_red = len(res.snapshots), len(res.reductions)
+        assert hooks.check_step((s,)) is None
+        if len(res.snapshots) > n_snap:
+            snapshot_at.append(s)
+        if len(res.reductions) > n_red:
+            evaluated_at.append(s)
+    assert snapshot_at == [14, 28] and evaluated_at == [16, 30]
     assert res.resets == 0
+    # once the snapshot of step 28 is proven clean (step 30) only the steps after it stay unchecked
+    assert [s for s, _ in hooks._WINDOW] == [29, 30]
+    assert res.blocking_waits == 0
 
 
-def test_check_step_poison_recovers_then_raises():
+def test_an_error_before_the_first_snapshot_aborts_the_first_sixteen_steps():
     res = _ready_hooks(FakeResources())
-    res.poison = 1
-    with pytest.raises(hooks.GemmFusionPoisonError):
-        hooks.check_step()
-    assert res.resets == 1  # collective recovery ran before raising
+    res.error_value = 1
+    results = {s: hooks.check_step((s,)) for s in range(1, 17)}
+    assert {s: r for s, r in results.items() if r is not None} == {
+        16: list(range(1, 17))
+    }
+    assert res.error_resets == 1 and res.epoch_resets == 0
+    assert hooks._STEP_IDX == 0 and not hooks._WINDOW and hooks._PENDING is None
 
 
-def test_check_step_any_rank_poison_makes_every_rank_recover():
-    """rank 0 clean, rank 1 poisoned: the all-reduce makes BOTH raise and recover."""
+def test_an_error_after_a_clean_snapshot_aborts_exactly_the_last_sixteen_steps():
+    """period 14 + evaluation 2 steps later = a window of 16: the steps after the last snapshot
+    proven clean (28) up to the step that evaluates the next one (44)."""
     res = _ready_hooks(FakeResources())
-    res._reduce_min = lambda v: [min(v[0], -1), v[1], v[2]]  # peer reports poison
-    with pytest.raises(hooks.GemmFusionPoisonError):
-        hooks.check_step()
-    assert res.resets == 1
+    for s in range(1, 31):
+        assert hooks.check_step((s,)) is None
+    res.error_value = 1  # the device error appears during step 31
+    verdicts = {}
+    for s in range(31, 45):
+        r = hooks.check_step((s,))
+        if r is not None:
+            verdicts[s] = r
+    assert verdicts == {44: list(range(29, 45))}
+    assert len(verdicts[44]) == 16 == hooks._PERIOD + hooks.SNAPSHOT_EVAL_DELAY
+    assert res.error_resets == 1
 
 
-def test_check_step_decision_mismatch_across_ranks_is_an_error():
+def test_check_step_any_rank_error_makes_every_rank_reset_and_abort():
+    """This rank is clean; a peer reports: the MAX all-reduce makes THIS rank reset too."""
     res = _ready_hooks(FakeResources())
-    res._reduce_min = lambda v: [v[0], v[1] - 1, v[2]]  # a peer's digest differs
-    with pytest.raises(hooks.GemmFusionPoisonError):
-        hooks.check_step()
+    res.peer_flag = 1
+    out = [hooks.check_step((s,)) for s in range(1, 17)]
+    assert out[15] == list(range(1, 17)) and all(r is None for r in out[:15])
+    assert res.reductions == [[0]]  # ONE all-reduce of this rank's flag
+    assert res.error_resets == 1
+
+
+def test_a_snapshot_not_yet_complete_is_waited_for_not_skipped():
+    """Skipping on 'not ready' would make ranks disagree about whether to all-reduce."""
+    res = _ready_hooks(FakeResources())
+    res.readback_ready = False
+    for s in range(1, 17):
+        assert hooks.check_step((s,)) is None
+    assert res.blocking_waits == 1 and len(res.reductions) == 1
+
+
+def test_check_step_period_one_is_synchronous_and_precedes_publication():
+    """KV publishers: snapshot, wait and agree in the SAME step (before the KV is announced)."""
+    res = _ready_hooks(FakeResources(), period=1)
+    assert hooks.check_step((1, 2)) is None
+    assert (len(res.snapshots), len(res.reductions), list(hooks._WINDOW)) == (1, 1, [])
+    res.error_value = 1
+    assert hooks.check_step((3, 4)) == [3, 4]  # same step, only this step's requests
+    assert res.error_resets == 1
+
+
+def test_a_verdict_with_nothing_to_abort_is_still_a_verdict():
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    assert (
+        hooks.check_step(()) == []
+    )  # e.g. a dummy batch: reset ran, caller must not publish KV
+    assert res.error_resets == 1
 
 
 def test_check_step_noop_when_off_or_not_ready():
     TU.reset_for_tests()
-    hooks.check_step()  # OFF: nothing
+    assert hooks.check_step((1,)) is None and hooks.check_now() is None  # OFF
     res = FakeResources()
     TU.reset_for_tests(res)
     TU.set_phase("pre")
-    hooks.check_step()
-    assert res.resets == 0
+    assert hooks.check_step((1,)) is None and hooks.check_now() is None
+    assert (res.snapshots, res.reductions, res.resets) == ([], [], 0)
 
 
-def test_negative_control_without_poison_check_is_silent():
-    """E1 negative control: the seam disables the check, poison goes unnoticed."""
+def test_after_a_failed_recovery_the_fused_path_refuses_to_run():
+    _ready_hooks(FakeResources())
+    hooks._BROKEN = "recover timeout after 1s"
+    with pytest.raises(hooks.GemmFusionDeviceError, match="failed recovery"):
+        hooks.check_step((1,))
+    with pytest.raises(hooks.GemmFusionDeviceError, match="failed recovery"):
+        hooks.check_now()
+
+
+def test_check_now_is_synchronous_and_has_the_check_step_contract():
     res = _ready_hooks(FakeResources())
-    res.poison = 1
-    with pytest.raises(hooks.GemmFusionPoisonError):
-        hooks.check_step()  # without the seam the same poison raises
-    res.resets = 0
-    TU.install_faults("no_poison_check")
-    hooks.check_step()  # no raise: this is what the check prevents
-    assert res.resets == 0
+    assert hooks.check_now() is None and len(res.snapshots) == 1
+    res.error_value = 1
+    assert hooks.check_now() == []  # nothing recorded yet, but the reset ran
+    assert res.error_resets == 1
 
 
-def test_poison_rank_fault_seam_targets_one_rank():
+@pytest.mark.parametrize("hook", ["before_graph_capture", "after_graph_capture"])
+def test_an_error_at_a_graph_capture_point_is_fatal_not_an_abort(hook):
+    """No request exists there, so there is nothing to abort: reset, then raise."""
+    res = _ready_hooks(FakeResources())
+    call = (
+        (lambda: hooks.before_graph_capture([]))
+        if hook == "before_graph_capture"
+        else hooks.after_graph_capture
+    )
+    call()  # clean: a clean epoch, no error reset
+    assert (res.epoch_resets, res.error_resets) == (1, 0)
+    res.error_value = 1
+    with pytest.raises(hooks.GemmFusionDeviceError, match="plans re-initialised"):
+        call()
+    assert res.error_resets == 1
+
+
+def test_the_first_registered_site_ticks_and_only_it():
+    TU.reset_for_tests()
+    a, b = SimpleNamespace(name="a"), SimpleNamespace(name="b")
+    hooks.register_site(a)
+    hooks.register_site(b)
+    hooks.register_site(a)  # re-registration keeps the decision
+    assert (a.ticks_step, b.ticks_step) == (True, False)
+
+
+def test_tick_adds_one_to_the_step_tensor_only_when_ready():
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    hooks._STEP_T = res.step_tensor()
+    hooks.tick()
+    assert res.ticks == 1
+    TU.set_phase("preparing")
+    hooks.tick()  # the counter does not exist before ready; the phase is rank-uniform
+    assert res.ticks == 1
+    hooks._STEP_T = None
+    TU.set_phase("ready")
+    hooks.tick()
+    assert res.ticks == 1
+
+
+def test_run_ticks_before_anything_that_can_return_or_raise(make_site):
+    """Once per forward on EVERY path: the tick is the first thing run() does."""
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    s = make_site(res)
+    hooks._STEP_T = res.step_tensor()
+    TU.set_phase("ready")
+
+    def boom(*a, **k):
+        raise RuntimeError("stop")
+
+    s._prepare = boom
+    s.ticks_step = True
+    with pytest.raises(RuntimeError, match="stop"):
+        s.run(None, None, None)
+    assert res.ticks == 1
+    s.ticks_step = False
+    with pytest.raises(RuntimeError, match="stop"):
+        s.run(None, None, None)
+    assert res.ticks == 1  # a later site never ticks
+
+
+def test_prepare_buckets_creates_the_step_view_and_starts_the_check_clean():
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    TU.set_phase("preparing")
+    hooks._WINDOW.append((1, (9,)))
+    hooks._STEP_IDX, hooks._PENDING = 5, 3
+    hooks.prepare_buckets([])
+    assert hooks.phase() == "ready" and hooks._STEP_T is res.step_tensor()
+    assert res.epoch_resets == 1
+    assert (hooks._STEP_IDX, hooks._PENDING, len(hooks._WINDOW)) == (0, None, 0)
+
+
+def test_shutdown_drops_the_step_view_and_the_check_state():
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    hooks._STEP_T = res.step_tensor()
+    hooks._WINDOW.append((1, (9,)))
+    hooks._STEP_IDX = 4
+    hooks.shutdown()
+    assert hooks._STEP_T is None and hooks._STEP_IDX == 0 and not hooks._WINDOW
+
+
+def test_error_word_fault_seam_targets_one_rank():
     res = _ready_hooks(FakeResources())
     res.rank = 1
-    TU.install_faults("poison_rank:1")
-    with pytest.raises(hooks.GemmFusionPoisonError):
-        hooks.check_step()  # rank 1 sees poison through the patched _poison_local
-    assert res.resets == 1
+    TU.install_faults("error_word:1")
+    assert _wrapper_error_word() == 1  # rank 1 reads its error word as set
     res.rank = 0
-    TU.install_faults("poison_rank:1")  # idempotent
-    hooks.check_step()  # rank 0 is untouched
-    assert res.resets == 1
+    TU.install_faults("error_word:1")  # idempotent
+    assert _wrapper_error_word() == 0  # rank 0 is untouched
+
+
+def test_negative_control_without_error_check_is_silent():
+    """E-1 negative control: the seam disables the check, the error goes unnoticed."""
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    assert hooks.check_step((1,)) == [1]  # without the seam the same error is a verdict
+    res.resets = res.error_resets = 0
+    TU.install_faults("no_error_check")
+    assert hooks.check_step((2,)) is None  # no verdict: this is what the check prevents
+    assert res.resets == 0
 
 
 def test_recover_skip_seam_skips_the_collective_recovery_on_the_target_rank():
@@ -633,25 +833,25 @@ def test_op_raise_seam_recovers_then_raises(monkeypatch):
 def test_two_fault_kinds_installed_together_each_keep_their_own_original():
     """Regression for a late-binding closure bug: with several kinds in one spec each wrapper must
     call ITS original, not whichever was assigned last."""
-    res = _ready_hooks(FakeResources())
-    res.poison = 0
-    TU.install_faults("poison_rank:0,recover_skip:0,no_poison_check:7")
-    assert hooks._poison_local() == 1  # poison_rank wrapper, rank 0
+    res = _ready_hooks(FakeResources(), period=1)
+    TU.install_faults("error_word:0,recover_skip:0,no_error_check:7")
+    assert _wrapper_error_word() == 1  # error_word wrapper, rank 0
     hooks.recover()
     assert res.resets == 0  # recover_skip wrapper
     res.rank = 7
-    hooks.check_step()  # no_poison_check on rank 7: silent even with the poison seam
-    assert res.resets == 0
+    res.error_value = 1
+    assert hooks.check_step((1,)) is None  # no_error_check on rank 7: silent
+    assert res.error_resets == 0
     TU.uninstall_faults()
-    assert hooks._poison_local() == 0
+    assert _wrapper_error_word() == 0
 
 
 def test_unknown_fault_kind_is_rejected_and_the_env_spec_parses():
     with pytest.raises(ValueError, match="unknown gemm_fusion fault"):
         TU.install_faults("bogus")
-    assert TU.parse_faults("poison_rank:1:x,no_poison_check,op_raise:*") == {
-        "poison_rank": (1, "x"),
-        "no_poison_check": (None, None),
+    assert TU.parse_faults("error_word:1:x,no_error_check,op_raise:*") == {
+        "error_word": (1, "x"),
+        "no_error_check": (None, None),
         "op_raise": (None, None),
     }
 
@@ -659,16 +859,16 @@ def test_unknown_fault_kind_is_rejected_and_the_env_spec_parses():
 def test_install_from_env_applies_faults_and_timeouts_and_uninstall_restores(
     monkeypatch,
 ):
-    monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
+    monkeypatch.setenv(TU.FAULT_ENV, "error_word")
     monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "7")
     monkeypatch.setenv(TU.SHUTDOWN_TIMEOUT_ENV, "3")
     before = (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S)
     TU.install_from_env()
-    assert TU.fault_active("poison_rank") == ""
+    assert TU.fault_active("error_word") == ""
     assert (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S) == (7.0, 3.0)
     TU.uninstall_faults()
     assert (hooks.RECOVER_TIMEOUT_S, hooks.SHUTDOWN_TIMEOUT_S) == before
-    assert TU.fault_active("poison_rank") is None
+    assert TU.fault_active("error_word") is None
 
 
 def test_the_runtime_package_has_no_test_hooks():
@@ -720,8 +920,8 @@ def test_recover_times_out_instead_of_hanging():
     with pytest.raises(hooks.GemmFusionRecoveryTimeout):
         hooks.recover(timeout_s=0.2)
     res.reset_blocks.set()
-    with pytest.raises(hooks.GemmFusionPoisonError):  # fused path now refuses to run
-        hooks.check_step()
+    with pytest.raises(hooks.GemmFusionDeviceError):  # fused path now refuses to run
+        hooks.check_step((1,))
 
 
 # ----------------------------------------------- S-B1 OFF == byte-identical
@@ -2457,24 +2657,24 @@ def test_seams_leave_proof_in_the_log_that_they_were_installed_and_fired(
     import logging
 
     _ready_hooks(FakeResources())
-    monkeypatch.setenv(TU.FAULT_ENV, "poison_rank")
+    monkeypatch.setenv(TU.FAULT_ENV, "error_word")
     monkeypatch.setenv(TU.RECOVER_TIMEOUT_ENV, "5")
     with caplog.at_level(logging.WARNING, logger="atom.gemm_fusion"):
         TU.install_from_env()
-        assert hooks._poison_local() == 1
-        assert hooks._poison_local() == 1  # fires twice, logs once
+        assert _wrapper_error_word() == 1
+        assert _wrapper_error_word() == 1  # fires twice, logs once
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert (
         "install_from_env ran" in text
-        and "faults=poison_rank" in text
+        and "faults=error_word" in text
         and "RECOVER_TIMEOUT_S=5" in text
     )
-    assert text.count("fault 'poison_rank' installed") == 1
-    assert text.count("fault 'poison_rank' FIRED") == 1
+    assert text.count("fault 'error_word' installed") == 1
+    assert text.count("fault 'error_word' FIRED") == 1
     s = TU.stats()
     assert (
-        s["fired"] == ["poison_rank"]
-        and "poison_rank" in s["faults"]
+        s["fired"] == ["error_word"]
+        and "error_word" in s["faults"]
         and s["alias_checks"] == 0
     )
     TU.uninstall_faults()
@@ -2920,3 +3120,129 @@ def test_an_aiter_without_prebuild_is_logged_and_skipped_without_a_collective(
     assert (
         reports == [] and hooks.resources() is res
     )  # uniform skip: nothing to agree on
+
+
+# ------------------------------------------------------- R12: check period at init
+def _init_period(monkeypatch, *, check_period=None, kv_publisher=False):
+    TU.inject_aiter(monkeypatch, SimpleNamespace(load_profile=lambda name: None))
+    TU.reset_for_tests()
+    gf_cfg = SimpleNamespace(profile="prof_x")
+    if check_period is not None:
+        gf_cfg.check_period = check_period
+    TU.init_with_resources(
+        SimpleNamespace(gemm_fusion=gf_cfg), FakeResources(), kv_publisher=kv_publisher
+    )
+    return hooks._PERIOD
+
+
+def test_init_takes_the_period_from_the_config_and_defaults_to_14(monkeypatch):
+    assert _init_period(monkeypatch) == 14
+    assert _init_period(monkeypatch, check_period=3) == 3
+
+
+def test_a_kv_publishing_rank_checks_synchronously_whatever_the_config_says(
+    monkeypatch,
+):
+    assert _init_period(monkeypatch, check_period=14, kv_publisher=True) == 1
+
+
+def test_init_starts_the_check_state_clean(monkeypatch):
+    hooks._STEP_IDX, hooks._PENDING = 7, 5
+    hooks._WINDOW.append((1, (1,)))
+    _init_period(monkeypatch)
+    assert (hooks._STEP_IDX, hooks._PENDING, len(hooks._WINDOW)) == (0, None, 0)
+
+
+# ------------------------------------------- R12: the adapter block of FusionResourcesWrapper
+def _adapter(monkeypatch, inner, world=1):
+    TU.inject_aiter(monkeypatch, SimpleNamespace())
+    return TU.InjectedResourcesWrapper(
+        world=world,
+        rank=0,
+        inner=inner,
+        arch="gfx950",
+        cu=256,
+        reduce_min=lambda v: v,  # not under test: skips the harness's own torch reducer
+    )
+
+
+def test_the_adapter_forwards_every_r12_call_to_one_aiter_name_each(monkeypatch):
+    log = []
+    inner = SimpleNamespace(
+        step_tensor=lambda: log.append("step_tensor") or "STEP",
+        error_readback_async=lambda stream: log.append(("async", stream)),
+        error_readback_result=lambda: 0,
+        reset=lambda: log.append("reset"),
+    )
+    w = _adapter(monkeypatch, inner)
+    assert w.step_tensor() == "STEP"
+    w.error_readback_async("S")
+    w.reset_after_error()
+    w.clean_epoch()
+    assert log == ["step_tensor", ("async", "S"), "reset", "reset"]
+    assert w.error_readback_ready() == 0
+
+
+def test_error_word_waits_for_the_copy_and_is_bounded(monkeypatch):
+    answers = iter([None, None, 3])
+    w = _adapter(
+        monkeypatch, SimpleNamespace(error_readback_result=lambda: next(answers))
+    )
+    assert w.error_word() == 3
+    stuck = _adapter(monkeypatch, SimpleNamespace(error_readback_result=lambda: None))
+    with pytest.raises(TimeoutError, match="did not complete"):
+        stuck.error_word(timeout_s=0.01)
+
+
+def test_reduce_max_is_trivial_on_one_rank(monkeypatch):
+    w = _adapter(monkeypatch, SimpleNamespace(), world=1)
+    assert w.reduce_max([0, 1, True]) == [0, 1, 1]
+
+
+def _fake_torch_distributed(monkeypatch, peer_values):
+    """Just enough torch / torch.distributed to see WHICH tensor and group the reduction uses."""
+    seen = {}
+
+    class T:
+        def __init__(self, values, device):
+            self.values, self.device = list(values), device
+
+        def tolist(self):
+            return list(self.values)
+
+    def tensor(values, dtype=None, device=None):
+        return T(values, device)
+
+    def all_reduce(t, op=None, group=None):
+        seen.update(device=t.device, op=op, group=group)
+        t.values = [max(a, b) for a, b in zip(t.values, peer_values)]
+
+    fake_torch = SimpleNamespace(
+        tensor=tensor,
+        int64="i64",
+        cuda=SimpleNamespace(current_device=lambda: 0),
+        device=lambda kind, idx: f"{kind}:{idx}",
+    )
+    fake_dist = SimpleNamespace(
+        all_reduce=all_reduce, ReduceOp=SimpleNamespace(MAX="MAX")
+    )
+    fake_torch.distributed = fake_dist
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", fake_dist)
+    return seen
+
+
+def test_reduce_max_uses_a_cpu_tensor_on_the_gloo_group(monkeypatch):
+    seen = _fake_torch_distributed(monkeypatch, peer_values=[1, 0])
+    w = _adapter(monkeypatch, SimpleNamespace(), world=4)
+    w.cpu_pg, w.pg = "GLOO", "GLOO"
+    assert w.reduce_max([0, 0]) == [1, 0]
+    assert seen == {"device": None, "op": "MAX", "group": "GLOO"}  # no device tensor
+
+
+def test_reduce_max_falls_back_to_a_device_tensor_without_a_cpu_group(monkeypatch):
+    seen = _fake_torch_distributed(monkeypatch, peer_values=[0])
+    w = _adapter(monkeypatch, SimpleNamespace(), world=4)
+    w.cpu_pg, w.pg = None, "NCCL"
+    assert w.reduce_max([1]) == [1]
+    assert seen["group"] == "NCCL" and seen["device"] == "cuda:0"
