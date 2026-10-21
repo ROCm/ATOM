@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import time
-from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -50,7 +49,7 @@ from atom.kv_transfer.disaggregation import (
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.output_transfer import D2HBufferPool, PendingD2H
+from atom.model_engine.output_transfer import D2HQueue
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
@@ -257,8 +256,8 @@ class tokenIDProcessor:
         self._max_output_requests = max(runner.config.max_num_seqs, 2)
 
         self.async_copy_stream = torch.cuda.Stream(runner.device)
-        self.default_num_rejected_tokens = torch.zeros(
-            max_num_batched_tokens, dtype=torch.int32, device=device
+        self.default_mtp_status = torch.zeros(
+            2 * self._max_output_requests, dtype=torch.int32, device=device
         )
         self.clean()
 
@@ -304,15 +303,14 @@ class tokenIDProcessor:
     def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
         # The next replay of this draft output follows a whole target forward.
         # Preserve side-stream overlap; no reverse wait on the forward stream.
-        self._pending_drafts.append(self._draft_buffers.copy(gpu_tensor))
+        self._draft_outputs.send(gpu_tensor)
 
     def recv_async_output_draft(self) -> np.ndarray:
-        if not self._pending_drafts:
-            return np.array([], dtype=np.int32)
-        return self._pending_drafts.popleft().result()
+        output = self._draft_outputs.receive()
+        return np.array([], dtype=np.int32) if output is None else output
 
     def recv_mtp_status_async(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        return self.mtp_status.receive()
+        return self.mtp_status.receive() or (None, None)
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -323,11 +321,10 @@ class tokenIDProcessor:
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
-        self._draft_buffers = D2HBufferPool(
+        self._draft_outputs = D2HQueue(
             self._max_output_requests * max(self.num_spec_tokens, 1),
             self.async_copy_stream,
         )
-        self._pending_drafts: deque[PendingD2H] = deque()
         self.mtp_status = MTPStatusQueue(
             self._max_output_requests, self.async_copy_stream
         )
@@ -3248,7 +3245,6 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        verdict = None
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3267,7 +3263,10 @@ class ModelRunner:
                 all_greedy,
                 needs_independent_noise=needs_independent_noise,
             )
-            num_reject_tokens = self.tokenID_processor.default_num_rejected_tokens[:bs]
+            # Prefill has zero bonus/rejection counts, in the same contiguous
+            # layout as verification. Slice before reshaping to avoid row gaps.
+            mtp_counts = self.tokenID_processor.default_mtp_status[: 2 * bs].view(2, bs)
+            num_reject_tokens = mtp_counts[1]
             next_token_locs = num_reject_tokens
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
@@ -3315,6 +3314,7 @@ class ModelRunner:
                 verdict = _g.broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
+            mtp_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
         if get_tp_group().world_size > 1 and (
@@ -3349,14 +3349,9 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                if verdict is None:
-                    self.tokenID_processor.mtp_status.send_counts(
-                        num_reject_tokens, next_token_locs, self.forward_done_event
-                    )
-                else:
-                    self.tokenID_processor.mtp_status.send_verdict(
-                        verdict, self.forward_done_event
-                    )
+                self.tokenID_processor.mtp_status.send(
+                    mtp_counts, ready=self.forward_done_event
+                )
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
                 ).view(bs)

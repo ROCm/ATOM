@@ -5,16 +5,18 @@ import numpy as np
 import pytest
 import torch
 
-from atom.model_engine.output_transfer import D2HBufferPool
+from atom.model_engine.output_transfer import D2HQueue
+from atom.spec_decode.output import MTPStatusQueue
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_request_count_changes_reuse_full_capacity_and_event(fake_cuda, dtype):
-    pool = D2HBufferPool(128 * 5, fake_cuda.stream)
+    pool = D2HQueue(128 * 5, fake_cuda.stream)
     saved = []
     for i, bs in enumerate((64, 63, 64, 1, 128, 0, 17)):
         source = torch.full((bs, 5), i, dtype=dtype)
-        saved.append((pool.copy(source).result(), i, bs))
+        pool.send(source)
+        saved.append((pool.receive(), i, bs))
     assert len(fake_cuda.allocations) == 1
     assert fake_cuda.allocations[0].numel() == 128 * 5
     assert len({id(event) for call, event in fake_cuda.calls if call == "record"}) == 1
@@ -25,25 +27,26 @@ def test_request_count_changes_reuse_full_capacity_and_event(fake_cuda, dtype):
 
 
 def test_pending_outputs_keep_separate_slots_until_consumed(fake_cuda):
-    pool = D2HBufferPool(20, fake_cuda.stream)
-    pending = [pool.copy(torch.full((3, 5), i)) for i in range(3)]
+    pool = D2HQueue(20, fake_cuda.stream)
+    for i in range(3):
+        pool.send(torch.full((3, 5), i))
     assert len({pointer for pointer, _ in fake_cuda.copies}) == 3
-    first = pending[0].result()
-    again = pool.copy(torch.full((3, 5), 9))
+    first = pool.receive()
+    pool.send(torch.full((3, 5), 9))
     assert len(fake_cuda.allocations) == 3
-    np.testing.assert_array_equal(pending[1].result(), np.full((3, 5), 1))
-    np.testing.assert_array_equal(pending[2].result(), np.full((3, 5), 2))
-    np.testing.assert_array_equal(again.result(), np.full((3, 5), 9))
+    for i in (1, 2, 9):
+        np.testing.assert_array_equal(pool.receive(), np.full((3, 5), i))
     np.testing.assert_array_equal(first, np.zeros((3, 5)))
-    with pytest.raises(RuntimeError, match="already been consumed"):
-        pending[0].result()
+    assert pool.receive() is None
 
 
 @pytest.mark.parametrize("rows", [False, True])
 def test_waits_before_reading_and_returns_independent_storage(fake_cuda, rows):
-    pool = D2HBufferPool(16, fake_cuda.stream)
-    pending = pool.copy(torch.arange(8).reshape(2, 4), ready=fake_cuda.ready)
-    slot = pending._slot
+    pool = (
+        MTPStatusQueue(8, fake_cuda.stream) if rows else D2HQueue(16, fake_cuda.stream)
+    )
+    pool.send(torch.arange(8).reshape(2, 4), ready=fake_cuda.ready)
+    slot = pool._pending[0]
 
     class GuardedArray(np.ndarray):
         def copy(self):
@@ -51,8 +54,8 @@ def test_waits_before_reading_and_returns_independent_storage(fake_cuda, rows):
             assert self.ndim == (1 if rows else 2), "unnecessary whole-array copy"
             return np.asarray(self).copy()
 
-    slot.array_view = slot.array_view.view(GuardedArray)
-    result = pending.result_rows() if rows else (pending.result(),)
+    slot.output = slot.output.view(GuardedArray)
+    result = pool.receive() if rows else (pool.receive(),)
     assert all(array.flags.owndata and array.base is None for array in result)
     assert [call for call, _ in fake_cuda.calls] == [
         "wait_event",
@@ -61,64 +64,56 @@ def test_waits_before_reading_and_returns_independent_storage(fake_cuda, rows):
         "synchronize",
     ]
     np.testing.assert_array_equal(
-        np.asarray(result), np.arange(8).reshape((2, 4) if rows else (1, 2, 4))
+        np.asarray(result),
+        np.arange(8).reshape(2, 4)[::-1] if rows else np.arange(8).reshape(1, 2, 4),
     )
 
 
 def test_dtype_change_replaces_storage_without_changing_received_outputs(fake_cuda):
-    pool = D2HBufferPool(8, fake_cuda.stream)
-    first = pool.copy(torch.arange(4, dtype=torch.int32)).result()
-    second = pool.copy(torch.arange(4, dtype=torch.int64)).result()
+    pool = D2HQueue(8, fake_cuda.stream)
+    pool.send(torch.arange(4, dtype=torch.int32))
+    first = pool.receive()
+    pool.send(torch.arange(4, dtype=torch.int64))
+    second = pool.receive()
     assert len(fake_cuda.allocations) == 2
     assert first.dtype == np.int32 and second.dtype == np.int64
     np.testing.assert_array_equal(first, second)
 
 
 def test_over_capacity_fails_before_borrowing_or_allocating(fake_cuda):
-    pool = D2HBufferPool(8, fake_cuda.stream)
-    pool.copy(torch.arange(8)).result()
+    pool = D2HQueue(8, fake_cuda.stream)
+    pool.send(torch.arange(8))
+    pool.receive()
     with pytest.raises(ValueError, match="exceeds capacity"):
-        pool.copy(torch.arange(9))
-    pool.copy(torch.arange(3)).result()
+        pool.send(torch.arange(9))
+    pool.send(torch.arange(3))
+    pool.receive()
     assert len(fake_cuda.allocations) == 1
 
 
-@pytest.mark.parametrize("kind", ["empty", "shape", "dtype"])
-def test_row_sources_must_have_one_layout(fake_cuda, kind):
-    pool = D2HBufferPool(8, fake_cuda.stream)
-    sources = {
-        "empty": (),
-        "shape": (torch.zeros(3), torch.zeros(4)),
-        "dtype": (torch.zeros(3, dtype=torch.int32), torch.zeros(3, dtype=torch.int64)),
-    }[kind]
-    with pytest.raises(ValueError):
-        pool.copy_rows(sources, ready=fake_cuda.ready)
-    assert not fake_cuda.allocations and not fake_cuda.copies
-
-
 def test_strided_sources_and_scalar_outputs(fake_cuda):
-    pool = D2HBufferPool(12, fake_cuda.stream)
+    pool = D2HQueue(12, fake_cuda.stream)
     for source in (torch.arange(12).reshape(3, 4).T, torch.tensor(5), torch.empty(0)):
-        result = pool.copy(source).result()
+        pool.send(source)
+        result = pool.receive()
         np.testing.assert_array_equal(result, source.numpy())
         assert result.flags.owndata
 
 
 def test_real_async_copies_preserve_pending_and_received_outputs(gpu_stream):
-    pool = D2HBufferPool(128 * 5, gpu_stream)
+    pool = D2HQueue(128 * 5, gpu_stream)
     producer = torch.cuda.Stream()
-    pending, sources = [], []
+    sources = []
     for i, bs in enumerate((1, 17, 4, 128)):
         with torch.cuda.stream(producer):
             source = torch.full((bs, 5), i, dtype=torch.int32, device="cuda")
             ready = torch.cuda.Event()
             ready.record(producer)
         sources.append(source)
-        pending.append(pool.copy(source, ready=ready))
-    saved = [item.result() for item in pending]
+        pool.send(source, ready=ready)
+    saved = [pool.receive() for _ in sources]
     for i, (source, array) in enumerate(zip(sources, saved)):
         source.add_(10)
-        np.testing.assert_array_equal(
-            pool.copy(source).result(), np.full(source.shape, i + 10)
-        )
+        pool.send(source)
+        np.testing.assert_array_equal(pool.receive(), np.full(source.shape, i + 10))
         np.testing.assert_array_equal(array, np.full(source.shape, i))

@@ -204,9 +204,9 @@ release cost while replacing a previous result.
 
 | Module | Responsibility |
 | --- | --- |
-| `model_engine/output_transfer.py` | Pinned slots, asynchronous copies, completion events, and independent NumPy snapshots |
-| `spec_decode/output.py` | MTP producer layouts, named rejection/bonus results, and FIFO ordering |
-| `model_engine/model_runner.py` | Select the submission path and consume outputs at the existing scheduling boundaries |
+| `model_engine/output_transfer.py` | FIFO transfers, reusable pinned slots and completion events, and independent NumPy snapshots |
+| `spec_decode/output.py` | Copy the two packed MTP rows into independently owned arrays in scheduler order |
+| `model_engine/model_runner.py` | Provide contiguous status counts and consume outputs at the existing scheduling boundaries |
 | `model_engine/scheduler.py` | Enforce the output object's storage-ownership contract |
 
 Each D2H slot has fixed capacity based on the server's `max_num_seqs`, with a
@@ -217,22 +217,22 @@ by peak outstanding outputs. Only the active batch region is copied. Changing
 batch size reuses the same allocation; exceeding capacity is an error. A dtype
 change replaces a free slot. No additional GPU staging buffer is allocated.
 
-A pending transfer owns its completion event and slot. Receiving it waits for
-D2H, takes an independent NumPy snapshot, and only then returns the slot for
-reuse. The completed event is reused with its slot. Already received arrays
-remain valid after later copies or processor cleanup. Each slot caches only
-its current shape's views, so changing batch sizes does not retain a growing
-view cache.
+The queue keeps each pending slot until receiving it has waited for D2H and
+copied its active NumPy output. The slot and its completed event can then be
+reused; no per-transfer handle is allocated. Already received arrays remain
+valid after later copies or processor cleanup. Each slot caches only its current
+shape's views, so changing batch sizes does not retain a growing view cache.
 
-MTP has explicit `send_verdict` and `send_counts` entry points. Verified steps
-copy the post-broadcast verdict's first two contiguous rows (`bonus`, `rejected`)
-once, excluding the GPU-only anchor with no packing kernel. Prefill copies its
-two separate counts into the same two-row host layout with two D2H operations.
-Both paths use one slot and one completion event and return a named
-`MTPStatus(rejected, bonus)` in FIFO order. Each returned row owns its storage,
-so `ScheduledBatchOutput` does not copy it a second time.
+Both prefill and verification submit contiguous `[bonus, rejected]` rows with
+one D2H operation and one completion event. Verification uses the final
+post-broadcast verdict, excluding its GPU-only anchor. Prefill views a persistent
+flat zero buffer, slicing before reshaping to keep the active rows contiguous.
+Neither path launches a packing kernel. `MTPStatusQueue` specializes only the
+snapshot: it copies each row once and returns `(rejected, bonus)` in scheduler
+order. Each returned row owns its storage, so `ScheduledBatchOutput` does not
+copy it a second time.
 
-Draft IDs use a separate pool. Their transfer waits on the producer stream;
+Draft IDs use a separate queue. Their transfer waits on the producer stream;
 the next draft graph replay still follows a target forward, preserving the
 existing overlap. Ordinary sampled-token and logprob transfers are unchanged.
 
