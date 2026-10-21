@@ -272,6 +272,12 @@ class BlockManager:
         # from "no slots were ever created" (permanent).
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
+        # P/D consumer only (`enable_state_release_lag`): state slots a
+        # finished request frees are held until the next postprocess. See
+        # `advance_state_release_lag`.
+        self.state_release_lag = False
+        self._state_held: list[int] = []
+        self._state_held_since = 0.0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3186,6 +3192,37 @@ class BlockManager:
         for block_id in block_ids:
             self.kv.free(block_id)
 
+    # How long an idle engine holds freed state slots before handing them out.
+    # Far longer than any forward, so the step that was in flight has ended.
+    STATE_RELEASE_IDLE_S = 2.0
+
+    def _hold_state_slots(self, slots) -> None:
+        if not self._state_held:
+            self._state_held_since = monotonic()
+        self._state_held.extend(slots)
+
+    def advance_state_release_lag(self, *, idle: bool = False) -> None:
+        """Hand back the state slots held since the previous postprocess.
+
+        With deferred output a request is known finished only in the
+        postprocess after the step that finished it, and by then the next step
+        -- which still carries the request -- is already running and writes
+        its state slot. On a P/D consumer a slot handed out right away can
+        receive another request's state by RDMA, which is ordered against no
+        stream, so that in-flight step can overwrite the transfer. The next
+        postprocess runs after that step's output came back, so slots held
+        until then are free of it.
+
+        `idle`: called when nothing is running, where no further postprocess
+        comes; the slots go back once held longer than any forward takes.
+        """
+        if not self._state_held:
+            return
+        if idle and monotonic() - self._state_held_since < self.STATE_RELEASE_IDLE_S:
+            return
+        held, self._state_held = self._state_held, []
+        self.state.release_many(held)
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             self.kv.free(block_id)
@@ -3253,6 +3290,8 @@ class BlockManager:
                 # above holds the slot until `settle_state_load`.
                 self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
                 self.state.release_many(seq.state_slots[1:])
+            elif self.state_release_lag:
+                self._hold_state_slots(seq.state_slots)
             else:
                 self.state.release_many(seq.state_slots)
             # No next forward will read a pending fork source after deallocation.

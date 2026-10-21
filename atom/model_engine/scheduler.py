@@ -631,6 +631,14 @@ class Scheduler:
             config,
             state_runtime=state_runtime,
         )
+        # A P/D consumer receives state by RDMA into slots the previous
+        # tenant's in-flight step may still write (`advance_state_release_lag`).
+        _kv = getattr(config, "kv_transfer_config", None) or {}
+        self.block_manager.state_release_lag = (
+            isinstance(_kv, dict)
+            and _kv.get("kv_role") == "kv_consumer"
+            and self.block_manager.num_state_slots > 0
+        )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
@@ -1903,6 +1911,9 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        if not self.running:
+            # No postprocess comes while idle; see `advance_state_release_lag`.
+            self.block_manager.advance_state_release_lag(idle=True)
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -3916,6 +3927,8 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
+        # The step that ran with the requests freed last time has returned.
+        self.block_manager.advance_state_release_lag()
         # Remember which seqs were already in the middle of chunked prefill
         # before this postprocess call mutates seq.is_partial_prefill below.
         #

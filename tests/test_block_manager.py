@@ -1368,3 +1368,60 @@ class TestJointChunkProbeIsGated:
         # Exercise the missing dependency even in images with LMCache installed.
         assert bm._joint_chunk_tokens == 0
         assert "LMCache chunk size" in caplog.text
+
+
+# ── a P/D consumer holds freed state slots for one postprocess ──────────────
+
+
+class TestStateReleaseLag:
+    """With deferred output the step after a request's last one is already
+    running when the request is freed, and it writes the request's state slot.
+    A P/D consumer would hand that slot straight to an incoming transfer, whose
+    RDMA no stream orders against that step. Measured on DeepSeek-V4-Flash
+    1P1D: 53 of 1319 received slots differed from what the producer sent."""
+
+    def _bm(self, lag):
+        bm = BlockManager(
+            MockConfig(
+                enable_prefix_caching=True,
+                pool_entries={"state": 2},
+                pool_entries_per_req={"state": 1},
+            )
+        )
+        bm.state_release_lag = lag
+        return bm
+
+    def _freed(self, bm):
+        """Free one slot the way `deallocate` does for a finished request."""
+        slot = bm.state.pop()
+        if bm.state_release_lag:
+            bm._hold_state_slots([slot])
+        else:
+            bm.state.release_many([slot])
+        return slot
+
+    def test_a_freed_slot_waits_for_the_next_postprocess(self):
+        bm = self._bm(lag=True)
+        slot = self._freed(bm)
+        assert not bm.state.has_free(2)
+        bm.advance_state_release_lag()
+        assert bm.state.has_free(2)
+        assert slot in bm.state._free
+
+    def test_an_idle_engine_releases_only_after_the_hold(self, monkeypatch):
+        import atom.model_engine.block_manager as module
+
+        now = [100.0]
+        monkeypatch.setattr(module, "monotonic", lambda: now[0])
+        bm = self._bm(lag=True)
+        self._freed(bm)
+        bm.advance_state_release_lag(idle=True)
+        assert not bm.state.has_free(2)
+        now[0] += bm.STATE_RELEASE_IDLE_S
+        bm.advance_state_release_lag(idle=True)
+        assert bm.state.has_free(2)
+
+    def test_without_lag_a_slot_is_free_at_once(self):
+        bm = self._bm(lag=False)
+        self._freed(bm)
+        assert bm.state.has_free(2)

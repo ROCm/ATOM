@@ -2,7 +2,6 @@
 """ATOM scheduling adapter for the eager CSA2 paged runtime."""
 
 import logging
-import os
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
@@ -430,25 +429,6 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def reserve_checkpoint_descriptors(self, descriptor_slots):
         self.copies.staging.reserve(descriptor_slots)
 
-    def _state_layout_id(self):
-        """A stable digest of the STATE slot's field layout: names, shapes,
-        dtypes and offsets. Equal on two ranks iff a raw slot image means the
-        same thing on both (DSpark widens the rings, a model changes layers).
-        """
-        import hashlib
-
-        from atom.model_ops.attentions.pool_layout.entry_arena import field_extents
-
-        geo = self.cache.geometry
-        desc = repr(
-            [
-                (f.name, f.layers, tuple(f.shape), str(f.dtype), start, size)
-                for f, start, size in field_extents(geo.state_fields)
-            ]
-            + [geo.state_bytes]
-        )
-        return hashlib.sha1(desc.encode()).hexdigest()[:16]
-
     def get_kv_transfer_tensors(self):
         """PAGE units and the native checkpoint contract, for `lmcache_mp`.
 
@@ -458,13 +438,11 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
 
-        For P/D: the request's whole STATE slot, through a staging pool
-        (`staging_region`, `gather_slot`, `scatter_slot`). A slot is contiguous and holds every
+        For P/D (`slot_regions`): the request's whole STATE slot as one
+        slot-indexed region. A slot is contiguous and holds every
         layer's window ring -- the decoder's bounded-replay tail and the DSpark
         context layers included -- plus the compressor rings and the cursor, so
         it is all a consumer needs to decode and draft from the prompt's end.
-        No staging region: unlike DeepSeek-V4 there is no separate compressor
-        pool to gather.
         """
         runner = self.model_runner
         if not getattr(runner.config, "kv_transfer_config", None):
@@ -501,82 +479,34 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # No cache dimension is split across TP: every rank holds the same PAGE
         # and STATE bytes, as DeepSeek-V4's compressed cache does.
         tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
-        # The STATE slot crosses through a staging pool, as DeepSeek-V4's
-        # compressor state does: the producer gathers the slot into a staging
-        # row and RDMAs it into the consumer's staging row, and the consumer
-        # scatters that row into the request's slot on its compute stream once
-        # the write is done. Writing the slot directly would race the step the
-        # consumer still has in flight for the slot's previous tenant (deferred
-        # output learns of a finish one step late): RDMA is outside the
-        # stream's ordering, so that step could land after the transfer and
-        # overwrite it.
+        # The STATE slot travels as one slot-indexed region the connector
+        # writes straight across (`src_slot * unit` to `dst_slot * unit`). Its
+        # ordering against the consumer's in-flight step for the slot's
+        # previous tenant is the scheduler's (`advance_state_release_lag`).
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
         state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
         slot_unit = int(state.shape[1])
-        if not KVConnectorFactory.topology_uses_pd_staging(
-            runner.config.kv_transfer_config
-        ):
-            # `lmcache_mp` moves STATE through `execute_paged_state_copies`.
-            return KVTransferTensors(
-                pages=pages,
-                num_slots=int(state.shape[0]),
-                tp_replication_factor=tp_size,
-                native_state_tp_replication_factor=tp_size,
-                paged_state_checkpoint_spec=spec,
-                execute_paged_state_copies=self.execute_paged_state_copies,
-                paged_state_region_count=len(pages),
-            )
-        pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
-        if pool_size <= 0:
-            # Without a staging row the connector sends no address, moves no
-            # STATE and still reports success: the consumer would resume from
-            # whatever the slot held.
-            raise ValueError(
-                "DeepSeek-V4.1 P/D moves STATE through the staging pool; "
-                f"ATOM_PD_STAGING_POOL must be positive, got {pool_size}"
-            )
-        staging = getattr(self, "_pd_state_staging", None)
-        if staging is None or tuple(staging.shape) != (pool_size, slot_unit):
-            staging = torch.zeros(
-                (pool_size, slot_unit), dtype=torch.uint8, device=state.device
-            )
-            self._pd_state_staging = staging
-
-        def gather_slot(compute_slot: int, pool_idx: int) -> None:
-            staging[pool_idx].copy_(state[compute_slot])
-
-        def scatter_slot(compute_slot: int, pool_idx: int) -> None:
-            # The connector releases `pool_idx` as soon as this returns, and
-            # the next receive may RDMA into it: wait for this copy alone. It
-            # is queued behind the step in flight, which is the ordering the
-            # staging hop exists for, so the wait is at most that step.
-            # The notification thread never sets a device, so name it: the
-            # copy and the event both go on the STATE device's current stream.
-            if not state.is_cuda:
-                state[compute_slot].copy_(staging[pool_idx])
-                return
-            with torch.cuda.device(state.device):
-                stream = torch.cuda.current_stream(state.device)
-                state[compute_slot].copy_(staging[pool_idx])
-                done = torch.cuda.Event()
-                done.record(stream)
-            done.synchronize()
-
+        p_d = (
+            KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
+            == "mooncake"
+        )
         return KVTransferTensors(
             pages=pages,
-            num_slots=int(state.shape[0]),
-            staging_region=KVTransferRegion(
-                staging.data_ptr(),
-                pool_size * slot_unit,
-                slot_unit,
-                # The row is a raw STATE image, so its role names the image's
-                # layout; the producer refuses a consumer whose role differs.
-                semantic_role=f"dsv41.pd_staging.state_slot/{self._state_layout_id()}",
+            # `lmcache_mp` moves STATE through `execute_paged_state_copies`.
+            slot_regions=(
+                [
+                    KVTransferRegion(
+                        state.data_ptr(),
+                        int(state.shape[0]) * slot_unit,
+                        slot_unit,
+                        semantic_role="dsv41.state_slot",
+                    )
+                ]
+                if p_d
+                else []
             ),
-            staging_pool_size=pool_size,
-            gather_slot=gather_slot,
-            scatter_slot=scatter_slot,
+            num_slots=int(state.shape[0]),
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,

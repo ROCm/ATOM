@@ -232,12 +232,13 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
-def test_pd_transfer_stages_the_state_slot(small_config):
-    """Mooncake P/D: PAGE units plus the STATE slot through a staging pool.
+def test_pd_transfer_publishes_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
 
-    The connector RDMAs staging row to staging row; gather/scatter move a slot
-    in and out of a row, byte for byte. Encoder bounded replay keeps no
-    checkpoint, so the spec may be None.
+    The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
+    consumer's slot only when `slot_regions` is non-empty. Encoder bounded
+    replay keeps no checkpoint, so the spec may be None. `lmcache_mp` gets no
+    slot region: it moves STATE through checkpoint copies.
     """
     from atom.model_ops.attentions.deepseek_v41.backend import (
         DeepseekV41MetadataBuilder,
@@ -255,47 +256,12 @@ def test_pd_transfer_stages_the_state_slot(small_config):
     )
     builder.cache = cache
     transfer = builder.get_kv_transfer_tensors()
-    assert not transfer.slot_regions and not transfer.swa_block_regions
+    assert not transfer.swa_block_regions and transfer.staging_region is None
+    (region,) = transfer.slot_regions
     assert transfer.num_slots == 4
-    assert transfer.staging_region.unit_bytes == geo.state_bytes
-    assert transfer.staging_pool_size > 1
-    # The role names the STATE layout, so a spec-config mismatch is refused.
-    role = transfer.staging_region.semantic_role
-    assert role.startswith("dsv41.pd_staging.state_slot/")
-    wider = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
-    wider.cache = PagedAttentionCache(
-        replace(geo, speculative_tokens=geo.speculative_tokens + 5), 8, 4, "cpu"
-    )
-    assert wider._state_layout_id() != builder._state_layout_id()
-
-    image = torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
-    cache.state_bytes[2].copy_(image)
-    transfer.gather_slot(2, 1)
-    cache.state_bytes[2].zero_()
-    transfer.scatter_slot(3, 1)
-    torch.testing.assert_close(cache.state_bytes[3], image, rtol=0, atol=0)
-    assert not cache.state_bytes[2].any()
-
-
-def test_pd_transfer_refuses_an_empty_staging_pool(small_config, monkeypatch):
-    """No staging row means no STATE moves while the transfer reports success."""
-    from atom.model_ops.attentions.deepseek_v41.backend import (
-        DeepseekV41MetadataBuilder,
-    )
-
-    monkeypatch.setenv("ATOM_PD_STAGING_POOL", "0")
-    geo = replace(geometry(small_config), window_size=32)
-    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
-    builder.model_runner = SimpleNamespace(
-        config=SimpleNamespace(
-            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
-            tensor_parallel_size=2,
-        ),
-        state_runtime=SimpleNamespace(checkpoint_spec=None),
-    )
-    builder.cache = PagedAttentionCache(geo, 8, 4, "cpu")
-    with pytest.raises(ValueError, match="ATOM_PD_STAGING_POOL"):
-        builder.get_kv_transfer_tensors()
+    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
+    for slot in range(4):
+        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

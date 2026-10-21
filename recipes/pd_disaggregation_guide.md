@@ -217,12 +217,16 @@ V4-specific env vars:
 V4.1 hands each request's PAGE units (main KV + index planes) plus its whole
 STATE slot to the decode node: every layer's window ring (including the
 decoder's bounded-replay tail and the DSpark context layers), the compressor
-rings and the cursor. The slot crosses through a staging pool and is scattered
-into the consumer's slot on its compute stream, so it is ordered after any step
-still in flight for the slot's previous tenant. Only Mooncake is admitted
-(MoRI-IO is refused), and `kv_role` must be explicit on both sides. Prefill and
-decode must run the same model and spec config: the producer refuses a consumer
-whose STATE layout differs (DSpark widens the rings).
+rings and the cursor, written straight into the consumer's slot. Only Mooncake
+is admitted (MoRI-IO is refused), and `kv_role` must be explicit on both sides.
+Prefill and decode must run the same model and spec config: the producer
+refuses a consumer whose slot size differs (DSpark widens the rings).
+
+A P/D consumer holds a finished request's state slot until the next
+postprocess before reusing it (all models): with deferred output the step
+after a request's last one is still running and writes its slot, and an RDMA
+into that slot is ordered against no stream. Without this, 4% of
+DeepSeek-V4-Flash transfers (53 of 1319) arrived partly overwritten.
 
 Validated 1P1D: each side one TP2 instance on MI355X, DeepSeek-V4.1-Flash-1017,
 bf16 KV, fp4 index, decoder and encoder SWA bounded replay on, DSpark 5.
@@ -273,8 +277,6 @@ V4.1 notes:
   producer's prefix cache, which is what limits a single producer under
   high concurrency (at c128 its hit rate fell to 6–18% from eviction; at c32
   it held 97–98%). Raise it where the cluster allows, or add producers.
-- `ATOM_PD_STAGING_POOL` (default 32) is the number of STATE staging rows per
-  rank; it must be positive.
 - With `--method dspark`, startup can spend a long time in inductor on a
   fallback-op log line; `ATOM_DSPARK_DISABLE_COMPILE=1` runs the draft eager.
 
@@ -286,7 +288,7 @@ AL 3.51):
 | TTFT p50 / p90 / p99 | 0.44 / 1.14 / 4.14 s | 0.30 / 0.72 / 2.65 s |
 | ITL p50 / p90 | 5.2 / 6.4 ms | 7.0 / 11.1 ms |
 | Output throughput | 1,615 tok/s | 1,473 tok/s |
-| gsm8k 3-shot (DSpark 5, real acceptance) | 0.921 | 0.930 |
+| gsm8k 3-shot (DSpark 5, real acceptance) | 0.923 | 0.930 |
 
 ---
 

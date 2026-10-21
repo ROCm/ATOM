@@ -1074,7 +1074,6 @@ class MooncakeConnector(KVConnectorBase):
         if tt.staging_region is not None:
             self._staging_base_addr = tt.staging_region.base_addr
             self._staging_slot_bytes = tt.staging_region.unit_bytes
-            self._staging_role = tt.staging_region.semantic_role
             self._staging_pool_size = tt.staging_pool_size
             self._staging_slots = SlotPool(
                 tt.staging_pool_size,
@@ -1599,7 +1598,6 @@ class MooncakeConnector(KVConnectorBase):
                         "consumer_slot_bps": [bps for _, bps in self._slot_regions],
                         "consumer_staging_addr": consumer_staging_addr,
                         "consumer_staging_bytes": self._staging_slot_bytes,
-                        "consumer_staging_role": getattr(self, "_staging_role", None),
                     }
                 )
                 if self._fp4_index_layout:
@@ -3039,6 +3037,16 @@ class MooncakeConnector(KVConnectorBase):
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
+            if consumer_slot_bps[cidx] != bps:
+                # A slot is a raw state image whose width follows the model and
+                # spec config (DeepSeek-V4.1's widens with DSpark): writing it
+                # into a differently sized slot overruns or misplaces fields.
+                raise RuntimeError(
+                    f"State slot size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bps} B, consumer region {cidx} "
+                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
+                    "run the same model and spec config"
+                )
             slot_src.append(src_base + src_slot * bps)
             slot_dst.append(dst_base + dst_slot * consumer_slot_bps[cidx])
             slot_sizes.append(bps)
@@ -3046,33 +3054,6 @@ class MooncakeConnector(KVConnectorBase):
         # Phase 2b: compressor states via staging buffer (182 → 1)
         producer_pool_idx = -1
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
-        consumer_staging_bytes = request_data.get("consumer_staging_bytes")
-        consumer_staging_role = request_data.get("consumer_staging_role")
-        own_staging_role = getattr(self, "_staging_role", None)
-        if (
-            self._gather_slot is not None
-            and consumer_staging_addr
-            and (
-                (
-                    consumer_staging_bytes is not None
-                    and int(consumer_staging_bytes) != self._staging_slot_bytes
-                )
-                or (
-                    consumer_staging_role is not None
-                    and own_staging_role is not None
-                    and consumer_staging_role != own_staging_role
-                )
-            )
-        ):
-            # A staging row is one raw STATE image; its layout follows the
-            # model and spec config (DSpark widens the rings), so a peer whose
-            # row differs would be overrun or restore fields at wrong offsets.
-            raise RuntimeError(
-                f"P/D STATE staging row mismatch for req {req_id}: producer "
-                f"{self._staging_slot_bytes} B {own_staging_role!r}, consumer "
-                f"{consumer_staging_bytes} B {consumer_staging_role!r}; "
-                "prefill and decode must run the same model and spec config"
-            )
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._staging_slots.acquire()
             self._gather_slot(src_slot, producer_pool_idx)
