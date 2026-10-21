@@ -136,20 +136,26 @@ PY
 }
 
 pre_cleanup_local() {
-  echo "=== pre-cleanup: stop running containers on $(hostname) ==="
-  set +e
-  running=()
-  while read -r id; do
-    [[ -n "${id}" ]] && running+=("${id}")
-  done < <(docker ps -q 2>/dev/null)
+  # Slurm exclusivity does not make unrelated host containers ours to stop.
+  # run_container_rank removes only its own deterministic container name.
+  echo "=== existing containers on $(hostname) (read-only inventory) ==="
+  docker ps --format "  {{.ID}} {{.Names}} {{.Status}}" || true
+}
 
-  if [[ "${#running[@]}" -gt 0 ]]; then
-    docker ps --format "  {{.ID}} {{.Names}} {{.Status}}"
-    docker stop -t 0 "${running[@]}" >/dev/null 2>&1 || true
-  else
-    echo "no running containers"
-  fi
-  set -e
+capture_container_failure() {
+  local container="$1" output="$2" started="$3"
+  local ended
+  ended="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Capture only exit state, not Config.Env (which can contain credentials).
+  timeout 10 docker inspect --format '{{json .State}}' "${container}" \
+    > "${output}-state.json" 2>&1 || true
+  timeout 10 docker events --since "${started}" --until "${ended}" \
+    --filter type=container --filter "container=${container}" \
+    --format '{{.TimeNano}} {{.Action}} signal={{index .Actor.Attributes "signal"}} exitCode={{index .Actor.Attributes "exitCode"}}' \
+    > "${output}-events.log" 2>&1 || true
+  cat /proc/meminfo > "${output}-host-meminfo.txt" 2>/dev/null || true
+  echo "[logs] container failure state: ${output}-state.json"
+  cat "${output}-state.json" >&2 || true
 }
 
 # The image ships every tuned FlyDSL kernel AOT-compiled under
@@ -375,7 +381,8 @@ EOF
     bash -lc "export PATH=/run_logs/slurm_job-${JOB_ID}/bin:\${PATH}; cd /workspace/ATOM && bash .github/scripts/atomesh/pd_server_atom.sh"
   )
 
-  local docker_rc
+  local docker_rc container_started_at
+  container_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # Spur returns worker stdout/stderr in a size-limited RPC response. Keep
   # unbounded container output on shared NFS, not in the scheduler response.
   echo "[logs] rank=${rank} phase=${execution_phase} full log: ${rank_dir}/${container_log}"
@@ -385,6 +392,7 @@ EOF
   set -e
   echo "[logs] rank=${rank} phase=${execution_phase} exited rc=${docker_rc}"
   if [[ "${docker_rc}" -ne 0 ]]; then
+    capture_container_failure "${container}" "${rank_dir}/${container_log%.log}" "${container_started_at}"
     echo "[logs] last 16384 bytes of ${rank_dir}/${container_log}:" >&2
     # Bound bytes rather than lines: benchmark progress and JSON can produce
     # arbitrarily long lines. Diagnostics must not replace the Docker status.

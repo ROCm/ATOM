@@ -289,7 +289,7 @@ stop_mooncake_store
         # The launch info shows each Store process's own environment.
         self.assertIn(
             "LAUNCH MOONCAKE_OWNER HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 "
-            "MC_NUM_QP_PER_EP=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1 "
+            "MC_NUM_QP_PER_EP=1 GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.perturb=165 "
             f"MC_MAX_MR_SIZE=68719476736 MC_TCP_BIND_ADDRESS={HOST} python3 ",
             result.stdout,
         )
@@ -319,7 +319,7 @@ stop_mooncake_store
             (64 * GIB, 96 * GIB),
         ):
             self.assertIn(
-                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1 BIND={HOST} MR=68719476736 ",
+                f"HIP=-1 QP=1 THP=glibc.malloc.hugetlb=1:glibc.malloc.perturb=165 BIND={HOST} MR=68719476736 ",
                 call,
             )
             self.assertIn(f"/scripts/numa_exec.py {numa} mooncake_client ", call)
@@ -352,14 +352,49 @@ stop_mooncake_store
         for pid in self.stub_pids():
             self.assertFalse(self.alive(pid), pid)
 
+    def test_owner_allocation_is_resident_before_rdma_registration(self):
+        self.run_shell("start_mooncake_store\nstop_mooncake_store\n")
+        owner = self.store_calls("mooncake_client")[0]
+        tunables = owner.split(" THP=", 1)[1].split(" ", 1)[0]
+        # The real Store calls glibc aligned_alloc. Check residency before
+        # reading any byte; an ordinary lazy allocation is not resident yet.
+        code = r"""
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+libc.aligned_alloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+libc.aligned_alloc.restype = ctypes.c_void_p
+libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+libc.free.argtypes = [ctypes.c_void_p]
+size = 64 * 1024 * 1024
+ptr = libc.aligned_alloc(4 * 1024 * 1024, size)
+assert ptr
+try:
+    pages = size // os.sysconf("SC_PAGE_SIZE")
+    resident = (ctypes.c_ubyte * pages)()
+    assert libc.mincore(ptr, size, resident) == 0, ctypes.get_errno()
+    assert all(value & 1 for value in resident), "Store allocation is still lazy"
+    for offset in (0, size // 2, size - 1):
+        assert ctypes.c_ubyte.from_address(ptr + offset).value == 90
+finally:
+    libc.free(ptr)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "GLIBC_TUNABLES": tunables},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_the_servers_start_with_the_store_env_on_their_command_lines(self):
         source = SERVER_SCRIPT.read_text()
         servers = source[
             source.index("start_prefill() {") : source.index("start_router() {")
         ]
         result = self.run_shell(
-            servers
-            + """
+            servers + """
 # Records each server's command line, one argument per line.
 start_logged_process() {
   printf '%s\\n' "${@:3}" > "${STUB_DIR}/argv-$(basename "$2" .log)"

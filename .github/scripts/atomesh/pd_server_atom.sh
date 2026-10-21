@@ -1570,12 +1570,15 @@ mooncake_owner_pool() {
 start_mooncake_store_owners() {
   local master_addr="$1"
   # No GPU: a process that sees one makes Mooncake probe every buffer through HIP.
-  # glibc's THP malloc makes the whole segment huge pages, which the NICs
-  # register in under a second per 64 GiB MR; eno1 is firewalled, so the
-  # transfer engine binds the role IP.
+  # aligned_alloc is lazy even with the THP hint. Initialize the actual Store
+  # allocation through glibc so CPU page faults can reclaim memory before the
+  # RDMA driver's first pin; Mooncake's preTouchMemory itself uses temporary
+  # MRs and can fail ENOMEM on an unfaulted range. No extra pool or host-wide
+  # THP preparation is needed. Keep this setting local to the owner process.
+  # eno1 is firewalled, so the transfer engine binds the role IP.
   local -a owner_env=(
     HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES=-1 MC_NUM_QP_PER_EP=1
-    GLIBC_TUNABLES=glibc.malloc.hugetlb=1 MC_MAX_MR_SIZE=68719476736
+    GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.perturb=165 MC_MAX_MR_SIZE=68719476736
     "MC_TCP_BIND_ADDRESS=${host_ip}"
   )
   local i pool log
