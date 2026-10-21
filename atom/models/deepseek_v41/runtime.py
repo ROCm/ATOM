@@ -88,8 +88,6 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
 def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
-    if not metadata.step.requests:
-        return torch.zeros_like(hidden)
     layer, rope = context.no_compile_layers[layer_name]
     # `hidden` arrives normed: the mHC seam (`pre_delayed`) applies the norm
     # before this boundary, so only the attention body runs here.
@@ -283,13 +281,16 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             )
             and not config.enforce_eager
         )
-        buffer_tokens = (
-            min(max(config.prefill_capture_sizes), config.max_num_batched_tokens)
-            if self.piecewise
-            and config.compilation_config.cudagraph_mode
-            == CUDAGraphMode.FULL_AND_PIECEWISE
-            else 0
-        )
+        buffer_tokens = 0
+        if self.piecewise:
+            # Tail widths vary independently of the outer capture bucket.
+            # All modes share bounded prefixes, including eager AF fallbacks.
+            buffer_tokens = config.max_num_batched_tokens
+            if (
+                config.compilation_config.cudagraph_mode
+                == CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                buffer_tokens = min(max(config.prefill_capture_sizes), buffer_tokens)
         self.replay = False
         self.late_aux_layers, self.aux_buffers = (), None
         if getattr(config, "enable_decoder_swa_bounded_replay", False):

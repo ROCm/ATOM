@@ -1071,11 +1071,15 @@ def test_tbo_preserves_v4_forward_signature(monkeypatch):
     torch.testing.assert_close(context.context.input_ids, ids)
 
 
-def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
+@pytest.mark.parametrize("mode", ["AF_PIECEWISE", "FULL_AND_PIECEWISE"])
+@pytest.mark.parametrize("level, eager", [(3, False), (0, False), (3, True)])
+def test_fp4_page_budget_includes_persistent_microbatch_metadata(
+    monkeypatch, mode, level, eager
+):
     import json
     from pathlib import Path
 
-    from atom.config import CompilationConfig
+    from atom.config import CompilationConfig, CUDAGraphMode
     from atom.model_ops.attentions.backends import CommonAttentionBuilder
     from atom.models.deepseek_v41.config import normalize_hf_config
 
@@ -1086,7 +1090,10 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
         forward_vars=metadata_buffers(2, 16, 8, "cpu"),
         config=SimpleNamespace(
             hf_config=hf,
-            compilation_config=CompilationConfig(),
+            compilation_config=CompilationConfig(
+                level=level, cudagraph_mode=CUDAGraphMode[mode]
+            ),
+            enforce_eager=eager,
             speculative_config=None,
             kv_cache_dtype="bf16",
             index_cache_dtype="fp4",
@@ -1136,6 +1143,7 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
             return pages
 
     builder = BudgetBuilder(runner)
+    assert builder.capture_attention == (level == 3 and not eager)
     assert len(recorded) == 1
     assert builder.score_workspace.packed
     assert builder.step_planners[0].workspace is builder.score_workspace

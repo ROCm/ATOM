@@ -127,8 +127,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         ]
         self.topology = tuple(topology)
         self.capture_attention = (
-            model_runner.config.compilation_config.cudagraph_mode
+            model_runner.config.compilation_config.level == 3
+            and model_runner.config.compilation_config.cudagraph_mode
             in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
+            and not model_runner.config.enforce_eager
         )
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens

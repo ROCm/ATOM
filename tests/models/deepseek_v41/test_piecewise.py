@@ -31,7 +31,10 @@ def _context(monkeypatch, tokens=8):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
-def test_split_graph_replays_with_live_batch_state_and_engram(monkeypatch):
+@pytest.mark.parametrize("empty_startup", [False, True])
+def test_split_graph_replays_with_live_batch_state_and_engram(
+    monkeypatch, empty_startup
+):
     context = _context(monkeypatch)
     calls = []
 
@@ -123,21 +126,86 @@ def test_split_graph_replays_with_live_batch_state_and_engram(monkeypatch):
             hidden.fill_(value)
             # Warm up new kernels without capturing before each bucket's capture.
             if n not in captured:
+                if empty_startup:
+                    step.requests = []
                 context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                 compiled(hidden)
                 context.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
                 compiled(hidden)  # capture records work; it does not execute it
                 captured.add(n)
+                step.requests = list(range(bs))
+                hidden.fill_(value)
             actual = compiled(hidden)
             torch.testing.assert_close(actual, torch.full_like(actual, 5 * value + 3))
     torch.cuda.current_stream().wait_stream(stream)
     assert calls.count("begin") == 8
-    assert calls.count("stage") == 8
-    assert calls.count("join") == 16
+    assert calls.count("stage") == (4 if empty_startup else 8)
+    assert calls.count("join") == (8 if empty_startup else 16)
     assert ("attention", 4) in calls
     assert any(len(piece.concrete_cudagraph_entries) == 2 for piece in pieces)
     for piece in pieces:
         piece.release_graphs()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        CUDAGraphMode.PIECEWISE,
+        CUDAGraphMode.AF_PIECEWISE,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ],
+)
+def test_runtime_boundary_storage_stays_bounded_after_graph_budget(monkeypatch, mode):
+    def initialize(self, config, **kwargs):
+        torch.nn.Module.__init__(self)
+        layer = torch.nn.Module()
+        layer.layer_name = "test.layer"
+        layer.attn = lambda hidden, *args, **kwargs: hidden + 1
+        self.layers = torch.nn.ModuleList([layer])
+
+    monkeypatch.setattr(runtime.DeepseekV41MultimodalModel, "__init__", initialize)
+    monkeypatch.setattr(runtime.DeepseekV41RuntimeModel, "_rope", lambda *args: None)
+    monkeypatch.setattr(runtime, "_Backbone", lambda **kwargs: torch.nn.Identity())
+    config = SimpleNamespace(
+        hf_config=None,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        prefill_capture_sizes=[8, 64],
+        online_quant_config=None,
+        enforce_eager=False,
+        compilation_config=SimpleNamespace(
+            level=3, cudagraph_mode=mode, static_forward_context={}
+        ),
+    )
+    model = runtime.DeepseekV41RuntimeModel(config)
+    layer = model.layers[0]
+    context = _context(monkeypatch, tokens=64)
+    context.no_compile_layers = config.compilation_config.static_forward_context
+    context.attn_metadata = SimpleNamespace(
+        step=SimpleNamespace(requests=[1]), cache=None, queries=None
+    )
+    sample = torch.ones(1, 64, 4)
+    first = runtime.v41_attention(sample[:, :33], layer.layer_name)
+    runner = next(iter(layer._piecewise_core_runners.values()))
+    runner.max_entries = 0
+    if mode != CUDAGraphMode.PIECEWISE:
+        context.attn_metadata.cudagraph_key = ("live",)
+    footprint = sum(
+        t.untyped_storage().nbytes() for t in layer.piecewise_outputs._slots.values()
+    )
+    for n in (*range(34, 65), 33):
+        sample.fill_(n)
+        actual = runtime.v41_attention(sample[:, :n], layer.layer_name)
+        torch.testing.assert_close(actual, torch.full_like(actual, n + 1))
+        assert actual.data_ptr() == first.data_ptr()
+        assert (
+            sum(
+                t.untyped_storage().nbytes()
+                for t in layer.piecewise_outputs._slots.values()
+            )
+            == footprint
+        )
+    assert not runner._graphs
 
 
 def test_image_stage_bypasses_text_graph(monkeypatch):
