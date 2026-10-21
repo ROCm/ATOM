@@ -68,10 +68,32 @@ Key entry points:
   mailbox and its `publish`, the TP group's peer bases and all-reduce sum
   (`ranks`), FP8 / MX codes, FP4 tile loads and the scaled MFMA (`mx`) and wave
   / math primitives), a model's
-  kernels in `atom/models/<model>/mono/` (MiniMax-M3; DeepSeek-V4.1, wrapped
-  after load through `model_runner.mono_decode_installers`; its per-step cell
-  decisions live in `deepseek_v41/mono/{index,attention,moe}_plan.py`, each
-  called by both the kernel and its CPU I3 test)
+  kernels in `atom/models/<model>/mono/kernels/` (MiniMax-M3; DeepSeek-V4.1 and
+  Kimi-K3, both wrapped after load through
+  `model_runner.mono_decode_installers`; V4.1's per-step cell decisions live in
+  `deepseek_v41/mono/{index,attention,moe}_plan.py`, each called by both the
+  kernel and its CPU I3 test. Kimi-K3 runs only its KDA layers — K1 (the
+  attention seam through the KDA recurrence) and K2 (`o_proj` + the latent MoE)
+  — and only on a uniform speculative verify of at most 8 rows; the MLA layers
+  keep the original paged path. Which steps it serves and how a served step is
+  keyed live in `kimi_k3/mono/plan.py`, apart from `runner.py` so the CPU test
+  gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
+  whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /
+  `kernels/geometry_config.py` hold its launch geometry and its own `LayerConfig`.
+  What is NOT GLM-5.2's sits in `atom/mono/`: the storage vocabulary and host-side
+  weight preparation in `mono/weights/` (`config` the enum vocabulary and
+  `LayerConfig`, `formats` MX conversion, `packing`, `layer` the `LayerWeights`
+  ABI), ATOM's MXFP4 index arithmetic in `plan/tiles.py`, and the HIP IPC wrapper
+  in `runtime/hip_ipc.py`. `runtime/peer_memory.py` now holds BOTH peer-buffer
+  implementations side by side — `PeerBuffer` (aiter's heap) and
+  `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
+  implementations rather than two copies, and merging them is a GPU behaviour
+  change, not a move. Where a model ships a
+  `mono/contract.py` with a `__main__` (DeepSeek-V4.1, MiniMax-M3), check its
+  hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
+  python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
+  per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
+  yet)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Optional, TypeVar
 
 if TYPE_CHECKING:
     from atom.kv_transfer.disaggregation.types import KVTransferTensors
+    from atom.utils.forward_context import BoundedReplayDPReport
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
+    checkpoint_copy_ops_per_batch,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
@@ -172,6 +174,17 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
 
     def prepare_model_inputs(self, input_ids, metadata):
         """Prepare model inputs after state maintenance and final token staging."""
+
+    def dp_stage_report(self, batch: ScheduledBatch) -> "BoundedReplayDPReport | None":
+        """This rank's `BoundedReplayDPReport` for the step's DP sync, or None when the
+        model runs every MoE layer on every row of the step.
+
+        A model whose prefill runs some MoE layers on other rows (DeepSeek-V4.1
+        decoder bounded replay) reports its per-stage token counts here, from
+        the batch alone, so they ride `ForwardMode.decide`'s one packed
+        all_gather. Must return None on every step, or a report of one fixed
+        layout on every step and every rank."""
+        return None
 
     def step_needs_eager(self, batch: ScheduledBatch) -> bool:
         """True when this backend cannot run `batch`'s decode from a captured
@@ -392,7 +405,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         because allocating pinned memory is itself a synchronizing call.
 
         A step can carry at most one store and one restore per sequence, so two
-        per sequence bounds it. The caller checks that bound rather than growing
+        per sequence bounds it (`checkpoint_copy_ops_per_batch`, the same budget
+        the coordinator begins queued midstep stores within). The caller checks that bound rather than growing
         on demand: a descriptor that did not fit would otherwise be silently
         truncated into a copy of the wrong shape.
 
@@ -409,7 +423,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         staging = getattr(self, "_checkpoint_staging_cache", None)
         if staging is None:
             plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            # The same budget the scheduler's coordinator begins stores within.
+            max_ops = checkpoint_copy_ops_per_batch(
+                self.model_runner.config.max_num_seqs
+            )
             staging = self._checkpoint_staging_cache = DescriptorStaging(
                 max_ops * plan.num_spans, self._checkpoint_descriptor_device()
             )

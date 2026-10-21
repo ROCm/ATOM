@@ -316,6 +316,44 @@ def test_graph_bs_and_decode_cap_mutually_exclusive():
         )
 
 
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("qlen", [1, 6])
+def test_v41_full_plans_keep_addresses_and_clear_replay_tail(ratio, qlen):
+    """Reuse the capture's actual storage across full/partial/empty batches."""
+    capacity = 4
+    bufs = {ratio: {name: _FakeBuf(64) for name in ("compress", "write")}}
+    captured = None
+    for count, start in [(capacity, 0), (capacity, 1), (1, 8), (0, 10)]:
+        extend = np.full(count, qlen, dtype=np.int32)
+        ends = np.full(count, start + qlen, dtype=np.int32)
+        plan = make_compress_plans(
+            extend,
+            ends,
+            [(ratio, False)],
+            plan_buffers=bufs,
+            running_bs=capacity,
+            max_q_len=qlen,
+            extra_write=qlen - 1,
+        )[ratio]
+        signature = (
+            plan.compress_plan_gpu.shape,
+            plan.compress_plan_gpu.data_ptr(),
+            plan.write_plan_gpu.shape,
+            plan.write_plan_gpu.data_ptr(),
+        )
+        if captured is None:
+            captured = signature
+        assert signature == captured
+        assert plan.compress_plan_gpu.shape[0] == capacity * -(-qlen // ratio)
+        assert plan.write_plan_gpu.shape[0] == capacity * qlen
+        assert (plan.compress_plan_gpu[plan.num_compress :, POSITION_COL] == -1).all()
+        assert (plan.write_plan_gpu[plan.num_write :, POSITION_COL] == -1).all()
+        if ratio == 2 and qlen == 1:
+            # Capturing at position zero must still record a nonzero dispatch;
+            # the next step activates those same rows at the ratio-2 boundary.
+            assert plan.num_compress == (count if start % 2 else 0)
+
+
 # ── write_from: rows a rebuilding forward recomputes but must not write ──────
 
 

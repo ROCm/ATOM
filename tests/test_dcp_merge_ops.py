@@ -1312,10 +1312,13 @@ def test_dcp_kernel_and_sparse_prefill_num_heads_can_diverge():
 
 _ATOM_MODELS = Path(__file__).resolve().parent.parent / "atom" / "models"
 
-# Query projections here must carry qrep_tp_override.
+# Query projections here must carry qrep_tp_override. Each entry is the path
+# relative to ``atom/models/``, not a bare file name: a model that is a package
+# names its module ``model.py``, so bare names collapse every such model onto
+# one ambiguous ``"model.py"`` key.
 _QREP_WIRED_MODELS = (
     "deepseek_v2.py",  # DeepSeek V2/V3/V3.2 and GLM-5.2 (GlmMoeDsaForCausalLM)
-    "kimi_k3.py",  # Kimi-K3 target
+    "kimi_k3/model.py",  # Kimi-K3 target
     "kimi_k3_dspark.py",  # DSpark draft for Kimi-K3
     "eagle3_deepseek_mla.py",  # eagle3 MLA draft
 )
@@ -1508,9 +1511,15 @@ def test_every_mla_model_has_an_explicit_qrep_decision():
     `rglob`, not `glob`: a non-recursive scan would miss an MLA model added
     under a subpackage (`atom/models/<family>/...`), the direction some of
     `atom/model_ops/` already organizes new code in.
+
+    Models are keyed by their path relative to `atom/models/`. `path.name`
+    would key every packaged model as `model.py`, so the first one to land
+    there would satisfy the census for all of them.
     """
     producers = {
-        path.name for path in _ATOM_MODELS.rglob("*.py") if _builds_mla_modules(path)
+        path.relative_to(_ATOM_MODELS).as_posix()
+        for path in _ATOM_MODELS.rglob("*.py")
+        if _builds_mla_modules(path)
     }
     undecided = producers - set(_QREP_WIRED_MODELS) - set(_QREP_UNWIRED_MODELS)
     assert not undecided, (

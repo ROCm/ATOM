@@ -395,7 +395,7 @@ class EagleProposer(Drafter):
             "positions": positions,
         }
 
-    def warmup_draft_graphs(self, build_context, stream) -> None:
+    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
         """Warm every size from the state the target's capture left behind.
 
         `_advance_decode_metadata` bumps `kv_indptr` and `context_lens` in
@@ -422,7 +422,7 @@ class EagleProposer(Drafter):
             return build_context(**kwargs)
 
         try:
-            super().warmup_draft_graphs(build_pristine_context, stream)
+            super().warmup_draft_graphs(build_pristine_context, stream, end_trace)
         finally:
             restore()
 

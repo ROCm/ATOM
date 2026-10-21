@@ -158,6 +158,22 @@ def test_bind_agreed_reraises_this_ranks_refusal():
     bind_agreed(lambda: None, None)
 
 
+def test_bind_agreed_converts_other_failures_to_refusal():
+    """A non-refusal failure must still leave every rank on the same path.
+
+    Peers only ever see MonoUnsupported, so a rank whose bind raised something
+    else -- an OOM, typically -- has to refuse the same way instead of dying
+    alone with an exception LazyRunner does not catch."""
+
+    import torch
+
+    def oom():
+        raise torch.OutOfMemoryError("out of memory")
+
+    with pytest.raises(MonoUnsupported, match="OutOfMemoryError: out of memory"):
+        bind_agreed(oom, None)
+
+
 def _mlir_escaped(data: bytes) -> str:
     return "".join(
         chr(b) if 0x20 <= b < 0x7F and b not in b'\\"' else f"\\{b:02X}" for b in data
@@ -309,14 +325,125 @@ def test_lazy_runner_waits_out_a_capture(monkeypatch):
     assert mono.ready(6) and mono.runner is not None
 
 
-@pytest.mark.parametrize("refusal", ["create", "prepare"])
-def test_lazy_runner_refusal_is_for_good(monkeypatch, refusal):
+def test_lazy_runner_create_refusal_is_for_good(monkeypatch):
+    """A `create()` refusal is a deployment verdict: mono cannot serve at all."""
     monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
 
     def create():
-        if refusal == "create":
-            raise MonoUnsupported("TP 8")
-        return _Runner(ok=False)
+        raise MonoUnsupported("TP 8")
 
     mono = route.LazyRunner(create, "test")
     assert not mono.ready(6) and not mono.enabled and not mono.ready(6)
+
+
+def test_lazy_runner_width_refusal_spares_other_widths(monkeypatch):
+    """A `prepare(width)` refusal is about that width and nothing else.
+
+    A step padded to an uncaptured width must not take mono away from the
+    widths that do build -- the runner stays enabled and a later good width
+    still runs.
+    """
+    monkeypatch.setattr(route.torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class _ByWidth:
+        def prepare(self, rows):
+            return rows != 20
+
+    mono = route.LazyRunner(_ByWidth, "test")
+    assert not mono.ready(20)  # the padded width is declined
+    assert mono.enabled  # ...but mono is not switched off
+    assert mono.ready(6)  # ...and a width that builds still runs
+    assert not mono.ready(20)  # the refused width stays refused
+
+
+def test_aiter_stub_teardown_leaves_no_second_copy():
+    """Dropping a module must clear its parent's attribute too.
+
+    `sys.modules.pop` alone leaves the parent package bound to the same object,
+    so a later import builds a fresh module while attribute access still finds
+    the old one -- two copies of every class in it, and a dotted-path
+    monkeypatch can reach the copy the test is not holding.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import _drop
+
+    pkg = types.ModuleType("fake_pkg")
+    sub = types.ModuleType("fake_pkg.sub")
+    pkg.sub = sub
+    sys.modules["fake_pkg"] = pkg
+    sys.modules["fake_pkg.sub"] = sub
+    try:
+        _drop("fake_pkg.sub")
+        assert "fake_pkg.sub" not in sys.modules
+        assert not hasattr(pkg, "sub"), "parent still points at the dropped module"
+    finally:
+        sys.modules.pop("fake_pkg.sub", None)
+        sys.modules.pop("fake_pkg", None)
+
+
+def test_aiter_stub_teardown_spares_modules_that_took_nothing():
+    """The teardown must drop poisoned `atom` modules and only those.
+
+    Dropping every `atom` module imported under the stub is the two-copies
+    bug from the other end: a caller still holding a module that never
+    touched AITER gets a second copy of its classes on the next import.
+    `test_scheduler_metrics` hit exactly that -- `engine_core_protocol` has
+    no AITER dependency, and pickling an enum member out of it raised
+    `PicklingError` once the module had been dropped and re-imported.
+
+    Synthetic modules, so the assertion does not depend on which real module
+    some earlier test happened to import first.
+    """
+    import sys
+    import types
+
+    from tests.aiter_stub import stubbed_aiter
+
+    # Force the stub path: with a real AITER present nothing is installed and
+    # the sweep under test never runs.
+    saved = {
+        name: sys.modules.pop(name)
+        for name in list(sys.modules)
+        if name == "aiter" or name.startswith("aiter.")
+    }
+    clean = types.ModuleType("atom.took_nothing")
+    poisoned = types.ModuleType("atom.took_a_mock")
+    # Holds a class *from* the poisoned module and nothing from AITER itself,
+    # which is how `engine_core` relates to `async_proc`. Keeping it would
+    # leave the stale second copy `conftest.atom_modules_are_imported_once`
+    # fails on, so the taint has to reach it transitively.
+    importer = types.ModuleType("atom.imports_the_poisoned_one")
+
+    class Borrowed:
+        pass
+
+    Borrowed.__module__ = "atom.took_a_mock"
+    try:
+        with stubbed_aiter():
+            import aiter
+
+            poisoned.borrowed = aiter.some_symbol
+            poisoned.Borrowed = Borrowed
+            importer.Borrowed = Borrowed
+            sys.modules["atom.took_nothing"] = clean
+            sys.modules["atom.took_a_mock"] = poisoned
+            sys.modules["atom.imports_the_poisoned_one"] = importer
+
+        assert (
+            sys.modules.get("atom.took_nothing") is clean
+        ), "a module that never touched AITER was dropped"
+        assert "atom.took_a_mock" not in sys.modules, "a poisoned module survived"
+        assert "atom.imports_the_poisoned_one" not in sys.modules, (
+            "a module holding a class from a dropped module survived; that is "
+            "the stale second copy the conftest guard fails on"
+        )
+    finally:
+        for name in (
+            "atom.took_nothing",
+            "atom.took_a_mock",
+            "atom.imports_the_poisoned_one",
+        ):
+            sys.modules.pop(name, None)
+        sys.modules.update(saved)

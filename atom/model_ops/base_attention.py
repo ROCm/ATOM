@@ -179,6 +179,24 @@ _flydsl_pa_routed: set[tuple] = set()
 _flydsl_plan_refused: set[tuple] = set()
 
 
+def flydsl_plan_shape(head_dim) -> dict:
+    """plan_pa_decode shape kwargs for a head size: empty, i.e. aiter's
+    defaults, except at head_dim 256.
+
+    aiter's planned reducer for head_dim 256 has a fast per-lane shuffle path
+    only up to 64 partitions and a slow serial loop above it. At the default
+    ceiling (CU count, 256 on MI355X) a long request splits into up to 256
+    partials and the reduce costs up to 40 us per call, against about 4 us
+    capped at 64 with a 256-workgroup budget: 1.21x per layer (geo-mean over
+    19 Qwen3.5 TP4 MTP-3 shapes, same error against the reference). Remove
+    once aiter #5949, a parallel head-256 reducer above 64 partitions, is in
+    the image.
+    """
+    if head_dim == 256:
+        return {"max_partitions": 64, "workgroup_budget": 256}
+    return {}
+
+
 @functools.lru_cache(maxsize=1)
 def _flydsl_arch_supported() -> bool:
     """Whether FlyDSL builds kernels for the running GPU.
@@ -412,9 +430,11 @@ def _flydsl_prepare_explicit_plan(
     existing_plan,
     plan_step_owner=None,
 ):
-    """Return the explicit plan aiter #5809 requires, at aiter's default budget.
+    """Return the explicit plan aiter #5809 requires.
 
-    ``plan_partition_cap``: None takes aiter's default partition ceiling.
+    ``plan_partition_cap``: None takes ``flydsl_plan_shape``, i.e. aiter's
+    defaults except at head_dim 256; a caller's cap is kept, with aiter's
+    default budget.
     ``plan_step_owner``: a per-step object whose calls all share the same
     lengths; the plan is then refreshed once per step instead of every call.
     Plans are window-free: the gate rejects sliding windows.
@@ -423,12 +443,14 @@ def _flydsl_prepare_explicit_plan(
 
     device = q.device
     num_kv_heads = int(k_cache.shape[1])
+    shape = {} if plan_partition_cap is not None else flydsl_plan_shape(q.shape[-1])
     if existing_plan is not None:
         max_partitions = int(existing_plan.max_partitions)
     elif plan_partition_cap is not None:
         max_partitions = int(plan_partition_cap)
     else:
-        max_partitions = None
+        max_partitions = shape.get("max_partitions")
+    workgroup_budget = shape.get("workgroup_budget")
 
     if existing_plan is not None and flydsl_plan_matches(
         existing_plan, num_seqs, num_kv_heads
@@ -449,6 +471,7 @@ def _flydsl_prepare_explicit_plan(
         num_kv_heads,
         query_length,
         max_partitions,
+        workgroup_budget,
         device.index,
         plan_step_owner is not None,
     )
@@ -463,11 +486,15 @@ def _flydsl_prepare_explicit_plan(
             return plan
         refreshed.add(mark)
     if plan is None:
+        budget = (
+            {} if workgroup_budget is None else {"workgroup_budget": workgroup_budget}
+        )
         plan = plan_pa_decode(
             lengths,
             num_kv_heads,
             max_partitions=max_partitions,
             query_length=query_length,
+            **budget,
         )
         _FLYDSL_RUNTIME_PLANS[plan_key] = plan
         logger.info(

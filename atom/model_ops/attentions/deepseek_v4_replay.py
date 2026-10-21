@@ -31,6 +31,29 @@ from atom.utils import envs
 logger = logging.getLogger("atom")
 
 
+def _connector_replays(kv_transfer_config) -> bool:
+    """Whether a bounded replay can run beside this KV connector.
+
+    A connector load starts at `num_cached_tokens` and raises it when the load
+    lands, and a replay moves exactly that field below blocks it has claimed:
+    a load that knows nothing of the replay would write those shared blocks
+    and resume past it. LMCache MP offload's native-state scheduler is the one
+    that knows (`Sequence.replay_kv_load`); under `multi` (P/D plus offload)
+    the P/D connector's loads do not.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    name = KVConnectorFactory.connector_name(kv_transfer_config)
+    if name is None:
+        return True
+    # Named as the factory resolves it, the role defaulting as the connector's
+    # does (`validated_kv_role`).
+    return (
+        name == "lmcache_mp"
+        and kv_transfer_config.get("kv_role", "offload") == "offload"
+    )
+
+
 def state_replay_tokens(config) -> int:
     """Tokens a bounded replay recomputes below a hit, or 0 when it is off.
 
@@ -39,10 +62,7 @@ def state_replay_tokens(config) -> int:
     trunk, compress ratios 4 / 128, no speculative method but MTP or the
     model's own DSpark layers, and a single-rank prefill (context parallel splits the query axis the
     floors are indexed by). It replays a prefix-cache hit, so it also needs the
-    prefix cache, and no KV connector: a connector load starts at
-    `num_cached_tokens` and raises it when the load lands, and a replay moves
-    exactly that field below blocks it has claimed (an LMCache MP load would
-    write those shared blocks and resume past the replay).
+    prefix cache, and no KV connector but LMCache MP offload (`_connector_replays`).
     """
     if not envs.ATOM_DSV4_STATE_REPLAY:
         return 0
@@ -69,8 +89,8 @@ def state_replay_tokens(config) -> int:
         reason = "context parallelism"
     elif not config.enable_prefix_caching:
         reason = "prefix caching off"
-    elif config.kv_transfer_config:
-        reason = "a KV connector (connector loads do not replay yet)"
+    elif not _connector_replays(config.kv_transfer_config):
+        reason = "a KV connector other than LMCache MP offload alone"
     if reason is not None:
         logger.warning("[State Cache] bounded replay off: %s.", reason)
         return 0
