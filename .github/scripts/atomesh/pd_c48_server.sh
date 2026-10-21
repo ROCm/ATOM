@@ -66,7 +66,9 @@ start_vllm_server() {
 run_aiperf_agentic_benchmark() {
   ensure_aiperf
   "${AIPERF_VENV}/bin/python" -m pip install 'datasets>=4.7.0'
-  local out_dir="${RUN_DIR}/benchmark_results/c48-${ATOMESH_C48_CASE}"
+  local out_dir="${RUN_DIR}/benchmark_results/c48-${ATOMESH_C48_CASE}" conc
+  conc="$(python3 -c 'import json, sys; (c,) = json.load(open(sys.argv[1]))["benchmark"]["concurrencies"]; print(int(c))' \
+    "${ATOMESH_SCRIPT_DIR}/../../benchmark/c48-model-gap/${ATOMESH_C48_CASE}.json")"
   mkdir -p "${out_dir}"
   git -C "${AIPERF_DIR}" rev-parse HEAD > "${out_dir}/aiperf-commit.txt"
   "${AIPERF_VENV}/bin/python" -m pip freeze > "${out_dir}/client-packages.txt"
@@ -87,7 +89,7 @@ run_aiperf_agentic_benchmark() {
   "${profile_wrapper[@]}" "${AIPERF_VENV}/bin/aiperf" profile \
     --scenario agentx --url "http://127.0.0.1:${ROUTER_PORT}" \
     --model "${SERVED_MODEL_NAME}" --tokenizer "${MODEL_PATH}" \
-    --concurrency 48 --benchmark-duration 3600 --tokenizer-trust-remote-code \
+    --concurrency "${conc}" --benchmark-duration 3600 --tokenizer-trust-remote-code \
     --server-metrics "http://${prefill_ips[0]}:${prefill_ports[0]}/metrics" \
                      "http://${decode_ips[0]}:${decode_ports[0]}/metrics" \
     --output-artifact-dir "${out_dir}" \
@@ -96,6 +98,6 @@ run_aiperf_agentic_benchmark() {
   snapshot_eval_metrics "${out_dir}" after
   test -s "${out_dir}/profile_export_aiperf.json"
   write_aiperf_dashboard_json "${out_dir}/profile_export_aiperf.json" \
-    "${RUN_DIR}/benchmark_results/pd-vllm-c48-${ATOMESH_C48_CASE}.json" 48
+    "${RUN_DIR}/benchmark_results/pd-vllm-c48-${ATOMESH_C48_CASE}.json" "${conc}"
   return "${benchmark_rc}"
 }
