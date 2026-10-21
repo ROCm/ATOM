@@ -523,6 +523,11 @@ class ScheduledBatchOutput:
         num_rejected: Per-request count of rejected speculative tokens.
         num_bonus: Per-request count of bonus accepted tokens.
         is_deferred_out: Whether output was deferred from a previous step.
+        aborted_req_ids: None normally. A list (possibly empty) when the runner's
+            device error check found an error word set on some rank: every
+            request in it ran a step that may have written corrupt KV, and the
+            scheduler must abort it and drop the prefix cache (see
+            ``Scheduler.postprocess``).
 
     NumPy views are copied before the result enters the output queue. Views
     returned by asynchronous D2H copies otherwise keep pinned tensor storage
@@ -541,6 +546,7 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        aborted_req_ids: list[int] | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -555,6 +561,7 @@ class ScheduledBatchOutput:
         # (main-process) scheduler so the NEXT step can size each request's
         # verification to ell_r+1. None when DSpark scheduling is off.
         self.dspark_ell = dspark_ell
+        self.aborted_req_ids = aborted_req_ids
         # O(1) lookup: req_id -> index (lazy-built on first access)
         self._req_id_to_idx: dict[int, int] | None = None
 
@@ -3904,6 +3911,41 @@ class Scheduler:
             )
 
     def postprocess(
+        self,
+        seqs: list[Sequence],
+        fwd_output: ScheduledBatchOutput,
+        stream_output_queue=None,
+        batch: ScheduledBatch = None,
+    ) -> list[Sequence]:
+        """Process model outputs, applying a device-error verdict first when there is one.
+
+        ``fwd_output.aborted_req_ids`` is set by the runner when its device error check found an
+        error word set on some rank (GEMM fusion) and ran the collective reset. The requests in it
+        ran steps that may have written corrupt KV: they are marked ABORTED BEFORE the body runs, so
+        it finishes them as ``"aborted"`` without consuming their sampled tokens. The prefix cache is
+        dropped AFTER the body, so no block of this step is hashed behind the clear: corrupt KV that
+        was already hashed (and freed) would otherwise be served to a later request as a prefix hit.
+        Requests that finished inside the window are gone (their tokens were already streamed) and
+        cannot be aborted. See ``_postprocess_impl`` for the normal processing.
+        """
+        aborted = getattr(fwd_output, "aborted_req_ids", None)
+        if aborted is None:
+            return self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
+        self._abort_for_device_error(aborted)
+        finished = self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
+        self.block_manager.clear_cache()
+        return finished
+
+    def _abort_for_device_error(self, req_ids) -> None:
+        aborted = [rid for rid in req_ids if self.abort_request(rid)]
+        logger.error(
+            "Scheduler: device error verdict from the runner: aborted %d of %d request(s) "
+            "(the rest already finished) and dropped the prefix cache",
+            len(aborted),
+            len(req_ids),
+        )
+
+    def _postprocess_impl(
         self,
         seqs: list[Sequence],
         fwd_output: ScheduledBatchOutput,

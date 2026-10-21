@@ -274,10 +274,10 @@ def _spin_gpu_us(us):
 def _install_error_word():
     orig = FusionResourcesWrapper.error_word
 
-    def error_word(self, timeout_s=30.0):
+    def error_word(self, step_idx):
         if fault_active("error_word") is not None:
             return 1
-        return orig(self, timeout_s)
+        return orig(self, step_idx)
 
     _patch(FusionResourcesWrapper, "error_word", error_word)
 

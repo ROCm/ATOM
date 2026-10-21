@@ -238,6 +238,7 @@ def prepare_buckets(tokens_list) -> None:
         for t in tokens_list:
             for mode in ("eager", "capture"):
                 s.resolve(t, graph_mode=mode)
+    _refuse_colliding_call_ids()
     _RES.finalize()
     if _KV is not None:
         import torch
@@ -254,6 +255,29 @@ def prepare_buckets(tokens_list) -> None:
     _STEP_T = _RES.step_tensor()  # created here, outside any capture
     _reset_check_state()
     _PHASE = "ready"
+
+
+def _refuse_colliding_call_ids() -> None:
+    """Every fused launch carries ``call_id = decision_key(site, tokens, vid, n_fused)`` and the
+    kernels' handshake tags rely on two DIFFERENT launches never sharing one. The key is a 31-bit
+    hash, so uniqueness is checked here, once, over every fused resolution (aiter's static check),
+    before any launch. A colliding or zero key makes its bucket native on every rank: the keys, the
+    check and therefore the verdict are rank-uniform."""
+    keys = {
+        (s.name, tokens, r.vid, r.n_fused)
+        for s in _SITES.values()
+        for (tokens, _mode), r in s._by_tokens.items()
+        if getattr(r, "plan", None) is not None  # an entry can also be an Exception
+    }
+    report = _RES.check_call_ids(keys)
+    if report is None or report.ok:
+        return
+    refused = report.refused_keys
+    n = sum(s.refuse_call_ids(refused) for s in _SITES.values())
+    logger.error(
+        "gemm_fusion: %d fused bucket(s) refused for call_id collisions; they run native on every rank",
+        n,
+    )
 
 
 def bind_kv_cache(kv_cache_data) -> None:
@@ -330,10 +354,10 @@ def _any_rank_error(word: int) -> bool:
     return int(_RES.reduce_max([int(word != 0)])[0]) != 0
 
 
-def _device_error_now() -> bool:
-    """Synchronous check: snapshot the error word now, wait for it, agree across ranks."""
-    _RES.error_readback_async()
-    return _any_rank_error(_RES.error_word())
+def _device_error_now(step: int) -> bool:
+    """Synchronous check: snapshot the error word under ``step``, wait for it, agree across ranks."""
+    _RES.error_readback_async(step)
+    return _any_rank_error(_RES.error_word(step))
 
 
 def _trim_window(upto: int) -> None:
@@ -345,15 +369,20 @@ def _verdict() -> list:
     """Some rank's error word was set: collective reset, then the ids of every request that ran in a
     step not yet proven clean. ``recover`` may raise (timeout): the worker is then failed.
     """
+    global _PENDING
     ids = sorted({rid for _step, rids in _WINDOW for rid in rids})
     logger.error(
-        "gemm_fusion: device error word set on some rank; collective reset; %d request(s) of the "
-        "last %d unchecked step(s) must be aborted",
+        "gemm_fusion: device error word set on some rank (this rank: %s); collective reset; %d "
+        "request(s) of the last %d unchecked step(s) must be aborted",
+        _RES.error_description(),
         len(ids),
         len(_WINDOW),
     )
     recover()
-    _reset_check_state()
+    # The step counter keeps counting (aiter keys its readback ring by step): only the window and
+    # the snapshot in flight are dropped. Every rank does the same, so it stays rank-uniform.
+    _WINDOW.clear()
+    _PENDING = None
     return ids
 
 
@@ -366,8 +395,9 @@ def check_step(req_ids=()):
     (the caller must abort them and must not publish this step's KV); the list may be empty.
 
     Asynchronous mode (``_PERIOD`` >= 3, the default 14): at every ``_PERIOD``-th step enqueue a
-    snapshot of the device error word (no sync); ``SNAPSHOT_EVAL_DELAY`` steps later read it (it is
-    complete by then), agree across ranks with ONE CPU-group MAX all-reduce, and either drop the
+    snapshot of the device error word under that step index (no sync); ``SNAPSHOT_EVAL_DELAY``
+    steps later consume it (complete by then; the adapter falls back to a blocking wait, never to a
+    skip), agree across ranks with ONE CPU-group MAX all-reduce, and either drop the
     now-proven-clean part of the window or report. An error in a step is therefore reported at most
     ``_PERIOD`` + ``SNAPSHOT_EVAL_DELAY`` steps later (16 for the default) and the window never holds
     more steps than that.
@@ -389,17 +419,18 @@ def check_step(req_ids=()):
     step = _STEP_IDX
     _WINDOW.append((step, tuple(req_ids)))
     if _PERIOD == 1:
-        if _device_error_now():
+        if _device_error_now(step):
             return _verdict()
         _WINDOW.clear()
         return None
-    if _PENDING is not None and step == _PENDING + SNAPSHOT_EVAL_DELAY:
-        if _any_rank_error(_RES.error_word()):
+    # ">=": a check_now() in between advances the counter, which must not strand the snapshot
+    if _PENDING is not None and step >= _PENDING + SNAPSHOT_EVAL_DELAY:
+        if _any_rank_error(_RES.error_word(_PENDING)):
             return _verdict()
         _trim_window(_PENDING)
         _PENDING = None
     if step % _PERIOD == 0:
-        _RES.error_readback_async()
+        _RES.error_readback_async(step)
         _PENDING = step
     return None
 
@@ -408,13 +439,16 @@ def check_now():
     """Synchronous check outside the step loop (graph-capture points, test harness). Same return
     contract as ``check_step``: None when clean, else the reset has run and the ids are returned.
     """
+    global _STEP_IDX
     if _RES is None or _PHASE != "ready":
         return None
     if _BROKEN is not None:
         raise GemmFusionDeviceError(
             f"gemm_fusion disabled after failed recovery: {_BROKEN}"
         )
-    if _device_error_now():
+    # a fresh snapshot index (never one a pending snapshot owns); called at uniform points only
+    _STEP_IDX += 1
+    if _device_error_now(_STEP_IDX):
         return _verdict()
     return None
 

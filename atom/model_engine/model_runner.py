@@ -1065,7 +1065,15 @@ class ModelRunner:
             from atom.distributed.ulysses_sp import get_sp_group
             from atom.model_ops import gemm_fusion
 
-            gemm_fusion.init_gemm_fusion(config, get_sp_group())
+            gemm_fusion.init_gemm_fusion(
+                config,
+                get_sp_group(),
+                # a rank that publishes KV checks for a device error in the SAME step, before the
+                # announcement (everyone else checks every `check_period` steps)
+                kv_publisher=kv_config_has_producer(
+                    getattr(config, "kv_transfer_config", None)
+                ),
+            )
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -3595,15 +3603,19 @@ class ModelRunner:
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
             # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
-            # ready. A step that fails check_step must not publish its KV.
-            self._gemm_fusion_check_step()
-            self._record_kv_cache_ready(batch)
-            return ScheduledBatchOutput(
-                req_ids=list(batch.req_ids),
-                token_ids=[],
-                num_rejected=None,
-                num_bonus=None,
-                draft_token_ids=None,
+            # ready. A step with a device error verdict must not publish its KV.
+            aborted = self._gemm_fusion_check_step(batch)
+            if aborted is None:
+                self._record_kv_cache_ready(batch)
+            return self._apply_gemm_fusion_verdict(
+                ScheduledBatchOutput(
+                    req_ids=list(batch.req_ids),
+                    token_ids=[],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                aborted,
             )
 
         fwd_output = self.postprocess(
@@ -3620,23 +3632,41 @@ class ModelRunner:
         reset_forward_context()
         self._record_forward_vars_event()
         # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
-        # ready. A step that fails check_step must not publish its KV.
-        self._gemm_fusion_check_step()
-        self._record_kv_cache_ready(batch)
-        return fwd_output
+        # ready. A step with a device error verdict must not publish its KV.
+        aborted = self._gemm_fusion_check_step(batch)
+        if aborted is None:
+            self._record_kv_cache_ready(batch)
+        return self._apply_gemm_fusion_verdict(fwd_output, aborted)
 
-    def _gemm_fusion_check_step(self) -> None:
-        """S-B2: per-step poison + decision-uniformity check, outside capture.
+    def _gemm_fusion_check_step(self, batch) -> list[int] | None:
+        """Periodic device error check of GEMM fusion, outside capture.
 
-        Runs on every rank at the end of every step (after postprocess, which has
-        already synchronised on the sampled tokens). On device poison or a
-        cross-rank decision mismatch it recovers collectively and raises, so the
-        step's output is never returned as if valid. No-op unless gemm_fusion ON.
+        Runs on every rank at the end of every step (after postprocess), exactly once per forward.
+        Returns None normally. When some rank's error word was set it has run the collective reset
+        and returns the ids of the requests that ran a step not yet proven clean (possibly empty):
+        the caller must not publish this step's KV and must hand the ids to the scheduler
+        (``_apply_gemm_fusion_verdict``). A dummy batch contributes no ids. No-op unless
+        gemm_fusion is ON.
         """
         if self.config.gemm_fusion.enabled:
             from atom.model_ops import gemm_fusion
 
-            gemm_fusion.check_step()
+            ids = () if getattr(batch, "is_dummy_run", False) else tuple(batch.req_ids)
+            return gemm_fusion.check_step(ids)
+        return None
+
+    def _apply_gemm_fusion_verdict(self, fwd_output, aborted):
+        """Attach a device error verdict to this step's output.
+
+        The scheduler aborts ``aborted`` and drops the prefix cache. The deferred-output state is
+        dropped too, so the next step starts like the first one after startup (no previous batch, no
+        queued token copy), which the scheduler already tolerates. Unverified on a GPU.
+        """
+        if aborted is None:
+            return fwd_output
+        self.tokenID_processor.clean()
+        fwd_output.aborted_req_ids = list(aborted)
+        return fwd_output
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
@@ -4734,8 +4764,10 @@ class RapidServeModelRunner(ModelRunner):
 
         self._record_forward_vars_event()
         reset_forward_context()
-        self._gemm_fusion_check_step()  # C-S1: a failed step must not return output as valid
-        return fwd_output
+        # C-S1: a step with a device error verdict must not return output as valid
+        return self._apply_gemm_fusion_verdict(
+            fwd_output, self._gemm_fusion_check_step(batch)
+        )
 
     # ------------------------------------------------------------------
     # Disagg IPC helpers (TP-aware)
@@ -5081,8 +5113,16 @@ class RapidServeModelRunner(ModelRunner):
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
-        # C-S1: verify the step before announcing this prefill's KV as ready for transfer.
-        self._gemm_fusion_check_step()
+        # C-S1: verify the step before announcing this prefill's KV as ready for transfer. This
+        # path returns plain token ids to a standalone PrefillScheduler, so there is no output
+        # object to carry abort ids: an error verdict (the collective reset has run) is fatal.
+        if self._gemm_fusion_check_step(batch) is not None:
+            from atom.model_ops.gemm_fusion import GemmFusionDeviceError
+
+            raise GemmFusionDeviceError(
+                "gemm_fusion device error word set during a prefill that publishes KV; "
+                "plans re-initialised, the prefill instance must be treated as failed"
+            )
         self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu

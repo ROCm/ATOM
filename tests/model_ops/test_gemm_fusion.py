@@ -76,10 +76,15 @@ class FakeResources:
         self.peer_flag = 0  # what the other ranks contribute to reduce_max
         self.readback_ready = True  # False: error_word has to wait for the copy
         self.snapshots = []  # error word value at each error_readback_async
+        self.snapshot_steps = []  # the step index each snapshot was enqueued under
+        self._ring = {}  # step index -> error word captured then
+        self.call_id_report = (
+            None  # what check_call_ids returns (None: no call-id module)
+        )
+        self.call_id_keys = None
         self.reductions = []  # values handed to each reduce_max
         self.blocking_waits = 0
         self.ticks = 0
-        self._snapshot = None
         self.inner = SimpleNamespace()
         self._step = SimpleNamespace(add_=self._tick)
 
@@ -110,17 +115,22 @@ class FakeResources:
     def step_tensor(self):
         return self._step
 
-    def error_readback_async(self, stream=None):
-        self._snapshot = self.error_value
+    def error_readback_async(self, step_idx, stream=None):
+        self._ring[step_idx] = self.error_value
         self.snapshots.append(self.error_value)
+        self.snapshot_steps.append(step_idx)
 
-    def error_readback_ready(self):
-        return self._snapshot if self.readback_ready else None
-
-    def error_word(self, timeout_s=30.0):
+    def error_word(self, step_idx):
         if not self.readback_ready:
             self.blocking_waits += 1
-        return self._snapshot
+        return self._ring[step_idx]
+
+    def error_description(self):
+        return "fake error page"
+
+    def check_call_ids(self, keys):
+        self.call_id_keys = set(keys)
+        return self.call_id_report
 
     def reduce_max(self, values):
         self.reductions.append(list(values))
@@ -546,7 +556,10 @@ def _ready_hooks(res, period=14):
 def _wrapper_error_word(local=0):
     """The adapter's real ``error_word`` (as patched by a fault seam, if any) on a stand-in self."""
     return FusionResourcesWrapper.error_word(
-        SimpleNamespace(error_readback_ready=lambda: local)
+        SimpleNamespace(
+            inner=SimpleNamespace(readback_consume=lambda step, wait: local)
+        ),
+        0,
     )
 
 
@@ -561,6 +574,7 @@ def test_check_step_clean_async_schedule_snapshots_every_period_and_evaluates_tw
         if len(res.reductions) > n_red:
             evaluated_at.append(s)
     assert snapshot_at == [14, 28] and evaluated_at == [16, 30]
+    assert res.snapshot_steps == [14, 28]  # the ring is keyed by the step index
     assert res.resets == 0
     # once the snapshot of step 28 is proven clean (step 30) only the steps after it stay unchecked
     assert [s for s, _ in hooks._WINDOW] == [29, 30]
@@ -575,7 +589,10 @@ def test_an_error_before_the_first_snapshot_aborts_the_first_sixteen_steps():
         16: list(range(1, 17))
     }
     assert res.error_resets == 1 and res.epoch_resets == 0
-    assert hooks._STEP_IDX == 0 and not hooks._WINDOW and hooks._PENDING is None
+    # the step counter keeps counting (aiter keys its readback ring by step); only the window and
+    # the snapshot in flight are dropped
+    assert hooks._STEP_IDX == 16 and not hooks._WINDOW and hooks._PENDING is None
+    assert res.snapshot_steps == [14]  # snapshot enqueued under step 14, consumed at 16
 
 
 def test_an_error_after_a_clean_snapshot_aborts_exactly_the_last_sixteen_steps():
@@ -2288,68 +2305,101 @@ def test_first_bind_runs_no_collective(make_site, monkeypatch):
 
 
 # ------------- C-S1: a failed fused step must not publish KV or return output as valid
+def _runner_tree():
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
+    ).read_text(encoding="utf-8")
+    return src, ast.parse(src)
+
+
+def _function(tree, cls_name, fn_name):
+    import ast
+
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cls_name
+    )
+    return next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == fn_name
+    )
+
+
+def _calls(fn, attr):
+    import ast
+
+    return [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == attr
+    ]
+
+
 def test_every_forward_path_checks_the_step_before_publishing_kv_ready():
-    """Reviewer C-S1. At each place ModelRunner announces a prefill's KV as ready for transfer
-    (``_record_kv_cache_ready``) the step has ALREADY been verified (``_gemm_fusion_check_step``),
-    and every forward path (normal, PD decode, PD prefill) verifies its step. A GemmFusionPoisonError
-    therefore propagates out of ``forward`` before the connector is told the KV is ready.
-    """
+    """Reviewer C-S1, for the verdict design. Every ``_record_kv_cache_ready`` is reached only when
+    the step's check returned no verdict: in the two ``ModelRunner.forward`` returns it sits under
+    ``if aborted is None:`` (``aborted`` is the check's result), and ``prefill_forward`` (plain token
+    ids, no output object) raises before it on any verdict. A step with a verdict therefore never
+    tells a transfer connector its KV is ready."""
+    import ast
+
+    _src, tree = _runner_tree()
+    fwd = _function(tree, "ModelRunner", "forward")
+    assert len(_calls(fwd, "_gemm_fusion_check_step")) == 2  # one per return path
+    for call in _calls(fwd, "_record_kv_cache_ready"):
+        guards = [
+            n
+            for n in ast.walk(fwd)
+            if isinstance(n, ast.If)
+            and ast.unparse(n.test) == "aborted is None"
+            and any(call in ast.walk(s) for s in n.body)
+        ]
+        assert guards, f"KV-ready at line {call.lineno} is not guarded by the verdict"
+    # every ModelRunner.forward return hands its output through the verdict
+    for ret in [n for n in ast.walk(fwd) if isinstance(n, ast.Return)]:
+        if ret.value is not None and "ScheduledBatchOutput" in ast.unparse(ret.value):
+            assert "_apply_gemm_fusion_verdict" in ast.unparse(ret.value)
+    # the PD prefill path: check, raise on a verdict, only then publish
+    pre = _function(tree, "RapidServeModelRunner", "prefill_forward")
+    (ready,) = _calls(pre, "_record_kv_cache_ready")
+    guard = next(
+        s
+        for s in pre.body
+        if isinstance(s, ast.If) and "_gemm_fusion_check_step" in ast.unparse(s.test)
+    )
+    assert any(isinstance(n, ast.Raise) for n in ast.walk(guard))
+    assert guard.lineno < ready.lineno
+    # the RapidServe decode forward also passes its output through the verdict
+    rs = _function(tree, "RapidServeModelRunner", "forward")
+    assert "_apply_gemm_fusion_verdict" in ast.unparse(rs)
+    assert len(_calls(rs, "_gemm_fusion_check_step")) == 1
+
+
+def test_the_runner_wrapper_swallows_nothing_so_fatal_errors_still_end_the_worker():
+    """A verdict is a return value now, not an exception. What is still an exception is fatal
+    (a failed recovery, a hung reset, a verdict in a PD prefill, a wedged readback): the wrapper
+    must not catch it, and the worker loop does not either, so the worker dies and the engine
+    shuts down instead of answering from a failed step."""
     from pathlib import Path
 
-    src = (
-        Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
-    ).read_text(encoding="utf-8")
-    body_lines = src.splitlines()
-    checks = [
-        i
-        for i, line in enumerate(body_lines)
-        if line.strip().startswith("self._gemm_fusion_check_step()")
-    ]
-    readies = [
-        i
-        for i, line in enumerate(body_lines)
-        if line.strip() == "self._record_kv_cache_ready(batch)"
-    ]
-    assert (
-        len(readies) == 3 and len(checks) == 4
-    )  # normal x2 returns, PD prefill, PD decode (no ready call)
-    for (
-        r
-    ) in (
-        readies
-    ):  # the nearest preceding check is within 3 lines: verified right before publishing
-        prior = [c for c in checks if c < r]
-        assert (
-            prior and r - max(prior) <= 3
-        ), f"KV-ready at line {r + 1} not preceded by a step check"
-    # each forward-like method returns only after a check
-    for name in (
-        "def forward(self, batch: ScheduledBatch)",
-        "def prefill_forward(self, batch: ScheduledBatch)",
-    ):
-        assert name in src
+    src, tree = _runner_tree()
+    import ast
 
-
-def test_poison_error_in_check_step_is_not_swallowed_by_the_runner_wrapper():
-    """The wrapper must not catch the error: the worker dies, the engine shuts down (no
-    scheduler retry exists), so no request in the batch is answered from a failed step.
-    """
-    from pathlib import Path
-
-    src = (
-        Path(__file__).resolve().parents[2] / "atom/model_engine/model_runner.py"
-    ).read_text(encoding="utf-8")
-    start = src.index("def _gemm_fusion_check_step")
-    wrapper = src[start : src.index("@staticmethod", start)]
+    wrapper = ast.get_source_segment(
+        src, _function(tree, "ModelRunner", "_gemm_fusion_check_step")
+    )
     assert "except" not in wrapper and "try:" not in wrapper
     busy = (
         Path(__file__).resolve().parents[2] / "atom/model_engine/async_proc.py"
     ).read_text(encoding="utf-8")
     loop = busy[busy.index("def busy_loop") : busy.index("def _run_generic_rpc")]
-    # Main added (a) a generic-RPC path (`_run_generic_rpc`, only for RpcPayload calls: it turns an
-    # outcome into a reply) and (b) a barrier handler. The model step is a PLAIN rpc (payload None):
-    # its call is not inside any try, and the only handler in the loop is the barrier's, which
-    # re-raises when payload is None. A GemmFusionPoisonError therefore still ends the worker.
+    # Main's busy_loop has a generic-RPC path (RpcPayload calls only: it turns an outcome into a
+    # reply) and a barrier handler. The model step is a PLAIN rpc (payload None): its call is not
+    # inside any try, and the only handler in the loop is the barrier's, which re-raises when
+    # payload is None.
     assert loop.count("except") == 1 and "except threading.BrokenBarrierError:" in loop
     assert "if payload is None:\n                            raise" in loop
     plain = loop[loop.index("func = getattr(runner, func_name, None)") :]
@@ -3170,28 +3220,63 @@ def test_the_adapter_forwards_every_r12_call_to_one_aiter_name_each(monkeypatch)
     log = []
     inner = SimpleNamespace(
         step_tensor=lambda: log.append("step_tensor") or "STEP",
-        error_readback_async=lambda stream: log.append(("async", stream)),
-        error_readback_result=lambda: 0,
+        readback_enqueue=lambda step, stream: log.append(("enqueue", step, stream)),
         reset=lambda: log.append("reset"),
+        quiesce_and_reset=lambda: log.append("quiesce_and_reset"),
     )
     w = _adapter(monkeypatch, inner)
     assert w.step_tensor() == "STEP"
-    w.error_readback_async("S")
-    w.reset_after_error()
-    w.clean_epoch()
-    assert log == ["step_tensor", ("async", "S"), "reset", "reset"]
-    assert w.error_readback_ready() == 0
+    w.error_readback_async(7, "S")
+    w.reset_after_error()  # the response to an observed error
+    w.clean_epoch()  # the call the clean points have always made
+    assert log == ["step_tensor", ("enqueue", 7, "S"), "reset", "quiesce_and_reset"]
 
 
-def test_error_word_waits_for_the_copy_and_is_bounded(monkeypatch):
-    answers = iter([None, None, 3])
-    w = _adapter(
-        monkeypatch, SimpleNamespace(error_readback_result=lambda: next(answers))
-    )
-    assert w.error_word() == 3
-    stuck = _adapter(monkeypatch, SimpleNamespace(error_readback_result=lambda: None))
-    with pytest.raises(TimeoutError, match="did not complete"):
-        stuck.error_word(timeout_s=0.01)
+def test_error_word_consumes_without_blocking_first_then_waits(monkeypatch):
+    calls = []
+
+    def consume(step, wait):
+        calls.append((step, wait))
+        return (
+            None if (len(calls) == 1) else 3
+        )  # the first, non-blocking look finds it incomplete
+
+    w = _adapter(monkeypatch, SimpleNamespace(readback_consume=consume))
+    assert w.error_word(5) == 3
+    assert calls == [(5, False), (5, True)]
+    calls.clear()
+    ready = _adapter(monkeypatch, SimpleNamespace(readback_consume=lambda s, wt: 0))
+    assert ready.error_word(5) == 0  # complete: one non-blocking call, no wait
+
+
+def test_error_description_is_best_effort_and_never_raises(monkeypatch):
+    err = SimpleNamespace(describe=lambda: "reason=timeout origin_rank=2")
+    ok = _adapter(monkeypatch, SimpleNamespace(error_info=lambda: (err, 9, [])))
+    assert ok.error_description() == "reason=timeout origin_rank=2 step=9"
+    none = _adapter(monkeypatch, SimpleNamespace(error_info=lambda: None))
+    assert none.error_description() == "no error page"
+
+    def boom():
+        raise RuntimeError("hip error")
+
+    bad = _adapter(monkeypatch, SimpleNamespace(error_info=boom))
+    assert "unreadable" in bad.error_description()
+
+
+def test_check_call_ids_goes_to_aiters_module_and_degrades_without_it(monkeypatch):
+    import types
+
+    w = _adapter(monkeypatch, SimpleNamespace())
+    monkeypatch.delitem(sys.modules, "aiter.gemm_fusion.callid", raising=False)
+    assert (
+        w.check_call_ids({("s", 64, "v", 2)}) is None
+    )  # older aiter: skipped (logged)
+    seen = []
+    fake = types.ModuleType("aiter.gemm_fusion.callid")
+    fake.check_call_ids = lambda keys: seen.append(set(keys)) or "REPORT"
+    monkeypatch.setitem(sys.modules, "aiter.gemm_fusion.callid", fake)
+    assert w.check_call_ids({("s", 64, "v", 2)}) == "REPORT"
+    assert seen == [{("s", 64, "v", 2)}]
 
 
 def test_reduce_max_is_trivial_on_one_rank(monkeypatch):
@@ -3246,3 +3331,82 @@ def test_reduce_max_falls_back_to_a_device_tensor_without_a_cpu_group(monkeypatc
     w.cpu_pg, w.pg = None, "NCCL"
     assert w.reduce_max([1]) == [1]
     assert seen["group"] == "NCCL" and seen["device"] == "cuda:0"
+
+
+# -------------------------------------------------- R12: call_id and the static collision check
+def _prepared_site(make_site, tokens=(64, 128)):
+    res = FakeResources(plan_n=(FakePlan(), 2))
+    s = make_site(res)
+    for tk in tokens:
+        s.resolve(tk, "eager")
+        s.resolve(tk, "capture")
+    return res, s
+
+
+def test_the_launch_carries_the_decision_key_as_its_call_id(make_site, monkeypatch):
+    res = FakeResources()
+    s = make_site(res)
+    runs = []
+    plan = SimpleNamespace(
+        run=lambda **kw: runs.append(kw), recv_view=lambda bound: "VIEW", mode="x"
+    )
+    monkeypatch.setattr(
+        site_mod,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(current_stream=lambda: "S")),
+        raising=False,
+    )
+    r = site_mod.Resolution(
+        plan, 1, "fake.large", "profile_hit"
+    )  # large plan: raw pointers
+    ctx = SimpleNamespace(padded_tokens=64)
+    TU.set_phase("ready")
+    s._execute(r, "X", "XS", ctx, None, None, None)
+    (kw,) = runs
+    want = consensus.decision_key("L0.qkv", 64, "fake.large", 1)
+    assert kw["call_id"] == want and 0 < want < 2**31
+    assert kw["stream"] == "S"  # the existing arguments are untouched
+
+
+def test_prepare_checks_every_fused_key_once_and_a_clean_report_changes_nothing(
+    make_site,
+):
+    res, s = _prepared_site(make_site)
+    res.call_id_report = SimpleNamespace(ok=True, refused_keys=frozenset())
+    hooks._refuse_colliding_call_ids()
+    assert res.call_id_keys == {
+        ("L0.qkv", 64, "fake.v1", 2),
+        ("L0.qkv", 128, "fake.v1", 2),
+    }
+    assert all(r.plan is not None for r in s._by_tokens.values())
+
+
+def test_a_missing_callid_module_changes_nothing(make_site):
+    res, s = _prepared_site(make_site)
+    res.call_id_report = None  # older aiter: no check available
+    hooks._refuse_colliding_call_ids()
+    assert all(r.plan is not None for r in s._by_tokens.values())
+
+
+def test_colliding_call_ids_make_exactly_those_buckets_native_in_both_modes(make_site):
+    res, s = _prepared_site(make_site)
+    res.call_id_report = SimpleNamespace(
+        ok=False, refused_keys=frozenset({("L0.qkv", 64, "fake.v1", 2)})
+    )
+    hooks._refuse_colliding_call_ids()
+    for mode in ("eager", "capture"):
+        r = s._by_tokens[(64, mode)]
+        assert (r.plan, r.n_fused, r.reason) == (None, 0, "call_id_refused")
+        assert (
+            s._by_tokens[(128, mode)].plan is not None
+        )  # the other bucket still fuses
+
+
+def test_native_and_error_entries_never_reach_the_key_set(make_site):
+    res = FakeResources(plan_n=(None, 0))
+    s = make_site(res)
+    s.resolve(64, "eager")  # native: no plan
+    s._by_tokens[(96, "eager")] = RuntimeError("an entry can also be an Exception")
+    res.call_id_report = SimpleNamespace(ok=True, refused_keys=frozenset())
+    hooks._refuse_colliding_call_ids()
+    assert res.call_id_keys == set()

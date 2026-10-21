@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-from . import hooks
+from . import consensus, hooks
 from .resources import plan_owner
 from .stages import aiter_gf
 
@@ -346,6 +346,22 @@ class GemmFusionSite:
                     "prepare_disagree" if outcome != "agree" else "unprepared",
                 )
 
+    def refuse_call_ids(self, refused) -> int:
+        """Downgrade every bucket whose ``(site, tokens, vid, n_fused)`` key is in ``refused`` (a
+        call_id collision or a zero id, from ``hooks._refuse_colliding_call_ids``) to native. The keys
+        and the check are rank-uniform, so every rank downgrades the same buckets. Returns how many.
+        """
+        n = 0
+        for (tokens, mode), r in list(self._by_tokens.items()):
+            if getattr(r, "plan", None) is None:
+                continue
+            if (self.name, tokens, r.vid, r.n_fused) in refused:
+                self._by_tokens[(tokens, mode)] = Resolution(
+                    None, 0, r.vid, "call_id_refused"
+                )
+                n += 1
+        return n
+
     # -- KV pointer guard (bind time, collective) --------------------------------
     def kv_ptrs(self, kv_cache_data):
         """Addresses of this layer's KV caches and scales: what a binding is made on."""
@@ -635,6 +651,12 @@ class GemmFusionSite:
             meta=meta,
             res=res.bound,
             stream=torch.cuda.current_stream(),
+            # the launch's identity in the kernels' handshake tags (R12 plans require it; older plans
+            # ignore it). Distinct non-zero keys were checked statically in prepare_buckets, and a
+            # refused key never reaches here (its bucket is native).
+            call_id=consensus.decision_key(
+                self.name, ctx.padded_tokens, r.vid, r.n_fused
+            ),
         )
         if r.n_fused < 2:
             # Zero-copy view of the plan's receive window; valid until this rank

@@ -17,7 +17,21 @@ import pytest
 
 from atom.model_ops.gemm_fusion import test_utils as TU
 
-AITER_ROOT = Path(__file__).resolve().parents[3] / "aiter-gemm-fusion"
+
+def _aiter_root():
+    """The aiter worktree with the R12 host API (A1), overridable; falls back to the older one."""
+    import os
+
+    wt = Path(__file__).resolve().parents[3]
+    candidates = [os.environ.get("ATOM_TEST_AITER_ROOT"), wt / "aiter-gemm-fusion-p1"]
+    candidates.append(wt / "aiter-gemm-fusion")
+    for c in candidates:
+        if c and (Path(c) / "aiter" / "gemm_fusion" / "__init__.py").exists():
+            return Path(c)
+    return Path(candidates[-1])
+
+
+AITER_ROOT = _aiter_root()
 GF = AITER_ROOT / "aiter" / "gemm_fusion"
 PROFILE_NAME = "minimax_m3_sp4_gfx950_v1"
 
@@ -115,27 +129,57 @@ def test_every_symbol_atom_reads_exists_on_the_real_package_or_its_submodule(rea
         assert callable(getattr(cls, m, None)), f"FusionResources.{m} missing"
 
 
-# The R12 host API (design card D2.6). ATOM reaches it ONLY through the adapter block in
-# FusionResourcesWrapper (resources.py). aiter A1 has not landed: until it does this is an expected
-# failure, and it flips to a pass (remove the marker) when the real names exist.
+# The R12 host API (aiter 9b081852). ATOM reaches it ONLY through the adapter block in
+# FusionResourcesWrapper (resources.py).
 R12_RESOURCE_API = (
     "step_tensor",
-    "error_readback_async",
-    "error_readback_result",
+    "readback_enqueue",
+    "readback_consume",
+    "error_info",
     "reset",
+    "quiesce_and_reset",
 )
 
 
-@pytest.mark.xfail(
-    reason="needs aiter A1 (R12 host API: error word / STEP / reset); until it lands",
-    strict=False,
-)
 def test_aiter_ships_the_r12_host_api_the_adapter_calls(real_gf):
     from atom.model_ops.gemm_fusion.resources import fusion_resources_cls
 
     cls = fusion_resources_cls(real_gf)
     for m in R12_RESOURCE_API:
         assert callable(getattr(cls, m, None)), f"FusionResources.{m} missing"
+    import inspect
+
+    def params(name):
+        return list(inspect.signature(getattr(cls, name)).parameters)
+
+    assert params("readback_enqueue")[1:] == ["step_idx", "stream"]
+    assert params("readback_consume")[1:] == ["step_idx", "wait"]
+
+
+def test_aiters_call_id_key_is_atoms_decision_key_and_its_check_is_reachable(
+    real_gf, monkeypatch
+):
+    """The kernels' tags and ATOM's launches must use ONE key function, and the static uniqueness
+    check must be what the adapter calls."""
+    import importlib
+
+    from atom.model_ops.gemm_fusion import consensus
+    from atom.model_ops.gemm_fusion.resources import FusionResourcesWrapper
+
+    callid = importlib.import_module("aiter.gemm_fusion.callid")
+    for key in (
+        ("L0.qkv", 64, "sp_qkv.small.v1", 2),
+        ("model.layers.3.self_attn.qkv", 8192, "sp_qkv.large.r12", 1),
+        ("x", 1, "v", 0),
+    ):
+        assert callid.decision_key(*key) == consensus.decision_key(*key)
+    w = TU.InjectedResourcesWrapper(
+        world=1, rank=0, inner=SimpleNamespace(), arch="gfx950", cu=256
+    )
+    rep = FusionResourcesWrapper.check_call_ids(
+        w, {("a", 64, "v", 2), ("b", 64, "v", 2)}
+    )
+    assert rep.ok and rep.keys == 2  # distinct keys, nothing refused
 
 
 def test_fusion_resources_constructor_accepts_the_kwargs_atom_passes(real_gf):
@@ -255,7 +299,8 @@ def test_window_budget_comes_from_the_config_profile_with_the_env_unset(
         assert (
             inner.window_bytes == wb["window_bytes"] == 171966464
         )  # 164 MiB, from the profile
-        assert inner.max_windows == wb["max_windows"] == 39
+        # 39 + the global page (error word, STEP, diagnostics) the plans' window request registers
+        assert inner.max_windows == wb["max_windows"] == 40
         # arena (the default): ONE registered window of (shared S/R/C + small windows) bytes, and a
         # heap of roundup_4GiB(arena + 256 MiB slack)
         assert inner.policy == "arena" and inner.policy_fallback_reason is None
@@ -263,7 +308,7 @@ def test_window_budget_comes_from_the_config_profile_with_the_env_unset(
         assert (
             arena
             == sum(wb["shared"].values()) + sum(wb["small_window_sizes"])
-            == 398458880
+            == 402653184  # 384 MiB: the shared windows gained gf.global (was 380 MiB)
         )
         assert inner._vmm >= arena + (256 << 20) and inner._vmm % (4 << 30) == 0
         assert (

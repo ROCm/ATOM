@@ -17,7 +17,6 @@ must ensure identical requests in identical order):
 """
 
 import logging
-import time
 
 from . import consensus
 from .stages import aiter_gf
@@ -133,55 +132,72 @@ class FusionResourcesWrapper:
     def release(self) -> None:
         self.inner.release()
 
-    # -- device error word, step counter, reset (aiter R12 host API) --------------------------
-    # EVERY call into aiter's error-word / STEP / reset API is in this block (names from the R12
-    # design card, D2.6). Re-pointing ATOM to the names aiter actually ships is a change to this
-    # block only; ``hooks`` and ``site`` call these methods and nothing else.
+    # -- device error word, step counter, reset, call ids (aiter R12 host API, aiter 9b081852) ---
+    # EVERY call into aiter's error-word / STEP / reset / call-id API is in this block. ``hooks`` and
+    # ``site`` call these methods and nothing else, so a rename on aiter's side is a change here only.
     def step_tensor(self):
         """int64 [1] device view of the rank-uniform STEP counter (ATOM is its only writer)."""
         return self.inner.step_tensor()
 
-    def error_readback_async(self, stream=None) -> None:
-        """Enqueue a 4-byte D2H copy of the local error word on ``stream`` (default: the current
-        stream), ordered after every launch already enqueued on it. Never syncs, never inside capture.
-        """
-        if stream is None:
-            import torch
+    def error_readback_async(self, step_idx: int, stream=None) -> None:
+        """Enqueue one 4-byte async D2H copy of the local error word into the pinned ring slot of
+        ``step_idx`` (``step_idx % 32``), in stream order on ``stream`` (default: the current stream),
+        i.e. after every launch already enqueued on it. Never syncs; aiter refuses it inside graph
+        capture."""
+        self.inner.readback_enqueue(step_idx, stream)
 
-            stream = torch.cuda.current_stream()
-        self.inner.error_readback_async(stream)
+    def error_word(self, step_idx: int) -> int:
+        """The error word captured at ``step_idx`` (0 = clean). Non-blocking first; when the copy is
+        not complete yet the call blocks (``wait=True``). Every rank takes this same uniform path
+        because the caller evaluates a snapshot a fixed number of steps after enqueueing it (the copy
+        is complete by then), so the wait is normally instant."""
+        v = self.inner.readback_consume(step_idx, False)
+        if v is None:
+            v = self.inner.readback_consume(step_idx, True)
+        return int(v)
 
-    def error_readback_ready(self):
-        """The value of the readback enqueued last, or None while its copy has not completed."""
-        return self.inner.error_readback_result()
-
-    def error_word(self, timeout_s: float = 30.0) -> int:
-        """The error word of the readback enqueued last, waiting for its copy if it is not complete
-        yet. The wait is normally instant (the copy was enqueued two or more steps ago); it is
-        bounded so a wedged device cannot hang a step silently."""
-        deadline = time.monotonic() + timeout_s
-        while True:
-            v = self.error_readback_ready()
-            if v is not None:
-                return int(v)
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"gemm_fusion: the device error readback did not complete in {timeout_s}s"
-                )
-            time.sleep(0.0005)
+    def error_description(self) -> str:
+        """A human-readable decode of the device error page, for the log only. A synchronous D2H
+        read: call it after a sync, never on the hot path. Never raises (a diagnostics read must not
+        block the recovery it belongs to)."""
+        try:
+            info = self.inner.error_info()
+            if info is None:
+                return "no error page"
+            err, step, _diag = info
+            return f"{err.describe()} step={step}"
+        except Exception as e:  # noqa: BLE001
+            return f"error page unreadable: {e!r}"
 
     def reset_after_error(self) -> None:
         """Collective reset after some rank's error word was set (every rank calls it)."""
         self.inner.reset()
 
     def clean_epoch(self) -> None:
-        """Collective epoch reset at a clean point (after prepare, around graph capture).
-
-        Maps to the same aiter ``reset()`` today. Kept apart from ``reset_after_error`` because the
-        design card calls ``reset()`` legal only after an observed error; whether it is legal at a
-        clean point is an open question for aiter, and the answer changes only this method.
+        """Collective epoch reset at a clean point (after prepare, around graph capture). Uses
+        aiter's ``quiesce_and_reset`` (kept as an alias of ``reset``), the call these points have
+        always made, since the design calls ``reset()`` itself the response to an observed error.
         """
-        self.inner.reset()
+        self.inner.quiesce_and_reset()
+
+    def check_call_ids(self, keys):
+        """aiter's static call-id uniqueness check over ``(site, tokens, vid, n_fused)`` keys.
+        Returns its report (``.ok``, ``.refused_keys``), or None when this aiter has no call-id
+        module (older build: its plans ignore ``call_id``). Rank-uniform: same keys, same install.
+        """
+        try:
+            import importlib
+
+            callid = importlib.import_module(
+                getattr(aiter_gf(), "__name__", "aiter.gemm_fusion") + ".callid"
+            )
+        except ImportError:
+            logger.warning(
+                "gemm_fusion: the installed aiter has no callid module; the call_id uniqueness "
+                "check is skipped"
+            )
+            return None
+        return callid.check_call_ids(keys)
 
     def reduce_max(self, values):
         """Elementwise MAX all-reduce of small ints over the SP group; trivial on one rank.
