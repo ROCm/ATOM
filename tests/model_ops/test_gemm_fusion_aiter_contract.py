@@ -296,20 +296,16 @@ def test_window_budget_comes_from_the_config_profile_with_the_env_unset(
     try:
         hooks.init_gemm_fusion(_config(PROFILE_NAME), sp_group)
         inner = hooks.resources().inner
-        assert (
-            inner.window_bytes == wb["window_bytes"] == 171966464
-        )  # 164 MiB, from the profile
-        # 39 + the global page (error word, STEP, diagnostics) the plans' window request registers
-        assert inner.max_windows == wb["max_windows"] == 40
+        # The numbers are aiter's (its profile changes them whenever a variant is added: 39 -> 40 with
+        # the global page, 52 with r20/r21), so they are read from the profile, never copied here.
+        # What is ATOM's to prove: the REAL resources got exactly the profile's budget.
+        assert inner.window_bytes == wb["window_bytes"] > 0
+        assert inner.max_windows == wb["max_windows"] > 0
         # arena (the default): ONE registered window of (shared S/R/C + small windows) bytes, and a
         # heap of roundup_4GiB(arena + 256 MiB slack)
         assert inner.policy == "arena" and inner.policy_fallback_reason is None
         arena = inner._arena_size_from_budget()
-        assert (
-            arena
-            == sum(wb["shared"].values()) + sum(wb["small_window_sizes"])
-            == 402653184  # 384 MiB: the shared windows gained gf.global (was 380 MiB)
-        )
+        assert arena == sum(wb["shared"].values()) + sum(wb["small_window_sizes"]) > 0
         assert inner._vmm >= arena + (256 << 20) and inner._vmm % (4 << 30) == 0
         assert (
             backend.device == 0

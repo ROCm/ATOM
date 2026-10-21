@@ -1014,7 +1014,14 @@ def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
     The SP series had collapsed main's two calls into one; the R12 branch restores main's dispatch
     (the MoE is called without a scale: its activation is BF16 by construction), so ``moe=True``
     now runs. The default stays dense-only so existing evidence stays comparable; the attention
-    geometry and the three attention layer types are the same either way."""
+    geometry and the three attention layer types are the same either way.
+
+    MoE EXPERT QUANTIZATION (``moe=True``): do NOT online-quantize the experts to ``ptpc_fp8``.
+    That makes ``Fp8MoEMethod`` (per_Token, Swiglu) run aiter's generic 2-stage CK kernels, a
+    combination no M3 recipe uses, and on gfx950 ``ck_moe_stage2`` rejects it at warmup
+    ("device_gemm with the specified compilation parameters does not support this GEMM problem").
+    Use ``m3_online_quant_config("mxfp4")`` (the production M3 expert path) or ``("bf16")`` (ATOM's
+    own recipe exclusion); ``serve_args(..., online_quant=...)`` passes it."""
     layer_ffn = [0] * layers if not moe else [0] + [1] * (layers - 1)
     return {
         "model_type": "minimax_m3",
@@ -1179,6 +1186,48 @@ def make_model_dir(path, *, layout="vl", **kw):
 SPARSE_BLOCK_SIZE = 128  # atom.model_ops.minimax_m3.sparse_attn.SPARSE_BLOCK_SIZE
 
 
+# The exclusions of ATOM's own M3 launch (recipes/MiniMax-M3.md): these never get online quant.
+M3_ONLINE_QUANT_EXCLUDE = (
+    "lm_head",
+    "model.embed_tokens",
+    "vision_tower",
+    "multi_modal_projector",
+    "patch_merge_mlp",
+)
+M3_MOE_EXPERT_QUANT = ("mxfp4", "bf16")
+
+
+def m3_online_quant_config(moe_experts="mxfp4"):
+    """The ``--online_quant_config`` JSON for an M3 smoke model: ptpc_fp8 for every linear the fusion
+    path consumes (attention, dense MLP), and a deliberate choice for the MoE block.
+
+    ``moe_experts="mxfp4"`` (default): routed experts become MXFP4 online (``per_1x32`` / fp4), the
+    production M3 expert path (``Mxfp4MoEMethod``; MiniMax-M3-MXFP4 is the primary M3 checkpoint;
+    1536 meets its 256 pad alignment). The shared experts stay unquantized.
+    ``moe_experts="bf16"``: the ``*block_sparse_moe`` exclusion of ATOM's own M3 recipe, so the whole
+    MoE block (experts, shared experts) keeps the source dtype and runs ``UnquantizedFusedMoEMethod``.
+
+    ``ptpc_fp8`` experts are not offered: they select the CK 2-stage per-token path that gfx950
+    rejects for these shapes (see ``m3_config``). Not verified on a GPU by this module.
+    """
+    if moe_experts not in M3_MOE_EXPERT_QUANT:
+        raise ValueError(
+            f"moe_experts must be one of {M3_MOE_EXPERT_QUANT}, got {moe_experts!r} "
+            "(ptpc_fp8 experts fail in ck_moe_stage2 on gfx950)"
+        )
+    exclude = list(M3_ONLINE_QUANT_EXCLUDE)
+    cfg = {"global_quant_config": "ptpc_fp8"}
+    if moe_experts == "bf16":
+        exclude.append(
+            "*block_sparse_moe"
+        )  # also matches its children (.experts, .shared_*)
+    else:
+        cfg["layer_quant_config"] = {"*block_sparse_moe.experts*": "mxfp4"}
+        exclude.append("*block_sparse_moe.shared_experts*")
+    cfg["exclude_layer"] = exclude
+    return json.dumps(cfg, separators=(",", ":"))
+
+
 def serve_args(
     model_dir,
     *,
@@ -1189,12 +1238,17 @@ def serve_args(
     extra=(),
     trust_remote_code=True,
     block_size=SPARSE_BLOCK_SIZE,
+    online_quant=None,
 ):
     """ATOM CLI argv. ``--block-size`` must be a multiple of the sparse block (128):
     the attention metadata builder asserts ``model_runner.block_size % self.block_size == 0``
     (attentions/backends.py:511) and ATOM's CLI default of 16 fails it for M3's sparse layers
     (found by the E2 OFF arm, job-e2_off01). The same value also fixes the KV page size the
-    dense layers' fusion signature derives from ``config.kv_cache_block_size``."""
+    dense layers' fusion signature derives from ``config.kv_cache_block_size``.
+
+    ``online_quant`` (None: no flag, argv unchanged): ``"mxfp4"`` or ``"bf16"`` adds
+    ``--online_quant_config`` from ``m3_online_quant_config`` (how the MoE experts are treated).
+    """
     if block_size % SPARSE_BLOCK_SIZE:
         raise ValueError(
             f"block_size must be a multiple of {SPARSE_BLOCK_SIZE}, got {block_size}"
@@ -1222,6 +1276,8 @@ def serve_args(
         argv.append("--enforce-eager")
     if profile:
         argv += ["--gemm-fusion-profile", profile]
+    if online_quant is not None:
+        argv += ["--online_quant_config", m3_online_quant_config(online_quant)]
     return argv + list(extra)
 
 
@@ -1258,16 +1314,23 @@ def m3_smoke_main():
     ap.add_argument("--profile", default="")
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--enforce-eager", action="store_true")
-    a = ap.parse_args()
-    make_model_dir(a.dir, layers=a.layers)
-    print(
-        "argv:",
-        " ".join(
-            serve_args(
-                a.dir, level=a.level, profile=a.profile, enforce_eager=a.enforce_eager
-            )
-        ),
+    ap.add_argument("--moe", action="store_true", help="MoE FFN layers (see m3_config)")
+    ap.add_argument(
+        "--online-quant",
+        choices=M3_MOE_EXPERT_QUANT,
+        default=None,
+        help="add --online_quant_config; how the MoE experts are treated",
     )
+    a = ap.parse_args()
+    make_model_dir(a.dir, layers=a.layers, moe=a.moe)
+    argv = serve_args(
+        a.dir,
+        level=a.level,
+        profile=a.profile,
+        enforce_eager=a.enforce_eager,
+        online_quant=a.online_quant,
+    )
+    print("argv:", " ".join(f"'{x}'" if x.startswith("{") else x for x in argv))
     print("env:", " ".join(f"{k}={v}" for k, v in serve_env().items()))
     print(
         "fault env:",
