@@ -5,6 +5,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -346,6 +347,46 @@ class SlurmMonitoringTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("result=0", result.stdout)
+
+    def run_spur_startup_monitor(self, final_state):
+        submit = (HELPERS.parent / "atomesh/pd_submit.sh").read_text()
+        start = submit.index("spur_workers_started() {")
+        check = submit[start : submit.index("\n}\n", start) + 3]
+        return self.run_script(
+            check + "monitor_slurm_job 831",
+            {
+                "squeue": [
+                    {"out": "831|RUNNING|0:01|2|n[1,2]"},
+                    {"out": "831|RUNNING|0:31|2|n[1,2]"},
+                    {"out": f"831|{final_state}|1:01|2|n[1,2]"},
+                ],
+                "scancel": [{}],
+            },
+            LOG_ROOT=str(self.root / "logs"),
+            SLURM_STARTUP_PROGRESS_CHECK="spur_workers_started",
+            SLURM_STARTUP_TIMEOUT="0",
+        )
+
+    def test_running_job_that_never_starts_workers_is_cancelled(self):
+        result = self.run_spur_startup_monitor("CANCELLED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("without starting its workload", result.stderr)
+        self.assertEqual(self.calls("scancel"), [["scancel", "831"]])
+
+    def test_started_workers_are_not_cancelled(self):
+        for marker in ("rank-workload-0.json", "rank-rc-1"):
+            with self.subTest(marker=marker):
+                for path in self.root.glob("*.count"):
+                    path.unlink()
+                (self.root / "calls").unlink(missing_ok=True)
+                run_dir = self.root / "logs/slurm_job-831"
+                shutil.rmtree(run_dir, ignore_errors=True)
+                run_dir.mkdir(parents=True)
+                (run_dir / marker).write_text("{}\n")
+                result = self.run_spur_startup_monitor("COMPLETED")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("without starting its workload", result.stderr)
+                self.assertFalse(self.calls("scancel"))
 
     def test_explicit_cancellation_still_cancels(self):
         result = self.run_script(

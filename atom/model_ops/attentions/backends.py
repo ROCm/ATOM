@@ -21,6 +21,7 @@ from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.model_engine.page_unit_checkpoint import (
     CheckpointRestoreOp,
     CheckpointStoreOp,
+    checkpoint_copy_ops_per_batch,
 )
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_engine.state_runtime import StateTransfer
@@ -404,7 +405,8 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         because allocating pinned memory is itself a synchronizing call.
 
         A step can carry at most one store and one restore per sequence, so two
-        per sequence bounds it. The caller checks that bound rather than growing
+        per sequence bounds it (`checkpoint_copy_ops_per_batch`, the same budget
+        the coordinator begins queued midstep stores within). The caller checks that bound rather than growing
         on demand: a descriptor that did not fit would otherwise be silently
         truncated into a copy of the wrong shape.
 
@@ -421,7 +423,10 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         staging = getattr(self, "_checkpoint_staging_cache", None)
         if staging is None:
             plan = self._checkpoint_copy_plan()
-            max_ops = 2 * int(self.model_runner.config.max_num_seqs)
+            # The same budget the scheduler's coordinator begins stores within.
+            max_ops = checkpoint_copy_ops_per_batch(
+                self.model_runner.config.max_num_seqs
+            )
             staging = self._checkpoint_staging_cache = DescriptorStaging(
                 max_ops * plan.num_spans, self._checkpoint_descriptor_device()
             )

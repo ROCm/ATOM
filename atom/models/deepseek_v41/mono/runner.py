@@ -50,10 +50,10 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes
-from atom.models.deepseek_v41.mono.state import AuxTaps, bind_aux_taps
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.walk_plan import walk_plan_name
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
 from atom.mono.runtime.lifecycle import owned_peer_buffer

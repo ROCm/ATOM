@@ -225,8 +225,8 @@ def test_vk_checkpoint_layout():
         index(x)
         for x in ([0, 1], [4, 5], [64, 128], [0, 1], [0, 1], [0, 2, 4], [0, 128, 256])
     ]
-    write_state_checkpoints(h, pool, x, conv, *args, 64)
-    write_state_checkpoints(h, vk, x, conv_vk, *args, 64)
+    write_state_checkpoints(h, pool, x, conv, *args, 64, 3)
+    write_state_checkpoints(h, vk, x, conv_vk, *args, 64, 3)
     torch.testing.assert_close(vk, pool, rtol=0, atol=0)
     torch.testing.assert_close(conv_vk, conv, rtol=0, atol=0)
 

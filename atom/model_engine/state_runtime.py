@@ -42,6 +42,16 @@ class StateTransfer:
     #: Default False, so every backend keeps today's behavior until it has
     #: actually ported the copy-out.
     readable_midstep: bool = False
+    #: Token spacing of the interior states a readable backend exposes, counted
+    #: from the *start of the forward*, not from position 0. GDN's chunk kernel
+    #: materializes `h` every 64 tokens of the step, so a forward over
+    #: `(start, end]` can be read at `start + 64k` and nowhere else inside it.
+    #: 0 when not readable.
+    midstep_grid: int = 0
+    #: Tokens of this forward a snapshot needs behind it: GDN's conv window
+    #: (`conv_kernel - 1`) is sliced out of the step's own conv input. 0 when
+    #: not readable.
+    midstep_min_offset: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.fork_tokens, int) or isinstance(self.fork_tokens, bool):
@@ -50,6 +60,14 @@ class StateTransfer:
             raise TypeError("readable_midstep must be a bool")
         if self.kind in (NONE, REPLAY) and self.readable_midstep:
             raise ValueError(f"{self.kind} transfer has no state to read midstep")
+        for name in ("midstep_grid", "midstep_min_offset"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(f"{name} must be a non-negative integer")
+        if self.readable_midstep and self.midstep_grid <= 0:
+            raise ValueError("a midstep-readable transfer must declare its grid")
+        if not self.readable_midstep and (self.midstep_grid or self.midstep_min_offset):
+            raise ValueError("midstep geometry on a transfer that is not readable")
         if self.kind == COPY:
             if self.fork_tokens != 0:
                 raise ValueError("copy transfer cannot bind successor tokens")
@@ -79,12 +97,36 @@ class StateTransfer:
         return cls(REPLAY)
 
     @classmethod
-    def fork(cls, tokens: int, readable_midstep: bool = False) -> "StateTransfer":
-        return cls(FORK, tokens, readable_midstep=readable_midstep)
+    def fork(
+        cls,
+        tokens: int,
+        readable_midstep: bool = False,
+        midstep_grid: int = 0,
+        midstep_min_offset: int = 0,
+    ) -> "StateTransfer":
+        return cls(
+            FORK,
+            tokens,
+            readable_midstep=readable_midstep,
+            midstep_grid=midstep_grid,
+            midstep_min_offset=midstep_min_offset,
+        )
 
     @classmethod
-    def copy(cls, layout_id: str, readable_midstep: bool = False) -> "StateTransfer":
-        return cls(COPY, paged_layout_id=layout_id, readable_midstep=readable_midstep)
+    def copy(
+        cls,
+        layout_id: str,
+        readable_midstep: bool = False,
+        midstep_grid: int = 0,
+        midstep_min_offset: int = 0,
+    ) -> "StateTransfer":
+        return cls(
+            COPY,
+            paged_layout_id=layout_id,
+            readable_midstep=readable_midstep,
+            midstep_grid=midstep_grid,
+            midstep_min_offset=midstep_min_offset,
+        )
 
     def to_wire(self) -> dict[str, str | int | bool | None]:
         return {
@@ -92,13 +134,22 @@ class StateTransfer:
             "fork_tokens": self.fork_tokens,
             "paged_layout_id": self.paged_layout_id,
             "readable_midstep": self.readable_midstep,
+            "midstep_grid": self.midstep_grid,
+            "midstep_min_offset": self.midstep_min_offset,
         }
 
     @classmethod
     def from_wire(cls, wire: object) -> "StateTransfer":
         if not isinstance(wire, Mapping):
             raise TypeError("state transfer capability must be a mapping")
-        expected = {"kind", "fork_tokens", "paged_layout_id", "readable_midstep"}
+        expected = {
+            "kind",
+            "fork_tokens",
+            "paged_layout_id",
+            "readable_midstep",
+            "midstep_grid",
+            "midstep_min_offset",
+        }
         if set(wire) != expected:
             raise ValueError(
                 "invalid state transfer capability fields: "
@@ -109,6 +160,8 @@ class StateTransfer:
             fork_tokens=wire["fork_tokens"],  # type: ignore[arg-type]
             paged_layout_id=wire["paged_layout_id"],  # type: ignore[arg-type]
             readable_midstep=wire["readable_midstep"],  # type: ignore[arg-type]
+            midstep_grid=wire["midstep_grid"],  # type: ignore[arg-type]
+            midstep_min_offset=wire["midstep_min_offset"],  # type: ignore[arg-type]
         )
 
     @property
@@ -206,3 +259,90 @@ class StateMaintenanceOps:
         return not (
             self.relocations or self.checkpoint_stores or self.checkpoint_restores
         )
+
+
+# ── midstep checkpoint geometry ──────────────────────────────────────────────
+#
+# One predicate for both ends of a midstep checkpoint. The scheduler reserves a
+# position and publishes its hash after the forward; the runner writes the
+# bytes during it. If the two disagree on which positions are writable, the
+# scheduler files a hash over a destination nobody wrote, and a request that
+# resumes there continues from the previous tenant's state with no error
+# anywhere. So the scheduler filters with this and the runner asserts it.
+
+
+def midstep_target_ok(
+    pos: int, start: int, end: int, grid: int, min_offset: int
+) -> bool:
+    """Whether a forward over `(start, end]` can snapshot the state at `pos`.
+
+    Interior positions must sit on the forward's own grid, `start + grid*k`:
+    that is where the chunk kernel left a state in `h`, and a position between
+    two of them reads the earlier one while being filed under the later hash.
+    `end` is always readable, from the runtime slot the forward leaves behind.
+
+    `min_offset` tokens of this forward must precede `pos`, because the conv
+    window is sliced out of this forward's conv input and has no earlier rows.
+    """
+    if not start < pos <= end or pos - start < min_offset:
+        return False
+    return pos == end or (pos - start) % grid == 0
+
+
+def snap_midstep_position(pos: int, start: int, end: int, grid: int) -> int:
+    """`pos` moved back onto the grid of a forward over `(start, end]`.
+
+    `end` stays where it is: the runtime slot holds it exactly. Anything else
+    goes back to the last state the chunk kernel materialized at or before it,
+    which costs the next resume at most `grid - 1` tokens of recompute.
+    """
+    if pos == end:
+        return pos
+    return start + (pos - start) // grid * grid
+
+
+def midstep_checkpoint_targets(
+    state_rows: list[int],
+    num_cached_tokens,
+    num_scheduled_tokens,
+    runtime_slots: list[int],
+    saves: list[list[tuple[int, int]]],
+    num_slots: int,
+    grid: int,
+    min_offset: int,
+) -> list[tuple[int, int, int, int, int]]:
+    """`(row, slot, offset, is_end, runtime_slot)` for every reservation.
+
+    `saves`, `runtime_slots` and `state_rows` are indexed by state-holding
+    sequence; `state_rows[j]` is that sequence's row in the batch, which is
+    what the token counts and the kernel's `cu_seqlens` are indexed by. The
+    two only coincide when every row holds state.
+
+    Raises rather than skipping. Every reservation here has already been
+    promised to `commit_midstep`, which publishes its hash after the forward;
+    a skipped write is a findable checkpoint over unwritten bytes.
+    """
+    if not (len(state_rows) == len(runtime_slots) == len(saves)):
+        raise RuntimeError(
+            "midstep targets: state rows, runtime slots and saves disagree "
+            f"({len(state_rows)}, {len(runtime_slots)}, {len(saves)})"
+        )
+    out = []
+    for j, reservations in enumerate(saves):
+        row = state_rows[j]
+        start = int(num_cached_tokens[row])
+        end = start + int(num_scheduled_tokens[row])
+        for dst, pos in reservations:
+            dst, pos = int(dst), int(pos)
+            if not 0 <= dst < num_slots:
+                raise RuntimeError(
+                    f"midstep checkpoint slot {dst} outside this rank's "
+                    f"{num_slots}-slot state pool"
+                )
+            if not midstep_target_ok(pos, start, end, grid, min_offset):
+                raise RuntimeError(
+                    f"midstep checkpoint at {pos} is not writable by a forward "
+                    f"over ({start}, {end}] (grid {grid}, min offset {min_offset})"
+                )
+            out.append((row, dst, pos - start, int(pos == end), runtime_slots[j]))
+    return out
