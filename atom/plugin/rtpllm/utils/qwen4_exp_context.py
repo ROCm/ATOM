@@ -414,7 +414,27 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                     dtype=raw.dtype,
                 ),
             )
-            module.bind_caches(key, value, *side)
+            model_config = getattr(runtime, "_rtp_model_config", None)
+            has_vision = bool(
+                getattr(
+                    getattr(model_config, "mm_model_config", None),
+                    "is_multimodal",
+                    False,
+                )
+            )
+            rope_positions = (
+                torch.zeros(
+                    (num_blocks, block_size, 1, 3),
+                    device=device,
+                    dtype=torch.int64,
+                )
+                if has_vision
+                else None
+            )
+            if has_vision:
+                module.bind_caches(key, value, *side, rope_positions)
+            else:
+                module.bind_caches(key, value, *side)
             module._rtp_qsa_cache_signature = signature
 
     @staticmethod

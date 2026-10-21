@@ -473,6 +473,24 @@ def test_qwen4_exp_plugin_config_and_registration(tmp_path):
     )
     assert draft.auxiliary_paged_cache_bytes_per_block == qsa_bytes
 
+    text_config["rope_parameters"].update(
+        {"mrope_section": [11, 11, 10], "mrope_interleaved": True}
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": text_config,
+                "language_model_only": False,
+                "vision_start_token_id": 248053,
+                "vision_end_token_id": 248054,
+            }
+        )
+    )
+    vision = ATOMQwen4Exp._create_config(str(tmp_path))
+    assert vision.mm_model_config.is_multimodal
+    assert vision.attn_config.rope_config.index_factor == 3
+    assert vision.mm_model_config.mm_position_ids_style == 2
+
 
 def test_qwen4_exp_cuda_graph_switch(monkeypatch):
     monkeypatch.setenv("ENABLE_CUDA_GRAPH", "1")
