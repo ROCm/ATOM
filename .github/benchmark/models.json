@@ -120,7 +120,7 @@
       "path": "deepseek-ai/DeepSeek-V4.1-Flash",
       "prefix": "deepseek-v41-flash",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "",
+      "env_vars": "ATOM_MOE_GU_ITLV=1",
       "config": {
         "tp": 4,
         "kv_cache_dtype": "bf16",
