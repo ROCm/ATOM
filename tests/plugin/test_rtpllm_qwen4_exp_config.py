@@ -341,6 +341,22 @@ quant_config.remap_layer_name.assert_called_once()
     assert result.returncode == 0, result.stderr
 
 
+def test_prepared_qwen4_exp_mtp_receives_atom_config(monkeypatch):
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+    from atom.plugin.prepare import _instantiate_prepared_model
+
+    atom_config = SimpleNamespace(hf_config=SimpleNamespace())
+
+    def lightweight_init(self, atom_config):
+        torch.nn.Module.__init__(self)
+        self.config = atom_config.hf_config
+
+    monkeypatch.setattr(Qwen4ExpMTP, "__init__", lightweight_init)
+    draft = _instantiate_prepared_model(None, atom_config, Qwen4ExpMTP)
+
+    assert draft.atom_config is atom_config
+
+
 def test_qwen4_exp_target_forward_restores_its_atom_config(monkeypatch):
     from atom import config as atom_config_module
     from atom.config import get_current_atom_config, set_current_atom_config
@@ -480,6 +496,42 @@ def test_qwen4_exp_graph_uses_refreshed_device_sequence_lengths(monkeypatch):
         64,
         129,
     ]
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draft):
+    def init_with_narrow_decode_bucket(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.model = torch.nn.Module()
+        self._cg_max_num_tokens = 4
+
+    monkeypatch.setattr(
+        _ATOMQwen35MoeRuntime, "__init__", init_with_narrow_decode_bucket
+    )
+    runtime = _ATOMQwen4ExpRuntime(
+        SimpleNamespace(atom_qwen4_exp_mtp_target=not is_draft, is_mtp=is_draft),
+        max_generate_batch_size=8,
+    )
+    assert runtime._cg_max_num_tokens == 8
+
+
+def test_qwen4_exp_mtp_graph_rejects_undersized_position_buffer(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(gen_num_per_cycle=2)
+    runtime._cg_mtp_meta_bufs = {
+        "qwen4_positions_i32": torch.empty(12, dtype=torch.int32)
+    }
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=True,
+            is_cuda_graph=True,
+            sequence_lengths_plus_1_device=torch.ones(8, dtype=torch.int32),
+        )
+    )
+    with pytest.raises(ValueError, match="capacity=12, tokens=24"):
+        runtime._extract_positions(inputs, torch.device("cpu"), 24)
 
 
 @pytest.mark.parametrize("draft_steps", [1, 2, 3])

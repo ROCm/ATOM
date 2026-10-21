@@ -43,6 +43,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         self._rtp_forward_context_cls = RTPQwen4ExpContext
         super().__init__(model_config, *args, **kwargs)
         self._rtp_model_config = model_config
+        if getattr(model_config, "atom_qwen4_exp_mtp_target", False) or getattr(
+            model_config, "is_mtp", False
+        ):
+            # RTP's MTP target/draft warmup uses the request capacity, which
+            # can exceed the largest decode capture bucket. Reserve metadata
+            # for that full batch before either graph is captured.
+            max_batch = kwargs.get("max_generate_batch_size")
+            if max_batch is None and len(args) >= 3:
+                max_batch = args[2]
+            if max_batch is not None:
+                self._cg_max_num_tokens = max(self._cg_max_num_tokens, int(max_batch))
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
@@ -262,6 +273,13 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 )
             graph_buffers = self._graph_buffers_for_inputs(attn_inputs)
             if graph_buffers is not None:
+                if graph_buffers["qwen4_positions_i32"].numel() < token_num:
+                    raise ValueError(
+                        "Qwen4Exp Graph position buffer is too small: "
+                        f"capacity={graph_buffers['qwen4_positions_i32'].numel()}, "
+                        f"tokens={token_num}, rows={lengths.numel()}, "
+                        f"window={tokens_per_request}"
+                    )
                 positions = graph_buffers["qwen4_positions_i32"][:token_num]
                 if is_mtp_draft_prefill or is_target_verify:
                     base = lengths if is_mtp_draft_prefill else lengths - 1
