@@ -10,12 +10,16 @@ so a sampled request is traced end to end across the two engines.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import threading
 import time
 
 from atom.utils import envs
 
 logger = logging.getLogger("atom")
+
+_phases = threading.local()
 
 
 def enabled() -> bool:
@@ -37,3 +41,28 @@ def log(event: str, transfer_id, **fields) -> None:
     logger.info(
         "[PD-TIMING] ev=%s tid=%s t=%.3f%s", event, transfer_id, time.time(), extra
     )
+
+
+def phases_begin(timed: bool) -> None:
+    """Start (or, untimed, stop) summing ``phase`` time on this thread."""
+    _phases.acc = {} if timed else None
+
+
+@contextlib.contextmanager
+def phase(name: str):
+    acc = getattr(_phases, "acc", None)
+    if acc is None:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        acc[name] = acc.get(name, 0.0) + time.perf_counter() - t0
+
+
+def phases_end() -> dict[str, str]:
+    """This thread's summed phases in ms, as ``log`` fields; stops summing."""
+    acc = getattr(_phases, "acc", None) or {}
+    _phases.acc = None
+    return {f"{k}_ms": f"{v * 1e3:.1f}" for k, v in acc.items()}

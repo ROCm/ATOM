@@ -2050,6 +2050,7 @@ class MooncakeConnector(KVConnectorBase):
             timed = request_data.get("consumer_tp_rank", 0) == 0 and pd_timing.sampled(
                 transfer_id
             )
+            pd_timing.phases_begin(timed)
             if timed:
                 pd_timing.log(
                     "P_wstart",
@@ -2231,7 +2232,9 @@ class MooncakeConnector(KVConnectorBase):
                 return
 
             if timed:
-                pd_timing.log("P_wsent", transfer_id, stage=self.pp_rank)
+                pd_timing.log(
+                    "P_wsent", transfer_id, stage=self.pp_rank, **pd_timing.phases_end()
+                )
             # Notify consumer — all data (blocks + slot state) is written.
             self._notify_transfer_result(request_data, success=True)
 
@@ -2986,15 +2989,18 @@ class MooncakeConnector(KVConnectorBase):
         staging = self._kv_staging
         dst_ids = np.asarray(dst_block_ids, dtype=np.int64)
         descriptors = 0
-        slot = staging.acquire()
+        with pd_timing.phase("slot"):
+            slot = staging.acquire()
         try:
-            shard = staging.prepare(plan, kv_cache_ready_event)
+            with pd_timing.phase("prep"):
+                shard = staging.prepare(plan, kv_cache_ready_event)
             for region_idx, dst_base, bpb in regions:
                 for start in range(0, shard.pages, staging.chunk_pages):
                     stop = min(start + staging.chunk_pages, shard.pages)
-                    slot_addr, page_bytes = staging.gather(
-                        region_idx, shard, start, stop, slot
-                    )
+                    with pd_timing.phase("gather"):
+                        slot_addr, page_bytes = staging.gather(
+                            region_idx, shard, start, stop, slot
+                        )
                     if page_bytes != bpb:
                         raise RuntimeError(
                             f"Staged region {region_idx} packs {page_bytes}-byte "
@@ -3150,15 +3156,16 @@ class MooncakeConnector(KVConnectorBase):
         sharded_runs = None
         staging = None
         if consumer_dcp_size > 1 and self.dcp_size == 1:
-            sharded_plan = build_dcp_shard_plan(
-                src_block_ids,
-                block_size=self.block_size,
-                dcp_size=consumer_dcp_size,
-                dcp_rank=request_data["consumer_dcp_rank"],
-                interleave_size=request_data.get("consumer_dcp_interleave", 1),
-                dst_pages=len(dst_block_ids),
-            )
-            sharded_runs = sharded_plan.token_runs(dst_block_ids)
+            with pd_timing.phase("plan"):
+                sharded_plan = build_dcp_shard_plan(
+                    src_block_ids,
+                    block_size=self.block_size,
+                    dcp_size=consumer_dcp_size,
+                    dcp_rank=request_data["consumer_dcp_rank"],
+                    interleave_size=request_data.get("consumer_dcp_interleave", 1),
+                    dst_pages=len(dst_block_ids),
+                )
+                sharded_runs = sharded_plan.token_runs(dst_block_ids)
             staging = mla_staging_for(getattr(self, "_kv_staging", None), sharded_plan)
         staged_kv: list[tuple[int, int, int]] = []
         for region_idx, (src_base, bpb) in enumerate(self._block_regions):
@@ -3447,12 +3454,13 @@ class MooncakeConnector(KVConnectorBase):
                 return None
             started = time.monotonic()
             try:
-                ret = engine.batch_transfer_sync_write(
-                    target,
-                    src_addrs[chunk_start:chunk_end],
-                    dst_addrs[chunk_start:chunk_end],
-                    sizes[chunk_start:chunk_end],
-                )
+                with pd_timing.phase(f"rdma_{label}"):
+                    ret = engine.batch_transfer_sync_write(
+                        target,
+                        src_addrs[chunk_start:chunk_end],
+                        dst_addrs[chunk_start:chunk_end],
+                        sizes[chunk_start:chunk_end],
+                    )
             except Exception:
                 logger.exception(
                     "[PRODUCER] %s RDMA chunk FAILED for req %s → %s "

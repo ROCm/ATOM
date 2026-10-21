@@ -1433,6 +1433,31 @@ models:
               OFFLOAD_LOAD_WORKERS: "2"
               ATOM_PP_MAX_INFLIGHT: "16"
 
+        # Test only. The c88-pdtiming cell with 64 Mooncake send workers per
+        # prefill stage instead of 16: each request queues eight writes per
+        # stage (one per decode rank), and a few slow writes fill all 16
+        # workers and hold back the writes queued behind them. The MLA
+        # staging pool grows with the workers, 144 -> 576 MiB per GPU.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-send64
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_PD_TIMING_SAMPLE: "4"
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
+              ATOM_PP_MAX_INFLIGHT: "16"
+              PREFILL_KV_TRANSFER_CONFIG: >-
+                {"kv_connector":"multi","connectors":[{"kv_connector":"mooncake","kv_role":"kv_producer","proxy_ip":"${ROLE_IP}","handshake_port":6301,"num_worker_threads":64},{"kv_connector":"lmcache_offload","kv_role":"offload"}]}
+
         # Test only. The c88 P0 cell with the offload pack and copy streams at
         # high priority, so they stop queueing behind the prefill forward.
         - <<: *kimi_k3_1p1d_pp8_dcp8_p0
