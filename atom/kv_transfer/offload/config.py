@@ -34,6 +34,7 @@ _OFFLOAD_LAYOUT_ALIASES = {
     "kimi_k3": "kimi_k3",
     "qwen": "qwen",
     "m3": "m3",
+    "dsv41": "dsv41",
     # Compatibility with the names used while the layout split was developed.
     "terminal_unit": "hybrid",
     "page_slot": "hybrid",
@@ -53,6 +54,11 @@ _HF_PAGE_FIELDS = (
     "compress_ratios",
     "indexer_dtype",
     "indexer_types",
+    # DeepSeek-V4.1: `sliding_window` sizes the per-request window ring and
+    # `candidate_block_size` pages the index plane, so either one moves the
+    # bytes a stored object holds while every field above stays put.
+    "sliding_window",
+    "candidate_block_size",
 )
 _HF_INTEGER_GEOMETRY_FIELDS = frozenset(_HF_PAGE_FIELDS) - {
     "compress_ratios",
@@ -80,12 +86,23 @@ _GDN_LINEAR_MODEL_TYPES = frozenset(
 
 # Layouts that own a tier for a model's per-request *recurrent* state.
 # `kimi_k3` is the kimi_linear KDA state; `qwen` is the same tier over a GDN
-# PAGE image. `hybrid` (DSV4 sparse-attention checkpoints) is not
+# PAGE image; `dsv41` is DeepSeek-V4.1's CSA2 window rings, compressor rings
+# and Engram cursor. `hybrid` (DSV4 sparse-attention checkpoints) is not
 # recurrent-state and dense<->hybrid is a legitimate operator override for
 # namespace separation. An explicit `offload_layout` override may not
 # downgrade a recurrent-state model to a layout that owns no tier for it
 # (silent wrong output) -- see `select_offload_layout`.
-_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen"})
+_STATE_OWNING_LAYOUTS = frozenset({"kimi_k3", "qwen", "dsv41"})
+
+# Every spelling of the V4.1 family, mirroring `atom.utils.selector._V41_TYPES`.
+# Matching only the text config's own type left the wrapper and DSpark
+# spellings to fall through to the `compress_ratios` probe below and resolve to
+# `hybrid` -- outside `_STATE_OWNING_LAYOUTS`, so an `offload_layout: dense`
+# override would be honoured on a model that carries per-request state, and
+# sharing DSV4's key space besides.
+_DSV41_MODEL_TYPES = frozenset(
+    {"deepseek_v41", "deepseek_v41_text", "deepseek_v41_dspark"}
+)
 
 logger = logging.getLogger("atom")
 
@@ -207,6 +224,16 @@ def _layout_from_model(config) -> str:
     # KDA per-request state that a reusable prefix also needs.
     if model_type == "kimi_linear":
         return "kimi_k3"
+    # DeepSeek-V4.1 before the `compress_ratios` probe below, which it would
+    # otherwise answer: V4.1 declares compress ratios exactly as DSV4 does, but
+    # it also carries per-request CSA2 state (window ring per layer, the
+    # compressor's incomplete group, the Engram cursor) that the `hybrid`
+    # PAGE+SLOT codec owns no tier for. Resolving it to `hybrid` would both
+    # share DSV4's key space and leave it outside `_STATE_OWNING_LAYOUTS`, so
+    # an `offload_layout: dense` override would silently restore a KV prefix
+    # over a window ring that never existed.
+    if model_type in _DSV41_MODEL_TYPES:
+        return "dsv41"
     if getattr(hf_config, "compress_ratios", None):
         return "hybrid"
     # GDN publishes the same PAGE-image contract the kimi_k3 tier already
@@ -256,10 +283,82 @@ def _stable_config_value(value: Any) -> Any:
     )
 
 
+# A `ParallelConfig` describes where *this* process sits, not what the bytes
+# look like, so it must not reach the namespace digest.
+_PAGE_PLACEMENT_FIELDS = frozenset({"target_parallel_config", "draft_parallel_config"})
+
+# Speculative-decoding behaviour each process decides for itself. Like the
+# placement fields above these say nothing about what the PAGE bytes look
+# like, and hashing them splits the namespace in two.
+#
+# Measured on DeepSeek-V4.1-Flash with DSpark on the `mp` backend: the four
+# workers hashed `disable_eagle_block_drop: false` and the scheduler hashed
+# `true`, so the workers registered their layout under
+# `atom-page-v3-290a23f2...` while every lookup asked for
+# `atom-page-v3-dbdf5a1c...`. The tier logged `Stored 2560 tokens` for the
+# saves and `No GPU context found for model ... during lookup` for the reads,
+# and the arm ran at a flat zero hit rate with no error on the engine side --
+# the third time this module has been bitten by a per-process field reaching
+# the digest (see `_PAGE_PLACEMENT_FIELDS` and `_canonical_head_dim`).
+_PAGE_SPECULATIVE_BEHAVIOUR_FIELDS = frozenset({"disable_eagle_block_drop"})
+
+
+def _stable_speculative_config(value: Any) -> Any:
+    """The speculative config with everything per-process removed.
+
+    The parallel configs carry this process' own coordinates -- `rank`,
+    `data_parallel_rank`, `node_rank` -- so hashing them gives every TP rank a
+    different PAGE namespace. Under `tp_rank_collapse` that is silent data
+    loss: the one writing rank publishes its bytes under its own name, the
+    other ranks look their own names up, and the tier answers every one of
+    those lookups with a miss and no error anywhere (the failure mode
+    `_canonical_head_dim` documents, reached by a different field). Placement
+    is not a property of the bytes; the parallelism that is -- TP and DCP width
+    -- `build_page_namespace` hashes explicitly.
+    """
+
+    stable = _stable_config_value(value)
+    if isinstance(stable, dict):
+        dropped = _PAGE_PLACEMENT_FIELDS | _PAGE_SPECULATIVE_BEHAVIOUR_FIELDS
+        return {key: item for key, item in stable.items() if key not in dropped}
+    return stable
+
+
+def _canonical_head_dim(hf: object) -> int | None:
+    """Return the attention head dim every process agrees on.
+
+    ``head_dim`` is not a stable property of the checkpoint: for MLA models it
+    is absent from ``config.json`` and each process fills it in on its own.
+    vLLM's scheduler process keeps transformers' computed default
+    (``hidden_size // num_attention_heads``, 74 for Kimi K3) while the workers
+    end up with the MLA head dim (``qk_nope + qk_rope``, 192).  Hashing the
+    attribute therefore splits the PAGE namespace in two: the workers publish
+    their layout under one name, every lookup asks for the other, and the tier
+    answers every lookup with a miss and no error.  Derive it from the fields
+    that do come from the checkpoint instead.
+    """
+
+    qk_nope = getattr(hf, "qk_nope_head_dim", None)
+    qk_rope = getattr(hf, "qk_rope_head_dim", None)
+    if qk_nope and qk_rope:
+        return int(qk_nope) + int(qk_rope)
+    head_dim = getattr(hf, "head_dim", None)
+    if head_dim:
+        return int(head_dim)
+    hidden_size = getattr(hf, "hidden_size", None)
+    num_heads = getattr(hf, "num_attention_heads", None)
+    if hidden_size and num_heads:
+        return int(hidden_size) // int(num_heads)
+    return None
+
+
 def _stable_hf_geometry(hf: object) -> dict[str, Any]:
     geometry: dict[str, Any] = {}
     for name in _HF_PAGE_FIELDS:
-        value = getattr(hf, name, None)
+        if name == "head_dim":
+            value = _canonical_head_dim(hf)
+        else:
+            value = getattr(hf, name, None)
         if value is not None and name in _HF_INTEGER_GEOMETRY_FIELDS:
             value = _strict_integer(f"PAGE {name}", value)
         elif value is not None and name == "compress_ratios":
@@ -349,6 +448,7 @@ def build_page_namespace(
         "page_mode": {
             "hybrid": "dsv4-page-regions",
             "m3": "m3-page-regions",
+            "dsv41": "dsv41-page-state",
         }.get(select_offload_layout(config), "dense-opaque-block"),
         "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
         "index_cache_dtype": str(getattr(config, "index_cache_dtype", "auto")),
@@ -375,7 +475,7 @@ def build_page_namespace(
         # The config-time snapshot when there is one; see `Config.__post_init__`.
         "hf_geometry": getattr(config, "offload_page_hf_geometry", None)
         or _stable_hf_geometry(hf),
-        "speculative_config": _stable_config_value(
+        "speculative_config": _stable_speculative_config(
             getattr(config, "speculative_config", None)
         ),
     }
@@ -716,7 +816,9 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
             minimum=1,
         )
         num_kv_heads_local = max(1, num_kv_heads // tp)
-        raw_head_dim = getattr(hf, "head_dim", 0)
+        # Same derivation the PAGE namespace hashes, so the shape a worker
+        # publishes and the shape the scheduler looks up cannot drift apart.
+        raw_head_dim = _canonical_head_dim(hf) or 0
         normalized_head_dim = (
             0
             if raw_head_dim is None

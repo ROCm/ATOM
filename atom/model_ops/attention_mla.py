@@ -2620,7 +2620,9 @@ class MLAAttention(nn.Module):
                     return_lse=return_lse,
                 )
         elif hasattr(attn_metadata, "triton_block_table"):
-            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
+            from atom.model_ops.attentions.triton_mla_decode import (
+                decode_attention_fwd,
+            )
 
             k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
             v_buffer = k_buffer[..., : self.kv_lora_rank]

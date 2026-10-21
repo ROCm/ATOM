@@ -158,10 +158,11 @@ def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
     if offcfg._is_minimax_m3(hf_config):
         return False
     hf_config = getattr(hf_config, "text_config", hf_config)
-    # Kimi-K3's MLA KV is replicated, but its KDA checkpoint images -- stored
-    # in those same PAGE units -- hold TP-sharded heads, so every rank keeps
-    # its own copy.
-    if getattr(hf_config, "model_type", None) == "kimi_linear":
+    # A state-owning layout's recurrent checkpoints ride inside the PAGE unit.
+    # Kimi-K3's hold TP-sharded heads, so the unit as a whole is not replicated
+    # even though the MLA KV in it is; the others are left one copy per rank
+    # until their backend declares otherwise.
+    if offcfg.select_offload_layout(config) in offcfg._STATE_OWNING_LAYOUTS:
         return False
     return getattr(hf_config, "kv_lora_rank", None) is not None
 

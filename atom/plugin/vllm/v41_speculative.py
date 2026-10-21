@@ -158,10 +158,41 @@ def _admission_is_possible(scheduler) -> bool:
     return len(scheduler.running) + streaming < cap
 
 
+def _kv_holding_request_will_prefill(scheduler) -> bool:
+    """Whether a request that already holds KV blocks is about to prefill.
+
+    vLLM 0.31 keeps a waiting request that holds blocks -- one parked in
+    WAITING_FOR_REMOTE_KVS for a KV connector's load, or one resuming with its
+    blocks -- in `kv_holding_waiting`, not `waiting`, and drains that queue
+    *first*. A parked request whose load has finished is promoted inside
+    `schedule` and prefills the rest of its prompt in the same step, so a
+    check of `waiting` alone never sees it. Measured once a connector could
+    park a V4.1 request at all: a resumed row `(768, 171, 0)` in the same step
+    as a verify row `(1024, 6, 5)`, refused by `_v41_prepare_kwargs`.
+
+    Only requests that will actually prefill count. One still waiting for its
+    load stays parked this step; counting it would clear the batch's drafts
+    for as long as any load is in flight.
+    """
+    queue = getattr(scheduler, "kv_holding_waiting", None)
+    if not queue:
+        return False
+    from vllm.v1.request import RequestStatus
+
+    done = getattr(scheduler, "finished_recving_kv_req_ids", None) or ()
+    return any(
+        request.status != RequestStatus.WAITING_FOR_REMOTE_KVS
+        or request.request_id in done
+        for request in queue
+    )
+
+
 def _would_mix_prefill_with_drafts(scheduler) -> bool:
     if not any(request.spec_token_ids for request in scheduler.running):
         return False
-    if scheduler.waiting and _admission_is_possible(scheduler):
+    if (
+        scheduler.waiting or _kv_holding_request_will_prefill(scheduler)
+    ) and _admission_is_possible(scheduler):
         return True
     # A running request can still be mid-prompt: chunked prefill keeps it in
     # `running` while it works through the rest of its tokens, and a preempted
@@ -250,6 +281,39 @@ def _anchors(num_rejected, query_start_loc, count):
     return ends - 1 - num_rejected[:count].to(ends.dtype)
 
 
+def _store_committed_decode_keeps(worker, num_rejected, query_start_loc, count):
+    """Store this step's decode keeps at the position it actually committed.
+
+    Right after the commit the slots hold exactly the committed state. The next
+    build is too late: if that step is not speculative, its staging advances
+    the cursor before any store runs, and the checkpoint would pair this step's
+    window with the next step's cursor and history.
+    """
+    import numpy as np
+
+    from atom.plugin.vllm.paged_state_checkpoint import store_decode_keeps
+    from atom.plugin.vllm.req_id_passthrough_patch import (
+        get_current_input_batch,
+        get_current_req_ids,
+    )
+
+    batch = get_current_input_batch()
+    req_ids = list(get_current_req_ids() or [])[:count]
+    if batch is None or len(req_ids) < count:
+        return
+    loc = np.asarray(
+        query_start_loc.cpu() if hasattr(query_start_loc, "cpu") else query_start_loc,
+        dtype=np.int64,
+    )
+    rejected = np.asarray(
+        num_rejected.cpu() if hasattr(num_rejected, "cpu") else num_rejected,
+        dtype=np.int64,
+    )
+    starts = np.asarray(batch.num_computed_tokens_cpu[:count], dtype=np.int64)
+    committed = starts + (loc[1 : count + 1] - loc[:count]) - rejected[:count]
+    store_decode_keeps(worker, req_ids, committed, fresh_rows=())
+
+
 def patch_v41_speculative_commit() -> int:
     """Wrap `postprocess_sampled` on every runner class. Returns the count."""
     from atom.plugin.vllm.vllm_runtime import gpu_model_runner_classes
@@ -309,6 +373,22 @@ def patch_v41_speculative_commit() -> int:
                     )
                 count = int(num_rejected.shape[0])
                 v41_commit_speculative_state(_anchors(num_rejected, starts, count))
+                # The step's checkpoint stores waited for this commit: the
+                # copier validates every slot against the cache's committed
+                # cursor, so one issued from `execute_model` (before the
+                # sampler ran) raises instead of storing. Flushing here is the
+                # speculative path's equivalent of that site.
+                from atom.plugin.vllm.paged_state_checkpoint import (
+                    _workers,
+                    flush_worker,
+                )
+
+                for _worker in list(_workers.values()):
+                    flush_worker(_worker)
+                    if _worker.decode_candidates:
+                        _store_committed_decode_keeps(
+                            _worker, num_rejected, starts, count
+                        )
             # Forwarded by keyword, so a caller that omitted the optional
             # argument reaches the original having omitted it too rather than
             # being given a None this wrapper invented.

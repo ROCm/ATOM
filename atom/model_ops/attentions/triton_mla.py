@@ -4,7 +4,6 @@
 import logging
 
 import torch
-from aiter.ops.triton.attention.mla_decode import csr_to_dense_block_table
 
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.attention_mla import MLAAttention
@@ -12,6 +11,7 @@ from atom.utils.forward_context import AttentionMetaData
 
 from .aiter_mla import AiterMLAMetadataBuilder
 from .backends import AttentionBackend
+from .triton_mla_decode import csr_to_dense_block_table
 
 logger = logging.getLogger("atom")
 
