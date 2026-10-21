@@ -520,8 +520,37 @@ class _DecodeMode:
 
 
 def test_draft_decode_hook_never_builds_target_graph_metadata():
-    """Draft decode batches stop before the target's _DECODE_GRAPH fill."""
+    """Flash draft decode batches stop before the target's _DECODE_GRAPH fill."""
+    flash = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen4_exp_text"))
     draft = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=EagleDraftInput())
-    assert prepare_qwen4_exp_decode_graph_metadata(draft) is not None
-    target = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=None)
-    assert prepare_qwen4_exp_decode_graph_metadata(target) is None
+    assert prepare_qwen4_exp_decode_graph_metadata(draft, atom_config=flash) is not None
+
+
+def test_draft_decode_hook_ignores_other_models():
+    """Another EAGLE drafter on the ATOM backend keeps its normal metadata path."""
+    other = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="qwen3_5_moe", architectures=["X"])
+    )
+    draft = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=EagleDraftInput())
+    assert prepare_qwen4_exp_decode_graph_metadata(draft, atom_config=other) is None
+
+
+def test_draft_qsa_covers_the_graph_bucket_without_a_request_limit(monkeypatch):
+    """No --max-running-requests: the 32-row default must grow to the capture bucket."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    args = SimpleNamespace(
+        max_running_requests=None,
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1, 8, 64])),
+    )
+    seen = {}
+    monkeypatch.setattr(bridge, "_server_args", lambda: args)
+    monkeypatch.setattr(bridge, "_get_qsa_graph_max_tokens_per_req", lambda: 5)
+    monkeypatch.setattr(
+        bridge,
+        "_DRAFT_QSA",
+        SimpleNamespace(allocate_once=lambda **kw: seen.update(kw)),
+    )
+    bridge._ensure_draft_qsa(torch.device("cpu"), block_size=64, ctx_len=8192)
+    assert seen["max_bs"] == 64
+    assert seen["max_tokens"] == 64 * 5

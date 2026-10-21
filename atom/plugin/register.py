@@ -1190,8 +1190,10 @@ def register_ops_to_sglang(atom_config: Config) -> None:
     _keep_atom_backend_for_qwen_qsa()
     _patch_sglang_dsv4_draft_backends()
     patch_sglang_eagle3_runtime_compat()
-    _patch_sglang_dsv4_spec_cuda_graph()
+    # Legacy SGLang: the argmax patch replaces EagleDraftWorker.draft_forward,
+    # so install it before the spec-graph patch wraps draft_forward.
     _patch_sglang_eagle_v2_draft_argmax()
+    _patch_sglang_dsv4_spec_cuda_graph()
 
 
 def set_attn_cls() -> None:

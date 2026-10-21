@@ -959,11 +959,14 @@ def _serving_context_len(atom_config: Any, indexer_budget: int) -> int:
 
 
 def _ensure_draft_qsa(device: torch.device, block_size: int, ctx_len: int) -> None:
-    """Allocate the draft page tables once, at serving capacity."""
+    """Allocate the draft page tables once, at serving and graph capacity."""
     args = _server_args()
     max_bs = 32
     if args is not None:
         max_bs = max(int(getattr(args, "max_running_requests", 32) or 32), 1)
+    # The draft decode graph captures up to the decode bucket, which exceeds
+    # the 32-row default when --max-running-requests is omitted.
+    max_bs = max(max_bs, _get_cuda_graph_max_bs())
     ctx = max(int(ctx_len), 1)
     tokens_per_req = _get_qsa_graph_max_tokens_per_req()
     pages = max(1, (ctx + block_size - 1) // block_size)
@@ -1633,12 +1636,6 @@ def prepare_qwen4_exp_decode_graph_metadata(
     is_verify = _is_target_verify(forward_batch)
     if not (mode.is_decode_or_idle() or is_verify):
         return None
-    # A Flash draft decode graph rebuilds its QSA metadata into
-    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
-    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
-    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
-    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
-        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
     if atom_config is None:
         try:
             from atom.config import get_current_atom_config
@@ -1648,6 +1645,12 @@ def prepare_qwen4_exp_decode_graph_metadata(
             return None
     if atom_config is None or not _is_qwen4_exp_config(atom_config):
         return None
+    # A Flash draft decode graph rebuilds its QSA metadata into
+    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
+    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
+    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
+    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
+        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
 
     tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
     positions = getattr(forward_batch, "positions", None)
