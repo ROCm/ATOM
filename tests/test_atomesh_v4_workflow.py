@@ -102,7 +102,7 @@ class V4WorkflowTest(unittest.TestCase):
                     schedule=schedule,
                     ATOMESH_SLURM_SUBMIT_RUNNER=runner,
                     ATOMESH_1P1D_NODES="n1,n2,n3,n4" if "mi350" in runner else "",
-                    ATOMESH_2P1D_NODES="n1,n2,n3,n4" if "mi350" in runner else "",
+                    ATOMESH_2P1D_NODES="n1,n2,n3,n4,n5" if "mi350" in runner else "",
                 )
                 self.assertTrue(all(cell["model"] != MODEL for cell in cells))
 
