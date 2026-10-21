@@ -449,6 +449,7 @@ class WritePathTest(unittest.TestCase):
         conn = object.__new__(self.connector)
         names = [f"layer_{i}" for i in range(layers)]
         conn.is_producer = producer
+        conn.transfer_mode = "write"
         conn.tp_rank = 1
         conn.tp_size = 8
         conn.dp_rank = 0
@@ -544,12 +545,12 @@ class WritePathTest(unittest.TestCase):
         request.update(overrides)
         return request
 
-    def test_mode_defaults_to_write(self):
+    def test_mode_defaults_to_read(self):
         mode = self.connector._transfer_mode_from
-        self.assertEqual(mode({}, env_mode=""), "write")
-        self.assertEqual(mode({"moriio_mode": "READ"}, env_mode=""), "read")
+        self.assertEqual(mode({}, env_mode=""), "read")
+        self.assertEqual(mode({"moriio_mode": "WRITE"}, env_mode=""), "write")
         # The env var wins, so a run can flip modes without a new config.
-        self.assertEqual(mode({"moriio_mode": "read"}, env_mode="write"), "write")
+        self.assertEqual(mode({"moriio_mode": "write"}, env_mode="read"), "read")
         with self.assertRaises(ValueError):
             mode({"moriio_mode": "push"}, env_mode="")
 

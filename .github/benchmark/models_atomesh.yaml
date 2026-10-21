@@ -1428,6 +1428,7 @@ models:
           env:
             common:
               KV_CONNECTOR: moriio
+              ATOM_MORIIO_MODE: write
             decode:
               # Empty drops the model-level Mooncake JSON for the built-in config.
               DECODE_KV_TRANSFER_CONFIG: ""
@@ -1946,6 +1947,8 @@ models:
         # so setting this once keeps the two cells below differing in nothing
         # but KV_CONNECTOR.
         MC_GID_INDEX: "1"
+        # MoRI IO only, set here for the same reason; see the Kimi-K2.5 cell.
+        ATOM_MORIIO_MODE: write
       prefill: {}
       decode: {}
     server:

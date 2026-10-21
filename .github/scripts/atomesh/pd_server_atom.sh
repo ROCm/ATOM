@@ -425,8 +425,12 @@ kv_transfer_config() {
   local ip="$3"
   local port="$4"
   if [[ -z "${override}" ]]; then
-    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s}' \
-      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}"
+    local extra=""
+    if [[ "${KV_CONNECTOR:-mooncake}" == moriio ]]; then
+      extra=',"moriio_mode":"write"'
+    fi
+    printf '{"kv_role":"%s","kv_connector":"%s","proxy_ip":"%s","handshake_port":%s%s}' \
+      "${role}" "${KV_CONNECTOR:-mooncake}" "${ip}" "${port}" "${extra}"
     return 0
   fi
   if [[ -n "${KV_CONNECTOR:-}" ]]; then

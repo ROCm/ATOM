@@ -83,9 +83,9 @@ class MoRIIOConnector(KVConnectorBase):
     3. Moving KV cache blocks from the producer to the consumer, in one of two
        modes chosen by the consumer's ``moriio_mode``:
 
-       - ``write`` (default): the consumer sends the producer its block ids
-         and the producer pushes the KV with RDMA writes, then reports back.
-       - ``read``: the consumer pulls the KV with RDMA reads.
+       - ``read`` (default): the consumer pulls the KV with RDMA reads.
+       - ``write``: the consumer sends the producer its block ids and the
+         producer pushes the KV with RDMA writes, then reports back.
 
     4. Tracking transfer completion and notifying the peer when done.
     5. Periodically pinging the proxy for service discovery.
@@ -347,16 +347,14 @@ class MoRIIOConnector(KVConnectorBase):
     def _transfer_mode_from(
         kv_transfer_config: dict, env_mode: str | None = None
     ) -> str:
-        """``"write"`` or ``"read"``: which side posts the RDMA verbs.
+        """``"read"`` or ``"write"``: which side posts the RDMA verbs.
 
         Only the consumer's mode matters: it either pulls with reads or asks
-        for a push, and the producer serves both. Write is the default because
-        on ionic AINIC (fw 1.117.5-a-56) an RDMA READ into GPU memory reports
-        SUCCESS without placing any data, while writes land.
+        for a push, and the producer serves both. 
         """
         if env_mode is None:
             env_mode = envs.ATOM_MORIIO_MODE
-        mode = env_mode or kv_transfer_config.get("moriio_mode", "write")
+        mode = env_mode or kv_transfer_config.get("moriio_mode", "read")
         mode = str(mode).lower()
         if mode not in ("read", "write"):
             raise ValueError(f"moriio_mode must be 'read' or 'write', got {mode!r}")

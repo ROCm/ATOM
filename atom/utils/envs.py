@@ -150,8 +150,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_FAILED_WRITE_HOLD_S": lambda: float(
         os.getenv("ATOM_PD_FAILED_WRITE_HOLD_S", "60")
     ),
-    # MoRIIO P/D, decode side: "write" (the prefill pushes) or "read" (the
-    # decode pulls). Unset = kv_transfer_config's moriio_mode, else write.
+    # MoRIIO P/D, decode side: "read" (the decode pulls) or "write" (the
+    # prefill pushes). Unset = kv_transfer_config's moriio_mode, else read.
     "ATOM_MORIIO_MODE": lambda: os.getenv("ATOM_MORIIO_MODE", ""),
     # MoRIIO P/D: how long a request waits for the handshake with its peer.
     "ATOM_MORIIO_HANDSHAKE_TIMEOUT_S": lambda: float(

@@ -71,6 +71,7 @@ class MoriIOCellTest(unittest.TestCase):
         env = self.cell["env"]
         for role in ("common", "prefill", "decode"):
             self.assertEqual(env[role]["KV_CONNECTOR"], "moriio")
+        self.assertEqual(env["common"]["ATOM_MORIIO_MODE"], "write")
         # The model-level Mooncake JSON must not survive into a MoRI IO cell.
         self.assertEqual(env["decode"].get("DECODE_KV_TRANSFER_CONFIG"), "")
         self.assertEqual(env["prefill"].get("PREFILL_KV_TRANSFER_CONFIG"), None)
@@ -126,6 +127,11 @@ class DeepSeekV3AttributionCellsTest(unittest.TestCase):
                 for cell in (mooncake, moriio)
             ]
             self.assertEqual(without[0], without[1])
+
+    def test_both_cells_ask_moriio_to_push(self):
+        # Shared, so the pair still differs only by the connector.
+        for cell in self.cells.values():
+            self.assertEqual(cell["env"]["common"]["ATOM_MORIIO_MODE"], "write")
 
     def test_neither_cell_pins_a_kv_transfer_config(self):
         # An explicit JSON would override the built-in config and defeat the
@@ -196,6 +202,7 @@ class KvConnectorTest(unittest.TestCase):
                 "kv_connector": "moriio",
                 "proxy_ip": "10.0.0.2",
                 "handshake_port": 6309,
+                "moriio_mode": "write",
             },
         )
 
