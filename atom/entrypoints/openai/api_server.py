@@ -475,6 +475,28 @@ def _pd_timing_probe(event: str, kv_transfer_params, **fields) -> None:
         pd_timing.log(event, tid, **fields)
 
 
+async def _pd_timing_first_frame(
+    gen: AsyncGenerator[str, None], tid
+) -> AsyncGenerator[str, None]:
+    """Pass ``gen`` through, logging ``D_sse`` as its first output leaves."""
+    pending = True
+    try:
+        async for chunk in gen:
+            if pending:
+                for data in iter_sse_data(chunk):
+                    try:
+                        payload = json.loads(data)
+                    except ValueError:
+                        continue
+                    if has_generated_output(payload):
+                        pd_timing.log("D_sse", tid)
+                        pending = False
+                        break
+            yield chunk
+    finally:
+        await gen.aclose()
+
+
 async def _client_stream(
     gen: AsyncGenerator[str, None], request_id: str
 ) -> AsyncGenerator[str, None]:
@@ -1776,6 +1798,9 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                     reasoning=_reasoning,
                     tool_parser_cls=tool_call_parser_cls,
                 )
+            tid = (request.kv_transfer_params or {}).get("transfer_id")
+            if pd_timing.sampled(tid):
+                gen = _pd_timing_first_frame(gen, tid)
             return StreamingResponse(
                 _client_stream(gen, request_id),
                 media_type="text/event-stream",
