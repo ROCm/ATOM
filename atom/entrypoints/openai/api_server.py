@@ -37,6 +37,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from atom import SamplingParams
 from atom.entrypoints.chat_utils import has_multimodal_content, parse_chat_messages
+from atom.kv_transfer.disaggregation import pd_timing
 from atom.model_engine.arg_utils import EngineArgs
 from atom.model_engine.llm_engine import _load_tokenizer
 from atom.model_engine.request import RequestOutput
@@ -466,6 +467,12 @@ def _json_response(model: Any) -> Response:
     (prefill under PD) that is ~26 ms against ~93 ms, on the event loop.
     """
     return Response(content=model.model_dump_json(), media_type="application/json")
+
+
+def _pd_timing_probe(event: str, kv_transfer_params, **fields) -> None:
+    tid = (kv_transfer_params or {}).get("transfer_id")
+    if pd_timing.sampled(tid):
+        pd_timing.log(event, tid, **fields)
 
 
 async def _client_stream(
@@ -1616,6 +1623,8 @@ async def general_error_handler(request: Request, exc: Exception):
 async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """Handle chat completion requests (OpenAI-compatible)."""
 
+    if (request.kv_transfer_params or {}).get("do_remote_prefill"):
+        _pd_timing_probe("D_http", request.kv_transfer_params)
     validate_model(request.model)
 
     try:
@@ -1872,7 +1881,15 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tool_parser_cls=tool_call_parser_cls,
             )
         _log_request_model("response", request_id, resp)
-        return _json_response(resp)
+        t0 = time.perf_counter()
+        response = _json_response(resp)
+        _pd_timing_probe(
+            "P_resp",
+            resp.kv_transfer_params,
+            ser_ms=f"{(time.perf_counter() - t0) * 1e3:.1f}",
+            bytes=len(response.body),
+        )
+        return response
 
     except _ClientDisconnected:
         # Client hung up; seq already aborted + popped. Nothing to return.
