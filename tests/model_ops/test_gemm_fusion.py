@@ -3436,12 +3436,12 @@ class _R19Plan(FakePlan):
         self.runs.append(kw)
 
 
-def _per_launch_case(make_site, *, abi=3, pos=None, slot=None, xs=None):
+def _per_launch_case(make_site, *, abi=3, pos=None, slot=None, xs=None, direct=False):
     import torch as _torch
 
     plan = _R19Plan()
     plan.abi = abi
-    s = make_site(FakeResources(plan_n=(plan, 2)))
+    s = make_site(FakeResources(plan_n=(plan, 2)), direct=direct)
     s.attn = SimpleNamespace(
         impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True)
     )
@@ -3667,3 +3667,95 @@ def test_the_decision_label_names_the_path_the_inputs_took(make_site):
     assert s._decision(ctx, r2, "profile_hit", "fused", st).bind_mode == "staged"
     r3 = site_mod.Resolution(plan, 1, "fake.large", "profile_hit")
     assert s._decision(ctx, r3, "profile_hit", "fused", st).bind_mode == "raw"
+
+
+# ------------------------------------------- R12: the golden adapter (DirectGemmFusionSite) and r19
+def _direct_prepare(make_site, monkeypatch, abi):
+    """Run DirectGemmFusionSite.prepare_bucket for one bucket and return what the plan would be
+    bound on: ``(site's own staging, the caller's direct tensors, what _bind_plan saw)``.
+    """
+    import torch as _torch
+
+    plan = _R19Plan()
+    plan.abi = abi
+    s = make_site(FakeResources(plan_n=(plan, 2)), direct=True)
+    own = SimpleNamespace(
+        outs={},
+        xs=_T((16, 1), _torch.float32),
+        pos=_T((64,), _torch.int64),
+        slot=_T((64,), _torch.int64),
+        prepared=False,
+        plan=None,
+        kv_ptrs=None,
+        m=16,
+        ptrs=None,
+        rebound=False,
+        own_token_arrays=False,
+    )
+    mine = (own.xs, own.pos, own.slot)
+    monkeypatch.setattr(s, "_stage", lambda tokens, device, dtype: own)
+    seen = []
+    monkeypatch.setattr(
+        s,
+        "_bind_plan",
+        lambda r, tokens, st, state, device, kv: seen.append(
+            (st.xs, st.pos, st.slot, state)
+        )
+        or True,
+    )
+    state = {
+        "slot_mapping": _T((64,), _torch.int64),
+        "k_cache": _T(),
+        "v_cache": _T(),
+        "k_scale": _T(),
+        "v_scale": _T(),
+    }
+    direct = {
+        "x_scale": _T((16, 1), _torch.float32),
+        "positions": _T((64,), _torch.int64),
+        "slot_mapping": state["slot_mapping"],
+        "state": state,
+    }
+    assert s.prepare_bucket(64, "dev", {}, None, direct=direct) is True
+    (bound,) = seen
+    return mine, direct, bound, own
+
+
+def test_an_r19_plan_binds_none_of_the_callers_per_launch_arrays_but_its_caches(
+    make_site, monkeypatch
+):
+    mine, direct, bound, own = _direct_prepare(make_site, monkeypatch, abi=3)
+    xs, pos, slot, state = bound
+    assert (
+        xs,
+        pos,
+        slot,
+    ) == mine  # the site's own conforming arrays: only prepare() sees them
+    assert state is direct["state"]  # the caches ARE bound, from the caller's state
+    assert own.own_token_arrays is False
+
+
+def test_an_r17_r18_plan_still_binds_the_callers_arrays_in_the_golden_adapter(
+    make_site, monkeypatch
+):
+    _mine, direct, bound, _own = _direct_prepare(make_site, monkeypatch, abi=2)
+    xs, pos, slot, _state = bound
+    assert xs is direct["x_scale"]  # unchanged behaviour for the A/B
+    assert pos is direct["positions"] and slot is direct["slot_mapping"]
+
+
+def test_a_direct_r19_call_never_asks_for_a_copy_and_is_labelled_per_launch(make_site):
+    s, plan, st, _state, ctx, x, xs = _per_launch_case(make_site, direct=True)
+    st.ptrs = (0, 0, 0, 0, 0, 0, 0)  # what an r17/r18 bind would have recorded
+    r, _reason, _got_state, got_st = s._prepare(ctx, x, xs)
+    assert r.plan is plan and got_st.rebound is False
+    assert s._bind_label(r, "fused", got_st) == "per_launch"
+
+
+def test_a_direct_r17_r18_call_keeps_its_direct_labels(make_site):
+    s, _plan, st, _state, ctx, x, xs = _per_launch_case(make_site, abi=2, direct=True)
+    st.ptrs = (0, 0, 0, 0, 0, 0, 0)
+    r, _reason, _got_state, got_st = s._prepare(ctx, x, xs)
+    assert (
+        s._bind_label(r, "fused", got_st) == "direct+copy"
+    )  # addresses differ: refreshed

@@ -386,6 +386,12 @@ def test_wrapper_drives_the_real_fusion_resources_end_to_end(real_gf, atu):
     except ImportError as e:
         pytest.skip(f"variants need the native stack to import: {e}")
     assert plan is not None and n == 2 and plan.vid == "sp_qkv.small.v1"
+    # aiter 46a73020: every small row of the shipped profile runs src r19 (abi 3). ATOM must then
+    # pass x_scale / positions / slot_mapping per launch and stage nothing for it.
+    from atom.model_ops.gemm_fusion.site import GemmFusionSite
+
+    assert (plan.src, plan.abi) == ("r19", 3)
+    assert GemmFusionSite.per_launch(plan) is True
 
     # THE ownership contract: ATOM must key windows exactly as the plan does
     assert (

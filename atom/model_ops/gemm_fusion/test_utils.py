@@ -543,14 +543,19 @@ def install_alias_check():
 # 4. direct-bind site (golden harness only)
 # =============================================================================
 class DirectGemmFusionSite(GemmFusionSite):
-    """A site whose plans bind the CALLER's own x_scale / positions / slot_mapping / cache tensors
-    at prepare time, with no per-call staging copies. Valid only where the caller guarantees stable
-    addresses (the golden harness cases; graph static buffers). The model path cannot use it:
+    """A site whose r17/r18 plans bind the CALLER's own x_scale / positions / slot_mapping / cache
+    tensors at prepare time, with no per-call staging copies. Valid only where the caller guarantees
+    stable addresses (the golden harness cases; graph static buffers). The model path cannot use it:
     ATOM's per-call tensors are not address-stable, which is why the runtime site stages.
 
     A moved x_scale / positions / slot_mapping is refreshed by a device-side copy (decision label
     ``direct+copy``); moved KV caches are reported as "not prepared" at prepare time so
-    ``agree_prepared`` downgrades the bucket to native on ALL ranks."""
+    ``agree_prepared`` downgrades the bucket to native on ALL ranks.
+
+    An r19 plan (``plan.abi >= 3``) binds none of x_scale / positions / slot_mapping: they are
+    per-launch kernel arguments, so the golden case's tensors are simply passed on every launch
+    (decision label ``per_launch``, no copy) and only the KV caches of ``direct["state"]`` are bound.
+    """
 
     bind_mode = "direct"
 
@@ -609,14 +614,20 @@ class DirectGemmFusionSite(GemmFusionSite):
             )
             return live[3:] == st.ptrs[3:]
         state = direct["state"]
-        st.xs = direct["x_scale"]
-        st.own_token_arrays = (
-            int(direct["positions"].shape[-1]) < tokens
-            or int(direct["slot_mapping"].shape[-1]) < tokens
-        )
-        if not st.own_token_arrays:
-            st.pos, st.slot = direct["positions"], direct["slot_mapping"]
-        # else: keep the T-length arrays _stage allocated (the caller's would be read out of bounds)
+        if self.per_launch(r.plan):
+            # r19: nothing of x_scale / positions / slot_mapping is bound (per-launch kernel
+            # arguments): keep the site's own conforming arrays for prepare(), pass the caller's
+            # on every launch.
+            st.own_token_arrays = False
+        else:
+            st.xs = direct["x_scale"]
+            st.own_token_arrays = (
+                int(direct["positions"].shape[-1]) < tokens
+                or int(direct["slot_mapping"].shape[-1]) < tokens
+            )
+            if not st.own_token_arrays:
+                st.pos, st.slot = direct["positions"], direct["slot_mapping"]
+            # else: keep the T-length arrays _stage allocated (the caller's would be read OOB)
         ptrs = list(self._live_ptrs(st.xs, st.pos, state))
         ptrs[2] = self._ptr(st.slot)  # the slot array the plan is actually bound to
         st.ptrs = tuple(ptrs)
@@ -625,12 +636,16 @@ class DirectGemmFusionSite(GemmFusionSite):
     def _prepare(self, ctx, x, x_scale):
         r, reason, state, st = super()._prepare(ctx, x, x_scale)
         if st is not None:
-            # x_scale / positions / slot_mapping may have moved since prepare: refreshed by copy
-            # in _stage_inputs. The KV addresses were checked at prepare, not here.
-            live = self._live_ptrs(x_scale, ctx.positions, state)
-            st.rebound = (
-                bool(getattr(st, "own_token_arrays", False)) or live[:3] != st.ptrs[:3]
-            )
+            if self.per_launch(r.plan):
+                st.rebound = False  # nothing is bound on the caller's arrays: they are per launch
+            else:
+                # x_scale / positions / slot_mapping may have moved since prepare: refreshed by
+                # copy in _stage_inputs. The KV addresses were checked at prepare, not here.
+                live = self._live_ptrs(x_scale, ctx.positions, state)
+                st.rebound = (
+                    bool(getattr(st, "own_token_arrays", False))
+                    or live[:3] != st.ptrs[:3]
+                )
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
@@ -642,6 +657,8 @@ class DirectGemmFusionSite(GemmFusionSite):
     def _bind_label(self, r, path, st):
         if path == "fused" and r.n_fused < 2:
             return "raw"
+        if path == "fused" and self.per_launch(r.plan):
+            return "per_launch"
         bm = "direct"
         if path == "fused" and st is not None and getattr(st, "rebound", False):
             bm += "+copy"  # rank-local
