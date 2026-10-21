@@ -129,7 +129,7 @@ one does not. So the pool declares NO per-token scale planes
 (`mha_kv_scale_fields(per_tensor_scales=True)`) and the scale is a python 1.0.
 
 `float()` on a multi-element tensor raises ValueError, which
-`verify_shared_kv_fwd` CATCHES and answers with 1.0 (verify_mla.py:784-790) --
+`verify_shared_kv_fwd` CATCHES and answers with 1.0 (verify_mla.py:852-858) --
 a per-token plane reaching it would be silently ignored, not rejected. Hence
 the explicit `numel() == 1` guard in `_store_cfg`, the same shape as
 `AttentionImpl._reject_per_token_scales_on_unified` (attention_mha.py:182).
@@ -404,7 +404,7 @@ class KimiK3DFlashAttention(nn.Module):
         the scales), "fp8" divides by `*k_scale` and casts.
 
         THE GUARD. `verify_shared_kv_fwd` does `float(k_scale)` inside a `try`
-        and answers 1.0 on ValueError (verify_mla.py:784-790) -- so a per-token
+        and answers 1.0 on ValueError (verify_mla.py:852-858) -- so a per-token
         scale plane reaching it is not an error, it is a silent 1.0 against a
         cache quantized at something else. Refused here instead, mirroring
         `AttentionImpl._reject_per_token_scales_on_unified`
@@ -463,7 +463,7 @@ class KimiK3DFlashAttention(nn.Module):
             # numerics and read like a kernel regression. Refused instead.
             raise NotImplementedError(
                 "ATOM_K3_DRAFT_SGLANG_ATTN=0 needs a bf16 draft KV pool; this "
-                f"one is {k_cache.dtype}. Run the target at --kv-cache-dtype "
+                f"one is {k_cache.dtype}. Run the target at --kv_cache_dtype "
                 "bf16 to A/B the two reads, or leave the SGLang read armed."
             )
 
@@ -554,7 +554,7 @@ class KimiK3DFlashAttention(nn.Module):
         # The SAME scales the write just quantized with, read off the one cache
         # that resolved them -- a per-tensor python float each, guarded at
         # `numel() == 1` there because this call answers a multi-element tensor
-        # with a silent 1.0 (verify_mla.py:784-790).
+        # with a silent 1.0 (verify_mla.py:852-858).
         _, _, _, k_scale, v_scale = self._store_cfg(k_cache)
         # Explicitly dense, NOT `empty_like`: q3 is strided, and an output that
         # inherited that pitch would be a buffer with holes the kernel writes

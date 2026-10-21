@@ -211,8 +211,11 @@ def _verify_mla_prefix_stage1(
             #
             # `kv_indices` is int32, and `kv_loc * stride_buf_kbs` was therefore
             # evaluated in int32, so the flat element offset wraps at 2**31.
-            # With stride_buf_kbs = num_kv_heads * head_dim = 2 * 64 = 128 that
-            # is pool entry 2**31 / 128 = 16384, and ATOM sizes this pool past
+            # With stride_buf_kbs = num_kv_heads * head_dim = 2 * 64 = 128 the
+            # flat offset wraps at slot id 2**31 / 128 = 16,777,216. ATOM's ids
+            # are `entry_index * entry_tokens`, and entry_tokens = block_size *
+            # dcp is 1024 at block_size 128 / dcp 8, so that boundary is pool
+            # entry 16,777,216 / 1024 = 16,384 -- and ATOM sizes this pool past
             # that. Entries above the boundary address far BELOW the buffer and
             # -- still inside ATOM's single paged allocation -- read silent
             # garbage rather than faulting. The block allocator hands out low

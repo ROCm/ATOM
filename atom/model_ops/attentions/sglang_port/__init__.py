@@ -34,7 +34,9 @@ Every deviation from the pinned upstream files is marked inline with a
 * ``TARGET_PROGRAMS`` is retuned 512 -> 2048, so that the stage-1 split count
   still reaches ``MAX_N_SPLITS`` at the batch sizes ATOM serves.
 
-``kv_indices.py`` is byte-identical to its pinned source. ATOM drives its
+``kv_indices.py`` carries no ``# LOCAL FIX:`` -- its kernel body is unmodified.
+It differs from the pinned source only by the provenance header, a
+``# ruff: noqa: SIM102`` directive, and comments on two arguments. ATOM drives its
 ``TOKEN_BLOCK_PARALLEL`` arm via the ``kv_indices_num_token_blocks`` helper the
 same file exports; that is a call-site choice, not a modification.
 

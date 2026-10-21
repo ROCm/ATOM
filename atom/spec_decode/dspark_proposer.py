@@ -1175,7 +1175,7 @@ class DSparkProposer(Drafter):
         # stream inside the block table's width, and a prefix is always at
         # least that much shorter. The floor at 1 is the KERNEL's and is
         # provably inert, not a correction: a zero-length prefix makes stage 1
-        # divide 0/0 and add -inf + log(0), i.e. NaN (verify_mla.py:215,225),
+        # divide 0/0 and add -inf + log(0), i.e. NaN (verify_mla.py:375-376),
         # and no row can produce one -- the anchor is a POSITION, so
         # `anchor + 1 >= 1`, and the pad tail's `_paged_pad_ctx_len` is the
         # anchor-at-0 row's `1 + T`. It is there so that stays true if either
@@ -1245,7 +1245,8 @@ class DSparkProposer(Drafter):
                 # (kv_indices.py:45-50): "one program crawling the whole
                 # context serially (which bottlenecks long-context spec decode,
                 # where this kernel runs every iteration)". ATOM vendored
-                # `kv_indices_num_token_blocks` for this and never called it.
+                # `kv_indices_num_token_blocks` for this without ever calling
+                # it; the 2D launch below is the first call site.
                 #
                 # It matters HERE and not for the MLA draft because this draft
                 # is not in the dcp group: it crawls the FULL context where a

@@ -2320,11 +2320,16 @@ class Config:
                     "only), or drop DCP or speculative decode."
                 )
                 # A non-MLA draft owns a SIBLING KV pool with two axes, and DCP
-                # shards one of them. That is only reconstructible where the
-                # draft replicates its heads across the DCP group and merges
-                # the per-rank partial softmaxes by LSE -- which exactly one
-                # draft family in this tree does (the DFlash non-causal GQA
-                # block drafter, `needs_non_causal_kv`). MLA is immune by
+                # shards one of them. That is only safe where the draft stays
+                # OUT of the dcp group and runs at DCP1, so the head axis is
+                # never sharded at all -- which exactly one draft family in
+                # this tree does (the DFlash non-causal GQA block drafter,
+                # `needs_non_causal_kv`; the target stays at DCP8 while the
+                # draft reads a pool whose entry is `block_size * dcp_size`
+                # tokens wide, `spec_decode/draft_kv.py:46-57`). Note
+                # `verify_shared_kv_fwd` returns only `o` and never an LSE, so
+                # it could not merge partial softmaxes even if asked. MLA is
+                # immune by
                 # construction: its cache is one latent row per token,
                 # replicated across TP, so DCP's token shard is the only shard.
                 #
@@ -2363,8 +2368,8 @@ class Config:
                         f"{self.decode_context_parallel_size}) with a non-MLA "
                         "draft that owns its own KV pool is only supported for the "
                         "DFlash block drafter, "
-                        "which replicates its KV heads across the DCP group and "
-                        "merges the per-rank partial softmaxes. This draft "
+                        "which stays out of the DCP group and runs at DCP1 so "
+                        "its head axis is never sharded. This draft "
                         f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
                         "would be sharded on BOTH the head and the token axis, "
                         "which is unreconstructible. Disable DCP for this draft."
