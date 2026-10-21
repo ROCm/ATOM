@@ -17,8 +17,19 @@ def create_scheduler(*args, **kwargs):
     manager = scheduler.kv_cache_manager
     coordinator = manager.coordinator
     requested = scheduler.cache_config.enable_mamba_shared_prefix_checkpoint
+    no_tail_split = (
+        os.environ.get("C48_P_NO_TAIL_SPLIT") == "1"
+        and os.environ["C48_DIAG_ROLE"] == "prefill"
+    )
+    if no_tail_split:
+        if scheduler.mamba_shared_prefix_checkpoint:
+            raise RuntimeError("C48_P_NO_TAIL_SPLIT does not support shared-prefix checkpoints")
+        # Skip the extra Prefill step that only registers the prompt's partial-tail
+        # Mamba state; internal checkpoints and block-boundary states still cache.
+        scheduler.mamba_partial_cache_hit = False
     record = {
         "role": os.environ["C48_DIAG_ROLE"],
+        "no_tail_split": no_tail_split,
         "scheduler_class": base.__module__ + "." + base.__name__,
         "async_scheduling": config.scheduler_config.async_scheduling,
         "requested_shared_prefix_checkpoint": requested,
