@@ -412,7 +412,7 @@ Multi-Token Prediction (MTP) models serve as lightweight draft models for specul
 | `atom/models/mixtral.py` | Mixtral model: `MixtralForCausalLM`, `MixtralModel`, `MixtralDecoderLayer`, `MixtralAttention`, `MixtralMoE` |
 | `atom/models/gpt_oss.py` | GPT-OSS model: `GptOssForCausalLM`, `GptOssModel`, `TransformerBlock`, `OAIAttention`, `MLPBlock` |
 | `atom/models/glm4_moe.py` | GLM4-MoE model: `Glm4MoeForCausalLM`, `Glm4MoeModel`, `Glm4MoeDecoderLayer`, `Glm4MoeAttention`, `Glm4MoE`, `Glm4MoeMLP` |
-| `atom/models/qwen3_5.py` | Qwen3.5 model: `Qwen3_5ForConditionalGenerationTextOnly`, `Qwen3_5MoeForConditionalGenerationTextOnly`, `Qwen3_5Model`, `Qwen3_5MoeModel`, `Qwen3_5DecoderLayer`, `Qwen3_5RMSNorm`, `Qwen3_5Attention`, `Qwen3_5GatedDeltaNet`, `Qwen3_5SparseMoeBlock`, `Qwen3_5MLP` |
+| `atom/models/qwen3_5/model.py` | Qwen3.5 model: `Qwen3_5ForConditionalGenerationTextOnly`, `Qwen3_5MoeForConditionalGenerationTextOnly`, `Qwen3_5Model`, `Qwen3_5MoeModel`, `Qwen3_5DecoderLayer`, `Qwen3_5RMSNorm`, `Qwen3_5Attention`, `Qwen3_5GatedDeltaNet`, `Qwen3_5SparseMoeBlock`, `Qwen3_5MLP` |
 | `atom/models/qwen3_next.py` | Qwen3-Next model: `Qwen3NextForCausalLM`, `Qwen3NextModel`, `Qwen3NextDecoderLayer`, `Qwen3NextAttention`, `Qwen3NextGatedDeltaNet`, `Qwen3NextSparseMoeBlock`, `Qwen3NextMLP` |
 | `atom/models/kimi_k3.py` | Kimi-K3 model: `KimiK3ForConditionalGeneration`, `KimiK3ForCausalLM`, `KimiLinearForCausalLM`, `KimiLinearModel`, `KimiDecoderLayer`, `KimiFullAttention`, `KimiKDAAttention`, `KimiSparseMoeBlock`, `KimiMLP` |
 | `atom/models/kimi_k3_vl.py` | Kimi-K3 MoonViT3d vision encoder: `KimiK3VisionTower`, `KimiK3VisionEncoder`, `KimiK3VisionBlock`, `KimiK3PatchEmbed`, `KimiK3PatchMergerProjector`, `build_vision_modules` |
