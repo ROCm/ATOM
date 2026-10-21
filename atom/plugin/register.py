@@ -418,7 +418,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         )
 
     def _qwen4_draft_extend_graph_enabled(runner) -> bool:
-        """PROTOTYPE: Flash draft-extend graph, on top of the draft decode graph."""
+        """Flash draft-extend graph, on top of the draft decode graph."""
         return (
             _is_qwen4_exp_nextn_runner(runner)
             and envs.ATOM_SGLANG_QWEN4_DRAFT_CG
@@ -970,7 +970,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
-                # PROTOTYPE: the Flash drafter also takes this plugin-built
+                # The Flash drafter also takes this plugin-built
                 # draft-extend runner; SGLang's own HIP gate only admits aiter
                 # multi-step / DSV4 / DSA backends.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
