@@ -66,6 +66,12 @@ class StateByteCodec:
         if self._max_entries is not None and self._max_entries < 1:
             raise ValueError("state CPU budget must fit at least one checkpoint")
         self._cache_keys: OrderedDict[Any, None] = OrderedDict()
+        # Under a budget, one extra reference per stored image. LMCache's
+        # LocalCPU LRU only evicts objects whose ref count is 1, so the pool
+        # cannot drop an image behind the codec's back while the engine-side
+        # `StateOffloadIndex` still advertises it. The budget is a reservation:
+        # only `put`'s own LRU retires these, KV pressure cannot.
+        self._held: dict[Any, Any] = {}
         self._cache_lock = threading.Lock()
         self._store_lock = threading.Lock()
         # Never hard-code a size: V4 keeps six compressor fields across
@@ -126,11 +132,27 @@ class StateByteCodec:
         key = self.key(h)
         with self._store_lock:
             with self._cache_lock:
-                if key not in self._cache_keys:
-                    while len(self._cache_keys) >= self._max_entries:
-                        old = next(iter(self._cache_keys))
-                        self._storage.remove(old)
-                        del self._cache_keys[old]
+                if key in self._held:
+                    # Same prefix hash and layout, same bytes, and the held
+                    # reference keeps the stored copy resident: storing again
+                    # would only cost an image-sized D2H that LocalCPU then
+                    # refuses as a duplicate key.
+                    self._cache_keys.move_to_end(key)
+                    stored = True
+                else:
+                    stored = False
+                    if key not in self._cache_keys:
+                        while len(self._cache_keys) >= self._max_entries:
+                            old = next(iter(self._cache_keys))
+                            self._storage.remove(old)
+                            del self._cache_keys[old]
+                            held = self._held.pop(old, None)
+                            if held is not None:
+                                held.ref_count_down()
+            if stored:
+                if on_source_released is not None:
+                    on_source_released()
+                return True
             ok = self._put(h, unit_ids, on_source_released)
             if ok:
                 with self._cache_lock:
@@ -164,6 +186,9 @@ class StateByteCodec:
         obj = self._allocate(self.entry_bytes)
         if obj is None:
             return False
+        hold = self._max_entries is not None
+        if hold:
+            obj.ref_count_up()
         # `batched_put` discharges the reference it is handed, but only in its
         # terminal tail loop (LMCache `storage_manager.py`, one
         # `ref_count_down()` per object), which runs *after* every step that can
@@ -196,7 +221,19 @@ class StateByteCodec:
             self._storage.batched_put([key], [obj])
         except Exception:
             obj.ref_count_down()
+            if hold:
+                obj.ref_count_down()
             raise
+        if hold:
+            ref_count = getattr(obj, "get_ref_count", None)
+            if not callable(ref_count) or ref_count() > 1:
+                # The hot cache adopted it (its own reference plus ours).
+                with self._cache_lock:
+                    self._held[key] = obj
+            else:
+                # Refused, e.g. the key was already resident: ours is the
+                # last reference, and keeping it would strand the block.
+                obj.ref_count_down()
         return True
 
     def get(self, h: int, slot) -> bool:
