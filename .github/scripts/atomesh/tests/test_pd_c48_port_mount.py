@@ -28,6 +28,7 @@ CPUREF = {
     "V-QD-CPUREF2-FP8ATTN-FQ2-WARM1": "cpu-lru-refresh-v2",
     "V-QD-CPUREF2-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM": "cpu-lru-refresh-v2",
     "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM": "cpu-lru-refresh-v3",
+    "V-QD-CPUREF3-FP8ATTN-FQ3-PQ-LDFP4-INPAD-WARM-DG5": "cpu-lru-refresh-v3",
 }
 FP8ATTN = "/vllm/v1/attention/backends/mla/prefill/aiter_flash_attn.py,readonly"
 LDFP4_CASE = "V-QD-CPUREF2-FP8ATTN-FQ2-PQ-LDFP4"
