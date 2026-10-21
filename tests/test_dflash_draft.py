@@ -855,3 +855,208 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
     proposer._aux_capture_spec(target)
     assert seen == {"layer_ids": (7, 11), "hidden_size": 16, "target_model": target}
+
+
+# --------------------------------------------------------------------------- #
+# the DCP admission guard (config.py __post_init__)
+#
+# The guard refuses DCP for a draft that OWNS a sibling KV pool and does NOT
+# read it non-causally. These exercise the PREDICATE exactly as `config.py`
+# computes it. They do NOT exercise the `raise` itself: reaching it needs
+# `aiter.jit.utils.chip_info.get_gfx` to answer "gfx950", so the end-to-end
+# refusal belongs in the GPU batch. What is covered here is the part that
+# decides WHICH configs are refused -- the half that silently regressed once.
+# --------------------------------------------------------------------------- #
+
+
+def _guard_refuses(draft_hf):
+    """Mirror of `config.py` 2352-2358, the predicate under the DCP guard."""
+    from atom.spec_decode.draft_kv import needs_non_causal_kv
+    from atom.utils.selector import attn_family, get_attn_backend
+
+    owns_sibling_pool = draft_hf is not None and bool(
+        get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
+    )
+    return owns_sibling_pool and not needs_non_causal_kv(draft_hf)
+
+
+def test_dcp_guard_admits_the_dflash_draft():
+    """DFlash owns a pool but stays out of the dcp group, so DCP is fine."""
+    draft_hf = _normalized_radixark()
+    assert _guard_refuses(draft_hf) is False
+
+
+def test_dcp_guard_refuses_a_pool_owning_causal_draft():
+    """An Eagle3-llama style MHA draft double-shards: head axis AND token axis.
+
+    This is the case the guard exists for. It owns a sibling pool like DFlash
+    does, but reads it causally, so it has no DCP1 escape -- and the failure is
+    silent (lost acceptance length, no fault), which is why it must be refused
+    at launch rather than diagnosed later.
+    """
+    draft_hf = types.SimpleNamespace(
+        architectures=["LlamaForCausalLMEagle3"],
+        model_type="llama",
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        num_hidden_layers=1,
+    )
+    assert _guard_refuses(draft_hf) is True
+
+
+def test_dcp_guard_admits_an_mtp_draft():
+    """`--method mtp` must still pass -- an earlier guard version broke it.
+
+    For mtp the draft hf config IS the target's, so `attn_family` returns the
+    TARGET's family (KIMI_MLA here), whose backend leaves `DRAFT_OWNS_KV_POOL`
+    at the default False: a latent-KV draft shares the target's cache and owns
+    no sibling pool. Keying on ownership rather than on `Family.MLA` is what
+    keeps `recipes/Agentic-GLM-5.2.md`'s documented
+    `--method mtp --decode-context-parallel-size 4` working.
+    """
+    target_hf = types.SimpleNamespace(
+        architectures=["KimiK3ForCausalLM"],
+        model_type="kimi_k3",
+        num_attention_heads=64,
+        num_hidden_layers=2,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=128,
+        v_head_dim=128,
+    )
+    assert _guard_refuses(target_hf) is False
+
+
+def test_dcp_guard_message_names_the_real_reason():
+    """The refusal text must describe DCP1, not a replicate-and-merge scheme.
+
+    `verify_shared_kv_fwd` returns only `o` and never an LSE, so the draft
+    cannot merge per-rank partial softmaxes -- it is exempt because it never
+    joins the dcp group (`spec_decode/draft_kv.py:46-57`). A message claiming
+    otherwise sends a reader looking for machinery that does not exist.
+    """
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "atom", "config.py"), encoding="utf-8") as fh:
+        src = fh.read()
+    guard = src[src.index("is only supported for the") :][:600]
+    assert "stays out of the DCP group" in guard
+    assert "DCP1" in guard
+    assert not re.search(r"merges the per-rank partial softmaxes", guard)
+
+
+# --------------------------------------------------------------------------- #
+# draft pool address arithmetic (dspark_proposer)
+#
+# `_draft_entry_tokens` is called on the REAL property. The slot and
+# prefix-length cases MIRROR the production expressions rather than driving
+# `_publish_draft_ctx_slots` end to end (that needs a forward_context, a
+# published block_table_state and attn_metadata). They are regression tests on
+# the ARITHMETIC -- they prove the aliasing the production comment names is
+# real and that the chosen formula avoids it. Driving the real method belongs
+# in the GPU batch alongside the rest of the proposer.
+# --------------------------------------------------------------------------- #
+
+
+def _entry_tokens(block_size, dcp, non_causal_gqa):
+    """Call the real property against a minimal stub."""
+    from atom.spec_decode.dspark_proposer import DSparkProposer
+
+    stub = types.SimpleNamespace(
+        runner=types.SimpleNamespace(block_size=block_size),
+        dcp_world_size=dcp,
+        _draft_reads_non_causal_gqa=non_causal_gqa,
+    )
+    return DSparkProposer._draft_entry_tokens.fget(stub)
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_draft_entry_spans_the_global_block_for_the_gqa_draft(dcp):
+    """A draft outside the dcp group stores all `block_size * dcp` positions.
+
+    The target's block id addresses `block_size` LOCAL tokens per rank. The
+    DFlash draft is not in the dcp group, so one id has to cover the whole
+    virtual block `dcp_prefill_slot_mapping` writes.
+    """
+    assert _entry_tokens(128, dcp, non_causal_gqa=True) == 128 * dcp
+
+
+@pytest.mark.parametrize("dcp", [1, 2, 8])
+def test_draft_entry_is_the_plain_block_for_the_mla_draft(dcp):
+    """A DCP-sharded draft addresses in LOCAL terms -- one id, one block."""
+    assert _entry_tokens(128, dcp, non_causal_gqa=False) == 128
+
+
+def test_block_size_instead_of_entry_tokens_aliases_requests():
+    """The regression `_publish_draft_ctx_slots` guards against.
+
+    Mirrors the slot expression at `dspark_proposer.py:844-846`:
+        block_tables[req, page] * vblock + pos % vblock
+    Using `block_size` in place of `vblock` addresses one `dcp`-th of each
+    entry, so `dcp` distinct block ids collapse onto overlapping slot ranges.
+    """
+    import torch
+
+    block_size, dcp = 128, 8
+    vblock = block_size * dcp
+    # Two requests holding ADJACENT entries, each reading its own first token.
+    block_ids = torch.tensor([3, 4], dtype=torch.int64)
+    pos = torch.tensor([0, 0], dtype=torch.int64)
+
+    correct = block_ids * vblock + torch.remainder(pos, vblock)
+    assert correct.tolist() == [3 * 1024, 4 * 1024]
+    # Distinct entries stay a full entry apart.
+    assert int(correct[1] - correct[0]) == vblock
+
+    wrong = block_ids * block_size + torch.remainder(pos, block_size)
+    # The bug: ids land `block_size` apart, so entry 3's 1024-token span runs
+    # straight through entries 4..10 -- eight requests on one range.
+    assert int(wrong[1] - wrong[0]) == block_size
+    assert int(wrong[0]) + vblock > int(wrong[1]), "must overlap to be the bug"
+
+
+def test_pages_past_the_table_are_dropped_not_clamped():
+    """Mirrors `dspark_proposer.py:838-848`.
+
+    A column the table does not have becomes -1. Clamping it into the last
+    column instead would hand the row ANOTHER request's KV, which reads as a
+    plausible answer rather than a fault.
+    """
+    import torch
+
+    vblock, width = 1024, 4
+    block_tables = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
+    pos = torch.tensor([0, 3 * vblock, 4 * vblock], dtype=torch.int64)
+    req = torch.zeros(3, dtype=torch.int64)
+
+    page = torch.div(pos, vblock, rounding_mode="floor")
+    in_table = page < width
+    page = page.clamp_(max=width - 1)
+    out = torch.where(
+        in_table,
+        block_tables[req, page] * vblock + torch.remainder(pos, vblock),
+        torch.tensor(-1, dtype=torch.int64),
+    )
+    assert out.tolist() == [10 * vblock, 13 * vblock, -1]
+
+
+def test_prefix_len_is_the_context_minus_the_block_floored_at_one():
+    """Mirrors `dspark_proposer.py:1185-1187`.
+
+    Stage 1 needs a NON-EMPTY prefix: a zero-length one divides 0/0 and adds
+    log(0) (`verify_mla.py:375-376`), i.e. NaN. The anchor is a position, so
+    `ctx - T >= 1` already holds for every real row; the floor keeps that true
+    if either side ever moves.
+    """
+    import torch
+
+    T = 7
+    ctx_lens = torch.tensor([64, 8, 7, 1], dtype=torch.int32)
+    prefix = torch.empty_like(ctx_lens)
+    torch.sub(ctx_lens, T, out=prefix)
+    prefix.clamp_(min=1)
+    assert prefix.tolist() == [57, 1, 1, 1]
+    assert int(prefix.min()) >= 1, "a zero-length prefix NaNs stage 1"
