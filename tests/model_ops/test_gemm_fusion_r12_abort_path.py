@@ -136,7 +136,7 @@ SCHED_METHODS = {
     "_abort_for_device_error",
     "_freed_blocks",
     "take_kv_scrub",
-    "_enable_free_tracking",
+    "_scrub_set",
 }
 
 
@@ -149,14 +149,15 @@ def _scheduler(events, live=()):
         return rid in live
 
     sched.running = []
-    sched.config = SimpleNamespace(gemm_fusion=SimpleNamespace(enabled=False))
     sched.abort_request = abort_request
     sched._postprocess_impl = lambda seqs, out, stream, batch: (
         events.append(("body", getattr(out, "aborted_req_ids", None))) or ["finished"]
     )
     sched.block_manager = SimpleNamespace(
         clear_cache=lambda: events.append(("clear_cache",)),
-        kv=SimpleNamespace(block=lambda b: SimpleNamespace(ref_count=0)),
+        kv=SimpleNamespace(
+            block=lambda b: SimpleNamespace(ref_count=0), used_free_blocks=list
+        ),
     )
     return sched
 

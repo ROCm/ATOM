@@ -3672,8 +3672,10 @@ class ModelRunner:
             return 0
         torch.cuda.synchronize()
         logger.warning(
-            "gemm_fusion: zeroed %d KV block(s) of aborted requests after a device error verdict",
+            "gemm_fusion: zeroed %d KV block(s) after a device error verdict (ids %d..%d)",
             len(ids),
+            min(ids),
+            max(ids),
         )
         return len(ids)
 

@@ -3926,12 +3926,9 @@ class Scheduler:
         dropped AFTER the body, so no block of this step is hashed behind the clear: corrupt KV that
         was already hashed (and freed) would otherwise be served to a later request as a prefix hit.
         Requests that finished inside the window are gone (their tokens were already streamed) and
-        cannot be aborted. See ``_postprocess_impl`` for the normal processing.
+        cannot be aborted, but the blocks they freed are scrubbed with every other free block that was
+        ever used. See ``_postprocess_impl`` for the normal processing.
         """
-        if not hasattr(self, "_gf_free_tracking"):
-            self._enable_free_tracking()
-        if self._gf_free_tracking:
-            self.block_manager.kv.advance_free_tick()
         aborted = getattr(fwd_output, "aborted_req_ids", None)
         if aborted is None:
             return self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
@@ -3940,36 +3937,40 @@ class Scheduler:
         self.block_manager.clear_cache()
         # AFTER the body, which frees the aborted requests' blocks: only blocks that really went
         # back to the free list may be zeroed (a block a surviving request still shares must not).
-        # Plus the blocks freed during the unchecked window: a request that FINISHED inside it may
-        # have written NaN, belongs to no aborted request, and is already free. _freed_blocks drops
-        # any that a live request holds again (if it was allocated inside the window it is aborted,
-        # so its blocks are in `held`; if later, it only wrote its own, finite, data).
-        recent = (
-            self.block_manager.kv.freed_recently() if self._gf_free_tracking else []
-        )
-        self._kv_scrub_blocks = self._freed_blocks(sorted({*held, *recent}))
+        # Every block that can hold NaN is now either free or held by a request the verdict did NOT
+        # abort, and the latter never ran in the unchecked window. So wipe every free block that was
+        # ever used, not only the aborted requests' own: the blocks of a request that finished inside
+        # the window, or earlier, are free and may hold NaN too (the next request takes the LOWEST free
+        # ids, which are the oldest blocks).
+        self._kv_scrub_blocks = self._scrub_set(held)
         return finished
 
-    def _enable_free_tracking(self) -> None:
-        """Remember which blocks are freed, for as many steps as a gemm_fusion error can go
-        undetected (the check period + the snapshot evaluation delay, one step of margin). Only when
-        gemm_fusion is ON; otherwise the block pool is never touched."""
-        window = 0
-        gf = getattr(self.config, "gemm_fusion", None)
-        if gf is not None and getattr(gf, "enabled", False):
-            from atom.model_ops.gemm_fusion.hooks import SNAPSHOT_EVAL_DELAY
-
-            window = int(getattr(gf, "check_period", 14)) + SNAPSHOT_EVAL_DELAY + 1
-            self.block_manager.kv.track_frees(window)
-        self._gf_free_tracking = window > 0
+    def _scrub_set(self, held) -> list[int]:
+        """The blocks every rank zeroes after a device error verdict: the ones the aborted requests
+        held that really were freed, plus every free block that was ever used (see postprocess).
+        """
+        freed_held = self._freed_blocks(held)
+        free_used = self.block_manager.kv.used_free_blocks()
+        blocks = sorted({*freed_held, *free_used})
+        logger.warning(
+            "Scheduler: KV scrub after a device error verdict: %d block(s) held by aborted "
+            "requests (%d actually freed), %d free block(s) ever used; %d to zero%s",
+            len(held),
+            len(freed_held),
+            len(free_used),
+            len(blocks),
+            f" (ids {blocks[0]}..{blocks[-1]})" if blocks else "",
+        )
+        return blocks
 
     def _freed_blocks(self, block_ids) -> list[int]:
         kv = self.block_manager.kv
         return [b for b in block_ids if kv.block(b).ref_count == 0]
 
     def take_kv_scrub(self) -> list[int]:
-        """The blocks the engine core must have every rank zero before the next step: those of the
-        requests a device error verdict aborted, once freed. Returned once, then cleared.
+        """The blocks the engine core must have every rank zero before the next step: after a device
+        error verdict, those the aborted requests held plus every free block that was ever used (see
+        ``postprocess``). Returned once, then cleared.
         """
         blocks, self._kv_scrub_blocks = getattr(self, "_kv_scrub_blocks", []), []
         return blocks

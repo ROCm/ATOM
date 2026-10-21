@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import array
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from heapq import heapify, heappop, heappush
@@ -109,11 +109,9 @@ class BlockPool:
         self._cached: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
-        # Which blocks went back to the free list during the last `_free_window` ticks, as
-        # (tick, block_id). Off (None) unless `track_frees` asks: it costs one append per freed block.
-        self._free_log: deque[tuple[int, int]] | None = None
-        self._free_tick = 0
-        self._free_window = 0
+        # The highest block id ever handed out for FRESH content (`allocate`). Blocks above it were
+        # never written by any request, so their KV is still what the pool was built with.
+        self._max_allocated = -1
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
         # Reusable content this pool destroyed, split by what destroyed it.
@@ -336,6 +334,7 @@ class BlockPool:
         block.reset()
         self._take_named(block_id)
         self._used.add(block_id)
+        self._max_allocated = max(self._max_allocated, block_id)
         return block
 
     def claim(self, block_id: int) -> Block:
@@ -368,8 +367,6 @@ class BlockPool:
             return
         self._used.remove(block_id)
         self._free.add(block_id)
-        if self._free_log is not None:
-            self._free_log.append((self._free_tick, block_id))
         if block.hash != -1:
             if block_id in self._reused:
                 self._protected[block_id] = None
@@ -385,32 +382,13 @@ class BlockPool:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
 
-    def track_frees(self, window: int) -> None:
-        """Start remembering the blocks freed during the last ``window`` ticks (``advance_free_tick``
-        moves time). gemm_fusion uses it to find the blocks a failed, not yet detected step may have
-        left NaN in after their request finished: they are free by the time a verdict arrives.
-        """
-        self._free_log = deque()
-        self._free_window = int(window)
-        self._free_tick = 0
-
-    def advance_free_tick(self) -> None:
-        """One tick passed (the scheduler calls it once per step); forget what is older than the
-        window."""
-        if self._free_log is None:
-            return
-        self._free_tick += 1
-        floor = self._free_tick - self._free_window
-        log = self._free_log
-        while log and log[0][0] <= floor:
-            log.popleft()
-
-    def freed_recently(self) -> list[int]:
-        """The distinct blocks freed within the window, ascending. A block may be in use again by
-        now: the caller checks ``ref_count``."""
-        if not self._free_log:
-            return []
-        return sorted({block_id for _tick, block_id in self._free_log})
+    def used_free_blocks(self) -> list[int]:
+        """Free blocks that may hold the bytes of an earlier request: the free ids at or below the
+        highest id ever handed out for fresh content, ascending. A block above it was never written.
+        After a gemm_fusion device error verdict every one of these is wiped (zeros are what a fresh
+        pool holds), whichever request wrote it and however long ago it was freed."""
+        top = self._max_allocated
+        return sorted(b for b in self._free if b <= top)
 
     def _trim_protected(self) -> None:
         # Bound protection so new prefixes can compete for cache space.
