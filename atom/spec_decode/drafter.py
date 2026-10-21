@@ -529,9 +529,8 @@ class Drafter(abc.ABC):
                 draft_embed = self.model.embed_tokens
                 if not hasattr(target_embed, "weight"):
                     logger.warning(
-                        "Target embed_tokens has no weight on this rank "
-                        "(PP non-first rank); drafter embeddings not "
-                        "initialized from target."
+                        "Target embed_tokens is empty on this rank; "
+                        "drafter embeddings not initialized from target."
                     )
                 elif target_embed.weight.shape == draft_embed.weight.shape:
                     draft_embed.weight.data.copy_(target_embed.weight.data)
