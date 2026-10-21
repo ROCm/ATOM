@@ -5633,6 +5633,39 @@ def test_cpu_budget_split_counts_the_draft_layer_on_the_last_stage(monkeypatch):
     assert budgets[3] < budgets[0]
 
 
+def test_cpu_budget_split_follows_stage_bytes_over_layer_count():
+    # K3 PP8: 3 MLA layers per stage (the KDA layers store no per-token KV),
+    # and the draft KV layer makes the last stage's block 2.67x the others'.
+    # By layer count (10 vs 12 bound layers) that stage got the least budget
+    # for the most bytes, a third of the others' token horizon.
+    from atom.kv_transfer.offload import config as offcfg
+
+    stage_bytes = [221184] * 7 + [589824]
+    budgets = []
+    for rank in range(8):
+        cfg = SimpleNamespace(max_local_cpu_size=224.0)
+        offcfg.scale_cpu_size_for_pp(cfg, _pp_config(rank, 8, 93, 1), stage_bytes)
+        budgets.append(cfg.max_local_cpu_size)
+    horizons = [b / n for b, n in zip(budgets, stage_bytes)]
+
+    assert sum(budgets) == pytest.approx(224.0 * 8)
+    assert horizons == pytest.approx([horizons[0]] * 8)
+    assert budgets[7] > budgets[0]
+
+
+@pytest.mark.parametrize("stage_bytes", [None, [100, 200], [100, 0, 100, 100]])
+def test_cpu_budget_split_without_usable_stage_bytes_uses_layers(stage_bytes):
+    from atom.kv_transfer.offload import config as offcfg
+
+    budgets = []
+    for rank in range(4):
+        cfg = SimpleNamespace(max_local_cpu_size=256.0)
+        offcfg.scale_cpu_size_for_pp(cfg, _pp_config(rank, 4, 80, None), stage_bytes)
+        budgets.append(cfg.max_local_cpu_size)
+
+    assert budgets == pytest.approx([256.0] * 4)
+
+
 # ---------------------------------------------------------------------------
 # LMCache engine identity across DP replicas
 # ---------------------------------------------------------------------------

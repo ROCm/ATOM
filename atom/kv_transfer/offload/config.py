@@ -540,15 +540,18 @@ def validate_lmcache_lookup_scope(cfg: Any, world_size: int) -> None:
         )
 
 
-def scale_cpu_size_for_pp(cfg, config) -> None:
-    """Split the CPU offload budget across PP stages by layer count.
+def scale_cpu_size_for_pp(cfg, config, stage_bytes: list[int] | None = None) -> None:
+    """Split the CPU offload budget across PP stages.
 
-    Give each stage a share proportional to its bound layer count so all
-    stages reach the same token horizon. Loads are all-or-nothing across
+    Give each stage a share proportional to the bytes one block costs it, so
+    all stages reach the same token horizon. Loads are all-or-nothing across
     stages, so unequal horizons waste the longer stage's extra capacity.
 
-    The last PP stage binds the draft KV layer (spec decode), so its
-    layer count is one more than its target-model slice.
+    ``stage_bytes`` is every stage's bytes per block, in stage order. Without
+    it the split falls back to bound layer count, which is only right when
+    every layer stores the same bytes per token: on a hybrid model the linear
+    attention layers store none, and the draft KV layer the last stage binds
+    (spec decode) can cost several target layers.
     """
     pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
     if pp_size <= 1:
@@ -568,6 +571,25 @@ def scale_cpu_size_for_pp(cfg, config) -> None:
             0,
         )
     )
+    if stage_bytes is not None and len(stage_bytes) == pp_size and min(stage_bytes) > 0:
+        scaled = configured * pp_size * stage_bytes[pp_rank] / sum(stage_bytes)
+        try:
+            cfg.max_local_cpu_size = scaled
+        except AttributeError:
+            return
+        logger.info(
+            "LMCache CPU budget for PP stage %d/%d: %.2fGB -> %.2fGB "
+            "(%d of %d bytes per block across stages; total unchanged at %.2fGB)",
+            pp_rank,
+            pp_size,
+            configured,
+            scaled,
+            stage_bytes[pp_rank],
+            sum(stage_bytes),
+            configured * pp_size,
+        )
+        return
+
     start, end = get_pp_indices(num_hidden_layers, pp_rank, pp_size)
     local_layers = end - start
 

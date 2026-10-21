@@ -88,6 +88,28 @@ def pp_aware_rank_and_world(config, tp) -> tuple[int, int]:
     return pp_rank * tp.world_size + tp.rank_in_group, pp_size * tp.world_size
 
 
+def pp_stage_bytes_per_block(config, bytes_per_block: int) -> list[int] | None:
+    """Every PP stage's bytes per block, in stage order, or None without PP.
+
+    A stage only sees its own KV caches, and the CPU budget split needs all of
+    them. Every stage builds its engine once, at KV registration, so this
+    gather over the PP group's CPU group lines up across stages.
+    """
+    pp_size = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+    if pp_size <= 1 or not torch.distributed.is_initialized():
+        return None
+    from aiter.dist.parallel_state import get_pp_group
+
+    pp = get_pp_group()
+    if pp.world_size != pp_size:
+        return None
+    gathered: list = [None] * pp.world_size
+    torch.distributed.all_gather_object(
+        gathered, int(bytes_per_block), group=pp.cpu_group
+    )
+    return [int(b) for b in gathered]
+
+
 def build_offload_engine(
     config,
     *,
@@ -116,7 +138,9 @@ def build_offload_engine(
         cfg = offcfg.build_lmcache_config(getattr(config, "kv_transfer_config", None))
     # Only the worker engine allocates the CPU pool, so the per-stage split is
     # applied here and not on the scheduler-side lookup clients.
-    offcfg.scale_cpu_size_for_pp(cfg, config)
+    offcfg.scale_cpu_size_for_pp(
+        cfg, config, pp_stage_bytes_per_block(config, bytes_per_block)
+    )
     base_meta = offcfg.build_lmcache_metadata(config, cfg, world, rank)
     meta = ATOMRawBytesLMCacheMetadata(
         base_meta, atom_block_size=int(block_size), bytes_per_block=int(bytes_per_block)
