@@ -11,8 +11,8 @@ from atom.utils import resolve_obj_by_qualname
 
 
 def _requires_piecewise_compilation(atom_config) -> bool:
-    """``atom_config.compilation_config.cudagraph_mode``'s own answer, or False
-    when either is absent. That absence is the real state at ``--level`` 0/1/2
+    """The decode mode's piecewise requirement, or False when the compilation
+    config or mode is absent. That absence is the real state at ``--level`` 0/1/2
     (``CompilationConfig`` is still built, but nothing sets a piecewise
     ``cudagraph_mode`` at those levels) and under SGLang, which builds its own
     ``atom_config`` without a ``compilation_config`` at all (see
@@ -22,7 +22,10 @@ def _requires_piecewise_compilation(atom_config) -> bool:
     cudagraph_mode = getattr(
         getattr(atom_config, "compilation_config", None), "cudagraph_mode", None
     )
-    return bool(cudagraph_mode) and cudagraph_mode.requires_piecewise_compilation()
+    return (
+        bool(cudagraph_mode)
+        and cudagraph_mode.decode_mode().requires_piecewise_compilation()
+    )
 
 
 def _takes_weight_updates(atom_config) -> bool:
@@ -65,8 +68,8 @@ def common_refusals(
     no expert, data, pipeline or context parallelism, no TBO, not a plugin.
 
     ``piecewise_cudagraph_required`` gates one more check: no piecewise
-    cudagraph. MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner
-    model, so a piecewise-compiled graph of that module runs underneath mono
+    decode cudagraph. MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner
+    model, so a piecewise decode graph of that module runs underneath mono
     and the two conflict -- this refusal is correct for them, and is the
     default. GLM-5.2 mono instead routes inside the *uncompiled* outer
     ``GlmMoeDsaForCausalLM`` and bypasses the compiled inner
@@ -110,7 +113,10 @@ def common_refusals(
     ]
     if piecewise_cudagraph_required:
         checks.append(
-            (not _requires_piecewise_compilation(atom_config), "piecewise cudagraph")
+            (
+                not _requires_piecewise_compilation(atom_config),
+                "piecewise decode cudagraph",
+            )
         )
     return checks
 

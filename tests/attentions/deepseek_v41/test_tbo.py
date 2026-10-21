@@ -1075,6 +1075,7 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
     import json
     from pathlib import Path
 
+    from atom.config import CompilationConfig
     from atom.model_ops.attentions.backends import CommonAttentionBuilder
     from atom.models.deepseek_v41.config import normalize_hf_config
 
@@ -1085,6 +1086,7 @@ def test_fp4_page_budget_includes_persistent_microbatch_metadata(monkeypatch):
         forward_vars=metadata_buffers(2, 16, 8, "cpu"),
         config=SimpleNamespace(
             hf_config=hf,
+            compilation_config=CompilationConfig(),
             speculative_config=None,
             kv_cache_dtype="bf16",
             index_cache_dtype="fp4",

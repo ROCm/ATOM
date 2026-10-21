@@ -134,9 +134,18 @@ def test_paged_scoring_bands_match_one_shot(
         workspace = ScoreWorkspace(geometry, rows, width // 16, "cuda")
         storage = workspace._logits.data_ptr()
         assert workspace._logits.numel() * 4 < 1024**2
+    outputs = tuple(None if t is None else torch.empty_like(t) for t in expected)
     actual = scoring.score_topk_paged(
-        query, weights, plane, live_tiles, visible, workspace=workspace, **kwargs
+        query,
+        weights,
+        plane,
+        live_tiles,
+        visible,
+        workspace=workspace,
+        out=outputs,
+        **kwargs,
     )
+    assert all(a is b for a, b in zip(actual, outputs))
     assert len(bands) > 1 and sum(count for count, _ in bands) == rows
     assert max(size for _, size in bands) < 1024**2
     torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)

@@ -1471,6 +1471,26 @@ def test_the_warm_marks_its_context_as_a_draft(monkeypatch):
     assert seen["is_draft"] is True
 
 
+def test_prefill_only_capture_skips_draft_warmup_and_proposes_eagerly(monkeypatch):
+    p = _proposer_with_graph_bs(monkeypatch, captured=False)
+    p.runner.capture_sizes = []
+    p.runner.graph_pool = object()
+    p.runner.rank = 0
+    assert p.draft_graphs
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("an empty decode ladder must not build or warm draft graphs")
+
+    monkeypatch.setattr(torch.cuda, "synchronize", unexpected)
+    p.warmup_draft_graphs(unexpected, None)
+    seen = {}
+    fc = _stub_forward_context(scheduled_bs=5, target_bs=5)
+    out = _run_propose(p, fc, 5, monkeypatch, seen)
+    assert seen["B"] == 5
+    assert out.shape == (5, p.mtp_k)
+    assert all(not g._cuda_graphs for g in p.draft_graphs)
+
+
 def test_the_pad_sentinel_lifts_off_a_row_that_becomes_real_again():
     """The half a single step cannot show: the batch shrinks, then grows.
 

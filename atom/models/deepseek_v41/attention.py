@@ -117,7 +117,9 @@ class Indexer(nn.Module):
                 query, weights, cache, step, weight_scale=self.weights_scale
             )
             return
-        self._publish(
+        cache.store_selection(
+            self.spec,
+            step,
             *score_topk_paged(
                 query,
                 weights,
@@ -127,7 +129,6 @@ class Indexer(nn.Module):
                 workspace=cache.workspace,
                 **self._bounds(cache, step),
             ),
-            step,
         )
 
     def score_quantized(self, query, scaled, cache, step, weight_scale=1.0):
@@ -138,7 +139,9 @@ class Indexer(nn.Module):
         ragged = self._ragged(cache, step)
         # a ragged layer's logits pack where the step laid its rows out
         packed = score_layout(step, spec.ratio) if ragged is not None else None
-        self._publish(
+        cache.store_selection(
+            self.spec,
+            step,
             *score_topk_quantized(
                 query,
                 scaled,
@@ -157,7 +160,6 @@ class Indexer(nn.Module):
                 packed=packed,
                 **self._bounds(cache, step),
             ),
-            step,
         )
 
     def _ragged(self, cache, step):
@@ -190,16 +192,14 @@ class Indexer(nn.Module):
             "candidates": (
                 None
                 if source is None
-                else cache.candidate_blocks(step, source, spec.ratio)
+                else cache.candidate_blocks(
+                    step, source, spec.ratio, layer=spec.layer_id
+                )
             ),
             "block_size": self.block_size,
             "candidate_count": self.topk_blocks if spec.produces_candidates else 0,
+            "out": cache.selection_outputs(spec, step),
         }
-
-    def _publish(self, selected, chosen, step):
-        step.selected[self.spec.layer_id] = selected.unsqueeze(0)
-        if chosen is not None:
-            step.candidates[self.spec.layer_id] = chosen
 
 
 class Attention(nn.Module):

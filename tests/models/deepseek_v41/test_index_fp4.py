@@ -295,15 +295,18 @@ def test_fp4_packed_rows_select_and_pick_what_the_plane_does(capacity):
     packed = _plan_step(workspace, seen)
     assert (len(packed.bands) > 1) == (capacity == 640)
 
-    def score(packed):
+    def score(packed, out=None):
         return scoring.score_topk_quantized(
             query, weights, units, None, visible, topk=64,
             weight_scale=(HEADS * DIM) ** -0.5, ragged=ragged, block_size=PAGE,
             candidate_count=16, workspace=workspace if packed else None,
-            packed=packed,
+            packed=packed, out=out,
         )  # fmt: skip
 
-    want, got = score(None), score(packed)
+    want = score(None)
+    outputs = tuple(torch.empty_like(t) for t in want)
+    got = score(packed, outputs)
+    assert all(a is b for a, b in zip(got, outputs))
     assert torch.equal(got[0], want[0])
     assert torch.equal(got[1], want[1])
 

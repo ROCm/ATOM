@@ -101,6 +101,7 @@ def score_topk_paged(
     block_size=8,
     candidate_count=0,
     workspace=None,
+    out=None,
 ):
     """`(selected, candidate blocks)` for a whole forward's query rows.
 
@@ -124,6 +125,9 @@ def score_topk_paged(
     shared logits memory budget. In a 1M-context configuration, the address
     limit alone allows an 8 GiB temporary, even for short live contexts.
     The band is taken from `workspace` when given, else allocated.
+    `out` optionally supplies the selected rows and candidate blocks. Either
+    entry may be None for a region-local result; supplied buffers are written
+    directly by the kernels, including when attention runs eagerly.
     """
     rows, heads = weights.shape
     q_fp8, q_scale = quantize_query_rows(query)
@@ -144,6 +148,7 @@ def score_topk_paged(
         block_size=block_size,
         candidate_count=candidate_count,
         workspace=workspace,
+        out=out,
     )
 
 
@@ -162,6 +167,7 @@ def score_topk_quantized(
     weight_scale=1.0,
     ragged=None,
     packed=None,
+    out=None,
 ):
     """`score_topk_paged` past its query quantization, in `units`' format.
     FP8: `query` [rows, heads, dim] e4m3 and `scaled` [rows, heads] fp32, the
@@ -192,6 +198,7 @@ def score_topk_quantized(
             block_size=block_size,
             candidate_count=candidate_count,
             weight_scale=weight_scale,
+            out=out,
         )
     rows = scaled.shape[0]
     tile = units.values.shape[1]
@@ -218,12 +225,7 @@ def score_topk_quantized(
         # Every block the request owns, and the row's own visibility into it.
         table, bound, width = tiles, visible, tiles.shape[1] * tile
     device = scaled.device
-    selected = torch.empty(rows, topk, dtype=torch.int32, device=device)
-    chosen = (
-        torch.empty(rows, candidate_count, dtype=torch.int32, device=device)
-        if candidate_count
-        else None
-    )
+    selected, chosen = _score_outputs(rows, topk, candidate_count, device, out)
     band = (
         logits_rows(rows, width)
         if workspace is None
@@ -293,6 +295,30 @@ def _ragged_width(ragged, tile):
     return ragged.block_tables.shape[1] * ragged.pages_per_block * tile
 
 
+def _score_outputs(rows, topk, candidate_count, device, out):
+    """Keep supplied result addresses; allocate only missing local outputs."""
+    selected, chosen = (None, None) if out is None else out
+    results = []
+    for value, shape in (
+        (selected, (rows, topk)),
+        (chosen, (rows, candidate_count) if candidate_count else None),
+    ):
+        if shape is None:
+            if value is not None:
+                raise ValueError("Candidate output supplied to a non-producing scorer")
+        elif value is None:
+            value = torch.empty(shape, dtype=torch.int32, device=device)
+        elif (
+            tuple(value.shape) != shape
+            or value.dtype != torch.int32
+            or value.device != torch.device(device)
+            or not value.is_contiguous()
+        ):
+            raise ValueError("Scorer output does not match its producer layout")
+        results.append(value)
+    return tuple(results)
+
+
 def _score_topk_packed(
     query,
     scaled,
@@ -305,6 +331,7 @@ def _score_topk_packed(
     block_size,
     candidate_count,
     weight_scale,
+    out=None,
 ):
     """`score_topk_quantized` for a whole-context FP4 layer, its logits
     packed: each band's rows scored, picked from and top-k'd in place. The
@@ -312,12 +339,7 @@ def _score_topk_packed(
     plane would and picks what it would."""
     plane_width = _ragged_width(ragged, units.values.shape[1])
     rows, device = scaled.shape[0], scaled.device
-    selected = torch.empty(rows, topk, dtype=torch.int32, device=device)
-    chosen = (
-        torch.empty(rows, candidate_count, dtype=torch.int32, device=device)
-        if candidate_count
-        else None
-    )
+    selected, chosen = _score_outputs(rows, topk, candidate_count, device, out)
     logits, maxima = workspace.packed_logits(), workspace.packed_maxima()
     for first, end in packed.bands:
         span, count = slice(first, end), end - first

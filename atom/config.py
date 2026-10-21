@@ -155,14 +155,27 @@ class CompilationConfig:
 
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     cudagraph_capture_sizes: list[int] | None = None
+    """Capture ladder: token counts for FULL_AND_PIECEWISE, batch sizes otherwise.
+
+    Hybrid mode uses these tokens directly for prefill and rounds them up to
+    each decode query length to derive FULL (batch size, query length) graphs.
+    """
+
+    cudagraph_prefill_capture_sizes: list[int] | None = None
+    """Optional independent prefill token ladder for FULL_AND_PIECEWISE.
+
+    With no capture-size overrides, prefill uses 91 sizes through 2048 while
+    FULL decode keeps the original 1024-token ladder. Explicit capture sizes
+    apply to both phases unless this prefill list is also supplied.
+    """
 
     cuda_graph_sizes: list[int] = field(default_factory=list)
-    """Cuda graph capture sizes
-    1. if none provided, then default set to [min(max_num_seqs * 2, 512)]
-    2. if one value is provided, then the capture list would follow the
-    pattern: [1, 2, 4] + [i for i in range(8, cuda_graph_sizes + 1, 8)]
-    3. more than one value (e.g. 1 2 128) is provided, then the capture list
-    will follow the provided list."""
+    """Fallback ladder when cudagraph_capture_sizes is not provided.
+
+    Defaults to [1024] in FULL_AND_PIECEWISE and [512] otherwise. A single
+    value is a ceiling expanded by Config.capture_sizes; multiple values
+    are used as explicit candidates.
+    """
     debug_dump_path: str = ""
     """The path to dump the debug information."""
 
@@ -270,7 +283,20 @@ class CompilationConfig:
         if self.level not in {0, 1, 2, 3}:
             raise ValueError("level must in 0-3")
         if not self.cuda_graph_sizes:
-            self.cuda_graph_sizes = [512]
+            if (
+                self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+                and not self.cudagraph_capture_sizes
+                and self.cudagraph_prefill_capture_sizes is None
+            ):
+                self.cudagraph_prefill_capture_sizes = (
+                    [1, 2, 4]
+                    + list(range(8, 256, 8))
+                    + list(range(256, 1025, 16))
+                    + list(range(1152, 2049, 128))
+                )
+            self.cuda_graph_sizes = [
+                1024 if self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE else 512
+            ]
 
     def compute_hash(self) -> str:
         """
@@ -289,6 +315,7 @@ class CompilationConfig:
         factors.append(self.use_cudagraph)
         factors.append(self.local_cache_dir)
         factors.append(self.cudagraph_capture_sizes)
+        factors.append(self.cudagraph_prefill_capture_sizes)
         factors.append(self.cuda_graph_sizes)
 
         return hashlib.sha256(str(factors).encode()).hexdigest()
@@ -2144,7 +2171,7 @@ class Config:
 
     @property
     def capture_sizes(self) -> list[int]:
-        """The declared CUDAGraph capture ladder, in batch sizes.
+        """The declared capture ladder (tokens for FULL_AND_PIECEWISE, else BS).
 
         Declared, not schedulable -- `ModelRunner` drops what its own token
         budget can never produce, a bound needing the drafter's resolved
@@ -2156,8 +2183,30 @@ class Config:
             return list(declared)
         sizes = self.compilation_config.cuda_graph_sizes
         if len(sizes) == 1:
+            if (
+                self.compilation_config.cudagraph_mode
+                == CUDAGraphMode.FULL_AND_PIECEWISE
+            ):
+                return [
+                    n
+                    for n in [1, 2, 4]
+                    + list(range(8, 256, 8))
+                    + list(range(256, sizes[0] + 1, 16))
+                    if n <= sizes[0]
+                ]
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    @property
+    def prefill_capture_sizes(self) -> list[int]:
+        """Prefill tokens, independent of the hybrid FULL/draft decode ladder."""
+        compilation = self.compilation_config
+        if (
+            compilation.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+            and compilation.cudagraph_prefill_capture_sizes is not None
+        ):
+            return list(compilation.cudagraph_prefill_capture_sizes)
+        return self.capture_sizes
 
     def __post_init__(self):
         self.moe_all2all_backend = (
@@ -2412,8 +2461,8 @@ class Config:
             or (self.plugin_config is not None and self.plugin_config.is_vllm)
         ) and self.compilation_config.level == CompilationLevel.PIECEWISE:
             self.compilation_config.set_splitting_ops_for_v1()
-            # Default to PIECEWISE, except V4.1 whose Engram stream fork/join
-            # currently requires a FULL graph. Explicit choices are preserved.
+            # Preserve V4.1's FULL default; PIECEWISE and AF are opt-in.
+            # Explicit choices are preserved.
             # splitting_ops/sizes still configure the level-3 backend.
             if self.compilation_config.cudagraph_mode is None:
                 self.compilation_config.cudagraph_mode = (

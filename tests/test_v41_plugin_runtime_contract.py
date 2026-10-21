@@ -27,7 +27,17 @@ def scratch_allocator():
         if isinstance(node, ast.FunctionDef) and node.name == "_capture_dummy_cache"
     )
 
-    def allocate(geometry, pages, slots, device, *, max_tokens, workspace):
+    def allocate(
+        geometry,
+        pages,
+        slots,
+        device,
+        *,
+        max_tokens,
+        workspace,
+        topology,
+        candidate_count,
+    ):
         return SimpleNamespace(num_pages=pages, num_slots=slots, max_tokens=max_tokens)
 
     scope = {"PagedAttentionCache": Mock(side_effect=allocate)}
@@ -40,11 +50,22 @@ def scratch_allocator():
         block_size=32,
         device="cpu",
         score_workspace=None,
+        topology=(object(),),
+        config=SimpleNamespace(candidate_topk_blocks=7),
         max_num_batched_tokens=96,
         max_bs=4,
         model_runner=SimpleNamespace(v41_graphs_enabled=True),
     )
     return builder, scope[method.name].__get__(builder), scope["PagedAttentionCache"]
+
+
+@pytest.mark.parametrize("graphs_enabled", [False, True])
+def test_scratch_preserves_attention_topology(scratch_allocator, graphs_enabled):
+    builder, allocate, constructor = scratch_allocator
+    builder.model_runner.v41_graphs_enabled = graphs_enabled
+    allocate(1, 1, 1)
+    assert constructor.call_args.kwargs["topology"] is builder.topology
+    assert constructor.call_args.kwargs["candidate_count"] == 7
 
 
 def test_capture_scratch_covers_per_request_tail_pages(scratch_allocator):

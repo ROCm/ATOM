@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from atom.config import CUDAGraphMode
 from atom.models.kimi_k3.mono import config as k3_config
 from atom.models.kimi_k3.mono.config import (
     ATTN_RES_BLOCK,
@@ -79,9 +80,7 @@ def _atom_config(**hf_overrides):
         kv_transfer_config=None,
         compilation_config=SimpleNamespace(
             level=3,
-            cudagraph_mode=SimpleNamespace(
-                requires_piecewise_compilation=lambda: False
-            ),
+            cudagraph_mode=CUDAGraphMode.FULL,
         ),
         speculative_config=SimpleNamespace(method="dspark", num_speculative_tokens=3),
     )

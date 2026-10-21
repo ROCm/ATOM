@@ -35,7 +35,9 @@ CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
 # sha256 of core's `Attention.forward`, comments and blank lines stripped.
-CORE_PREPARE_DIGEST = "4f502d41815e8e82"
+# Dummy scratch now carries the topology and candidate count, also passed by
+# the plugin's _capture_dummy_cache in both eager and retained capture paths.
+CORE_PREPARE_DIGEST = "d4b009974b74850f"
 CORE_FORWARD_DIGEST = "3a7ee084e43a1498"
 
 
