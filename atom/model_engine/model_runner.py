@@ -1867,6 +1867,35 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _cap_allocator_at_budget(self, budget: int, total: int) -> None:
+        """Hold the caching allocator to the memory budget under mixed batching.
+
+        Mixed prefill+decode steps run eagerly, and their shapes change every
+        step, so freed blocks are often the wrong size to reuse and stay
+        cached. Uncapped, the allocator's reservation grew past the budget
+        (271 GB reserved against a 259 GB budget, 234 GB of it live, on
+        V4-Flash-DSpark tp8 at c=512) into the headroom HSA queues and RCCL
+        allocate from outside it. The device then ran out under them -- an
+        `HSA_STATUS_ERROR_OUT_OF_RESOURCES` abort inside an RCCL kernel -- or
+        the allocator's own retry `hipFree`d while a collective waited on its
+        peers. Capped, the allocator reclaims its cache within the budget and
+        the headroom stays free (min 11.7 GB vs 0.1 GB, same throughput).
+
+        Mixed only: elsewhere steps replay CUDA graphs or keep stable shapes,
+        and a config that today reserves past the budget during capture would
+        start failing where it now runs.
+        """
+        if not getattr(self.config, "enable_mixed_prefill_decode", False):
+            return
+        fraction = budget / total
+        torch.cuda.set_per_process_memory_fraction(fraction)
+        logger.info(
+            "Mixed prefill+decode: capping the caching allocator at the memory "
+            "budget (fraction=%.4f, %.2fGB)",
+            fraction,
+            budget / (1 << 30),
+        )
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -1887,6 +1916,7 @@ class ModelRunner:
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)
+        self._cap_allocator_at_budget(budget, total)
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
