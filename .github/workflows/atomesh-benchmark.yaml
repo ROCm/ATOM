@@ -172,7 +172,7 @@ on:
           - atomesh-cicd-mi350
           - atomesh-cicd-mi355-crusoe
       atomesh_slurm_account:
-        description: 'Slurm account: amd-atom uses amd-atom-qos (salloc -A amd-atom --qos=amd-atom-qos); TW: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses amd-aifw-dev'
+        description: 'Slurm account: amd-atom uses amd-atom-qos, amd-frameworks uses amd-frameworks-qos; Crusoe v2 uses amd-aifw-dev'
         required: false
         default: auto
         type: choice
@@ -180,16 +180,13 @@ on:
           - auto
           - amd-atom
           - amd-frameworks
-          - amd-tw
       atomesh_slurm_partition:
-        description: 'TW Slurm partition: amd-frameworks[42/44/47], amd-tw[36/43]; Crusoe v2 uses the default partition'
+        description: 'TW Slurm partition: amd-spur; Crusoe v2 uses the default partition'
         required: false
         default: auto
         type: choice
         options:
           - auto
-          - amd-frameworks
-          - amd-tw
           - amd-spur
       atomesh_single_node:
         description: 'Single-node P/D placement; auto lets Slurm select an idle node, an explicit node pins the job'

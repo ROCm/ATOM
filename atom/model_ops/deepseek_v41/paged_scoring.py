@@ -35,11 +35,11 @@ from aiter.ops.topk import top_k_per_row_decode
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
+from atom.model_ops.sparse_indexer_chunk import logits_rows
 from atom.model_ops.v4_kernels import scale_indexer_weights
 
 from .candidate_table import lift_candidate_selection
 from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
-from .score_workspace import logits_rows
 
 
 def quantize_query_rows(query):
