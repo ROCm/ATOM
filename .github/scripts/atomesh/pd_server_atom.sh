@@ -787,6 +787,18 @@ if [[ -n "${STATE_CHECKPOINT_INTERVAL_TOKENS}" ]]; then
     --state-checkpoint-interval-tokens "${STATE_CHECKPOINT_INTERVAL_TOKENS}"
   )
 fi
+exit_if_peer_failed() {
+  # rank-rc files live on shared NFS and are checked against this submission's
+  # token and job ID. Local/single-node launches do not need a peer check.
+  [[ -n "${ATOMESH_RUN_TOKEN:-}" && "${ATOMESH_NUM_NODES:-1}" -gt 1 ]] || return 0
+  local rc=0
+  python3 "${ATOMESH_SCRIPT_DIR}/pd_job_result.py" check-peers \
+    --run-dir "${RUN_DIR}" --job-id "${SLURM_JOB_ID:-${SPUR_JOB_ID:-local}}" \
+    --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${ATOMESH_NUM_NODES}" \
+    --rank "${NODE_RANK}" || rc=$?
+  [[ "${rc}" -eq 0 ]] || exit "${rc}"
+}
+
 wait_http() {
   local url="$1"
   local name="$2"
@@ -795,6 +807,7 @@ wait_http() {
   local deadline=$(( $(date +%s) + timeout ))
   echo "[wait] ${name} ${url} timeout=${timeout}s"
   until curl -sf --max-time 10 "${url}" >/dev/null 2>&1; do
+    exit_if_peer_failed
     exit_if_mooncake_store_died
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
       set +e
@@ -819,6 +832,7 @@ wait_router_closed() {
   local max_misses=3
   echo "[wait] router shutdown http://${NODE0_ADDR}:${ROUTER_PORT}/health"
   while true; do
+    exit_if_peer_failed
     if curl -sf --max-time 10 "http://${NODE0_ADDR}:${ROUTER_PORT}/health" >/dev/null 2>&1; then
       miss_count=0
       exit_if_mooncake_store_died

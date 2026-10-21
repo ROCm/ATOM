@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,85 @@ class JobResultTest(unittest.TestCase):
     def test_empty_submission_token_or_rank_set_is_not_proof(self):
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "", 2))
         self.assertFalse(RESULT.workload_completed(self.root, "3619", "this-run", 0))
+
+    def test_peer_failure_requires_current_submission_identity(self):
+        marker = self.root / "rank-workload-0.json"
+        (self.root / "rank-rc-0").write_text("134\n")
+        original = json.loads(marker.read_text())
+        for status in ("running", "completed"):
+            marker.write_text(json.dumps({**original, "status": status}))
+            self.assertEqual(
+                RESULT.failed_peer(self.root, "3619", "this-run", 1, 2), (0, 134)
+            )
+        for change in [
+            {"run_token": "old"},
+            {"job_id": "3618"},
+            {"rank": 1},
+            {"num_ranks": 3},
+            {"schema_version": 2},
+            {"status": "unknown"},
+        ]:
+            with self.subTest(change=change):
+                marker.write_text(json.dumps({**original, **change}))
+                self.assertIsNone(
+                    RESULT.failed_peer(self.root, "3619", "this-run", 1, 2)
+                )
+        for content in ("", "broken", "null", "[]"):
+            marker.write_text(content)
+            self.assertIsNone(RESULT.failed_peer(self.root, "3619", "this-run", 1, 2))
+        marker.unlink()
+        self.assertIsNone(RESULT.failed_peer(self.root, "3619", "this-run", 1, 2))
+
+    def test_peer_check_ignores_self_success_and_incomplete_codes(self):
+        code = self.root / "rank-rc-0"
+        code.write_text("134\n")
+        self.assertIsNone(RESULT.failed_peer(self.root, "3619", "this-run", 0, 2))
+        self.assertIsNone(RESULT.failed_peer(self.root, "3619", "", 1, 2))
+        for content in ("0", "", "bad", "-1", "256"):
+            code.write_text(content)
+            self.assertIsNone(RESULT.failed_peer(self.root, "3619", "this-run", 1, 2))
+        code.unlink()
+        self.assertIsNone(RESULT.failed_peer(self.root, "3619", "this-run", 1, 2))
+
+    def test_server_waits_exit_on_peer_failure_without_sleeping(self):
+        source = SCRIPT.with_name("pd_server_atom.sh").read_text()
+        functions = source[
+            source.index("exit_if_peer_failed() {") : source.index(
+                "start_logged_process() {"
+            )
+        ]
+        (self.root / "rank-rc-0").write_text("134\n")
+        for command in ("wait_http http://unused router 7200", "wait_router_closed"):
+            with self.subTest(command=command):
+                process = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        "set -euo pipefail\n"
+                        + functions
+                        + "\ncurl() { return 1; }\nsleep() { exit 99; }\n"
+                        "exit_if_mooncake_store_died() { :; }\n" + command,
+                    ],
+                    env={
+                        **os.environ,
+                        "ATOMESH_SCRIPT_DIR": str(SCRIPT.parent),
+                        "ATOMESH_RUN_TOKEN": "this-run",
+                        "ATOMESH_NUM_NODES": "2",
+                        "SLURM_JOB_ID": "3619",
+                        "NODE_RANK": "1",
+                        "RUN_DIR": str(self.root),
+                        "NODE0_ADDR": "unused",
+                        "ROUTER_PORT": "8000",
+                    },
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(
+                    process.returncode, 134, process.stdout + process.stderr
+                )
+                self.assertIn("peer rank 0 exited rc=134", process.stdout)
 
     def test_cli_exits_with_effective_result_and_retains_raw_failure(self):
         args = [

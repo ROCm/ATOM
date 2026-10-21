@@ -267,6 +267,7 @@ if sys.argv[1] == "run" and os.environ.get("ATOMESH_PREPARE_LMCACHE_HOST_MEMORY"
             runs = [call for call in calls if call[0] == "run"]
             self.assertEqual(len(runs), 1)
             self.assertIn(f"NODE_RANK={rank}", runs[0])
+            self.assertIn("ATOMESH_NUM_NODES=2", runs[0])
             self.assertIn("NODE0_ADDR=10.19.0.1", runs[0])
             self.assertIn("IPADDRS=10.19.0.1,10.19.0.2", runs[0])
             interface = "eno0" if rank == 0 else "enp5s0"
@@ -279,6 +280,19 @@ if sys.argv[1] == "run" and os.environ.get("ATOMESH_PREPARE_LMCACHE_HOST_MEMORY"
             )
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["run_token"], "test-submission")
+
+    def test_worker_clears_previous_exit_before_starting_container(self):
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "rank-rc-1").write_text("134\n")
+        docker = self.bin_dir / "docker"
+        docker.write_text(docker.read_text() + """
+if sys.argv[1] == "run":
+    previous = Path(os.environ["LOG_ROOT"]) / "slurm_job-42" / ("rank-rc-" + rank)
+    if previous.exists():
+        sys.exit(99)
+""")
+        self.run_job("--spur-worker", SPUR_TASK_OFFSET="1")
+        self.assertEqual((self.run_dir / "rank-rc-1").read_text(), "0\n")
 
     def test_worker_does_not_dispatch_again(self):
         self.run_job("--spur-worker", SPUR_TASK_OFFSET="1")

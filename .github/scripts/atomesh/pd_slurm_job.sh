@@ -279,6 +279,7 @@ EOF
     -e SLURM_JOB_ID="${JOB_ID}"
     -e SPUR_JOB_ID="${SPUR_JOB_ID:-${JOB_ID}}"
     -e NODE_RANK="${rank}"
+    -e ATOMESH_NUM_NODES="${NUM_NODES}"
     -e NODE0_ADDR="${NODE0_ADDR}"
     -e IPADDRS="${IPADDRS}"
     -e xP="${PREFILL_WORKERS}"
@@ -459,6 +460,8 @@ run_spur_job() {
     echo "ERROR: invalid Spur worker rank ${node_rank} for ${NUM_NODES} nodes" >&2
     return 2
   fi
+  # Clear an earlier worker exit before publishing this submission identity.
+  rm -f "${RUN_DIR}/rank-rc-${node_rank}"
   publish_workload_status "${node_rank}" running
   local env_file="${RUN_DIR}/docker-rank-${node_rank}.env"
   local peers=()

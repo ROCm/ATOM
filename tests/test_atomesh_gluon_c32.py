@@ -32,6 +32,16 @@ class SingleVariableTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             checker.compare(self.candidate())
 
+    def test_only_documented_node_quarantine_is_allowed(self):
+        data = self.candidate()
+        excluded = data["include"][0]["runner"]["exclude_nodes"]
+        excluded.append("pit2-p03-g41")
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.compare(data)
+        excluded.append("pit2-p03-g01")
+        with self.assertRaisesRegex(ValueError, "Non-kernel"):
+            checker.compare(data)
+
     def test_draft_parallelism_cache_workload_changes_are_rejected(self):
         changes = [
             ("server_args", "draft_model", "Inferact/MiniMax-M3-EAGLE-GQA"),

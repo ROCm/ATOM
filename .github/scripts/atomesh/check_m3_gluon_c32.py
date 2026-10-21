@@ -23,6 +23,12 @@ def compare(matrix):
         new["env"][role][key] = old["env"][role][key]
     if len(set(refs)) != 1 or refs[0] == old["env"]["common"]["ATOM_AITER_SCATTER_REF"]:
         raise ValueError("Expected one new kernel pin across roles")
+    # Scheduling may avoid a node that failed host-memory/RDMA preparation.
+    # Preserve the saved baseline and reject every other configuration change.
+    excluded = new["runner"]["exclude_nodes"]
+    if "pit2-p03-g41" in excluded:
+        print("[gluon-c32-config] excluding g41 after host-memory/RDMA failures")
+    new["runner"]["exclude_nodes"] = [n for n in excluded if n != "pit2-p03-g41"]
     if new != old:
         different = [
             key for key in old.keys() | new.keys() if old.get(key) != new.get(key)

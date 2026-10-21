@@ -49,6 +49,35 @@ def workload_completed(run_dir, job_id, run_token, num_ranks):
     return True
 
 
+def failed_peer(run_dir, job_id, run_token, rank, num_ranks):
+    """Read a peer's exit code only when its submission identity matches."""
+    if not run_token or not 0 <= rank < num_ranks:
+        return None
+    for peer in range(num_ranks):
+        if peer == rank:
+            continue
+        try:
+            actual = json.loads((run_dir / f"rank-workload-{peer}.json").read_text())
+            rc_text = (run_dir / f"rank-rc-{peer}").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        expected = {
+            "schema_version": 1,
+            "job_id": job_id,
+            "run_token": run_token,
+            "rank": peer,
+            "num_ranks": num_ranks,
+            "status": "running",
+        }
+        completed = {**expected, "status": "completed"}
+        if actual not in (expected, completed) or not rc_text.isdecimal():
+            continue
+        rc = int(rc_text)
+        if 0 < rc <= 255:
+            return peer, rc
+    return None
+
+
 def resolve(run_dir, job_id, run_token, num_ranks, state, exit_code, rc, spur):
     completed = workload_completed(run_dir, job_id, run_token, num_ranks)
     # Only the generic Spur failure may be reconciled. Explicit cancellation,
@@ -70,7 +99,7 @@ def resolve(run_dir, job_id, run_token, num_ranks, state, exit_code, rc, spur):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("publish", "resolve"))
+    parser.add_argument("action", choices=("publish", "resolve", "check-peers"))
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--run-token", required=True)
@@ -82,6 +111,19 @@ def main():
     parser.add_argument("--scheduler-rc", type=int)
     parser.add_argument("--spur", choices=("0", "1"), default="0")
     args = parser.parse_args()
+    if args.action == "check-peers":
+        if args.rank is None or not 0 <= args.rank < args.num_ranks:
+            parser.error("check-peers requires a valid --rank")
+        failure = failed_peer(
+            args.run_dir, args.job_id, args.run_token, args.rank, args.num_ranks
+        )
+        if failure:
+            peer, rc = failure
+            print(
+                f"[wait][FAIL] peer rank {peer} exited rc={rc}; stopping rank {args.rank}"
+            )
+            return rc
+        return 0
     if args.action == "publish":
         if args.rank is None or not 0 <= args.rank < args.num_ranks or not args.status:
             parser.error("publish requires a valid --rank and --status")
