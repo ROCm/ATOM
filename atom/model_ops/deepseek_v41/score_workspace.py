@@ -18,34 +18,17 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
-from atom.utils import envs
+from atom.model_ops.sparse_indexer_chunk import (
+    capped_logits_rows,
+    logits_rows,
+    plane_rows,
+)
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
 # A packed row starts on a 256-byte boundary, which the row-group scorer's
 # stores need to run at speed, and on a whole candidate block, so its block
 # maxima start at its logits' start over the block.
 ROW_ALIGN = 64
-
-
-def plane_rows(width):
-    """Query rows a `width`-column logits plane may hold at once.
-
-    Its readers reach a row as `row * stride` in int32, so a plane past 2**31
-    elements wraps to a negative address. `width` follows the model-length cap
-    and not the live context, so only a long-context configuration can get
-    there; wherever a batch already fits, this leaves it in one piece.
-    """
-    return max(1, (2**31 - 1) // width)
-
-
-def logits_rows(rows, width):
-    """One logits band's rows, shared by allocation and execution."""
-    return min(
-        plane_rows(width),
-        sparse_indexer_row_chunk(
-            rows, width, envs.ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB
-        ),
-    )
 
 
 def packed_capacity(geometry, pages, max_tokens, plane_elements):
@@ -116,7 +99,9 @@ class ScoreWorkspace:
     `pages` bounds the PAGE pool the FP4 plane's packed rows can see.
     """
 
-    def __init__(self, geometry, max_tokens, columns, device, pages=None):
+    def __init__(
+        self, geometry, max_tokens, columns, device, pages=None, candidate_blocks=0
+    ):
         self._max_tokens = max_tokens
         ratios = sorted({ratio for _, ratio in geometry.owners})
         self._tiles = {
@@ -128,6 +113,18 @@ class ScoreWorkspace:
             for ratio in ([] if geometry.index_fp4 else ratios)
         }
         widths = [columns * geometry.rows_per_page(ratio) for ratio in ratios]
+        if candidate_blocks:
+            # Two independent widths, and the plane has to hold the larger. A
+            # layer reading the whole context needs `columns * rows_per_page`;
+            # one reading an earlier layer's candidate list needs
+            # `candidate_blocks * index_block_rows`, which the checkpoint fixes
+            # and `max_model_len` does not bound -- so which is larger flips
+            # with the context length, and sizing from the first alone fits
+            # every long-context configuration and none of the short ones:
+            # the candidate plane then overruns a workspace whose own
+            # arithmetic is correct, and the error names the scorer rather
+            # than the budget it was sized from.
+            widths.append(candidate_blocks * geometry.index_block_rows)
         plane = max((logits_rows(max_tokens, w) * w for w in widths), default=0)
         self.packed = geometry.index_fp4
         if self.packed and pages is None:
@@ -225,10 +222,7 @@ class ScoreWorkspace:
         a configured width. Bound by actual storage too, without reallocating
         buffers captured by graphs or retained by overlapping microbatches.
         """
-        capacity = self._logits.numel() // width
-        if capacity == 0:
-            raise ValueError("One logits row exceeds the scorer workspace")
-        return min(logits_rows(rows, width), capacity)
+        return capped_logits_rows(rows, width, self._logits.numel() // width)
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
@@ -241,12 +235,3 @@ class _TileWorkspace:
 
     def unit_table(self, ratio, tokens, width):
         return _view(self._tiles[ratio], tokens, width)
-
-
-def _view(flat, rows, width):
-    if rows * width > flat.numel():
-        raise ValueError(
-            f"a [{rows}, {width}] scorer temporary exceeds its workspace of "
-            f"{flat.numel()} elements"
-        )
-    return flat[: rows * width].view(rows, width)

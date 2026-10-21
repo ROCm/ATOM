@@ -45,7 +45,34 @@ from .speculative import TentativeState
 
 
 class PagedAttentionCache:
-    def __init__(self, geometry, pages, slots, device, max_tokens=0, workspace=None):
+    def _allocate_backing(self, size, device):
+        """This cache's whole pool, as one flat uint8 arena.
+
+        The one seam a caller that already owns the bytes overrides. PAGE and
+        STATE share a single address space here because
+        :meth:`V41PoolGeometry.window` states a slot's ring as an offset past
+        the absolute end of the paged region, and the ``_indices`` kernels
+        dereference page rows and window rows against one base -- so the pool
+        is handed over whole or not at all, and an override returns the whole
+        arena rather than the paged part of it.
+
+        What an override has to return is what this returns: zeroed, flat
+        uint8, contiguous, on ``device``, and exactly ``size`` elements. Every
+        region below is a `view` of it with its own strides, which neither a
+        short arena nor a longer tail would divide, and the cursor reset plus
+        every cold read assume the zeros.
+        """
+        return torch.zeros(size, dtype=torch.uint8, device=device)
+
+    def __init__(
+        self,
+        geometry,
+        pages,
+        slots,
+        device,
+        max_tokens=0,
+        workspace=None,
+    ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
         self.geometry, self.num_pages, self.num_slots = geometry, pages, slots
@@ -56,7 +83,7 @@ class PagedAttentionCache:
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
         size = boundary + slots * geometry.state_bytes
-        self.backing = torch.zeros(size, dtype=torch.uint8, device=device)
+        self.backing = self._allocate_backing(size, device)
         main_bytes = self.num_pages * geometry.page_bytes
         self.pages = EntryMajorArena(
             geometry.page_fields,
@@ -325,6 +352,13 @@ class PagedAttentionCache:
         # Per-forward and layer-invariant, so built here rather than by the
         # first layer to want one, exactly as V4 builds its own three. Triton,
         # like every reader of them, so a CPU pool has neither.
+
+        # Held so a reader that cannot be handed this object still finds it.
+        # Under vLLM's breakable capture an eager break is replayed with the
+        # arguments it was captured with, so attention cannot take `step` as a
+        # parameter and see this step -- it would see the one recorded with the
+        # graph. The cache outlives every step, so reading it from here is live.
+        self.current_step = step
         if not step.positions.is_cuda:
             return step
         self._reserve_indptrs(step.width)
@@ -406,6 +440,7 @@ class PagedAttentionCache:
         if not wrong.size:
             return
         first = int(wrong[0])
+
         raise ValueError(
             f"Request {requests[first]} needs state at {starts[first]}, "
             f"found {int(cursors[first, 0])}; replay from a recoverable boundary"
@@ -727,6 +762,7 @@ class PagedAttentionCache:
         (`rotate_query`).
         """
         dim, packed = self.geometry.head_dim, self.packed
+
         if not step.width:
             return (None, None) if step.decode else (torch.empty_like(kv), None)
         seam = (
