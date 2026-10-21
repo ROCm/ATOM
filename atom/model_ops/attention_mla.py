@@ -34,7 +34,6 @@ except ImportError:
     concat_and_cache_mla_seg = None
     fused_qk_rope_concat_and_cache_mla_seg = None
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -72,6 +71,7 @@ from atom.distributed.pcp_utils import (
 )
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.mla_query_heads import _MLA_MIN_HEADS
 from atom.model_ops.triton_fused_mla_ctx_kv import fused_mla_ctx_norm_rope_cache
 from atom.model_ops.triton_fused_qkv_quant import (
     fused_kv_per_tensor_quant,
@@ -217,8 +217,6 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 
 logger = logging.getLogger("atom")
 
-_MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
-
 
 def check_kv_shuffled_supported(
     atom_config,
@@ -245,35 +243,6 @@ def check_kv_shuffled_supported(
         raise ValueError(
             "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
         )
-
-
-def mla_min_query_heads(kv_cache_dtype: str, block_width: int, num_heads: int) -> int:
-    """Query-head padding that lets aiter dispatch a NON-causal MLA decode.
-
-    aiter picks its .co from (gqa, block width, causality), and on an fp8 cache
-    a 2-wide non-causal block has no kernel at gqa=16: the asm dispatch hits
-    AITER_CHECK and aborts the whole process. Padding to 32 instead reaches the
-    4-wide non-causal kernel through aiter's own (gqa=32, width 2) remap.
-
-    Only width 2 needs this. Widths 1, 3 and 4 have gqa=16 kernels, and aiter
-    remaps anything wider onto gqa=32 itself. Padding rather than remapping
-    width 2 to the 4-wide kernel at gqa=16 is deliberate: the persistent work
-    descriptors are sized from the block width, so a 2-wide plan driving a
-    4-wide kernel writes its partials past the reduce buffers (illegal access
-    at some batch sizes, a non-terminating kernel at others).
-
-    gfx1250 has none of those kernels: its page-size-1 fp8 decode is aiter's
-    FlyDSL PS1 kernel alone, and aiter routes a block wider than 1 to it only at
-    16 heads (up to 4 wide) or 96, causal or not. ``num_heads`` is the layer's
-    own count, which decides between the two.
-    """
-    if kv_cache_dtype.startswith("fp8") and get_gfx() == "gfx1250":
-        if block_width > 1 and (num_heads > _MLA_MIN_HEADS or block_width > 4):
-            return 96
-        return _MLA_MIN_HEADS
-    if block_width == 2 and kv_cache_dtype.startswith("fp8"):
-        return 32
-    return _MLA_MIN_HEADS
 
 
 def mla_kernel_num_heads(num_heads: int) -> int:

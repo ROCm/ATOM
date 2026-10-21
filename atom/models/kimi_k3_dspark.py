@@ -62,7 +62,6 @@ from torch import nn
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.attention_mla import (
     MLAModules,
-    mla_min_query_heads,
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
@@ -75,6 +74,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from atom.model_ops.mla_query_heads import mla_min_query_heads
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant, yarn_get_mscale
 from atom.models.dspark_draft import DSparkDraftModel
 from atom.models.kimi_k3 import _RMS_FUSABLE_QUANT_TYPES, _effective_layer_quant
