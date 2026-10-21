@@ -234,15 +234,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST": lambda: (
         os.getenv("ATOM_SGLANG_EAGLE3_TP_VERIFY_BROADCAST", "0") == "1"
     ),
-    # Qwen3.8-Flash-Next MTP on SGLang: capture the drafter's decode CUDA graph
-    # (default: the draft runs eagerly). Read by both the graph gate in
-    # atom/plugin/register.py and the QSA metadata hook in qwen4_exp_bridge.py.
-    "ATOM_SGLANG_QWEN4_DRAFT_CG": lambda: _flag_env("ATOM_SGLANG_QWEN4_DRAFT_CG"),
-    # With ATOM_SGLANG_QWEN4_DRAFT_CG, also capture the draft-extend graph that
-    # runs after every verify.
-    "ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG": lambda: _flag_env(
-        "ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG"
-    ),
     # Dynamic CPP follows SGLang's quadratic chunk-size predictor. This factor
     # interpolates between the configured initial chunk size (0) and the fitted
     # equal-latency size (1). Values around 0.6-0.85 are typically most stable.

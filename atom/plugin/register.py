@@ -6,7 +6,6 @@ from importlib import import_module
 
 from atom.config import Config
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
-from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -414,15 +413,7 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         return (
             _env_flag("ATOM_SGLANG_V4_ENABLE_DRAFT_EXTEND_CG")
             or (_is_dsv4_nextn_runner(runner) and _is_dsv4_flash_runner(runner))
-            or _qwen4_draft_extend_graph_enabled(runner)
-        )
-
-    def _qwen4_draft_extend_graph_enabled(runner) -> bool:
-        """Flash draft-extend graph, on top of the draft decode graph."""
-        return (
-            _is_qwen4_exp_nextn_runner(runner)
-            and envs.ATOM_SGLANG_QWEN4_DRAFT_CG
-            and envs.ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG
+            or _is_qwen4_exp_nextn_runner(runner)
         )
 
     def _target_verify_graph_enabled() -> bool:
@@ -927,17 +918,10 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
-            # Flash draft graphs are opt-in: ATOM_SGLANG_QWEN4_DRAFT_CG captures
-            # the draft decode graph (ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG adds the
-            # draft-extend graph below). Their [3, N] mRoPE input is staged on
-            # replay by stage_draft_graph_mrope.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
-            ) or (
-                _is_qwen4_exp_nextn_runner(draft_runner)
-                and not envs.ATOM_SGLANG_QWEN4_DRAFT_CG
             )
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
@@ -970,14 +954,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     getattr(self, "draft_runner", None)
                 ):
                     self.cuda_graph_runner = None
-                # The Flash drafter also takes this plugin-built
-                # draft-extend runner; SGLang's own HIP gate only admits aiter
-                # multi-step / DSV4 / DSA backends.
+                # The Flash drafter also takes this plugin-built draft-extend
+                # runner (its [3, N] mRoPE input is staged on replay by
+                # stage_draft_graph_mrope); SGLang's own HIP gate only admits
+                # aiter multi-step / DSV4 / DSA backends.
                 supports_plugin_graph = _is_dsv4_or_glm52_nextn_runner(
                     getattr(self, "draft_runner", None)
-                ) or _qwen4_draft_extend_graph_enabled(
-                    getattr(self, "draft_runner", None)
-                )
+                ) or _is_qwen4_exp_nextn_runner(getattr(self, "draft_runner", None))
                 if (
                     getattr(self, "cuda_graph_runner_for_draft_extend", None)
                     is not None

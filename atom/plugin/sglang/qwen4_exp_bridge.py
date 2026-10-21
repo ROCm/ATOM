@@ -37,7 +37,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer, envs
+from atom.utils import CpuGpuBuffer
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -244,9 +244,7 @@ _DRAFT_GRAPH_METADATA_IN_GRAPH = object()
 
 
 def _is_draft_decode_batch(forward_batch: Any) -> bool:
-    """Draft-runner decode batch (EAGLE draft input) with draft graphs enabled."""
-    if not envs.ATOM_SGLANG_QWEN4_DRAFT_CG:
-        return False
+    """Draft-runner decode batch (EAGLE draft input)."""
     spec = getattr(forward_batch, "spec_info", None)
     return type(spec).__name__ == "EagleDraftInput"
 

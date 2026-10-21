@@ -111,8 +111,6 @@ cannot affect a server that does not use the feature.
 |----------|------|---------|-------------|
 | **ATOM_DISABLE_VLLM_PLUGIN** | bool | 0 (false) | If set to `1`, disable the vLLM plugin registration entirely. |
 | **ATOM_V4_CG_INSTR_DIR** | str | — (off) | vLLM plugin, DeepSeek-V4 diagnostic: directory for per-process cudagraph dispatch counters (dispatched modes, steps whose uniform decode was overridden for a still-prefilling row, guard trips), one `cg_<pid>.json` per process, rewritten on every step. |
-| **ATOM_SGLANG_QWEN4_DRAFT_CG** | bool | 0 (false) | SGLang plugin, Qwen3.8-Flash-Next EAGLE MTP: capture the draft decode CUDA graph instead of running each draft step eagerly. Any value other than empty, `0`, `false`, `no` or `off` enables it. |
-| **ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG** | bool | 0 (false) | With `ATOM_SGLANG_QWEN4_DRAFT_CG`, also capture the draft-extend CUDA graph that runs after every verify. Ignored without `ATOM_SGLANG_QWEN4_DRAFT_CG`. |
 
 ## Kernel / backend selection
 

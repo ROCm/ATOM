@@ -25,10 +25,10 @@ from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
     note_qwen4_exp_from_identity,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
-    _is_draft_decode_batch,
     _query_start_loc,
     advance_draft_decode_mrope,
     bind_qsa_caches,
+    prepare_qwen4_exp_decode_graph_metadata,
     stage_draft_graph_mrope,
 )
 
@@ -509,23 +509,19 @@ class EagleDraftInput:
     pass
 
 
-@pytest.mark.parametrize(
-    "value,enabled",
-    [
-        ("1", True),
-        ("true", True),
-        ("yes", True),
-        ("on", True),
-        ("0", False),
-        ("off", False),
-        ("", False),
-    ],
-)
-def test_draft_graph_hook_reads_the_registered_flag(monkeypatch, value, enabled):
-    """The QSA hook and the capture gate in register.py share one parser."""
-    from atom.utils import envs
+class _DecodeMode:
+    @staticmethod
+    def is_decode_or_idle():
+        return True
 
-    monkeypatch.setenv("ATOM_SGLANG_QWEN4_DRAFT_CG", value)
-    assert envs.ATOM_SGLANG_QWEN4_DRAFT_CG is enabled
-    batch = SimpleNamespace(spec_info=EagleDraftInput())
-    assert _is_draft_decode_batch(batch) is enabled
+    @staticmethod
+    def is_target_verify():
+        return False
+
+
+def test_draft_decode_hook_never_builds_target_graph_metadata():
+    """Draft decode batches stop before the target's _DECODE_GRAPH fill."""
+    draft = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=EagleDraftInput())
+    assert prepare_qwen4_exp_decode_graph_metadata(draft) is not None
+    target = SimpleNamespace(forward_mode=_DecodeMode(), spec_info=None)
+    assert prepare_qwen4_exp_decode_graph_metadata(target) is None
