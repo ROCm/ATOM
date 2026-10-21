@@ -27,7 +27,6 @@ from .backends import AttentionBackend
 from .gdn_attn import LINEAR_STATE_ROWS, GDNStateMixin
 from .pool_layout.page_unit_geometry import PageUnitGeometryMixin
 from .pool_layout.sub_pool_spec import SubPoolSpec, page_pool, state_pool
-from .triton_mla import TritonMLAMetadataBuilder
 
 
 class KimiMLAGDNBackend(AttentionBackend):
@@ -38,6 +37,8 @@ class KimiMLAGDNBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["_KimiMLAGDNCommon"]:
         if envs.ATOM_USE_TRITON_MLA:
+            from .kimi_triton_mla_gdn_attn import KimiTritonMLAGDNMetadataBuilder
+
             return KimiTritonMLAGDNMetadataBuilder
         return KimiAiterMLAGDNMetadataBuilder
 
@@ -540,7 +541,3 @@ class _KimiMLAGDNCommon(PageUnitGeometryMixin, GDNStateMixin):
 class KimiAiterMLAGDNMetadataBuilder(_KimiMLAGDNCommon, AiterMLAMetadataBuilder):
     def _supports_dcp_index_staging(self) -> bool:
         return False
-
-
-class KimiTritonMLAGDNMetadataBuilder(_KimiMLAGDNCommon, TritonMLAMetadataBuilder):
-    pass
