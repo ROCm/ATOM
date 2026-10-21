@@ -1543,6 +1543,41 @@ async def _reclaim_watch_once() -> None:
     reclaim_watch("api_server")
 
 
+# Chat template render time on the loop since the last LOOP report.
+_loop_probe = {"tmpl_s": 0.0}
+
+
+async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
+    """Log how late this loop wakes from a ``tick`` sleep, every ``window``."""
+    loop = asyncio.get_running_loop()
+    lags: list[float] = []
+    start = loop.time()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(tick)
+        now = loop.time()
+        lags.append(now - t0 - tick)
+        if now - start < window:
+            continue
+        lags.sort()
+        n = len(lags)
+        logger.info(
+            "[PD-TIMING] ev=LOOP t=%.3f window_s=%.1f n=%d p50_ms=%.1f "
+            "p99_ms=%.1f max_ms=%.1f blocked20_s=%.2f tmpl_s=%.2f",
+            time.time(),
+            now - start,
+            n,
+            lags[n // 2] * 1e3,
+            lags[int(n * 0.99)] * 1e3,
+            lags[-1] * 1e3,
+            sum(x for x in lags if x > 0.02),
+            _loop_probe["tmpl_s"],
+        )
+        lags.clear()
+        _loop_probe["tmpl_s"] = 0.0
+        start = now
+
+
 async def _periodic(interval: float, step: Callable[[], Awaitable[None]]) -> None:
     """Run `step` on a fixed cadence for the life of the process.
 
@@ -1583,6 +1618,10 @@ async def lifespan(app: FastAPI):
             (_GC_WATCH_INTERVAL_SECONDS, _reclaim_watch_once),
         )
     ]
+    if pd_timing.enabled():
+        _background_tasks.append(
+            asyncio.create_task(_loop_lag_monitor(), name="_loop_lag_monitor")
+        )
     try:
         yield
     finally:
@@ -1726,6 +1765,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
             prompt_or_tokens = pretokenized
             kv_transfer_params = _engine_kv_transfer_params(kv_transfer_params)
         else:
+            t0 = time.perf_counter()
             prompt_or_tokens = apply_chat_template(
                 tokenizer,
                 custom_message_encoder,
@@ -1733,6 +1773,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                 tools=request.tools,
                 **merged_kwargs,
             )
+            _loop_probe["tmpl_s"] += time.perf_counter() - t0
 
         # The K3 template may open the reasoning channel in text or token IDs.
         _reasoning = reasoning_channel(
