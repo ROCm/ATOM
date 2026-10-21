@@ -864,6 +864,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
+    # Captured renormalized softmax top-k routing uses the Triton kernel in
+    # `model_ops/triton_topk_softmax.py` (same bits as AITER, ~2x faster at
+    # 512 experts). Eager calls always use AITER.
+    "ATOM_TRITON_TOPK_SOFTMAX": lambda: (
+        os.getenv("ATOM_TRITON_TOPK_SOFTMAX", "1").lower() == "1"
+    ),
     # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
     # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
     # dispatcher, so this moves V2/V3.2/K3 too. See docs.
