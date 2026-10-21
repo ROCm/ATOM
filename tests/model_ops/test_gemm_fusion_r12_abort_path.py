@@ -38,7 +38,11 @@ def _extract(rel, cls_name, methods, namespace):
 
 # ----------------------------------------------------------------------------------- runner side
 RUNNER = "atom/model_engine/model_runner.py"
-RUNNER_METHODS = {"_gemm_fusion_check_step", "_apply_gemm_fusion_verdict"}
+RUNNER_METHODS = {
+    "_gemm_fusion_check_step",
+    "_apply_gemm_fusion_verdict",
+    "_gemm_fusion_check_launch_gate",
+}
 
 
 def _runner(enabled=True):
@@ -70,8 +74,18 @@ def check_step(monkeypatch):
     import types
 
     fake = _CheckStep()
+    fake.gate_checks = 0
+    fake.gate_error = None
+
+    def check_launch_gate():
+        fake.gate_checks += 1
+        if fake.gate_error is not None:
+            raise fake.gate_error
+
     fake_pkg = types.ModuleType("atom.model_ops")
-    fake_pkg.gemm_fusion = SimpleNamespace(check_step=fake)
+    fake_pkg.gemm_fusion = SimpleNamespace(
+        check_step=fake, check_launch_gate=check_launch_gate
+    )
     monkeypatch.setitem(sys.modules, "atom.model_ops", fake_pkg)
     return fake
 
@@ -198,3 +212,71 @@ def test_the_output_object_carries_the_verdict_and_defaults_to_none():
     assert plain.aborted_req_ids is None
     verdict = out_cls([1], [], None, None, None, aborted_req_ids=[1])
     assert verdict.aborted_req_ids == [1]
+
+
+# ------------------------------------------------- the launch gate in the runner
+def test_the_runner_gate_check_is_a_noop_when_fusion_is_off(check_step):
+    _runner(enabled=False)._gemm_fusion_check_launch_gate()
+    assert check_step.gate_checks == 0
+
+
+def test_the_runner_gate_check_asks_gemm_fusion_and_lets_its_error_through(check_step):
+    runner = _runner()
+    runner._gemm_fusion_check_launch_gate()
+    assert check_step.gate_checks == 1
+    check_step.gate_error = RuntimeError("reset in progress")
+    with pytest.raises(RuntimeError, match="reset in progress"):
+        runner._gemm_fusion_check_launch_gate()  # never swallowed: the worker must fail
+
+
+def _runner_functions():
+    tree = ast.parse((ROOT / RUNNER).read_text(encoding="utf-8"))
+    out = {}
+    for cls in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+        for fn in (n for n in cls.body if isinstance(n, ast.FunctionDef)):
+            out[(cls.name, fn.name)] = fn
+    return out
+
+
+def _is_gate_check(stmt):
+    return (
+        isinstance(stmt, ast.Expr)
+        and ast.unparse(stmt.value) == "self._gemm_fusion_check_launch_gate()"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        ("ModelRunner", "forward"),
+        ("RapidServeModelRunner", "forward"),
+        ("RapidServeModelRunner", "prefill_forward"),
+    ],
+)
+def test_every_forward_entry_checks_the_launch_gate_before_anything_else(key):
+    fn = _runner_functions()[key]
+    body = fn.body
+    if (  # skip a docstring
+        isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    assert _is_gate_check(body[0]), f"{key[1]} must start with the launch gate check"
+
+
+def test_a_graph_replay_is_always_preceded_by_the_launch_gate_check():
+    """A captured graph runs no Python, so the check must be made right before ``replay()``."""
+    fn = _runner_functions()[("ModelRunner", "run_model")]
+    replays = 0
+    for node in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody"):
+            stmts = getattr(node, field, None)
+            if not isinstance(stmts, list):
+                continue
+            for i, stmt in enumerate(stmts):
+                src = ast.unparse(stmt)
+                if src.startswith("self.graphs[") and src.endswith(".replay()"):
+                    replays += 1
+                    assert i > 0 and _is_gate_check(stmts[i - 1]), src
+    assert replays == 1  # the only replay of a served step

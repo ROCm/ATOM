@@ -176,6 +176,13 @@ class FusionResourcesWrapper:
         """
         self.inner.reset()
 
+    @property
+    def launch_gate(self) -> bool:
+        """True for the whole of aiter's collective reset: ``Plan.run`` raises while it is set, and a
+        captured-graph replay (no Python) would not notice, so ATOM reads it before every forward and
+        graph replay. A plain bool read (False on an aiter without the gate)."""
+        return bool(getattr(self.inner, "launch_gate", False))
+
     def reset_error_words(self, exc):
         """``{rank: error word}`` when ``exc`` is aiter's ``ResetError`` (a reset that could not reach
         an all-zero error state: the communicator cannot be trusted), else None."""

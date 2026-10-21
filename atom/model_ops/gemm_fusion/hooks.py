@@ -346,8 +346,26 @@ def tick() -> None:
     ``run`` (inside the custom op, so it is captured into every graph and executed in eager), once per
     forward per rank. Not before the phase is ready: the counter does not exist earlier, and the
     phase is rank-uniform."""
-    if _STEP_T is not None and _PHASE == "ready":
-        _STEP_T.add_(1)
+    if _STEP_T is not None and _PHASE == "ready" and not _RES.launch_gate:
+        _STEP_T.add_(1)  # not while a reset is zeroing the page this counter lives in
+
+
+def check_launch_gate() -> None:
+    """Refuse to start a forward or a graph replay while aiter's collective reset is in progress.
+
+    ``recover()`` blocks the forward thread for the whole reset, so the gate can only be seen set
+    when a reset outlived its caller (``GemmFusionRecoveryTimeout``: the reset thread is still
+    running) or is run from another thread. A fused launch in that window could write the error
+    word, STEP and the control windows after they were zeroed, and a CAPTURED GRAPH REPLAY runs no
+    Python, so neither aiter's own ``Plan.run`` check nor anything else would stop it: this one bool
+    read, made on the forward thread before the replay, is the only guard. The worker is failed.
+    """
+    res = _RES
+    if res is not None and res.launch_gate:
+        raise GemmFusionDeviceError(
+            "gemm_fusion: a collective reset is in progress (launch gate set); refusing to start "
+            "a forward / graph replay, the worker must be treated as failed"
+        )
 
 
 def _any_rank_error(word: int) -> bool:

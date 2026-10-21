@@ -3301,6 +3301,7 @@ class ModelRunner:
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
                 if sp_is_enabled():
                     self.sp_graph_input_ids(running_tokens)
+                self._gemm_fusion_check_launch_gate()  # a replay runs no Python: check here
                 self.graphs[graph_key].replay()
                 if sp_is_enabled():
                     local = self.sp_local_tokens(running_tokens)
@@ -3535,6 +3536,7 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        self._gemm_fusion_check_launch_gate()
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -3637,6 +3639,15 @@ class ModelRunner:
         if aborted is None:
             self._record_kv_cache_ready(batch)
         return self._apply_gemm_fusion_verdict(fwd_output, aborted)
+
+    def _gemm_fusion_check_launch_gate(self) -> None:
+        """Refuse a forward / graph replay while GEMM fusion's collective reset is running (a replayed
+        graph runs no Python, so aiter's own launch check cannot see it). One bool read; no-op unless
+        gemm_fusion is ON."""
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.check_launch_gate()
 
     def _gemm_fusion_check_step(self, batch) -> list[int] | None:
         """Periodic device error check of GEMM fusion, outside capture.
@@ -4731,6 +4742,7 @@ class RapidServeModelRunner(ModelRunner):
         # GPU; postprocess (sampling + async CPU copy) stays on the default
         # stream. The stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
+        self._gemm_fusion_check_launch_gate()
         stream = self._decode_streams[batch.cu_stream_fraction]
         self._done_event.record()
         stream.wait_event(self._done_event)
@@ -5089,6 +5101,7 @@ class RapidServeModelRunner(ModelRunner):
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
         """
+        self._gemm_fusion_check_launch_gate()
         prefill_streams = getattr(self, "_prefill_streams", None)
         if prefill_streams is not None:
             stream = self._prefill_streams[batch.cu_stream_fraction]

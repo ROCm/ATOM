@@ -82,6 +82,7 @@ class FakeResources:
         self.reset_raises = (
             None  # set to an exception: every collective reset raises it
         )
+        self.launch_gate = False  # aiter: True for the whole of a collective reset
         # device error word / STEP model (the adapter API of FusionResourcesWrapper)
         self.error_value = 0  # this rank's device error word
         self.peer_flag = 0  # what the other ranks contribute to reduce_max
@@ -148,11 +149,15 @@ class FakeResources:
         return [max(v, self.peer_flag) for v in values]
 
     def _reset(self):
-        if self.reset_blocks is not None:
-            self.reset_blocks.wait()
-        if self.reset_raises is not None:
-            raise self.reset_raises
-        self.resets += 1
+        self.launch_gate = True
+        try:
+            if self.reset_blocks is not None:
+                self.reset_blocks.wait()
+            if self.reset_raises is not None:
+                raise self.reset_raises
+            self.resets += 1
+        finally:
+            self.launch_gate = False
 
     def reset_error_words(self, exc):
         return exc.words if isinstance(exc, _FakeResetError) else None
@@ -3893,3 +3898,69 @@ def test_the_adapter_recognises_aiters_reset_error_and_nothing_else(monkeypatch)
     # an aiter without the class (older build): never a false positive
     TU.inject_aiter(monkeypatch, SimpleNamespace())
     assert w.reset_error_words(ResetError("x", words)) is None
+
+
+# ------------------------------------------------ R12: no forward / graph replay while a reset runs
+def test_the_launch_gate_check_is_a_noop_when_off_or_when_no_reset_runs():
+    TU.reset_for_tests()
+    hooks.check_launch_gate()  # OFF: no resources at all
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    hooks.check_launch_gate()  # gate open
+
+
+def test_a_set_launch_gate_fails_the_forward_instead_of_starting_it():
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    res.launch_gate = True
+    with pytest.raises(hooks.GemmFusionDeviceError, match="reset is in progress"):
+        hooks.check_launch_gate()
+    res.launch_gate = False
+    hooks.check_launch_gate()  # open again: fine
+
+
+def test_a_reset_that_outlived_its_caller_blocks_the_next_forward():
+    """The overlap the gate exists for: recover() timed out (a peer never arrived) but aiter's reset
+    is STILL running on its thread with the gate set. The next forward (or graph replay, which runs
+    no Python) must not start."""
+    import threading
+    import time
+
+    res = _ready_hooks(FakeResources())
+    res.reset_blocks = threading.Event()
+    with pytest.raises(hooks.GemmFusionRecoveryTimeout):
+        hooks.recover(timeout_s=0.2)
+    assert res.launch_gate is True  # the reset thread is still inside reset()
+    with pytest.raises(hooks.GemmFusionDeviceError, match="reset is in progress"):
+        hooks.check_launch_gate()
+    res.reset_blocks.set()  # the peer finally arrives; the gate drops when reset() returns
+    deadline = time.monotonic() + 5
+    while res.launch_gate and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert res.launch_gate is False
+
+
+def test_the_step_tick_is_skipped_while_the_gate_is_set():
+    res = FakeResources()
+    TU.reset_for_tests(res)
+    hooks._STEP_T = res.step_tensor()
+    TU.set_phase("ready")
+    hooks.tick()
+    assert res.ticks == 1
+    res.launch_gate = True  # the page the counter lives in is being zeroed
+    hooks.tick()
+    assert res.ticks == 1
+    res.launch_gate = False
+    hooks.tick()
+    assert res.ticks == 2
+
+
+def test_the_adapter_reads_aiters_launch_gate_as_a_plain_bool(monkeypatch):
+    inner = SimpleNamespace(launch_gate=False)
+    w = _adapter(monkeypatch, inner)
+    assert w.launch_gate is False
+    inner.launch_gate = True
+    assert w.launch_gate is True
+    assert (
+        _adapter(monkeypatch, SimpleNamespace()).launch_gate is False
+    )  # an aiter without it

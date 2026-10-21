@@ -12,6 +12,7 @@ from .hooks import (  # noqa: F401
     after_graph_capture,
     before_graph_capture,
     bind_kv_cache,
+    check_launch_gate,
     check_now,
     check_step,
     init_gemm_fusion,

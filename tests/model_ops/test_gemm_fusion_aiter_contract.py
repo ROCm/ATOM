@@ -832,3 +832,24 @@ def test_the_adapter_recognises_the_real_aiter_reset_error(real_gf):
     err = real_gf.ResetError("reset: ERR still non-zero", words)
     assert w.reset_error_words(err) == words
     assert w.reset_error_words(real_gf.ResourceError("not a reset failure")) is None
+
+
+def test_the_real_fusion_resources_carry_the_launch_gate_the_adapter_reads(
+    real_gf, atu
+):
+    """aiter f6309062: ``FusionResources.launch_gate`` is True for the whole of reset() and
+    ``Plan.run`` raises ``LaunchGateError`` while it is set; a graph replay bypasses Python, so ATOM
+    reads the flag itself (hooks.check_launch_gate) through the adapter."""
+    assert issubclass(real_gf.LaunchGateError, real_gf.ResourceError)
+    w = TU.InjectedResourcesWrapper(
+        None,
+        4,
+        rank=0,
+        inner=_real_inner(real_gf, atu, atu.ArenaBackend()),
+        reduce_min=lambda v: list(v),
+        arch="gfx950",
+        cu=256,
+    )
+    assert w.inner.launch_gate is False and w.launch_gate is False
+    w.inner.launch_gate = True
+    assert w.launch_gate is True
