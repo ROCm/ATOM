@@ -15,6 +15,7 @@ import torch
 
 from atom.model_ops.sparse_indexer_chunk import (
     _BUFFER_DESCRIPTOR_LIMIT_BYTES,
+    capped_logits_rows,
     decode_band_rows,
     flat_view,
     plane_rows,
@@ -144,6 +145,22 @@ def test_glm52_mtp3_at_bs512_is_six_bands_of_96_requests(budget):
 def test_the_workspace_capacity_clamps_the_band(budget):
     assert decode_band_rows(2048, _GLM52_WIDTH, 4, capacity=101) == 100
     assert decode_band_rows(2048, _GLM52_WIDTH, 3, capacity=101) == 99
+
+
+@pytest.mark.parametrize("next_n", [1, 4])
+def test_no_decode_rows_is_an_empty_loop_not_a_zero_step(budget, next_n):
+    band = decode_band_rows(0, _GLM52_WIDTH, next_n)
+    assert band == next_n
+    assert list(range(0, 0, band)) == []
+
+
+def test_capped_logits_rows_is_bounded_by_the_workspace(budget):
+    assert capped_logits_rows(2048, _GLM52_WIDTH, 100) == 100
+    assert capped_logits_rows(64, _GLM52_WIDTH, 512) == 64
+    with pytest.raises(ValueError):
+        capped_logits_rows(2048, _GLM52_WIDTH, 0)
+    with pytest.raises(ValueError):
+        capped_logits_rows(2048, _GLM52_WIDTH, 3, min_rows=4)
 
 
 def test_a_workspace_below_one_request_fails(budget):

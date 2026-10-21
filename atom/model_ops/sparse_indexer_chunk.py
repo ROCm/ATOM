@@ -80,18 +80,29 @@ def logits_rows(rows, width):
     )
 
 
+def capped_logits_rows(rows, width, capacity, min_rows=1):
+    """`logits_rows` within a workspace of `capacity` rows of `width`; fails
+    when it cannot hold `min_rows`."""
+    if capacity < min_rows:
+        raise ValueError(
+            f"logits workspace holds {capacity} rows of {width} columns, "
+            f"fewer than {min_rows}"
+        )
+    return min(logits_rows(rows, width), capacity)
+
+
 def decode_band_rows(rows, width, next_n, capacity=None):
     """Rows per decode band: `logits_rows` rounded down to whole requests of
     `next_n` rows, never below one request, and within `capacity` rows when
-    given. A band that split a request would mis-slice its query and lengths."""
-    band = logits_rows(rows, width)
-    if capacity is not None:
-        if capacity < next_n:
-            raise ValueError(
-                f"logits workspace holds {capacity} rows, less than one "
-                f"request's {next_n}"
-            )
-        band = min(band, capacity)
+    given. A band that split a request would mis-slice its query and lengths.
+    No rows still gives a positive band, so a loop over them is empty."""
+    if rows <= 0:
+        return next_n
+    band = (
+        logits_rows(rows, width)
+        if capacity is None
+        else capped_logits_rows(rows, width, capacity, next_n)
+    )
     return min(rows, max(next_n, band // next_n * next_n))
 
 

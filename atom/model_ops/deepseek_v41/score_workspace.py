@@ -18,8 +18,12 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from atom.model_ops.sparse_indexer_chunk import (
+    capped_logits_rows,
+    logits_rows,
+    plane_rows,
+)
 from atom.model_ops.sparse_indexer_chunk import flat_view as _view
-from atom.model_ops.sparse_indexer_chunk import logits_rows, plane_rows
 
 # A packed row starts on a 256-byte boundary, which the row-group scorer's
 # stores need to run at speed, and on a whole candidate block, so its block
@@ -218,10 +222,7 @@ class ScoreWorkspace:
         a configured width. Bound by actual storage too, without reallocating
         buffers captured by graphs or retained by overlapping microbatches.
         """
-        capacity = self._logits.numel() // width
-        if capacity == 0:
-            raise ValueError("One logits row exceeds the scorer workspace")
-        return min(logits_rows(rows, width), capacity)
+        return capped_logits_rows(rows, width, self._logits.numel() // width)
 
     def row_starts(self, rows):
         """`[rows + 1]` int32 0 .. rows: each of `rows` rows its own sequence."""
