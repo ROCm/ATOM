@@ -293,6 +293,46 @@ if sys.argv[1] == "run" and os.environ.get("ATOMESH_PREPARE_LMCACHE_HOST_MEMORY"
         self.assertEqual(result["status"], "running")
         self.assertIn(["rm", "-f", "atomesh-test-cell-42-1"], self.docker_calls(1))
 
+    def test_failed_container_retains_exit_state_and_event_evidence(self):
+        docker = self.bin_dir / "docker"
+        docker.write_text(docker.read_text() + """
+if sys.argv[1] == "inspect":
+    print('{"OOMKilled": true, "ExitCode": 7}')
+if sys.argv[1] == "events":
+    print('1000000000 oom signal= exitCode=7')
+""")
+        self.run_job(expected_rc=7, FAIL_RANK="1")
+        state = self.run_dir / "rank-1/container-state.json"
+        self.assertEqual(json.loads(state.read_text())["ExitCode"], 7)
+        events = (self.run_dir / "rank-1/container-events.log").read_text()
+        self.assertIn("oom", events)
+        calls = self.docker_calls(1)
+        event = next(call for call in calls if call[0] == "events")
+        self.assertIn("--until", event)
+        self.assertIn("container=atomesh-test-cell-42-1", event)
+
+    def test_failure_diagnostics_cannot_replace_workload_exit_code(self):
+        docker = self.bin_dir / "docker"
+        docker.write_text(docker.read_text() + """
+if sys.argv[1] in ("inspect", "events"):
+    sys.exit(99)
+""")
+        self.run_job(expected_rc=7, FAIL_RANK="1")
+        self.assertEqual((self.run_dir / "rank-rc-1").read_text(), "7\n")
+
+    def test_startup_does_not_stop_unrelated_host_containers(self):
+        docker = self.bin_dir / "docker"
+        docker.write_text(docker.read_text() + """
+if sys.argv[1] == "ps":
+    print('unrelated-container')
+""")
+        self.run_job()
+        for rank in range(2):
+            for call in self.docker_calls(rank):
+                self.assertNotEqual(call[0], "stop")
+                if call[0] in ("kill", "rm"):
+                    self.assertNotIn("unrelated-container", call)
+
     def test_dispatch_failure_is_not_reported_as_success(self):
         self.run_job(expected_rc=9, DISPATCH_RC="9")
         self.assertFalse((self.root / "docker-0.jsonl").exists())
