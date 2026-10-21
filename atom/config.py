@@ -1649,10 +1649,25 @@ class GemmFusionConfig:
     """
 
     profile: str = ""
+    # Host cadence of the device error check, in model steps. 14 = snapshot the device error word every
+    # 14 steps and evaluate it 2 steps later, so a verdict aborts the requests of at most 14 + 2 = 16
+    # steps. 1 = synchronous: verify in the same step, before the step's KV is published (what a P/D
+    # producer needs; forced for those ranks regardless of this value). 2 (and anything below 1) is
+    # rejected: the asynchronous schedule needs its two-step evaluation delay inside one period.
+    check_period: int = 14
 
     def __post_init__(self):
         if not isinstance(self.profile, str):
             raise TypeError("gemm_fusion.profile must be a string")
+        if not isinstance(self.check_period, int) or isinstance(
+            self.check_period, bool
+        ):
+            raise TypeError("gemm_fusion.check_period must be an integer")
+        if self.check_period != 1 and self.check_period < 3:
+            raise ValueError(
+                "gemm_fusion.check_period must be 1 (synchronous) or >= 3, "
+                f"got {self.check_period}"
+            )
 
     @property
     def enabled(self) -> bool:
@@ -2250,6 +2265,25 @@ class Config:
                 )
         self.prefill_context_parallel_size = sp
 
+    def _validate_gemm_fusion(self) -> None:
+        """Refuse GEMM fusion where its rank-uniform step and error protocol is not defined.
+
+        The profile is an explicit opt-in, so a combination that cannot work is an error, not a silent
+        fall back to OFF. With pipeline parallelism every stage would be its own SP group with its own
+        step counter and its own verdict, and the runner's abort path (one ``ScheduledBatchOutput`` from
+        the last stage) does not carry a per-stage verdict.
+        """
+        if (
+            self.gemm_fusion.enabled
+            and self.sequence_parallel_size > 1
+            and self.pipeline_parallel_size > 1
+        ):
+            raise ValueError(
+                "--gemm-fusion-profile is not supported with pipeline parallelism "
+                f"(--pipeline-parallel-size {self.pipeline_parallel_size}) together with "
+                f"--sequence-parallel-size {self.sequence_parallel_size}."
+            )
+
     def _validate_m3_tp_replicated_o_proj(self) -> None:
         if not self.m3_tp_replicated_o_proj:
             return
@@ -2490,6 +2524,7 @@ class Config:
         _normalize_moe_config_fields(self.hf_config, self.model)
         if self.sequence_parallel_size > 1:
             self._init_sequence_parallel()
+        self._validate_gemm_fusion()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

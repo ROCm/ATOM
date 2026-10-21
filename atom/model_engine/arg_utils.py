@@ -182,6 +182,7 @@ class EngineArgs:
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
     gemm_fusion_profile: str | None = None
+    gemm_fusion_check_period: int | None = None
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -738,6 +739,17 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--gemm-fusion-check-period",
+            type=int,
+            default=None,
+            help=(
+                "Steps between device error checks of GEMM fusion (default 14: the "
+                "requests of at most 16 steps are aborted on an error; 1 = check "
+                "every step synchronously). Ignored without --gemm-fusion-profile; "
+                "KV-publishing P/D ranks always check every step."
+            ),
+        )
+        parser.add_argument(
             "--dspark-config",
             type=json.loads,
             default=None,
@@ -915,9 +927,11 @@ class EngineArgs:
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
         # --gemm-fusion-profile (name) -> Config.gemm_fusion; empty = OFF.
-        kwargs["gemm_fusion"] = GemmFusionConfig(
-            profile=kwargs.pop("gemm_fusion_profile", None) or ""
-        )
+        gemm_fusion_kwargs = {"profile": kwargs.pop("gemm_fusion_profile", None) or ""}
+        check_period = kwargs.pop("gemm_fusion_check_period", None)
+        if check_period is not None:
+            gemm_fusion_kwargs["check_period"] = check_period
+        kwargs["gemm_fusion"] = GemmFusionConfig(**gemm_fusion_kwargs)
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
