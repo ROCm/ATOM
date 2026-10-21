@@ -64,6 +64,45 @@ def _os_env(k):
     return os.environ.get(k, "<unset>")
 
 
+def _verify_mtpr_group_agreed(selected_mtpr: int, context) -> None:
+    """Fail loudly when EP ranks disagree on the capacity, instead of hanging.
+
+    `_select_decode_mtpr` reads only this rank's context and trusts that every
+    peer reads an equal one -- the contract stated at the top of this file.
+    Nothing enforces it, and the failure mode when it breaks is the worst kind:
+    MTPR picks the p2p wire format, so a divergent rank does not raise, it waits
+    inside `megamoe_stage1` for a layout no peer will send. The group then sits
+    at 100% CPU with one dispatch in flight and no rank identifiable as the odd
+    one out.
+
+    Both bounds ride one MAX reduction (`[m, -m]` -> `[max, -min]`), on the EP
+    gloo group so nothing touches the compute stream. Callers must reach this on
+    every rank: it is collective.
+    """
+    import torch.distributed as dist
+    from aiter.dist.parallel_state import get_ep_group
+
+    ep = get_ep_group()
+    cpu_group = getattr(ep, "cpu_group", None)
+    if cpu_group is None:
+        return
+    bounds = torch.tensor([selected_mtpr, -selected_mtpr], dtype=torch.int64)
+    dist.all_reduce(bounds, op=dist.ReduceOp.MAX, group=cpu_group)
+    hi, lo = int(bounds[0]), -int(bounds[1])
+    if hi != lo:
+        raise RuntimeError(
+            f"[mega] EP ranks disagree on MegaMoE capacity: this rank chose "
+            f"{selected_mtpr}, the group spans [{lo}, {hi}]. MTPR selects the "
+            f"p2p wire format, so this would hang in megamoe_stage1 rather "
+            f"than fail. This rank's inputs: is_draft="
+            f"{getattr(context, 'is_draft', '?')} "
+            f"is_prefill={getattr(context, 'is_prefill', '?')} "
+            f"running_tokens={getattr(context, 'running_tokens', '?')} "
+            f"running_tokens_are_unified="
+            f"{getattr(context, 'running_tokens_are_unified', '?')}"
+        )
+
+
 def _select_decode_mtpr(mtpr: int, context, *, tbo_active: bool) -> int:
     """Select from already allocated capacities using the pass's shared shape.
 
@@ -290,6 +329,13 @@ def run_mega_moe(
 
         context = get_forward_context().context
         selected_mtpr = _select_decode_mtpr(mtpr, context, tbo_active=False)
+        if envs.ATOM_MEGA_VERIFY_MTPR:
+            # Here, not inside the `!= mtpr` branch below: a rank that KEEPS the
+            # configured capacity while a peer switches is the divergence, so
+            # checking only the switchers would miss exactly the case that
+            # hangs. `use_decode_capacity` is uniform across the group (env,
+            # config and world shape only), so every rank reaches this.
+            _verify_mtpr_group_agreed(selected_mtpr, context)
         if selected_mtpr != mtpr:
             # The local tensor is a bound check, not an independent protocol
             # selector. All peers must choose using the same context metadata.

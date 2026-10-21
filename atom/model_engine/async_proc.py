@@ -17,6 +17,7 @@ import logging
 import multiprocessing
 import pickle
 import queue
+import sys
 import threading
 import time
 import weakref
@@ -58,6 +59,60 @@ from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
 
 logger = logging.getLogger("atom")
+
+_SLEEP_WHEN_IDLE_APPLIED = False
+
+
+def _maybe_sleep_when_idle() -> None:
+    """Let an idle worker back off its RPC-ring poll, when asked to.
+
+    aiter's vendored `shm_broadcast` froze vLLM's `VLLM_SLEEP_WHEN_IDLE` to a
+    module constant `False` -- its `envs` lookup is commented out at the top of
+    that file -- so every reader gets the bare-`sched_yield` `SpinTimer` and
+    pins a thread at ~100% regardless of load. Flipping the constant is the
+    only seam: `MessageQueue.__init__` reads it to choose the timer, and keeps
+    no setting we could pass instead.
+
+    Must run BEFORE the queue is constructed; after it, the timer is already
+    chosen. Idempotent so repeated worker construction does not re-log.
+    """
+    global _SLEEP_WHEN_IDLE_APPLIED
+    if _SLEEP_WHEN_IDLE_APPLIED or not envs.ATOM_WORKER_SLEEP_WHEN_IDLE:
+        return
+    _SLEEP_WHEN_IDLE_APPLIED = True
+    # Reached off the class, not by importing the module: `aiter.dist` is
+    # rebound to `torch.distributed`, so `import aiter.dist.shm_broadcast as x`
+    # resolves by attribute and raises, while the `from ... import` above goes
+    # through the path finder and works. This takes the module that import
+    # already produced.
+    shm = sys.modules[MessageQueue.__module__]
+    timer_cls = getattr(shm, "SpinSleepTimer", None)
+    if timer_cls is None:
+        # An aiter without the backoff timer: leave the spin alone rather than
+        # half-apply a setting whose other half does not exist.
+        logger.warning(
+            "ATOM_WORKER_SLEEP_WHEN_IDLE is set but this aiter has no "
+            "SpinSleepTimer; workers keep spinning."
+        )
+        return
+    busy_s = envs.ATOM_WORKER_IDLE_BUSY_LOOP_S
+    sleep_s = envs.ATOM_WORKER_IDLE_SLEEP_S
+
+    class _AtomSpinSleepTimer(timer_cls):
+        # Subclassed rather than relying on aiter's defaults (3.0s / 0.1s): the
+        # sleep bounds how late a message is noticed, and 100ms is a long tail
+        # for a decode step. The constant below only selects the class.
+        def __init__(self):
+            super().__init__(busy_loop_s=busy_s, wait_sleep_s=sleep_s)
+
+    shm.SpinSleepTimer = _AtomSpinSleepTimer
+    shm.VLLM_SLEEP_WHEN_IDLE = True
+    logger.info(
+        "Worker RPC poll backs off when idle: busy_loop=%.3fs sleep=%.3fs "
+        "(ATOM_WORKER_SLEEP_WHEN_IDLE)",
+        busy_s,
+        sleep_s,
+    )
 
 
 @dataclass
@@ -177,6 +232,7 @@ class AsyncIOProc:
         self.rpc_output_addr = rpc_output_addr
         self.rpc_queue: queue.Queue | None = None
 
+        _maybe_sleep_when_idle()
         self.rpc_broadcast_mq = MessageQueue.create_from_handle(input_shm_handle, rank)
         import atexit
 

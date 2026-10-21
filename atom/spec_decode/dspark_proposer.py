@@ -17,6 +17,7 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 
+
 @triton.jit(do_not_specialize=["scheduled_bs", "vocab_max"])
 def _stage_anchors_kernel(
     ids_out,
@@ -559,7 +560,15 @@ class DSparkProposer(Drafter):
             x_prev = getattr(output, "x_prev", None)
             post = getattr(output, "post_mix", None)
             comb = getattr(output, "comb_mix", None)
-            if x_prev is not None and post is not None and comb is not None:
+            # NOTE: no instrumentation in here. This runs from a forward
+            # hook on a target decoder layer, i.e. INSIDE the
+            # `@support_torch_compile` traced region, where a logging call or a
+            # module-level set mutation breaks Dynamo -- it surfaces as
+            # "Assigning / modifying buffers of nn.Module during forward pass"
+            # from a frame that names neither. Report the branch from a call
+            # site instead (`run_draft_pass`'s `[draft-pass]` line).
+            mixed = x_prev is not None and post is not None and comb is not None
+            if mixed:
                 residual = block.hc_post(x_prev, residual, post, comb)
             return residual.mean(dim=1)
 

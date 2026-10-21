@@ -4344,10 +4344,13 @@ class PrefillScheduler:
     """Scheduler for the disaggregated prefill process.
 
     Key differences from the base Scheduler:
-    - No BlockManager: KV blocks are pre-assigned by DecodeEngineCore and
-      written into seq.block_table before schedule() is called.
-    - schedule() only runs sequences that already have a non-empty block_table.
-      Sequences still waiting for a BlockAssignment message stay in waiting.
+    - No BlockManager: KV blocks AND per-request state slots are pre-assigned
+      by DecodeEngineCore and written into seq.block_table / seq.state_slots
+      before schedule() is called.
+    - schedule() only runs sequences whose assignment has fully landed -- both
+      halves, since a model with a per-request cache cannot run without its
+      slot. Sequences still waiting for a BlockAssignment message stay in
+      waiting.
     - postprocess() is a no-op: prefill produces no sampled tokens.
     - Decode scheduling is never performed.
     """
@@ -4457,11 +4460,12 @@ class PrefillScheduler:
         return result
 
     def _schedule(self):
-        """Schedule only sequences whose block_table has been populated.
+        """Schedule only sequences whose block assignment has fully landed.
 
-        Sequences that do not yet have a block assignment (block_table is
-        empty) remain in the waiting queue and will be reconsidered on the
-        next call.
+        Sequences that do not yet have one remain in the waiting queue and are
+        reconsidered on the next call. "Fully" means both halves: an empty
+        `block_table`, or a missing state slot on a model that keeps a
+        per-request cache, each leave the sequence unrunnable.
 
         Returns (ScheduledBatch, dict[seq_id, Sequence]) or (None, {}) when
         no sequence is ready.
@@ -4479,8 +4483,27 @@ class PrefillScheduler:
         stores: list = []
 
         with self._pending_lock:
-            # Collect ready sequences (have received BlockAssignment from decode)
-            ready = [s for s in self.waiting if s.block_table]
+            # Collect ready sequences (have received BlockAssignment from decode).
+            #
+            # BOTH halves of the assignment, not just the block table. A
+            # `BlockAssignment` carries `block_table` AND `state_slots`, and a
+            # model with a per-request cache is unrunnable without the second:
+            # the batch's `state_slot_out` is built from
+            # `[seq for seq in seqs.values()
+            #   if seq.has_per_req_cache and seq.state_slot >= 0]`,
+            # so a sequence admitted with blocks but no slot silently drops out
+            # of that table while still occupying a row of the grid. The draft
+            # block then indexes past the table's end -- "a Python slice past
+            # the end truncates rather than raising, so the kernels got a slot
+            # table shorter than their own grid and read past it" -- which
+            # surfaces as a GPU memory access fault with no Python frame, not
+            # as an error anyone can read.
+            ready = [
+                s
+                for s in self.waiting
+                if s.block_table
+                and (not getattr(s, "has_per_req_cache", False) or s.state_slot >= 0)
+            ]
 
             for seq in ready:
                 if num_seqs >= self.max_num_seqs:
@@ -4493,20 +4516,50 @@ class PrefillScheduler:
                 # a 226k prompt against a 16k budget asks for its 221184-token
                 # rung, never fits, and every request behind it stops too.
                 #
-                # Bounding here is also what gives this scheduler chunked
-                # prefill at all. It never had any -- it took the whole
-                # remaining prompt and broke when that did not fit -- so a
-                # prompt longer than `max_num_batched_tokens` could not be run,
-                # only queued. The partial machinery the cut needed is exactly
-                # what a long prompt needs, so the two are one mechanism.
+                # The budget no longer CHUNKS, it only admits: a prompt either
+                # fits what is left of this batch and runs whole, or waits. So
+                # the only chunking left is the checkpoint rung, which is
+                # gated on prefix caching (`_prepare_prefill_checkpoint`
+                # returns early when the coordinator is disabled). With prefix
+                # caching off, every prefill batch is whole prompts and
+                # `produces_output()` is never false.
                 budget = self.max_num_batched_tokens - num_batched_tokens
                 if budget <= 0:
                     break
                 num_new_tokens = seq.num_tokens - seq.num_cached_tokens
                 partial = False
+                # WHOLE SEQUENCES ONLY. A prompt that does not fit the budget
+                # left in this batch is not truncated into a chunk any more --
+                # it waits for a pass that can take all of it. Budget-chunking
+                # was the thing manufacturing middle chunks: a prompt cut here
+                # produces a forward with no output rows, and that is the batch
+                # shape the draft pass has to special-case.
+                #
+                # Previously this read:
+                #     if num_new_tokens > budget:
+                #         num_new_tokens = budget
+                #         partial = True
+                #
+                # Cost of removing it: a prompt longer than
+                # `max_num_batched_tokens` ENTIRE can never fit any batch, and
+                # before this it was the only way such a prompt ran at all.
+                # Breaking on it would park it at the head of the queue and
+                # stall everything behind it, so it is skipped and named
+                # instead -- starving one request beats deadlocking the rank.
                 if num_new_tokens > budget:
-                    num_new_tokens = budget
-                    partial = True
+                    if num_new_tokens > self.max_num_batched_tokens:
+                        logger.error(
+                            "seq %s needs %d tokens but max_num_batched_tokens "
+                            "is %d: unrunnable without chunked prefill, skipping "
+                            "so it cannot block the queue. Raise "
+                            "--max_num_batched_tokens above the prompt length.",
+                            seq.id,
+                            num_new_tokens,
+                            self.max_num_batched_tokens,
+                        )
+                        continue
+                    # Fits a full batch, just not what is left of this one.
+                    break
                 # Stop on the rung decode picked, when it falls inside the
                 # chunk this pass can afford. A checkpoint holds the state as
                 # of a forward's LAST token, so the only way the image at
@@ -4932,7 +4985,17 @@ class DecodeScheduler(Scheduler):
         seq.prefill_cuts = []
         seq.prefill_store_hashes = []
         bm = self.block_manager
-        if bm.paged_state_checkpoints is None:
+        cp = bm.paged_state_checkpoints
+        # `is None` is not the same question as "is this doing anything".
+        # The coordinator is CONSTRUCTED whenever the model has a checkpoint
+        # spec and carries `enabled = enable_prefix_caching and
+        # num_state_slots > 0`, so without prefix caching it exists, answers
+        # every call, and stores nothing. Walking the ladder against it
+        # reserved rungs no one would ever resume from and chopped every long
+        # prompt into middle chunks for free -- cost with the benefit switched
+        # off. A rung only pays for itself when a later request can hit the
+        # image it pins.
+        if cp is None or not cp.enabled:
             return
         budget = max(1, self.max_num_batched_tokens)
         pos = seq.num_cached_tokens
@@ -4992,6 +5055,22 @@ class DecodeScheduler(Scheduler):
         match the non-disagg postprocess state before the first decode step.
         """
 
+        from atom.utils import envs as _envs
+
+        if _envs.ATOM_LOG_DRAFT_TOKENS:
+            # The RECEIVING end of the handoff. `rejected_prev=6` on every
+            # sequence's first logged decode step is a verdict on these, and
+            # nothing else prints them: they are appended here by the
+            # scheduler, not produced by `propose_draft_token_ids`. An empty
+            # list here means the placeholder fallback below is what decode
+            # actually verified, whatever prefill proposed.
+            logger.info(
+                "[draft-handoff] seq=%s is_final=%s sampled=%s drafts=%s",
+                seq_id,
+                is_final,
+                sampled_token_id,
+                list(draft_token_ids) if draft_token_ids else "(empty)",
+            )
         if not is_final:
             # A partial chunk: real KV, no token. Its hashes are published (the
             # engine does that before `schedule()`), but the request cannot
@@ -5062,18 +5141,46 @@ class DecodeScheduler(Scheduler):
                 # fault the GPU. So the seq must always arrive with mtp_k
                 # drafts appended.
                 #
-                # Prefer the real drafts the prefill process proposed. When it
-                # ran no drafter (DSpark, or spec off on that side) fall back to
-                # placeholders: rejection sampling makes draft *quality*
-                # irrelevant to correctness — a draft is emitted only if it
-                # matches what the target would have sampled — so placeholders
-                # are simply rejected, at the cost of one unspeculated step.
+                # Prefer the real drafts the prefill process proposed. Every
+                # drafter proposes there now, DSpark included, so an empty list
+                # means spec is off on that side — not a flavor we decline.
+                #
+                # The fallback stays because it must: rejection sampling makes
+                # draft *quality* irrelevant to correctness — a draft is emitted
+                # only if it matches what the target would have sampled — so
+                # placeholders are simply rejected, at the cost of one
+                # unspeculated step. That cost is what proposing in prefill
+                # removes, and it was measurable: with the fallback in play,
+                # `rejected_prev == mtp_k` on the first decode step of every
+                # sequence.
                 drafts = [int(d) for d in (draft_token_ids or [])][: self.mtp_k]
                 if len(drafts) < self.mtp_k:
                     drafts += [self.eos_token_id] * (self.mtp_k - len(drafts))
                 for d in drafts:
                     seq.append_token(int(d))
                 seq.spec_token_ids = np.asarray(drafts, dtype=np.int32)
+                # Declare those trailing slots as placeholders, which the
+                # inter-node P/D path has always done at the same point
+                # (`_schedule_first_decode_after_remote_kv`) and this one never
+                # did. `num_placeholder_tokens` is "the only width that
+                # describes what is actually there": at 0, the `mtp_k` drafts
+                # just appended count as REAL tokens in `seq.num_tokens`, and
+                # `num_tokens` is what the batch turns into `context_lens`. So
+                # the first decode step is told its context is `mtp_k` tokens
+                # longer than the KV that exists, and every query position --
+                # including position 0, whose logits produce the emitted token
+                # -- attends past the end of the prompt.
+                #
+                # That is why the drafter made this visible while nothing else
+                # did: without it the step is q=1, `num_tokens` is right by
+                # accident, and the output is correct. With it the step is
+                # `mtp_k + 1` wide and the count is wrong by exactly `mtp_k`.
+                #
+                # Width is `mtp_k`, not `len(drafts)`: the padding above is
+                # `eos_token_id`, so a short draft list still occupies the full
+                # window and counting only the real ones leaves that EOS behind
+                # as context. T0 is excluded -- it is a real generated token.
+                seq.num_placeholder_tokens = self.mtp_k
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 

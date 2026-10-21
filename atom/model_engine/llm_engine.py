@@ -881,9 +881,17 @@ class InputOutputProcessor:
             seqs.append(seq)
 
         if n == 1:
+            # Prompt head/tail alongside the seq id: the draft log keys on the
+            # SEQ id, and ids are handed out in arrival order, so matching a
+            # sequence back to the prompt it is drafting needs the two printed
+            # together. Across two runs the same id can be a different request
+            # -- concurrent arrivals race -- and these tokens are what settles
+            # which is which. Head and tail, not the whole prompt: 8192 ids per
+            # request would bury the log.
             logger.info(
                 f"Request {seqs[0].id} arrived, input tokens: {len(tokens)}, "
-                f"pending requests: {len(self.requests)}"
+                f"pending requests: {len(self.requests)}, "
+                f"prompt_head={list(tokens[:8])} prompt_tail={list(tokens[-4:])}"
             )
         else:
             logger.info(

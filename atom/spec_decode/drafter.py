@@ -541,6 +541,109 @@ class Drafter(abc.ABC):
             delattr(owner, attr)
             setattr(owner, attr, source)
 
+    def _report_loaded_weights(self, loaded: set) -> None:
+        """Say whether the draft's OWN weights actually arrived.
+
+        A drafter that shares embed/head still loads its backbone from a
+        checkpoint, and nothing downstream notices if that silently produced
+        nothing: an unloaded draft does not crash, it drafts confidently from
+        zeros and every token is rejected. Under rapidserve the decode process
+        loads this copy itself (the IPC import carries the TARGET's parameters
+        only), so "did it load here too" is a real question.
+
+        OPT-IN (`ATOM_DRAFTER_WEIGHT_CHECK=1`) and deliberately timid, because
+        the obvious implementation is not safe here. Reducing every parameter
+        means touching the MoE weights, which are packed sub-byte dtypes
+        (`float4_e2m1fn_x2`, FP8): upcasting one of those to fp32 to norm it
+        allocates gigabytes on a device that has just finished loading, and the
+        conversion is not defined for every packed layout. So: packed and
+        non-floating dtypes are reported by dtype alone and never reduced, the
+        reduction is capped, and the whole thing is wrapped -- a diagnostic
+        must not be able to take down a load it was only meant to describe.
+        """
+        import torch
+
+        from atom.utils import envs as _envs
+
+        if not getattr(_envs, "ATOM_DRAFTER_WEIGHT_CHECK", False):
+            return
+        # Only dtypes whose norm is both meaningful and cheap. Anything packed
+        # or integral is counted, not reduced.
+        safe = (torch.float32, torch.float64, torch.float16, torch.bfloat16)
+        MAX_ELEMS = 1 << 24  # ~16M: large enough to catch a dead tensor
+        zero: list[str] = []
+        skipped = 0
+        total = 0
+        try:
+            for name, p in self.model.named_parameters():
+                if p is None or p.is_meta or p.numel() == 0:
+                    continue
+                total += 1
+                if p.dtype not in safe or p.numel() > MAX_ELEMS:
+                    skipped += 1
+                    # Still worth a line: dtype and shape are comparable across
+                    # PROCESSES, where a pointer is not (separate address
+                    # spaces, and an IPC-mapped tensor lands at a different VA
+                    # on each side). A packed weight that loaded with the wrong
+                    # shape shows up here even though its value never can.
+                    logger.info(
+                        "[drafter-w] %s dtype=%s shape=%s norm=SKIPPED",
+                        name,
+                        str(p.dtype).replace("torch.", ""),
+                        tuple(p.shape),
+                    )
+                    continue
+                # Reduced on the HOST, not the device. The gates above already
+                # exclude the packed sub-byte weights whose upcast faulted the
+                # GPU once (HSA_STATUS_ERROR_EXCEPTION -> MODE1 reset), but a
+                # gate is only as good as the dtype list behind it, and the
+                # `try` below cannot save us either way: an HSA fault is
+                # asynchronous, so it surfaces at a later sync or kills the
+                # context outright and no `except` ever sees it. Copying to CPU
+                # runs no compute kernel over the weight, so a malformed layout
+                # cannot fault one. A <=16.7M-element bf16 tensor is <=32MB and
+                # this is a one-shot load-time diagnostic, so the per-parameter
+                # sync costs nothing that matters.
+                n = p.detach().to("cpu", copy=True).float().norm()
+                # The value, not just a verdict. "Did it load" and "did it load
+                # the SAME bytes as the other process" are different questions,
+                # and only the second one distinguishes a drafter fed bad
+                # weights from a drafter fed bad inputs. Printed per parameter
+                # so two runs' logs diff directly:
+                #   grep '\[drafter-w\]' a.log | sort -u > /tmp/a
+                #   grep '\[drafter-w\]' b.log | sort -u > /tmp/b; diff /tmp/a /tmp/b
+                # %.6e because bf16 rounding makes the low digits of a fp32
+                # reduction differ run to run; six significant digits is far
+                # tighter than any real weight discrepancy and still stable.
+                logger.info(
+                    "[drafter-w] %s dtype=%s shape=%s norm=%.6e",
+                    name,
+                    str(p.dtype).replace("torch.", ""),
+                    tuple(p.shape),
+                    float(n),
+                )
+                if not torch.isfinite(n) or n == 0:
+                    zero.append(f"{name}[{p.dtype}]")
+            if zero:
+                logger.error(
+                    "drafter: %d/%d reduced parameters are zero or non-finite "
+                    "-- the draft will produce rejected tokens, not an error: %s",
+                    len(zero),
+                    total - skipped,
+                    zero[:8],
+                )
+            else:
+                logger.info(
+                    "drafter: %d parameters (%d reduced, %d packed/large "
+                    "skipped), %d checkpoint keys consumed",
+                    total,
+                    total - skipped,
+                    skipped,
+                    len(loaded),
+                )
+        except Exception:
+            logger.warning("drafter weight check failed; skipping", exc_info=True)
+
     def load_model(self, target_model: nn.Module) -> None:
         # Three drafter flavors cover three of the four combinations:
         #   eagle3          standalone ckpt, independent embed + lm_head
@@ -581,6 +684,7 @@ class Drafter(abc.ABC):
                 self.model.reset_kv_cache(
                     self.config.max_num_seqs, self.device, self.dtype
                 )
+            self._report_loaded_weights(loaded)
             return
 
         # Share embed_tokens with the target model. Match on the *logical* vocab

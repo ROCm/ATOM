@@ -841,6 +841,8 @@ class DSparkLayer(Block):  # type: ignore[misc]
             getattr(a, "unified_kv_rope", None) is not None
             and not fc.context.is_dummy_run
         )
+        if _dspark_pad_check_enabled():
+            _check_dspark_window_pads(fc, B, use_fp8, self.stage_id)
         if use_fp8:
             slots = fc.attn_metadata.state_slot_out[:B]
             # Ring rows for this block's own KV, scattered by the fused quant
@@ -1233,6 +1235,75 @@ class DeepseekV4DSpark(DSparkDraftModel):
         ``hc_hidden``'s middle dimension."""
         normed, hc_hidden = out
         return self.model.head_and_sample(normed, hc_hidden, anchor_ids)
+
+
+_DSPARK_PAD_CHECK_DONE: set = set()
+_DSPARK_PAD_CHECK_CAP = 64
+
+
+def _dspark_pad_check_enabled() -> bool:
+    from atom.utils import envs
+
+    return bool(getattr(envs, "ATOM_DSPARK_PAD_CHECK", False))
+
+
+def _check_dspark_window_pads(fc, B: int, use_fp8: bool, stage_id: int) -> None:
+    """Report, once per shape, whether the draft's pad rows can scribble.
+
+    The window is addressed by `state_slot_out`, and the V4 builder fills the
+    `[scheduled_bs, running_bs)` tail with 0 -- a REAL request's slot -- on the
+    stated grounds that every reader masks the tail. For the draft block that
+    masking is `mask_pad_tail`, which sentinels those rows to -1, and it is
+    only built on the `use_fp8` branch. If a padded step ever reaches the
+    window with `use_fp8` false and a 0-filled tail, the block's own KV writes
+    land in slot 0's window: invisible at one request (no pad rows) and
+    corrupting under concurrency.
+
+    Logged once per (use_fp8, padded, stage, scheduled_bs, running_bs) so a
+    steady state does not spam. The shape is part of the key on purpose: keyed
+    only on (use_fp8, padded, stage), warmup's unpadded B=2 compile claims the
+    key and every later unpadded serving step is silently dropped, which makes
+    "serving never padded" indistinguishable from "serving never logged".
+    `_DSPARK_PAD_CHECK_CAP` bounds the distinct shapes so a run that sees many
+    batch sizes still cannot flood the log.
+    """
+    import logging as _logging
+
+    log = _logging.getLogger("atom")
+    try:
+        ctx = fc.context
+        sched = int(getattr(ctx, "scheduled_bs", B) or B)
+        run = int(getattr(ctx, "running_bs", B) or B)
+        md = fc.attn_metadata
+        slot = getattr(md, "state_slot_out", None)
+        padded = run > sched
+        key = (bool(use_fp8), padded, stage_id, sched, run)
+        if key in _DSPARK_PAD_CHECK_DONE:
+            return
+        # A hazardous shape must always be reported, even past the cap.
+        if len(_DSPARK_PAD_CHECK_DONE) >= _DSPARK_PAD_CHECK_CAP and not (
+            padded and not use_fp8
+        ):
+            return
+        _DSPARK_PAD_CHECK_DONE.add(key)
+        tail = "n/a"
+        if slot is not None and padded and slot.numel() >= run:
+            tail = str(slot[sched:run].tolist()[:8])
+        msg = (
+            "[dspark-pad] stage=%s use_fp8=%s scheduled_bs=%s running_bs=%s "
+            "padded=%s pad_slots=%s"
+        )
+        args = (stage_id, use_fp8, sched, run, padded, tail)
+        if padded and not use_fp8:
+            log.error(
+                msg + "  <-- pad rows are NOT masked (mask_pad_tail is built "
+                "only on the use_fp8 branch) and address a real slot",
+                *args,
+            )
+        else:
+            log.info(msg, *args)
+    except Exception:
+        log.warning("dspark pad check failed; skipping", exc_info=True)
 
 
 @support_torch_compile

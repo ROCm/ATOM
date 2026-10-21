@@ -366,6 +366,72 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Rows per rank of that small instance: 128, 256, 512 or 1024 (see docs).
     "ATOM_MEGA_DECODE_MTPR": lambda: _int_env("ATOM_MEGA_DECODE_MTPR", 128),
+    # Let an idle ModelRunner worker stop spinning on its RPC ring.
+    #
+    # aiter's vendored shm_broadcast froze vLLM's `VLLM_SLEEP_WHEN_IDLE` to a
+    # module constant `False` (its env lookup is commented out), so every
+    # worker gets the bare-`sched_yield` `SpinTimer` and pins a thread at ~100%
+    # whether or not it has work. Under paired rapidserve that is 16 workers
+    # instead of 8, and the idle half -- the prefill side between bursts --
+    # burns cores that decode needs for input prep, H2D staging and its RPC
+    # round trip, which is CPU work the GPU waits on.
+    #
+    # On: `SpinSleepTimer` keeps yielding for `busy_loop_s` after the last
+    # message and only then sleeps `wait_sleep_s`, so an active worker is
+    # untouched and a request arriving mid-idle waits at most that sleep.
+    # Off by default: it trades a bounded wake-up latency for the cores.
+    "ATOM_WORKER_SLEEP_WHEN_IDLE": lambda: os.getenv(
+        "ATOM_WORKER_SLEEP_WHEN_IDLE", "0"
+    )
+    == "1",
+    # Seconds of inactivity before an idle worker backs off, and how long it
+    # sleeps per poll once it has. The sleep bounds how late a message can be
+    # noticed, so shortening it recovers most of the CPU at a smaller tail.
+    "ATOM_WORKER_IDLE_BUSY_LOOP_S": lambda: _finite_float_env(
+        "ATOM_WORKER_IDLE_BUSY_LOOP_S", 3.0, allow_zero=True
+    ),
+    "ATOM_WORKER_IDLE_SLEEP_S": lambda: _finite_float_env(
+        "ATOM_WORKER_IDLE_SLEEP_S", 0.005, allow_zero=False
+    ),
+    # Report whether the DSpark draft's padded rows are masked before they can
+    # write the rolling window. Off by default: one log per shape, but it reads
+    # device state. See `_check_dspark_window_pads`.
+    "ATOM_DSPARK_PAD_CHECK": lambda: os.getenv("ATOM_DSPARK_PAD_CHECK", "0") == "1",
+    # Log every drafted token, per request, per step: anchor, the drafts this
+    # step proposed, and how many of the PREVIOUS step's drafts the target
+    # rejected. Off by default -- each line forces a device sync on the step's
+    # critical path. N caps the requests printed per step; 0 = all of them.
+    "ATOM_LOG_DRAFT_TOKENS": lambda: os.getenv("ATOM_LOG_DRAFT_TOKENS", "0") == "1",
+    "ATOM_LOG_DRAFT_TOKENS_N": lambda: _int_env("ATOM_LOG_DRAFT_TOKENS_N", 0),
+    # Log the tokens each step EMITTED, per request, regardless of whether a
+    # drafter exists.
+    #
+    # `ATOM_LOG_DRAFT_TOKENS` cannot do this: both of its log lines live inside
+    # `run_draft_pass`, and every path there is gated on
+    # `hasattr(self, "drafter")`. So a run with speculation off produces no
+    # per-step token trail at all -- which is exactly the run you want as the
+    # comparison baseline. This one sits on the sampling path instead, so it
+    # reports for baseline with spec, baseline without, prefill and decode
+    # alike.
+    #
+    # Cheaper than the draft logs: it prints `token_id_dict`, which postprocess
+    # has already brought to the host, so it adds no device sync.
+    "ATOM_LOG_EMITTED_TOKENS": lambda: os.getenv("ATOM_LOG_EMITTED_TOKENS", "0")
+    == "1",
+    # Report the drafter's own parameters after load (zero/non-finite ones mean
+    # a silent loading failure: the draft then drafts from zeros and every
+    # token is rejected, with no error anywhere). Off by default -- it reduces
+    # tensors on a device that has just finished loading.
+    "ATOM_DRAFTER_WEIGHT_CHECK": lambda: os.getenv("ATOM_DRAFTER_WEIGHT_CHECK", "0")
+    == "1",
+    # Check that every EP rank picked the SAME MegaMoE capacity, on every
+    # forward that could pick. MTPR selects the p2p wire format, so a rank that
+    # chooses differently from its peers does not fail -- it waits inside
+    # `megamoe_stage1` for a message in a layout nobody will send, which
+    # surfaces as a hang with no rank to blame. This turns that into an
+    # immediate error naming the ranks and what each chose. Off by default: it
+    # is a (cheap, gloo) collective on the forward path.
+    "ATOM_MEGA_VERIFY_MTPR": lambda: os.getenv("ATOM_MEGA_VERIFY_MTPR", "0") == "1",
     # Route DP pad rows (past this rank's scheduled tokens) to expert -1 on the
     # MegaMoE backend, which skips them, so padding costs no transport or GEMM.
     # Set to 0 to retain the unmasked path.

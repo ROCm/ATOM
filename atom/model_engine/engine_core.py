@@ -1152,7 +1152,8 @@ class PrefillEngineCore(DPEngineCoreProc):
         super().__init__(config, input_address, output_address)
         # Replace the base Scheduler created by EngineCore.__init__ with
         # PrefillScheduler, which has no BlockManager and only schedules
-        # sequences that already have a block_table from decode. The base
+        # sequences whose assignment from decode has fully landed -- block
+        # table and, for a per-request-cache model, state slot. The base
         # Scheduler may have started a KV event publisher with bound sockets;
         # prefill never publishes, so release it instead of leaking a thread
         # and an endpoint for the life of the process.

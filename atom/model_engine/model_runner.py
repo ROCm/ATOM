@@ -926,6 +926,10 @@ class ModelRunner:
         self._init_h2d_publication()
         self.forward_done_event = torch.cuda.Event()
         initialize_eplb_runtime(self)
+        # The producer's side of the same dump. Harmless to call on a consumer
+        # too: its target is still on meta here, so every parameter falls out
+        # at the `is_meta` gate and the post-import call is what speaks.
+        self._report_imported_target_weights()
         self._maybe_warmup()
 
         # Restore the implicit CPU default. An explicit "cpu" leaves a
@@ -3441,6 +3445,29 @@ class ModelRunner:
         req_ids_out = [k for k in token_id_dict if k != -1]
         token_ids_out = [token_id_dict[k] for k in req_ids_out]
 
+        if envs.ATOM_LOG_EMITTED_TOKENS:
+            # What this step actually PRODUCED, before anything drafter-shaped.
+            # Deliberately above the `hasattr(self, "drafter")` gate below:
+            # `[draft]` and `[draft-pass]` both live inside `run_draft_pass`,
+            # which only runs when a drafter exists, so a speculation-off run
+            # leaves no per-step token trail -- and that run is the baseline a
+            # speculative one is compared against.
+            #
+            # No device sync: `token_id_dict` is what `prepare_sampled_ids`
+            # already brought to the host.
+            self._emit_log_step = getattr(self, "_emit_log_step", 0) + 1
+            for _rid in req_ids_out:
+                _t = token_id_dict[_rid]
+                logger.info(
+                    "[emit] step=%d dp=%s role=%s seq=%s n=%s tokens=%s",
+                    self._emit_log_step,
+                    self.config.parallel_config.data_parallel_rank,
+                    self._draft_role(),
+                    _rid,
+                    len(_t) if isinstance(_t, list | tuple) else 1,
+                    _t,
+                )
+
         draft_token_ids: np.ndarray | None = None
         if self.tokenID_processor.is_deferred_out:
             if hasattr(self, "drafter"):
@@ -3701,6 +3728,157 @@ class ModelRunner:
             finished_sending=done_sending, finished_recving=done_recving
         )
 
+    def _report_imported_target_weights(self) -> None:
+        """Dump the TARGET's weights, so decode's copy can be diffed against
+        prefill's.
+
+        The drafter got this check and the target never did -- `[drafter-w]`
+        walks `self.drafter.model`, which is loaded from the checkpoint on both
+        sides. The target is the one that arrives by IPC: built on meta here
+        and filled from the producer's pages. Nothing downstream verifies those
+        VALUES. The import warns about tensors left on meta and counts the MoE
+        layers it rebuilt, and both of those pass while a materialized-but-wrong
+        tensor sails through.
+
+        That matters because a target whose forward differs from the producer's
+        rejects drafts that are correct -- the drafts match what the model
+        should emit, and this process's logits disagree. It also shows up in
+        the aux hidden states the drafter reads, which is a second symptom of
+        one cause rather than two faults.
+
+        Same host-side reduction as `Drafter._report_loaded_weights`, for the
+        same reason: packed sub-byte MoE weights are reported by dtype and
+        shape alone (their upcast is what faulted a GPU once), everything small
+        and floating gets a norm, and the copy to CPU keeps any compute kernel
+        off a possibly-malformed layout. Diff two ranks with:
+            grep '\\[target-w\\]' log | sort -u
+        and any line that differs names the tensor.
+        """
+        from atom.utils import envs as _envs
+
+        if not getattr(_envs, "ATOM_DRAFTER_WEIGHT_CHECK", False):
+            return
+        safe = (torch.float32, torch.float64, torch.float16, torch.bfloat16)
+        MAX_ELEMS = 1 << 24
+        total = reduced = 0
+        try:
+            for name, p in self.model.named_parameters():
+                if p is None or p.is_meta or p.numel() == 0:
+                    continue
+                total += 1
+                dt = str(p.dtype).replace("torch.", "")
+                if p.dtype not in safe or p.numel() > MAX_ELEMS:
+                    logger.info(
+                        "[target-w] %s dtype=%s shape=%s norm=SKIPPED",
+                        name,
+                        dt,
+                        tuple(p.shape),
+                    )
+                    continue
+                n = p.detach().to("cpu", copy=True).float().norm()
+                reduced += 1
+                logger.info(
+                    "[target-w] %s dtype=%s shape=%s norm=%.6e",
+                    name,
+                    dt,
+                    tuple(p.shape),
+                    float(n),
+                )
+            logger.info(
+                "[target-w] rank %s: %d parameters (%d reduced, %d packed/large)",
+                self.rank,
+                total,
+                reduced,
+                total - reduced,
+            )
+        except Exception:
+            logger.warning("target weight check failed; skipping", exc_info=True)
+
+    def _draft_role(self) -> str:
+        """Which half of a run this process is, for the draft logs.
+
+        Three answers, not two: `single` is a non-disagg engine that both
+        drafts and verifies, and it is the BASELINE every rapidserve
+        measurement is compared against. Collapsing it into `decode` -- which
+        the `[draft-pass]` probe did -- labels a baseline run as a decode rank,
+        so a filter on `role=decode` silently mixes the two populations.
+
+        One definition for both log sites: they were written separately and
+        disagreed, which is exactly the drift this prevents.
+        """
+        if getattr(self.config, "disagg_is_decode", False):
+            return "decode"
+        if getattr(self.config, "enable_rapidserve", False):
+            return "prefill"
+        return "single"
+
+    def _log_draft_tokens(
+        self, batch, next_token_ids, draft_token, num_reject_tokens
+    ) -> None:
+        """Log one line per request per step: anchor, drafts, previous verdict.
+
+        Each line pairs THIS step's drafts with the verdict on LAST step's --
+        `num_reject_tokens` is how many of the previous drafts the target threw
+        away, so a row reads as "I proposed these, and of the ones I proposed
+        before, this many were wrong". That is the per-position acceptance
+        picture, per request, rather than the aggregate.
+
+        Off by default: every field here lives on the device, so printing one
+        costs a D2H sync on the step's critical path. `ATOM_LOG_DRAFT_TOKENS_N`
+        caps how many requests are printed, because at `max_num_seqs=128` a
+        line each is unreadable and slow; the first N are stable across steps
+        (batch order follows the scheduler) so the same requests are followed.
+        """
+        try:
+            # 0 (the default) means EVERY request in the batch. Capping was
+            # costing exactly the sequences worth following: a request only
+            # appears while it sits in the first N rows, so a sequence's log
+            # starts mid-stream and its first `rejected_prev` refers to a step
+            # that was never printed.
+            cap = int(envs.ATOM_LOG_DRAFT_TOKENS_N)
+            total = int(batch.total_seqs_num)
+            n = total if cap <= 0 else min(cap, total)
+            if n <= 0 or draft_token is None:
+                return
+            # One sync each, not one per row.
+            drafts = draft_token[:n].tolist()
+            anchors = (
+                next_token_ids[:n].tolist()
+                if hasattr(next_token_ids, "tolist")
+                else list(next_token_ids[:n])
+            )
+            rejected = (
+                num_reject_tokens[:n].tolist()
+                if hasattr(num_reject_tokens, "tolist")
+                else [None] * n
+            )
+            req_ids = list(batch.req_ids)[:n]
+            self._draft_log_step = getattr(self, "_draft_log_step", 0) + 1
+            for i in range(n):
+                row = drafts[i] if isinstance(drafts[i], list) else [drafts[i]]
+                logger.info(
+                    "[draft] step=%d %s dp=%s role=%s seq=%s anchor=%s "
+                    "rejected_prev=%s drafts=%s",
+                    self._draft_log_step,
+                    self.label,
+                    # `self.label` is "Model Runner{tp_rank}/{tp_world}", which
+                    # under rapidserve is "Model Runner0/1" on EVERY worker:
+                    # eight decode processes interleave into one log with
+                    # nothing to tell them apart. DP rank is what separates
+                    # them, and role separates the prefill half from the decode
+                    # half -- without both, two sequences cannot be known to
+                    # share a pool, and cross-request reasoning is unfounded.
+                    self.config.parallel_config.data_parallel_rank,
+                    self._draft_role(),
+                    req_ids[i] if i < len(req_ids) else "?",
+                    anchors[i] if i < len(anchors) else "?",
+                    rejected[i] if i < len(rejected) else "?",
+                    row,
+                )
+        except Exception:
+            logger.warning("draft-token logging failed; disabling", exc_info=True)
+            envs.ATOM_LOG_DRAFT_TOKENS = False
+
     def propose_draft_token_ids(
         self,
         batch: ScheduledBatch,
@@ -3720,6 +3898,47 @@ class ModelRunner:
         the `batch.next_token_ids` override below replaces `next_token_ids`
         wholesale, so the zeros it passes are never read. The ids are dropped --
         the scheduler is not expecting a draft for a seq that produced no token.
+        """
+        draft_token = self.run_draft_pass(
+            batch,
+            input_ids,
+            hidden_states,
+            next_token_ids,
+            num_reject_tokens,
+            anchors,
+            align_only=align_only,
+        )
+        if align_only:
+            return None
+        return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+
+    def run_draft_pass(
+        self,
+        batch: ScheduledBatch,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        num_reject_tokens: torch.Tensor,
+        anchors: torch.Tensor | None,
+        align_only: bool = False,
+    ) -> torch.Tensor | None:
+        """Everything `propose_draft_token_ids` does EXCEPT its return path.
+
+        Split out for the rapidserve prefill process, which needs this batch's
+        drafts synchronously to put on the wire and so cannot use
+        `prepare_draft_ids`: on a V4 producer `is_deferred_out` is True (V4 is
+        `Family.MLA`, so `has_recurrent_state` is False and
+        `hands_off_recurrent_state` never fires), which makes that call return
+        the PREVIOUS step's ids -- and since `prev_req_ids` is only ever set by
+        `prepare_sampled_ids` inside `postprocess`, which prefill never runs, it
+        returns an empty array every time.
+
+        That one line is the whole incompatibility. Everything above it is what
+        prefill needs, and hand-copying it is what produced a GPU memory fault
+        per missing piece: the anchor override (mid-prompt sequences anchoring
+        on a sampler output that means nothing), `commit_speculative_state`, the
+        `align_only` treatment of a batch with no real anchors. Sharing the body
+        is what stops the two drifting again.
         """
         forward_context = get_forward_context()
 
@@ -3752,6 +3971,134 @@ class ModelRunner:
             forward_context.attn_metadata, last_token_indices
         )
 
+        if envs.ATOM_LOG_DRAFT_TOKENS:
+            # Emitted BEFORE the block runs, deliberately: a GPU memory fault
+            # inside it kills the process with no Python frame, so a line
+            # written after the call would never reach the log. This one names
+            # every shape the block is about to index by, which is what tells a
+            # fault in it apart from a fault anywhere else.
+            _ctx = forward_context.context
+            _slot = getattr(forward_context.attn_metadata, "state_slot_out", None)
+            # The aux hidden states are the drafter's real input -- DSpark
+            # drafts from them, not from `target_hidden_states`.
+            #
+            # Reported PER QUERY POSITION within one sequence, not as a single
+            # norm over the batch, because that is the question the aggregate
+            # cannot answer. A spec decode step forwards `mtp_k + 1` positions
+            # per sequence: position 0 is the anchor, whose logits produce the
+            # token actually emitted, and positions 1..mtp_k are the draft
+            # slots, whose logits decide whether each draft is accepted. A
+            # fault confined to the draft slots keeps the OUTPUT correct --
+            # q=1 decoding and accuracy both stay fine -- while rejecting
+            # drafts that are right.
+            #
+            # Comparing rows inside a single forward is what makes this
+            # conclusive: a batch-wide norm differing between prefill and
+            # decode can always be waved off as "different content", but
+            # row 0 vs rows 1..6 of the SAME forward cannot.
+            try:
+                _aux = self.drafter.aux_for(hidden_states)
+                if _aux is None:
+                    _auxn = "none"
+                else:
+                    _bs = max(1, int(batch.total_seqs_num))
+                    _q = max(1, int(batch.total_tokens_num // _bs))
+                    _parts = []
+                    for _a in _aux:
+                        _rows = _a[: min(_q, _a.shape[0])].float()
+                        _p0 = float(_rows[0].norm()) if _rows.shape[0] else 0.0
+                        _pd = (
+                            float(_rows[1:].norm()) / math.sqrt(_rows.shape[0] - 1)
+                            if _rows.shape[0] > 1
+                            else 0.0
+                        )
+                        _parts.append(f"{_p0:.3e}/{_pd:.3e}")
+                    _auxn = f"q{_q}:" + ",".join(_parts)
+            except Exception as _e:  # noqa: BLE001 - a probe must not kill a step
+                _auxn = f"err:{type(_e).__name__}"
+            # The rolling target-KV window, the drafter's other per-step input
+            # and the last one never measured. `compute_draft_kv` writes it
+            # after every target forward; the draft block reads it addressed by
+            # `state_slot_out`. Reported per stage as (slot rows this batch
+            # owns), so an all-zero window on one side shows up directly rather
+            # than being inferred. Whole-plane norms are useless here -- the
+            # plane is shared by every request -- so this gathers only the rows
+            # this batch's slots address.
+            try:
+                _wn = []
+                _slots = None if _slot is None else _slot[: batch.total_seqs_num]
+                for _st in self.drafter.model.context_layers:
+                    _plane = getattr(getattr(_st, "attn", None), "swa_plane", None)
+                    if _plane is None or _slots is None or _slots.numel() == 0:
+                        _wn.append("n/a")
+                        continue
+                    _rows = _plane.index_select(
+                        0, _slots.to(torch.long).clamp_(0, _plane.shape[0] - 1)
+                    )
+                    _wn.append(f"{float(_rows.float().norm()):.3e}")
+                _winn = ",".join(_wn)
+            except Exception as _e:  # noqa: BLE001
+                _winn = f"err:{type(_e).__name__}"
+            # What position 0 of this step actually attends over. The
+            # emitted token comes from that row, so when it is wrong while
+            # q=1 decoding is right, the question is whether the step was
+            # handed a context that matches the KV on disk. All of this is
+            # read at a CALL SITE, outside the traced region -- the same
+            # information gathered from inside a forward hook is what broke
+            # Dynamo.
+            try:
+                _md = forward_context.attn_metadata
+                _cl = getattr(_md, "context_lens", None)
+                _cq = getattr(_md, "cu_seqlens_q", None)
+                _fd = getattr(batch, "is_first_decode_without_local_prefill", None)
+                _ids = list(batch.req_ids)[: batch.total_seqs_num]
+                _cls = (
+                    _cl.tolist() if hasattr(_cl, "tolist") else list(_cl or [])
+                )
+                _fds = list(_fd or [])
+                # PAIRED with the request id, not three leading values. A bare
+                # `ctx=[1088, 1109, 1148]` cannot be tied to a prompt, so the
+                # only test available was "does ctx minus some offset appear
+                # anywhere in the set of prompt lengths" -- and with ~170
+                # prompts packed into a ~490-wide range that test says almost
+                # nothing. With the id attached, ctx is checkable against THAT
+                # request's prompt.
+                _rows = ";".join(
+                    f"{_ids[i] if i < len(_ids) else '?'}"
+                    f":ctx{_cls[i] if i < len(_cls) else '?'}"
+                    f":f{1 if i < len(_fds) and _fds[i] else 0}"
+                    for i in range(min(4, len(_ids)))
+                )
+                _cuq = (
+                    "n/a" if _cq is None
+                    else str(_cq[:4].tolist() if hasattr(_cq, "tolist")
+                             else list(_cq)[:4])
+                )
+                _dp = self.config.parallel_config.data_parallel_rank
+            except Exception as _e:  # noqa: BLE001
+                _rows = _cuq = f"err:{type(_e).__name__}"
+                _dp = -1
+            logger.info(
+                "[draft-pass] role=%s dummy=%s produces_output=%s align_only=%s "
+                "bs=%d running_bs=%s tokens=%d anchors=%d last_idx_max=%s "
+                "slot_out=%s aux_norms=%s win_norms=%s dp=%s seqs=%s cuq=%s",
+                self._draft_role(),
+                batch.is_dummy_run,
+                batch.produces_output(),
+                align_only,
+                batch.total_seqs_num,
+                getattr(_ctx, "running_bs", "?"),
+                batch.total_tokens_num,
+                int(next_token_ids.shape[0]),
+                int(last_token_indices.max()) if last_token_indices.numel() else -1,
+                tuple(_slot.shape) if _slot is not None else None,
+                _auxn,
+                _winn,
+                _dp,
+                _rows,
+                _cuq,
+            )
+
         draft_token = self.drafter.propose(
             target_token_ids=input_ids,
             target_positions=positions,
@@ -3767,6 +4114,8 @@ class ModelRunner:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
         if align_only:
             return None
+        if envs.ATOM_LOG_DRAFT_TOKENS:
+            self._log_draft_tokens(batch, next_token_ids, draft_token, num_reject_tokens)
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,
         # so next step's calc_spec_decode_metadata can re-map it onto the (possibly
         # reordered) batch. Keying by req_id (not batch position) is required:
@@ -3774,7 +4123,7 @@ class ModelRunner:
         verify_scheduler = getattr(self.drafter, "verify_scheduler", None)
         if verify_scheduler is not None:
             verify_scheduler.record_ell(batch.req_ids[: batch.total_seqs_num])
-        return self.tokenID_processor.prepare_draft_ids(batch, draft_token)
+        return draft_token
 
     def start_capture_profiler(self):
         """Set up the per-bs CUDA graph capture profiler (profiles in place).
@@ -4788,6 +5137,39 @@ class RapidServeModelRunner(ModelRunner):
             ) = self.prepare_model(batch)
             self._mark_staging_h2d_enqueued()
             logits, hidden_states = self.run_model(input_ids, batch)
+            # Absorb THIS step's tokens into the drafter's rolling window.
+            #
+            # `ModelRunner.forward` does this after every target forward and
+            # this override did not, so under rapidserve the window was written
+            # only by prefill, for the prompt -- nothing decode generated ever
+            # reached it. The drafter kept drafting from a context frozen at the
+            # handoff while generation moved away from it, which is the decay
+            # the acceptance curve shows: 3.53 rejected at the first decode
+            # step, then 5.07, 5.47, 5.63, 5.8.
+            #
+            # It is also why probing the window found it healthy: the prompt
+            # rows ARE there, and `compute_draft_kv`'s own contract covers the
+            # rest -- "the read side gathers by absolute position without
+            # checking what was written, so anything left unwritten shows the
+            # slot's previous occupant".
+            #
+            # Inside the stream block on purpose: it reads `hidden_states` and
+            # writes KV, so it belongs with the forward that produced them
+            # rather than after the event handshake below.
+            #
+            # Guards are narrower than the base path's, for the reasons
+            # `_prefill_compute_draft_kv` already gives: no PP stage split
+            # reaches here, and there is no DP draft-ALIGNMENT pass, since a
+            # decode batch always produces output. A dummy run stays excluded --
+            # it carries no real request and its rows would overwrite the window
+            # of whatever live sequence occupies those slots.
+            _drafter = getattr(self, "drafter", None)
+            if _drafter is not None and not batch.is_dummy_run:
+                _drafter.compute_draft_kv(
+                    get_forward_context().context.positions,
+                    hidden_states,
+                    batch.next_token_ids,
+                )
         self._model_fwd_event.record(stream)
         torch.cuda.current_stream().wait_event(self._model_fwd_event)
 
@@ -4965,10 +5347,82 @@ class RapidServeModelRunner(ModelRunner):
                 f"meta after IPC import (not materialized): {leftover[:10]}"
             )
         self._init_moe_all2all_after_import()
+        self._rebind_drafter_shared_weights_after_import()
+        self._report_imported_target_weights()
         logger.info(
             f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
         )
         return True
+
+    def _rebind_drafter_shared_weights_after_import(self) -> None:
+        """Re-point the drafter at the target tensors the import just installed.
+
+        A drafter that shares embed/head does so by BINDING the target's module
+        objects (`DeepseekV4DSpark.share_with_target`: `self.model.embed =
+        target_base.model.embed`), and its docstring's precondition -- "the
+        already-loaded target instances" -- does not hold on this side. Decode's
+        ordering is: build the target on meta, construct the drafter and bind,
+        and only then import. The import REPLACES parameters rather than filling
+        them (`mod._parameters[attr] = nn.Parameter(view)`), so a reference
+        captured before it keeps the superseded tensor. Prefill never sees this:
+        its target is genuinely loaded before the drafter binds.
+
+        The symptom is not a crash. The draft still runs, and its first token
+        survives on the anchor's own hidden state, so acceptance at position 0
+        stays high while every position that depends on the Markov chain over
+        previously drafted tokens collapses to near-chance.
+
+        Same reason `_init_moe_all2all_after_import` exists above: work
+        `load_model` does for prefill, redone here against materialized weights.
+        `loaded` is empty because nothing was loaded from a checkpoint on this
+        path -- the hook only uses it to decide what NOT to rebind.
+        """
+        drafter = getattr(self, "drafter", None)
+        model = getattr(drafter, "model", None)
+        if model is None or not hasattr(model, "share_with_target"):
+            return
+        target_base = getattr(self.model, "language_model", self.model)
+        model.share_with_target(target_base, set())
+        self._assert_drafter_shares_target_storage(model, target_base)
+
+    @staticmethod
+    def _assert_drafter_shares_target_storage(draft_model, target_base) -> None:
+        """Check the rebind actually landed on the imported storage.
+
+        Comparing `data_ptr()`, not identity: the point is that the drafter
+        reads the same bytes decode imported, and a tensor that merely looks
+        equal is what the stale binding produced in the first place. Logged
+        rather than raised -- a model whose hook shares something else entirely
+        is not broken, it just has nothing for this to verify.
+        """
+        for attr in ("embed", "head"):
+            d = getattr(getattr(draft_model, "model", None), attr, None)
+            t = getattr(getattr(target_base, "model", None), attr, None)
+            dw = getattr(d, "weight", None)
+            tw = getattr(t, "weight", None)
+            if dw is None or tw is None:
+                continue
+            if dw.is_meta or tw.is_meta:
+                logger.error(
+                    "drafter %s is still on meta after the IPC import: the "
+                    "draft would read unmaterialized weights",
+                    attr,
+                )
+            elif dw.data_ptr() != tw.data_ptr():
+                logger.error(
+                    "drafter %s does not alias the imported target weight "
+                    "(draft=0x%x target=0x%x): the draft is reading a "
+                    "superseded tensor",
+                    attr,
+                    dw.data_ptr(),
+                    tw.data_ptr(),
+                )
+            else:
+                logger.info(
+                    "drafter %s aliases the imported target weight (0x%x)",
+                    attr,
+                    dw.data_ptr(),
+                )
 
     def _init_moe_all2all_after_import(self) -> None:
         """Build decode's MoE all-to-all path, which load_model would have built.
@@ -4995,23 +5449,41 @@ class RapidServeModelRunner(ModelRunner):
         """
         from atom.model_ops.moe import FusedMoEMethodBase
 
-        built = 0
-        seen = 0
-        for module in self.model.modules():
-            quant_method = getattr(module, "quant_method", None)
-            if not isinstance(quant_method, FusedMoEMethodBase):
-                continue
-            seen += 1
-            if quant_method.using_modular_kernel:
-                continue  # init_prepare_finalize asserts it runs once
-            quant_method.init_prepare_finalize(module)
-            if quant_method.using_modular_kernel:
-                built += 1
-        if seen:
-            logger.info(
-                f"[MOE-COMM] rank {self.rank}: built all-to-all for {built}/{seen} "
-                f"MoE layers after IPC import"
-            )
+        # The DRAFTER's MoE too, not just the target's. DSpark's backbone
+        # carries its own expert-parallel FFN -- `model.mtp.*.ffn`, 384 experts
+        # in V4 -- and it reaches decode by the same route the target does:
+        # built on meta, never through `load_model`'s post-processing loop. The
+        # paragraph above applies verbatim, and the failure is quieter, because
+        # a draft that silently drops 7/8 of its experts does not corrupt
+        # output. It only drafts badly, and rejection sampling converts that
+        # into throughput loss that no accuracy test can see. Measured before
+        # this covered the drafter: GSM8K accuracy matching baseline while
+        # `toks/fwd` fell 4.49 -> 1.14, with 88.79% of steps accepting zero
+        # drafts, flat across every batch size, DP rank and point in the run.
+        targets = [("target", self.model)]
+        drafter = getattr(self, "drafter", None)
+        draft_model = getattr(drafter, "model", None)
+        if draft_model is not None:
+            targets.append(("drafter", draft_model))
+
+        for label, root in targets:
+            built = 0
+            seen = 0
+            for module in root.modules():
+                quant_method = getattr(module, "quant_method", None)
+                if not isinstance(quant_method, FusedMoEMethodBase):
+                    continue
+                seen += 1
+                if quant_method.using_modular_kernel:
+                    continue  # init_prepare_finalize asserts it runs once
+                quant_method.init_prepare_finalize(module)
+                if quant_method.using_modular_kernel:
+                    built += 1
+            if seen:
+                logger.info(
+                    f"[MOE-COMM] rank {self.rank}: built all-to-all for "
+                    f"{built}/{seen} {label} MoE layers after IPC import"
+                )
 
     def _shared_pool_names(self) -> tuple[str, ...]:
         """Runner attributes this pair shares, `kv_cache` first.
@@ -5418,12 +5890,79 @@ class RapidServeModelRunner(ModelRunner):
             self._mark_staging_h2d_enqueued()
             # hidden_states is kept (not discarded as before): the drafter needs
             # it as target_hidden_states.
-            logits, hidden_states = self.run_model(input_ids, batch)  # noqa: RUF059
+            logits, hidden_states = self.run_model(input_ids, batch)
+            # The prompt's share of the draft's context, written HERE because
+            # this is the only place the prompt is ever forwarded.
+            #
+            # `ModelRunner.forward` calls this after every target forward so the
+            # drafter's own KV covers what the target just ran. Under rapidserve
+            # the prompt never reaches that path -- prefill runs it here, decode
+            # only ever runs decode steps -- so without this the window holds no
+            # prompt at all and the drafter blocks off an empty context. Every
+            # draft then mismatches the target, rejection sampling drops all of
+            # them, and acceptance pins at exactly 1.
+            #
+            # Writing it from this process is what makes it reach decode: the
+            # window is a view of the per-request pool (`_window_field_plane` ->
+            # `_kv_planes`), which `shared_runner_attrs` publishes as
+            # `PER_REQ_POOL_ATTR` and decode imports by IPC. Both sides carve
+            # one allocation from the same geometry, so the rows prefill writes
+            # are the rows decode's drafter gathers. The `stream.synchronize()`
+            # below already covers them -- the comment there says "all KV
+            # writes", and this is one of them.
+            self._prefill_compute_draft_kv(batch, hidden_states)
             # Sample the first generated token from each sequence's last logit
+            # Cut the LM head's output to the SCHEDULED batch before sampling,
+            # which is what `_sample_and_postprocess` does on the non-disagg
+            # path ("the LM head emitted one row per sequence the step
+            # FORWARDED, which prefill pads to `running_bs` for the draft pass
+            # that follows it. Cut to the scheduled batch here and nowhere
+            # else"). This path never did, and the pad rows did not stay
+            # harmless: DSpark sizes its block off the ANCHOR COUNT
+            # (`scheduled_bs = next_token_ids.shape[0]`), so a batch of 14
+            # sequences padded to 16 drafted 16 rows and called
+            # `prepare_block(..., scheduled_bs=16, running_bs=16)` -- where
+            # `mask_pad_tail` sentinels nothing, because `real_batch == batch`.
+            # The two pad rows then scattered draft KV at whatever slot they
+            # addressed. Measured directly: "role=prefill bs=14 ... anchors=16".
+            logits = logits[: batch.total_seqs_num]
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
-            # drafts_cpu = self._prefill_propose_drafts(batch, sampled, hidden_states)
-            drafts_cpu = []
+            if envs.ATOM_LOG_EMITTED_TOKENS:
+                # Prefill's own copy of the `[emit]` line. It needs one because
+                # this path never reaches `postprocess` -- it samples here and
+                # returns -- so the log that covers baseline and decode would
+                # leave the rapidserve PREFILL half silent. Its only other
+                # token log is `[draft-prefill]`, which exists only when a
+                # drafter does, so with speculation off T0 would go unrecorded
+                # on the one side that produces it.
+                self._emit_log_step = getattr(self, "_emit_log_step", 0) + 1
+                for _i, _rid in enumerate(
+                    list(batch.req_ids)[: len(sampled_cpu)]
+                ):
+                    logger.info(
+                        "[emit] step=%d dp=%s role=%s seq=%s n=1 tokens=%s",
+                        self._emit_log_step,
+                        self.config.parallel_config.data_parallel_rank,
+                        self._draft_role(),
+                        _rid,
+                        sampled_cpu[_i],
+                    )
+            drafts_cpu = self._prefill_propose_drafts(batch, sampled, hidden_states)
+            if envs.ATOM_LOG_DRAFT_TOKENS:
+                # The PRODUCING end of the handoff. Decode's first verification
+                # for every request judges these, and that verdict is invisible
+                # to `_log_draft_tokens` -- the drafts reaching decode's first
+                # decode step were made here, not by `propose_draft_token_ids`.
+                # Logged next to the sampled token so the pair can be matched
+                # against what `on_prefill_done` reports receiving.
+                for _i, _sid in enumerate(list(batch.req_ids)[: len(sampled_cpu)]):
+                    logger.info(
+                        "[draft-prefill] seq=%s sampled=%s drafts=%s",
+                        _sid,
+                        sampled_cpu[_i] if _i < len(sampled_cpu) else "?",
+                        drafts_cpu[_i] if _i < len(drafts_cpu) else "(none)",
+                    )
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
@@ -5431,56 +5970,106 @@ class RapidServeModelRunner(ModelRunner):
         reset_forward_context()
         return sampled_cpu, drafts_cpu
 
+    def _prefill_compute_draft_kv(self, batch, hidden_states) -> None:
+        """Absorb this prefill chunk into the drafter's context.
+
+        The rapidserve counterpart of the `compute_draft_kv` call in
+        `ModelRunner.forward`, and deliberately narrower than it. The two cases
+        that guard it there cannot arise on this path: there is no PP stage
+        split (`pp_non_last`), and no DP draft-ALIGNMENT pass -- the output-less
+        pass `will_align_draft` describes, which prefill has no equivalent of.
+        `draft_kv_duplicates_propose` is only consulted together with that flag,
+        so it has nothing to suppress here even though `_prefill_propose_drafts`
+        runs `propose` right after this.
+
+        Running both, in this order, is what the non-disagg path does too: the
+        window write lands first and `propose` reads it, which is how a prompt's
+        context reaches the drafts prefill puts on the wire.
+
+        A dummy run is still excluded: it carries no real request, and its rows
+        would overwrite window slots that hold a live prompt's context.
+
+        Chunked prefill needs every chunk, not just the last: the window holds
+        a row per position it spans, and a chunk this skipped would leave a hole
+        the draft later gathers as zeros.
+        """
+        drafter = getattr(self, "drafter", None)
+        if drafter is None or batch.is_dummy_run:
+            return
+        drafter.compute_draft_kv(
+            get_forward_context().context.positions,
+            hidden_states,
+            batch.next_token_ids,
+        )
+
     def _prefill_propose_drafts(self, batch, sampled, hidden_states) -> list:
         """Run the drafter on the prefill forward's output.
 
-        Returns one draft list per sequence, or [] when no drafter ran — decode
-        then falls back to placeholder drafts.
+        Returns one draft list per sequence, or [] when nothing usable was
+        drafted — decode then falls back to placeholder drafts.
 
-        Calls the drafter directly rather than going through
-        propose_draft_token_ids: that wrapper ends in
-        tokenIDProcessor.prepare_draft_ids, which is deferred-output plumbing —
-        it stashes this step's drafts, fires an async D2H, and returns the
-        PREVIOUS step's drafts (and reads `prev_req_ids`, which only
-        prepare_sampled_ids inside postprocess ever sets). Prefill runs no such
-        pipeline: it needs this batch's drafts synchronously, to put on the wire.
+        The pass itself is `run_draft_pass`, shared verbatim with the
+        non-disagg path. Only the RETURN differs, and that is the whole reason
+        this function exists: `propose_draft_token_ids` ends in
+        `prepare_draft_ids`, which on a V4 producer takes its deferred-output
+        branch (`is_deferred_out` is True — V4 is `Family.MLA`, so
+        `has_recurrent_state` is False and `hands_off_recurrent_state` never
+        fires) and returns the PREVIOUS step's ids. `prev_req_ids` is set only
+        by `prepare_sampled_ids` inside `postprocess`, which this process never
+        runs, so it would hand back an empty array every time. Prefill needs
+        THIS batch's drafts, synchronously, to put on the wire.
 
-        Restricted to plain (EAGLE/MTP) drafters. DSpark is excluded on purpose:
-        its ragged verification carries per-request `ell` state recorded via
-        `verify_scheduler.record_ell`, and that bookkeeping is consumed in the
-        DECODE process — recording it here, in a process whose scheduler never
-        runs the verify step, would desynchronise it.
+        Everything else — the mid-prompt anchor override, the speculative-state
+        commit, the PCP broadcast, the draft log, `record_ell` — is the shared
+        body's, not re-implemented here. Each one that was previously
+        hand-copied and dropped cost a GPU memory fault.
         """
         drafter = getattr(self, "drafter", None)
-        if (
-            drafter is None
-            or drafter.is_block_drafter
-            or drafter.uses_confidence_schedule
-        ):
+        if drafter is None:
             return []
         bs = batch.total_seqs_num
         if bs == 0:
             return []
-        # Nothing was verified this step, so nothing is rejected: the anchor is
-        # each prompt's last token (prepare_inputs counts back 1+num_reject from
-        # each segment end). Prefill batches skip both the RAGGED and
-        # confidence-schedule branches in propose_draft_token_ids, since
-        # total_tokens_num_prefill != 0.
+        # A batch with no real anchors drafts for the DP collectives alone, and
+        # its ids are discarded — exactly `align_only`. Two kinds reach here:
+        #
+        #   * a PURE MIDDLE CHUNK, where every seq is mid-prompt. Under
+        #     rapidserve this is routine whenever a prompt outruns the token
+        #     budget, so it is the common path, not the exotic one.
+        #   * a DP-SYNC DUMMY, which `produces_output()` answers True for on
+        #     purpose ("the dummy is what flushes the last real one"). It
+        #     carries no request and is decode-shaped (`q = mtp_k + 1`), while
+        #     `prefill_forward` samples raw head output with no `logits[:bs]`
+        #     cut — so its `sampled` holds `mtp_k + 1` rows for ONE sequence.
+        #     DSpark sizes the block off the anchor count
+        #     (`scheduled_bs = next_token_ids.shape[0]`), so passing those
+        #     through ran 7 rows against a 1-entry slot table.
+        no_real_anchors = batch.is_dummy_run or not batch.produces_output()
+        if no_real_anchors:
+            next_token_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        else:
+            # A MIXED batch (some seqs final, some mid-prompt) is fine here:
+            # `produces_output` is `any(is_final_chunk)`, so it takes this
+            # branch, and the shared body's `draft_anchor_overrides` fixes up
+            # the mid-prompt rows one at a time — that is what it is for.
+            next_token_ids = sampled.view(-1)
+        # Nothing was verified this step, so nothing is rejected. DSpark ignores
+        # this argument entirely (it seeds from the anchor, not the reject
+        # verdict); it is passed because `propose` is a shared signature.
         num_reject = self.tokenID_processor.default_num_rejected_tokens[:bs]
-        # Anchor = each prompt's last token. prepare_inputs counts back
-        # `1 + num_reject` from every segment end (cu_seqlens_q[1:]), and
-        # nothing was verified this step, so num_reject is all-zero.
-        last_token_indices = drafter.prepare_inputs(bs, 1 + num_reject)
-        drafts = drafter.propose(
-            target_token_ids=self.tokenID_processor.input_ids.gpu[
-                1 : batch.total_tokens_num + 1
-            ],
-            target_positions=get_forward_context().context.positions,
-            target_hidden_states=hidden_states,
-            num_reject_tokens=num_reject,
-            next_token_ids=sampled.view(-1),
-            last_token_indices=last_token_indices,
+        drafts = self.run_draft_pass(
+            batch,
+            self.tokenID_processor.input_ids.gpu[1 : batch.total_tokens_num + 1],
+            hidden_states,
+            next_token_ids,
+            num_reject,
+            None,  # nothing verified -> the body anchors on each segment's last row
+            align_only=no_real_anchors,
         )
         if drafts is None:
             return []
-        return drafts.view(bs, -1).tolist()
+        # `reshape`, not `view`: DSpark returns `draft_token_ids[:bs, :T]`, a
+        # row-and-column slice of a wider buffer, so it is not contiguous and
+        # `view` raises on it. `reshape` is a no-op on the contiguous case the
+        # serial drafters return.
+        return drafts.reshape(bs, -1).tolist()

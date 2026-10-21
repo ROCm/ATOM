@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import inspect
+import logging
 import os
 import sys
 import time
@@ -267,7 +268,22 @@ def start_monitoring_torch_compile(vllm_config: Config):
         compilation_config.level == CompilationLevel.PIECEWISE
         and compilation_config.debug_dump_path
     ):
-        import depyf
+        # Optional: `depyf` is not declared as a dependency and is absent from
+        # some environments. Missing it used to surface as
+        # `InternalTorchDynamoError: ModuleNotFoundError: No module named
+        # 'depyf'` raised from inside the Dynamo compile of the model forward,
+        # which reads as a compilation bug and kills warmup before the first
+        # request. Degrade to "no dump" instead: the dump is a debugging aid,
+        # and nothing downstream reads it.
+        try:
+            import depyf
+        except ImportError:
+            logging.getLogger("atom").warning(
+                "debug_dump_path is set but `depyf` is not installed, so no "
+                "computation graphs will be dumped. `pip install depyf` to "
+                "enable them, or unset debug_dump_path to silence this."
+            )
+            return
 
         path = os.path.join(compilation_config.debug_dump_path, "rank_0")
         # f"rank_{vllm_config.parallel_config.rank}")
@@ -393,12 +409,28 @@ class TorchCompileWrapperWithCustomDispatcher:
             self.vllm_config.compilation_config.use_cudagraph
             and "update" in new_code.co_names
         ):
-            import depyf
+            # The decompiled source is an AID to this error, not the error.
+            # `depyf` is optional and absent in some environments, and letting
+            # its ImportError escape here replaces a precise diagnosis
+            # ("something mutates a buffer during forward") with
+            # "No module named 'depyf'", which points at the wrong problem
+            # entirely. Raise the real error either way.
+            try:
+                import depyf
 
-            src = depyf.decompile(new_code)
+                clue = (
+                    " The following code contains clues about which buffer is "
+                    "being modified (please search for the usage of the "
+                    "function `update`):\n" + depyf.decompile(new_code)
+                )
+            except Exception:  # noqa: BLE001 - diagnosis must not mask the error
+                clue = (
+                    " Install `depyf` to have the offending code decompiled "
+                    "and shown here."
+                )
             msg = (
-                "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):\n"
-                + src
+                "Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code."
+                + clue
             )
             raise RuntimeError(msg)
 

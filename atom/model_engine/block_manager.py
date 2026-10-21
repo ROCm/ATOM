@@ -2251,6 +2251,17 @@ class BlockManager:
         every off-grid position it is then handed — zero checkpoints kept, no
         error, no warning, and a hit rate that quietly collapses.
         """
+        # No prefix caching, no ladder. A checkpoint image exists so a LATER
+        # request can resume from it, and that lookup IS prefix caching — with
+        # it off, every rung costs its keeper an extra forward (its prompt gets
+        # cut there) to pin an image nothing can ever hit. The pairing warning
+        # above does not apply to this gate: it is about suppressing the cut
+        # while still WANTING checkpoints, where `checkpointers_at` would then
+        # refuse the off-grid positions it was handed. Here both halves are
+        # being switched off together on purpose, so "zero checkpoints kept" is
+        # the outcome, not the regression.
+        if not self.enable_prefix_caching:
+            return 0
         applicable = [c for c in self.state_caches if c.applies(seq)]
         if all(c.readable_midstep for c in applicable):
             return 0
