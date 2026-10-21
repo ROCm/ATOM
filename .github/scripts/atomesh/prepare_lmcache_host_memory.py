@@ -227,6 +227,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
     base_page_step_timeout = (
         getattr(args, "base_page_step_timeout", None) or args.step_timeout + 30
     )
+    thp_step_timeout = getattr(args, "thp_step_timeout", None) or args.step_timeout
     result = {
         "status": "preparing",
         "attempts": [],
@@ -237,6 +238,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
             "step_timeout": args.step_timeout,
             "reserve_gib": args.reserve_gib,
             "base_page_step_timeout": base_page_step_timeout,
+            "thp_step_timeout": thp_step_timeout,
             "child_exit_timeout": CHILD_EXIT_TIMEOUT,
         },
     }
@@ -416,6 +418,7 @@ def prepare(args, *, run=run_step, take_snapshot=snapshot, clock=time.monotonic)
                             "--progress",
                             str(gib),
                         ],
+                        timeout=thp_step_timeout,
                     )
                     # The existing script exits 0 even for partial THP coverage.
                     full_thp = any(
@@ -480,6 +483,11 @@ def main():
         "--base-page-step-timeout",
         type=budget.positive_seconds,
         help="base-page population and release budget; defaults to step-timeout + 30",
+    )
+    parser.add_argument(
+        "--thp-step-timeout",
+        type=budget.positive_seconds,
+        help="THP population/compaction budget; defaults to step-timeout",
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(

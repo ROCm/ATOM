@@ -338,6 +338,38 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(self.result["settings"]["base_page_step_timeout"], 600)
         self.assertEqual(len(self.result["attempts"]), 1)
 
+    def test_slow_thp_has_own_budget_and_keeps_ordinary_step_limit(self):
+        self.args.timeout = 1800
+        self.args.step_timeout = 90
+        self.args.thp_step_timeout = 600
+
+        def run(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "compact_huge_pages.py" in str(command):
+                self.assertEqual(seconds, 600)
+                self.now += 300
+            else:
+                self.assertEqual(seconds, 90)
+            return result
+
+        self.assertEqual(self.prepare(run), 0)
+        self.assertEqual(self.result["settings"]["thp_step_timeout"], 600)
+        self.assertEqual(len(self.result["attempts"]), 1)
+
+    def test_thp_budget_is_capped_by_remaining_total_deadline(self):
+        self.args.timeout = 100
+        self.args.thp_step_timeout = 600
+
+        def run(command, seconds, output):
+            result = self.run_step(command, seconds, output)
+            if "drop_page_cache.py" in str(command):
+                self.now += 30
+            if "compact_huge_pages.py" in str(command):
+                self.assertEqual(seconds, 70)
+            return result
+
+        self.assertEqual(self.prepare(run), 0)
+
     def test_small_base_page_allocation_is_resident_then_released(self):
         result = subprocess.run(
             [sys.executable, str(SCRIPTS / "reclaim_file_cache.py"), "0.0078125"],

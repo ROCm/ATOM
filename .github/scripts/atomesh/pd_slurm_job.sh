@@ -428,7 +428,7 @@ prepare_lmcache_memory_on_host() {
     --gpus "${ATOMESH_PREFILL_ENV_HIP_VISIBLE_DEVICES}" \
     --per-gpu-gib "${ATOMESH_PREFILL_ENV_LMCACHE_MAX_LOCAL_CPU_SIZE}" \
     --attempts 3 --timeout 1800 --step-timeout 90 \
-    --base-page-step-timeout 600 --reserve-gib 128 \
+    --base-page-step-timeout 600 --thp-step-timeout 600 --reserve-gib 128 \
     --output "${output}" "${cache_root_args[@]}" "${model_dirs[@]}" || return $?
   export ATOMESH_LMCACHE_HOST_PREPARED=true
 }
