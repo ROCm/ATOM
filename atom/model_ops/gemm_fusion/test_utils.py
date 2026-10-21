@@ -1007,14 +1007,14 @@ def m3_config(layers=4, experts=8, vocab=32000, index_topk_freq=2, moe=False):
     """HF-style config dict (no weights). Geometry matches the golden cases.
 
     ``moe=False`` (default): every FFN is the dense MLP (``moe_layer_freq`` all 0).
-    WHY: stock ATOM at the golden pin 8f9258a76 calls ``ffn(hidden_states,
+    WHY (history): at the golden pin 8f9258a76 the decoder layer called ``ffn(hidden_states,
     x_scale=hidden_states_scale)`` for BOTH FFN kinds (model.py:776) but
-    ``MiniMaxM3MoE.forward(self, hidden_states)`` takes no ``x_scale``, so ANY MoE layer raises
+    ``MiniMaxM3MoE.forward(self, hidden_states)`` takes no ``x_scale``, so ANY MoE layer raised
     ``TypeError`` at the first forward (E2 OFF arm, job-e2_off03, with no gemm_fusion involved).
-    The dense ``MiniMaxM3MLP.forward`` does accept ``x_scale``. The attention geometry and the
-    three attention layer types are unchanged, so E-2 still exercises the attention/compile path.
-    MoE layers are therefore NOT covered by this smoke config (``moe=True`` restores the old
-    layout and will hit that stock error until ATOM fixes it)."""
+    The SP series had collapsed main's two calls into one; the R12 branch restores main's dispatch
+    (the MoE is called without a scale: its activation is BF16 by construction), so ``moe=True``
+    now runs. The default stays dense-only so existing evidence stays comparable; the attention
+    geometry and the three attention layer types are the same either way."""
     layer_ffn = [0] * layers if not moe else [0] + [1] * (layers - 1)
     return {
         "model_type": "minimax_m3",

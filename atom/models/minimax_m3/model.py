@@ -772,8 +772,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states_scale = torch.ops.aiter.minimax_m3_tp_gather(
                     hidden_states_scale, 4
                 )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)
+        if self.is_moe_layer:
+            # `fuse_post_attention_ar_rmsnorm_quant` requires `not self.is_moe_layer`, so every
+            # post-attention norm branch above leaves a MoE layer's activation BF16 with no scale,
+            # and MiniMaxM3MoE (gate, experts, shared experts) consumes BF16 and takes no `x_scale`.
+            # Asserted rather than dropped: a scale here would mean FP8 reached a BF16-only consumer.
+            assert hidden_states_scale is None
+            hidden_states = self.block_sparse_moe(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states, x_scale=hidden_states_scale)
         if self._tp_replicated_o_proj:
             hidden_states = torch.ops.aiter.minimax_m3_tp_complete(
                 hidden_states, attention_output, tokens, 4

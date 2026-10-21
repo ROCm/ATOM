@@ -1742,16 +1742,21 @@ def test_m3_smoke_default_is_all_dense_ffn_but_keeps_all_three_attention_types()
     assert m.m3_vl_config(layers=3)["text_config"]["moe_layer_freq"] == [0, 0, 0]
 
 
-def test_stock_moe_forward_still_lacks_x_scale_so_the_dense_default_is_still_needed():
-    """Pins the reason for moe=False to the real source. When ATOM fixes MiniMaxM3MoE.forward to
-    take x_scale this test FAILS, which is the signal to revisit the default."""
+def test_the_moe_takes_no_x_scale_and_the_decoder_layer_never_passes_it_one():
+    """The contract behind the MoE crash fixed on this branch. ``MiniMaxM3MoE.forward`` takes BF16 only
+    (no ``x_scale``) and the dense ``MiniMaxM3MLP`` accepts one, so the decoder layer must call the
+    two differently. The SP series had collapsed them into ``ffn(hidden_states, x_scale=...)``, which
+    raised TypeError in every MoE layer at warmup; the smoke recipe's ``moe=False`` default worked
+    around it. The behavioural test is tests/test_minimax_m3_decoder_ffn_dispatch.py."""
     import re
     from pathlib import Path
 
     src = (
         Path(__file__).resolve().parents[2] / "atom/models/minimax_m3/model.py"
     ).read_text(encoding="utf-8")
-    assert "hidden_states = ffn(hidden_states, x_scale=hidden_states_scale)" in src
+    assert "ffn(hidden_states, x_scale=hidden_states_scale)" not in src
+    assert "hidden_states = self.block_sparse_moe(hidden_states)" in src
+    assert "hidden_states = self.mlp(hidden_states, x_scale=hidden_states_scale)" in src
     moe_cls = src.split("class MiniMaxM3MoE", 1)[1].split(
         "class MiniMaxM3Attention", 1
     )[0]
