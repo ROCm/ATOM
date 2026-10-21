@@ -77,14 +77,14 @@ def test_iq2r_rejects_unknown_layout(layout):
         )
 
 
-def _glm53_packed_layer(method):
+def _glm53_packed_layer(method, device="meta"):
     layer = torch.nn.Module()
     layer.has_bias = False
     layer.num_fused_shared_experts = 1
-    with torch.device("meta"):
+    with torch.device(device):
         method.create_weights(
             layer,
-            num_experts=257,
+            num_experts=method.num_experts,
             hidden_size=6144,
             intermediate_size_per_partition=method.intermediate_size,
             params_dtype=torch.bfloat16,
@@ -109,6 +109,52 @@ def test_iq2r_glm53_packed_create_weights_at_tp4(aiter_iq2r):
         parameter = getattr(layer, name)
         assert (tuple(parameter.shape), parameter.dtype) == ((1,), torch.int32)
     assert (method.tp_size, method.tp_rank) == (4, 1)
+
+
+def _glm53_dummy_loaded_layer(method, mode):
+    from atom.model_loader.loader import initialize_dummy_weights
+
+    layer = _glm53_packed_layer(method, device="cpu")
+    # Stands in for the uninitialized memory that "empty" leaves.
+    for parameter in layer.parameters():
+        parameter.data.view(torch.uint8).fill_(0xA5)
+    if mode != "empty":
+        initialize_dummy_weights(layer, mode)
+    return layer
+
+
+@pytest.mark.parametrize("mode", ["empty", "zero", "xavier"])
+def test_iq2r_glm53_packed_post_load_accepts_dummy_weights(
+    aiter_iq2r, monkeypatch, mode
+):
+    method = _glm53_packed_method(tp_size=8, tp_rank=0, intermediate=256)
+    method.num_experts = 2
+    layer = _glm53_dummy_loaded_layer(method, mode)
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(load_dummy=mode)
+    )
+    monkeypatch.setattr(moe_mod, "_IQ2R_GLM53_WORKSPACES", {})
+
+    method.process_weights_after_loading(layer)
+
+    # Shapes are still checked.
+    method.num_experts = 3
+    with pytest.raises(ValueError, match="expected 3"):
+        method.process_weights_after_loading(layer)
+
+
+def test_iq2r_glm53_packed_post_load_checks_checkpoint_codebooks(
+    aiter_iq2r, monkeypatch
+):
+    method = _glm53_packed_method(tp_size=8, tp_rank=0, intermediate=256)
+    method.num_experts = 2
+    layer = _glm53_dummy_loaded_layer(method, "xavier")
+    monkeypatch.setattr(
+        moe_mod, "get_current_atom_config", lambda: SimpleNamespace(load_dummy=None)
+    )
+
+    with pytest.raises(ValueError, match="codebook entry zero"):
+        method.process_weights_after_loading(layer)
 
 
 def test_glm53_weights_mapping_targets_every_compiled_tensor(aiter_iq2r):

@@ -1079,11 +1079,14 @@ class Iq2rMoEMethod(FusedMoEMethodBase):
         from aiter.ops.iq2r_format import iq2r_validate_expert_weights
 
         # Only the down records keep the canonical layout the validator checks.
+        # `--load_dummy` writes no codebooks, so their reserved all-zero entry
+        # is checked only for checkpoint weights.
         iq2r_validate_expert_weights(
             layer.w2_weight,
             layer.w2_weight_scale,
             layer.iq2r_down_metadata,
             expert_count=self.num_experts,
+            verify_reserved_zero=not get_current_atom_config().load_dummy,
         )
         self._glm53_workspace(layer.w13_weight.device)
 
