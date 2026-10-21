@@ -8,8 +8,8 @@ the owed post, the gate projection, Sinkhorn, the collapse with the carried
 pre-mix and the sublayer's input RMSNorm. HIP uses one compute kernel on gfx950;
 Triton remains available through ATOM_DSV41_MHC_BACKEND=triton.
 
-The norm is the sublayer's own: its output is BF16, and a layer whose first
-GEMM takes FP8 quantizes it there, as the reference model does.
+The norm is the sublayer's own. Attention can request HIP's fused MXFP8
+output alongside BF16 for its other readers; FFN keeps the BF16 interface.
 """
 
 from functools import cache
@@ -80,6 +80,7 @@ def pre_delayed(
     post_mult,
     norm_eps,
     w_preshuffle_bf16=False,
+    fuse_quant=False,
     sublayer_output=None,
     post_mix=None,
     combination=None,
@@ -90,6 +91,7 @@ def pre_delayed(
     `residual` is the caller's own tensor when no post was requested.
     `hc_fn` is a HIP BF16 hi/lo pack when `w_preshuffle_bf16=True`,
     or the original FP32 weight for Triton otherwise.
+    With `fuse_quant`, `normed_input` is `(bf16, fp8, e8m0_scale)`.
     """
     outputs = v41_mhc_pre_delayed(
         residual,
@@ -104,13 +106,19 @@ def pre_delayed(
         post_mult=post_mult,
         norm_eps=norm_eps,
         w_preshuffle_bf16=w_preshuffle_bf16,
+        fuse_quant=fuse_quant,
         sublayer_output=sublayer_output,
         post_mix=post_mix,
         combination=combination,
     )
-    # Preserve the no-post input alias outside the custom op. The guarded
-    # implementation returns four new tensors, or five when post updates it.
-    return (residual, *outputs) if sublayer_output is None else tuple(outputs)
+    # Keep the guarded op's outputs flat and preserve the no-post input alias
+    # outside it. Only the attention-facing wrapper groups the norm outputs.
+    if fuse_quant:
+        outputs, quant, scale = outputs[:-2], outputs[-2], outputs[-1]
+    outputs = (residual, *outputs) if sublayer_output is None else tuple(outputs)
+    if fuse_quant:
+        outputs = (outputs[0], (outputs[1], quant, scale), *outputs[2:])
+    return outputs
 
 
 def _pre_delayed_fake(
@@ -122,6 +130,7 @@ def _pre_delayed_fake(
     norm_weight,
     *,
     sublayer_output=None,
+    fuse_quant=False,
     **kwargs,
 ):
     *outer, hc, hidden = residual.shape
@@ -131,6 +140,13 @@ def _pre_delayed_fake(
         residual.new_empty((*outer, hc), dtype=torch.float32),
         residual.new_empty((*outer, hc, hc), dtype=torch.float32),
     ]
+    if fuse_quant:
+        outputs.extend(
+            [
+                residual.new_empty((*outer, hidden), dtype=torch.float8_e4m3fn),
+                residual.new_empty((*outer, hidden // 32), dtype=torch.float8_e8m0fnu),
+            ]
+        )
     return (
         outputs if sublayer_output is None else [torch.empty_like(residual), *outputs]
     )
@@ -151,6 +167,7 @@ def v41_mhc_pre_delayed(
     post_mult: float,
     norm_eps: float,
     w_preshuffle_bf16: bool = False,
+    fuse_quant: bool = False,
     sublayer_output: torch.Tensor | None = None,
     post_mix: torch.Tensor | None = None,
     combination: torch.Tensor | None = None,
@@ -161,9 +178,12 @@ def v41_mhc_pre_delayed(
     with_post = sublayer_output is not None
     kernel = mhc_fused_post_pre_delayed_rmsnorm
     options = {}
+    if fuse_quant and not w_preshuffle_bf16:
+        raise ValueError("Fused mHC quantization requires the HIP backend")
     if w_preshuffle_bf16:
         kernel = _hip_ops()[0]
         options["w_preshuffle_bf16"] = True
+        options["out_dtype"] = "mxfp8" if fuse_quant else "bf16"
     new_residual, post, comb, normed, pre = kernel(
         residual.view(rows, hc_mult, hidden),
         hc_fn,
@@ -184,10 +204,19 @@ def v41_mhc_pre_delayed(
         norm_eps=norm_eps,
         **options,
     )
+    if fuse_quant:
+        normed, quant, scale = normed
     outputs = [
         normed.view(*outer, hidden),
         pre.view(*outer, hc_mult),
         post.view(*outer, hc_mult),
         comb.view(*outer, hc_mult, hc_mult),
     ]
+    if fuse_quant:
+        outputs.extend(
+            [
+                quant.view(*outer, hidden),
+                scale.view(torch.float8_e8m0fnu).view(*outer, hidden // 32),
+            ]
+        )
     return outputs if not with_post else [new_residual.view_as(residual), *outputs]

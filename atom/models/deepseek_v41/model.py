@@ -115,7 +115,12 @@ class Block(nn.Module):
             )
 
     def attention_forward(self, normed, cache, step, rope):
-        """Run attention on its seam's normed BF16 input."""
+        """Keep BF16 for auxiliary readers and reuse the optional QKV quant."""
+        if isinstance(normed, tuple):
+            hidden, hidden_fp8, hidden_scale = normed
+            return self.attn(
+                hidden, hidden_scale, cache, step, rope, hidden_fp8=hidden_fp8
+            )
         return self.attn(normed, None, cache, step, rope)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -146,6 +151,7 @@ class Block(nn.Module):
             **self.hc_options,
             norm_eps=self.attn_norm.eps,
             w_preshuffle_bf16=hc_fn is not None,
+            fuse_quant=hc_fn is not None,
             sublayer_output=state.pending,
             post_mix=state.post_mix,
             combination=state.combination,

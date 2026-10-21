@@ -29,7 +29,7 @@ from .multimodal import DeepseekV41MultimodalModel
 logger = logging.getLogger("atom")
 
 
-def _fake_layer_output(hidden, layer_name):
+def _fake_layer_output(hidden, layer_name, hidden_fp8=None, hidden_scale=None):
     return torch.empty_like(hidden)
 
 
@@ -61,7 +61,12 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
-def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
+def v41_attention(
+    hidden: torch.Tensor,
+    layer_name: str,
+    hidden_fp8: torch.Tensor | None = None,
+    hidden_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
     if not metadata.step.requests:
@@ -71,8 +76,15 @@ def v41_attention(hidden: torch.Tensor, layer_name: str) -> torch.Tensor:
     # before this boundary, so only the attention body runs here.
     # A bounded replay's layer 39 outputs some rows of `hidden`
     # (`metadata.queries`); it runs outside the compiled graphs.
+    options = {} if hidden_fp8 is None else {"hidden_fp8": hidden_fp8}
     return layer.attn(
-        hidden, None, metadata.cache, metadata.step, rope, metadata.queries
+        hidden,
+        hidden_scale,
+        metadata.cache,
+        metadata.step,
+        rope,
+        metadata.queries,
+        **options,
     )
 
 
@@ -91,6 +103,9 @@ class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
 
     def attention_forward(self, normed, cache, step, rope):
+        if isinstance(normed, tuple):
+            hidden, hidden_fp8, hidden_scale = normed
+            return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
         return v41_attention(normed, self.layer_name)
 
     def engram_forward(self, residual, embeddings, image_mask):
@@ -313,11 +328,23 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         layer, rope = self.layers[self.decoder_start], self._rope(self.decoder_start)
         normed, *seam = layer.prepare_attention(state, None, None)
         del state
-        layer.attn._compress_batch(normed, cache, step, rope)
-        full = normed.new_zeros(num_tokens, self.config.hidden_size)
+        hidden = normed[0] if isinstance(normed, tuple) else normed
+        layer.attn._compress_batch(hidden, cache, step, rope)
+        full = hidden.new_zeros(num_tokens, self.config.hidden_size)
         if plan.tail is not None:
             carry_selections(step, plan, self.decoder_specs)
-            normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
+            if isinstance(normed, tuple):
+                hidden, quant, scale, *seam = gather_rows(
+                    plan.tail_rows,
+                    normed[0],
+                    normed[1],
+                    normed[2].view(torch.uint8),
+                    *seam,
+                    dim=1,
+                )
+                normed = (hidden, quant, scale.view(torch.float8_e8m0fnu))
+            else:
+                normed, *seam = gather_rows(plan.tail_rows, normed, *seam, dim=1)
             with rows_of(metadata, plan.tail, rows=plan.tail_rows):
                 output = layer.attention_forward(normed, None, None, rope)
                 tail = self._late_layers(layer.ffn_forward(output, *seam))
