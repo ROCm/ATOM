@@ -205,6 +205,7 @@ SCHED_METHODS = {
     "_abort_for_device_error",
     "_freed_blocks",
     "take_kv_scrub",
+    "_enable_free_tracking",
 }
 
 
@@ -220,6 +221,7 @@ def _scheduler(seqs, refs):
     ns = {"logger": logging.getLogger("atom.test_scrub_sched")}
     sched = _extract(SCHED, "Scheduler", SCHED_METHODS, ns)()
     sched.running = list(seqs)
+    sched.config = SimpleNamespace(gemm_fusion=SimpleNamespace(enabled=False))
     sched.aborted = set()
     sched.abort_request = lambda rid: sched.aborted.add(rid) or True
 
@@ -328,3 +330,183 @@ def test_the_scrub_runs_right_after_postprocess_in_the_step_that_serves_requests
                 found += 1
                 assert ast.unparse(fn.body[i + 1]) == "self._scrub_kv_after_verdict()"
     assert found == 1
+
+
+# ------------------------------------------- blocks freed during the unchecked window (the ring)
+def _real_pool(n=32):
+    from atom.model_engine.block_pool import BlockPool
+
+    return BlockPool(n)
+
+
+def _take(pool, *block_ids):
+    for b in block_ids:
+        pool.claim(b)
+
+
+def test_the_block_pool_remembers_nothing_unless_asked():
+    pool = _real_pool()
+    _take(pool, 3)
+    pool.free(3)
+    pool.advance_free_tick()
+    assert pool.freed_recently() == []
+
+
+def test_the_block_pool_remembers_the_blocks_freed_within_its_window():
+    pool = _real_pool()
+    pool.track_frees(3)
+    _take(pool, 5, 2, 9)
+    pool.free(5)  # tick 0
+    pool.advance_free_tick()
+    pool.free(2)  # tick 1
+    assert pool.freed_recently() == [2, 5]  # distinct, ascending
+    pool.advance_free_tick()
+    assert pool.freed_recently() == [2, 5]  # tick 2: the first free is still inside
+    pool.advance_free_tick()
+    assert pool.freed_recently() == [
+        2
+    ]  # tick 3: block 5 (freed at tick 0) is out of the window
+    pool.advance_free_tick()
+    assert pool.freed_recently() == []
+
+
+def test_a_block_freed_twice_is_listed_once_and_a_shared_block_only_when_really_freed():
+    pool = _real_pool()
+    pool.track_frees(5)
+    _take(pool, 4)
+    pool.claim(4)  # a second holder: ref_count 2
+    pool.free(4)  # one holder left: NOT freed yet
+    assert pool.freed_recently() == []
+    pool.free(4)  # now it is
+    _take(pool, 4)
+    pool.free(4)
+    assert pool.freed_recently() == [4]
+
+
+# ------------------------------------------------------------ the scheduler: the window at a verdict
+def _tracked(monkeypatch, seqs, pool, check_period=4):
+    """A scheduler with free tracking ON over the REAL BlockPool. Its body frees an aborted request's
+    blocks through ``pool.free``, like BlockManager.deallocate."""
+    import sys
+    import types
+
+    fake_hooks = types.ModuleType("atom.model_ops.gemm_fusion.hooks")
+    fake_hooks.SNAPSHOT_EVAL_DELAY = 2
+    for name, mod in (
+        ("atom.model_ops", types.ModuleType("atom.model_ops")),
+        ("atom.model_ops.gemm_fusion", types.ModuleType("atom.model_ops.gemm_fusion")),
+        ("atom.model_ops.gemm_fusion.hooks", fake_hooks),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+    sched = _scheduler(seqs, {})
+    sched.config = SimpleNamespace(
+        gemm_fusion=SimpleNamespace(enabled=True, check_period=check_period)
+    )
+
+    def body(_seqs, _out, _stream, _batch):
+        for seq in sched.running:
+            if seq.id in sched.aborted:
+                for b in seq.block_table:
+                    pool.free(b)
+                seq.block_table.clear()
+        return []
+
+    sched._postprocess_impl = body
+    sched.block_manager = SimpleNamespace(clear_cache=lambda: None, kv=pool)
+    # Tracking switches on at the FIRST postprocess: take that step now, so a test that frees a block
+    # afterwards is really recorded (freeing earlier would pass vacuously).
+    _quiet_step(sched)
+    return sched
+
+
+def _quiet_step(sched):
+    sched.postprocess([], SimpleNamespace(aborted_req_ids=None))
+
+
+def test_free_tracking_is_sized_to_the_error_window_and_only_when_fusion_is_on(
+    monkeypatch,
+):
+    pool = _real_pool()
+    sched = _tracked(monkeypatch, [], pool, check_period=4)
+    _quiet_step(sched)
+    assert (
+        pool._free_window == 4 + 2 + 1
+    )  # period + snapshot evaluation delay + one step of margin
+    off = _scheduler([], {})
+    off.config = SimpleNamespace(gemm_fusion=SimpleNamespace(enabled=False))
+    off.block_manager = SimpleNamespace(
+        clear_cache=lambda: None,
+        kv=SimpleNamespace(
+            advance_free_tick=lambda: pytest.fail("tracking must stay off"),
+            track_frees=lambda w: pytest.fail("tracking must stay off"),
+        ),
+    )
+    off._postprocess_impl = lambda *a: []
+    _quiet_step(off)  # fusion OFF: the block pool is never touched
+
+
+def test_blocks_of_a_request_that_finished_inside_the_window_are_scrubbed_too(
+    monkeypatch,
+):
+    """THE GAP: request B ran under the error, finished before the verdict and freed its blocks; it
+    is not in the abort set, but its blocks may hold NaN and are free for reuse."""
+    pool = _real_pool()
+    a = _Seq(10, [1, 2])  # running, aborted by the verdict
+    _take(pool, 1, 2, 5, 6)  # blocks 5, 6: request B's
+    sched = _tracked(monkeypatch, [a], pool)
+    _quiet_step(sched)
+    pool.free(5)
+    pool.free(6)  # B finished (freed during the postprocess of this step)
+    _quiet_step(sched)
+    sched.postprocess([], _verdict([10]))
+    assert sched.take_kv_scrub() == [1, 2, 5, 6]
+
+
+def test_blocks_freed_before_the_window_began_are_left_alone(monkeypatch):
+    """Freed long ago: written by steps the check already proved clean."""
+    pool = _real_pool()
+    _take(pool, 1, 7)
+    sched = _tracked(monkeypatch, [_Seq(10, [1])], pool, check_period=4)
+    pool.free(7)
+    for _ in range(4 + 2 + 1):  # a whole window of quiet steps
+        _quiet_step(sched)
+    sched.postprocess([], _verdict([10]))
+    assert sched.take_kv_scrub() == [1]
+
+
+def test_a_window_block_reallocated_to_a_live_request_is_skipped(monkeypatch):
+    """Re-allocated after the window block was freed: it now holds that request's own, finite data."""
+    pool = _real_pool()
+    _take(pool, 1, 5)
+    sched = _tracked(monkeypatch, [_Seq(10, [1])], pool)
+    pool.free(5)
+    _quiet_step(sched)
+    _take(pool, 5)  # live request C picked the freed block up
+    sched.postprocess([], _verdict([10]))
+    assert sched.take_kv_scrub() == [1]
+
+
+def test_a_window_block_reallocated_to_an_aborted_request_is_scrubbed(monkeypatch):
+    pool = _real_pool()
+    _take(pool, 1, 5)
+    a = _Seq(10, [1])
+    sched = _tracked(monkeypatch, [a], pool)
+    pool.free(5)
+    _quiet_step(sched)
+    _take(pool, 5)
+    a.block_table.append(
+        5
+    )  # allocated to a request the verdict aborts: freed by the body
+    sched.postprocess([], _verdict([10]))
+    assert sched.take_kv_scrub() == [1, 5]
+
+
+def test_a_verdict_with_nothing_freed_in_the_window_scrubs_only_the_aborted(
+    monkeypatch,
+):
+    pool = _real_pool()
+    _take(pool, 1, 2)
+    sched = _tracked(monkeypatch, [_Seq(10, [1, 2])], pool)
+    _quiet_step(sched)
+    sched.postprocess([], _verdict([10]))
+    assert sched.take_kv_scrub() == [1, 2]

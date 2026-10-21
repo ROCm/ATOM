@@ -136,6 +136,7 @@ SCHED_METHODS = {
     "_abort_for_device_error",
     "_freed_blocks",
     "take_kv_scrub",
+    "_enable_free_tracking",
 }
 
 
@@ -148,6 +149,7 @@ def _scheduler(events, live=()):
         return rid in live
 
     sched.running = []
+    sched.config = SimpleNamespace(gemm_fusion=SimpleNamespace(enabled=False))
     sched.abort_request = abort_request
     sched._postprocess_impl = lambda seqs, out, stream, batch: (
         events.append(("body", getattr(out, "aborted_req_ids", None))) or ["finished"]

@@ -3928,6 +3928,10 @@ class Scheduler:
         Requests that finished inside the window are gone (their tokens were already streamed) and
         cannot be aborted. See ``_postprocess_impl`` for the normal processing.
         """
+        if not hasattr(self, "_gf_free_tracking"):
+            self._enable_free_tracking()
+        if self._gf_free_tracking:
+            self.block_manager.kv.advance_free_tick()
         aborted = getattr(fwd_output, "aborted_req_ids", None)
         if aborted is None:
             return self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
@@ -3936,8 +3940,28 @@ class Scheduler:
         self.block_manager.clear_cache()
         # AFTER the body, which frees the aborted requests' blocks: only blocks that really went
         # back to the free list may be zeroed (a block a surviving request still shares must not).
-        self._kv_scrub_blocks = self._freed_blocks(held)
+        # Plus the blocks freed during the unchecked window: a request that FINISHED inside it may
+        # have written NaN, belongs to no aborted request, and is already free. _freed_blocks drops
+        # any that a live request holds again (if it was allocated inside the window it is aborted,
+        # so its blocks are in `held`; if later, it only wrote its own, finite, data).
+        recent = (
+            self.block_manager.kv.freed_recently() if self._gf_free_tracking else []
+        )
+        self._kv_scrub_blocks = self._freed_blocks(sorted({*held, *recent}))
         return finished
+
+    def _enable_free_tracking(self) -> None:
+        """Remember which blocks are freed, for as many steps as a gemm_fusion error can go
+        undetected (the check period + the snapshot evaluation delay, one step of margin). Only when
+        gemm_fusion is ON; otherwise the block pool is never touched."""
+        window = 0
+        gf = getattr(self.config, "gemm_fusion", None)
+        if gf is not None and getattr(gf, "enabled", False):
+            from atom.model_ops.gemm_fusion.hooks import SNAPSHOT_EVAL_DELAY
+
+            window = int(getattr(gf, "check_period", 14)) + SNAPSHOT_EVAL_DELAY + 1
+            self.block_manager.kv.track_frees(window)
+        self._gf_free_tracking = window > 0
 
     def _freed_blocks(self, block_ids) -> list[int]:
         kv = self.block_manager.kv
