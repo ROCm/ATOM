@@ -3044,6 +3044,21 @@ class MooncakeConnector(KVConnectorBase):
         # Phase 2b: compressor states via staging buffer (182 → 1)
         producer_pool_idx = -1
         consumer_staging_addr = request_data.get("consumer_staging_addr", 0)
+        consumer_staging_bytes = request_data.get("consumer_staging_bytes")
+        if (
+            self._gather_slot is not None
+            and consumer_staging_addr
+            and consumer_staging_bytes is not None
+            and int(consumer_staging_bytes) != self._staging_slot_bytes
+        ):
+            # A staging row is one raw STATE image; its layout follows the
+            # model and spec config (DSpark widens the rings), so a peer whose
+            # row differs would be overrun or restore fields at wrong offsets.
+            raise RuntimeError(
+                f"P/D STATE staging row mismatch for req {req_id}: producer "
+                f"{self._staging_slot_bytes} B, consumer {consumer_staging_bytes} B; "
+                "prefill and decode must run the same model and spec config"
+            )
         if self._gather_slot is not None and consumer_staging_addr:
             producer_pool_idx = self._staging_slots.acquire()
             self._gather_slot(src_slot, producer_pool_idx)

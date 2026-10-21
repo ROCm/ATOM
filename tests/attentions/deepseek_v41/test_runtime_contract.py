@@ -126,9 +126,19 @@ def test_unimplemented_modes_fail_before_loading(override):
 
 
 def test_lmcache_mp_and_mooncake_are_the_kv_transfers_admitted():
-    for connector in ("lmcache_mp", "mooncake"):
+    validate_runtime_config(
+        runtime_config(kv_transfer_config={"kv_connector": "lmcache_mp"})
+    )
+    for role in ("kv_producer", "kv_consumer"):
         validate_runtime_config(
-            runtime_config(kv_transfer_config={"kv_connector": connector})
+            runtime_config(
+                kv_transfer_config={"kv_connector": "mooncake", "kv_role": role}
+            )
+        )
+    # Mooncake's implicit producer default would escape producer detection.
+    with pytest.raises(ValueError, match="without an explicit kv_role"):
+        validate_runtime_config(
+            runtime_config(kv_transfer_config={"kv_connector": "mooncake"})
         )
     for connector in ("lmcache_offload", "moriio", "multi"):
         with pytest.raises(

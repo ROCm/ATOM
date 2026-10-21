@@ -248,7 +248,7 @@ def test_pd_transfer_stages_the_state_slot(small_config):
     builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
     builder.model_runner = SimpleNamespace(
         config=SimpleNamespace(
-            kv_transfer_config={"kv_connector": "mooncake"},
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
             tensor_parallel_size=2,
         ),
         state_runtime=SimpleNamespace(checkpoint_spec=None),
@@ -267,6 +267,27 @@ def test_pd_transfer_stages_the_state_slot(small_config):
     transfer.scatter_slot(3, 1)
     torch.testing.assert_close(cache.state_bytes[3], image, rtol=0, atol=0)
     assert not cache.state_bytes[2].any()
+
+
+def test_pd_transfer_refuses_an_empty_staging_pool(small_config, monkeypatch):
+    """No staging row means no STATE moves while the transfer reports success."""
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    monkeypatch.setenv("ATOM_PD_STAGING_POOL", "0")
+    geo = replace(geometry(small_config), window_size=32)
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    with pytest.raises(ValueError, match="ATOM_PD_STAGING_POOL"):
+        builder.get_kv_transfer_tensors()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")

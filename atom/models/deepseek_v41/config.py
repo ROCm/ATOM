@@ -383,6 +383,17 @@ def validate_runtime_config(config):
             KVConnectorFactory.connector_name(config.kv_transfer_config)
             not in (None, "lmcache_mp", "mooncake"),
         ),
+        (
+            # Mooncake defaults a missing role to producer, but producer
+            # detection (`kv_config_has_producer`) reads only an explicit one:
+            # an implicit producer would keep deferred output and decode T0
+            # into the slot before handing it over.
+            "Mooncake P/D without an explicit kv_role",
+            KVConnectorFactory.connector_name(config.kv_transfer_config) == "mooncake"
+            and isinstance(config.kv_transfer_config, dict)
+            and config.kv_transfer_config.get("kv_role")
+            not in ("kv_producer", "kv_consumer"),
+        ),
         ("RapidServe", config.enable_rapidserve),
         ("online quantization", config.online_quant_config is not None),
         ("EPLB", config.eplb_enable),

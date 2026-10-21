@@ -509,6 +509,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 paged_state_region_count=len(pages),
             )
         pool_size = int(os.environ.get("ATOM_PD_STAGING_POOL", "32"))
+        if pool_size <= 0:
+            # Without a staging row the connector sends no address, moves no
+            # STATE and still reports success: the consumer would resume from
+            # whatever the slot held.
+            raise ValueError(
+                "DeepSeek-V4.1 P/D moves STATE through the staging pool; "
+                f"ATOM_PD_STAGING_POOL must be positive, got {pool_size}"
+            )
         staging = getattr(self, "_pd_state_staging", None)
         if staging is None or tuple(staging.shape) != (pool_size, slot_unit):
             staging = torch.zeros(
@@ -520,7 +528,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             staging[pool_idx].copy_(state[compute_slot])
 
         def scatter_slot(compute_slot: int, pool_idx: int) -> None:
+            # The connector releases `pool_idx` as soon as this returns, and
+            # the next receive may RDMA into it: wait for this copy alone. It
+            # is queued behind the step in flight, which is the ordering the
+            # staging hop exists for, so the wait is at most that step.
             state[compute_slot].copy_(staging[pool_idx])
+            if state.is_cuda:
+                done = torch.cuda.Event()
+                done.record()
+                done.synchronize()
 
         return KVTransferTensors(
             pages=pages,
