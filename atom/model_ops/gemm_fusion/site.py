@@ -386,10 +386,11 @@ class GemmFusionSite:
 
     # -- persistent staging (aiter binds raw pointers once per tensor set) ------
     def _stage(self, tokens, device, dtype):
-        """Per-bucket buffers whose addresses never move: aiter's plan binds
-        outs/x_scale/positions/slot_mapping/caches by pointer outside capture, and
-        the per-call tensors ATOM receives are not address-stable. Each call
-        copies the small per-call inputs into these (device-side, capturable).
+        """Per-bucket buffers whose addresses never move: aiter's plan binds ``outs`` (and, for an
+        r17/r18 plan, x_scale/positions/slot_mapping) by pointer outside capture, and the per-call
+        tensors ATOM receives are not address-stable, so an r17/r18 call copies its small per-call
+        inputs into these (device-side, capturable). An r19 plan takes those inputs per launch: the
+        ``xs/pos/slot`` arrays then only give ``prepare`` conforming tensors to validate.
         """
         st = self._staging.get(tokens)
         if st is None:
@@ -436,13 +437,17 @@ class GemmFusionSite:
             self._wcache[key] = c
         return c[1]
 
-    def build_meta(self, st, state) -> dict:
-        """``Plan.run(meta=...)``: the authoritative aiter sp_qkv.small.v1 key contract."""
+    def build_meta(self, st, state, ctx=None) -> dict:
+        """``Plan.run(meta=...)``: the authoritative aiter sp_qkv.small.v1 key contract.
+
+        ``ctx`` given (an r19 per-launch call): positions / slot_mapping are the caller's own
+        tensors. Without it (prepare, and r17/r18 plans) they are the site's T-long staging arrays.
+        """
         impl = self.attn.impl
         rot = impl.rotary_emb
         meta = {
-            "positions": st.pos,
-            "slot_mapping": st.slot,
+            "positions": st.pos if ctx is None else ctx.positions,
+            "slot_mapping": st.slot if ctx is None else state["slot_mapping"],
             "k_cache": state["k_cache"],
             # the prologue writes the SHUFFLE view of V (== what rope_cache writes)
             "v_cache": state.get("v_cache_shuffle", state["v_cache"]),
@@ -465,7 +470,13 @@ class GemmFusionSite:
 
     @staticmethod
     def decide_path(
-        *, resolution, is_dummy_run, x_dtype_is_fp8, x_scale_ok, x_k_ok=True
+        *,
+        resolution,
+        is_dummy_run,
+        x_dtype_is_fp8,
+        x_scale_ok,
+        x_k_ok=True,
+        tokens_ok=True,
     ):
         """The per-call fused/native decision as a PURE function of rank-uniform inputs
         (resolution agreed at resolve, the broadcast batch's dummy flag, and the input's
@@ -474,8 +485,14 @@ class GemmFusionSite:
         -> (path, reason).
 
         Padded rows (``real_tokens < padded_tokens``) are NOT a reason to go native: both plan
-        kinds run them. The small-M plan reads positions/slot_mapping for all T = 4*M rows, so the
-        site stages T-length arrays whose pad rows are (position 0, slot -1); see ``_stage_inputs``.
+        kinds run them. The small-M plan reads positions/slot_mapping for all T = 4*M rows. An
+        r17/r18 plan gets T-length arrays the site stages (pad rows are position 0, slot -1; see
+        ``_stage_inputs``); an r19 plan (``plan.abi >= 3``) takes the caller's arrays per launch and
+        its kernel pads the rows past ``t_valid`` the same way.
+
+        ``tokens_ok`` (r19 only): the per-launch ``positions`` / ``slot_mapping`` / ``x_scale``
+        satisfy the plan's own input contract. The plan RAISES on a violation, and a raise on one
+        rank is a fatal host exception, so a violation must be a native decision on every rank.
         """
         if resolution.plan is None:
             return "native", resolution.reason
@@ -490,6 +507,8 @@ class GemmFusionSite:
                 "native",
                 "x_k_mismatch",
             )  # the plan's K is the spec's (input_size); never feed it another
+        if not tokens_ok:
+            return "native", "meta_layout"
         return "fused", resolution.reason
 
     @staticmethod
@@ -504,6 +523,24 @@ class GemmFusionSite:
             and x_scale.dtype == torch.float32
         )
         return fp8, ok
+
+    @staticmethod
+    def per_launch_ok(x_scale, positions, slot_mapping):
+        """Whether the arrays an r19 plan reads per launch meet its contract (aiter ``inputs``):
+        ``x_scale`` contiguous; ``positions`` and ``slot_mapping`` int64, contiguous, non-empty. A
+        rank-uniform fact (SPMD: the same tensors on every rank), read from metadata only.
+        """
+        return x_scale.is_contiguous() and all(
+            t.dtype == torch.int64 and t.is_contiguous() and t.numel() >= 1
+            for t in (positions, slot_mapping)
+        )
+
+    @staticmethod
+    def per_launch(plan) -> bool:
+        """True for a plan whose small-M kernel takes x_scale / positions / slot_mapping per launch
+        (R12, ``abi >= 3``); r17/r18 plans bind them by pointer and need the site's staging.
+        """
+        return getattr(plan, "abi", 2) >= 3
 
     # -- binding -----------------------------------------------------------------
     def _bind_plan(self, r, tokens, st, state, device, kv_cache_data):
@@ -593,21 +630,28 @@ class GemmFusionSite:
         if r.plan is None:
             return r, reason, None, None
         fp8, scale_ok = self.input_facts(x, x_scale)
+        state = None
+        tokens_ok = True
+        if r.n_fused >= 2:
+            # eligibility was agreed at resolve; never None here
+            state = ctx.prologue_state()
+            if self.per_launch(r.plan) and fp8 and scale_ok:
+                tokens_ok = self.per_launch_ok(
+                    x_scale, ctx.positions, state["slot_mapping"]
+                )
         path, why = self.decide_path(
             resolution=r,
             is_dummy_run=ctx.is_dummy_run,
             x_dtype_is_fp8=fp8,
             x_scale_ok=scale_ok,
             x_k_ok=x.shape[-1] == self.linear.input_size,  # SPMD: same on every rank
+            tokens_ok=tokens_ok,
         )
         if path == "native":
             return Resolution(None, 0, "native", why), why, None, None
         if r.n_fused < 2:
             return r, reason, None, None
         st = self._staging[ctx.padded_tokens]  # prepared on every rank (agree_prepared)
-        state = (
-            ctx.prologue_state()
-        )  # eligibility was agreed at resolve; never None here
         return r, reason, state, st
 
     def _stage_inputs(self, x_scale, ctx, state, st):
@@ -635,11 +679,16 @@ class GemmFusionSite:
         res = hooks.resources()
         res.finalize()  # collective + idempotent; before any plan executes
         if r.n_fused >= 2:
-            self._stage_inputs(x_scale, ctx, state, st)
             # the plan keeps its pointer bindings per INSTANCE; that the plan launched here is the
             # one prepared is verified at prepare time (`_prepared_ok` via `agree_prepared`),
             # not per call, so no rank can raise here while its peers launch.
-            outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
+            if self.per_launch(r.plan):
+                # r19: x_scale / positions / slot_mapping are per-launch kernel arguments (not part
+                # of the binding) and t_valid is read from their lengths: no staging copies.
+                outs, meta, xs = st.outs, self.build_meta(st, state, ctx), x_scale
+            else:
+                self._stage_inputs(x_scale, ctx, state, st)  # r17/r18
+                outs, meta, xs = st.outs, self.build_meta(st, state), st.xs
         else:
             outs, meta, xs = {}, {}, x_scale  # large M: raw per-launch pointers
         r.plan.run(
@@ -674,7 +723,11 @@ class GemmFusionSite:
         return outs
 
     def _bind_label(self, r, path, st):
-        return "raw" if (path == "fused" and r.n_fused < 2) else "staged"
+        if path == "fused" and r.n_fused < 2:
+            return "raw"
+        if path == "fused" and self.per_launch(r.plan):
+            return "per_launch"
+        return "staged"
 
     def _decision(self, ctx, r, reason, path, st=None):
         d = Decision(

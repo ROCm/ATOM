@@ -394,7 +394,12 @@ def test_wrapper_drives_the_real_fusion_resources_end_to_end(real_gf, atu):
     assert w.can_ensure(plan) is True
     w.ensure(plan)
     assert plan.owner in w.inner.windows
-    assert set(w.inner.windows[plan.owner]) == {plan.owner + "/rx", plan.owner + "/ctl"}
+    expected = {plan.owner + "/rx", plan.owner + "/ctl"}
+    if (
+        getattr(plan, "abi", 2) >= 3
+    ):  # an R12 plan also requests the per-comm ERR/STEP page
+        expected.add(plan.owner + "/gpage")
+    assert set(w.inner.windows[plan.owner]) == expected
     w.finalize()
     assert w.finalized is True and any(
         e[0] == "dev" for e in backend.log

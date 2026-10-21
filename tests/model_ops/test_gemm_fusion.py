@@ -2103,12 +2103,13 @@ class _T:
 
     _next = [10_000]  # noqa: RUF012 - one counter shared by all instances, on purpose
 
-    def __init__(self, shape=(1,), dtype=None, ptr=None):
+    def __init__(self, shape=(1,), dtype=None, ptr=None, contiguous=True):
         import torch as _torch
 
         self.shape, self.dtype = tuple(shape), (
             dtype if dtype is not None else _torch.float32
         )
+        self._contiguous = contiguous
         if ptr is None:
             _T._next[0] += 64
             ptr = _T._next[0]
@@ -2116,6 +2117,15 @@ class _T:
 
     def dim(self):
         return len(self.shape)
+
+    def numel(self):
+        n = 1
+        for d in self.shape:
+            n *= d
+        return n
+
+    def is_contiguous(self):
+        return self._contiguous
 
     def data_ptr(self):
         return self.p
@@ -3410,3 +3420,250 @@ def test_native_and_error_entries_never_reach_the_key_set(make_site):
     res.call_id_report = SimpleNamespace(ok=True, refused_keys=frozenset())
     hooks._refuse_colliding_call_ids()
     assert res.call_id_keys == set()
+
+
+# ---------------------------------- R12: r19 plans take x_scale / positions / slot_mapping per launch
+class _R19Plan(FakePlan):
+    """An aiter small plan of the R12 generation (``abi`` 3): its kernel takes the three arrays per
+    launch and pads the rows past ``t_valid``; ``run`` records what the site passes."""
+
+    abi = 3
+
+    def __init__(self):
+        self.runs = []
+
+    def run(self, **kw):
+        self.runs.append(kw)
+
+
+def _per_launch_case(make_site, *, abi=3, pos=None, slot=None, xs=None):
+    import torch as _torch
+
+    plan = _R19Plan()
+    plan.abi = abi
+    s = make_site(FakeResources(plan_n=(plan, 2)))
+    s.attn = SimpleNamespace(
+        impl=SimpleNamespace(layer_num=3, gemm_fusion_prologue_supported=lambda: True)
+    )
+    s.resolve(64, "eager")
+    s.resolve(64, "capture")
+    TU.set_phase("ready")
+    st = SimpleNamespace(
+        outs={"q": "Q"},
+        xs=_T((16, 1), _torch.float32),
+        pos=_T((64,), _torch.int64),
+        slot=_T((64,), _torch.int64),
+        prepared=True,
+        plan=plan,
+        kv_ptrs=None,
+        m=16,
+    )
+    s._staging[64] = st
+    state = {
+        "slot_mapping": slot or _T((61,), _torch.int64),
+        "k_cache": _T(),
+        "v_cache": _T(),
+        "k_scale": _T(),
+        "v_scale": _T(),
+    }
+    ctx = SimpleNamespace(
+        is_dummy_run=False,
+        real_tokens=61,
+        padded_tokens=64,
+        positions=pos or _T((61,), _torch.int64),
+        prologue_state=lambda: state,
+    )
+    x = _T((16, 3072), _torch.float8_e4m3fn)
+    x_scale = xs or _T((16, 1), _torch.float32)
+    return s, plan, st, state, ctx, x, x_scale
+
+
+def test_the_site_knows_which_plans_take_their_inputs_per_launch():
+    per_launch = site_mod.GemmFusionSite.per_launch
+    assert per_launch(FakePlan()) is False  # no abi: the older generation
+    assert per_launch(SimpleNamespace(abi=2)) is False  # r17 / r18
+    assert per_launch(SimpleNamespace(abi=3)) is True  # r19
+
+
+@pytest.mark.parametrize(
+    "xs_kw,pos_kw,slot_kw,ok",
+    [
+        ({}, {}, {}, True),
+        ({"contiguous": False}, {}, {}, False),
+        ({}, {"contiguous": False}, {}, False),
+        ({}, {}, {"contiguous": False}, False),
+        ({}, {"shape": (0,)}, {}, False),  # an empty array: the plan refuses numel < 1
+        ({}, {}, {"shape": (0,)}, False),
+        (
+            {},
+            {"shape": (3,)},
+            {"shape": (61,)},
+            True,
+        ),  # SHORT arrays are legal: the kernel pads
+    ],
+)
+def test_per_launch_inputs_are_checked_against_the_plans_contract(
+    xs_kw, pos_kw, slot_kw, ok
+):
+    import torch as _torch
+
+    xs = _T(**{"shape": (16, 1), "dtype": _torch.float32, **xs_kw})
+    pos = _T(**{"shape": (61,), "dtype": _torch.int64, **pos_kw})
+    slot = _T(**{"shape": (61,), "dtype": _torch.int64, **slot_kw})
+    assert site_mod.GemmFusionSite.per_launch_ok(xs, pos, slot) is ok
+
+
+def test_a_wrong_dtype_of_positions_or_slot_mapping_fails_the_check():
+    import torch as _torch
+
+    xs = _T((16, 1), _torch.float32)
+    good = _T((61,), _torch.int64)
+    bad = _T((61,), "not-int64")
+    assert site_mod.GemmFusionSite.per_launch_ok(xs, bad, good) is False
+    assert site_mod.GemmFusionSite.per_launch_ok(xs, good, bad) is False
+
+
+def test_decide_path_sends_a_violating_per_launch_call_native_with_meta_layout():
+    kw = {
+        "resolution": site_mod.Resolution(FakePlan(), 2, "fake.v1", "profile_hit"),
+        "is_dummy_run": False,
+        "x_dtype_is_fp8": True,
+        "x_scale_ok": True,
+    }
+    decide = site_mod.GemmFusionSite.decide_path
+    assert decide(**kw, tokens_ok=False) == ("native", "meta_layout")
+    assert decide(**kw) == (
+        "fused",
+        "profile_hit",
+    )  # default: nothing to check (r17/r18)
+    # an earlier reason still wins, so the reason names the FIRST thing wrong
+    assert decide(**{**kw, "is_dummy_run": True}, tokens_ok=False) == (
+        "native",
+        "dummy_run",
+    )
+    assert decide(**{**kw, "x_scale_ok": False}, tokens_ok=False) == (
+        "native",
+        "xscale_layout",
+    )
+    assert decide(**kw, x_k_ok=False, tokens_ok=False) == ("native", "x_k_mismatch")
+
+
+def test_an_r19_call_with_conforming_inputs_stays_fused(make_site):
+    s, plan, st, state, ctx, x, xs = _per_launch_case(make_site)
+    r, _reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert r.plan is plan and got_state is state and got_st is st
+
+
+@pytest.mark.parametrize("which", ["positions", "slot", "x_scale"])
+def test_an_r19_call_with_a_violating_input_is_native_on_the_rank_not_a_raise(
+    make_site, which
+):
+    import torch as _torch
+
+    bad = {
+        "positions": {"pos": _T((61,), "not-int64")},  # a dtype that is not int64
+        "slot": {"slot": _T((61,), _torch.int64, contiguous=False)},
+        "x_scale": {"xs": _T((16, 1), _torch.float32, contiguous=False)},
+    }[which]
+    s, _plan, _st, _state, ctx, x, xs = _per_launch_case(make_site, **bad)
+    r, reason, got_state, got_st = s._prepare(ctx, x, xs)
+    assert (r.plan, r.reason, reason) == (None, "meta_layout", "meta_layout")
+    assert got_state is None and got_st is None
+
+
+def test_an_r17_r18_call_never_needs_the_per_launch_contract(make_site):
+    """The staging copies convert dtype and layout, so those plans must not be sent native."""
+    s, plan, _st, _state, ctx, x, xs = _per_launch_case(
+        make_site, abi=2, pos=_T((61,), "not-int64")
+    )
+    r, _reason, _state, _st = s._prepare(ctx, x, xs)
+    assert r.plan is plan
+
+
+def _recording_torch(monkeypatch):
+    monkeypatch.setattr(
+        site_mod,
+        "torch",
+        SimpleNamespace(
+            cuda=SimpleNamespace(current_stream=lambda: "S"),
+            int64=site_mod.torch.int64,
+        ),
+        raising=False,
+    )
+
+
+def _stub_meta(s):
+    """``build_meta`` needs the layer's rope tables and norm weights (real tensors); the part under
+    test is only which positions / slot_mapping it hands the plan."""
+    s._f32 = lambda key, t: t
+    impl = s.attn.impl
+    impl.rotary_emb = SimpleNamespace(cos_cache=_T(), sin_cache=_T())
+    impl.q_norm = SimpleNamespace(weight=_T())
+    impl.k_norm = SimpleNamespace(weight=_T())
+
+
+def test_an_r19_launch_passes_the_callers_tensors_and_stages_nothing(
+    make_site, monkeypatch
+):
+    s, plan, st, state, ctx, x, xs = _per_launch_case(make_site)
+    _recording_torch(monkeypatch)
+    monkeypatch.setattr(site_mod, "_rows2d", lambda t: t, raising=False)
+    _stub_meta(s)
+
+    def staged(*a, **k):
+        raise AssertionError("an r19 plan must not use the staging copies")
+
+    s._stage_inputs = staged
+    outs = s._execute(
+        plan_r := site_mod.Resolution(plan, 2, "fake.v1", "x"),
+        x,
+        xs,
+        ctx,
+        state,
+        st,
+        None,
+    )
+    assert outs is st.outs and plan_r.plan is plan
+    (kw,) = plan.runs
+    assert kw["x_scale"] is xs  # the caller's own x_scale, not st.xs
+    assert kw["meta"]["positions"] is ctx.positions
+    assert kw["meta"]["slot_mapping"] is state["slot_mapping"]
+    assert kw["outs"] is st.outs  # outs stay site-owned (they ARE part of the binding)
+    assert isinstance(kw["call_id"], int) and 0 < kw["call_id"] < 2**31
+
+
+def test_an_r17_r18_launch_still_stages_its_inputs(make_site, monkeypatch):
+    s, plan, st, state, ctx, x, xs = _per_launch_case(make_site, abi=2)
+    _recording_torch(monkeypatch)
+    monkeypatch.setattr(site_mod, "_rows2d", lambda t: t, raising=False)
+    _stub_meta(s)
+    staged = []
+    s._stage_inputs = lambda *a: staged.append(a)
+    s._execute(
+        site_mod.Resolution(plan, 2, "fake.v1", "x"), x, xs, ctx, state, st, None
+    )
+    assert len(staged) == 1
+    (kw,) = plan.runs
+    assert kw["x_scale"] is st.xs  # the staging array
+    assert kw["meta"]["positions"] is st.pos and kw["meta"]["slot_mapping"] is st.slot
+
+
+def test_prepare_binds_on_the_sites_conforming_dummies_not_on_a_call(
+    make_site, monkeypatch
+):
+    """prepare() validates its inputs too, so an r19 bind uses the site's T-long arrays."""
+    s, _plan, st, state, _ctx, _x, _xs = _per_launch_case(make_site)
+    monkeypatch.setattr(site_mod, "_rows2d", lambda t: t, raising=False)
+    _stub_meta(s)
+    meta = s.build_meta(st, state)  # no ctx: the dummies
+    assert meta["positions"] is st.pos and meta["slot_mapping"] is st.slot
+
+
+def test_the_decision_label_names_the_path_the_inputs_took(make_site):
+    s, plan, st, _state, ctx, _x, _xs = _per_launch_case(make_site)
+    r = site_mod.Resolution(plan, 2, "fake.v1", "profile_hit")
+    assert s._decision(ctx, r, "profile_hit", "fused", st).bind_mode == "per_launch"
+    r2 = site_mod.Resolution(SimpleNamespace(abi=2), 2, "fake.v1", "profile_hit")
+    assert s._decision(ctx, r2, "profile_hit", "fused", st).bind_mode == "staged"
+    r3 = site_mod.Resolution(plan, 1, "fake.large", "profile_hit")
+    assert s._decision(ctx, r3, "profile_hit", "fused", st).bind_mode == "raw"
