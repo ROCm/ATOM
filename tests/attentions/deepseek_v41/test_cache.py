@@ -259,6 +259,14 @@ def test_pd_transfer_stages_the_state_slot(small_config):
     assert transfer.num_slots == 4
     assert transfer.staging_region.unit_bytes == geo.state_bytes
     assert transfer.staging_pool_size > 1
+    # The role names the STATE layout, so a spec-config mismatch is refused.
+    role = transfer.staging_region.semantic_role
+    assert role.startswith("dsv41.pd_staging.state_slot/")
+    wider = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    wider.cache = PagedAttentionCache(
+        replace(geo, speculative_tokens=geo.speculative_tokens + 5), 8, 4, "cpu"
+    )
+    assert wider._state_layout_id() != builder._state_layout_id()
 
     image = torch.randint(0, 256, cache.state_bytes[2].shape, dtype=torch.uint8)
     cache.state_bytes[2].copy_(image)

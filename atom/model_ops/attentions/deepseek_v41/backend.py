@@ -430,6 +430,25 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def reserve_checkpoint_descriptors(self, descriptor_slots):
         self.copies.staging.reserve(descriptor_slots)
 
+    def _state_layout_id(self):
+        """A stable digest of the STATE slot's field layout: names, shapes,
+        dtypes and offsets. Equal on two ranks iff a raw slot image means the
+        same thing on both (DSpark widens the rings, a model changes layers).
+        """
+        import hashlib
+
+        from atom.model_ops.attentions.pool_layout.entry_arena import field_extents
+
+        geo = self.cache.geometry
+        desc = repr(
+            [
+                (f.name, f.layers, tuple(f.shape), str(f.dtype), start, size)
+                for f, start, size in field_extents(geo.state_fields)
+            ]
+            + [geo.state_bytes]
+        )
+        return hashlib.sha1(desc.encode()).hexdigest()[:16]
+
     def get_kv_transfer_tensors(self):
         """PAGE units and the native checkpoint contract, for `lmcache_mp`.
 
@@ -532,11 +551,17 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # the next receive may RDMA into it: wait for this copy alone. It
             # is queued behind the step in flight, which is the ordering the
             # staging hop exists for, so the wait is at most that step.
-            state[compute_slot].copy_(staging[pool_idx])
-            if state.is_cuda:
+            # The notification thread never sets a device, so name it: the
+            # copy and the event both go on the STATE device's current stream.
+            if not state.is_cuda:
+                state[compute_slot].copy_(staging[pool_idx])
+                return
+            with torch.cuda.device(state.device):
+                stream = torch.cuda.current_stream(state.device)
+                state[compute_slot].copy_(staging[pool_idx])
                 done = torch.cuda.Event()
-                done.record()
-                done.synchronize()
+                done.record(stream)
+            done.synchronize()
 
         return KVTransferTensors(
             pages=pages,
@@ -545,7 +570,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 staging.data_ptr(),
                 pool_size * slot_unit,
                 slot_unit,
-                semantic_role="dsv41.pd_staging.state_slot",
+                # The row is a raw STATE image, so its role names the image's
+                # layout; the producer refuses a consumer whose role differs.
+                semantic_role=f"dsv41.pd_staging.state_slot/{self._state_layout_id()}",
             ),
             staging_pool_size=pool_size,
             gather_slot=gather_slot,
