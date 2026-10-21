@@ -53,6 +53,7 @@ from atom.model_ops.glm5_next.geometry import (
     effective_kpool_size,
     topk_output_width,
 )
+from atom.model_ops.sparse_indexer_chunk import decode_band_rows
 from atom.model_ops.sparse_indexer_fp4 import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -792,6 +793,27 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         if self.is_sparse:
             sfc = config.compilation_config.static_forward_context
+            # Shared indexer decode logits workspace (like V4.1's ScoreWorkspace),
+            # only for indexers that use it (FP8, native op, no DCP).
+            # Allocated before the memory profile so the KV budget counts it.
+            ws_users = [
+                m
+                for m in sfc.values()
+                if callable(getattr(m, "uses_logits_workspace", None))
+                and m.uses_logits_workspace()
+            ]
+            if ws_users and self.dcp_world_size == 1 and not self._indexer_fp4:
+                width = model_runner.config.max_model_len
+                rows = decode_band_rows(
+                    self.max_bs * max_seqlen_qo, width, max_seqlen_qo
+                )
+                ws = torch.empty(rows * width, dtype=torch.float32, device=self.device)
+                for m in ws_users:
+                    m.indexer_logits_ws = ws
+                logger.info(
+                    "Sparse indexer logits workspace: %.2f GiB",
+                    ws.numel() * 4 / (1 << 30),
+                )
             for module in sfc.values():
                 impl = getattr(module, "impl", None)
                 # DCP compact buffers ride along with the indices buffer: the
