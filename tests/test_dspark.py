@@ -2710,3 +2710,19 @@ def test_staged_anchors_clamp_the_id_and_repeat_the_last_row_into_the_pad():
     )
     assert ids.tolist() == [5, 0, 99, 7, 7, 7]
     assert anchor_positions.tolist() == [6, 15, 27, 39, 39, 39]
+
+
+@pytest.mark.parametrize(
+    "requested, engine, scheduler",
+    [(1, 2, 1), (2, 2, None), (32, 32, None)],
+)
+def test_a_dspark_engine_is_sized_for_two_sequences(requested, engine, scheduler):
+    """`--max-num-seqs 1` used to fail the block drafter's B=2 warmup against
+    buffers sized for 1; the engine now holds 2 while the scheduler runs 1."""
+    from types import SimpleNamespace
+
+    from atom.config import Config
+
+    cfg = SimpleNamespace(max_num_seqs=requested, scheduler_max_num_seqs=None)
+    Config._size_engine_for_dspark_drafter(cfg)
+    assert (cfg.max_num_seqs, cfg.scheduler_max_num_seqs) == (engine, scheduler)
