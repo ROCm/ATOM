@@ -164,7 +164,7 @@ def _install_decode_graph_forward_context_patch() -> None:
                     forward_batch,
                     attn_backend=self.model_runner.attn_backend,
                 )
-            except Exception:  # noqa: BLE001 - never fail the decode path on track
+            except Exception:
                 logger.exception("Native GDN post-replay mamba track failed")
             return output
 
