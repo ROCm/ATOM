@@ -25,8 +25,11 @@ from atom.plugin.sglang.patches.qwen4_exp_rocm_patch import (
     note_qwen4_exp_from_identity,
 )
 from atom.plugin.sglang.qwen4_exp_bridge import (
+    _is_draft_decode_batch,
     _query_start_loc,
+    advance_draft_decode_mrope,
     bind_qsa_caches,
+    stage_draft_graph_mrope,
 )
 
 
@@ -462,3 +465,67 @@ def test_stacked_loader_sees_only_the_routed_ep_range():
     assert experts.expert_map is fused_map
     assert experts.expert_map.shape[0] == num_routed + 2
     assert int(experts.expert_map[-2]) == local_num
+
+
+def test_draft_graph_mrope_broadcasts_text_positions_and_zeroes_padding():
+    """SGLang computed no mRoPE: stage the 1-D positions on all three rows."""
+    buf = torch.full((3, 6), 99, dtype=torch.int64)
+    batch = SimpleNamespace(
+        mrope_positions=None, positions=torch.tensor([64, 7, 300], dtype=torch.int64)
+    )
+    stage_draft_graph_mrope(buf, batch)
+    assert buf[:, :3].tolist() == [[64, 7, 300]] * 3
+    assert buf[:, 3:].eq(0).all()
+
+
+def test_draft_graph_mrope_keeps_multimodal_offsets():
+    """Live rows carry the image delta; staging must not rebuild them from positions."""
+    buf = torch.full((3, 4), 99, dtype=torch.int64)
+    live = torch.tensor([[10, 11], [12, 13], [14, 15]], dtype=torch.int64)
+    batch = SimpleNamespace(
+        mrope_positions=live, positions=torch.tensor([500, 501], dtype=torch.int64)
+    )
+    stage_draft_graph_mrope(buf, batch)
+    assert torch.equal(buf[:, :2], live)
+    assert buf[:, 2:].eq(0).all()
+
+
+def test_draft_decode_mrope_tracks_positions_across_steps():
+    """EAGLE draft_forward: forward, then positions.add_(1); mRoPE must follow."""
+    positions = torch.tensor([64, 7], dtype=torch.int64)
+    delta = torch.tensor([-1000, 0], dtype=torch.int64)
+    batch = SimpleNamespace(
+        positions=positions,
+        mrope_positions=(positions + delta).unsqueeze(0).repeat(3, 1),
+    )
+    for _ in range(3):
+        assert torch.equal(batch.mrope_positions - batch.positions, delta.expand(3, -1))
+        advance_draft_decode_mrope(batch)
+        batch.positions.add_(1)
+    advance_draft_decode_mrope(SimpleNamespace(mrope_positions=None))
+
+
+class EagleDraftInput:
+    pass
+
+
+@pytest.mark.parametrize(
+    "value,enabled",
+    [
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        ("0", False),
+        ("off", False),
+        ("", False),
+    ],
+)
+def test_draft_graph_hook_reads_the_registered_flag(monkeypatch, value, enabled):
+    """The QSA hook and the capture gate in register.py share one parser."""
+    from atom.utils import envs
+
+    monkeypatch.setenv("ATOM_SGLANG_QWEN4_DRAFT_CG", value)
+    assert envs.ATOM_SGLANG_QWEN4_DRAFT_CG is enabled
+    batch = SimpleNamespace(spec_info=EagleDraftInput())
+    assert _is_draft_decode_batch(batch) is enabled

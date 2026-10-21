@@ -23,7 +23,6 @@ Decode / TARGET_VERIFY graph contract:
 from __future__ import annotations
 
 import logging
-import os
 from types import SimpleNamespace
 from typing import Any
 
@@ -38,7 +37,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -235,7 +234,7 @@ class _Qwen4ExpDecodeGraphBuffers:
 
 
 _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
-# Draft stays eager (Flash mRoPE) but must not write the buffers baked into
+# The draft must not write the buffers baked into
 # the target verify graph. A second set still keeps page tables and seq_lens
 # on device, so a draft step does not allocate or sync seq_lens back to host.
 _DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
@@ -246,10 +245,42 @@ _DRAFT_GRAPH_METADATA_IN_GRAPH = object()
 
 def _is_draft_decode_batch(forward_batch: Any) -> bool:
     """PROTOTYPE: draft-runner decode batch (EAGLE draft input), graphs enabled."""
-    if os.environ.get("ATOM_SGLANG_QWEN4_DRAFT_CG", "0").lower() not in ("1", "true"):
+    if not envs.ATOM_SGLANG_QWEN4_DRAFT_CG:
         return False
     spec = getattr(forward_batch, "spec_info", None)
     return type(spec).__name__ == "EagleDraftInput"
+
+
+def stage_draft_graph_mrope(mrope_buffer: torch.Tensor, forward_batch: Any) -> None:
+    """Stage the live mRoPE rows into a draft graph runner's ``[3, N]`` buffer.
+
+    SGLang's EAGLE draft decode / draft-extend runners capture
+    ``forward_batch.mrope_positions`` from that buffer but refresh only the
+    1-D ``positions`` on replay, and the buffer is shared by name and shape
+    with other runners. The Flash drafter reads the 3-row positions
+    (``_lm_positions_for_runtime``), so copy SGLang's live rows in (they carry
+    multimodal offsets), or broadcast the 1-D positions when SGLang computed
+    none. Rows past the batch are zeroed, as SGLang zeroes padded ``positions``.
+    """
+    live = getattr(forward_batch, "mrope_positions", None)
+    if live is None:
+        live = forward_batch.positions.unsqueeze(0).expand(3, -1)
+    num_tokens = int(live.shape[-1])
+    mrope_buffer[:, :num_tokens].copy_(live)
+    mrope_buffer[:, num_tokens:].zero_()
+
+
+def advance_draft_decode_mrope(forward_batch: Any) -> None:
+    """Advance mRoPE in step with EAGLE ``draft_forward``'s ``positions.add_(1)``.
+
+    SGLang moves only the 1-D positions after each draft decode step, so the
+    3-row positions the Flash drafter reads would stay at step 0. The plugin's
+    ``draft_forward`` wrapper calls this on the caller's batch after every draft
+    decode forward; inside a draft decode graph capture the add is recorded.
+    """
+    mrope = getattr(forward_batch, "mrope_positions", None)
+    if mrope is not None:
+        mrope.add_(1)
 
 
 def _is_draft_forward() -> bool:

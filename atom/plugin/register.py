@@ -6,6 +6,7 @@ from importlib import import_module
 
 from atom.config import Config
 from atom.plugin.prepare import is_rtpllm, is_sglang, is_vllm
+from atom.utils import envs
 
 logger = logging.getLogger("atom")
 
@@ -420,8 +421,8 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         """PROTOTYPE: Flash draft-extend graph, on top of the draft decode graph."""
         return (
             _is_qwen4_exp_nextn_runner(runner)
-            and _env_flag("ATOM_SGLANG_QWEN4_DRAFT_CG")
-            and _env_flag("ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG")
+            and envs.ATOM_SGLANG_QWEN4_DRAFT_CG
+            and envs.ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG
         )
 
     def _target_verify_graph_enabled() -> bool:
@@ -533,6 +534,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
             setattr(EAGLEDraftCudaGraphRunner, draft_internal_method, _replay)
 
         def replay(self, forward_batch):
+            if _is_qwen4_exp_nextn_runner(getattr(self, "model_runner", None)):
+                from atom.plugin.sglang.qwen4_exp_bridge import (
+                    stage_draft_graph_mrope,
+                )
+
+                stage_draft_graph_mrope(self.buffers.mrope_positions, forward_batch)
+                return original_draft_replay(self, forward_batch)
             if not _is_dsv4_or_glm52_nextn_runner(getattr(self, "model_runner", None)):
                 return original_draft_replay(self, forward_batch)
             if _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG"):
@@ -626,6 +634,13 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         "GLM-5.2 draft-extend cuda graph replay was disabled"
                     )
                 return original_extend_replay(self, forward_batch, *args, **kwargs)
+            if _is_qwen4_exp_nextn_runner(model_runner):
+                from atom.plugin.sglang.qwen4_exp_bridge import (
+                    stage_draft_graph_mrope,
+                )
+
+                stage_draft_graph_mrope(self.buffers.mrope_positions, forward_batch)
+                return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _is_dsv4_nextn_runner(model_runner):
                 return original_extend_replay(self, forward_batch, *args, **kwargs)
             if not _draft_extend_graph_enabled(getattr(self, "model_runner", None)):
@@ -706,6 +721,46 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_can_run_method, can_run)
         setattr(EAGLEDraftExtendCudaGraphRunner, extend_replay_method, replay)
         EAGLEDraftExtendCudaGraphRunner._atom_dsv4_replay_patched = True
+
+    if not getattr(EagleDraftWorker, "_atom_qwen4_draft_mrope_patched", False):
+        original_draft_forward = EagleDraftWorker.draft_forward
+
+        def draft_forward(self, forward_batch):
+            # EAGLE advances only the 1-D positions after each draft decode
+            # forward, and the eager / graph runners hand the model a copy of
+            # the batch. Advance the caller's mRoPE rows (the Flash drafter's
+            # RoPE input) alongside; inside a draft graph capture the add is
+            # recorded on the graph's mRoPE buffer.
+            runner = getattr(self, "draft_runner", None)
+            if (
+                not _is_qwen4_exp_nextn_runner(runner)
+                or forward_batch.forward_mode.is_idle()
+                or getattr(forward_batch, "mrope_positions", None) is None
+            ):
+                return original_draft_forward(self, forward_batch)
+            from atom.plugin.sglang.qwen4_exp_bridge import (
+                advance_draft_decode_mrope,
+            )
+
+            shadowed = vars(runner).get("forward")
+            runner_forward = runner.forward
+
+            def forward(step_batch, *args, **kwargs):
+                out = runner_forward(step_batch, *args, **kwargs)
+                advance_draft_decode_mrope(forward_batch)
+                return out
+
+            runner.forward = forward
+            try:
+                return original_draft_forward(self, forward_batch)
+            finally:
+                if shadowed is None:
+                    del runner.forward
+                else:
+                    runner.forward = shadowed
+
+        EagleDraftWorker.draft_forward = draft_forward
+        EagleDraftWorker._atom_qwen4_draft_mrope_patched = True
 
     if not getattr(EagleDraftWorker, "_atom_dsv4_draft_extend_accept_patched", False):
         original_draft_extend_for_decode = EagleDraftWorker._draft_extend_for_decode
@@ -872,17 +927,17 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         backend.get_cuda_graph_seq_len_fill_value = (
                             lambda value=GLM52_GRAPH_SEQ_LEN_CAPACITY: value
                         )
-            # Flash draft stays eager: mRoPE positions are [3, N], same as
-            # Native EagleProposer skipping mid-step graphs.
-            # PROTOTYPE: ATOM_SGLANG_QWEN4_DRAFT_CG=1 lets SGLang capture the
-            # Flash draft decode graph (draft-extend stays eager).
+            # Flash draft graphs are opt-in: ATOM_SGLANG_QWEN4_DRAFT_CG captures
+            # the draft decode graph (ATOM_SGLANG_QWEN4_DRAFT_EXTEND_CG adds the
+            # draft-extend graph below). Their [3, N] mRoPE input is staged on
+            # replay by stage_draft_graph_mrope.
             skip_all_draft_graphs = (
                 _env_flag("ATOM_SGLANG_V4_DISABLE_DRAFT_CG")
                 and not _draft_extend_graph_enabled(draft_runner)
                 and _is_dsv4_or_glm52_nextn_runner(draft_runner)
             ) or (
                 _is_qwen4_exp_nextn_runner(draft_runner)
-                and not _env_flag("ATOM_SGLANG_QWEN4_DRAFT_CG")
+                and not envs.ATOM_SGLANG_QWEN4_DRAFT_CG
             )
             original_capture_cuda_graphs = None
             if skip_all_draft_graphs:
