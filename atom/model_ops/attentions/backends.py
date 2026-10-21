@@ -506,6 +506,13 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         backing back. A builder that holds no pool has nothing to drop.
         """
 
+    def zero_kv_entries(self, entry_ids) -> bool:
+        """Return the given scheduler blocks of every paged pool this builder holds to the zeros a
+        fresh pool has (KV, scales and indexer keys, every layer). True when it did. The default is
+        False: a builder without per-block zeroing says so instead of pretending, and the caller
+        reports it."""
+        return False
+
     def build_kv_cache_tensor(self, module):
         """Build the vLLM-style `KVCacheTensor` registration entry for one
         attention module, OR return None if this builder does not recognize

@@ -3931,12 +3931,33 @@ class Scheduler:
         aborted = getattr(fwd_output, "aborted_req_ids", None)
         if aborted is None:
             return self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
-        self._abort_for_device_error(aborted)
+        held = self._abort_for_device_error(aborted)
         finished = self._postprocess_impl(seqs, fwd_output, stream_output_queue, batch)
         self.block_manager.clear_cache()
+        # AFTER the body, which frees the aborted requests' blocks: only blocks that really went
+        # back to the free list may be zeroed (a block a surviving request still shares must not).
+        self._kv_scrub_blocks = self._freed_blocks(held)
         return finished
 
-    def _abort_for_device_error(self, req_ids) -> None:
+    def _freed_blocks(self, block_ids) -> list[int]:
+        kv = self.block_manager.kv
+        return [b for b in block_ids if kv.block(b).ref_count == 0]
+
+    def take_kv_scrub(self) -> list[int]:
+        """The blocks the engine core must have every rank zero before the next step: those of the
+        requests a device error verdict aborted, once freed. Returned once, then cleared.
+        """
+        blocks, self._kv_scrub_blocks = getattr(self, "_kv_scrub_blocks", []), []
+        return blocks
+
+    def _abort_for_device_error(self, req_ids) -> list[int]:
+        """Mark the requests aborted; returns the blocks they hold NOW, which the body is about to
+        free (the caller zeroes the ones that really are freed: see ``take_kv_scrub``).
+        """
+        wanted = set(req_ids)
+        held = sorted(
+            {b for seq in self.running if seq.id in wanted for b in seq.block_table}
+        )
         aborted = [rid for rid in req_ids if self.abort_request(rid)]
         logger.error(
             "Scheduler: device error verdict from the runner: aborted %d of %d request(s) "
@@ -3944,6 +3965,7 @@ class Scheduler:
             len(aborted),
             len(req_ids),
         )
+        return held
 
     def _postprocess_impl(
         self,

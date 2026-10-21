@@ -3640,6 +3640,43 @@ class ModelRunner:
             self._record_kv_cache_ready(batch)
         return self._apply_gemm_fusion_verdict(fwd_output, aborted)
 
+    def scrub_kv_blocks(self, block_ids) -> int:
+        """Return the given scheduler blocks to the zeros of a fresh KV pool (every layer; K, V,
+        scales and the indexer cache), on THIS rank. An RPC target: the engine core calls it on every
+        rank after a gemm_fusion device error verdict, with the blocks the aborted requests held and
+        that were actually freed, before the next step can allocate them.
+
+        Why: the fused path writes into the KV while the error word is set, in a sticky NaN mode, so
+        the failed steps leave NaN in those blocks. The stock paged path reads unwritten slots of a
+        LATER sequence and masks them by multiplying with 0; NaN * 0 = NaN, so a recycled block
+        poisons it, while finite stale bytes are harmless. Returns how many blocks were zeroed.
+        Skipped with a KV transfer connector (a peer may be reading KV in flight; a PD producer never
+        publishes the KV of a failed step)."""
+        ids = list(block_ids)
+        if not ids:
+            return 0
+        if getattr(self.config, "kv_transfer_config", None):
+            logger.warning(
+                "gemm_fusion: not zeroing %d KV block(s) after a device error verdict "
+                "(a KV transfer connector is configured)",
+                len(ids),
+            )
+            return 0
+        if not self.attn_metadata_builder.zero_kv_entries(ids):
+            logger.warning(
+                "gemm_fusion: %s has no per-block KV zeroing; %d block(s) of aborted requests "
+                "may still hold NaN",
+                type(self.attn_metadata_builder).__name__,
+                len(ids),
+            )
+            return 0
+        torch.cuda.synchronize()
+        logger.warning(
+            "gemm_fusion: zeroed %d KV block(s) of aborted requests after a device error verdict",
+            len(ids),
+        )
+        return len(ids)
+
     def _gemm_fusion_check_launch_gate(self) -> None:
         """Refuse a forward / graph replay while GEMM fusion's collective reset is running (a replayed
         graph runs no Python, so aiter's own launch check cannot see it). One bool read; no-op unless

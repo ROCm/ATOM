@@ -628,6 +628,12 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         for pool in self.kv_pools.values():
             pool.release()
 
+    def zero_kv_entries(self, entry_ids) -> bool:
+        pools = getattr(self, "kv_pools", None) or {}
+        for pool in pools.values():
+            pool.zero_entries(entry_ids)
+        return bool(pools)
+
     def _allocate_kv_pools(self, blocks: int, buf) -> None:
         """Back every declared pool, side by side in this builder's region.
 

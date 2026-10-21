@@ -131,7 +131,12 @@ def test_a_verdict_is_attached_and_drops_the_deferred_output_state(ids):
 
 # -------------------------------------------------------------------------------- scheduler side
 SCHED = "atom/model_engine/scheduler.py"
-SCHED_METHODS = {"postprocess", "_abort_for_device_error"}
+SCHED_METHODS = {
+    "postprocess",
+    "_abort_for_device_error",
+    "_freed_blocks",
+    "take_kv_scrub",
+}
 
 
 def _scheduler(events, live=()):
@@ -142,12 +147,14 @@ def _scheduler(events, live=()):
         events.append(("abort", rid))
         return rid in live
 
+    sched.running = []
     sched.abort_request = abort_request
     sched._postprocess_impl = lambda seqs, out, stream, batch: (
         events.append(("body", getattr(out, "aborted_req_ids", None))) or ["finished"]
     )
     sched.block_manager = SimpleNamespace(
-        clear_cache=lambda: events.append(("clear_cache",))
+        clear_cache=lambda: events.append(("clear_cache",)),
+        kv=SimpleNamespace(block=lambda b: SimpleNamespace(ref_count=0)),
     )
     return sched
 
