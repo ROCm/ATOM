@@ -15,6 +15,8 @@ checkpoint layout:
 Weight keys map directly to model attribute paths; no key rewriting needed.
 """
 
+import math
+
 import torch
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.rotary_embedding import get_rope
@@ -339,8 +341,18 @@ class Eagle3LlamaModel(nn.Module):
         draft_vocab = getattr(config, "draft_vocab_size", config.vocab_size)
         self.has_draft_vocab = draft_vocab != config.vocab_size
         if self.has_draft_vocab:
-            self.t2d = nn.Parameter(torch.zeros(config.vocab_size, dtype=torch.bool), requires_grad=False)
-            self.d2t = nn.Parameter(torch.zeros(draft_vocab, dtype=torch.int64), requires_grad=False)
+            self.t2d = nn.Parameter(
+                torch.zeros(config.vocab_size, dtype=torch.bool),
+                requires_grad=False,
+            )
+            self.d2t = nn.Parameter(
+                torch.zeros(draft_vocab, dtype=torch.int64),
+                requires_grad=False,
+            )
+            # Round up for TP-sharded lm_head.
+            tp_size = get_tensor_model_parallel_world_size()
+            if draft_vocab % tp_size != 0:
+                draft_vocab = math.ceil(draft_vocab / tp_size) * tp_size
 
         # Independent embedding (vocab matches target model). The draft embed is
         # NOT shared with the (still TP-sharded) lm_head, so it can be replicated

@@ -800,7 +800,9 @@ class EagleProposer(Drafter):
                     )
 
                 if self.model.has_draft_vocab:
-                    next_input_ids = (next_input_ids + self.model.d2t[next_input_ids.long()]).int()
+                    next_input_ids = (
+                        next_input_ids + self.model.d2t[next_input_ids.long()]
+                    ).int()
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.
                     from_prefill = context.is_prefill

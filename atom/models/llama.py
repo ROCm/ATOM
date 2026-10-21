@@ -494,7 +494,11 @@ class LlamaForCausalLM(nn.Module):
         )
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
+        start = self.model.start_layer
+        end = self.model.end_layer
+        self.model.aux_hidden_state_layers = tuple(
+            g - start for g in layers if start <= g < end
+        )
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)

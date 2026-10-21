@@ -356,7 +356,9 @@ class Qwen3ForCausalLM(nn.Module):
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
         if self._aux_hidden_state_layers:
-            model_kwargs["capture_hidden_state_layers"] = set(self._aux_hidden_state_layers)
+            model_kwargs["capture_hidden_state_layers"] = set(
+                self._aux_hidden_state_layers
+            )
         hidden_states = self.model(
             input_ids=input_ids, positions=positions, **model_kwargs
         )
