@@ -222,16 +222,80 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 attention_inputs_by_tag=tagged,
                 bert_embedding_inputs=inputs.bert_embedding_inputs,
             )
+        if bool(getattr(fmha_impl, "is_cuda_graph", False)):
+            inputs.attention_inputs.is_cuda_graph = True
         from atom.config import use_custom_atom_config
 
         with use_custom_atom_config(self.model.atom_config):
-            outputs = super().forward(inputs, fmha_impl)
+            if bool(
+                getattr(
+                    getattr(
+                        getattr(self, "_rtp_model_config", None),
+                        "mm_model_config",
+                        None,
+                    ),
+                    "is_multimodal",
+                    False,
+                )
+            ):
+                outputs = self._forward_with_vision_positions(inputs)
+            else:
+                outputs = super().forward(inputs, fmha_impl)
         if not getattr(self._rtp_model_config, "atom_qwen4_exp_mtp_target", False):
             return outputs
         hc = outputs.hidden_states.flatten(1)
         self._mtp_target_hidden_states = hc
         mixed, _ = self.model.model.hyper_connection_mixer.mix(hc)
         return PyModelOutputs(mixed, hc)
+
+    def _forward_with_vision_positions(self, inputs):
+        from rtp_llm.models_py.modules.base.common.multimodal_embedding import (
+            MultimodalEmbeddingInjector,
+        )
+
+        from atom.utils.forward_context import get_forward_context
+
+        model_device = self._get_model_device()
+        input_ids = inputs.input_ids
+        if input_ids is not None and input_ids.numel() > 0:
+            input_ids = input_ids.to(device=model_device, non_blocking=True)
+        token_num = self._get_token_num(inputs, input_ids)
+        logical_positions = self._extract_positions(inputs, model_device, token_num)
+        rope_positions = self._rope_positions(inputs, model_device, token_num)
+        features = inputs.multimodal_inputs.multimodal_features
+        inputs_embeds = None
+        if input_ids is None or input_ids.numel() == 0:
+            inputs_embeds = inputs.input_hiddens
+            if inputs_embeds is not None and inputs_embeds.numel() > 0:
+                inputs_embeds = inputs_embeds.to(
+                    device=model_device,
+                    dtype=self._get_model_dtype(),
+                    non_blocking=True,
+                )
+        elif features:
+            inputs_embeds = MultimodalEmbeddingInjector()(
+                self.model.embed_input_ids(input_ids),
+                features,
+                inputs.multimodal_inputs.mm_features_locs,
+            )
+
+        with self._rtp_forward_context_cls.bind(
+            model=self.model,
+            runtime=self,
+            inputs=inputs,
+            positions=logical_positions,
+            layer_maps=self._rtp_layer_maps,
+            cg_max_seq_len=int(self._cg_max_seq_len),
+            cg_bufs=self._graph_buffers_for_inputs(inputs.attention_inputs),
+        ):
+            get_forward_context().context.positions = rope_positions
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=rope_positions,
+                intermediate_tensors=None,
+                inputs_embeds=inputs_embeds,
+            )
+        return PyModelOutputs(hidden_states)
 
     def get_mtp_target_hidden_states(self, num_tokens: int):
         hidden = getattr(self, "_mtp_target_hidden_states", None)
@@ -242,6 +306,21 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return hidden if num_tokens < 0 else hidden[:num_tokens]
 
     def _extract_positions(self, inputs, model_device, token_num):
+        if bool(
+            getattr(
+                getattr(
+                    getattr(self, "_rtp_model_config", None), "mm_model_config", None
+                ),
+                "is_multimodal",
+                False,
+            )
+        ):
+            logical = self._logical_positions(inputs.attention_inputs, model_device)
+            if logical is None or logical.numel() != token_num:
+                raise ValueError(
+                    "Qwen4Exp requires one logical cache position per token"
+                )
+            return logical
         attn_inputs = inputs.attention_inputs
         is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
         is_mtp_draft_prefill = bool(
@@ -306,13 +385,34 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             positions = positions[0]
         return positions.contiguous()
 
+    def _logical_positions(self, attn_inputs, model_device):
+        if not attn_inputs.is_prefill:
+            next_lengths = getattr(attn_inputs, "sequence_lengths_plus_1_device", None)
+            if next_lengths is not None and next_lengths.numel() > 0:
+                return (
+                    next_lengths.to(device=model_device, dtype=torch.int32) - 1
+                ).contiguous()
+        return self._build_positions_from_attention_inputs(attn_inputs, model_device)
+
+    @staticmethod
+    def _rope_positions(inputs, model_device, token_num):
+        attn_inputs = inputs.attention_inputs
+        positions = getattr(attn_inputs, "combo_position_ids", None)
+        if positions is None or positions.numel() == 0:
+            positions = getattr(inputs, "combo_position_ids", None)
+        if positions is None or positions.numel() == 0:
+            raise ValueError("Qwen4Exp vision requires RTP MRoPE position IDs")
+        positions = positions.to(device=model_device, dtype=torch.int32)
+        if positions.ndim == 2 and positions.shape == (3, token_num):
+            return positions.contiguous()
+        if positions.numel() != 3 * token_num:
+            raise ValueError("Qwen4Exp MRoPE requires three positions per token")
+        # RTP's gatherer writes consecutive T/H/W values for each token.
+        return positions.reshape(token_num, 3).transpose(0, 1).contiguous()
+
 
 class ATOMQwen4Exp(ATOMQwen35Moe):
-    """Use ATOM's Qwen4Exp compute with RTP scheduling and token sampling.
-
-    The plugin integration is text-only. Image/video position metadata is a
-    separate feature.
-    """
+    """Use ATOM's Qwen4Exp compute with RTP scheduling and token sampling."""
 
     @classmethod
     def _create_config(cls, ckpt_path: str) -> ModelConfig:
@@ -350,6 +450,23 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
         # Qwen3.8 ends in the hyper-connection mixer, not a separate final RMSNorm.
         config.has_post_decoder_layernorm = False
         config.activation_type = "SiGLU"
+
+        if root.get("language_model_only", True) is False:
+            from rtp_llm.models.mrope_utils import apply_mrope_section
+
+            config.attn_config.rope_config.style = 7
+            apply_mrope_section(
+                config.attn_config.rope_config,
+                rope["mrope_section"],
+                model_name="Qwen4Exp",
+                interleaved=bool(rope.get("mrope_interleaved", True)),
+            )
+            config.mm_model_config.is_multimodal = True
+            config.mm_model_config.mm_position_ids_style = 2
+            config.mm_model_config.mm_sep_tokens = [
+                [int(root["vision_start_token_id"]), int(root["vision_end_token_id"])]
+            ]
+            config.mm_related_params.config["ckpt_path"] = ckpt_path
 
         config.moe_k = int(text["num_experts_per_tok"])
         config.expert_num = int(text["num_experts"])
@@ -446,7 +563,19 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
                 * conv_state_len
                 * torch.empty((), dtype=model_config.compute_dtype).element_size()
             )
-        model_config.auxiliary_paged_cache_bytes_per_block = qsa_bytes + ple_bytes
+        # QSA needs the three-axis RoPE position of every image token when
+        # compressing index keys. This side cache follows RTP's physical blocks.
+        rope_bytes = (
+            full_layers
+            * block_size
+            * 3
+            * torch.empty((), dtype=torch.int64).element_size()
+            if model_config.mm_model_config.is_multimodal
+            else 0
+        )
+        model_config.auxiliary_paged_cache_bytes_per_block = (
+            qsa_bytes + ple_bytes + rope_bytes
+        )
 
     def _create_python_model(self):
         from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode

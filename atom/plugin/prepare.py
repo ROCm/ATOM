@@ -120,8 +120,8 @@ def _prepare_model_atom_rtpllm(
 
             model_cls = Qwen4ExpMTP
 
-        # The RTP bridge below currently feeds token IDs only. Do not build a
-        # vision tower that RTP never supplies pixel tensors or mRoPE grids to.
+        # RTP's multimodal worker owns the vision tower and sends embeddings to
+        # this language-model worker. Avoid loading the tower twice here.
         atom_config.multimodal_config = None
         hf = (
             getattr(atom_config.hf_config, "text_config", None) or atom_config.hf_config
