@@ -54,6 +54,14 @@ class FakePlan:
         return []
 
 
+class _FakeResetError(RuntimeError):
+    """Stands in for aiter's ResetError: ``words`` = {rank: ERR word} of the last verification."""
+
+    def __init__(self, msg, words):
+        super().__init__(msg)
+        self.words = dict(words)
+
+
 class FakeResources:
     world = 4
     caps = frozenset()
@@ -71,6 +79,9 @@ class FakeResources:
         self.error_resets = 0  # reset_after_error
         self.epoch_resets = 0  # clean_epoch
         self.reset_blocks = None  # set to an Event to make a reset hang
+        self.reset_raises = (
+            None  # set to an exception: every collective reset raises it
+        )
         # device error word / STEP model (the adapter API of FusionResourcesWrapper)
         self.error_value = 0  # this rank's device error word
         self.peer_flag = 0  # what the other ranks contribute to reduce_max
@@ -139,7 +150,12 @@ class FakeResources:
     def _reset(self):
         if self.reset_blocks is not None:
             self.reset_blocks.wait()
+        if self.reset_raises is not None:
+            raise self.reset_raises
         self.resets += 1
+
+    def reset_error_words(self, exc):
+        return exc.words if isinstance(exc, _FakeResetError) else None
 
     def reset_after_error(self):
         self._reset()
@@ -3764,3 +3780,116 @@ def test_a_direct_r17_r18_call_keeps_its_direct_labels(make_site):
     assert (
         s._bind_label(r, "fused", got_st) == "direct+copy"
     )  # addresses differ: refreshed
+
+
+# ----------------------------------- R12: a reset that cannot clear the error word is fatal (aiter ResetError)
+def _persistent_error():
+    return _FakeResetError(
+        "reset: ERR still non-zero after 3 zeroing round(s); rank 2: timeout",
+        {0: 0, 1: 0, 2: 0x21, 3: 0},
+    )
+
+
+def test_a_reset_that_cannot_clear_the_error_at_a_verdict_is_fatal_and_typed():
+    """The verdict path: check_step -> _verdict -> recover -> reset. aiter raises ResetError (every
+    rank, the verification is an all-gather); ATOM turns it into GemmFusionDeviceError, never a
+    verdict that lets the engine keep serving."""
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    res.reset_raises = _persistent_error()
+    with pytest.raises(hooks.GemmFusionDeviceError, match="could not clear") as ei:
+        hooks.check_step((1, 2))
+    assert isinstance(
+        ei.value.__cause__, _FakeResetError
+    )  # the aiter error stays the cause
+    assert (
+        "0x21" in hooks._BROKEN and "2" in hooks._BROKEN
+    )  # the offending rank and word
+    # and it stays dead: the fused path refuses every later call, no abort verdict is ever returned
+    for call in (lambda: hooks.check_step((3,)), hooks.check_now):
+        with pytest.raises(hooks.GemmFusionDeviceError, match="failed recovery"):
+            call()
+
+
+def test_the_reset_failure_is_logged_loudly_with_the_decoded_words(caplog):
+    import logging
+
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    res.reset_raises = _persistent_error()
+    with (
+        caplog.at_level(logging.CRITICAL, logger="atom.gemm_fusion"),
+        pytest.raises(hooks.GemmFusionDeviceError),
+    ):
+        hooks.check_step((1,))
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "could not clear the device error" in text and "0x21" in text
+
+
+def test_a_reset_that_fails_for_any_other_reason_is_equally_fatal():
+    """An unreadable error word (aiter refuses to take it for zero), a HIP error, a barrier error:
+    anything that stops the collective reset proving the state clean."""
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    res.reset_raises = RuntimeError("hipMemcpy failed reading the ERR word")
+    with pytest.raises(hooks.GemmFusionDeviceError, match="reset failed") as ei:
+        hooks.check_step((1,))
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert "hipMemcpy" in hooks._BROKEN
+
+
+def test_a_clean_reset_after_a_verdict_is_still_just_an_abort_list():
+    res = _ready_hooks(FakeResources(), period=1)
+    res.error_value = 1
+    assert hooks.check_step((1, 2)) == [
+        1,
+        2,
+    ]  # unchanged: the happy path of aiter's reset
+    assert hooks._BROKEN is None and res.error_resets == 1
+
+
+def test_a_failing_reset_at_a_clean_point_is_fatal_too():
+    """aiter's quiesce_and_reset (the clean-point call) verifies the error word as well now."""
+    for where, run in (
+        ("prepare", lambda: hooks.prepare_buckets([])),
+        ("before graph capture", lambda: hooks.before_graph_capture([])),
+        ("after graph capture", hooks.after_graph_capture),
+    ):
+        res = FakeResources()
+        TU.reset_for_tests(res)
+        TU.set_phase("preparing" if where == "prepare" else "ready")
+        res.reset_raises = _persistent_error()
+        with pytest.raises(hooks.GemmFusionDeviceError, match="could not clear") as ei:
+            run()
+        assert isinstance(ei.value.__cause__, _FakeResetError), where
+        assert hooks._BROKEN and where in hooks._BROKEN, where
+
+
+def test_the_recovery_timeout_keeps_its_own_type():
+    """A peer that never arrives (no answer at all) is still GemmFusionRecoveryTimeout."""
+    import threading
+
+    res = _ready_hooks(FakeResources())
+    res.reset_blocks = threading.Event()
+    with pytest.raises(hooks.GemmFusionRecoveryTimeout):
+        hooks.recover(timeout_s=0.2)
+    res.reset_blocks.set()
+
+
+def test_the_adapter_recognises_aiters_reset_error_and_nothing_else(monkeypatch):
+    class ResetError(RuntimeError):  # aiter.gemm_fusion.ResetError
+        def __init__(self, msg, words):
+            super().__init__(msg)
+            self.words = dict(words)
+
+    TU.inject_aiter(monkeypatch, SimpleNamespace(ResetError=ResetError))
+    w = TU.InjectedResourcesWrapper(
+        world=1, rank=0, inner=SimpleNamespace(), arch="gfx950", cu=256
+    )
+    words = {0: 0, 3: 0x21}
+    got = w.reset_error_words(ResetError("x", words))
+    assert got == words and got is not words  # a copy
+    assert w.reset_error_words(RuntimeError("hip")) is None
+    # an aiter without the class (older build): never a false positive
+    TU.inject_aiter(monkeypatch, SimpleNamespace())
+    assert w.reset_error_words(ResetError("x", words)) is None

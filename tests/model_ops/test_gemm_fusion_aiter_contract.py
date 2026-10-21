@@ -817,3 +817,18 @@ def test_init_calls_prebuild_with_the_wrapper_target_on_the_real_aiter(
     TU.init_with_resources(_config(PROFILE_NAME), _wrapper(real_gf, atu))
     assert seen == [(PROFILE_NAME, "gfx950", 256, 4)]
     assert hooks.phase() == "pre"
+
+
+def test_the_adapter_recognises_the_real_aiter_reset_error(real_gf):
+    """aiter 44f67753: reset() verifies the error word with an all-gather and raises ResetError
+    (exported, a ResourceError, with ``words`` = {rank: ERR word}) when it cannot clear it. ATOM turns
+    that into a fatal GemmFusionDeviceError (hooks._fatal_reset), which needs this recognition to
+    keep working. The reset sequence itself is aiter's to test (its own suite)."""
+    assert issubclass(real_gf.ResetError, real_gf.ResourceError)
+    w = TU.InjectedResourcesWrapper(
+        world=1, rank=0, inner=SimpleNamespace(), arch="gfx950", cu=256
+    )
+    words = {0: 0, 1: 0, 2: 0x21, 3: 0}
+    err = real_gf.ResetError("reset: ERR still non-zero", words)
+    assert w.reset_error_words(err) == words
+    assert w.reset_error_words(real_gf.ResourceError("not a reset failure")) is None

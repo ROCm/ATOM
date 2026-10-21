@@ -170,8 +170,19 @@ class FusionResourcesWrapper:
             return f"error page unreadable: {e!r}"
 
     def reset_after_error(self) -> None:
-        """Collective reset after some rank's error word was set (every rank calls it)."""
+        """Collective reset after some rank's error word was set (every rank calls it). aiter drains,
+        barriers, zeroes and verifies with an all-gather of every rank's error word, up to its
+        ``reset_max_rounds``, and raises its ``ResetError`` when the word cannot be cleared.
+        """
         self.inner.reset()
+
+    def reset_error_words(self, exc):
+        """``{rank: error word}`` when ``exc`` is aiter's ``ResetError`` (a reset that could not reach
+        an all-zero error state: the communicator cannot be trusted), else None."""
+        cls = getattr(aiter_gf(), "ResetError", None)
+        if cls is not None and isinstance(exc, cls):
+            return dict(exc.words)
+        return None
 
     def clean_epoch(self) -> None:
         """Collective epoch reset at a clean point (after prepare, around graph capture). Uses

@@ -251,7 +251,7 @@ def prepare_buckets(tokens_list) -> None:
             for t in tokens_list:
                 prepared = s.prepare_bucket(t, device, _KV, out_dtype)
                 s.agree_prepared(t, prepared)  # collective: uniform prepared state
-    _RES.clean_epoch()
+    _clean_epoch("prepare")
     _STEP_T = _RES.step_tensor()  # created here, outside any capture
     _reset_check_state()
     _PHASE = "ready"
@@ -324,13 +324,13 @@ def before_graph_capture(buckets) -> None:
                 r.reason,
             )
     _raise_on_device_error("before graph capture")
-    _RES.clean_epoch()
+    _clean_epoch("before graph capture")
 
 
 def after_graph_capture() -> None:
     if _RES is not None:
         _raise_on_device_error("during graph capture")
-        _RES.clean_epoch()
+        _clean_epoch("after graph capture")
 
 
 # ----------------------------------------------------------- per-step check
@@ -462,6 +462,47 @@ def _raise_on_device_error(where: str) -> None:
 
 
 # ---------------------------------------------------------------- recovery
+def _fatal_reset(exc, where: str) -> "GemmFusionDeviceError":
+    """A collective reset FAILED (aiter's ``ResetError``: the error word could not be cleared after
+    its bounded rounds; or an unreadable error word, a HIP error, a barrier error). The communicator
+    cannot be trusted, so the fused path is marked broken for good and the caller raises the returned
+    error: it leaves ``forward`` and ends the worker (nothing in the worker loop catches it), so the
+    engine shuts down instead of serving from a state that was not proven clean. Every rank gets the
+    same ``ResetError`` (the verification is an all-gather), so every rank fails together.
+    """
+    global _BROKEN
+    words = _RES.reset_error_words(exc) if _RES is not None else None
+    if words is not None:
+        bad = {r: hex(w) for r, w in sorted(words.items()) if w}
+        _BROKEN = f"{where}: reset left a non-zero error word on rank(s) {bad}"
+        logger.critical(
+            "gemm_fusion %s: the collective reset could not clear the device error "
+            "(non-zero ERR words %s); failing the worker: %s",
+            where,
+            bad,
+            exc,
+        )
+        return GemmFusionDeviceError(
+            f"gemm_fusion {where}: collective reset could not clear the error word "
+            f"({exc}); the worker must be treated as failed"
+        )
+    _BROKEN = f"{where} failed: {exc!r}"
+    logger.critical("gemm_fusion %s: the collective reset failed: %r", where, exc)
+    return GemmFusionDeviceError(
+        f"gemm_fusion {where}: collective reset failed ({exc!r}); the worker must be "
+        "treated as failed"
+    )
+
+
+def _clean_epoch(where: str) -> None:
+    """Collective epoch reset at a clean point. aiter's reset also verifies the error word, so it
+    can raise too; that is as fatal as a failed reset after a verdict."""
+    try:
+        _RES.clean_epoch()
+    except Exception as e:
+        raise _fatal_reset(e, where) from e
+
+
 def recover(timeout_s: float | None = None) -> None:
     """Collective recovery: device sync -> drain -> barrier -> re-init -> barrier.
 
@@ -490,8 +531,7 @@ def recover(timeout_s: float | None = None) -> None:
         _BROKEN = f"recover timeout after {timeout_s}s"
         raise GemmFusionRecoveryTimeout(_BROKEN)
     if err:
-        _BROKEN = f"recover failed: {err[0]!r}"
-        raise err[0]
+        raise _fatal_reset(err[0], "recover") from err[0]
 
 
 def shutdown(timeout_s: float | None = None) -> None:
