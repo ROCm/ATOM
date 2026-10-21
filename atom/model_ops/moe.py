@@ -1453,6 +1453,8 @@ class Nvfp4MoEMethod(FusedMoEMethodBase):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    DEFAULT_PAD_ALIGN = 256
+
     def __init__(self, quant_config: LayerQuantConfig, moe: FusedMoEConfig):
         super().__init__(moe)
         self.quant_config = quant_config
@@ -1462,7 +1464,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
         self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
-        self.pad_align = 256
+        self.pad_align = self.DEFAULT_PAD_ALIGN
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
@@ -3542,6 +3544,11 @@ class FusedMoE(torch.nn.Module):
                 parallel_config=self.moe_parallel_config,
                 model_dim=hidden_size,
                 inter_dim=intermediate_size // self.tp_size,
+                pad_align=(
+                    pad_align
+                    if pad_align is not None
+                    else Mxfp4MoEMethod.DEFAULT_PAD_ALIGN
+                ),
                 experts=num_experts,
                 topk=top_k,
                 activation=activation,

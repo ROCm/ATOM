@@ -51,6 +51,7 @@ def create_comm_fused_moe_backend(
     parallel_config: Any,
     model_dim: int,
     inter_dim: int,
+    pad_align: int,
     experts: int,
     topk: int,
     activation: ActivationType,
@@ -88,6 +89,10 @@ def create_comm_fused_moe_backend(
     if modules is None:
         return None
     host, runtime = modules
+    if pad_align <= 0:
+        raise ValueError(f"pad_align must be positive, got {pad_align}")
+    model_dim = (model_dim + pad_align - 1) // pad_align * pad_align
+    inter_dim = (inter_dim + pad_align - 1) // pad_align * pad_align
     try:
         winners = host.winners_for(
             host.ShapeKey(
@@ -194,8 +199,8 @@ class CommFusedMoeBackend:
 
         runner_args = {
             "tp_group": group,
-            "model_dim": layer.hidden_size,
-            "inter_dim": layer.intermediate_size_per_partition,
+            "model_dim": method.hidden_size,
+            "inter_dim": method.intermediate_size,
             "experts": layer.global_num_experts,
             "topk": layer.top_k,
             "comm": "rs" if self.use_dp_reduce_scatter else "ar",

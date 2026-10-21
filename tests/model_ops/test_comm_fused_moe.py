@@ -275,6 +275,7 @@ def _create_backend(modules, state, **overrides):
         "parallel_config": SimpleNamespace(dp_size=1, use_ep=False, tp_size=8),
         "model_dim": 7168,
         "inter_dim": 384,
+        "pad_align": 128,
         "experts": 384,
         "topk": 6,
         "activation": modules.comm.ActivationType.Silu,
@@ -407,6 +408,8 @@ def _initialize_backend(comm_fused_env, *, dpa=False):
     layer.quant_method = object.__new__(modules.moe.Mxfp4MoEMethod)
     layer.quant_method.use_triton = True
     layer.quant_method.use_triton_decode = True
+    layer.quant_method.hidden_size = 7168
+    layer.quant_method.intermediate_size = 384
     layer.moe_parallel_config = _parallel(dp_size=8 if dpa else 1)
     layer.hidden_size = 7168
     layer.intermediate_size_per_partition = 384
@@ -479,6 +482,65 @@ def test_support_predicate_uses_runtime_shape_and_fails_closed(comm_fused_env):
 
     state.missing_shape = True
     assert _create_backend(modules, state) is None
+
+
+def test_support_predicate_uses_padded_mxfp4_shape(comm_fused_env):
+    modules, state, _, _ = comm_fused_env
+
+    assert (
+        _create_backend(
+            modules,
+            state,
+            model_dim=5120,
+            inter_dim=576,
+            pad_align=128,
+            parallel_config=SimpleNamespace(dp_size=1, use_ep=False, tp_size=4),
+        )
+        is not None
+    )
+    assert state.shape_keys == [_ShapeKey("gfx950", 5120, 640, 384, 6, 4)]
+
+
+def test_runner_wiring_uses_padded_mxfp4_shape(comm_fused_env):
+    modules, state, tp_group, _ = comm_fused_env
+    tp_group.world_size = 4
+    parallel = SimpleNamespace(dp_size=1, use_ep=False, tp_size=4)
+    backend = _create_backend(
+        modules,
+        state,
+        model_dim=5120,
+        inter_dim=576,
+        pad_align=128,
+        parallel_config=parallel,
+    )
+    assert backend is not None
+
+    layer = _new_fused_moe(modules)
+    layer.quant_method = object.__new__(modules.moe.Mxfp4MoEMethod)
+    layer.quant_method.use_triton = True
+    layer.quant_method.use_triton_decode = True
+    layer.quant_method.hidden_size = 5120
+    layer.quant_method.intermediate_size = 640
+    layer.moe_parallel_config = parallel
+    layer.hidden_size = 5120
+    layer.intermediate_size_per_partition = 576
+    layer.global_num_experts = 384
+    layer.top_k = 6
+
+    backend.configure_quant_method(layer.quant_method)
+    backend.initialize(layer)
+
+    assert state.runner_calls == [
+        {
+            "tp_group": tp_group,
+            "model_dim": 5120,
+            "inter_dim": 640,
+            "experts": 384,
+            "topk": 6,
+            "comm": "ar",
+            "add_shared": True,
+        }
+    ]
 
 
 def test_runner_wiring_pins_flydsl_weight_layout(comm_fused_env):
