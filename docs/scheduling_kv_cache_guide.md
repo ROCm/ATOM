@@ -205,7 +205,7 @@ release cost while replacing a previous result.
 | Module | Responsibility |
 | --- | --- |
 | `model_engine/output_transfer.py` | FIFO transfers, reusable pinned slots and completion events, and independent NumPy snapshots |
-| `spec_decode/output.py` | Copy the two packed MTP rows into independently owned arrays in scheduler order |
+| `spec_decode/status.py` | Copy the two packed speculative status rows into independently owned arrays in scheduler order |
 | `model_engine/model_runner.py` | Provide contiguous status counts and consume outputs at the existing scheduling boundaries |
 | `model_engine/scheduler.py` | Enforce the output object's storage-ownership contract |
 
@@ -227,7 +227,7 @@ Both prefill and verification submit contiguous `[bonus, rejected]` rows with
 one D2H operation and one completion event. Verification uses the final
 post-broadcast verdict, excluding its GPU-only anchor. Prefill views a persistent
 flat zero buffer, slicing before reshaping to keep the active rows contiguous.
-Neither path launches a packing kernel. `MTPStatusQueue` specializes only the
+Neither path launches a packing kernel. `SpecStatusQueue` specializes only the
 snapshot: it copies each row once and returns `(rejected, bonus)` in scheduler
 order. Each returned row owns its storage, so `ScheduledBatchOutput` does not
 copy it a second time.

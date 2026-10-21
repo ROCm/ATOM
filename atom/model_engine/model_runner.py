@@ -81,7 +81,7 @@ from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.factory import build_drafter
-from atom.spec_decode.output import MTPStatusQueue
+from atom.spec_decode.status import SpecStatusQueue
 from atom.utils import (
     CpuGpuBuffer,
     envs,
@@ -253,11 +253,11 @@ class tokenIDProcessor:
         self.num_spec_tokens = num_spec_tokens
         # Block-drafter warmup fabricates at least two requests, even when
         # the service admits only one. Real batches/graphs obey max_num_seqs.
-        self._max_output_requests = max(runner.config.max_num_seqs, 2)
+        self._output_request_capacity = max(runner.config.max_num_seqs, 2)
 
         self.async_copy_stream = torch.cuda.Stream(runner.device)
-        self.default_mtp_status = torch.zeros(
-            2 * self._max_output_requests, dtype=torch.int32, device=device
+        self.zero_spec_counts = torch.zeros(
+            2 * self._output_request_capacity, dtype=torch.int32, device=device
         )
         self.clean()
 
@@ -300,17 +300,17 @@ class tokenIDProcessor:
             return logprob_tensor.tolist()
         return None
 
-    def send_to_cpu_async_draft(self, gpu_tensor: torch.Tensor):
+    def send_draft_token_ids_to_cpu(self, gpu_tensor: torch.Tensor):
         # The next replay of this draft output follows a whole target forward.
         # Preserve side-stream overlap; no reverse wait on the forward stream.
-        self._draft_outputs.send(gpu_tensor)
+        self._draft_token_ids_queue.send(gpu_tensor)
 
-    def recv_async_output_draft(self) -> np.ndarray:
-        output = self._draft_outputs.receive()
+    def recv_draft_token_ids(self) -> np.ndarray:
+        output = self._draft_token_ids_queue.receive()
         return np.array([], dtype=np.int32) if output is None else output
 
-    def recv_mtp_status_async(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        return self.mtp_status.receive() or (None, None)
+    def recv_spec_status(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        return self.spec_status_queue.receive() or (None, None)
 
     def clean(self):
         self.token_ids_cpu: list[torch.Tensor] = []
@@ -321,12 +321,12 @@ class tokenIDProcessor:
 
         self.pre_num_decode_token_per_seq = 1
         self.draft_token_ids: torch.Tensor | None = None
-        self._draft_outputs = D2HQueue(
-            self._max_output_requests * max(self.num_spec_tokens, 1),
+        self._draft_token_ids_queue = D2HQueue(
+            self._output_request_capacity * max(self.num_spec_tokens, 1),
             self.async_copy_stream,
         )
-        self.mtp_status = MTPStatusQueue(
-            self._max_output_requests, self.async_copy_stream
+        self.spec_status_queue = SpecStatusQueue(
+            self._output_request_capacity, self.async_copy_stream
         )
         self.num_rejected: np.ndarray | None = None
         self.num_bonus: np.ndarray | None = None
@@ -483,14 +483,14 @@ class tokenIDProcessor:
         total_tokens_prefill = batch.total_tokens_num_prefill
         total_tokens_decode = batch.total_tokens_num_decode
         total_reqs_prefill = batch.total_seqs_num_prefill
-        # The MTP status queue is filled in postprocess but drained here, so a
+        # The speculative status queue is filled in postprocess but drained here, so a
         # step whose postprocess is skipped must not drain it: `forward()` bails
         # before postprocess when the batch produces no output (every prefill in
         # it is a middle chunk), and the status it popped belongs to the batch
         # whose deferred tokens the NEXT output-producing step will surface.
         # Draining it here would hand that step `num_rejected=None`.
         if batch.produces_output():
-            self.prev_rejected_num, self.prev_bonus_num = self.recv_mtp_status_async()
+            self.prev_rejected_num, self.prev_bonus_num = self.recv_spec_status()
 
         # TODO: remove this when we support mixed prefill and decode in one batch
         if total_reqs_prefill > 0:
@@ -640,8 +640,8 @@ class tokenIDProcessor:
         else:
             self.draft_token_ids = draft_token_ids
             self.pre_num_decode_token_per_seq = self.num_spec_tokens + 1
-            token_ids = self.recv_async_output_draft()
-            self.send_to_cpu_async_draft(draft_token_ids)
+            token_ids = self.recv_draft_token_ids()
+            self.send_draft_token_ids_to_cpu(draft_token_ids)
             ret = (
                 token_ids
                 if self.prev_req_ids is not None
@@ -3265,8 +3265,8 @@ class ModelRunner:
             )
             # Prefill has zero bonus/rejection counts, in the same contiguous
             # layout as verification. Slice before reshaping to avoid row gaps.
-            mtp_counts = self.tokenID_processor.default_mtp_status[: 2 * bs].view(2, bs)
-            num_reject_tokens = mtp_counts[1]
+            spec_counts = self.tokenID_processor.zero_spec_counts[: 2 * bs].view(2, bs)
+            num_reject_tokens = spec_counts[1]
             next_token_locs = num_reject_tokens
             # No drafts scored -> no verdict; the drafter anchors on each
             # segment's last row.
@@ -3314,7 +3314,7 @@ class ModelRunner:
                 verdict = _g.broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
-            mtp_counts = verdict[:2]
+            spec_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
         if get_tp_group().world_size > 1 and (
@@ -3349,8 +3349,8 @@ class ModelRunner:
             if hasattr(self, "drafter"):
                 prev_rejected_num = self.tokenID_processor.prev_rejected_num
                 prev_bonus_num = self.tokenID_processor.prev_bonus_num
-                self.tokenID_processor.mtp_status.send(
-                    mtp_counts, ready=self.forward_done_event
+                self.tokenID_processor.spec_status_queue.send(
+                    spec_counts, ready=self.forward_done_event
                 )
                 next_token_ids = torch.gather(
                     sampled_tokens.view(bs, -1), 1, next_token_locs.view(-1, 1)
