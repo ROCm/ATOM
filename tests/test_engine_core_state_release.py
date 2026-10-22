@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("torch")
+# The engine core reaches AITER through the model runner it imports.
+pytest.importorskip("aiter", reason="atom.model_engine.engine_core imports AITER")
 
 from atom.model_engine.engine_core import EngineCore
 
