@@ -393,6 +393,57 @@ class Gsm8kThresholdTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("[eval] FAIL", result.stdout)
 
+    def test_a_failing_concurrency_does_not_skip_the_rest(self):
+        source = SERVER_SCRIPT.read_text()
+        start = source.index("run_eval() {")
+        run_eval = source[start : source.index("\n}\n", start) + 3]
+        fake_lm_eval = r"""
+lm_eval() {
+  local out="${@: -1}"
+  local conc="${out##*_c}" score=0.95
+  if [[ "${conc}" == 8 ]]; then score=0.10; fi
+  echo "${conc}" >> "${RUN_DIR}/ran"
+  mkdir -p "${out}/model"
+  printf '{"results": {"gsm8k": {"exact_match,flexible-extract": %s}}}\n' \
+    "${score}" > "${out}/model/results.json"
+}
+"""
+        script = "set -euo pipefail\n" + fake_lm_eval + run_eval + "run_eval\n"
+        with tempfile.TemporaryDirectory() as run_dir:
+            env = {
+                **os.environ,
+                "RUN_DIR": run_dir,
+                "RUN_EVAL": "true",
+                "EVAL_TASK": "gsm8k",
+                "EVAL_CONCURRENCY": "8,64",
+                "EVAL_THRESHOLD": "0.90",
+                "EVAL_FEWSHOT": "3",
+                "EVAL_LIMIT": "",
+                "EVAL_BATCH_SIZE": "",
+                "EVAL_MAX_GEN_TOKS": "",
+                "EVAL_APPLY_CHAT_TEMPLATE": "false",
+                "EVAL_FEWSHOT_AS_MULTITURN": "false",
+                "EVAL_MODEL_TYPE": "local-completions",
+                "EVAL_ENDPOINT": "completions",
+                "MODEL_PATH": "/models/m",
+                "ROUTER_PORT": "8000",
+                "TOPOLOGY": "1p1d",
+            }
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            ran_file = Path(run_dir) / "ran"
+            ran = ran_file.read_text().split() if ran_file.exists() else []
+        self.assertEqual(ran, ["8", "64"], result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("[eval] PASS: concurrent=64", result.stdout)
+        self.assertIn("[eval] FAIL: concurrency 8 did not pass", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

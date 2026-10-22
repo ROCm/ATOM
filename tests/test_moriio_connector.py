@@ -87,29 +87,30 @@ class ConnectorSourceTest(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "get_port_offset"
         ]
-        # Side channel, read notify, handshake, write request, write report.
-        self.assertEqual(len(calls), 5)
+        # Side channel, read notify, early-failure notify, handshake, write
+        # request, write report.
+        self.assertEqual(len(calls), 6)
         for call in calls:
             self.assertEqual(len(call.args), 3, ast.unparse(call))
 
     def test_a_short_remote_list_is_caught_before_the_pairing(self):
         body = self.segment("_read_blocks")
-        guard = body.index("len(remote_block_ids) < len(local_block_ids)")
+        guard = body.index("self._source_covers(")
         pairing = body.index("self._group_offsets(")
         # The pairing silently drops the tail, which costs the end of the
         # prompt's KV and surfaces only as degenerate decode output.
         self.assertLess(guard, pairing)
-        self.assertIn("raise ValueError", body[guard - 200 : pairing])
+        self.assertIn("raise ValueError", self.segment("_source_covers"))
         self.assertIn(
             "zip(local_block_ids, remote_block_ids)", self.segment("_group_offsets")
         )
 
     def test_a_short_source_is_caught_on_both_ends_of_a_push(self):
         # The consumer refuses before asking, the producer before writing.
-        self.assertIn("if len(src) < len(dst):", self.segment("_request_write"))
+        self.assertIn("self._source_covers(", self.segment("_request_write"))
         body = self.segment("_write_blocks")
         self.assertLess(
-            body.index("if len(src) < len(dst):"), body.index("self._group_offsets(")
+            body.index("self._source_covers("), body.index("self._group_offsets(")
         )
 
     def test_layer_shapes_are_checked_against_the_offset_source(self):
@@ -139,7 +140,7 @@ class ConnectorSourceTest(unittest.TestCase):
         # A push that completes this step should free its blocks this step.
         self.assertLess(
             body.index("self._service_write_requests()"),
-            body.index("self.done_sending.copy()"),
+            body.index("done_sending, self.done_sending = self.done_sending, set()"),
         )
         # Consumer reports feed the same verify pass as finished reads.
         self.assertLess(
@@ -164,8 +165,20 @@ class ConnectorSourceTest(unittest.TestCase):
     def test_handshake_wait_is_bounded(self):
         body = self.segment("_issue_ready_reads")
         self.assertIn("now >= deadline", body)
-        self.assertIn("self._failed_before_read.add(req_id)", body)
+        self.assertIn("self._fail_before_transfer(req_id, meta)", body)
         self.assertIn("zmq.RCVTIMEO", self.segment("_execute_handshake"))
+
+    def test_write_mode_refuses_a_zero_hold(self):
+        body = self.segment("__init__")
+        self.assertIn("ATOM_PD_FAILED_WRITE_HOLD_S <= 0", body)
+        self.assertIn("raise ValueError", body)
+
+    def test_registration_uses_the_transfer_layout(self):
+        self.assertIn("self._kv_layout()", self.segment("register_kv_caches"))
+
+    def test_done_sending_is_swapped_under_its_lock(self):
+        for name in ("get_finished", "_handshake_listener", "_finish_write"):
+            self.assertIn("with self._done_sending_lock:", self.segment(name), name)
 
     def test_unimplemented_transfer_subsets_are_not_ignored(self):
         body = self.segment("_rejects_transfer_subset")
@@ -174,7 +187,7 @@ class ConnectorSourceTest(unittest.TestCase):
         for path in ("_issue_read_for_req", "_request_write"):
             caller = self.segment(path)
             self.assertIn("self._rejects_transfer_subset(", caller, path)
-            self.assertIn("_failed_before_read", caller, path)
+            self.assertIn("_fail_before_transfer", caller, path)
 
     def test_a_rejected_request_does_not_take_down_the_rank(self):
         body = self.segment("_issue_read_for_req")
@@ -286,7 +299,9 @@ class ConnectorBehaviourTest(unittest.TestCase):
             self.read_blocks([1, 2, 3], [1, 2])
         # A bare instance has no tp_rank, so reaching this message at all also
         # shows the guard runs before the first attribute access.
-        self.assertIn("3 local blocks but only 2 remote blocks", str(caught.exception))
+        self.assertIn(
+            "3 destination blocks but only 2 source blocks", str(caught.exception)
+        )
 
     def test_a_longer_remote_list_is_accepted(self):
         # The producer's block table also covers the token it generated, which
@@ -354,10 +369,15 @@ class ConnectorBehaviourTest(unittest.TestCase):
         import types
 
         conn = object.__new__(self.connector)
+        notified = []
         conn._failed_before_read = set()
         conn._recving_transfers = {}
-        conn.moriio_wrapper = types.SimpleNamespace(lock=threading.Lock())
-        conn.tp_rank = 0  # only read by the entry log
+        conn.request_id_to_transfer_id = {}
+        conn.moriio_wrapper = types.SimpleNamespace(
+            lock=threading.Lock(),
+            send_notify=lambda transfer_id, host, port: notified.append(transfer_id),
+        )
+        conn.tp_rank = 0
         meta = types.SimpleNamespace(
             num_computed_blocks=0,
             src_block_skip_factor=1,
@@ -368,10 +388,13 @@ class ConnectorBehaviourTest(unittest.TestCase):
             remote_handshake_port=1,
             remote_dp_rank=0,
             tp_size=8,
+            transfer_id=5,
         )
         # No exception: the rank survives and the scheduler hears about it.
         conn._issue_read_for_req("req", meta)
         self.assertEqual(conn._failed_before_read, {"req"})
+        # And the producer is told to release the source blocks.
+        self.assertEqual(notified, [5])
 
     def test_digest_tells_apart_payloads_with_the_same_byte_sum(self):
         conn, names = self.make_connector(layers=1)
@@ -442,6 +465,7 @@ class WritePathTest(unittest.TestCase):
         MLA layout with block_size 2 over 4-byte rows, so a block is 8 bytes,
         and 4 blocks per registered chunk so a block id can cross chunks.
         """
+        import collections
         import queue
         import threading
         import types
@@ -494,6 +518,9 @@ class WritePathTest(unittest.TestCase):
         conn.remote_moriio_metadata = {}
         conn.layer_name_to_remote_kv_cache_metadata = {}
         conn.done_sending = set()
+        conn._done_sending_lock = threading.Lock()
+        conn._write_ids = {}
+        conn._finished_writes = collections.deque()
 
         conn.sent = []
         conn.writes = []
@@ -587,13 +614,15 @@ class WritePathTest(unittest.TestCase):
             ("10.0.0.2", 7400),
         )
         self.assertAlmostEqual(request["deadline"], time.time() + 600, delta=60)
-        self.assertEqual(conn._awaiting_write["d1"], request["deadline"])
+        self.assertEqual(conn._awaiting_write["d1"][0], request["deadline"])
 
     def test_the_consumer_refuses_a_short_source_without_asking(self):
         conn = self.make(producer=False)
         conn._request_write("d1", self.recv_meta([4, 5, 6], [10, 11]))
         self.assertEqual(conn.sent, [])
         self.assertEqual(conn._failed_before_read, {"d1"})
+        # Rank 1 of the producer still holds the source blocks; let it go.
+        self.assertEqual(conn.notified, [(0, "10.0.0.1", 7302)])
 
     def test_an_unreachable_producer_fails_the_request_not_the_rank(self):
         conn = self.make(producer=False)
@@ -758,12 +787,13 @@ class WritePathTest(unittest.TestCase):
         import time
 
         conn = self.make(producer=False)
+        meta = self.recv_meta([4], [10])
         now = time.time()
         conn._awaiting_write = {
-            "a": now + 600,
-            "b": now + 600,
-            "late": now - 10_000,
-            "just_late": now - 1,
+            "a": (now + 600, meta),
+            "b": (now + 600, meta),
+            "late": (now - 10_000, meta),
+            "just_late": (now - 1, meta),
         }
         conn._write_reports = {"a": True, "b": False, "stray": True}
         done, failed = set(), set()
@@ -775,6 +805,8 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(set(conn._awaiting_write), {"just_late"})
         self.assertIn("b", conn._held_failures)
         self.assertEqual(conn._write_reports, {})
+        # late's WRITE_REQ may never have arrived, so the producer is told.
+        self.assertEqual(len(conn.notified), 1)
 
     def test_a_failed_push_is_reported_only_once_no_write_is_in_flight(self):
         conn = self.make(producer=True)
@@ -847,8 +879,8 @@ class WritePathTest(unittest.TestCase):
         meta = self.recv_meta([4], [10])
         meta.remote_engine_id = "10.0.0.1:7301"
         conn._awaiting_handshake = {
-            "bad": time.monotonic() + 300,
-            "good": time.monotonic() + 300,
+            "bad": (time.monotonic() + 300, meta),
+            "good": (time.monotonic() + 300, meta),
         }
         conn._ready_requests.put(("bad", meta, RuntimeError("producer gone")))
         conn._ready_requests.put(("good", meta, None))
@@ -857,6 +889,7 @@ class WritePathTest(unittest.TestCase):
         self.assertEqual(issued, ["good"])
         self.assertEqual(conn._failed_before_read, {"bad"})
         self.assertEqual(conn._awaiting_handshake, {})
+        self.assertEqual(len(conn.notified), 1)
 
     def test_a_read_whose_handshake_never_finishes_is_failed(self):
         import time
@@ -864,10 +897,13 @@ class WritePathTest(unittest.TestCase):
         conn = self.make(producer=False)
         issued = []
         conn._issue_read_for_req = lambda req_id, meta: issued.append(req_id)
-        conn._awaiting_handshake = {"r": time.monotonic() - 1}
+        conn._awaiting_handshake = {
+            "r": (time.monotonic() - 1, self.recv_meta([4], [10]))
+        }
         with self.assertLogs("atom", "ERROR"):
             conn._issue_ready_reads()
         self.assertEqual(conn._failed_before_read, {"r"})
+        self.assertEqual(len(conn.notified), 1)
         # A handshake finishing after that must not start a read for it.
         conn._ready_requests.put(("r", self.recv_meta([4], [10]), None))
         conn._issue_ready_reads()
@@ -931,6 +967,77 @@ class WritePathTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             conn._get_or_build_sessions("engine")
         self.assertEqual(conn._built_sessions, {})
+
+    def test_a_second_write_req_for_one_transfer_is_not_pushed_twice(self):
+        conn = self.make(producer=True)
+        pushed = []
+        in_flight = FakeStatus("progress")
+        conn._write_target_ready = lambda request: True
+        conn._write_blocks = lambda request, engine_id: (
+            pushed.append(request["decode_req_id"]) or [in_flight]
+        )
+        conn._write_requests.put(self.push_request())
+        conn._service_write_requests()
+        conn._write_requests.put(self.push_request(decode_req_id="d2"))
+        with self.assertLogs("atom", "WARNING"):
+            conn._service_write_requests()
+        self.assertEqual(pushed, ["d1"])
+
+        in_flight.state = "ok"
+        conn._service_write_requests()
+        # The source blocks are released now, so a late repeat must not push.
+        conn._write_requests.put(self.push_request(decode_req_id="d3"))
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(pushed, ["d1"])
+        reports = [self.msgpack.loads(frames[1]) for frames, _host, _port in conn.sent]
+        self.assertEqual(
+            reports,
+            [
+                {"decode_req_id": "d1", "ok": True},
+                {"decode_req_id": "d3", "ok": False},
+            ],
+        )
+
+    def test_a_push_that_fails_part_way_waits_for_what_it_posted(self):
+        conn = self.make(producer=True)
+        conn._remote_agents = {"10.0.0.2:7400_dp0": {"agent"}}
+        sessions = [({(0, 0): "L0"}, {}), ({(0, 0): "L1"}, {})]
+        conn._get_or_build_sessions = lambda engine_id: (sessions, None)
+        posted = FakeStatus("progress")
+
+        def write(szs, local_offsets, remote_offsets, session):
+            if session == "L1":
+                raise RuntimeError("could not post")
+            return posted
+
+        conn.moriio_wrapper.write_remote_data_status = write
+        conn._write_target_ready = lambda request: True
+        conn._write_requests.put(self.push_request())
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        # Layer 0's write may still be reading the source blocks.
+        self.assertEqual(conn.done_sending, set())
+        self.assertEqual(conn.sent, [])
+
+        posted.state = "ok"
+        with self.assertLogs("atom", "ERROR"):
+            conn._service_write_requests()
+        self.assertEqual(conn.done_sending, {9})
+        ((frames, _host, _port),) = conn.sent
+        self.assertEqual(self.msgpack.loads(frames[1])["ok"], False)
+        self.assertEqual(conn._remote_agents, {})
+
+    def test_a_read_refused_before_any_transfer_releases_the_producer(self):
+        conn = self.make(producer=False)
+        meta = self.recv_meta([4], [10])
+        meta.src_block_skip_factor = 2
+        meta.remote_engine_id = "10.0.0.1:7301"
+        conn.request_id_to_transfer_id = {"r": 77}
+        with self.assertLogs("atom", "ERROR"):
+            conn._issue_read_for_req("r", meta)
+        self.assertEqual(conn._failed_before_read, {"r"})
+        self.assertEqual(conn.notified, [(77, "10.0.0.1", 7302)])
 
     def block_peer(self, local, remote, remote_blocks):
         """A producer with one block layer, facing a consumer's descriptors."""

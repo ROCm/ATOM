@@ -2651,6 +2651,7 @@ run_eval() {
 
   IFS=',' read -r -a eval_concs <<< "${EVAL_CONCURRENCY}"
   local eval_conc tag result_dir
+  local below=()
   for eval_conc in "${eval_concs[@]}"; do
     eval_conc="${eval_conc//[[:space:]]/}"
     [[ -n "${eval_conc}" ]] || continue
@@ -2671,7 +2672,7 @@ run_eval() {
       --log_samples \
       --output_path "${result_dir}"
 
-    python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
+    if ! python3 - "${result_dir}" "${eval_conc}" "${EVAL_THRESHOLD}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -2706,9 +2707,16 @@ if threshold:
         f">= threshold {float(threshold):.4f}"
     )
 PY
+    then
+      below+=("${eval_conc}")
+    fi
   done
 
   echo "[eval] gsm8k runs done, results saved to ${RUN_DIR}/eval_results"
+  if (( ${#below[@]} )); then
+    echo "[eval] FAIL: concurrency ${below[*]} did not pass" >&2
+    return 1
+  fi
 }
 
 run_benchmark_and_eval() {

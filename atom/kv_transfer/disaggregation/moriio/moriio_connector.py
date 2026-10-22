@@ -15,7 +15,7 @@ import queue
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -104,6 +104,15 @@ class MoRIIOConnector(KVConnectorBase):
             kv_transfer_config.get("kv_role", "kv_producer") == "kv_producer"
         )
         self.transfer_mode = self._transfer_mode_from(kv_transfer_config)
+        if (
+            self.transfer_mode == "write"
+            and not self.is_producer
+            and envs.ATOM_PD_FAILED_WRITE_HOLD_S <= 0
+        ):
+            raise ValueError(
+                "MoRIIO write mode needs ATOM_PD_FAILED_WRITE_HOLD_S > 0: a push "
+                "started just before its deadline could land in freed blocks"
+            )
         self.http_port = kv_transfer_config.get("http_port", 8000)
         self.request_address = f"{self.local_ip}:{self.http_port}"
         self.base_handshake_port = kv_transfer_config.get(
@@ -184,7 +193,7 @@ class MoRIIOConnector(KVConnectorBase):
         # Read mode: the handshake with each producer DP rank, and the requests
         # waiting on one with their deadlines.
         self._read_handshakes: dict[EngineId, Future[set[str]]] = {}
-        self._awaiting_handshake: dict[ReqId, float] = {}
+        self._awaiting_handshake: dict[ReqId, tuple[float, ReqMeta]] = {}
         self._ready_requests: queue.Queue[
             tuple[ReqId, ReqMeta, BaseException | None]
         ] = queue.Queue()
@@ -199,7 +208,9 @@ class MoRIIOConnector(KVConnectorBase):
 
         # In-flight receive transfers
         self._recving_transfers: defaultdict[ReqId, list] = defaultdict(list)
-        self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str]] = {}
+        self._recving_transfers_callback_addr: dict[
+            ReqId, tuple[str, str, EngineId]
+        ] = {}
 
         # Opt-in correctness probe. A transfer that reports success only says
         # the RDMA verbs retired, not that every layer's KV arrived, and decode
@@ -222,11 +233,16 @@ class MoRIIOConnector(KVConnectorBase):
         self._pending_writes: list[tuple[dict[str, Any], float]] = []
         self._write_handshakes: dict[EngineId, Future[set[str]]] = {}
         self._sending_writes: dict[int, tuple[list[Any], dict[str, Any]]] = {}
+        # Transfers asked for: None while queued or pushing, else when the push
+        # was reported (monotonic). The source blocks go once it is, so a
+        # second ask for the same transfer must not push again.
+        self._write_ids: dict[int, float | None] = {}
+        self._finished_writes: deque[tuple[float, int]] = deque()
 
         # Serial WRITE mode, consumer side: requests waiting on the producer's
         # report with the push deadline each one sent, and the reports the
         # listener thread has collected.
-        self._awaiting_write: dict[ReqId, float] = {}
+        self._awaiting_write: dict[ReqId, tuple[float, ReqMeta]] = {}
         self._write_reports: dict[ReqId, bool] = {}
         self._write_reports_lock = threading.Lock()
         self._write_timeout_s = envs.ATOM_MORIIO_WRITE_TIMEOUT_S
@@ -234,8 +250,10 @@ class MoRIIOConnector(KVConnectorBase):
         # Failed receives, held until the given time before they are reported.
         self._held_failures: dict[ReqId, float] = {}
 
-        # Completed send-side transfers (populated by handshake listener)
+        # Completed send-side transfers, added by the listener thread and by
+        # _finish_write, so swapped out under the lock.
         self.done_sending: set[int] = set()
+        self._done_sending_lock = threading.Lock()
 
         # Transfer ID mapping (worker side)
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -312,8 +330,9 @@ class MoRIIOConnector(KVConnectorBase):
             self.blocks_per_chunk,
         )
 
-        # Extract block geometry from the last registered tensor
-        is_mla = len(cache_tensor.shape) == 3
+        # The same layout test the transfers use. It also refuses layers shaped
+        # unlike the first, so a mixed pool fails here rather than per request.
+        is_mla, _per_block_bytes = self._kv_layout()
         self.block_len = self.kv_cache_block_size
         if is_mla:
             self.num_blocks = cache_tensor.shape[0] // self.block_len
@@ -350,7 +369,7 @@ class MoRIIOConnector(KVConnectorBase):
         """``"read"`` or ``"write"``: which side posts the RDMA verbs.
 
         Only the consumer's mode matters: it either pulls with reads or asks
-        for a push, and the producer serves both. 
+        for a push, and the producer serves both.
         """
         if env_mode is None:
             env_mode = envs.ATOM_MORIIO_MODE
@@ -399,7 +418,8 @@ class MoRIIOConnector(KVConnectorBase):
                 continue
             # Not waited for here: this runs on the worker's busy loop.
             self._awaiting_handshake[req_id] = (
-                time.monotonic() + self._handshake_timeout_s
+                time.monotonic() + self._handshake_timeout_s,
+                meta,
             )
             self._initiate_background_handshake(req_id, remote_engine_id, meta)
 
@@ -420,12 +440,12 @@ class MoRIIOConnector(KVConnectorBase):
                     meta.remote_engine_id,
                     error,
                 )
-                self._failed_before_read.add(req_id)
+                self._fail_before_transfer(req_id, meta)
                 continue
             self._issue_read_for_req(req_id, meta)
 
         now = time.monotonic()
-        for req_id, deadline in list(self._awaiting_handshake.items()):
+        for req_id, (deadline, meta) in list(self._awaiting_handshake.items()):
             if now >= deadline:
                 logger.error(
                     "req %s: no handshake with its producer after %.0fs; failing it",
@@ -433,7 +453,7 @@ class MoRIIOConnector(KVConnectorBase):
                     self._handshake_timeout_s,
                 )
                 del self._awaiting_handshake[req_id]
-                self._failed_before_read.add(req_id)
+                self._fail_before_transfer(req_id, meta)
 
     def _issue_read_for_req(self, req_id: str, meta: ReqMeta) -> None:
         """Issue RDMA reads for a single request."""
@@ -445,7 +465,7 @@ class MoRIIOConnector(KVConnectorBase):
             meta.remote_dp_rank,
         )
         if self._rejects_transfer_subset(req_id, meta):
-            self._failed_before_read.add(req_id)
+            self._fail_before_transfer(req_id, meta)
             return
         try:
             self._read_blocks(
@@ -468,7 +488,33 @@ class MoRIIOConnector(KVConnectorBase):
                     # Failed once the reads already posted have settled.
                     posted.append(_POST_FAILED)
             if not posted:
-                self._failed_before_read.add(req_id)
+                self._fail_before_transfer(req_id, meta)
+
+    def _fail_before_transfer(self, req_id: ReqId, meta: ReqMeta) -> None:
+        """Fail a receive that moved nothing, and let the producer release it."""
+        self._failed_before_read.add(req_id)
+        self._notify_producer(req_id, meta)
+
+    def _notify_producer(self, req_id: ReqId, meta: ReqMeta) -> None:
+        """Best-effort done-notify; the producer holds the source blocks until
+        it hears back. Repeats are harmless."""
+        try:
+            port = int(meta.remote_handshake_port) + get_port_offset(
+                meta.remote_dp_rank,
+                self.tp_rank,
+                int(meta.tp_size or 0) or self.tp_size,
+            )
+            self.moriio_wrapper.send_notify(
+                self.request_id_to_transfer_id.get(req_id, meta.transfer_id),
+                meta.remote_host,
+                port,
+            )
+        except Exception:
+            logger.warning(
+                "req %s: could not tell the producer to release its blocks",
+                req_id,
+                exc_info=True,
+            )
 
     @staticmethod
     def _rejects_transfer_subset(req_id: ReqId, meta: ReqMeta) -> bool:
@@ -503,22 +549,15 @@ class MoRIIOConnector(KVConnectorBase):
         that is left is to tell it where to write.
         """
         if self._rejects_transfer_subset(req_id, meta):
-            self._failed_before_read.add(req_id)
+            self._fail_before_transfer(req_id, meta)
             return
         dst = [int(b) for b in meta.local_block_ids]
         src = [int(b) for b in (meta.remote_block_ids or [])]
-        # The producer's table also covers the token it generated, which we
-        # never allocate for, so a longer source is normal. A shorter one would
-        # leave the tail of the prompt with nothing to fill it.
-        if len(src) < len(dst):
-            logger.error(
-                "req %s: %d local blocks but only %d remote blocks; the tail of "
-                "the prompt's KV has no source",
-                req_id,
-                len(dst),
-                len(src),
-            )
-            self._failed_before_read.add(req_id)
+        try:
+            self._source_covers(f"req {req_id}", dst, src)
+        except ValueError as error:
+            logger.error("%s", error)
+            self._fail_before_transfer(req_id, meta)
             return
 
         if self._verify_kv:
@@ -557,9 +596,9 @@ class MoRIIOConnector(KVConnectorBase):
             logger.exception("req %s: could not ask the producer to push KV", req_id)
             self._verify_rows.pop(req_id, None)
             self._verify_before.pop(req_id, None)
-            self._failed_before_read.add(req_id)
+            self._fail_before_transfer(req_id, meta)
             return
-        self._awaiting_write[req_id] = deadline
+        self._awaiting_write[req_id] = (deadline, meta)
 
     def merge_contiguous_blocks(
         self,
@@ -633,39 +672,18 @@ class MoRIIOConnector(KVConnectorBase):
 
         return merged_local, merged_remote, merged_sizes
 
-    def _compute_block_transfer_offsets(
-        self,
-        layer_name: str,
-        local_block_ids: list[int],
-        remote_block_ids: list[int],
-        remote_moriio_meta: MoRIIOAgentMetadata,
-    ) -> tuple[list[int], list[int], list[int]]:
-        """Compute per-block byte offsets within a single registered region.
+    @staticmethod
+    def _source_covers(label: str, dst: list[int], src: list[int]) -> None:
+        """Raise unless every destination block has a source block.
 
-        With chunked registration every region's base address corresponds
-        to block 0 of that chunk.  The byte offset of block ``b`` is
-        ``b * per_block_bytes``.  For cross-chunk transfers, callers
-        must convert to chunk-relative block IDs first (see
-        ``_read_blocks``).
-
-        This method is kept for test compatibility; the hot path in
-        ``_read_blocks`` does its own chunk-aware grouping.
+        A longer source is normal: the producer's table also covers the token
+        it generated, which the consumer never allocates for.
         """
-        del remote_moriio_meta
-        assert self.kv_cache_shape is not None, "KV caches shape not initialized"
-        is_mla = len(self.kv_cache_shape) == 3
-        cache_tensor = self.kv_caches[layer_name].k_cache
-        sz = cache_tensor.element_size()
-        if is_mla:
-            per_block_bytes = self.kv_cache_block_size * cache_tensor.stride(0) * sz
-        else:
-            per_block_bytes = cache_tensor.stride(0) * sz
-
-        n = len(local_block_ids)
-        offset_local = [lb * per_block_bytes for lb in local_block_ids]
-        offset_remote = [rb * per_block_bytes for rb in remote_block_ids]
-        sizes = [per_block_bytes] * n
-        return offset_local, offset_remote, sizes
+        if len(src) < len(dst):
+            raise ValueError(
+                f"{label}: {len(dst)} destination blocks but only {len(src)} "
+                "source blocks; the tail of the prompt's KV has no source"
+            )
 
     def _get_or_build_sessions(
         self, remote_engine_id: str
@@ -850,8 +868,8 @@ class MoRIIOConnector(KVConnectorBase):
 
         Block pairs are grouped by ``(local_chunk_idx, remote_chunk_idx)``
         and chunk-relative offsets are computed.  Each group issues a
-        separate RDMA batch read using the matching session from the NxN
-        chunk grid.
+        separate RDMA batch read using the matching session from the local x
+        remote chunk grid.
 
         Transfer statuses are stored for later polling in
         :meth:`_pop_done_transfers`.
@@ -864,12 +882,7 @@ class MoRIIOConnector(KVConnectorBase):
         # allocate for. Extra producer blocks are therefore the normal case and
         # the prefix pairing is what we want. Fewer is not: the consumer would
         # be left attending over blocks nobody filled.
-        if len(remote_block_ids) < len(local_block_ids):
-            raise ValueError(
-                f"req {request_id}: {len(local_block_ids)} local blocks but "
-                f"only {len(remote_block_ids)} remote blocks; the tail of the "
-                "prompt's KV has no source"
-            )
+        self._source_covers(f"req {request_id}", local_block_ids, remote_block_ids)
         if len(remote_block_ids) > len(local_block_ids):
             logger.debug(
                 "req %s: producer offered %d blocks for %d local; pairing the "
@@ -996,8 +1009,9 @@ class MoRIIOConnector(KVConnectorBase):
 
         Pairs positionally and stops at the shorter list; callers check the
         lengths first. Each ``(local_chunk, remote_chunk)`` group is one batch
-        on the matching session of the NxN grid. Shared by both directions, so
-        a read and a write of the same pair always touch the same bytes.
+        on the matching session of the local x remote grid. Shared by both
+        directions, so a read and a write of the same pair always touch the
+        same bytes.
         """
         bpc = self.blocks_per_chunk
         groups: dict[tuple[int, int], tuple[list[int], list[int], list[int]]] = {}
@@ -1019,29 +1033,35 @@ class MoRIIOConnector(KVConnectorBase):
         """
         dst = [int(b) for b in request["dst_block_ids"]]
         src = [int(b) for b in request["src_block_ids"]]
-        if len(src) < len(dst):
-            raise ValueError(
-                f"transfer {request['transfer_id']}: {len(dst)} destination "
-                f"blocks but only {len(src)} source blocks"
-            )
+        self._source_covers(f"transfer {request['transfer_id']}", dst, src)
         sessions, _remote_meta = self._get_or_build_sessions(engine_id)
         _is_mla, per_block_bytes = self._kv_layout()
         groups = self._group_offsets(src[: len(dst)], dst, per_block_bytes)
 
         statuses: list[Any] = []
-        for k_sessions, v_sessions in sessions:
-            for (lci, rci), (l_offs, r_offs, szs) in groups.items():
-                statuses.append(
-                    self.moriio_wrapper.write_remote_data_status(
-                        szs, l_offs, r_offs, k_sessions[(lci, rci)]
-                    )
-                )
-                if v_sessions:
+        try:
+            for k_sessions, v_sessions in sessions:
+                for (lci, rci), (l_offs, r_offs, szs) in groups.items():
                     statuses.append(
                         self.moriio_wrapper.write_remote_data_status(
-                            szs, l_offs, r_offs, v_sessions[(lci, rci)]
+                            szs, l_offs, r_offs, k_sessions[(lci, rci)]
                         )
                     )
+                    if v_sessions:
+                        statuses.append(
+                            self.moriio_wrapper.write_remote_data_status(
+                                szs, l_offs, r_offs, v_sessions[(lci, rci)]
+                            )
+                        )
+        except Exception:
+            if not statuses:
+                raise
+            # Settled like any failed push, so the source blocks stay held
+            # until the writes already posted can no longer read them.
+            logger.exception(
+                "transfer %s: could not post every write", request["transfer_id"]
+            )
+            statuses.append(_POST_FAILED)
         logger.debug(
             "RDMA write issued for transfer %s: %d blocks, %d layers, %d chunk "
             "groups to %s",
@@ -1066,7 +1086,8 @@ class MoRIIOConnector(KVConnectorBase):
             except queue.Empty:
                 break
             if self._is_valid_write_request(request):
-                self._pending_writes.append((request, time.monotonic()))
+                self._accept_write_request(request)
+        self._forget_finished_writes()
 
         waiting: list[tuple[dict[str, Any], float]] = []
         now = time.time()
@@ -1102,6 +1123,7 @@ class MoRIIOConnector(KVConnectorBase):
                     "transfer %s: could not push KV to the consumer",
                     request["transfer_id"],
                 )
+                self._forget_peer(self._write_engine_id(request))
                 self._finish_write(request, ok=False)
                 continue
             self._sending_writes[int(request["transfer_id"])] = (statuses, request)
@@ -1127,6 +1149,38 @@ class MoRIIOConnector(KVConnectorBase):
                 self._finish_write(request, ok=False)
             else:
                 self._finish_write(request, ok=True)
+
+    def _accept_write_request(self, request: dict[str, Any]) -> None:
+        """Queue a push, unless it is a second ask for the same transfer."""
+        transfer_id = int(request["transfer_id"])
+        if transfer_id not in self._write_ids:
+            self._write_ids[transfer_id] = None
+            self._pending_writes.append((request, time.monotonic()))
+        elif self._write_ids[transfer_id] is None:
+            logger.warning(
+                "transfer %s: ignoring a second WRITE_REQ while the first is "
+                "still being served",
+                transfer_id,
+            )
+        else:
+            logger.error(
+                "transfer %s: WRITE_REQ for a push that already finished; its "
+                "source blocks may belong to another request now",
+                transfer_id,
+            )
+            self._finish_write(request, ok=False)
+
+    def _forget_finished_writes(self) -> None:
+        """Drop finished ids after the write timeout plus the hold; a second
+        ask later than that is not caught."""
+        cutoff = (
+            time.monotonic() - self._write_timeout_s - envs.ATOM_PD_FAILED_WRITE_HOLD_S
+        )
+        while self._finished_writes and self._finished_writes[0][0] < cutoff:
+            _, transfer_id = self._finished_writes.popleft()
+            finished = self._write_ids.get(transfer_id)
+            if finished is not None and finished < cutoff:
+                del self._write_ids[transfer_id]
 
     @staticmethod
     def _is_valid_write_request(request: Any) -> bool:
@@ -1204,9 +1258,13 @@ class MoRIIOConnector(KVConnectorBase):
         """Release the source blocks and tell the consumer how the push went."""
         transfer_id = int(request["transfer_id"])
         self._sending_writes.pop(transfer_id, None)
+        finished = time.monotonic()
+        self._write_ids[transfer_id] = finished
+        self._finished_writes.append((finished, transfer_id))
         # Released whatever happened: a consumer told the push failed has no
         # reason to come back for these blocks.
-        self.done_sending.add(transfer_id)
+        with self._done_sending_lock:
+            self.done_sending.add(transfer_id)
         port = int(request["decode_handshake_port"]) + get_port_offset(
             int(request.get("decode_dp_rank", 0)),
             self.tp_rank,
@@ -1245,7 +1303,7 @@ class MoRIIOConnector(KVConnectorBase):
 
         hold_s = envs.ATOM_PD_FAILED_WRITE_HOLD_S
         now = time.time()
-        for req_id, deadline in list(self._awaiting_write.items()):
+        for req_id, (deadline, meta) in list(self._awaiting_write.items()):
             if now > deadline + hold_s:
                 logger.error(
                     "req %s: no report from the producer %.0fs past its push "
@@ -1255,6 +1313,9 @@ class MoRIIOConnector(KVConnectorBase):
                 )
                 del self._awaiting_write[req_id]
                 failed_recving.add(req_id)
+                # In case the WRITE_REQ never arrived and the producer still
+                # holds the source blocks.
+                self._notify_producer(req_id, meta)
 
     def _hold_failure(self, req_id: ReqId) -> None:
         """Hold a failed receive's blocks for ATOM_PD_FAILED_WRITE_HOLD_S.
@@ -1323,7 +1384,8 @@ class MoRIIOConnector(KVConnectorBase):
                     if len(parts) < 3:
                         raise ValueError("POP_DONE_RECV missing request ID")
                     req_id = int(parts[2])
-                    self.done_sending.add(req_id)
+                    with self._done_sending_lock:
+                        self.done_sending.add(req_id)
                     logger.debug(
                         "Handshake listener: consumer finished reading req %d", req_id
                     )
@@ -1603,18 +1665,16 @@ class MoRIIOConnector(KVConnectorBase):
             for req_id in failed_recving:
                 self._verify_rows.pop(req_id, None)
                 self._verify_before.pop(req_id, None)
-        if self.is_producer:
-            done_sending = self.done_sending.copy()
-            self.done_sending.clear()
-        else:
-            if self.done_sending:
+        with self._done_sending_lock:
+            done_sending, self.done_sending = self.done_sending, set()
+        if not self.is_producer:
+            if done_sending:
                 logger.warning(
                     "Consumer received %d stale done_sending notifications "
                     "(single-machine port collision?) — discarding: %s",
-                    len(self.done_sending),
-                    self.done_sending,
+                    len(done_sending),
+                    done_sending,
                 )
-                self.done_sending.clear()
             done_sending = set()
         return KVConnectorOutput(
             finished_sending=done_sending,
@@ -1791,7 +1851,7 @@ class MoRIIOConnectorScheduler(KVConnectorSchedulerBase):
 
 
 class _PostFailed:
-    """Stands in for the reads a request could not post."""
+    """Stands in for the transfers a request could not post."""
 
     @staticmethod
     def Succeeded() -> bool:
@@ -1803,7 +1863,7 @@ class _PostFailed:
 
     @staticmethod
     def Message() -> str:
-        return "not every read could be posted"
+        return "not every transfer could be posted"
 
     @staticmethod
     def Code() -> str:

@@ -151,3 +151,12 @@ class TestConnectorMetadata:
         assert rm.remote_dp_rank == 0
         assert rm.tp_size == 1
         assert rm.transfer_id == 0
+
+    def test_null_dp_fields_become_defaults(self):
+        # Peer ids are built from remote_dp_rank, so None would give "_dpNone".
+        meta = ConnectorMetadata()
+        meta.add_new_req_to_recv(
+            "req-z", [0], {"remote_dp_rank": None, "remote_dp_size": None}
+        )
+        rm = meta.reqs_to_recv["req-z"]
+        assert (rm.remote_dp_rank, rm.remote_dp_size) == (0, 1)
