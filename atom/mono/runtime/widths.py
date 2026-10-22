@@ -25,9 +25,10 @@ class WidthBuilds:
     dispatched only in part (the scratch the runtime holds for the grid), its
     resident CTAs then waiting for ever on the rest."""
 
-    def __init__(self, build, kernels, group, what: str) -> None:
+    def __init__(self, build, kernels, group, what: str, *, validate=None) -> None:
         self._build, self._kernels = build, kernels
         self._group, self._what = group, what
+        self._validate = validate
         self._built = {}
         self._refused = set()
 
@@ -50,6 +51,8 @@ class WidthBuilds:
             launchers = compile_kernels(self._kernels(built))
             if not self._scratch_free(launchers, width):
                 built = None
+            elif self._validate is not None:
+                self._validate(built, width)
         except Exception:
             logger.exception(
                 "%s: building the width-%d kernels failed", self._what, width
