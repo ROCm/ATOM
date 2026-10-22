@@ -5,6 +5,8 @@ import torch
 from torch import nn
 from torch.profiler import record_function
 
+from aiter.dist.parallel_state import get_pp_group
+
 from atom.config import CompilationLevel
 from atom.distributed.dcp_utils import get_dcp_world_size
 from atom.distributed.pcp_utils import (
@@ -262,6 +264,8 @@ class EagleProposer(Drafter):
         spec = self.speculative_config
         if spec.method != "eagle3" or not spec.use_aux_hidden_state:
             return
+        if get_pp_group().world_size > 1:
+            raise ValueError("EAGLE3 does not support pipeline parallelism (PP>1).")
         # Unwrap to the model that owns eagle3 aux-layer state; the strip hook
         # still goes on target_model (the outermost forward).
         aux_model = target_model
@@ -800,9 +804,8 @@ class EagleProposer(Drafter):
                     )
 
                 if self.model.has_draft_vocab:
-                    next_input_ids = (
-                        next_input_ids + self.model.d2t[next_input_ids.long()]
-                    ).int()
+                    ids = next_input_ids.long().clamp(max=self.model.d2t.shape[0] - 1)
+                    next_input_ids = (next_input_ids + self.model.d2t[ids]).int()
                 if i < self.mtp_k - 1:
                     # Read before step 0's rewrite below flips it to decode.
                     from_prefill = context.is_prefill
@@ -879,5 +882,6 @@ class EagleProposer(Drafter):
         # [batch_size, mtp_k], contiguous: every consumer indexes by sequence.
         result = draft_token_ids.t().contiguous()
         if self.model.has_draft_vocab:
-            result = (result + self.model.d2t[result.long()]).to(result.dtype)
+            ids = result.long().clamp(max=self.model.d2t.shape[0] - 1)
+            result = (result + self.model.d2t[ids]).to(result.dtype)
         return result

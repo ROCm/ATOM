@@ -349,7 +349,8 @@ class Eagle3LlamaModel(nn.Module):
                 torch.zeros(draft_vocab, dtype=torch.int64),
                 requires_grad=False,
             )
-            # Round up for TP-sharded lm_head.
+            # Round up for TP-sharded lm_head only (d2t keeps
+            # checkpoint size so the loader can populate it).
             tp_size = get_tensor_model_parallel_world_size()
             if draft_vocab % tp_size != 0:
                 draft_vocab = math.ceil(draft_vocab / tp_size) * tp_size
