@@ -3930,8 +3930,8 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # Slots freed one step ago are safe once a forward read its
-        # predecessor's output; a middle prefill chunk read nothing.
+        # Freed state slots advance one stage per output-reading postprocess
+        # and go back after two (`release_held_state_slots`).
         if self.block_manager.state_release_lag and (
             batch is None or batch.produces_output()
         ):

@@ -1374,40 +1374,48 @@ class TestJointChunkProbeIsGated:
 
 
 class TestStateReleaseLag:
-    """With deferred output the forward after a request's last one is already
-    running when the request is freed, and it writes the request's state slot.
-    A P/D consumer would hand that slot straight to an incoming transfer, whose
-    RDMA no stream orders against that forward. Measured on DeepSeek-V4-Flash
-    1P1D: 53 of 1319 received slots differed from what the producer sent."""
+    """With deferred output the forwards already launched when a request is
+    freed -- the one after its last, or a cancelled request's middle prefill
+    chunk -- still write its state slot. A P/D consumer would hand that slot
+    straight to an incoming transfer, whose RDMA no stream orders against them.
+    Measured on DeepSeek-V4-Flash 1P1D: 53 of 1319 received slots differed
+    from what the producer sent."""
 
-    def _bm(self, lag=True):
+    def _finished(self, seq_factory, lag=True):
+        """A BlockManager and one stateful request it has just deallocated."""
         bm = BlockManager(
             MockConfig(
-                enable_prefix_caching=True,
+                num_kvcache_blocks=32,
+                kv_cache_block_size=4,
                 pool_entries={"state": 2},
                 pool_entries_per_req={"state": 1},
             )
         )
         bm.state_release_lag = lag
-        return bm
+        seq = seq_factory(list(range(8)))
+        bm.allocate(seq)
+        seq.has_per_req_cache = True
+        seq.state_slots = bm.state.pop_many(1)
+        slot = seq.state_slot
+        bm.deallocate(seq)
+        return bm, slot
 
-    def _free(self, bm):
-        """Free one slot the way `deallocate` does for a finished request."""
-        slot = bm.state.pop()
-        if bm.state_release_lag:
-            bm._held_state_slots.append(slot)
-        else:
-            bm.state.release_many([slot])
-        return slot
-
-    def test_held_until_the_next_release(self):
-        bm = self._bm()
-        slot = self._free(bm)
-        assert not bm.state.has_free(2) and bm.has_held_state_slots
+    def test_a_freed_slot_goes_back_after_two_output_reading_postprocesses(
+        self, seq_factory
+    ):
+        bm, slot = self._finished(seq_factory)
+        assert slot not in bm.state._free and bm.has_held_state_slots
+        # The first may read a forward older than a middle chunk still in flight.
+        bm.release_held_state_slots()
+        assert slot not in bm.state._free
         bm.release_held_state_slots()
         assert slot in bm.state._free and not bm.has_held_state_slots
 
-    def test_without_lag_a_slot_is_free_at_once(self):
-        bm = self._bm(lag=False)
-        self._free(bm)
-        assert bm.state.has_free(2) and not bm.has_held_state_slots
+    def test_a_drain_releases_everything_at_once(self, seq_factory):
+        bm, slot = self._finished(seq_factory)
+        bm.release_held_state_slots(drained=True)
+        assert slot in bm.state._free and not bm.has_held_state_slots
+
+    def test_without_lag_deallocate_frees_the_slot_at_once(self, seq_factory):
+        bm, slot = self._finished(seq_factory, lag=False)
+        assert slot in bm.state._free and not bm.has_held_state_slots

@@ -593,7 +593,7 @@ class EngineCore:
         if not bm.has_held_state_slots:
             return
         self.runner_mgr.call_func("drain_device", wait_out=True)
-        bm.release_held_state_slots()
+        bm.release_held_state_slots(drained=True)
 
     def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may
