@@ -21,6 +21,37 @@ def test_qwen4_exp_vision_mixin_registered():
     assert get_multimodal_mixin_cls("atom_qwen4_exp") is Qwen4ExpVisionMixin
 
 
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_vision_embedding_masks_image_placeholders_on_single_rank(monkeypatch, tp_size):
+    from atom.model_ops import embed_head
+
+    input_ids = torch.tensor([1, 999], dtype=torch.int32)
+    weight = torch.ones(4, 2)
+    calls = []
+    expected = torch.zeros(2, 2)
+
+    def replicated(ids, table):
+        calls.append("masked")
+        assert ids is input_ids and table is weight
+        return expected
+
+    def partitioned(ids):
+        calls.append("partitioned")
+        assert ids is input_ids
+        return expected
+
+    monkeypatch.setattr(embed_head, "replicated_embedding", replicated)
+    runtime = SimpleNamespace(
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(tp_size=tp_size, weight=weight),
+            embed_input_ids=partitioned,
+        )
+    )
+    actual = _ATOMQwen4ExpRuntime._embed_vision_input_ids(runtime, input_ids)
+    assert actual is expected
+    assert calls == (["masked"] if tp_size == 1 else ["partitioned"])
+
+
 def test_vision_weight_budget_reads_checkpoint_metadata(tmp_path):
     save_file(
         {"model.visual.weight": torch.zeros(2, 3)}, tmp_path / "visual.safetensors"
