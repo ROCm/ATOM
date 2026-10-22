@@ -219,16 +219,19 @@ STATE slot to the decode node: every layer's window ring (including the
 decoder's bounded-replay tail and the DSpark context layers), the compressor
 rings and the cursor, written straight into the consumer's slot. Only Mooncake
 is admitted (MoRI-IO is refused), and `kv_role` must be explicit on both sides.
-Prefill and decode must run the same model and spec config: the producer
-refuses a consumer whose slot size differs (DSpark widens the rings).
+Prefill and decode must run the same model and spec config: a consumer
+refuses a producer whose slot size differs on first contact, before anything is
+written (DSpark widens the rings).
 
 A Mooncake consumer asks the producer to write only after its own device has
 finished everything already launched (all models): with deferred output the
 step after a request's last one is still running and writes the slot and
 blocks it just freed, and an RDMA into them is ordered against no stream.
-Without this, 4% of DeepSeek-V4-Flash transfers (53 of 1319) arrived partly
-overwritten. The wait runs off the engine loop and adds about one decode step
-to TTFT.
+Measured on DeepSeek-V4-Flash 1P1D (gsm8k, each received slot compared with
+what the producer sent): 33 of 1231 transfers arrived partly overwritten
+without the wait, 0 of 1225 with it. The wait runs off the engine loop; one
+device synchronize covers every write request queued before it, so a burst of
+new requests adds about one decode step to TTFT.
 
 Validated 1P1D: each side one TP2 instance on MI355X, DeepSeek-V4.1-Flash-1017,
 bf16 KV, fp4 index, decoder and encoder SWA bounded replay on, DSpark 5.

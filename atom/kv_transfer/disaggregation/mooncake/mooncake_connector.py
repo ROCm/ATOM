@@ -136,9 +136,11 @@ class SlotPool:
     ``acquire`` waits on a condition until a slot is free. Every holder
     releases its slot once the copy or RDMA write using it returned, so the
     wait always ends -- unless the holder's transfer was never started, which
-    ``fail`` reports: waiters then raise instead of waiting forever. The
-    consumer staging rows, the DSA index staging slots and the MLA staging
-    slots each keep one.
+    ``fail`` reports: waiters then raise instead of waiting forever. A failure
+    is permanent: every later ``acquire`` raises too, free rows or not, since
+    the consumer that reports it cannot run on (see
+    ``MooncakeConnector._post_queued_write_requests``). The consumer staging
+    rows, the DSA index staging slots and the MLA staging slots each keep one.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -161,8 +163,10 @@ class SlotPool:
             return self.free.pop()
 
     def fail(self, exc: BaseException) -> None:
-        """Wake every waiter with ``exc``. Rows stay held: a transfer that was
-        partly posted may still write them."""
+        """Wake every waiter, and fail every later ``acquire``, with ``exc``.
+
+        Never cleared. Rows stay held: a transfer that was partly posted may
+        still write them."""
         with self._cv:
             self._failure = exc
             self._cv.notify_all()
@@ -383,6 +387,8 @@ MSG_WRITE_DONE = b"write_done"
 # the consumer's receive deadline for that rank (see _record_write_ack).
 MSG_WRITE_ACK = b"write_ack"
 MSG_GET_META = b"get_meta"
+# How long a consumer waits for a producer's metadata on first contact.
+PD_META_TIMEOUT_MS = 10_000
 # PP-prefill only: consumer tells stage-0 a request's KV is fully received from
 # every stage, so stage-0 may reuse the shared page table (see _record_release).
 MSG_RELEASE = b"release"
@@ -990,16 +996,19 @@ class MooncakeConnector(KVConnectorBase):
                 initargs=(self._cuda_device,),
             )
         else:
-            # Consumer: one thread, so write requests leave in issue order
-            # (`_post_write_requests`); a send it fails is raised on the engine
-            # thread at the next `get_finished`, as it was when sent inline.
-            self._write_request_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="mooncake-write-request",
-                initializer=torch.cuda.set_device,
-                initargs=(self._cuda_device,),
-            )
+            # Consumer: write requests queue here and one daemon worker posts
+            # them, in issue order, once the device has drained
+            # (`_post_queued_write_requests`). A post it fails is raised on the
+            # engine thread at the next `get_finished`, as it was when sent
+            # inline, and is fatal to this consumer.
+            self._write_queue: list[tuple[str, list[bytes]]] = []
+            self._write_cv = threading.Condition()
+            self._write_closed = False
+            self._write_thread: threading.Thread | None = None
             self._write_request_error: BaseException | None = None
+            # Producer side channels whose slot layout was checked
+            # (`_verify_producer`).
+            self._verified_producers: set[str] = set()
 
         # --- ZMQ for metadata exchange ---
         self.zmq_context = zmq.Context()
@@ -1717,24 +1726,53 @@ class MooncakeConnector(KVConnectorBase):
             # Per request, not after the loop: the next request may block in
             # `_staging_slots.acquire()` until a transfer already prepared here
             # completes and frees its row, which needs its write request out.
-            self._write_request_executor.submit(
-                self._post_write_requests, write_requests
-            )
+            self._enqueue_write_requests(write_requests)
 
-    def _post_write_requests(self, write_requests: list) -> None:
-        """Let the producer write only once this device has run everything
-        already launched on it.
+    def _enqueue_write_requests(self, write_requests: list) -> None:
+        with self._write_cv:
+            if self._write_closed:
+                return
+            self._write_queue.extend(write_requests)
+            if self._write_thread is None:
+                # Daemon: a hung device must not keep the process from exiting.
+                self._write_thread = threading.Thread(
+                    target=self._write_request_loop,
+                    name="mooncake-write-request",
+                    daemon=True,
+                )
+                self._write_thread.start()
+            self._write_cv.notify()
+
+    def _write_request_loop(self) -> None:
+        torch.cuda.set_device(self._cuda_device)
+        while self._post_queued_write_requests():
+            pass
+
+    def _post_queued_write_requests(self) -> bool:
+        """Post every write request queued so far, once this device has run
+        everything already launched on it. False once closed or failed.
 
         A slot or block handed to a new request may have just been freed by
         one whose last forward is still running -- with deferred output the
         engine learns a request finished one forward late -- and that forward
         writes it. The producer's RDMA is ordered against no stream here, so
-        it could land first and be overwritten. Waiting off the engine loop
-        costs the new request about one step of TTFT and stalls nothing else.
+        it could land first and be overwritten.
+
+        One synchronize covers every request queued before it started, so a
+        burst of receives pays about one step of TTFT rather than one step
+        per request ahead of it in the burst.
         """
+        with self._write_cv:
+            self._write_cv.wait_for(lambda: self._write_queue or self._write_closed)
+            if self._write_closed:
+                return False
+            batch, self._write_queue = self._write_queue, []
         try:
             torch.cuda.synchronize(self._cuda_device)
-            for addr, parts in write_requests:
+            for addr, parts in batch:
+                if addr not in self._verified_producers:
+                    self._verify_producer(addr)
+                    self._verified_producers.add(addr)
                 self._send_on_socket(addr, parts)
         except Exception as e:
             logger.exception("[CONSUMER] failed to post write requests")
@@ -1742,6 +1780,59 @@ class MooncakeConnector(KVConnectorBase):
             # The engine thread may be blocked taking a staging row only this
             # request's transfer would have returned.
             self._staging_slots.fail(e)
+            return False
+        return True
+
+    def _verify_producer(self, addr: str) -> None:
+        """Refuse a producer whose state slot is not the size of ours, once,
+        on first contact.
+
+        Both sizes are fixed at startup (DeepSeek-V4.1's follows the DSpark
+        config), so a mismatch is a deployment error; caught here it fails
+        this consumer before anything is written, rather than every transfer
+        after its pages already moved. The producer re-checks per transfer
+        for layouts this cannot map (pipeline-parallel producer stages).
+        """
+        if not self._has_slot_regions:
+            return
+        sock = self.zmq_context.socket(zmq.DEALER)
+        try:
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(addr)
+            sock.send_multipart([MSG_GET_META])
+            if not sock.poll(PD_META_TIMEOUT_MS):
+                logger.warning(
+                    "[CONSUMER] producer at %s did not send its metadata in "
+                    "%d ms; leaving the slot-size check to the producer",
+                    addr,
+                    PD_META_TIMEOUT_MS,
+                )
+                return
+            meta = self._decoder.decode(sock.recv_multipart()[-1])
+        finally:
+            sock.close()
+        mine = [bps for _, bps in self._slot_regions]
+        theirs = list(meta.slot_bps or [])
+        if not meta.has_slot_regions or len(theirs) != len(mine):
+            # A different region count is a pipeline-parallel producer stage;
+            # its mapping is the producer's to check.
+            return
+        if theirs != mine:
+            raise RuntimeError(
+                f"Mooncake producer at {addr} has state slots of {theirs} B, "
+                f"this consumer {mine} B; prefill and decode must run the same "
+                "model and spec config"
+            )
+
+    def close(self) -> None:
+        """Stop posting at worker teardown; queued write requests are dropped
+        rather than sent while this process goes away."""
+        if self.is_producer:
+            return
+        with self._write_cv:
+            self._write_closed = True
+            self._write_queue = []
+            self._write_cv.notify_all()
 
     # -----------------------------------------------------------------
     # Send worker streams
@@ -2929,6 +3020,24 @@ class MooncakeConnector(KVConnectorBase):
         dst_swa_block_ids = request_data.get("dst_swa_block_ids", [])
         src_swa_block_ids = prefill_data.get("swa_block_ids", [])
 
+        # A slot is a raw state image whose width follows the model and spec
+        # config (DeepSeek-V4.1's widens with DSpark): writing it into a
+        # differently sized slot overruns or misplaces fields. Checked before
+        # any page moves; the consumer also checks once on first contact
+        # (`_verify_producer`).
+        slot_cmap = self._consumer_region_map(
+            len(self._slot_regions), len(consumer_slot_addrs)
+        )
+        for region_idx, (_, bps) in enumerate(self._slot_regions):
+            cidx = slot_cmap[region_idx]
+            if consumer_slot_bps[cidx] != bps:
+                raise RuntimeError(
+                    f"State slot size mismatch for req {req_id}: producer "
+                    f"region {region_idx} has {bps} B, consumer region {cidx} "
+                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
+                    "run the same model and spec config"
+                )
+
         # ---- Phase 1: Block transfer ----
         block_src: list[int] = []
         block_dst: list[int] = []
@@ -3097,16 +3206,6 @@ class MooncakeConnector(KVConnectorBase):
         for region_idx, (src_base, bps) in enumerate(self._slot_regions):
             cidx = slot_cmap[region_idx]
             dst_base = consumer_slot_addrs[cidx]
-            if consumer_slot_bps[cidx] != bps:
-                # A slot is a raw state image whose width follows the model and
-                # spec config (DeepSeek-V4.1's widens with DSpark): writing it
-                # into a differently sized slot overruns or misplaces fields.
-                raise RuntimeError(
-                    f"State slot size mismatch for req {req_id}: producer "
-                    f"region {region_idx} has {bps} B, consumer region {cidx} "
-                    f"has {consumer_slot_bps[cidx]} B; prefill and decode must "
-                    "run the same model and spec config"
-                )
             slot_src.append(src_base + src_slot * bps)
             slot_dst.append(dst_base + dst_slot * consumer_slot_bps[cidx])
             slot_sizes.append(bps)

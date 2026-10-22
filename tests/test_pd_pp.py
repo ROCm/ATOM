@@ -456,6 +456,8 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
         # Check the actual wire payload used for the RDMA target and ZMQ
         # write-done notification, not only the engine's bootstrap address.
         conn._send_on_socket = MagicMock()
+        # Drive the write-request worker by hand: no thread, one round per call.
+        conn._write_thread = object()
         meta = ConnectorMetadata._build_req_meta(
             req_id="r0",
             local_block_ids=[0],
@@ -475,13 +477,13 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
         # Nothing goes out on the engine thread: the request is posted by the
         # write-request worker, and only after the device has drained.
         conn._send_on_socket.assert_not_called()
-        post, queued = conn._write_request_executor.submit.call_args.args
+        assert len(conn._write_queue) == 1
         order = []
         conn._send_on_socket.side_effect = lambda *a: order.append("send")
         monkeypatch.setattr(
             mc.torch.cuda, "synchronize", lambda *a: order.append("synchronize")
         )
-        post(queued)
+        assert conn._post_queued_write_requests()
         assert order == ["synchronize", "send"]
         assert conn._write_request_error is None
         addr, (_, payload) = conn._send_on_socket.call_args.args
@@ -494,7 +496,8 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
 
         # A post that fails off-thread surfaces on the engine thread.
         conn._send_on_socket.side_effect = OSError("unreachable")
-        post(queued)
+        conn._write_queue.append(("tcp://10.19.0.113:6301", [b"x"]))
+        assert not conn._post_queued_write_requests()
         with pytest.raises(RuntimeError, match="could not post a write request"):
             conn.get_finished()
 
@@ -541,6 +544,7 @@ def _one_row_staging_consumer(monkeypatch, send):
     conn._staging_base_addr = 0
     conn._staging_slot_bytes = 64
     conn._send_on_socket = lambda addr, parts, repeat=1: send(conn, addr)
+    conn._verify_producer = lambda addr: None
     return conn
 
 
@@ -597,7 +601,8 @@ def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
     outcome = _receive_two(conn)
     assert outcome["returned"], "second receive never got a staging row"
     assert "error" not in outcome
-    conn._write_request_executor.shutdown(wait=True)
+    conn.close()
+    conn._write_thread.join(5)
     assert len(posted) == 2
 
 
@@ -616,6 +621,94 @@ def test_a_failed_post_wakes_a_receive_waiting_for_a_staging_row(monkeypatch):
     assert conn._staging_slots.free == []
     with pytest.raises(RuntimeError, match="could not post a write request"):
         conn.get_finished()
+    # The worker stopped at the failure; nothing outlives the test.
+    conn._write_thread.join(5)
+    assert not conn._write_thread.is_alive()
+
+
+def _queue_only_consumer():
+    """A consumer whose write-request worker is driven by hand."""
+    mc = pytest.importorskip(
+        "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"
+    )
+    conn = object.__new__(mc.MooncakeConnector)
+    conn.is_producer = False
+    conn._cuda_device = 0
+    conn._write_queue = []
+    conn._write_cv = threading.Condition()
+    conn._write_closed = False
+    conn._write_thread = object()
+    conn._write_request_error = None
+    conn._verified_producers = set()
+    conn._has_slot_regions = False
+    conn._staging_slots = mc.SlotPool()
+    return mc, conn
+
+
+def test_one_synchronize_posts_every_request_queued_before_it(monkeypatch):
+    """A burst of receives shares one device synchronize instead of paying
+    one each, in order, behind the requests ahead of it."""
+    mc, conn = _queue_only_consumer()
+    events = []
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: events.append("sync"))
+    conn._send_on_socket = lambda addr, parts: events.append(parts[0])
+    for i in range(4):
+        conn._enqueue_write_requests([("tcp://p:1", [f"r{i}".encode()])])
+    assert conn._post_queued_write_requests()
+    assert events == ["sync", b"r0", b"r1", b"r2", b"r3"]
+
+
+def test_close_drops_queued_requests_and_stops_the_worker(monkeypatch):
+    mc, conn = _queue_only_consumer()
+    sent = []
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"])])
+    conn.close()
+    assert not conn._post_queued_write_requests()
+    conn._enqueue_write_requests([("tcp://p:1", [b"r1"])])
+    assert sent == [] and conn._write_queue == []
+
+
+def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
+    """Checked once, on first contact, before any write request goes out."""
+    mc, conn = _queue_only_consumer()
+    conn._has_slot_regions = True
+    conn._slot_regions = [(0, 4096)]
+    conn._decoder = mc.msgspec.msgpack.Decoder(mc.MooncakeAgentMetadata)
+    reply = mc.msgspec.msgpack.encode(
+        mc.MooncakeAgentMetadata(
+            engine_id="p", rpc_port=1, has_slot_regions=True, slot_bps=[8192]
+        )
+    )
+    sock = MagicMock()
+    sock.poll.return_value = 1
+    sock.recv_multipart.return_value = [b"", reply]
+    conn.zmq_context = MagicMock()
+    conn.zmq_context.socket.return_value = sock
+    sent = []
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"])])
+    assert not conn._post_queued_write_requests()
+    assert sent == []
+    assert "state slots of [8192] B" in str(conn._write_request_error)
+    sock.send_multipart.assert_called_once_with([mc.MSG_GET_META])
+
+    # Matching sizes pass, and the producer is asked only once.
+    _, conn2 = _queue_only_consumer()
+    conn2.__dict__.update(
+        _has_slot_regions=True,
+        _slot_regions=[(0, 8192)],
+        _decoder=conn._decoder,
+        zmq_context=conn.zmq_context,
+        _send_on_socket=lambda addr, parts: sent.append(parts),
+    )
+    for i in range(2):
+        conn2._enqueue_write_requests([("tcp://p:1", [b"r%d" % i])])
+        assert conn2._post_queued_write_requests()
+    assert sent == [[b"r0"], [b"r1"]]
+    assert sock.send_multipart.call_count == 2
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
