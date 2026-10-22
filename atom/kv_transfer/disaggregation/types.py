@@ -40,6 +40,20 @@ def kv_config_has_producer(kv_config: object) -> bool:
     return any(kv_config_has_producer(sub) for sub in kv_config.get("connectors", []))
 
 
+def kv_config_has_consumer(kv_config: object) -> bool:
+    """Whether a KV config contains a P/D consumer, including ``multi``.
+
+    A consumer receives per-request state by RDMA into slots the scheduler
+    hands out, so it must not reuse a slot a forward may still write
+    (`BlockManager.advance_state_release_lag`).
+    """
+    if not isinstance(kv_config, dict):
+        return False
+    if kv_config.get("kv_role") == "kv_consumer":
+        return True
+    return any(kv_config_has_consumer(sub) for sub in kv_config.get("connectors", []))
+
+
 @dataclass(frozen=True)
 class SaveOperationId:
     """Exact identity of one scheduler-issued PAGE/SLOT save generation.

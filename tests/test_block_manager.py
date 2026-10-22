@@ -1374,13 +1374,13 @@ class TestJointChunkProbeIsGated:
 
 
 class TestStateReleaseLag:
-    """With deferred output the step after a request's last one is already
+    """With deferred output the forward after a request's last one is already
     running when the request is freed, and it writes the request's state slot.
     A P/D consumer would hand that slot straight to an incoming transfer, whose
-    RDMA no stream orders against that step. Measured on DeepSeek-V4-Flash
+    RDMA no stream orders against that forward. Measured on DeepSeek-V4-Flash
     1P1D: 53 of 1319 received slots differed from what the producer sent."""
 
-    def _bm(self, lag):
+    def _bm(self, lag=True):
         bm = BlockManager(
             MockConfig(
                 enable_prefix_caching=True,
@@ -1391,8 +1391,10 @@ class TestStateReleaseLag:
         bm.state_release_lag = lag
         return bm
 
-    def _freed(self, bm):
-        """Free one slot the way `deallocate` does for a finished request."""
+    def _free_during(self, bm, forward_id):
+        """Free one slot the way `deallocate` does, in forward `forward_id`'s
+        postprocess."""
+        bm.state_hold_forward_id = forward_id
         slot = bm.state.pop()
         if bm.state_release_lag:
             bm._hold_state_slots([slot])
@@ -1400,28 +1402,33 @@ class TestStateReleaseLag:
             bm.state.release_many([slot])
         return slot
 
-    def test_a_freed_slot_waits_for_the_next_postprocess(self):
-        bm = self._bm(lag=True)
-        slot = self._freed(bm)
-        assert not bm.state.has_free(2)
-        bm.advance_state_release_lag()
+    def test_held_until_that_forward_and_the_next_have_finished(self):
+        bm = self._bm()
+        self._free_during(bm, forward_id=7)
+        # A middle prefill chunk's postprocess consumes no output: reaching it
+        # says nothing about forward 7, and neither does 7 alone under TP.
+        for done in (5, 6, 7):
+            bm.advance_state_release_lag(done)
+            assert not bm.state.has_free(2)
+        bm.advance_state_release_lag(8)
         assert bm.state.has_free(2)
-        assert slot in bm.state._free
 
-    def test_an_idle_engine_releases_only_after_the_hold(self, monkeypatch):
-        import atom.model_engine.block_manager as module
+    def test_slots_go_back_in_the_order_their_forwards_finish(self):
+        bm = self._bm()
+        first = self._free_during(bm, forward_id=3)
+        self._free_during(bm, forward_id=9)
+        bm.advance_state_release_lag(4)
+        assert first in bm.state._free and not bm.state.has_free(2)
 
-        now = [100.0]
-        monkeypatch.setattr(module, "monotonic", lambda: now[0])
-        bm = self._bm(lag=True)
-        self._freed(bm)
-        bm.advance_state_release_lag(idle=True)
-        assert not bm.state.has_free(2)
-        now[0] += bm.STATE_RELEASE_IDLE_S
-        bm.advance_state_release_lag(idle=True)
-        assert bm.state.has_free(2)
+    def test_an_idle_drain_releases_everything(self):
+        bm = self._bm()
+        self._free_during(bm, forward_id=3)
+        self._free_during(bm, forward_id=4)
+        assert bm.has_held_state_slots
+        bm.advance_state_release_lag(None)
+        assert bm.state.has_free(2) and not bm.has_held_state_slots
 
     def test_without_lag_a_slot_is_free_at_once(self):
         bm = self._bm(lag=False)
-        self._freed(bm)
+        self._free_during(bm, forward_id=3)
         assert bm.state.has_free(2)

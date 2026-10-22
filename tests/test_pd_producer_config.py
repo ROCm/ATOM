@@ -205,3 +205,26 @@ def test_mla_staging_reserve_is_zero_without_a_pool(monkeypatch, overrides, env)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert mla_staging_reserve_bytes(_mla_producer_config(16, **overrides)) == 0
+
+
+def test_consumer_detection_reaches_into_multi():
+    """A `multi` config keeps the P/D role on its child connector; a consumer
+    there still needs its freed state slots held."""
+    from atom.kv_transfer.disaggregation import kv_config_has_consumer
+
+    assert kv_config_has_consumer(
+        {"kv_connector": "mooncake", "kv_role": "kv_consumer"}
+    )
+    assert kv_config_has_consumer(
+        {
+            "kv_connector": "multi",
+            "connectors": [
+                {"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+                {"kv_connector": "lmcache_offload", "kv_role": "offload"},
+            ],
+        }
+    )
+    assert not kv_config_has_consumer(
+        {"kv_connector": "multi", "connectors": [{"kv_role": "kv_producer"}]}
+    )
+    assert not kv_config_has_consumer(None)

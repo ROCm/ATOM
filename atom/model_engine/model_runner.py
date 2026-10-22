@@ -3441,6 +3441,52 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        out = self._forward_body(batch)
+        self._stamp_forward_completion(out)
+        return out
+
+    def _stamp_forward_completion(self, out) -> None:
+        """Number this forward and report how far the device has got.
+
+        `forward_id` names this forward; `completed_forward_id` is the newest
+        forward whose GPU work has finished, read without waiting. A scheduler
+        that must not reuse a resource until some forward is done -- a P/D
+        consumer's freed state slot (`BlockManager.advance_state_release_lag`)
+        -- waits for this rather than for a postprocess, which an output-less
+        forward (a middle prefill chunk) reaches without consuming anything.
+        """
+        events = getattr(self, "_forward_events", None)
+        if events is None:
+            from atom.kv_transfer.disaggregation import kv_config_has_consumer
+
+            # Only a P/D consumer reads these; nobody else pays for the event.
+            self._stamps_forwards = kv_config_has_consumer(
+                getattr(self.config, "kv_transfer_config", None)
+            )
+            events = self._forward_events = []
+            self._forward_seq = 0
+            self._forward_done = 0
+        if not self._stamps_forwards:
+            return
+        self._forward_seq += 1
+        event = torch.cuda.Event()
+        event.record()
+        events.append((self._forward_seq, event))
+        while events and events[0][1].query():
+            self._forward_done = events.pop(0)[0]
+        if out is not None:
+            out.forward_id = self._forward_seq
+            out.completed_forward_id = self._forward_done
+
+    def drain_device(self) -> bool:
+        """Wait until every queued forward on every TP rank has finished."""
+        torch.cuda.synchronize()
+        tp = get_tp_group()
+        if tp.world_size > 1:
+            torch.distributed.barrier(group=tp.cpu_group)
+        return True
+
+    def _forward_body(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.

@@ -272,12 +272,15 @@ class BlockManager:
         # from "no slots were ever created" (permanent).
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
-        # P/D consumer only (`enable_state_release_lag`): state slots a
-        # finished request frees are held until the next postprocess. See
-        # `advance_state_release_lag`.
+        # P/D consumer only: state slots a finished request frees are held
+        # until the forward that may still write them has finished on the
+        # device. See `advance_state_release_lag`.
         self.state_release_lag = False
-        self._state_held: list[int] = []
-        self._state_held_since = 0.0
+        # [(forward id that may still write the slots, slots), ...]
+        self._state_held: list[tuple[int, list[int]]] = []
+        # The forward in flight while requests are being freed (set per
+        # postprocess from the forward's own output).
+        self.state_hold_forward_id = 0
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3192,36 +3195,42 @@ class BlockManager:
         for block_id in block_ids:
             self.kv.free(block_id)
 
-    # How long an idle engine holds freed state slots before handing them out.
-    # Far longer than any forward, so the step that was in flight has ended.
-    STATE_RELEASE_IDLE_S = 2.0
+    # A forward on another TP rank can trail the reporting rank by at most one:
+    # each forward has a TP collective, which no rank finishes until every rank
+    # has entered it, and a rank enters forward N+1 only after forward N.
+    STATE_RELEASE_SLACK = 1
 
     def _hold_state_slots(self, slots) -> None:
-        if not self._state_held:
-            self._state_held_since = monotonic()
-        self._state_held.extend(slots)
+        self._state_held.append((self.state_hold_forward_id, list(slots)))
 
-    def advance_state_release_lag(self, *, idle: bool = False) -> None:
-        """Hand back the state slots held since the previous postprocess.
+    @property
+    def has_held_state_slots(self) -> bool:
+        return bool(self._state_held)
+
+    def advance_state_release_lag(self, completed_forward_id: int | None) -> None:
+        """Hand back held state slots whose last writer has finished.
 
         With deferred output a request is known finished only in the
-        postprocess after the step that finished it, and by then the next step
-        -- which still carries the request -- is already running and writes
-        its state slot. On a P/D consumer a slot handed out right away can
-        receive another request's state by RDMA, which is ordered against no
-        stream, so that in-flight step can overwrite the transfer. The next
-        postprocess runs after that step's output came back, so slots held
-        until then are free of it.
+        postprocess of the forward after the one that finished it, and that
+        forward -- already running, still carrying the request -- writes its
+        state slot. On a P/D consumer a slot handed out at once can receive
+        another request's state by RDMA, which no stream orders against that
+        forward, so it could be overwritten. A slot goes back only once the
+        workers report that forward (and, for TP, the one after it) finished.
 
-        `idle`: called when nothing is running, where no further postprocess
-        comes; the slots go back once held longer than any forward takes.
+        `completed_forward_id=None` means everything queued has finished
+        (`drain_device`).
         """
         if not self._state_held:
             return
-        if idle and monotonic() - self._state_held_since < self.STATE_RELEASE_IDLE_S:
-            return
-        held, self._state_held = self._state_held, []
-        self.state.release_many(held)
+        if completed_forward_id is None:
+            ready, self._state_held = self._state_held, []
+        else:
+            limit = completed_forward_id - self.STATE_RELEASE_SLACK
+            ready = [h for h in self._state_held if h[0] <= limit]
+            self._state_held = [h for h in self._state_held if h[0] > limit]
+        for _, slots in ready:
+            self.state.release_many(slots)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

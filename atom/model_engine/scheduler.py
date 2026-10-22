@@ -33,7 +33,11 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
+from atom.kv_transfer.disaggregation import (
+    KVConnectorOutput,
+    kv_config_has_consumer,
+    kv_config_has_producer,
+)
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
@@ -633,10 +637,8 @@ class Scheduler:
         )
         # A P/D consumer receives state by RDMA into slots the previous
         # tenant's in-flight step may still write (`advance_state_release_lag`).
-        _kv = getattr(config, "kv_transfer_config", None) or {}
         self.block_manager.state_release_lag = (
-            isinstance(_kv, dict)
-            and _kv.get("kv_role") == "kv_consumer"
+            kv_config_has_consumer(getattr(config, "kv_transfer_config", None))
             and self.block_manager.num_state_slots > 0
         )
         self.waiting: deque[Sequence] = deque()
@@ -1911,9 +1913,6 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
-        if not self.running:
-            # No postprocess comes while idle; see `advance_state_release_lag`.
-            self.block_manager.advance_state_release_lag(idle=True)
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -3927,8 +3926,15 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # The step that ran with the requests freed last time has returned.
-        self.block_manager.advance_state_release_lag()
+        # Slots held for a forward the device has finished go back; requests
+        # freed below are held for this forward, which may still write them.
+        if self.block_manager.state_release_lag:
+            self.block_manager.advance_state_release_lag(
+                getattr(fwd_output, "completed_forward_id", 0)
+            )
+            self.block_manager.state_hold_forward_id = getattr(
+                fwd_output, "forward_id", self.block_manager.state_hold_forward_id
+            )
         # Remember which seqs were already in the middle of chunked prefill
         # before this postprocess call mutates seq.is_partial_prefill below.
         #
