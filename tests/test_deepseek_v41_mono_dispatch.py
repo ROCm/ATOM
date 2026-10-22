@@ -118,6 +118,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         ({"pipeline_parallel_size": 2}, "PP"),
         ({"decode_context_parallel_size": 2}, "decode CP"),
         ({"prefill_context_parallel_size": 2}, "prefill CP"),
+        ({"is_multinode_tp": True}, "TP group spans nodes"),
         ({"enable_tbo": True}, "TBO"),
         ({"enable_tbo_decode": True}, "TBO"),
         (
