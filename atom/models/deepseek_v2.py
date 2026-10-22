@@ -2620,6 +2620,8 @@ class DeepseekV2MLAAttention(nn.Module):
             # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
             # honors this flag in LinearBase.process_weights_after_loading.
             self.fused_qkv_a_proj.needs_preshuffled_weight = True
+            # Under Triton GEMMs the fused FP4 forward reads its weight scale directly.
+            self.fused_qkv_a_proj.needs_e8m0_shuffled_scale = use_triton_gemm()
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
