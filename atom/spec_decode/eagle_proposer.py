@@ -265,7 +265,7 @@ class EagleProposer(Drafter):
         if spec.method != "eagle3" or not spec.use_aux_hidden_state:
             return
         if get_pp_group().world_size > 1:
-            raise ValueError("EAGLE3 does not support pipeline parallelism (PP>1).")
+            raise ValueError("EAGLE3 does not support pipeline parallelism.")
         # Unwrap to the model that owns eagle3 aux-layer state; the strip hook
         # still goes on target_model (the outermost forward).
         aux_model = target_model
