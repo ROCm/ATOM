@@ -653,6 +653,37 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     assert final[-1].labels["request_id"] == "request-3" and final[-1].value == 300
 
 
+def test_request_context_off_records_no_per_request_series(monkeypatch):
+    """ATOM_METRICS_REQUEST_CONTEXT=0: the batch histograms still count, but no
+    request leaves a series behind for every later scrape to re-read."""
+    from prometheus_client import CollectorRegistry
+
+    monkeypatch.setenv("ATOM_METRICS_REQUEST_CONTEXT", "0")
+    metrics = SchedulerMetrics(registry=CollectorRegistry())
+    seqs = {
+        i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")
+        for i in (1, 2, 3)
+    }
+    for seq in seqs.values():
+        metrics.enqueue(seq)
+    metrics.record_forward(
+        SimpleNamespace(
+            req_ids=[1, 2, 3],
+            is_dummy_run=False,
+            total_seqs_num_decode=2,
+            total_seqs_num_prefill=1,
+            total_tokens_num_prefill=50,
+            num_cached_tokens=[0, 0, 0],
+            context_lens=[1000, 9000, 300],
+        ),
+        seqs,
+    )
+
+    assert metrics.decode_request_context_tokens.collect()[0].samples == []
+    assert metrics.prefill_request_context_tokens.collect()[0].samples == []
+    assert histogram_values_by_name(metrics)["decode_context_tokens"]["sum"] == 10000
+
+
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 @pytest.mark.parametrize(
     "rows,context", [(128, 131072), (512, 1048576), (1024, 8388608)]

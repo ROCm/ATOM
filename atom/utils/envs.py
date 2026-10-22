@@ -682,6 +682,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
     ),
+    # Export `atom:{prefill,decode}_request_context_tokens`, one series per
+    # request ever served. Multiprocess storage never drops a series, so every
+    # scrape re-reads all of them in the API server: after ~9.5K requests a
+    # scrape took 0.43 s of Python there and drove its gen-2 GC passes to
+    # ~250 ms each, scraped or idle. 0 = record none.
+    "ATOM_METRICS_REQUEST_CONTEXT": lambda: _flag_env(
+        "ATOM_METRICS_REQUEST_CONTEXT", "1"
+    ),
     "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
         "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
     )

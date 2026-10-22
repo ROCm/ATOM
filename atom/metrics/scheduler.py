@@ -14,6 +14,7 @@ import numpy as np
 from prometheus_client import Gauge, Histogram
 
 from atom.metrics.histogram import LATENCY_BUCKETS
+from atom.utils import envs
 
 BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TOKEN_BUCKETS = (
@@ -117,6 +118,7 @@ class SchedulerMetrics:
             multiprocess_mode="max",
             registry=registry,
         )
+        self._request_context = envs.ATOM_METRICS_REQUEST_CONTEXT
         # Only in-flight external loads are retained; removed on every terminal
         # path, including abort and fallback. Sequence timing dies with the seq.
         self._loads: dict[str, tuple[object, float]] = {}
@@ -156,6 +158,8 @@ class SchedulerMetrics:
             self.pd_transfer.observe(now - started)
 
     def _record_request_context(self, metric, req_id, seq, tokens):
+        if not self._request_context:
+            return
         # Retain completed requests so a scrape can still see short requests.
         metric.labels(
             **self._labels,
