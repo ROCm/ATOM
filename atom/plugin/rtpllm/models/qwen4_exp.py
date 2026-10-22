@@ -274,7 +274,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 )
         elif features:
             inputs_embeds = MultimodalEmbeddingInjector()(
-                self.model.embed_input_ids(input_ids),
+                self._embed_vision_input_ids(input_ids),
                 features,
                 inputs.multimodal_inputs.mm_features_locs,
             )
@@ -296,6 +296,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 inputs_embeds=inputs_embeds,
             )
         return PyModelOutputs(hidden_states)
+
+    def _embed_vision_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # RTP uses out-of-vocabulary placeholder IDs for image patches. TP>1
+        # masks them, but TP=1 uses F.embedding and would fail before the image
+        # features replace those positions. The existing masked implementation
+        # preserves zero embeddings for placeholders in both configurations.
+        if self.model.embed_tokens.tp_size == 1:
+            from atom.model_ops.embed_head import replicated_embedding
+
+            return replicated_embedding(input_ids, self.model.embed_tokens.weight)
+        return self.model.embed_input_ids(input_ids)
 
     def get_mtp_target_hidden_states(self, num_tokens: int):
         hidden = getattr(self, "_mtp_target_hidden_states", None)
