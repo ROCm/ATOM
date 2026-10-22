@@ -571,7 +571,7 @@ def _receive_two(conn):
                     reqs_to_recv={"r0": meta(0), "r1": meta(1)},
                 )
             )
-        except Exception as e:
+        except RuntimeError as e:
             outcome["error"] = e
         done.set()
 
