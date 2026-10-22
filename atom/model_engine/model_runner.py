@@ -9,6 +9,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
@@ -157,6 +158,21 @@ mono_decode_installers = {
         "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
     ),
 }
+
+
+def managed_store_client_kwargs(config) -> dict:
+    """Extra arguments for a rank's client of the CoreManager's TCPStore.
+
+    Every NCCL communicator created on first use takes its unique id from this
+    store. When the TP group spans nodes, its trays reach such a collective
+    apart by as much as their checkpoint loads differ (13 minutes on a tray
+    that cannot page-cache the checkpoint), so torch's default 300 s wait aborts
+    the start. Such a rank waits as long as the rest of the cross-node TP setup
+    does instead.
+    """
+    if config.is_multinode_tp:
+        return {"timeout": timedelta(seconds=envs.ATOM_MULTINODE_TP_TIMEOUT_S)}
+    return {}
 
 
 def max_schedulable_decode_bs(
@@ -1039,6 +1055,7 @@ class ModelRunner:
                 config.parallel_config.data_parallel_master_ip,
                 config.parallel_config.data_parallel_base_port,
                 is_master=False,
+                **managed_store_client_kwargs(config),
             )
             torch.distributed.init_process_group(
                 backend="nccl", store=store, rank=global_rank, world_size=world_size
