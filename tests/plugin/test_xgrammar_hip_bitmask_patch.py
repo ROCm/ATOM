@@ -1,7 +1,6 @@
 """Unit tests for HIP xgrammar vocab-mask Torch fallback.
 
-Lives under ``tests/`` (not ``tests/plugin/``) so Pre Checkin's
-``run_unit_tests.sh`` picks it up: that script ``--ignore=tests/plugin``.
+Plugin tests stay under ``tests/plugin/``. Pre Checkin ignores that tree.
 """
 
 from __future__ import annotations
