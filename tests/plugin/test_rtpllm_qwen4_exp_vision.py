@@ -52,6 +52,19 @@ def test_vision_embedding_masks_image_placeholders_on_single_rank(monkeypatch, t
     assert calls == (["masked"] if tp_size == 1 else ["partitioned"])
 
 
+def test_vision_placeholder_ids_are_canonicalized_for_ple_history():
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime.model = SimpleNamespace(
+        atom_config=SimpleNamespace(hf_config=SimpleNamespace(image_token_id=248056))
+    )
+    ids = torch.tensor([12, 999999, 999999, 15, 999999, 16])
+    features = [torch.zeros(2, 3), torch.zeros(1, 3)]
+    locations = torch.tensor([1, 4], dtype=torch.int32)
+    canonical = runtime._canonical_vision_input_ids(ids, features, locations)
+    assert canonical.tolist() == [12, 248056, 248056, 15, 248056, 16]
+    assert ids.tolist() == [12, 999999, 999999, 15, 999999, 16]
+
+
 def test_vision_weight_budget_reads_checkpoint_metadata(tmp_path):
     save_file(
         {"model.visual.weight": torch.zeros(2, 3)}, tmp_path / "visual.safetensors"
@@ -149,7 +162,7 @@ def test_vision_graph_decode_uses_prewarmed_position_buffer(monkeypatch):
     assert actual.tolist() == [128, 256]
 
 
-def test_vision_draft_keeps_text_only_mtp_position_path(monkeypatch):
+def test_vision_draft_eager_uses_logical_cache_positions(monkeypatch):
     runtime = object.__new__(_ATOMQwen4ExpRuntime)
     runtime._rtp_model_config = SimpleNamespace(
         mm_model_config=SimpleNamespace(is_multimodal=True), is_mtp=True
@@ -159,8 +172,31 @@ def test_vision_draft_keeps_text_only_mtp_position_path(monkeypatch):
         attention_inputs=SimpleNamespace(
             is_prefill=False,
             is_cuda_graph=False,
-            combo_position_ids=torch.tensor([32, 64], dtype=torch.int32),
+            combo_position_ids=torch.tensor([[36, 70], [38, 72], [40, 74]]),
+            sequence_lengths_plus_1_device=torch.tensor([33, 65], dtype=torch.int32),
         )
     )
     actual = runtime._extract_positions(inputs, torch.device("cpu"), 2)
     assert actual.tolist() == [32, 64]
+
+
+def test_vision_draft_initial_prefill_is_ragged_not_mtp_window(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True),
+        is_mtp=True,
+        gen_num_per_cycle=2,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn = SimpleNamespace(
+        is_prefill=True,
+        is_cuda_graph=False,
+        is_target_verify=False,
+        input_lengths=torch.tensor([2, 3], dtype=torch.int32),
+        prefix_lengths=torch.tensor([8, 16], dtype=torch.int32),
+        prefix_lengths_device=torch.tensor([8, 16], dtype=torch.int32),
+    )
+    actual = runtime._extract_positions(
+        SimpleNamespace(attention_inputs=attn), torch.device("cpu"), 5
+    )
+    assert actual.tolist() == [8, 9, 16, 17, 18]

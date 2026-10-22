@@ -357,6 +357,85 @@ def test_prepared_qwen4_exp_mtp_receives_atom_config(monkeypatch):
     assert draft.atom_config is atom_config
 
 
+def test_qwen4_exp_mtp_fp8_exclusion_keeps_draft_layer_name():
+    from atom.config import LayerQuantConfig, QuantizationConfig
+    from atom.models.qwen4_exp import _Qwen4ExpQuantizationConfig
+    from atom.models.qwen4_exp_mtp import Qwen4ExpMTP
+
+    quant = QuantizationConfig()
+    quant.quant_method = "compressed-tensors"
+    quant.global_spec = LayerQuantConfig(quant_dtype=torch.float8_e4m3fn)
+    quant.exclude_layers = ["mtp.layers.0.self_attn.q_proj", "mtp.fc_embedding"]
+    # RTP's draft prepare path must not map mtp.* exclusions to model.*.
+    quant.remap_layer_name(
+        SimpleNamespace(model_type="qwen4_exp"),
+        packed_modules_mapping=Qwen4ExpMTP.packed_modules_mapping,
+    )
+    draft_quant = _Qwen4ExpQuantizationConfig(quant)
+    assert (
+        draft_quant.get_layer_quant_config(
+            "mtp.layers.0.self_attn.qkv_proj"
+        ).quant_dtype
+        is torch.bfloat16
+    )
+    assert (
+        draft_quant.get_layer_quant_config("mtp.fc_embedding").quant_dtype
+        is torch.bfloat16
+    )
+    assert (
+        draft_quant.get_layer_quant_config("mtp.layers.0.self_attn.o_proj").quant_dtype
+        is torch.float8_e4m3fn
+    )
+
+
+def test_qwen4_exp_mtp_draft_marks_forward_context(monkeypatch):
+    from contextlib import contextmanager
+
+    import atom.plugin.rtpllm.models.qwen4_exp as qwen4_module
+    from atom.utils import forward_context as forward_context_module
+
+    runtime = object.__new__(_ATOMQwen4ExpMTPRuntime)
+    runtime._rtp_model_config = SimpleNamespace(hidden_size=2, hc_mult=1)
+    runtime._rtp_layer_maps = ({}, {}, {})
+    runtime._cg_max_seq_len = 32
+    runtime._get_model_device = lambda: torch.device("cpu")
+    runtime._extract_positions = lambda *args: torch.tensor([3], dtype=torch.int32)
+    runtime._graph_buffers_for_inputs = lambda *_: None
+    context = SimpleNamespace(is_draft=False)
+    monkeypatch.setattr(
+        forward_context_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(context=context),
+    )
+
+    @contextmanager
+    def bind(**kwargs):
+        yield
+
+    runtime._rtp_forward_context_cls = SimpleNamespace(bind=bind)
+
+    class Draft:
+        atom_config = SimpleNamespace()
+
+        def __call__(self, ids, positions, hc_input):
+            assert context.is_draft
+            assert positions.tolist() == [4]
+            return hc_input
+
+        def _head_input(self, hc):
+            return hc
+
+    runtime.model = Draft()
+    monkeypatch.setattr(qwen4_module, "PyModelOutputs", lambda mixed, hc: (mixed, hc))
+    inputs = SimpleNamespace(
+        input_ids=torch.tensor([1], dtype=torch.int32),
+        input_hiddens=torch.ones(1, 2),
+        attention_inputs=SimpleNamespace(is_cuda_graph=False),
+    )
+    runtime.forward(inputs)
+    assert context.is_draft
+
+
 def test_qwen4_exp_target_forward_restores_its_atom_config(monkeypatch):
     from atom import config as atom_config_module
     from atom.config import get_current_atom_config, set_current_atom_config
@@ -518,7 +597,14 @@ def test_qwen4_exp_graph_uses_refreshed_device_sequence_lengths(monkeypatch):
 
 @pytest.mark.parametrize("is_draft", [False, True])
 def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draft):
-    def init_with_narrow_decode_bucket(self, *args, **kwargs):
+    def init_with_narrow_decode_bucket(
+        self,
+        model_config,
+        parallelism_config=None,
+        weights=None,
+        max_generate_batch_size=None,
+        **kwargs,
+    ):
         torch.nn.Module.__init__(self)
         self.model = torch.nn.Module()
         self._cg_max_num_tokens = 4
@@ -530,6 +616,22 @@ def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draf
         SimpleNamespace(atom_qwen4_exp_mtp_target=not is_draft, is_mtp=is_draft),
         max_generate_batch_size=8,
     )
+    assert runtime._cg_max_num_tokens == 8
+
+
+def test_qwen4_exp_mtp_graph_capacity_uses_bound_positional_argument(monkeypatch):
+    def init_with_narrow_decode_bucket(
+        self, model_config, parallelism, weights, max_generate_batch_size, **kwargs
+    ):
+        torch.nn.Module.__init__(self)
+        self.model = torch.nn.Module()
+        self.max_generate_batch_size = max_generate_batch_size
+        self._cg_max_num_tokens = 4
+
+    monkeypatch.setattr(
+        _ATOMQwen35MoeRuntime, "__init__", init_with_narrow_decode_bucket
+    )
+    runtime = _ATOMQwen4ExpRuntime(SimpleNamespace(is_mtp=True), None, None, 8)
     assert runtime._cg_max_num_tokens == 8
 
 
@@ -660,8 +762,19 @@ def test_qwen4_exp_mtp_graph_target_slots(draft_steps):
     lengths = torch.tensor([17, 32, 2, 1, 97], dtype=torch.int32, device=device)
     reads = torch.empty((5, width), dtype=torch.int32, device=device)
     writes = torch.empty_like(reads)
+    invalid_live_rows = torch.zeros((), dtype=torch.int32, device=device)
     _target_verify_state_slots_graph_kernel[(1,)](
-        table, lengths, reads, writes, 5, *table.stride(), 5, 16, width, 128
+        table,
+        lengths,
+        reads,
+        writes,
+        invalid_live_rows,
+        5,
+        *table.stride(),
+        5,
+        16,
+        width,
+        128,
     )
     assert reads.cpu().tolist() == [
         [10] * width,
@@ -677,6 +790,22 @@ def test_qwen4_exp_mtp_graph_target_slots(draft_steps):
         [0] * width,
         [0] * width,
     ]
+    assert invalid_live_rows.item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_mtp_graph_counts_invalid_real_rows_not_padding():
+    device = torch.device("cuda")
+    table = torch.tensor([[5, 6], [0, 0]], device=device, dtype=torch.int32)
+    lengths = torch.tensor([32, 32], device=device, dtype=torch.int32)
+    reads = torch.empty((2, 3), device=device, dtype=torch.int32)
+    writes = torch.empty_like(reads)
+    counter = torch.zeros((), device=device, dtype=torch.int32)
+    _target_verify_state_slots_graph_kernel[(1,)](
+        table, lengths, reads, writes, counter, 2, *table.stride(), 2, 16, 3, 128
+    )
+    assert counter.item() == 1
+    assert writes.cpu().tolist() == [[6, 0, 0], [0, 0, 0]]
 
 
 def test_qwen4_exp_graph_marks_both_cache_tags(monkeypatch):
@@ -797,7 +926,7 @@ def test_qwen4_exp_mtp_graph_prewarms_verify_window(monkeypatch, draft_steps):
     assert buffers["target_read_slots_i32"].shape == (3, width)
     assert buffers["target_write_slots_i32"].shape == (3, width)
     assert buffers["block_table_i32"].shape == (3, 3 + draft_steps)
-    assert buffers["physical_block_table_i32"].shape == (3 * width, 2 + width)
+    assert buffers["physical_block_table_i32"].shape == (3, 2 + width)
 
 
 @pytest.mark.parametrize("draft_steps", [1, 2, 3])

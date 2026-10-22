@@ -133,11 +133,14 @@ def _prepare_model_atom_rtpllm(
         atom_config.quant_config.remap_layer_name(
             atom_config.hf_config,
             packed_modules_mapping=packed,
-            weights_mapper=WeightsMapper(
-                orig_to_new_prefix=(
-                    {"mtp.": "model."}
-                    if is_mtp
-                    else {"model.language_model.": "model."}
+            # The draft modules themselves are named mtp.*. Rewriting their
+            # quant exclusions to model.* makes FP8-disabled checkpoint
+            # layers miss the exclusion and load BF16 weights as FP8.
+            weights_mapper=(
+                None
+                if is_mtp
+                else WeightsMapper(
+                    orig_to_new_prefix={"model.language_model.": "model."}
                 )
             ),
             quant_exclude_name_mapping=getattr(

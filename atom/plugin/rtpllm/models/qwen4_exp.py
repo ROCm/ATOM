@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -40,20 +41,26 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
     def __init__(self, model_config: ModelConfig, *args, **kwargs) -> None:
         from atom.plugin.rtpllm.utils.qwen4_exp_context import RTPQwen4ExpContext
 
+        # Bind by the parent's parameter name, not a positional offset. The
+        # runtime base does not retain max_generate_batch_size as an attribute.
+        bound = inspect.signature(_ATOMQwen35MoeRuntime.__init__).bind(
+            self, model_config, *args, **kwargs
+        )
+        max_batch = bound.arguments.get("max_generate_batch_size")
         self._rtp_forward_context_cls = RTPQwen4ExpContext
         super().__init__(model_config, *args, **kwargs)
         self._rtp_model_config = model_config
         if getattr(model_config, "atom_qwen4_exp_mtp_target", False) or getattr(
             model_config, "is_mtp", False
         ):
-            # RTP's MTP target/draft warmup uses the request capacity, which
-            # can exceed the largest decode capture bucket. Reserve metadata
-            # for that full batch before either graph is captured.
-            max_batch = kwargs.get("max_generate_batch_size")
-            if max_batch is None and len(args) >= 3:
-                max_batch = args[2]
-            if max_batch is not None:
-                self._cg_max_num_tokens = max(self._cg_max_num_tokens, int(max_batch))
+            # Text and vision MTP both need the full request capacity, which
+            # can exceed the largest decode capture bucket.
+            if max_batch is None:
+                raise ValueError("Qwen4Exp MTP request capacity was not provided")
+            max_batch = int(max_batch)
+            if max_batch <= 0:
+                raise ValueError("Qwen4Exp MTP requires positive request capacity")
+            self._cg_max_num_tokens = max(self._cg_max_num_tokens, max_batch)
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
@@ -125,7 +132,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 int(self._cg_max_seq_len) + physical_block_size - 1
             ) // physical_block_size + num_tokens // max_batch
             graph_buffers["physical_block_table_i32"] = torch.empty(
-                num_tokens,
+                max_batch,
                 max_physical_blocks,
                 device=device,
                 dtype=torch.int32,
@@ -174,6 +181,11 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             mtp_buffers[name] = torch.empty(max_tokens, device=device, dtype=dtype)
         add_qsa_buffers(mtp_buffers, max_tokens)
         if is_target:
+            # Replays accumulate invalid *real* rows on device without a
+            # host sync; graph padding (reserved block 0) is not counted.
+            mtp_buffers["target_invalid_live_rows"] = torch.zeros(
+                (), device=device, dtype=torch.int32
+            )
             mtp_buffers["target_read_slots_i32"] = torch.empty(
                 (max_batch, mtp_tokens_per_request), device=device, dtype=torch.int32
             )
@@ -278,6 +290,15 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 features,
                 inputs.multimodal_inputs.mm_features_locs,
             )
+            # RTP uses out-of-vocabulary placeholders for image patch rows.
+            # Embeddings are replaced above, but PLE also hashes input_ids and
+            # persists its n-gram history across decode steps. Match ATOM's
+            # canonical image token there without altering RTP's input tensor.
+            input_ids = self._canonical_vision_input_ids(
+                input_ids,
+                features,
+                inputs.multimodal_inputs.mm_features_locs,
+            )
 
         with self._rtp_forward_context_cls.bind(
             model=self.model,
@@ -308,6 +329,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             return replicated_embedding(input_ids, self.model.embed_tokens.weight)
         return self.model.embed_input_ids(input_ids)
 
+    def _canonical_vision_input_ids(self, input_ids, features, locations):
+        image_token_id = int(self.model.atom_config.hf_config.image_token_id)
+        canonical = input_ids.clone()
+        locs = locations.to(device="cpu", dtype=torch.long).view(-1).tolist()
+        if len(locs) != len(features):
+            raise ValueError("Qwen4Exp vision feature locations do not match features")
+        for feature, loc in zip(features, locs):
+            if feature is not None and feature.numel():
+                canonical.narrow(0, loc, feature.shape[0]).fill_(image_token_id)
+        return canonical
+
     def get_mtp_target_hidden_states(self, num_tokens: int):
         hidden = getattr(self, "_mtp_target_hidden_states", None)
         if hidden is None:
@@ -317,8 +349,8 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return hidden if num_tokens < 0 else hidden[:num_tokens]
 
     def _extract_positions(self, inputs, model_device, token_num):
-        # The draft consumes target HC states, not image patches; keep its
-        # existing MTP position stream even when the checkpoint is multimodal.
+        # The draft consumes target HC states, but its QSA cache still uses
+        # logical token positions. MRoPE's T row can differ after an image.
         is_multimodal = bool(
             getattr(
                 getattr(
@@ -327,7 +359,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 "is_multimodal",
                 False,
             )
-        ) and not bool(getattr(self._rtp_model_config, "is_mtp", False))
+        )
         attn_inputs = inputs.attention_inputs
         is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
         is_mtp_draft_prefill = bool(
@@ -382,7 +414,22 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 raise RuntimeError("Qwen4Exp MTP Graph requires prewarmed positions")
             return lengths.to(device=model_device, dtype=torch.int32) - 1
         if is_multimodal:
-            logical = self._logical_positions(attn_inputs, model_device)
+            if is_mtp_draft_prefill:
+                starts = attn_inputs.prefix_lengths_device
+                width = int(self._rtp_model_config.gen_num_per_cycle) + 1
+                if starts is not None and starts.numel() * width == token_num:
+                    logical = (
+                        starts.to(device=model_device, dtype=torch.int32)[:, None]
+                        + torch.arange(width, device=model_device, dtype=torch.int32)[
+                            None, :
+                        ]
+                    ).reshape(-1)
+                else:
+                    # Initial MTP prompt prefill is ragged, not a fixed
+                    # verification window. Use actual per-request lengths.
+                    logical = self._logical_positions(attn_inputs, model_device)
+            else:
+                logical = self._logical_positions(attn_inputs, model_device)
             if logical is None or logical.numel() != token_num:
                 raise ValueError(
                     "Qwen4Exp requires one logical cache position per token"
@@ -422,6 +469,9 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
     @staticmethod
     def _rope_positions(inputs, model_device, token_num):
         attn_inputs = inputs.attention_inputs
+        # RTP's CudaGraphRunner::updateInputs explicitly copies the live
+        # combo_position_ids into the captured buffer before every replay.
+        # Unlike its BERT position buffer, these MRoPE rows are not frozen.
         positions = getattr(attn_inputs, "combo_position_ids", None)
         if positions is None or positions.numel() == 0:
             positions = getattr(inputs, "combo_position_ids", None)
@@ -721,7 +771,9 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
             # QSA cache slots use the RTP logical position; the draft's RoPE
             # rotates one token ahead, as in ATOM's standalone/SGLang MTP.
             from atom.config import use_custom_atom_config
+            from atom.utils.forward_context import get_forward_context
 
+            get_forward_context().context.is_draft = True
             with use_custom_atom_config(self.model.atom_config):
                 hc = self.model(input_ids, positions + 1, hc_input)
         hc = hc.flatten(1)
@@ -780,8 +832,9 @@ class ATOMQwen4ExpMTP(ATOMQwen4Exp):
             torch.set_default_dtype(self.model_config.compute_dtype)
             _set_framework_backbone("rtpllm")
             atom_model = prepare_model(config=self, engine="rtpllm").to(device)
-            # The checkpoint has only one embedding and head. Share the target's
-            # parameters before loading mtp.* so no duplicate HBM is allocated.
+            # Share the target's embedding and head before loading mtp.*.
+            # prepare_model already constructed temporary draft parameters,
+            # so this avoids persistent duplicates, not peak load-time HBM.
             atom_model.model.embed_tokens.weight = target.model.embed_tokens.weight
             atom_model.lm_head.weight = target.lm_head.weight
             # The draft owns physical RTP cache layer 0; its checkpoint layer

@@ -96,6 +96,8 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
         if batch_size <= 0 or num_tokens % batch_size:
             raise ValueError("invalid Qwen4Exp MTP target-verify token count")
         query_len = num_tokens // batch_size
+        # RTP normalizes input_lengths to host int32 before calling the plugin;
+        # this is not a device-to-host transfer on the verify hot path.
         if query_len not in (2, 3, 4) or any(
             int(length) != query_len for length in attn_inputs.input_lengths.tolist()
         ):
@@ -124,6 +126,7 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 seq_lens,
                 read_slots,
                 write_slots,
+                cg_bufs["target_invalid_live_rows"],
                 batch_size,
                 block_table.stride(0),
                 block_table.stride(1),
@@ -149,15 +152,14 @@ class RTPQwen4ExpContext(RTPForwardQwen35HybridContext):
                 seq_size_per_block,
                 rounding_mode="floor",
             )[:, None] + torch.arange(query_len, device=block_table.device)
-            if bool(
-                torch.any((read_col < 0) | (read_col >= block_table.shape[1])).item()
-            ) or bool(torch.any(write_cols >= block_table.shape[1]).item()):
+            invalid_columns = (read_col < 0) | (read_col >= block_table.shape[1])
+            invalid_columns |= torch.any(write_cols >= block_table.shape[1], dim=1)
+            if bool(torch.any(invalid_columns).item()):
                 raise ValueError("Qwen4Exp MTP target-verify block table is too narrow")
             read_slots = block_table[rows[:, 0], read_col]
             write_slots = block_table[rows, write_cols]
-            if bool(torch.any(read_slots < 0).item()) or bool(
-                torch.any(write_slots < 0).item()
-            ):
+            invalid_slots = (read_slots < 0) | torch.any(write_slots < 0, dim=1)
+            if bool(torch.any(invalid_slots).item()):
                 raise ValueError("Qwen4Exp MTP target-verify state block is invalid")
             sequence_masks = torch.ones(
                 batch_size, device=block_table.device, dtype=torch.bool
