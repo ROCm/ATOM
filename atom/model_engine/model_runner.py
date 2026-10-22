@@ -142,7 +142,9 @@ support_model_arch_dict = {
     "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGenerationVL"
+    ),
     "Glm5NextForConditionalGeneration": (
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
