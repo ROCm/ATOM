@@ -1,4 +1,8 @@
-"""Unit tests for HIP xgrammar vocab-mask Torch fallback."""
+"""Unit tests for HIP xgrammar vocab-mask Torch fallback.
+
+Lives under ``tests/`` (not ``tests/plugin/``) so Pre Checkin's
+``run_unit_tests.sh`` picks it up: that script ``--ignore=tests/plugin``.
+"""
 
 from __future__ import annotations
 
@@ -37,3 +41,17 @@ def test_apply_bitmask_torch_gpu_with_indices():
     # Untouched rows stay zero.
     assert torch.all(logits[0] == 0)
     assert torch.all(logits[2] == 0)
+
+
+def test_apply_bitmask_torch_gpu_masks_logits_beyond_bitmask():
+    # logits padded past bitmask coverage must be -inf (not left finite).
+    logits = torch.zeros(1, 40, dtype=torch.float32)
+    bitmask = torch.zeros(1, 1, dtype=torch.int32)
+    bitmask[0, 0] = 1 << 0  # only token 0 allowed in the first 32
+
+    _apply_bitmask_torch_gpu(logits, bitmask)
+
+    assert logits[0, 0] == 0
+    assert torch.isneginf(logits[0, 1])
+    assert torch.isneginf(logits[0, 32])
+    assert torch.isneginf(logits[0, 39])

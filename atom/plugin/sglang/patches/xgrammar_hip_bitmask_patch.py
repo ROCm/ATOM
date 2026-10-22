@@ -12,9 +12,12 @@ CPU xgrammar apply also rejects device logits.
 
 This patch replaces the HIP binding with a pure-Torch GPU apply
 (packed int32 bitmask → ``masked_fill_(-inf)``), matching the CUDA
-semantic without the broken native/Triton launches.
+semantic without the broken native/Triton launches. Logits past the
+bitmask coverage are also set to ``-inf`` so padded vocab slots cannot
+be sampled.
 
-Disable with ``ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK=0``.
+Disable with ``ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK=0``
+(legacy alias ``ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK`` still honored).
 """
 
 from __future__ import annotations
@@ -30,7 +33,14 @@ _BITS_PER_BLOCK = 32
 
 
 def _env_enabled() -> bool:
-    return os.environ.get("ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK", "1") != "0"
+    # Prefer the Torch-named flag; keep the old Triton-named alias.
+    for name in (
+        "ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK",
+        "ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK",
+    ):
+        if name in os.environ:
+            return os.environ[name] != "0"
+    return True
 
 
 def _apply_bitmask_torch_gpu(
@@ -63,12 +73,15 @@ def _apply_bitmask_torch_gpu(
         bitmask_rows = bitmask_2d
         indices = None
 
-    vocab_size = min(logits_rows.shape[-1], bitmask_rows.shape[-1] * _BITS_PER_BLOCK)
+    covered = min(logits_rows.shape[-1], bitmask_rows.shape[-1] * _BITS_PER_BLOCK)
     bit_ids = torch.arange(_BITS_PER_BLOCK, device=logits.device, dtype=torch.int32)
     # bitmask bit==0 → masked (set to -inf), same as upstream Triton/xgrammar.
     expanded = ((bitmask_rows.unsqueeze(-1) >> bit_ids) & 1) == 0
-    mask = expanded.reshape(bitmask_rows.shape[0], -1)[:, :vocab_size]
-    logits_rows[:, :vocab_size].masked_fill_(mask, float("-inf"))
+    mask = expanded.reshape(bitmask_rows.shape[0], -1)[:, :covered]
+    logits_rows[:, :covered].masked_fill_(mask, float("-inf"))
+    # Padded logits beyond the bitmask must stay unsampleable.
+    if covered < logits_rows.shape[-1]:
+        logits_rows[:, covered:].fill_(float("-inf"))
 
     if indices is not None:
         logits_2d.index_copy_(0, indices, logits_rows)
