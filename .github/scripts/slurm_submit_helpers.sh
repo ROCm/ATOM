@@ -433,6 +433,7 @@ monitor_slurm_job() {
   local job_id="$1"
   local job_line result state current_job_id elapsed nodes reason
   local missing_queries=0 unknown_since=0 now
+  local running_since=0 startup_confirmed=0 startup_timeout
   SLURM_CONFIRMED_RESULT=""
   OUT_LINE=0
   ERR_LINE=0
@@ -466,6 +467,23 @@ monitor_slurm_job() {
       # Includes PENDING, RUNNING, COMPLETING, SUSPENDED and requeue states.
       unknown_since=0
       missing_queries=0
+      # A RUNNING job whose batch script never started its workload otherwise
+      # holds the allocation until the time limit.
+      if [[ -n "${SLURM_STARTUP_PROGRESS_CHECK:-}" && "${startup_confirmed}" -eq 0 &&
+            "${state%%+*}" == RUNNING ]]; then
+        now="$(date +%s)"
+        startup_timeout="${SLURM_STARTUP_TIMEOUT:-900}"
+        if [[ "${running_since}" -eq 0 ]]; then
+          running_since="${now}"
+        fi
+        if "${SLURM_STARTUP_PROGRESS_CHECK}" "${job_id}"; then
+          startup_confirmed=1
+        elif [[ $((now - running_since)) -ge "${startup_timeout}" ]]; then
+          echo "ERROR: Slurm job ${job_id} has been RUNNING for ${startup_timeout}s without starting its workload; cancelling it" >&2
+          run_scancel "${job_id}"
+          startup_confirmed=1
+        fi
+      fi
     else
       now="$(date +%s)"
       if [[ "${unknown_since}" -eq 0 ]]; then

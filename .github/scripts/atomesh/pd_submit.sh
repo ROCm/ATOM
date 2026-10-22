@@ -254,8 +254,8 @@ exports = {
     "SWEBENCH_MAX_WORKERS": "" if accuracy.get("max_workers") is None else accuracy.get("max_workers"),
     "SWEBENCH_EVAL_TIMEOUT": "" if accuracy.get("instance_timeout") is None else accuracy.get("instance_timeout"),
     "SLURM_SUBMIT_RUNNER": slurm_submit_runner,
-    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-frameworks"),
-    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-frameworks"),
+    "SLURM_ACCOUNT": "amd-aifw-dev" if is_crusoe_v2 else runner.get("slurm_account", "amd-atom"),
+    "SLURM_PARTITION": "" if is_crusoe_v2 else runner.get("slurm_partition", "amd-spur"),
     "SLURM_QOS": "amd-aifw-dev-qos" if is_crusoe_v2 else runner.get("slurm_qos", ""),
     "SLURM_CPUS_PER_TASK": runner.get("cpus_per_task", 114),
     "SLURM_GPUS_PER_NODE": runner.get("gpus_per_node", 8),
@@ -387,10 +387,18 @@ stream_spur_shared_logs_once() {
   shopt -u nullglob
 }
 
+# Each Spur worker publishes rank-workload-* on entry and rank-rc-* on exit.
+spur_workers_started() {
+  compgen -G "${LOG_ROOT}/slurm_job-$1/rank-workload-*.json" >/dev/null ||
+    compgen -G "${LOG_ROOT}/slurm_job-$1/rank-rc-*" >/dev/null
+}
+
 # Every Spur worker writes container output to shared storage, regardless of
 # runner label. Stream it from the submitter rather than through Spur RPCs.
 if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once
+  SLURM_STARTUP_PROGRESS_CHECK=spur_workers_started
+  SLURM_STARTUP_TIMEOUT="${ATOMESH_SPUR_STARTUP_TIMEOUT:-900}"
 fi
 install_slurm_cancel_traps
 
@@ -550,8 +558,8 @@ if [[ "${USES_SPUR_CONTROLLER}" == "1" ]]; then
   python3 "${REPO_ROOT}/.github/scripts/atomesh/pd_job_result.py" resolve \
     --run-dir "${SLURM_STATUS_DIR}" --job-id "${JOB_ID}" \
     --run-token "${ATOMESH_RUN_TOKEN}" --num-ranks "${NUM_NODES}" \
-    --scheduler-state "${SLURM_STATE}" --scheduler-exit-code "${SLURM_EXIT_CODE}" \
-    --scheduler-rc "${SLURM_JOB_RC}" --spur 1
+    --scheduler-state="${SLURM_STATE}" --scheduler-exit-code="${SLURM_EXIT_CODE}" \
+    --scheduler-rc="${SLURM_JOB_RC}" --spur 1
   SBATCH_RC=$?
   set -e
 fi
