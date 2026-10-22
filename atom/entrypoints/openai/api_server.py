@@ -19,6 +19,7 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import gc
 import json
 import logging
 import os
@@ -1560,6 +1561,35 @@ async def _reclaim_watch_once() -> None:
 # monotonic time of the monitor's last wake-up (read by the block sampler).
 _loop_probe = {"tmpl_s": 0.0, "beat": 0.0}
 
+# Collections per generation since the last LOOP report: count, seconds,
+# longest. Whatever thread triggers one holds the GIL throughout, so each is a
+# loop stall, and one started from C code (uvloop) shows no Python frame to
+# the block sampler.
+_gc_probe = {"t0": 0.0, "n": [0, 0, 0], "s": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]}
+
+
+def _gc_timing_callback(phase: str, info: dict) -> None:
+    if phase == "start":
+        _gc_probe["t0"] = time.perf_counter()
+        return
+    gen = info.get("generation")
+    if gen not in (0, 1, 2):
+        return
+    dt = time.perf_counter() - _gc_probe["t0"]
+    _gc_probe["n"][gen] += 1
+    _gc_probe["s"][gen] += dt
+    _gc_probe["max"][gen] = max(_gc_probe["max"][gen], dt)
+
+
+def _take_gc_probe() -> str:
+    def ms(xs: list[float]) -> str:
+        return "/".join(f"{x * 1e3:.1f}" for x in xs)
+
+    n = "/".join(str(x) for x in _gc_probe["n"])
+    out = f"gc_n={n} gc_ms={ms(_gc_probe['s'])} gc_max_ms={ms(_gc_probe['max'])}"
+    _gc_probe.update(n=[0, 0, 0], s=[0.0, 0.0, 0.0], max=[0.0, 0.0, 0.0])
+    return out
+
 
 async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
     """Log how late this loop wakes from a ``tick`` sleep, every ``window``."""
@@ -1578,7 +1608,7 @@ async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
         n = len(lags)
         logger.info(
             "[PD-TIMING] ev=LOOP t=%.3f window_s=%.1f n=%d p50_ms=%.1f "
-            "p99_ms=%.1f max_ms=%.1f blocked20_s=%.2f tmpl_s=%.2f",
+            "p99_ms=%.1f max_ms=%.1f blocked20_s=%.2f tmpl_s=%.2f %s",
             time.time(),
             now - start,
             n,
@@ -1587,6 +1617,7 @@ async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
             lags[-1] * 1e3,
             sum(x for x in lags if x > 0.02),
             _loop_probe["tmpl_s"],
+            _take_gc_probe(),
         )
         lags.clear()
         _loop_probe["tmpl_s"] = 0.0
@@ -1726,6 +1757,7 @@ async def lifespan(app: FastAPI):
         )
     ]
     if pd_timing.enabled():
+        gc.callbacks.append(_gc_timing_callback)
         _background_tasks.append(
             asyncio.create_task(_loop_lag_monitor(), name="_loop_lag_monitor")
         )
