@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, Optional, Union
 
 import torch
 
@@ -37,7 +36,7 @@ def _env_enabled() -> bool:
 def _apply_bitmask_torch_gpu(
     logits: torch.Tensor,
     bitmask: torch.Tensor,
-    indices: Optional[Union[List[int], torch.Tensor]] = None,
+    indices: list[int] | torch.Tensor | None = None,
 ) -> None:
     """Apply packed int32 token bitmask on GPU via Torch (HIP-safe)."""
 
