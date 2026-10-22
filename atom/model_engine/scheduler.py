@@ -33,11 +33,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from atom.config import Config
-from atom.kv_transfer.disaggregation import (
-    KVConnectorOutput,
-    kv_config_has_consumer,
-    kv_config_has_producer,
-)
+from atom.kv_transfer.disaggregation import KVConnectorOutput, kv_config_has_producer
 from atom.metrics.scheduler import SchedulerMetrics
 from atom.model_engine.block_manager import BlockManager, draft_kv_lookahead
 from atom.model_engine.dynamic_chunking import (
@@ -634,16 +630,6 @@ class Scheduler:
         self.block_manager = BlockManager(
             config,
             state_runtime=state_runtime,
-        )
-        # A P/D consumer receives state by RDMA into slots the previous
-        # tenant's in-flight step may still write (`release_held_state_slots`).
-        # Not under pipeline parallelism: deferred output is off there
-        # (`tokenIDProcessor.is_deferred_out`), so a finished request has no
-        # forward still in flight, and the PP head runs its own loop.
-        self.block_manager.state_release_lag = (
-            kv_config_has_consumer(getattr(config, "kv_transfer_config", None))
-            and self.block_manager.num_state_slots > 0
-            and getattr(config, "pipeline_parallel_size", 1) == 1
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -3930,12 +3916,6 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # Slots freed one step ago are safe once a forward read its
-        # predecessor's output; a middle prefill chunk read nothing.
-        if self.block_manager.state_release_lag and (
-            batch is None or batch.produces_output()
-        ):
-            self.block_manager.release_held_state_slots()
         # Remember which seqs were already in the middle of chunked prefill
         # before this postprocess call mutates seq.is_partial_prefill below.
         #

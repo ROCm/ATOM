@@ -222,11 +222,13 @@ is admitted (MoRI-IO is refused), and `kv_role` must be explicit on both sides.
 Prefill and decode must run the same model and spec config: the producer
 refuses a consumer whose slot size differs (DSpark widens the rings).
 
-A P/D consumer holds a finished request's state slot until the next
-postprocess before reusing it (all models): with deferred output the step
-after a request's last one is still running and writes its slot, and an RDMA
-into that slot is ordered against no stream. Without this, 4% of
-DeepSeek-V4-Flash transfers (53 of 1319) arrived partly overwritten.
+A Mooncake consumer asks the producer to write only after its own device has
+finished everything already launched (all models): with deferred output the
+step after a request's last one is still running and writes the slot and
+blocks it just freed, and an RDMA into them is ordered against no stream.
+Without this, 4% of DeepSeek-V4-Flash transfers (53 of 1319) arrived partly
+overwritten. The wait runs off the engine loop and adds about one decode step
+to TTFT.
 
 Validated 1P1D: each side one TP2 instance on MI355X, DeepSeek-V4.1-Flash-1017,
 bf16 KV, fp4 index, decoder and encoder SWA bounded replay on, DSpark 5.

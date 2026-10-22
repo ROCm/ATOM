@@ -477,14 +477,12 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
-            self._release_held_state_slots_when_idle()
             self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            self._release_held_state_slots_when_idle()
             self._advance_idle_kv_transfer()
             return False
 
@@ -519,9 +517,6 @@ class EngineCore:
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
-            # Admission can fail because every state slot is held, which yields
-            # an empty batch rather than None; no forward will release them.
-            self._release_held_state_slots_when_idle()
             return False
 
         seqs = seqs.values()
@@ -580,20 +575,6 @@ class EngineCore:
         if connector is None or not hasattr(connector, "has_pending_work"):
             return False
         return bool(connector.has_pending_work())
-
-    def _release_held_state_slots_when_idle(self) -> None:
-        """No forward ran this tick, so none will report completion: wait for
-        the device and hand back the state slots a P/D consumer is holding
-        (`BlockManager.release_held_state_slots`). Without this a pool whose
-        every slot is held -- one slot under `--max-num-seqs 1` -- would admit
-        nothing and never run the forward that releases them."""
-        bm = getattr(self.scheduler, "block_manager", None)
-        if bm is None or not getattr(bm, "state_release_lag", False):
-            return
-        if not bm.has_held_state_slots:
-            return
-        self.runner_mgr.call_func("drain_device", wait_out=True)
-        bm.release_held_state_slots()
 
     def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may
@@ -1473,11 +1454,9 @@ class DecodeEngineCore(EngineCore):
         result = self.scheduler.schedule()
         if result is None:
             # Sequences exist but are still waiting for PrefillDone — spin.
-            self._release_held_state_slots_when_idle()
             return False
         scheduled_batch, seqs = result
         if scheduled_batch is None:
-            self._release_held_state_slots_when_idle()
             return False
         self.scheduler.metrics.record_forward(scheduled_batch, seqs)
         t0 = time.perf_counter()

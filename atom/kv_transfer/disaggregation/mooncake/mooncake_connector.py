@@ -975,6 +975,17 @@ class MooncakeConnector(KVConnectorBase):
                 initializer=torch.cuda.set_device,
                 initargs=(self._cuda_device,),
             )
+        else:
+            # Consumer: one thread, so write requests leave in issue order
+            # (`_post_write_requests`); a send it fails is raised on the engine
+            # thread at the next `get_finished`, as it was when sent inline.
+            self._write_request_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="mooncake-write-request",
+                initializer=torch.cuda.set_device,
+                initargs=(self._cuda_device,),
+            )
+            self._write_request_error: BaseException | None = None
 
         # --- ZMQ for metadata exchange ---
         self.zmq_context = zmq.Context()
@@ -1499,6 +1510,7 @@ class MooncakeConnector(KVConnectorBase):
             metadata.request_id_to_transfer_id,
         )
 
+        write_requests: list[tuple[str, list[bytes]]] = []
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_tp_size = meta.tp_size
             if remote_tp_size != self.tp_size:
@@ -1671,12 +1683,14 @@ class MooncakeConnector(KVConnectorBase):
                             meta.transfer_id,
                             self.tp_size,
                         )
-                self._send_on_socket(
-                    remote_addr,
-                    [MSG_WRITE_REQUEST, stage_requests.get(stage, write_request)],
+                write_requests.append(
+                    (
+                        remote_addr,
+                        [MSG_WRITE_REQUEST, stage_requests.get(stage, write_request)],
+                    )
                 )
                 logger.debug(
-                    "[CONSUMER] write_request sent for req %s (transfer_id=%s) "
+                    "[CONSUMER] write_request queued for req %s (transfer_id=%s) "
                     "to stage %d/%d at %s, off=%d, dst_block_ids=%s",
                     req_id,
                     meta.transfer_id,
@@ -1686,6 +1700,29 @@ class MooncakeConnector(KVConnectorBase):
                     off,
                     dst_block_ids[:10],
                 )
+        if write_requests:
+            self._write_request_executor.submit(
+                self._post_write_requests, write_requests
+            )
+
+    def _post_write_requests(self, write_requests: list) -> None:
+        """Let the producer write only once this device has run everything
+        already launched on it.
+
+        A slot or block handed to a new request may have just been freed by
+        one whose last forward is still running -- with deferred output the
+        engine learns a request finished one forward late -- and that forward
+        writes it. The producer's RDMA is ordered against no stream here, so
+        it could land first and be overwritten. Waiting off the engine loop
+        costs the new request about one step of TTFT and stalls nothing else.
+        """
+        try:
+            torch.cuda.synchronize(self._cuda_device)
+            for addr, parts in write_requests:
+                self._send_on_socket(addr, parts)
+        except Exception as e:
+            logger.exception("[CONSUMER] failed to post write requests")
+            self._write_request_error = e
 
     # -----------------------------------------------------------------
     # Send worker streams
@@ -1709,6 +1746,10 @@ class MooncakeConnector(KVConnectorBase):
 
     def get_finished(self) -> KVConnectorOutput:
         """Return send/recv completion status and clear internal sets."""
+        if not self.is_producer and self._write_request_error is not None:
+            raise RuntimeError(
+                "Mooncake consumer could not post a write request"
+            ) from self._write_request_error
         if self._mla_landing is not None:
             self._mla_landing.sweep()
         self._expire_pending_recvs()

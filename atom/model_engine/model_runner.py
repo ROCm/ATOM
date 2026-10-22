@@ -3437,14 +3437,6 @@ class ModelRunner:
         if callable(callback):
             callback(req_ids)
 
-    def drain_device(self) -> bool:
-        """Wait until every queued forward on every TP rank has finished."""
-        torch.cuda.synchronize()
-        tp = get_tp_group()
-        if tp.world_size > 1:
-            torch.distributed.barrier(group=tp.cpu_group)
-        return True
-
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor

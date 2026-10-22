@@ -472,6 +472,18 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
                 request_id_to_transfer_id={"r0": 9}, reqs_to_recv={"r0": meta}
             )
         )
+        # Nothing goes out on the engine thread: the request is posted by the
+        # write-request worker, and only after the device has drained.
+        conn._send_on_socket.assert_not_called()
+        post, queued = conn._write_request_executor.submit.call_args.args
+        order = []
+        conn._send_on_socket.side_effect = lambda *a: order.append("send")
+        monkeypatch.setattr(
+            mc.torch.cuda, "synchronize", lambda *a: order.append("synchronize")
+        )
+        post(queued)
+        assert order == ["synchronize", "send"]
+        assert conn._write_request_error is None
         addr, (_, payload) = conn._send_on_socket.call_args.args
         request = mc.msgpack.loads(payload)
         assert addr == "tcp://10.19.0.113:6301"
@@ -479,6 +491,12 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
         assert request["consumer_rpc_port"] == 16578
         assert request["notify_host"] == host_ip
         assert request["notify_port"] == 42000
+
+        # A post that fails off-thread surfaces on the engine thread.
+        conn._send_on_socket.side_effect = OSError("unreachable")
+        post(queued)
+        with pytest.raises(RuntimeError, match="could not post a write request"):
+            conn.get_finished()
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():

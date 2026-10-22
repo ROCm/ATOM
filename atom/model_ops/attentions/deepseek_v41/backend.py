@@ -480,9 +480,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # and STATE bytes, as DeepSeek-V4's compressed cache does.
         tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
         # The STATE slot travels as one slot-indexed region the connector
-        # writes straight across (`src_slot * unit` to `dst_slot * unit`). Its
-        # ordering against the consumer's in-flight step for the slot's
-        # previous tenant is the scheduler's (`release_held_state_slots`).
+        # writes straight across (`src_slot * unit` to `dst_slot * unit`). The
+        # consumer posts the write only once its device ran the in-flight step
+        # of the slot's previous tenant (`MooncakeConnector._post_write_requests`).
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
         state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
