@@ -135,8 +135,10 @@ class SlotPool:
 
     ``acquire`` waits on a condition until a slot is free. Every holder
     releases its slot once the copy or RDMA write using it returned, so the
-    wait always ends. The consumer staging rows, the DSA index staging slots
-    and the MLA staging slots each keep one.
+    wait always ends -- unless the holder's transfer was never started, which
+    ``fail`` reports: waiters then raise instead of waiting forever. The
+    consumer staging rows, the DSA index staging slots and the MLA staging
+    slots each keep one.
     """
 
     def __init__(self, size: int = 0, exhausted_warning: str | None = None) -> None:
@@ -145,13 +147,25 @@ class SlotPool:
         # Logged with ``size`` whenever a caller has to wait.
         self._exhausted_warning = exhausted_warning
         self._cv = threading.Condition()
+        self._failure: BaseException | None = None
 
     def acquire(self) -> int:
         with self._cv:
             if not self.free and self._exhausted_warning:
                 logger.warning(self._exhausted_warning, self.size)
-            self._cv.wait_for(lambda: self.free)
+            self._cv.wait_for(lambda: self.free or self._failure is not None)
+            if self._failure is not None:
+                raise RuntimeError(
+                    "staging row unavailable: a transfer holding one failed"
+                ) from self._failure
             return self.free.pop()
+
+    def fail(self, exc: BaseException) -> None:
+        """Wake every waiter with ``exc``. Rows stay held: a transfer that was
+        partly posted may still write them."""
+        with self._cv:
+            self._failure = exc
+            self._cv.notify_all()
 
     def release(self, idx: int) -> None:
         with self._cv:
@@ -1725,6 +1739,9 @@ class MooncakeConnector(KVConnectorBase):
         except Exception as e:
             logger.exception("[CONSUMER] failed to post write requests")
             self._write_request_error = e
+            # The engine thread may be blocked taking a staging row only this
+            # request's transfer would have returned.
+            self._staging_slots.fail(e)
 
     # -----------------------------------------------------------------
     # Send worker streams

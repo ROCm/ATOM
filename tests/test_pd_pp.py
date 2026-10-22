@@ -499,12 +499,8 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
             conn.get_finished()
 
 
-def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
-    monkeypatch,
-):
-    """With one staging row, the second receive waits in `acquire()` until
-    the first transfer frees the row, which needs its write request posted
-    first. Posting only after the whole loop would deadlock."""
+def _one_row_staging_consumer(monkeypatch, send):
+    """A real consumer with one staging row whose producer runs `send`."""
     from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
 
     monkeypatch.setenv("ATOM_HOST_IP", "10.19.0.140")
@@ -544,15 +540,12 @@ def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
     conn._staging_slots = mc.SlotPool(1)
     conn._staging_base_addr = 0
     conn._staging_slot_bytes = 64
-    # The producer's transfer completes as soon as its request is posted,
-    # handing the staging row back.
-    posted = []
+    conn._send_on_socket = lambda addr, parts, repeat=1: send(conn, addr)
+    return conn
 
-    def send(addr, parts, repeat=1):
-        posted.append(addr)
-        conn._staging_slots.release(0)
 
-    conn._send_on_socket = send
+def _receive_two(conn):
+    """Run `start_load_kv` for two receives off-thread; return what it did."""
 
     def meta(i):
         return ConnectorMetadata._build_req_meta(
@@ -567,23 +560,62 @@ def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
             },
         )
 
+    outcome = {}
     done = threading.Event()
-    worker = threading.Thread(
-        target=lambda: (
+
+    def run():
+        try:
             conn.start_load_kv(
                 SimpleNamespace(
                     request_id_to_transfer_id={"r0": 0, "r1": 1},
                     reqs_to_recv={"r0": meta(0), "r1": meta(1)},
                 )
-            ),
-            done.set(),
-        ),
-        daemon=True,
-    )
-    worker.start()
-    assert done.wait(10), "second receive never got a staging row"
+            )
+        except Exception as e:
+            outcome["error"] = e
+        done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    outcome["returned"] = done.wait(10)
+    return outcome
+
+
+def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
+    monkeypatch,
+):
+    """With one staging row, the second receive waits in `acquire()` until
+    the first transfer frees the row, which needs its write request posted
+    first. Posting only after the whole loop would deadlock."""
+    posted = []
+
+    def send(conn, addr):
+        # The transfer completes as soon as it is posted, returning the row.
+        posted.append(addr)
+        conn._staging_slots.release(0)
+
+    conn = _one_row_staging_consumer(monkeypatch, send)
+    outcome = _receive_two(conn)
+    assert outcome["returned"], "second receive never got a staging row"
+    assert "error" not in outcome
     conn._write_request_executor.shutdown(wait=True)
     assert len(posted) == 2
+
+
+def test_a_failed_post_wakes_a_receive_waiting_for_a_staging_row(monkeypatch):
+    """If the first request is never posted its row never comes back; the
+    second receive must raise instead of blocking the engine thread."""
+
+    def send(conn, addr):
+        raise OSError("producer unreachable")
+
+    conn = _one_row_staging_consumer(monkeypatch, send)
+    outcome = _receive_two(conn)
+    assert outcome["returned"], "engine thread stayed blocked on the staging row"
+    assert isinstance(outcome.get("error"), RuntimeError)
+    # The row stays held: a partly posted transfer may still write it.
+    assert conn._staging_slots.free == []
+    with pytest.raises(RuntimeError, match="could not post a write request"):
+        conn.get_finished()
 
 
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
