@@ -184,19 +184,26 @@ def _flydsl_prefill_metadata(
 
 
 def _track_mamba_radix_slots(forward_batch: Any, layer_id: int) -> None:
-    """Mirror community ``GDNAttnBackend`` mamba track after Native GDN compute.
+    """Decode-side mamba track after Native GDN compute.
 
     Community bakes ``_track_mamba_state_decode`` inside the decode CUDA graph.
     Native GDN + FlyDSL has repeatedly faulted with that binding under
     radix/extra_buffer, so decode-graph capture **skips** track here and
     ``track_mamba_radix_after_decode_graph`` (post-replay epilogue) performs
-    the same snapshot with live Hybrid metadata. Eager prefill/extend still
-    tracks inline. Never host-sync on ``mask.any()``.
+    the same snapshot with live Hybrid metadata. Eager decode tracks inline.
+    Never host-sync on ``mask.any()``.
+
+    Decode only: a decode step's live state IS the state at its track point.
+    Extend is tracked by ``SGLangGatedDeltaNet._track_mamba_states``, which
+    reads the chunk-boundary state an unaligned track point needs; a row copy
+    of the finished state here would overwrite that snapshot.
 
     ``check_freed_slots=True`` skips ``src/dst == -1`` (graph pad / tombstones);
     the track kernel otherwise faults on ``ptr + (-1)*stride``.
     """
     if getattr(forward_batch, "mamba_track_mask", None) is None:
+        return
+    if not forward_batch.forward_mode.is_decode_or_idle():
         return
     # Do not bake track into the full decode graph; epilogue owns decode track.
     if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
@@ -229,21 +236,6 @@ def _track_mamba_radix_slots(forward_batch: Any, layer_id: int) -> None:
     track_mask = forward_batch.mamba_track_mask
     if track_mask is not None and track_mask.shape[0] != bs:
         track_mask = track_mask[:bs]
-
-    mode = forward_batch.forward_mode
-    if mode.is_extend() and not mode.is_target_verify():
-        # Community also writes conv at track boundaries inside causal_conv;
-        # Native only has the finished state. Apply final-src extend copies
-        # when no chunk ``h`` is required, then the same decode-style row copy.
-        track_extend = getattr(linear, "_track_mamba_state_extend", None)
-        h_src = getattr(fm, "track_ssm_h_src", None)
-        needs_h = h_src is not None and int(h_src.numel()) > 0
-        if (
-            track_extend is not None
-            and not needs_h
-            and getattr(fm, "has_mamba_track_mask", False)
-        ):
-            track_extend(forward_batch, None, layer_cache.temporal, fm)
 
     # Prefer community coalesced all-layers track at the last mamba layer
     # (same as ``GDNAttnBackend.forward_decode(..., layer.layer_id)``). Always
@@ -289,11 +281,10 @@ def track_mamba_radix_after_decode_graph(
 ) -> None:
     """Post-replay mamba track (Native epilogue).
 
-    Community bakes track inside the graph; Native also does that via
-    ``_track_mamba_radix_slots``. This epilogue re-runs a coalesced track with
-    the *live* Hybrid metadata after replay so radix/extra_buffer still gets a
-    correct snapshot if the captured track-save missed a buffer. Cheap relative
-    to the graphed decode body.
+    Community bakes track inside the graph; ``_track_mamba_radix_slots`` skips
+    capture, so for a replayed decode graph this epilogue is the only snapshot:
+    it runs the coalesced track with the *live* Hybrid metadata after replay.
+    Cheap relative to the graphed decode body.
 
     ``attn_backend`` must be passed from ``DecodeCudaGraphRunner`` — after
     ``execute`` returns, SGLang's forward context is gone so
@@ -378,8 +369,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
                 and not draft_extend
             ):
                 note_full_state_write(self._verify_cache_slots(forward_batch))
-            if forward_batch is not None:
-                _track_mamba_radix_slots(forward_batch, int(self.layer_num))
             return out
 
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
@@ -473,7 +462,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         which the plugin replaces. They are made here, after the ATOM forward,
         through SGLang's helpers so the snapshot semantics stay defined there.
         Every source is final by now: the conv window is read from the pre-conv
-        input, the SSM state from the chunk kernel's `h` or the runtime slot.
+        input, the SSM state from the prefill kernel's chunk states `h` (Triton
+        or FlyDSL) or the runtime slot.
+
+        Decode goes through `_track_mamba_radix_slots`, which also covers the
+        replayed decode graph via the post-replay epilogue.
         """
         if (
             forward_batch is None
@@ -481,6 +474,11 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         ):
             return
         mode = forward_batch.forward_mode
+        if mode.is_decode_or_idle():
+            _track_mamba_radix_slots(forward_batch, int(self.layer_num))
+            return
+        if not mode.is_extend():
+            return
         attn_backend = SGLangGDNForwardContext._resolve_attn_backend(forward_batch)
         if attn_backend is None:
             return
@@ -497,18 +495,6 @@ class SGLangGatedDeltaNet(GatedDeltaNet):
         policy = getattr(self, "gdn_flydsl_policy", None)
         if policy is not None and policy.decode:
             ssm_states = ssm_states.transpose(-1, -2)
-
-        if mode.is_decode_or_idle():
-            linear_backend._track_mamba_state_decode(
-                forward_batch,
-                conv_states,
-                ssm_states,
-                metadata.mamba_cache_indices,
-                self.layer_num,
-            )
-            return
-        if not mode.is_extend():
-            return
 
         from atom.model_ops.fla_ops.chunk import pop_last_intermediate_states
 

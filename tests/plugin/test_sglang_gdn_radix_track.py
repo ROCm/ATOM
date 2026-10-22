@@ -3,7 +3,8 @@
 The plugin replaces SGLang's GDN kernels, so it has to make the track calls
 SGLang's own backend makes around them. These tests drive
 `SGLangGatedDeltaNet._track_mamba_states` against a stand-in linear backend and
-check which helper receives which buffers, plus the ReplaySSM radix guard.
+check which helper receives which buffers, that extend and decode each have a
+single owner, plus the ReplaySSM radix guard.
 """
 
 from __future__ import annotations
@@ -89,19 +90,46 @@ def test_no_track_mask_is_a_no_op(backend):
     assert lb.calls == []
 
 
-def test_decode_tracks_through_sglang_with_layer_id(backend):
-    idx = torch.tensor([2, 3])
-    lb = backend(SimpleNamespace(mamba_cache_indices=idx))
+def test_decode_tracks_through_the_radix_slot_helper(backend, monkeypatch):
+    lb = backend(SimpleNamespace(mamba_cache_indices=torch.tensor([2, 3])))
+    seen = []
+    monkeypatch.setattr(
+        attention_gdn,
+        "_track_mamba_radix_slots",
+        lambda fb, layer_id: seen.append((fb, layer_id)),
+    )
     fb = SimpleNamespace(
         mamba_track_mask=torch.tensor([True, False]), forward_mode=_Mode("decode")
     )
     _impl()._track_mamba_states(fb, torch.zeros(2, CONV_DIM))
-    (call,) = lb.calls
-    assert call[0] == "decode"
-    assert call[1] is lb.layer_cache.conv[0]
-    assert call[2] is lb.layer_cache.temporal
-    assert call[3] is idx
-    assert call[4] == LAYER_NUM
+    # One owner for decode: the helper that also backs the post-replay
+    # epilogue, never SGLang's in-graph per-layer call.
+    assert seen == [(fb, LAYER_NUM)]
+    assert lb.calls == []
+
+
+def test_radix_slot_helper_leaves_extend_to_chunk_states(backend):
+    """A finished-state row copy on extend would overwrite the chunk-boundary
+    snapshot an unaligned track point needs."""
+    lb = backend(
+        SimpleNamespace(
+            has_mamba_track_mask=True,
+            mamba_cache_indices=torch.tensor([1, 2]),
+            mamba_track_indices=torch.tensor([6, 7]),
+            track_ssm_h_src=torch.empty(0, dtype=torch.long),
+        )
+    )
+    lb.layer_cache.conv[0][1:3] = 1.0
+    lb.layer_cache.temporal[1:3] = 1.0
+    fb = SimpleNamespace(
+        mamba_track_mask=torch.tensor([True, True]),
+        forward_mode=_Mode("extend"),
+        batch_size=2,
+    )
+    attention_gdn._track_mamba_radix_slots(fb, LAYER_NUM)
+    assert lb.calls == []
+    assert lb.layer_cache.conv[0][6:].abs().sum() == 0
+    assert lb.layer_cache.temporal[6:].abs().sum() == 0
 
 
 def _extend_metadata(track_conv_indices, dst, h_src_rows):
