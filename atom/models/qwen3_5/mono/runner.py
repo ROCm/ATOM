@@ -27,7 +27,14 @@ from aiter.dist.parallel_state import get_tp_group
 
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
 from atom.models.qwen3_5.mono.dispatch import final_norm
-from atom.models.qwen3_5.mono.layout import TL_POINTS, layout, router_rows, shape_dims
+from atom.models.qwen3_5.mono.layout import (
+    BF16_GEMM_RULES,
+    TL_POINTS,
+    baseline_m,
+    layout,
+    router_rows,
+    shape_dims,
+)
 from atom.models.qwen3_5.mono.op import (
     Qwen35MonoKernel,
     Qwen35Variant,
@@ -162,6 +169,12 @@ class Qwen35MonoDecodeRunner:
         self.replay_cap = replay_cap
         self.debug = envs.ATOM_MONO_DEBUG
         self.max_len = atom_config.max_model_len
+        # the CUDA-graph ladder baseline ATOM pads a decode to (None: eager, no padding)
+        self.capture = (
+            None
+            if atom_config.enforce_eager
+            else tuple(sorted(atom_config.capture_sizes))
+        )
         bind_agreed(lambda: self._bind(causal_lm), self.group)
         # ATOM_MONO_TIMELINE: every layer's stamps, saved after the warm-up steps (eager)
         tl_prefix = envs.ATOM_MONO_TIMELINE
@@ -439,6 +452,12 @@ class Qwen35MonoDecodeRunner:
         """
         T = self.T
         self._check_records()
+        # the M baseline ATOM's GEMMs run this step at: the MXFP4 build's BF16 rounding follows it
+        gemm_m = baseline_m(S, T, self.capture)
+        if self.cfg.weights == "mxfp4" and gemm_m not in BF16_GEMM_RULES["out"]:
+            raise MonoUnsupported(
+                f"{S} rows run at M {gemm_m}: no BF16 GEMM rounding rule there"
+            )
         # one peer buffer for both kinds (the same symmetric regions; a layer's tags are its own),
         # freed with the runner; collective over the CPU group
         dims = shape_dims(self.cfg)
@@ -459,6 +478,7 @@ class Qwen35MonoDecodeRunner:
                 debug=self.debug,
                 timeline=self.timeline is not None,
                 peers=peers,
+                gemm_m=gemm_m,
             )
             for full in (False, True)
         }
@@ -518,6 +538,13 @@ class Qwen35MonoDecodeRunner:
         """Whether every rank holds the launch of a ``rows``-row step."""
         S = self.launch_width(rows)
         return S is not None and self.widths.prepare(S)
+
+    def prebuild(self) -> None:
+        """Every width a step can take, built now (collective, at install). A CUDA-graph deployment
+        builds them while capturing; an eager one would otherwise stall a serving step on each.
+        """
+        for rows in range(self.T, MAX_TOKENS + 1, self.T):
+            self.prepare(rows)
 
     # ---------------------------------------------------------------- forward
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

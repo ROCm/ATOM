@@ -135,6 +135,7 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             debug=self.debug,
             timeline=self.timeline is not None,
             peers=peers,
+            gemm_m=S,  # ATOM runs the draft eagerly: no padding
         )
         op = Qwen35MonoKernel(
             W, S, self.rank, self.tp, variant=var, packed=p, tokens_per_seq=T
@@ -164,6 +165,14 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
     def prepare(self, rows: int) -> bool:
         t = self.step_t(rows)
         return t is not None and self.by_t[t].prepare(rows)
+
+    def prebuild(self) -> None:
+        """Every width a draft step can take, built now (collective, at install): ATOM runs the draft
+        eagerly, so a width first met on a serving step would stall it for its compile and peer
+        handshake."""
+        for bs in range(1, MAX_TOKENS // self.T + 1):
+            self.by_t[self.T].prepare(bs * self.T)
+            self.by_t[1].prepare(bs)
 
     def layer(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """The decoder layer on ``x`` [rows, hidden] (the ``fc`` output, gathered): the f32 residual

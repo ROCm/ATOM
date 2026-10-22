@@ -4,8 +4,9 @@
 for gfx950 (no GPU launch), every mailbox access checked against
 ``layout.mailbox_regions``.
 
-The served shapes of one MTP-3 request (4 rows): the GDN and the full-attention
-layer, FP8 and MXFP4; the negative control checks a trace against a wrong table
+The served shapes at 4 rows: plain decode of 4 requests and an MTP-3 verify of one
+request (its GDN on the snapshot state and on ReplaySSM records), GDN and full
+attention, FP8 and MXFP4; the negative control checks a trace against a wrong table
 instead of building again."""
 
 import dataclasses
@@ -21,7 +22,14 @@ from atom.mono.plan.check import ContractError, check
 from atom.mono.runtime.compile import trace
 
 ROWS = 4
-BUILDS = [(full, w) for full in (False, True) for w in ("fp8", "mxfp4")]
+# (full, weights, tokens a request, ReplaySSM records)
+BUILDS = [
+    (full, w, T, cap)
+    for full in (False, True)
+    for w in ("fp8", "mxfp4")
+    for T, cap in ((1, 0), (4, 0), (4, 0 if full else 16))
+]
+BUILDS = list(dict.fromkeys(BUILDS))
 
 
 @pytest.fixture(scope="module")
@@ -29,12 +37,16 @@ def traces():
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("ARCH", "gfx950")
         patch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-        return {b: trace(*contract.build_layer(ROWS, *b)) for b in BUILDS}
+        return {
+            b: trace(*contract.build_layer(ROWS, b[0], b[1], T=b[2], cap=b[3]))
+            for b in BUILDS
+        }
 
 
-@pytest.mark.parametrize("full, weights", BUILDS)
-def test_the_layer_kernel_holds(traces, full, weights):
-    check(traces[(full, weights)], mailbox_regions(ROWS, full, weights, contract.TP))
+@pytest.mark.parametrize("build", BUILDS)
+def test_the_layer_kernel_holds(traces, build):
+    full, weights = build[:2]
+    check(traces[build], mailbox_regions(ROWS, full, weights, contract.TP))
 
 
 def test_a_wrong_declaration_is_caught(traces):
@@ -45,4 +57,4 @@ def test_a_wrong_declaration_is_caught(traces):
         dataclasses.replace(d, writer="down") if d.name == "mid" else d for d in decls
     ]
     with pytest.raises(ContractError, match="mid put by ug, its writer is down"):
-        check(traces[(False, "fp8")], wrong)
+        check(traces[(False, "fp8", 1, 0)], wrong)

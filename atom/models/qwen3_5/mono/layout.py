@@ -104,18 +104,23 @@ def xin_stage(S: int, weights: str) -> bool:
     return weights == "fp8" and S >= XIN_MIN
 
 
-def baseline_m(S: int, tokens_per_seq: int = 1) -> int:
-    """The M of baseline ATOM's decode GEMMs for an S-row step: CUDA graphs pad a plain decode batch to
-    its capture size (1 .. 8, then multiples of 16); an MTP verify's batch (at most 4 requests) is
-    captured as is."""
-    if S <= 8 or tokens_per_seq > 1:
-        return S
-    return -(-S // 16) * 16
+# ATOM's default CUDA-graph ladder (``Config.capture_sizes``), in requests
+DEFAULT_CAPTURE = tuple(range(1, 9)) + tuple(range(16, 513, 16))
 
 
-def bf16_gemm_rule(name: str, S: int, tokens_per_seq: int = 1) -> tuple:
-    """The partial-sum rounding of baseline ATOM's BF16 GEMM ``name`` (``BF16_GEMM_RULES``) at an S-row step."""
-    return BF16_GEMM_RULES[name][baseline_m(S, tokens_per_seq)]
+def baseline_m(S: int, tokens_per_seq: int = 1, capture=DEFAULT_CAPTURE) -> int:
+    """The M of baseline ATOM's decode GEMMs for an S-row step: a CUDA graph pads the step's requests to
+    the smallest capture size holding them (``capture``, the runner's ladder in requests; None under
+    ``--enforce-eager``: no padding), each request ``tokens_per_seq`` rows."""
+    q = S // tokens_per_seq
+    if capture is not None:
+        q = min((c for c in capture if c >= q), default=q)
+    return q * tokens_per_seq
+
+
+def bf16_gemm_rule(name: str, m: int) -> tuple:
+    """The partial-sum rounding of baseline ATOM's BF16 GEMM ``name`` (``BF16_GEMM_RULES``) at M ``m``."""
+    return BF16_GEMM_RULES[name][m]
 
 
 def gdn_dims(dims: dict) -> dict:

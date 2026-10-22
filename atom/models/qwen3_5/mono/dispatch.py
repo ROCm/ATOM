@@ -221,6 +221,9 @@ def step_supported(input_ids, T: int, replay: bool) -> bool:
         return False
     fwd = get_forward_context()
     c = fwd.context
+    # is_dummy_run is a per-rank flag: TP-uniform here only because DP > 1 is refused (with DP, an
+    # idle replica's dummy step would leave its ranks on the original path while a peer waits in
+    # the kernel's exchange). Lifting the DP refusal needs this gate removed and dummy steps run.
     if c is None or c.is_prefill or c.is_dummy_run or getattr(c, "is_draft", False):
         return False
     if getattr(fwd, "ubatch_slices", None) is not None:
@@ -390,9 +393,11 @@ def install_mono_decode(
         getattr(draft, "model", None), "pre_fc_norm_hidden"
     ):
         try:
-            drafter.model = MonoDraftModel(
-                draft, Qwen35MonoDraftRunner(draft, atom_config, steps)
-            )
+            draft_runner = Qwen35MonoDraftRunner(draft, atom_config, steps)
+            draft_runner.prebuild()
+            drafter.model = MonoDraftModel(draft, draft_runner)
         except MonoUnsupported as why:
             logger.warning("Qwen3.5 mono draft off: %s", why)
+    if atom_config.enforce_eager:
+        runner.prebuild()
     return MonoDecodeModel(model, runner)

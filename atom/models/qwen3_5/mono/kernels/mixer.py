@@ -203,7 +203,7 @@ def out_stages(ctx):
     OUT_UPW = OUT_NKC // OUT_WPR if MX else OUT_K // 128 // OUT_WPR
     # the MXFP4 checkpoint's BF16 out_proj rounds as baseline ATOM's GEMM: with K halves, wave j of a
     # row group takes the first (j even) or second (j odd) 128 of every 256-wide K tile
-    OUT_RULE = bf16_gemm_rule("out", S, ctx["T_SEQ"]) if MX else None
+    OUT_RULE = bf16_gemm_rule("out", ctx["GEMM_M"]) if MX else None
     HALVES = OUT_RULE is not None and OUT_RULE[0] == "halves"
     if HALVES:
         assert OUT_WPR % 2 == 0 and OUT_K % 256 == 0 and OUT_WPR * OUT_UPW == OUT_NKC

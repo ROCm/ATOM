@@ -40,6 +40,7 @@ from atom.models.qwen3_5.mono.kernels.gdn import gdn_stages
 from atom.models.qwen3_5.mono.kernels.helpers import SHARED_SOURCE_KEY
 from atom.models.qwen3_5.mono.kernels.mixer import mixer_defs, out_stages
 from atom.models.qwen3_5.mono.layout import (
+    BF16_GEMM_RULES,
     BS,
     MOE_MISC,
     PROJ_GROUPS,
@@ -48,6 +49,7 @@ from atom.models.qwen3_5.mono.layout import (
     ROW_TILE,
     TL_POINTS,
     UG8,
+    baseline_m,
     dn_tile,
     gdn_dims,
     layout,
@@ -90,6 +92,7 @@ def build_qwen35_kernel(
     replay_cap=0,
     debug=False,
     timeline=False,
+    gemm_m=None,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer: full attention when ``full``, else
     Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank). ``tokens_per_seq`` > 1:
@@ -106,6 +109,9 @@ def build_qwen35_kernel(
     assert inter % 128 == 0 and hidden % 128 == 0
     HIDDEN = hidden
     T_SEQ = tokens_per_seq
+    # the M baseline ATOM's GEMMs run this step at (its CUDA graph's padded batch): the BF16 GEMMs'
+    # rounding and the MXFP4 combine's order follow it
+    GEMM_M = baseline_m(S, T_SEQ) if gemm_m is None else gemm_m
     assert S % T_SEQ == 0
     REPLAY = replay_cap > 0
     CAP = replay_cap
@@ -128,6 +134,7 @@ def build_qwen35_kernel(
     WFMT = weights
     MX = WFMT == "mxfp4"
     assert WFMT in ("fp8", "mxfp4")
+    assert not MX or GEMM_M in BF16_GEMM_RULES["out"], "no BF16 GEMM rule at this M"
     EPS = eps
     MOE_SLOTS = TOP_K + 1
     SHARED_EXPERT = N_EXPERTS

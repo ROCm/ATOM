@@ -89,7 +89,21 @@ def attn_stages(ctx):
     xs = ctx["xs"]
     r_pos, r_bt, r_slot = rsrc(positions), rsrc(block_tables), rsrc(slot_mapping)
     r_ctx = rsrc(context_lens)
-    r_kc, r_vc, r_ks, r_vs = rsrc(k_cache), rsrc(v_cache), rsrc(k_scale), rsrc(v_scale)
+    r_ks, r_vs = rsrc(k_scale), rsrc(v_scale)
+    # A layer's K / V pool passes 4 GiB, the reach of a buffer offset (about 5 GB at TP4): a cache
+    # block's bytes are addressed from that block's own 64-bit base, never as one offset from the
+    # pool's (the scales, 64 B a block, stay within reach)
+    KVB = HD * BS  # bytes of a cache block (this rank's one KV head), K and V alike
+
+    def kv_block(pool, blk):
+        """A buffer resource on cache block ``blk`` (wave-uniform) of ``pool``."""
+        return rsrc(pool + fx.Int64(blk) * KVB)
+
+    def v_words(blk, byte):
+        """Two words at ``byte`` of V cache block ``blk`` (a lane's own block): a 64-bit address."""
+        at = v_cache + fx.Int64(blk) * KVB + fx.Int64(byte)
+        ptr = fx.inttoptr(fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8), at)
+        return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(2, fx.Int32)))
 
     def ld_pos(s):
         return uniform(bo.buffer_load(r_pos, s, vec_width=1, dtype=T.i32))
@@ -193,10 +207,10 @@ def attn_stages(ctx):
                 kb = arith.trunci(T.i8, fx.Int32(kword).ir_value())
                 vb = arith.trunci(T.i8, fx.Int32(vword).ir_value())
                 bo.buffer_store(
-                    kb, r_kc, ((blk * (HD // 16) + d // 16) * BS + t) * 16 + d % 16
+                    kb, kv_block(k_cache, blk), ((d // 16) * BS + t) * 16 + d % 16
                 )
                 bo.buffer_store(
-                    vb, r_vc, ((blk * (BS // 16) + t // 16) * HD + d) * 16 + t % 16
+                    vb, kv_block(v_cache, blk), ((t // 16) * HD + d) * 16 + t % 16
                 )
             if live:
                 # this launch's row for the split tasks: other CTAs may not see the cache stores yet
@@ -290,13 +304,14 @@ def attn_stages(ctx):
             out = []
             for gi in range_constexpr(2):
                 bi = tb // BS + wave * 2 + gi
-                blk = ld_block(s0, fx.min(bi, last_blk))
+                blk = uniform(ld_block(s0, fx.min(bi, last_blk)))  # this wave's block
+                r_kb = kv_block(k_cache, blk)
                 for c in range_constexpr(HD // 32):
                     d = 32 * c + 8 * g4
-                    off = ((blk * (HD // 16) + d // 16) * BS + lane % 16) * 16 + d % 16
+                    off = ((d // 16) * BS + lane % 16) * 16 + d % 16
                     out.append(
                         fx.Vector(
-                            bo.buffer_load(r_kc, off // 4, vec_width=2, dtype=T.i32)
+                            bo.buffer_load(r_kb, off // 4, vec_width=2, dtype=T.i32)
                         )
                     )
                 for e in range_constexpr(4):
@@ -310,12 +325,7 @@ def attn_stages(ctx):
                 for c in range_constexpr(CPS // 32):
                     tk = 32 * c + 8 * g4  # this lane's 8 keys (one cache block's half)
                     blk = ld_block(s0, fx.min((tb + tk) // BS, last_blk))
-                    off = blk * (HD * BS) + dim * 16 + tk % 16
-                    out.append(
-                        fx.Vector(
-                            bo.buffer_load(r_vc, off // 4, vec_width=2, dtype=T.i32)
-                        )
-                    )
+                    out.append(v_words(blk, dim * 16 + tk % 16))
             return out
 
         # the first partition's loads before this launch's inputs: their latency hides under the wait

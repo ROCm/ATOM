@@ -22,9 +22,11 @@ from atom.mono.runtime.compile import check_traced
 TP = 4
 
 
-def build_layer(S: int, full: bool, weights: str = "fp8", T: int = 1, npes: int = TP):
-    """The layer kernel for ``S`` rows (an MTP verify of ``T`` tokens a request), full attention or GDN,
-    and its launch ABI."""
+def build_layer(
+    S: int, full: bool, weights: str = "fp8", T: int = 1, npes: int = TP, cap: int = 0
+):
+    """The layer kernel for ``S`` rows (an MTP verify of ``T`` tokens a request; ``cap`` > 0 its GDN on
+    ReplaySSM records), full attention or GDN, and its launch ABI."""
     cfg = Q35Config(tp=TP, rank=0, weights=weights)
     fn = build_qwen35_kernel(
         S,
@@ -33,6 +35,7 @@ def build_layer(S: int, full: bool, weights: str = "fp8", T: int = 1, npes: int 
         eps=cfg.eps,
         rope_dim=cfg.rope_dim,
         tokens_per_seq=T,
+        replay_cap=cap,
         **shape_dims(cfg),
     )
     params = tuple(inspect.signature(getattr(fn, "func", None) or fn._func).parameters)

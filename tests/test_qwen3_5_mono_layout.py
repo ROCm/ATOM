@@ -231,7 +231,17 @@ def test_bf16_gemm_rules_match_aiters_tuned_picks(name):
 def test_baseline_m_is_the_graph_padded_decode_batch(tokens):
     m = layout.baseline_m(tokens)
     assert m == (tokens if tokens <= 8 else 16)
-    assert layout.baseline_m(tokens, tokens_per_seq=4) == tokens
+    if tokens % 4 == 0:  # an MTP-3 verify of tokens / 4 requests: captured as is
+        assert layout.baseline_m(tokens, tokens_per_seq=4) == tokens
+    # --enforce-eager: no graph, no padding
+    assert layout.baseline_m(tokens, capture=None) == tokens
+
+
+def test_baseline_m_follows_a_custom_ladder():
+    ladder = (1, 2, 4, 8, 16)
+    assert [layout.baseline_m(s, capture=ladder) for s in (3, 5, 9)] == [4, 8, 16]
+    # a verify pads its requests: 3 requests of 4 rows run as 4
+    assert layout.baseline_m(12, tokens_per_seq=4, capture=ladder) == 16
 
 
 def test_the_mono_package_imports_without_the_model():

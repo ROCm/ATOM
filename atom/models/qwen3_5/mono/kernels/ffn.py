@@ -23,7 +23,6 @@ from atom.models.qwen3_5.mono.layout import (
     MOE_MISC,
     ROUTER_TILE,
     UG8,
-    baseline_m,
     bf16_gemm_rule,
     router_spt,
 )
@@ -229,7 +228,7 @@ def ffn_stages(ctx):
     # ================================ 6. expert up/gate + SiLU (W8A8; MXFP4: A4W4 and the BF16 shared expert)
     UG_NKC = HIDDEN // 64
     # the MXFP4 checkpoint's BF16 shared gate_up (wave w: K range w of WAVES) rounds as baseline ATOM's GEMM
-    SH_UG_RULE = bf16_gemm_rule("shared_ug", S, ctx["T_SEQ"]) if MX else None
+    SH_UG_RULE = bf16_gemm_rule("shared_ug", ctx["GEMM_M"]) if MX else None
     UG_W_BYTES = 2 * INTER * HIDDEN
     UG_S_BYTES = 2 * INTER // 128 * (HIDDEN // 128) * 4
     # MXFP4 bank: packed E2M1 [2 INTER, HIDDEN / 2], E8M0 [2 INTER, HIDDEN / 32 padded to 8]
@@ -493,9 +492,7 @@ def ffn_stages(ctx):
     # MXFP4: each routed down unit's [DN_TILE] partial, in xs past the staged mids (DN_BLK blocks)
     DN_PART = DN_BLK * 64
     assert not MX or DN_PART + DN_NU * DN_TILE <= ctx["XN"]
-    DN_ATOMIC = (
-        baseline_m(S, ctx["T_SEQ"]) <= 4
-    )  # baseline's atomic (vs reduce) epilogue
+    DN_ATOMIC = ctx["GEMM_M"] <= 4  # baseline's atomic (vs reduce) epilogue
     for t in range(start("down"), N_DN_TILES, G):
         t = fx.Int32(t)
         gpu.barrier()
