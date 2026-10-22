@@ -26,6 +26,7 @@ import os
 import sys
 import threading
 import time
+import types
 import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -1591,6 +1592,86 @@ def _take_gc_probe() -> str:
     return out
 
 
+def _census_own(x: object, skip: tuple) -> bool:
+    return any(x is s for s in skip) or getattr(x, "cr_code", None) is (
+        _gc_heap_census.__code__
+    )
+
+
+def _describe_referrer(r: object, skip: tuple, depth: int = 1) -> str:
+    for attr in ("f_code", "cr_code", "gi_code", "ag_code"):
+        code = getattr(r, attr, None)
+        if isinstance(code, types.CodeType):
+            return f"{type(r).__name__}:{code.co_qualname}"
+    if isinstance(r, types.FunctionType):
+        return f"func:{r.__qualname__}"
+    name = type(r).__qualname__
+    if depth > 0 and type(r) in (dict, list, tuple):
+        up = []
+        for x in gc.get_referrers(r):
+            if not _census_own(x, skip):
+                up.append(_describe_referrer(x, skip, depth - 1))
+            if len(up) == 3:
+                break
+        name += "<" + "|".join(up)
+    return name
+
+
+async def _gc_heap_census(top: int = 12, big: int = 10_000, chase: int = 3) -> None:
+    """Log what the oldest generation holds: the commonest types, the element
+    count every full pass walks, and the largest containers with who holds
+    them. Stalls the loop for about one full pass per referrer chased."""
+    t = time.perf_counter()
+    young = [len(gc.get_objects(generation=g)) for g in (0, 1)]
+    objs = gc.get_objects(generation=2)
+    by_type: dict[type, int] = {}
+    elems = 0
+    bigs: list[tuple[int, int]] = []
+    for i, o in enumerate(objs):
+        tp = type(o)
+        by_type[tp] = by_type.get(tp, 0) + 1
+        if tp in (list, tuple, dict, set):
+            n = len(o)
+            elems += n
+            if n >= big:
+                bigs.append((n, i))
+    ranked = sorted(by_type.items(), key=lambda kv: -kv[1])[:top]
+    top_s = ",".join(f"{tp.__qualname__}:{n}" for tp, n in ranked)
+    bigs.sort(reverse=True)
+    big_s = []
+    for rank, (n, i) in enumerate(bigs[:8]):
+        o = objs[i]
+        first = next(iter(o), None)
+        desc = f"{type(o).__name__}[{type(first).__name__}]x{n}"
+        if rank < chase:
+            refs = [r for r in gc.get_referrers(o) if not _census_own(r, (objs,))]
+            names = []
+            for r in refs:
+                names.append(_describe_referrer(r, (objs, refs)))
+                if len(names) == 4:
+                    break
+            desc += "<-" + "|".join(names)
+            refs = r = None
+        big_s.append(desc)
+    o = first = None
+    total = len(objs)
+    objs = None
+    logger.info(
+        "[PD-TIMING] ev=GCHEAP t=%.3f ms=%.0f gen0=%d gen1=%d gen2=%d elems=%d "
+        "nbig=%d bigelems=%d top=%s big=%s",
+        time.time(),
+        (time.perf_counter() - t) * 1e3,
+        young[0],
+        young[1],
+        total,
+        elems,
+        len(bigs),
+        sum(n for n, _ in bigs),
+        top_s,
+        ";".join(big_s) or "-",
+    )
+
+
 async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
     """Log how late this loop wakes from a ``tick`` sleep, every ``window``."""
     loop = asyncio.get_running_loop()
@@ -1761,6 +1842,13 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(
             asyncio.create_task(_loop_lag_monitor(), name="_loop_lag_monitor")
         )
+        if envs.ATOM_PD_GC_CENSUS_S > 0:
+            _background_tasks.append(
+                asyncio.create_task(
+                    _periodic(envs.ATOM_PD_GC_CENSUS_S, _gc_heap_census),
+                    name="_gc_heap_census",
+                )
+            )
         threading.Thread(
             target=_loop_block_sampler,
             args=(threading.get_ident(),),

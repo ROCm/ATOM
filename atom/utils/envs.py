@@ -153,6 +153,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # P/D latency probes: log `[PD-TIMING]` lines for every N-th request (by
     # the producer's request id) on both engines. 0 = off.
     "ATOM_PD_TIMING_SAMPLE": lambda: _nonnegative_int_env("ATOM_PD_TIMING_SAMPLE", 0),
+    # With the probes on, also log a census of the API server's oldest GC
+    # generation every this many seconds. Each one stalls the event loop for
+    # a few full collections. 0 = off.
+    "ATOM_PD_GC_CENSUS_S": lambda: _nonnegative_int_env("ATOM_PD_GC_CENSUS_S", 0),
     # Non-PP engines: while requests are parked for remote KV, block up to this
     # many ms after each forward for a fresh worker completion poll, so a
     # receive that landed during the forward is scheduled the next step rather
