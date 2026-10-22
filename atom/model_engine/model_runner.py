@@ -103,6 +103,7 @@ from atom.utils.forward_context import (
 )
 from atom.utils.gc_utils import freeze_gc_heap
 from atom.utils.h2d import h2d_producer
+from atom.utils.mem_probe import MemProbe
 from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
@@ -797,6 +798,9 @@ class ModelRunner:
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
+        # ATOM_PROBE_MEM; `wrap` returns `forward` unchanged when it is off.
+        self._mem_probe = MemProbe(worker_process_name(config, rank))
+        self.forward = self._mem_probe.wrap(self.forward)
         self._dynamic_chunking = DynamicChunkingWorker(self)
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
@@ -1435,6 +1439,7 @@ class ModelRunner:
             total_seqs_num_prefill=num_seqs,
             is_dummy_run=True,
         )
+        self._mem_probe.record_warmup(num_seqs, total_tokens_num)
         self.forward(dummy_batch)
         self.tokenID_processor.clean()
         torch.cuda.empty_cache()
@@ -2081,6 +2086,15 @@ class ModelRunner:
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
+        )
+        # After the allocator peak above is read: arming starts per-step peak
+        # resets, which must not touch the profile that sized the KV cache.
+        self._mem_probe.record_budget(
+            peak=peak,
+            current=current,
+            non_torch=non_torch,
+            budget=budget,
+            kv_bytes=num_kvcache_blocks * block_bytes,
         )
         # Concurrent-capacity table: at each context-length percentage of
         # max_model_len, how many requests can simultaneously hold their

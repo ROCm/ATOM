@@ -1105,6 +1105,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dp8/conc1024 it is ~128 of 16384 (0.8%) and cannot by itself explain a
     # TTFT change. Only a per-step tally settles what the budget really did.
     "ATOM_PROBE_STEP_BUDGET": lambda: os.getenv("ATOM_PROBE_STEP_BUDGET", "0") == "1",
+    # Log each step kind's activation memory against what the startup profile
+    # measured, a periodic allocator summary, and the allocator's state at an
+    # OOM (atom/utils/mem_probe.py). For KV-budget misses that only show on
+    # steps the pure-prefill profile does not cover, e.g. mixed + DSpark on
+    # DeepSeek-V4-Pro. Off: the runner's `forward` is not wrapped at all.
+    "ATOM_PROBE_MEM": lambda: os.getenv("ATOM_PROBE_MEM", "0") == "1",
     # Per-segment output magnitude for a mixed batch's two halves. A segment
     # that is wrong usually shows it here -- zeros, NaN, or a norm an order off
     # the other half -- and that says WHICH half to read. Registered rather than
