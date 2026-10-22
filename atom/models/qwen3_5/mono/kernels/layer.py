@@ -49,7 +49,6 @@ from atom.models.qwen3_5.mono.layout import (
     ROW_TILE,
     TL_POINTS,
     UG8,
-    baseline_m,
     dn_tile,
     gdn_dims,
     layout,
@@ -92,7 +91,6 @@ def build_qwen35_kernel(
     replay_cap=0,
     debug=False,
     timeline=False,
-    gemm_m=None,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer: full attention when ``full``, else
     Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank). ``tokens_per_seq`` > 1:
@@ -109,9 +107,10 @@ def build_qwen35_kernel(
     assert inter % 128 == 0 and hidden % 128 == 0
     HIDDEN = hidden
     T_SEQ = tokens_per_seq
-    # the M baseline ATOM's GEMMs run this step at (its CUDA graph's padded batch): the BF16 GEMMs'
-    # rounding and the MXFP4 combine's order follow it
-    GEMM_M = baseline_m(S, T_SEQ) if gemm_m is None else gemm_m
+    # the M baseline ATOM's GEMMs run this step at: the step's rows, which ATOM pads to its capture size
+    # (graph replay, and an eager decode alike) before the model sees them. The BF16 GEMMs' rounding
+    # and the MXFP4 combine's order follow it
+    GEMM_M = S
     assert S % T_SEQ == 0
     REPLAY = replay_cap > 0
     CAP = replay_cap

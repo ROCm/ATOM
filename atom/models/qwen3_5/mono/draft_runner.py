@@ -135,7 +135,6 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             debug=self.debug,
             timeline=self.timeline is not None,
             peers=peers,
-            gemm_m=S,  # ATOM runs the draft eagerly: no padding
         )
         op = Qwen35MonoKernel(
             W, S, self.rank, self.tp, variant=var, packed=p, tokens_per_seq=T

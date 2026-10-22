@@ -227,21 +227,11 @@ def test_bf16_gemm_rules_match_aiters_tuned_picks(name):
         assert layout.BF16_GEMM_RULES[name][M] == _rule_of_aiter_pick(cfg), (M, cfg)
 
 
-@pytest.mark.parametrize("tokens", TOKEN_COUNTS)
-def test_baseline_m_is_the_graph_padded_decode_batch(tokens):
-    m = layout.baseline_m(tokens)
-    assert m == (tokens if tokens <= 8 else 16)
-    if tokens % 4 == 0:  # an MTP-3 verify of tokens / 4 requests: captured as is
-        assert layout.baseline_m(tokens, tokens_per_seq=4) == tokens
-    # --enforce-eager: no graph, no padding
-    assert layout.baseline_m(tokens, capture=None) == tokens
-
-
-def test_baseline_m_follows_a_custom_ladder():
-    ladder = (1, 2, 4, 8, 16)
-    assert [layout.baseline_m(s, capture=ladder) for s in (3, 5, 9)] == [4, 8, 16]
-    # a verify pads its requests: 3 requests of 4 rows run as 4
-    assert layout.baseline_m(12, tokens_per_seq=4, capture=ladder) == 16
+def test_every_launch_width_has_its_bf16_gemm_rule():
+    """A launch's rows are the M baseline ATOM's GEMMs run at (ATOM pads the step before the model sees
+    it): every width the kernel launches has its rounding rule."""
+    for name, rules in layout.BF16_GEMM_RULES.items():
+        assert set(TOKEN_COUNTS) <= set(rules), name
 
 
 def test_the_mono_package_imports_without_the_model():
@@ -254,3 +244,21 @@ def test_the_mono_package_imports_without_the_model():
         "assert 'atom.models.qwen3_5.model' not in sys.modules, 'model imported'"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_rope_tables_hold_the_drafted_positions_past_the_last_kept_token():
+    """``max_pos + spare`` rows: ATOM's own rows as they are, past its caches the last one repeated (a
+    token there is dropped); a cache short of ``max_pos`` positions is refused."""
+    from types import SimpleNamespace
+
+    from atom.models.qwen3_5.mono.weights import rope_tables
+
+    cfg = Q35Config()
+    half = cfg.rope_dim // 2
+    cos = torch.arange(10 * half, dtype=torch.bfloat16).view(10, 1, half)
+    rot = SimpleNamespace(cos_cache=cos, sin_cache=-cos)
+    c, s_ = rope_tables(rot, cfg, 8, spare=3)
+    assert c.shape == (11, half) and c.dtype == torch.float32 and c.is_contiguous()
+    assert torch.equal(c[:10], cos.view(10, half).float())
+    assert torch.equal(c[10], c[9]) and torch.equal(s_, -c)
+    assert rope_tables(rot, cfg, 11) is None

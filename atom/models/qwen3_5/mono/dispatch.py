@@ -75,9 +75,10 @@ _FIXED = {
 
 
 def rotary_factor(hf):
-    """The share of a head RoPE rotates: ``rope_parameters``' (Qwen3.5), else the flat field."""
+    """The share of a head RoPE rotates, read as the original attention reads it (``qwen3_next``:
+    ``rope_parameters``, 1.0 when absent)."""
     rope = getattr(hf, "rope_parameters", None) or {}
-    return rope.get("partial_rotary_factor", getattr(hf, "partial_rotary_factor", None))
+    return rope.get("partial_rotary_factor", 1.0)
 
 
 def baseline_switches() -> list[tuple[str, bool]]:

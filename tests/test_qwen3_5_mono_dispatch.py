@@ -177,10 +177,14 @@ def test_a_rotary_share_other_than_the_kernels_is_refused(native, rope):
     assert reason.startswith("partial_rotary_factor")
 
 
-def test_the_flat_rotary_field_is_read(native):
+def test_the_rotary_share_is_read_where_the_original_reads_it(native):
+    """A flat ``partial_rotary_factor`` is not what the original attention reads: it rotates the whole
+    head without ``rope_parameters``, so that config is refused."""
     hf = {k: v for k, v in _HF.items() if k != "rope_parameters"}
     hf = SimpleNamespace(**hf, partial_rotary_factor=0.25)
-    assert dispatch.config_refusal(_atom_config(hf_config=hf)) is None
+    assert dispatch.config_refusal(_atom_config(hf_config=hf)).startswith(
+        "partial_rotary_factor 1.0"
+    )
 
 
 def test_the_layer_check_needs_eager_plain_decode(native, monkeypatch):
@@ -426,3 +430,27 @@ def test_both_architectures_install_mono(arch):
         mono_decode_installers[arch]
         == "atom.models.qwen3_5.mono.dispatch.install_mono_decode"
     )
+
+
+def test_a_step_the_kernel_refuses_runs_the_original_model(monkeypatch):
+    """A step whose tensors the kernel does not address (``StepInputError``, raised before any launch)
+    is served by the original model, not an engine crash."""
+    from atom.models.qwen3_5.mono.op import StepInputError
+
+    class Runner:
+        T, replay_cap = 1, 0
+
+        def forward(self, input_ids, positions):
+            raise StepInputError("v_cache must be FP8")
+
+    model = torch.nn.Identity()
+    model.forward = lambda ids, pos, *a, **k: "original"
+    wrapped = dispatch.MonoDecodeModel(model, Runner())
+    object.__setattr__(
+        wrapped, "_mono", SimpleNamespace(ready=lambda n: True, runner=Runner())
+    )
+    monkeypatch.setattr(
+        dispatch, "get_forward_context", lambda: SimpleNamespace(kv_cache_data=True)
+    )
+    monkeypatch.setattr(dispatch, "step_supported", lambda *a: True)
+    assert wrapped(_ids(4), torch.zeros(4, dtype=torch.int32)) == "original"

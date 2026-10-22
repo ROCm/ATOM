@@ -40,10 +40,16 @@ def forward_checked(
     lm = runner.lm
     n = input_ids.numel()
     built = runner.widths[n]
-    built["mailboxes"].begin_step()
     hidden = lm.embed_tokens(input_ids)
     residual = None
     x = hidden.float()
+    # the step's tensors before anything runs: a refused step runs the original model once, untouched
+    from atom.models.qwen3_5.mono.runner import check_inputs
+
+    check_inputs(
+        built, kvd, x, runner.layer_inputs(built, kvd, pos, ctx, slots, bt, gdn)
+    )
+    built["mailboxes"].begin_step()
     scr = {}
     for i, op in enumerate(built["ops"]):
         layer = lm.layers[i]

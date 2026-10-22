@@ -43,7 +43,6 @@ class Qwen35Variant:
         debug=False,
         timeline=False,
         peers=None,
-        gemm_m=None,
     ):
         if full and cfg.local_kv_heads != 1:
             raise ValueError("the full-attention kernel holds one K / V head per rank")
@@ -93,7 +92,6 @@ class Qwen35Variant:
             tuple(sorted(dims.items())),
             debug,
             timeline,
-            gemm_m,
         )
         if self.key not in Qwen35Variant._cache:
             Qwen35Variant._cache[self.key] = build_qwen35_kernel(
@@ -106,7 +104,6 @@ class Qwen35Variant:
                 replay_cap=replay_cap,
                 debug=debug,
                 timeline=timeline,
-                gemm_m=gemm_m,
                 **dims,
             )
         self.launch = Qwen35Variant._cache[self.key]

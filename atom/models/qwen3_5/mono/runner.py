@@ -28,9 +28,7 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
 from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import (
-    BF16_GEMM_RULES,
     TL_POINTS,
-    baseline_m,
     layout,
     router_rows,
     shape_dims,
@@ -169,12 +167,6 @@ class Qwen35MonoDecodeRunner:
         self.replay_cap = replay_cap
         self.debug = envs.ATOM_MONO_DEBUG
         self.max_len = atom_config.max_model_len
-        # the CUDA-graph ladder baseline ATOM pads a decode to (None: eager, no padding)
-        self.capture = (
-            None
-            if atom_config.enforce_eager
-            else tuple(sorted(atom_config.capture_sizes))
-        )
         bind_agreed(lambda: self._bind(causal_lm), self.group)
         # ATOM_MONO_TIMELINE: every layer's stamps, saved after the warm-up steps (eager)
         tl_prefix = envs.ATOM_MONO_TIMELINE
@@ -452,12 +444,6 @@ class Qwen35MonoDecodeRunner:
         """
         T = self.T
         self._check_records()
-        # the M baseline ATOM's GEMMs run this step at: the MXFP4 build's BF16 rounding follows it
-        gemm_m = baseline_m(S, T, self.capture)
-        if self.cfg.weights == "mxfp4" and gemm_m not in BF16_GEMM_RULES["out"]:
-            raise MonoUnsupported(
-                f"{S} rows run at M {gemm_m}: no BF16 GEMM rounding rule there"
-            )
         # one peer buffer for both kinds (the same symmetric regions; a layer's tags are its own),
         # freed with the runner; collective over the CPU group
         dims = shape_dims(self.cfg)
@@ -478,7 +464,6 @@ class Qwen35MonoDecodeRunner:
                 debug=self.debug,
                 timeline=self.timeline is not None,
                 peers=peers,
-                gemm_m=gemm_m,
             )
             for full in (False, True)
         }
@@ -508,10 +493,13 @@ class Qwen35MonoDecodeRunner:
 
     def _check_records(self) -> None:
         """ReplaySSM's record buffers as the kernel reads them. They bind with the KV
-        cache, so this is checked when a width is built (its first step)."""
+        cache: a width built before (at install) leaves them to the step's own check
+        (``check_inputs``), which also compares their shape before the first launch."""
         if not self.replay_cap:
             return
         kvd = get_forward_context().kv_cache_data
+        if not kvd:
+            return
         want = (self.cfg.hv, self.replay_cap, self.cfg.linear_k_dim)
         for i, full in enumerate(self.full):
             if full:
@@ -597,14 +585,8 @@ class Qwen35MonoDecodeRunner:
             bt = md.block_tables[:Q].repeat_interleave(T, 0)
         return pos, ctx, slots, bt, gdn
 
-    def _layers(self, x, pos, ctx, slots, bt, gdn):
-        """The step's rows through every layer: one launch each."""
-
-        def tl(i):
-            return self.timeline.ptr(i) if self.timeline is not None else 0
-
-        kvd = get_forward_context().kv_cache_data
-        built = self.widths[x.shape[0]]
+    def layer_inputs(self, built, kvd, pos, ctx, slots, bt, gdn) -> list[dict]:
+        """Every layer's step tensors, as its ``op.forward`` takes them (``kv`` / ``rope``, or ``gdn_state``)."""
         ins = []
         for i, op in enumerate(built["ops"]):
             lc = kvd[f"layer_{self.layer_nums[i]}"]
@@ -618,6 +600,17 @@ class Qwen35MonoDecodeRunner:
                 if self.replay_cap:
                     state += (lc.replay_buf_k, lc.replay_buf_u, lc.replay_buf_g)
                 ins.append({"gdn_state": state})
+        return ins
+
+    def _layers(self, x, pos, ctx, slots, bt, gdn):
+        """The step's rows through every layer: one launch each."""
+
+        def tl(i):
+            return self.timeline.ptr(i) if self.timeline is not None else 0
+
+        kvd = get_forward_context().kv_cache_data
+        built = self.widths[x.shape[0]]
+        ins = self.layer_inputs(built, kvd, pos, ctx, slots, bt, gdn)
         check_inputs(built, kvd, x, ins)
         built["mailboxes"].begin_step()
         for i, op in enumerate(built["ops"]):
