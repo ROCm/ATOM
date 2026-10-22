@@ -22,6 +22,8 @@ import contextlib
 import json
 import logging
 import os
+import sys
+import threading
 import time
 import uuid
 from asyncio import AbstractEventLoop
@@ -1543,8 +1545,9 @@ async def _reclaim_watch_once() -> None:
     reclaim_watch("api_server")
 
 
-# Chat template render time on the loop since the last LOOP report.
-_loop_probe = {"tmpl_s": 0.0}
+# Chat template render time on the loop since the last LOOP report, and the
+# monotonic time of the monitor's last wake-up (read by the block sampler).
+_loop_probe = {"tmpl_s": 0.0, "beat": 0.0}
 
 
 async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
@@ -1556,6 +1559,7 @@ async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
         t0 = loop.time()
         await asyncio.sleep(tick)
         now = loop.time()
+        _loop_probe["beat"] = time.monotonic()
         lags.append(now - t0 - tick)
         if now - start < window:
             continue
@@ -1575,6 +1579,59 @@ async def _loop_lag_monitor(tick: float = 0.01, window: float = 30.0) -> None:
         )
         lags.clear()
         _loop_probe["tmpl_s"] = 0.0
+        start = now
+
+
+def _stack_key(frame, depth: int = 8) -> str:
+    parts = []
+    while frame is not None and len(parts) < depth:
+        code = frame.f_code
+        parts.append(
+            f"{os.path.basename(code.co_filename)}:{code.co_name}:{frame.f_lineno}"
+        )
+        frame = frame.f_back
+    return "<".join(parts)
+
+
+def _loop_block_sampler(
+    loop_tid: int,
+    threshold: float = 0.03,
+    period: float = 0.005,
+    window: float = 30.0,
+    top: int = 6,
+) -> None:
+    """Sample the loop thread's stack whenever the LOOP monitor is more than
+    ``threshold`` overdue, and log the most frequent stacks every ``window``.
+
+    A C call that holds the GIL (json parsing, pydantic validation) keeps this
+    thread out until it returns, so such a block is sampled at its Python call
+    site, and fewer times than its length.
+    """
+    counts: dict[str, int] = {}
+    start = time.monotonic()
+    while True:
+        time.sleep(period)
+        now = time.monotonic()
+        beat = _loop_probe["beat"]
+        if beat and now - beat > threshold:
+            frame = sys._current_frames().get(loop_tid)
+            if frame is not None:
+                key = _stack_key(frame)
+                counts[key] = counts.get(key, 0) + 1
+            del frame
+        if now - start < window:
+            continue
+        total = sum(counts.values())
+        for key, n in sorted(counts.items(), key=lambda kv: -kv[1])[:top]:
+            logger.info(
+                "[PD-TIMING] ev=LOOPSTK t=%.3f window_s=%.1f n=%d of=%d stack=%s",
+                time.time(),
+                now - start,
+                n,
+                total,
+                key,
+            )
+        counts.clear()
         start = now
 
 
@@ -1622,6 +1679,12 @@ async def lifespan(app: FastAPI):
         _background_tasks.append(
             asyncio.create_task(_loop_lag_monitor(), name="_loop_lag_monitor")
         )
+        threading.Thread(
+            target=_loop_block_sampler,
+            args=(threading.get_ident(),),
+            name="loop-block-sampler",
+            daemon=True,
+        ).start()
     try:
         yield
     finally:

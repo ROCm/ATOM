@@ -4608,7 +4608,7 @@ class Scheduler:
             return False
 
         logger.debug("KV transfer finished for seq %s, ready for scheduling.", seq.id)
-        tid = (seq.kv_transfer_params or {}).get("transfer_id")
+        tid = (getattr(seq, "kv_transfer_params", None) or {}).get("transfer_id")
         if pd_timing.sampled(tid):
             pd_timing.log("D_ready", tid, rid=seq.id)
 
