@@ -124,6 +124,34 @@ def _slot_routing(hidden_states, gating_output, topk, renormalize):
     return torch.ones_like(gating_output, dtype=torch.float32), ids
 
 
+def _slot_moe_unsupported(experts, enable_dp_attention: bool) -> str | None:
+    """Why ``experts`` cannot run the pre-expanded top-1 slots, or None.
+
+    Two FusedMoE paths cannot take ``[tokens * top_k]`` slot rows
+    with preselected expert ids:
+    - the Triton TP path routes from ``router_logits`` and ignores
+      ``custom_routing_function`` (moe.py ``Mxfp4MoEMethod.apply``), so it would
+      read the expert ids as logits and pick expert 0 for every slot;
+    - with DP attention the MoE gathers rows across DP ranks against the
+      forward context's token count, which the slots exceed ``top_k`` times
+      (the gather/scatter path asserts; the all2all path is not validated with
+      expanded slots).
+    """
+    if getattr(experts.quant_method, "use_triton", False):
+        return (
+            "Muse Spark routes preselected experts over top_k-expanded slots, "
+            "which the Triton TP MoE path does not support (it routes from "
+            "logits). Set ATOM_USE_TRITON_MOE=0, or run with expert parallel."
+        )
+    if enable_dp_attention and experts.dp_size > 1:
+        return (
+            "Muse Spark does not support DP attention yet: its MoE runs "
+            "top_k-expanded slots, and the DP MoE communication expects one row "
+            "per token. Run without DP attention (TP or TP + EP)."
+        )
+    return None
+
+
 # ── modules ────────────────────────────────────────────────────────────────
 
 
@@ -306,6 +334,11 @@ class MuseSparkMoE(nn.Module):
             custom_routing_function=_slot_routing,
             config=config,
         )
+        unsupported = _slot_moe_unsupported(
+            self.experts, atom_config.enable_dp_attention
+        )
+        if unsupported:
+            raise NotImplementedError(unsupported)
         self.post_expert_proj = ReplicatedLinear(
             self.expert_dim,
             config.hidden_size,
