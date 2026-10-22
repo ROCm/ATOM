@@ -683,7 +683,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             ),
         }
 
-    def build_for_cudagraph_capture(self, bs: int):
+    def build_for_cudagraph_capture(self, bs: int, max_context_len: int | None = None):
         """Decode-graph metadata pointing at the same buffers replay writes.
 
         Every tensor here is a slice of a persistent buffer that
@@ -709,7 +709,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             num_tokens,
             np.full(bs, int(attn_metadata.max_seqlen_q), dtype=np.int64),
             num_tokens,
-            max_seq_len=runner.config.max_model_len,
+            max_seq_len=(
+                runner.config.max_model_len
+                if max_context_len is None
+                else int(max_context_len)
+            ),
         )
 
         slots = self._ple_state_slots(attn_metadata.gdn_metadata)
