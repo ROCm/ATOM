@@ -273,14 +273,11 @@ class BlockManager:
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
         # P/D consumer only: state slots a finished request frees are held
-        # until the forward that may still write them has finished on the
-        # device. See `advance_state_release_lag`.
+        # until the forward that may still write them has certainly finished.
+        # See `advance_state_release_lag`.
         self.state_release_lag = False
-        # [(forward id that may still write the slots, slots), ...]
-        self._state_held: list[tuple[int, list[int]]] = []
-        # The forward in flight while requests are being freed (set per
-        # postprocess from the forward's own output).
-        self.state_hold_forward_id = 0
+        # [[confirmations still needed, slots], ...]
+        self._state_held: list[list] = []
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3195,40 +3192,47 @@ class BlockManager:
         for block_id in block_ids:
             self.kv.free(block_id)
 
-    # A forward on another TP rank can trail the reporting rank by at most one:
-    # each forward has a TP collective, which no rank finishes until every rank
-    # has entered it, and a rank enters forward N+1 only after forward N.
-    STATE_RELEASE_SLACK = 1
+    # Output-reading postprocesses a held slot waits for. The first proves the
+    # forward in flight when the slot was freed has finished on this rank: the
+    # next output-producing forward synchronizes on its sampled tokens before
+    # the scheduler reads them. The second covers TP peers, which can trail by
+    # at most one forward (each forward has a TP collective).
+    STATE_RELEASE_CONFIRMATIONS = 2
 
     def _hold_state_slots(self, slots) -> None:
-        self._state_held.append((self.state_hold_forward_id, list(slots)))
+        self._state_held.append([self.STATE_RELEASE_CONFIRMATIONS, list(slots)])
 
     @property
     def has_held_state_slots(self) -> bool:
         return bool(self._state_held)
 
-    def advance_state_release_lag(self, completed_forward_id: int | None) -> None:
-        """Hand back held state slots whose last writer has finished.
+    def advance_state_release_lag(self, confirmed: bool | None) -> None:
+        """Count one postprocess toward releasing held state slots.
 
         With deferred output a request is known finished only in the
         postprocess of the forward after the one that finished it, and that
         forward -- already running, still carrying the request -- writes its
         state slot. On a P/D consumer a slot handed out at once can receive
         another request's state by RDMA, which no stream orders against that
-        forward, so it could be overwritten. A slot goes back only once the
-        workers report that forward (and, for TP, the one after it) finished.
+        forward, so it could be overwritten.
 
-        `completed_forward_id=None` means everything queued has finished
-        (`drain_device`).
+        `confirmed`: whether the forward being postprocessed produced output.
+        Only such a postprocess proves anything -- its forward waited for the
+        previous one's sampled tokens -- so an output-less one (a middle
+        prefill chunk) does not count. `None`: the workers have drained
+        (`drain_device`), everything held goes back.
         """
         if not self._state_held:
             return
-        if completed_forward_id is None:
+        if confirmed is None:
             ready, self._state_held = self._state_held, []
         else:
-            limit = completed_forward_id - self.STATE_RELEASE_SLACK
-            ready = [h for h in self._state_held if h[0] <= limit]
-            self._state_held = [h for h in self._state_held if h[0] > limit]
+            if not confirmed:
+                return
+            for held in self._state_held:
+                held[0] -= 1
+            ready = [h for h in self._state_held if h[0] <= 0]
+            self._state_held = [h for h in self._state_held if h[0] > 0]
         for _, slots in ready:
             self.state.release_many(slots)
 

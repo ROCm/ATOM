@@ -1391,10 +1391,8 @@ class TestStateReleaseLag:
         bm.state_release_lag = lag
         return bm
 
-    def _free_during(self, bm, forward_id):
-        """Free one slot the way `deallocate` does, in forward `forward_id`'s
-        postprocess."""
-        bm.state_hold_forward_id = forward_id
+    def _free(self, bm):
+        """Free one slot the way `deallocate` does for a finished request."""
         slot = bm.state.pop()
         if bm.state_release_lag:
             bm._hold_state_slots([slot])
@@ -1402,33 +1400,36 @@ class TestStateReleaseLag:
             bm.state.release_many([slot])
         return slot
 
-    def test_held_until_that_forward_and_the_next_have_finished(self):
+    def test_only_output_reading_postprocesses_count(self):
         bm = self._bm()
-        self._free_during(bm, forward_id=7)
-        # A middle prefill chunk's postprocess consumes no output: reaching it
-        # says nothing about forward 7, and neither does 7 alone under TP.
-        for done in (5, 6, 7):
-            bm.advance_state_release_lag(done)
-            assert not bm.state.has_free(2)
-        bm.advance_state_release_lag(8)
+        self._free(bm)
+        # A middle prefill chunk's postprocess consumes no output and proves
+        # nothing about the forward that was in flight.
+        for _ in range(5):
+            bm.advance_state_release_lag(False)
+        assert not bm.state.has_free(2)
+        bm.advance_state_release_lag(True)
+        assert not bm.state.has_free(2)  # one more for a trailing TP peer
+        bm.advance_state_release_lag(True)
         assert bm.state.has_free(2)
 
-    def test_slots_go_back_in_the_order_their_forwards_finish(self):
+    def test_slots_freed_later_wait_their_own_turn(self):
         bm = self._bm()
-        first = self._free_during(bm, forward_id=3)
-        self._free_during(bm, forward_id=9)
-        bm.advance_state_release_lag(4)
+        first = self._free(bm)
+        bm.advance_state_release_lag(True)
+        self._free(bm)
+        bm.advance_state_release_lag(True)
         assert first in bm.state._free and not bm.state.has_free(2)
 
     def test_an_idle_drain_releases_everything(self):
         bm = self._bm()
-        self._free_during(bm, forward_id=3)
-        self._free_during(bm, forward_id=4)
+        self._free(bm)
+        self._free(bm)
         assert bm.has_held_state_slots
         bm.advance_state_release_lag(None)
         assert bm.state.has_free(2) and not bm.has_held_state_slots
 
     def test_without_lag_a_slot_is_free_at_once(self):
         bm = self._bm(lag=False)
-        self._free_during(bm, forward_id=3)
+        self._free(bm)
         assert bm.state.has_free(2)

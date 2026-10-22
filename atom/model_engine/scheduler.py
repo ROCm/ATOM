@@ -3926,14 +3926,13 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # Slots held for a forward the device has finished go back; requests
-        # freed below are held for this forward, which may still write them.
+        # Held state slots wait for output-reading postprocesses; requests
+        # freed below are held from here (`advance_state_release_lag`).
         if self.block_manager.state_release_lag:
             self.block_manager.advance_state_release_lag(
-                getattr(fwd_output, "completed_forward_id", 0)
-            )
-            self.block_manager.state_hold_forward_id = getattr(
-                fwd_output, "forward_id", self.block_manager.state_hold_forward_id
+                batch.produces_output()
+                if batch is not None
+                else bool(getattr(fwd_output, "token_ids", None))
             )
         # Remember which seqs were already in the middle of chunked prefill
         # before this postprocess call mutates seq.is_partial_prefill below.
