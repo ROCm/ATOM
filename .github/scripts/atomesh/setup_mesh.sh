@@ -33,7 +33,10 @@ if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]
     source_dirty=true
   fi
   echo "[setup] Building Mesh before launching services" >&2
+  # A cold build runs one rustc per CPU (192 on MI350 nodes), which exhausts
+  # Docker's default soft limit of 1024 open files.
   docker run --rm --user "$(id -u):$(id -g)" \
+    --ulimit nofile=65536:524288 \
     --env-file "${env_file}" \
     -e ATOMESH_MESH_SOURCE_COMMIT="${source_commit}" \
     -e ATOMESH_MESH_SOURCE_DIRTY="${source_dirty}" \
