@@ -3536,7 +3536,10 @@ class ModelRunner:
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
                 verdict = _g.broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
-            self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
+            # Only a mixed step's verdict needs re-expressing in token rows; a
+            # pure step keeps postprocess free of the mixed path entirely.
+            if getattr(batch, "is_mixed", False):
+                self._settle_mixed_verdict(batch, num_reject_tokens, anchors)
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
