@@ -50,6 +50,10 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         self._rtp_forward_context_cls = RTPQwen4ExpContext
         super().__init__(model_config, *args, **kwargs)
         self._rtp_model_config = model_config
+        if model_config.mm_model_config.is_multimodal:
+            # RTP owns the vision tower, so prepare_model clears ATOM's
+            # multimodal_config and the language model has no image_token_id.
+            self._image_token_id = self._read_image_token_id(model_config.ckpt_path)
         if getattr(model_config, "atom_qwen4_exp_mtp_target", False) or getattr(
             model_config, "is_mtp", False
         ):
@@ -330,7 +334,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return self.model.embed_input_ids(input_ids)
 
     def _canonical_vision_input_ids(self, input_ids, features, locations):
-        image_token_id = int(self.model.atom_config.hf_config.image_token_id)
+        image_token_id = self._image_token_id
         canonical = input_ids.clone()
         locs = locations.to(device="cpu", dtype=torch.long).view(-1).tolist()
         if len(locs) != len(features):
@@ -339,6 +343,11 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             if feature is not None and feature.numel():
                 canonical.narrow(0, loc, feature.shape[0]).fill_(image_token_id)
         return canonical
+
+    @staticmethod
+    def _read_image_token_id(ckpt_path: str) -> int:
+        with open(os.path.join(ckpt_path, "config.json"), encoding="utf-8") as file:
+            return int(json.load(file)["image_token_id"])
 
     def get_mtp_target_hidden_states(self, num_tokens: int):
         hidden = getattr(self, "_mtp_target_hidden_states", None)

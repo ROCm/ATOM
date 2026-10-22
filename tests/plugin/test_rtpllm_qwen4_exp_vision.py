@@ -54,15 +54,20 @@ def test_vision_embedding_masks_image_placeholders_on_single_rank(monkeypatch, t
 
 def test_vision_placeholder_ids_are_canonicalized_for_ple_history():
     runtime = object.__new__(_ATOMQwen4ExpRuntime)
-    runtime.model = SimpleNamespace(
-        atom_config=SimpleNamespace(hf_config=SimpleNamespace(image_token_id=248056))
-    )
+    runtime._image_token_id = 248056
     ids = torch.tensor([12, 999999, 999999, 15, 999999, 16])
     features = [torch.zeros(2, 3), torch.zeros(1, 3)]
     locations = torch.tensor([1, 4], dtype=torch.int32)
     canonical = runtime._canonical_vision_input_ids(ids, features, locations)
     assert canonical.tolist() == [12, 248056, 248056, 15, 248056, 16]
     assert ids.tolist() == [12, 999999, 999999, 15, 999999, 16]
+
+
+def test_vision_image_token_id_comes_from_checkpoint_root(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"image_token_id": 248056, "text_config": {}})
+    )
+    assert _ATOMQwen4ExpRuntime._read_image_token_id(str(tmp_path)) == 248056
 
 
 def test_vision_weight_budget_reads_checkpoint_metadata(tmp_path):

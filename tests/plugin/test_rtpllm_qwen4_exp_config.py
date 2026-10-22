@@ -613,7 +613,11 @@ def test_qwen4_exp_mtp_graph_reserves_full_request_capacity(monkeypatch, is_draf
         _ATOMQwen35MoeRuntime, "__init__", init_with_narrow_decode_bucket
     )
     runtime = _ATOMQwen4ExpRuntime(
-        SimpleNamespace(atom_qwen4_exp_mtp_target=not is_draft, is_mtp=is_draft),
+        SimpleNamespace(
+            atom_qwen4_exp_mtp_target=not is_draft,
+            is_mtp=is_draft,
+            mm_model_config=SimpleNamespace(is_multimodal=False),
+        ),
         max_generate_batch_size=8,
     )
     assert runtime._cg_max_num_tokens == 8
@@ -631,7 +635,14 @@ def test_qwen4_exp_mtp_graph_capacity_uses_bound_positional_argument(monkeypatch
     monkeypatch.setattr(
         _ATOMQwen35MoeRuntime, "__init__", init_with_narrow_decode_bucket
     )
-    runtime = _ATOMQwen4ExpRuntime(SimpleNamespace(is_mtp=True), None, None, 8)
+    runtime = _ATOMQwen4ExpRuntime(
+        SimpleNamespace(
+            is_mtp=True, mm_model_config=SimpleNamespace(is_multimodal=False)
+        ),
+        None,
+        None,
+        8,
+    )
     assert runtime._cg_max_num_tokens == 8
 
 
