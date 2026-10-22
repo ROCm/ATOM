@@ -2754,6 +2754,7 @@ class Config:
         spec = self.speculative_config
         spec_method = None if spec is None else spec.method
         cg_mode = self.compilation_config.cudagraph_mode
+        rope_parameters = getattr(hf, "rope_parameters", None) or {}
         # (is this config affected, what it is, why it cannot run mixed)
         refusals = [
             # Only the V4 builder implements `prepare_mixed`. Compared by
@@ -2814,6 +2815,19 @@ class Config:
                 (
                     "an unchunked prompt is admitted whole even past the "
                     "decode-first prefill budget, which then cannot hold"
+                ),
+            ),
+            # Keyed off the same predicate as the runner's `use_mrope`, not off
+            # the family: no V4 checkpoint carries `mrope_section` today, but
+            # the family check alone would admit one. `prepare_prefill` lays
+            # M-RoPE positions over every request in the batch, so a mixed
+            # batch's decode rows would write past the prefill positions.
+            (
+                "mrope_section" in rope_parameters,
+                "M-RoPE",
+                (
+                    "the prefill builder lays M-RoPE positions over the whole "
+                    "mixed batch, decode rows included"
                 ),
             ),
             (

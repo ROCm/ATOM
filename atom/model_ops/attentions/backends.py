@@ -656,6 +656,14 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         slot: a slot's bank is reused only when the slot is, which the runner's
         own owner already gates on the slot's previous forward.
 
+        So the bank's own completion event covers only its uploads, and needs
+        no more. Its GPU side is ordered by stream: uploads publish on the
+        owner's compute stream, the forward that reads them runs there too
+        (TBO rejoins its comm stream before returning), so the next step's
+        upload queues behind the previous step's reads. With a PP ring, the
+        slot owner's `begin()` -- which runs before `prepare_mixed` touches the
+        bank -- has already waited for the slot's previous forward to finish.
+
         Returns ``(forward_vars, owner, groups)``; the last two are None for a
         runner without a publication registry.
         """

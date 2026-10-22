@@ -224,6 +224,16 @@ def test_validator_refuses_unchunked_prefill():
         cfg._validate_mixed_prefill_decode()
 
 
+def test_validator_refuses_mrope_even_on_v4():
+    """Same predicate as the runner's `use_mrope`: the V4 family check alone
+    would admit a V4 config that carried an `mrope_section`."""
+    _bind()
+    hf = _v4_hf()
+    hf.rope_parameters = {"mrope_section": [16, 24, 24]}
+    with pytest.raises(ValueError, match="M-RoPE"):
+        _FakeConfig(hf=hf)._validate_mixed_prefill_decode()
+
+
 def test_validator_refuses_pcp():
     """PCP's round-robin query split covers the whole batch, decode rows too."""
     _bind()
