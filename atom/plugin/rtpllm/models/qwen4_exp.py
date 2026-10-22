@@ -1,4 +1,4 @@
-"""Text-only Qwen3.8-Flash-Next adapter for RTP-LLM's ATOM plugin mode."""
+"""Qwen3.8-Flash-Next adapter for RTP-LLM's ATOM plugin mode."""
 
 from __future__ import annotations
 
@@ -306,7 +306,9 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return hidden if num_tokens < 0 else hidden[:num_tokens]
 
     def _extract_positions(self, inputs, model_device, token_num):
-        if bool(
+        # The draft consumes target HC states, not image patches; keep its
+        # existing MTP position stream even when the checkpoint is multimodal.
+        is_multimodal = bool(
             getattr(
                 getattr(
                     getattr(self, "_rtp_model_config", None), "mm_model_config", None
@@ -314,13 +316,7 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
                 "is_multimodal",
                 False,
             )
-        ):
-            logical = self._logical_positions(inputs.attention_inputs, model_device)
-            if logical is None or logical.numel() != token_num:
-                raise ValueError(
-                    "Qwen4Exp requires one logical cache position per token"
-                )
-            return logical
+        ) and not bool(getattr(self._rtp_model_config, "is_mtp", False))
         attn_inputs = inputs.attention_inputs
         is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
         is_mtp_draft_prefill = bool(
@@ -374,6 +370,13 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             if tokens_per_request > 1:
                 raise RuntimeError("Qwen4Exp MTP Graph requires prewarmed positions")
             return lengths.to(device=model_device, dtype=torch.int32) - 1
+        if is_multimodal:
+            logical = self._logical_positions(attn_inputs, model_device)
+            if logical is None or logical.numel() != token_num:
+                raise ValueError(
+                    "Qwen4Exp requires one logical cache position per token"
+                )
+            return logical
         positions = super()._extract_positions(inputs, model_device, token_num)
         # RTP may package text MRoPE as three equal rows. The QSA slot-index
         # bridge is text-only and needs one logical position per token.
@@ -386,6 +389,17 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         return positions.contiguous()
 
     def _logical_positions(self, attn_inputs, model_device):
+        is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
+        if is_target_verify:
+            lengths = attn_inputs.sequence_lengths_plus_1_device
+            if lengths is None:
+                return None
+            width = int(self._rtp_model_config.gen_num_per_cycle) + 1
+            base = lengths.to(device=model_device, dtype=torch.int32) - 1
+            return (
+                base[:, None]
+                + torch.arange(width, device=model_device, dtype=torch.int32)[None, :]
+            ).reshape(-1)
         if not attn_inputs.is_prefill:
             next_lengths = getattr(attn_inputs, "sequence_lengths_plus_1_device", None)
             if next_lengths is not None and next_lengths.numel() > 0:

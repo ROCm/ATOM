@@ -68,3 +68,68 @@ def test_decode_cache_position_uses_sequence_length_not_mrope():
     )
     actual = runtime._logical_positions(attn_inputs, torch.device("cpu"))
     assert torch.equal(actual, torch.tensor([128, 256], dtype=torch.int32))
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("is_graph", [False, True])
+def test_vision_mtp_uses_candidate_cache_positions(monkeypatch, is_draft, is_graph):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True),
+        is_mtp=is_draft,
+        gen_num_per_cycle=2,
+    )
+    runtime._cg_mtp_meta_bufs = {
+        "qwen4_positions_i32": torch.empty(6, dtype=torch.int32)
+    }
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=True,
+            is_target_verify=not is_draft,
+            is_cuda_graph=is_graph,
+            prefix_lengths_device=torch.tensor([16, 129], dtype=torch.int32),
+            sequence_lengths_plus_1_device=torch.tensor([17, 130], dtype=torch.int32),
+            combo_position_ids=torch.tensor(
+                [16, 17, 18, 129, 130, 131], dtype=torch.int32
+            ),
+        )
+    )
+    actual = runtime._extract_positions(inputs, torch.device("cpu"), 6)
+    assert actual.tolist() == [16, 17, 18, 129, 130, 131]
+
+
+def test_vision_graph_decode_uses_prewarmed_position_buffer(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True), is_mtp=False
+    )
+    runtime._cg_meta_bufs = {"qwen4_positions_i32": torch.empty(2, dtype=torch.int32)}
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=False,
+            is_cuda_graph=True,
+            sequence_lengths_plus_1_device=torch.tensor([129, 257], dtype=torch.int32),
+        )
+    )
+    actual = runtime._extract_positions(inputs, torch.device("cpu"), 2)
+    assert actual.data_ptr() == runtime._cg_meta_bufs["qwen4_positions_i32"].data_ptr()
+    assert actual.tolist() == [128, 256]
+
+
+def test_vision_draft_keeps_text_only_mtp_position_path(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True), is_mtp=True
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    inputs = SimpleNamespace(
+        attention_inputs=SimpleNamespace(
+            is_prefill=False,
+            is_cuda_graph=False,
+            combo_position_ids=torch.tensor([32, 64], dtype=torch.int32),
+        )
+    )
+    actual = runtime._extract_positions(inputs, torch.device("cpu"), 2)
+    assert actual.tolist() == [32, 64]
