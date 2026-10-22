@@ -404,7 +404,9 @@ def _attn_out_buffer(self, hidden):
     )
 
 
-def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope, queries):
+def _attend_block(
+    self, attn_out, hidden, hidden_scale, cache, _step, rope, queries, hidden_fp8=None
+):
     """Everything from the compressor fork to the attention rows, in place.
 
     Reads the step from the cache, not from its argument: the decorator binds
@@ -415,7 +417,10 @@ def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope, quer
     """
     step = getattr(cache, "current_step", None) or _step
     compressed = self._fork_compress(hidden, cache, step, rope)
-    q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+    # Auxiliary readers keep BF16; QKV can reuse the preceding MHC quantization.
+    q_lora, kv_pre = self.project_qkv(
+        hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+    )
     qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
     selecting = self._fork_select(
         hidden, qr, qr_scale, cache, step, rope, compressed=compressed
@@ -499,11 +504,13 @@ def _attend_block(self, attn_out, hidden, hidden_scale, cache, _step, rope, quer
         flat_out.copy_(rows)
 
 
-def _forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+def _forward(
+    self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
+):
     """`Attention.forward` with its attention half inside a capture break."""
     attn_out = _attn_out_buffer(self, hidden)
     type(self)._atom_v41_attend_block(
-        self, attn_out, hidden, hidden_scale, cache, step, rope, queries
+        self, attn_out, hidden, hidden_scale, cache, step, rope, queries, hidden_fp8
     )
     return self._project_out(
         attn_out,
