@@ -9,7 +9,8 @@ single owner, plus the ReplaySSM radix guard.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -253,3 +254,57 @@ def test_forcing_replayssm_under_radix_cache_is_rejected(monkeypatch):
     _server(monkeypatch, disable_radix_cache=False, speculative_algorithm="DFLASH")
     with pytest.raises(RuntimeError, match="radix cache"):
         gdn_replayssm.replayssm_enabled()
+
+
+def _patched_decode_runner(monkeypatch):
+    """Install the plugin's DecodeCudaGraphRunner patch on a stand-in class."""
+    from atom.plugin.sglang import register
+
+    class _Runner:
+        def __init__(self):
+            self.model_runner = SimpleNamespace(attn_backend="backend")
+
+        def capture_one_shape(self, *args, **kwargs):
+            return None
+
+        def execute(self, forward_batch, *args, **kwargs):
+            return ("replayed", forward_batch)
+
+    forward_context = ModuleType("sglang.srt.model_executor.forward_context")
+    forward_context.ForwardContext = object
+    forward_context.forward_context = None
+    forward_context.has_forward_context = lambda: True
+    runner_module = ModuleType(
+        "sglang.srt.model_executor.runner.decode_cuda_graph_runner"
+    )
+    runner_module.DecodeCudaGraphRunner = _Runner
+    monkeypatch.setitem(sys.modules, forward_context.__name__, forward_context)
+    monkeypatch.setitem(sys.modules, runner_module.__name__, runner_module)
+    register._install_decode_graph_forward_context_patch()
+    assert _Runner._atom_mamba_track_epilogue
+    return _Runner()
+
+
+def test_decode_graph_epilogue_snapshots_after_replay(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        attention_gdn,
+        "track_mamba_radix_after_decode_graph",
+        lambda fb, attn_backend: seen.append((fb, attn_backend)),
+    )
+    runner = _patched_decode_runner(monkeypatch)
+    assert runner.execute("fb") == ("replayed", "fb")
+    assert seen == [("fb", "backend")]
+
+
+def test_decode_graph_epilogue_failure_is_not_swallowed(monkeypatch):
+    """The epilogue is the only snapshot writer for a replayed decode; a
+    failure must not return the step as if the track slot had been written."""
+
+    def fail(fb, attn_backend):
+        raise RuntimeError("track launch failed")
+
+    monkeypatch.setattr(attention_gdn, "track_mamba_radix_after_decode_graph", fail)
+    runner = _patched_decode_runner(monkeypatch)
+    with pytest.raises(RuntimeError, match="track launch failed"):
+        runner.execute("fb")

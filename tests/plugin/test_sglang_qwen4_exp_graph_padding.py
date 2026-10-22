@@ -775,6 +775,29 @@ def test_ple_state_pool_slots_uses_mamba_pool_size():
     assert _ple_state_pool_slots(fb, idx) >= 64
 
 
+def test_ple_state_pool_slots_ignores_kv_token_budget(monkeypatch):
+    """`--max-total-tokens` sizes the KV cache, not the mamba pool; as a PLE
+    row floor it allocated one 184 KB row per KV token."""
+    from atom.plugin.sglang import qwen4_exp_bridge as bridge
+
+    monkeypatch.setattr(
+        bridge,
+        "_server_args",
+        lambda: SimpleNamespace(
+            max_mamba_cache_size=330, max_total_tokens=65536, max_running_requests=4
+        ),
+    )
+    fb = SimpleNamespace(
+        batch_size=4,
+        attn_backend=None,
+        req_to_token_pool=SimpleNamespace(size=64, req_to_token=torch.zeros(64, 8)),
+        token_to_kv_pool=None,
+    )
+    idx = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    slots = _ple_state_pool_slots(fb, idx)
+    assert 330 <= slots < 65536
+
+
 def test_plugin_ple_metadata_is_native():
     """Plugin PLE metadata is Native Qwen4ExpPLEMetadata, including num_accepted_tokens."""
     from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpPLEMetadata

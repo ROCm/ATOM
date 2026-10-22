@@ -1210,10 +1210,11 @@ def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
     slots = max(int(_DECODE_GRAPH.max_bs), 512)
     args = _server_args()
     if args is not None:
-        for key in ("max_mamba_cache_size", "max_total_tokens"):
-            val = getattr(args, key, None)
-            if val:
-                slots = max(slots, int(val))
+        # Mamba slots only: `max_total_tokens` is the KV token budget, and as
+        # a row floor it allocated one PLE row (184 KB on Flash) per KV token.
+        mamba_cache_size = getattr(args, "max_mamba_cache_size", None)
+        if mamba_cache_size:
+            slots = max(slots, int(mamba_cache_size))
         running = int(getattr(args, "max_running_requests", 0) or 0)
         if running > 0:
             # extra_buffer ≈ 2x; radix retains finished track slots on top.

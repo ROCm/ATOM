@@ -146,26 +146,24 @@ def _install_decode_graph_forward_context_patch() -> None:
 
     DecodeCudaGraphRunner.capture_one_shape = capture_one_shape_with_forward_context
 
-    # Post-replay mamba track epilogue for Native GDN (community bakes track
-    # inside the graph; Native also bakes via ``_track_mamba_radix_slots``).
-    # Re-snapshot after replay so radix/extra_buffer never depends solely on
-    # the captured track-save binding.
+    # Post-replay mamba track epilogue for Native GDN. Community bakes the
+    # decode track inside the graph; ``_track_mamba_radix_slots`` skips capture,
+    # so for a replayed decode this epilogue is the only snapshot writer. A
+    # failure propagates: a track slot left unwritten would be offered to later
+    # prefix hits as if it held this request's state.
     if not getattr(DecodeCudaGraphRunner, "_atom_mamba_track_epilogue", False):
         original_execute = DecodeCudaGraphRunner.execute
 
         def execute_with_mamba_track_epilogue(self, forward_batch, *args, **kwargs):
             output = original_execute(self, forward_batch, *args, **kwargs)
-            try:
-                from atom.plugin.sglang.attention_backend.attention_gdn import (
-                    track_mamba_radix_after_decode_graph,
-                )
+            from atom.plugin.sglang.attention_backend.attention_gdn import (
+                track_mamba_radix_after_decode_graph,
+            )
 
-                track_mamba_radix_after_decode_graph(
-                    forward_batch,
-                    attn_backend=self.model_runner.attn_backend,
-                )
-            except Exception:
-                logger.exception("Native GDN post-replay mamba track failed")
+            track_mamba_radix_after_decode_graph(
+                forward_batch,
+                attn_backend=self.model_runner.attn_backend,
+            )
             return output
 
         DecodeCudaGraphRunner.execute = execute_with_mamba_track_epilogue
