@@ -584,7 +584,7 @@ class EngineCore:
     def _release_held_state_slots_when_idle(self) -> None:
         """No forward ran this tick, so none will report completion: wait for
         the device and hand back the state slots a P/D consumer is holding
-        (`BlockManager.advance_state_release_lag`). Without this a pool whose
+        (`BlockManager.release_held_state_slots`). Without this a pool whose
         every slot is held -- one slot under `--max-num-seqs 1` -- would admit
         nothing and never run the forward that releases them."""
         bm = getattr(self.scheduler, "block_manager", None)
@@ -593,7 +593,7 @@ class EngineCore:
         if not bm.has_held_state_slots:
             return
         self.runner_mgr.call_func("drain_device", wait_out=True)
-        bm.advance_state_release_lag(None)
+        bm.release_held_state_slots()
 
     def _advance_idle_kv_transfer(self, dispatch_new: bool = True) -> None:
         # No forward batch will run this tick, but offload load/save work may

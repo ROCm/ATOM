@@ -45,7 +45,7 @@ def kv_config_has_consumer(kv_config: object) -> bool:
 
     A consumer receives per-request state by RDMA into slots the scheduler
     hands out, so it must not reuse a slot a forward may still write
-    (`BlockManager.advance_state_release_lag`).
+    (`BlockManager.release_held_state_slots`).
     """
     if not isinstance(kv_config, dict):
         return False

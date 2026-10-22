@@ -636,7 +636,7 @@ class Scheduler:
             state_runtime=state_runtime,
         )
         # A P/D consumer receives state by RDMA into slots the previous
-        # tenant's in-flight step may still write (`advance_state_release_lag`).
+        # tenant's in-flight step may still write (`release_held_state_slots`).
         # Not under pipeline parallelism: deferred output is off there
         # (`tokenIDProcessor.is_deferred_out`), so a finished request has no
         # forward still in flight, and the PP head runs its own loop.
@@ -3930,14 +3930,12 @@ class Scheduler:
         are still mid-prefill (partial chunks) so their sampled tokens can be
         discarded.
         """
-        # Held state slots wait for output-reading postprocesses; requests
-        # freed below are held from here (`advance_state_release_lag`).
-        if self.block_manager.state_release_lag:
-            self.block_manager.advance_state_release_lag(
-                batch.produces_output()
-                if batch is not None
-                else bool(getattr(fwd_output, "token_ids", None))
-            )
+        # Slots freed one step ago are safe once a forward read its
+        # predecessor's output; a middle prefill chunk read nothing.
+        if self.block_manager.state_release_lag and (
+            batch is None or batch.produces_output()
+        ):
+            self.block_manager.release_held_state_slots()
         # Remember which seqs were already in the middle of chunked prefill
         # before this postprocess call mutates seq.is_partial_prefill below.
         #

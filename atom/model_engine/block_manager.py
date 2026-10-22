@@ -272,12 +272,10 @@ class BlockManager:
         # from "no slots were ever created" (permanent).
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
-        # P/D consumer only: state slots a finished request frees are held
-        # until the forward that may still write them has certainly finished.
-        # See `advance_state_release_lag`.
+        # P/D consumer only: state slots freed since the last output-reading
+        # postprocess (`release_held_state_slots`).
         self.state_release_lag = False
-        # [[confirmations still needed, slots], ...]
-        self._state_held: list[list] = []
+        self._held_state_slots: list[int] = []
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3192,49 +3190,23 @@ class BlockManager:
         for block_id in block_ids:
             self.kv.free(block_id)
 
-    # Output-reading postprocesses a held slot waits for. The first proves the
-    # forward in flight when the slot was freed has finished on this rank: the
-    # next output-producing forward synchronizes on its sampled tokens before
-    # the scheduler reads them. The second covers TP peers, which can trail by
-    # at most one forward (each forward has a TP collective).
-    STATE_RELEASE_CONFIRMATIONS = 2
-
-    def _hold_state_slots(self, slots) -> None:
-        self._state_held.append([self.STATE_RELEASE_CONFIRMATIONS, list(slots)])
-
     @property
     def has_held_state_slots(self) -> bool:
-        return bool(self._state_held)
+        return bool(self._held_state_slots)
 
-    def advance_state_release_lag(self, confirmed: bool | None) -> None:
-        """Count one postprocess toward releasing held state slots.
+    def release_held_state_slots(self) -> None:
+        """Hand back state slots freed one step ago (P/D consumer only).
 
-        With deferred output a request is known finished only in the
-        postprocess of the forward after the one that finished it, and that
-        forward -- already running, still carrying the request -- writes its
-        state slot. On a P/D consumer a slot handed out at once can receive
-        another request's state by RDMA, which no stream orders against that
-        forward, so it could be overwritten.
-
-        `confirmed`: whether the forward being postprocessed produced output.
-        Only such a postprocess proves anything -- its forward waited for the
-        previous one's sampled tokens -- so an output-less one (a middle
-        prefill chunk) does not count. `None`: the workers have drained
-        (`drain_device`), everything held goes back.
+        With deferred output a request is known finished one forward late, and
+        that forward -- already running, still carrying it -- writes its state
+        slot. Handed out at once, the slot can receive another request's state
+        by RDMA, which no stream orders against that forward. So a freed slot
+        waits for the next output-reading postprocess (its forward synchronized
+        on the previous one's tokens) or an idle drain (`drain_device`).
         """
-        if not self._state_held:
-            return
-        if confirmed is None:
-            ready, self._state_held = self._state_held, []
-        else:
-            if not confirmed:
-                return
-            for held in self._state_held:
-                held[0] -= 1
-            ready = [h for h in self._state_held if h[0] <= 0]
-            self._state_held = [h for h in self._state_held if h[0] > 0]
-        for _, slots in ready:
-            self.state.release_many(slots)
+        if self._held_state_slots:
+            self.state.release_many(self._held_state_slots)
+            self._held_state_slots = []
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -3304,7 +3276,7 @@ class BlockManager:
                 self._state_loads = [e for e in self._state_loads if e[0] != seq.id]
                 self.state.release_many(seq.state_slots[1:])
             elif self.state_release_lag:
-                self._hold_state_slots(seq.state_slots)
+                self._held_state_slots.extend(seq.state_slots)
             else:
                 self.state.release_many(seq.state_slots)
             # No next forward will read a pending fork source after deallocation.

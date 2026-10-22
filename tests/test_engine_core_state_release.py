@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """A P/D consumer whose state slots are all held must not stall.
 
-`BlockManager.advance_state_release_lag` holds a finished request's slot until
-an output-reading postprocess confirms the forward that may still write it.
+`BlockManager.release_held_state_slots` hands back a finished request's slot
+one output-reading postprocess late, after the forward that may still write it.
 When admission fails because every slot is held, the scheduler returns an
 empty batch: no forward runs, so the engine step itself has to drain the
 workers and release the slots, or the queued request never starts.
@@ -30,10 +30,9 @@ class _BlockManager:
     def has_held_state_slots(self):
         return self.held
 
-    def advance_state_release_lag(self, confirmed):
-        self.released_with.append(confirmed)
-        if confirmed is None:
-            self.held = False
+    def release_held_state_slots(self):
+        self.released_with.append("release")
+        self.held = False
 
 
 def _engine(empty_batch):
@@ -63,7 +62,7 @@ def test_an_empty_batch_drains_and_releases_held_slots():
     core, bm, calls = _engine(batch)
     assert core._process_engine_step_inner() is False
     assert calls == ["drain_device"]
-    assert bm.released_with == [None] and not bm.has_held_state_slots
+    assert bm.released_with == ["release"] and not bm.has_held_state_slots
 
 
 def test_nothing_held_means_no_drain():

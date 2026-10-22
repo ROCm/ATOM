@@ -482,7 +482,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # The STATE slot travels as one slot-indexed region the connector
         # writes straight across (`src_slot * unit` to `dst_slot * unit`). Its
         # ordering against the consumer's in-flight step for the slot's
-        # previous tenant is the scheduler's (`advance_state_release_lag`).
+        # previous tenant is the scheduler's (`release_held_state_slots`).
         from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
 
         state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
