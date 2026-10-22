@@ -1593,6 +1593,28 @@ def _stack_key(frame, depth: int = 8) -> str:
     return "<".join(parts)
 
 
+# Innermost functions of a thread parked in a blocking call, which releases the
+# GIL, so the thread cannot be what holds the loop up.
+_IDLE_FUNCS = frozenset(
+    {
+        "wait",
+        "select",
+        "poll",
+        "get",
+        "recv",
+        "recv_multipart",
+        "recv_pyobj",
+        "sleep",
+        "accept",
+        "acquire",
+        "join",
+        "readinto",
+        "_wait_for_tstate_lock",
+        "dequeue",
+    }
+)
+
+
 def _loop_block_sampler(
     loop_tid: int,
     threshold: float = 0.03,
@@ -1600,38 +1622,55 @@ def _loop_block_sampler(
     window: float = 30.0,
     top: int = 6,
 ) -> None:
-    """Sample the loop thread's stack whenever the LOOP monitor is more than
-    ``threshold`` overdue, and log the most frequent stacks every ``window``.
+    """Sample stacks whenever the LOOP monitor is more than ``threshold``
+    overdue, and log the most frequent ones every ``window``: the loop
+    thread's (``who=loop``) and, per thread, any other that is not parked in a
+    blocking call (``who=<thread name>``), as it may be holding the GIL.
 
     A C call that holds the GIL (json parsing, pydantic validation) keeps this
     thread out until it returns, so such a block is sampled at its Python call
     site, and fewer times than its length.
     """
-    counts: dict[str, int] = {}
+    me = threading.get_ident()
+    counts: dict[tuple[str, str], int] = {}
+    blocked = 0
     start = time.monotonic()
     while True:
         time.sleep(period)
         now = time.monotonic()
         beat = _loop_probe["beat"]
         if beat and now - beat > threshold:
-            frame = sys._current_frames().get(loop_tid)
-            if frame is not None:
-                key = _stack_key(frame)
+            blocked += 1
+            names = {t.ident: t.name for t in threading.enumerate()}
+            for tid, frame in sys._current_frames().items():
+                if tid == me:
+                    continue
+                if tid == loop_tid:
+                    key = ("loop", _stack_key(frame))
+                elif frame.f_code.co_name in _IDLE_FUNCS:
+                    continue
+                else:
+                    key = (names.get(tid, str(tid)), _stack_key(frame, depth=6))
                 counts[key] = counts.get(key, 0) + 1
-            del frame
+            frame = None
         if now - start < window:
             continue
-        total = sum(counts.values())
-        for key, n in sorted(counts.items(), key=lambda kv: -kv[1])[:top]:
-            logger.info(
-                "[PD-TIMING] ev=LOOPSTK t=%.3f window_s=%.1f n=%d of=%d stack=%s",
-                time.time(),
-                now - start,
-                n,
-                total,
-                key,
-            )
+        ranked = sorted(counts.items(), key=lambda kv: -kv[1])
+        for who in ("loop", None):
+            picked = [kv for kv in ranked if (kv[0][0] == "loop") == (who == "loop")]
+            for (name, key), n in picked[:top]:
+                logger.info(
+                    "[PD-TIMING] ev=LOOPSTK t=%.3f window_s=%.1f who=%s n=%d "
+                    "of=%d stack=%s",
+                    time.time(),
+                    now - start,
+                    name.replace(" ", "_"),
+                    n,
+                    blocked,
+                    key,
+                )
         counts.clear()
+        blocked = 0
         start = now
 
 
