@@ -369,3 +369,83 @@ def test_execute_rebalance_drains_runtime_generator():
     with pytest.raises(StopIteration):
         next(gen)
     assert steps == ["chunk0", "chunk1"]
+
+
+def _alternating_hot_manager(monkeypatch, policy, reduced_shapes=None):
+    """2 GPUs, 4 physical slots, no redundancy, live placement GPU0=[A,B],
+    GPU1=[C,D]. Step 1 loads A,B; step 2 loads C,D: balanced over the window,
+    yet every step leaves one GPU idle."""
+    group = types.SimpleNamespace(world_size=2, device_group=object())
+    shapes = reduced_shapes if reduced_shapes is not None else []
+    # Stand-in for the group reduction: record what is reduced, sum over 1 rank.
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", lambda t, **kw: shapes.append(tuple(t.shape))
+    )
+    monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=2)
+    monitor.set_load_group(group)
+    monitor.track_step_load = policy == "step_peak"
+    monitor.initialize(
+        num_layers=1, num_physical=4, device=torch.device("cpu"), num_gpus=2
+    )
+    fired = []
+    manager = eplb.EPLBManager(
+        enabled=True,
+        monitor=monitor,
+        rebalance_interval=2,
+        rebalance_min_balancedness=0.9,
+        rebalance_balancedness_agg="min",
+        placement_policy=policy,
+    )
+    _spy_rebalance(manager, fired)
+    manager.live_metadata = types.SimpleNamespace(ep_size=2)
+    manager._dp_is_migration_group = True
+    for hot in ([0, 1], [2, 3]):
+        monitor.on_forward_start()
+        topk = torch.tensor([e for e in hot for _ in range(100)], dtype=torch.int32)
+        monitor.record(layer_id=0, topk_physical=topk.view(-1, 1), num_physical=4)
+        monitor.on_forward_end(is_dummy_run=False)
+        manager.on_forward_pass_end(True, True, local_step_load=True)
+    return manager, fired
+
+
+def test_step_peak_gate_judges_per_step_balance(monkeypatch):
+    # The window sum is perfectly balanced, so the window gate (naive/biased)
+    # skips; step_peak judges on per-step balance (sum of mean / sum of busiest
+    # GPU = 200 / 400) and rebalances.
+    naive, naive_fired = _alternating_hot_manager(monkeypatch, "naive")
+    assert naive_fired == []
+    assert naive.last_balancedness == pytest.approx(1.0)
+
+    step_peak, step_peak_fired = _alternating_hot_manager(monkeypatch, "step_peak")
+    assert step_peak_fired == [1]
+    assert step_peak.last_balancedness == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("policy", ["naive", "biased"])
+def test_window_policies_keep_no_step_windows(monkeypatch, policy):
+    shapes = []
+    manager, _ = _alternating_hot_manager(monkeypatch, policy, reduced_shapes=shapes)
+    monitor = manager.monitor
+    assert monitor._step_load_window is None and monitor._step_gpu_window is None
+    assert monitor.dump_global_step_load() is None
+    assert monitor.dump_global_step_gpu_load() is None
+    # Only the [L, P] window sum feeds the gate, as before step_peak existed.
+    assert shapes == [(1, 4)]
+
+
+def test_step_windows_allocated_per_policy():
+    def monitor_for(track):
+        monitor = eplb.ExpertLoadMonitor(enabled=True, window_size=8)
+        monitor.track_step_load = track
+        monitor.initialize(
+            num_layers=3, num_physical=12, device=torch.device("cpu"), num_gpus=4
+        )
+        return monitor
+
+    window_only = monitor_for(False)
+    assert window_only._step_load_window is None
+    assert window_only._step_gpu_window is None
+
+    step_peak = monitor_for(True)
+    assert tuple(step_peak._step_load_window.shape) == (8, 3, 12)
+    assert tuple(step_peak._step_gpu_window.shape) == (8, 3, 4)

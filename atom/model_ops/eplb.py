@@ -376,6 +376,99 @@ def resolve_placement_policy(name: str | None):
     return _PLACEMENT_POLICIES[key]
 
 
+def _step_peak_pack_indices(
+    vectors: torch.Tensor, p2l: torch.Tensor, logcnt: torch.Tensor, capacity: int
+) -> torch.Tensor:
+    """Pack replicas onto GPUs against the per-step peak (see step_peak_rebalance).
+
+    vectors [L, Lg, S] per-replica load per step, p2l [L, P], logcnt [L, Lg].
+    Returns [L, P]: a permutation of the slots of p2l, `capacity` per GPU.
+    """
+    weights = vectors.sum(dim=-1)
+    phys = p2l.to(torch.int64)
+    order = weights.gather(-1, phys).argsort(dim=-1, descending=True, stable=True)
+    expert_order = phys.gather(-1, order)
+    num_layers, _, num_steps = vectors.shape
+    num_physical = order.size(1)
+    num_gpus = num_physical // capacity
+    loads = vectors.new_zeros((num_layers, num_gpus, num_steps))
+    peaks = vectors.new_zeros((num_layers, num_steps))
+    occupancy = torch.zeros(
+        (num_layers, num_gpus), dtype=torch.int64, device=vectors.device
+    )
+    indices = torch.empty_like(order)
+    layers = torch.arange(num_layers, device=vectors.device)
+    for job in range(num_physical):
+        vector = vectors[layers, expert_order[:, job]]
+        # Score of each GPU: sum over steps of that step's peak if this replica
+        # lands there. Full GPUs are excluded; ties go to the lower GPU id.
+        cand = torch.maximum(loads + vector.unsqueeze(1), peaks.unsqueeze(1))
+        scores = cand.sum(dim=-1)
+        scores.masked_fill_(occupancy == capacity, float("inf"))
+        gpu = scores.argmin(dim=-1)
+        occupied = occupancy[layers, gpu]
+        indices[layers, gpu * capacity + occupied] = order[:, job]
+        occupancy[layers, gpu] = occupied + 1
+        updated = loads[layers, gpu] + vector
+        loads[layers, gpu] = updated
+        peaks = torch.maximum(peaks, updated)
+    return indices
+
+
+def step_peak_rebalance(
+    step_load: torch.Tensor, *, num_physical: int, num_gpus: int
+) -> torch.Tensor:
+    """Per-step peak ("step_peak") placement.
+
+    Where `naive` balances the window-summed load, this keeps the window's steps
+    apart and minimizes the sum over steps of the busiest GPU's load -- the
+    quantity MoE time follows. Replicas go one at a time to the logical expert
+    whose extra copy lowers that sum the most, then replicas are packed greedily
+    onto GPUs against the same objective. All layers are solved together.
+
+    step_load: [S, L, Lg] logical load per step. Returns p2l [L, num_physical].
+    """
+    _, num_layers, num_logical = step_load.shape
+    device = step_load.device
+    tokens = step_load.to(torch.float64)
+    arange_logical = torch.arange(num_logical, device=device)
+    layers = torch.arange(num_layers, device=device)
+    p2l = torch.empty((num_layers, num_physical), dtype=torch.int64, device=device)
+    p2l[:, :num_logical] = arange_logical
+    logcnt = torch.ones((num_layers, num_logical), dtype=torch.float64, device=device)
+    # Distinct scores keep the argmax unique; ties then favor the lower id.
+    tie_broken = tokens + arange_logical * 1e-4
+    for i in range(num_physical - num_logical):
+        score = tie_broken / logcnt
+        score_added = tokens / (logcnt + 1)
+        # A copy of expert j only changes a step's peak if j is that step's
+        # argmax, so the per-step peak after copying j is the old peak except
+        # at the argmax, where it is the max with j's score replaced.
+        values, idx = score.max(-1, keepdim=True)
+        values = values.expand_as(score).contiguous()
+        score.scatter_(-1, idx, score_added.gather(-1, idx))
+        values.scatter_(-1, idx, score.max(-1, keepdim=True).values)
+        pick = values.sum(0).argmin(-1)
+        p2l[:, num_logical + i] = pick
+        logcnt[layers, pick] += 1
+    capacity = num_physical // num_gpus
+    if capacity > 1:
+        vectors = tokens.permute(1, 2, 0) / logcnt.unsqueeze(-1)
+        p2l = p2l.gather(-1, _step_peak_pack_indices(vectors, p2l, logcnt, capacity))
+    return p2l
+
+
+def _placement_from_p2l(
+    p2l: torch.Tensor, num_logical: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(p2l, l2p, logcnt) for a whole [L, P] physical->logical map."""
+    rebuilt = [_rebuild_placement_from_p2l(row, num_logical) for row in p2l]
+    p2l = torch.stack([r[0] for r in rebuilt]).to(torch.int32)
+    phyrank = torch.stack([r[1] for r in rebuilt])
+    logcnt = torch.stack([r[2] for r in rebuilt])
+    return p2l, _build_logical_to_physical_map(p2l, phyrank, logcnt), logcnt
+
+
 def _rebalance_single_layer_global(
     weight_l: torch.Tensor,
     num_physical: int,
@@ -1385,19 +1478,43 @@ class ExpertLoadMonitor:
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
+        # Windows per global prefill step (every rank commits each step its
+        # group prefills, zeros if it did not prefill itself), so slot i is the
+        # same step on every rank and the reduced window keeps steps apart.
+        # Only the step_peak policy sets ``track_step_load``: it allocates a
+        # per-GPU window [S, L, num_gpus] (step_peak gate, realized per-step
+        # balance log) and the per-slot window [S, L, P] the planner fits on.
+        # Other policies allocate, commit and reduce none of it.
+        self.track_step_load = False
+        self._num_gpus = 1
+        self._step_gpu_window: torch.Tensor | None = None
+        self._step_load_window: torch.Tensor | None = None
+        self._step_slot = 0
+        self._step_filled = 0
 
     def set_load_group(self, group: Any) -> None:
         self._load_group = group
 
     def initialize(
-        self, *, num_layers: int, num_physical: int, device: torch.device
+        self,
+        *,
+        num_layers: int,
+        num_physical: int,
+        device: torch.device,
+        num_gpus: int = 1,
     ) -> None:
         """Allocate fixed-address load tensors once during EPLB runtime init."""
         if not self.enabled:
             return
         num_layers = int(num_layers)
         num_physical = int(num_physical)
+        num_gpus = int(num_gpus)
         device = torch.device(device)
+        if num_gpus <= 0 or num_physical % num_gpus != 0:
+            raise ValueError(
+                f"ExpertLoadMonitor needs num_physical={num_physical} divisible "
+                f"by num_gpus={num_gpus}"
+            )
         if num_layers <= 0 or num_physical <= 0:
             raise ValueError(
                 "ExpertLoadMonitor requires positive dimensions: "
@@ -1428,6 +1545,14 @@ class ExpertLoadMonitor:
             dtype=torch.int32,
             device=device,
         )
+        if self.track_step_load:
+            self._step_gpu_window = torch.zeros(
+                (self.window_size, num_layers, num_gpus),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._step_load_window = torch.zeros_like(self._expert_load_window)
+        self._num_gpus = num_gpus
         self._num_layers = num_layers
         self._num_physical = num_physical
         self._device = device
@@ -1438,6 +1563,7 @@ class ExpertLoadMonitor:
             num_layers=meta.num_layers,
             num_physical=meta.num_physical_experts,
             device=meta.expert_map.device,
+            num_gpus=meta.ep_size,
         )
 
     def ensure_capacity_for_metadata(self, meta: ExpertLocationMetadata) -> None:
@@ -1523,6 +1649,53 @@ class ExpertLoadMonitor:
         self._expert_load_window[self._slot].copy_(self._cur_pass_count)
         self._slot = (self._slot + 1) % self.window_size
         self._filled = min(self._filled + 1, self.window_size)
+
+    def commit_step(self, local_load: bool) -> None:
+        """Commit one global prefill step to the step-aligned window. Every rank
+        of the group calls this on the same steps; ``local_load`` says whether
+        this rank's pass load belongs to it (a real pure-prefill pass)."""
+        if not self.enabled or self._step_gpu_window is None:
+            return
+        slot = self._step_slot
+        local = local_load and self._cur_pass_count is not None
+        gpu_row = self._step_gpu_window[slot]
+        if local:
+            gpu_row.copy_(
+                self._cur_pass_count.view(self._num_layers, self._num_gpus, -1).sum(-1)
+            )
+        else:
+            gpu_row.zero_()
+        if self._step_load_window is not None:
+            if local:
+                self._step_load_window[slot].copy_(self._cur_pass_count)
+            else:
+                self._step_load_window[slot].zero_()
+        self._step_slot = (slot + 1) % self.window_size
+        self._step_filled = min(self._step_filled + 1, self.window_size)
+
+    def dump_global_step_gpu_load(self) -> torch.Tensor | None:
+        """Group-summed load per step and GPU, oldest first: [S, L, num_gpus]."""
+        return self._reduce_steps(self._step_gpu_window)
+
+    def dump_global_step_load(self) -> torch.Tensor | None:
+        """Group-summed physical load per step, oldest first: [S, L, P] int64.
+        Only kept when ``track_step_load`` (the step_peak policy)."""
+        return self._reduce_steps(self._step_load_window)
+
+    def _reduce_steps(self, window: torch.Tensor | None) -> torch.Tensor | None:
+        if window is None or self._step_filled == 0:
+            return None
+        order = [
+            (self._step_slot - self._step_filled + i) % self.window_size
+            for i in range(self._step_filled)
+        ]
+        load = window[order].to(torch.int64)
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        device_group = getattr(group, "device_group", None)
+        if int(getattr(group, "world_size", 1)) > 1:
+            assert device_group is not None, "per-step EPLB load needs a device group"
+            torch.distributed.all_reduce(load, group=device_group)
+        return load
 
     def dump_global_physical_load(self) -> torch.Tensor | None:
         if self._expert_load_window is None or self._cur_pass_count is None:
@@ -1852,6 +2025,7 @@ class EPLBManager:
             ep_size,
             ep_rank,
         )
+        self.monitor.track_step_load = self.placement_policy == "step_peak"
         self.monitor.initialize_for_metadata(self.live_metadata)
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
@@ -2089,6 +2263,7 @@ class EPLBManager:
         self,
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
+        local_step_load: bool = False,
     ) -> None:
         # Once stopped there is nothing left to schedule, so skip the per-step
         # has-prefill reduction too. The stop latches on the same step on every
@@ -2115,6 +2290,8 @@ class EPLBManager:
         if not has_prefill:
             # Pure-decode step across the migration group: do not advance.
             return
+        if self.placement_policy == "step_peak":
+            self.monitor.commit_step(local_step_load)
         next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
@@ -2173,7 +2350,17 @@ class EPLBManager:
         physical_load = self.monitor.dump_global_physical_load()
         if physical_load is None:
             return
-        if not self._need_rebalance(physical_load):
+        if self.placement_policy == "step_peak":
+            # Judge on the quantity step_peak optimizes: a window can be
+            # balanced in total while every step leaves a GPU idle.
+            step_gpu_load = self.monitor.dump_global_step_gpu_load()
+            if step_gpu_load is None:
+                return
+            balancedness = self._step_balancedness(step_gpu_load)
+            self._last_balancedness = balancedness
+            if not self._gate(balancedness, "per-step balancedness"):
+                return
+        elif not self._need_rebalance(physical_load):
             return
         yield from self._execute_rebalance()
 
@@ -2202,6 +2389,10 @@ class EPLBManager:
         logical_load = self.monitor.dump_global_logical_load()
         if logical_load is None:
             return
+        if self.placement_policy == "step_peak":
+            step_gpu_load = self.monitor.dump_global_step_gpu_load()
+            if step_gpu_load is not None:
+                self._log_step_balance(step_gpu_load)
 
         first_layer = self._moe_layers[min(self._moe_layers)]
         num_groups = int(getattr(first_layer, "num_expert_group", None) or 1)
@@ -2211,18 +2402,24 @@ class EPLBManager:
         _rc = self._rebalance_count
 
         _t0 = _time.perf_counter()
-        p2l, l2p, logcnt = rebalance_experts(
-            logical_load,
-            num_physical=self.live_metadata.num_physical_experts,
-            num_groups=num_groups,
-            num_nodes=num_nodes,
-            num_gpus=ep_size,
-            enable_hierarchical=(num_groups > 1 and num_nodes > 1),
-            policy=resolve_placement_policy(self.placement_policy),
-            # Current live placement -> enables the biased sticky/shortest-path
-            # fast-path: unchanged hot set => reuse old placement => zero migration.
-            old_p2l=self.live_metadata.physical_to_logical_map,
-        )
+        if self.placement_policy == "step_peak":
+            step_load = self.monitor.dump_global_step_load()
+            if step_load is None:
+                return
+            p2l, l2p, logcnt = self._step_peak_rebalance(step_load)
+        else:
+            p2l, l2p, logcnt = rebalance_experts(
+                logical_load,
+                num_physical=self.live_metadata.num_physical_experts,
+                num_groups=num_groups,
+                num_nodes=num_nodes,
+                num_gpus=ep_size,
+                enable_hierarchical=(num_groups > 1 and num_nodes > 1),
+                policy=resolve_placement_policy(self.placement_policy),
+                # Current live placement -> enables the biased sticky/shortest-path
+                # fast-path: unchanged hot set => reuse old placement => zero migration.
+                old_p2l=self.live_metadata.physical_to_logical_map,
+            )
         new_meta = ExpertLocationMetadata.from_rebalance_result(
             physical_to_logical_map=p2l,
             logical_to_physical_map=l2p,
@@ -2285,6 +2482,58 @@ class EPLBManager:
                 _chunk_ms,
             )
 
+    def _step_peak_rebalance(
+        self, step_load: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fit the step_peak policy on rank 0 of the migration group and broadcast
+        it: the fit is floating point, so ranks solving it independently could
+        disagree on a near tie and plan mismatched migrations."""
+        meta = self.live_metadata
+        assert meta is not None
+        num_logical = meta.num_logical_experts
+        num_physical = meta.num_physical_experts
+        p2l = torch.empty(
+            (meta.num_layers, num_physical), dtype=torch.int64, device=step_load.device
+        )
+        if meta.ep_rank == 0:
+            idx = meta.physical_to_logical_map.to(
+                device=step_load.device, dtype=torch.int64
+            ).clamp(min=0)
+            logical = torch.zeros(
+                (*step_load.shape[:2], num_logical),
+                dtype=torch.int64,
+                device=step_load.device,
+            )
+            logical.scatter_add_(-1, idx.expand_as(step_load), step_load)
+            p2l.copy_(
+                step_peak_rebalance(
+                    logical, num_physical=num_physical, num_gpus=meta.ep_size
+                )
+            )
+        src = torch.distributed.get_process_group_ranks(self._migration_group)[0]
+        torch.distributed.broadcast(p2l, src=src, group=self._migration_group)
+        p2l = p2l.to(meta.physical_to_logical_map.device)
+        return _placement_from_p2l(p2l, num_logical)
+
+    def _log_step_balance(self, step_gpu_load: torch.Tensor) -> None:
+        """Log the outgoing placement's realized per-step balance on its own
+        window: sum over steps and layers of the busiest GPU's measured load over
+        the sum of the mean GPU's (1.0 = every step perfectly balanced)."""
+        meta = self.live_metadata
+        if meta is None or meta.ep_rank != 0:
+            return
+        per_gpu = step_gpu_load.to(torch.float64)
+        peak = float(per_gpu.max(-1).values.sum())
+        mean = float(per_gpu.mean(-1).sum())
+        logger.info(
+            "EPLB realized step imbalance before rebalance #%d (policy=%s, "
+            "steps=%d): %.4f",
+            self._rebalance_count,
+            self.placement_policy,
+            step_gpu_load.shape[0],
+            peak / mean if mean > 0 else 1.0,
+        )
+
     def _log_rebalance_metrics(
         self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor
     ) -> None:
@@ -2327,19 +2576,38 @@ class EPLBManager:
 
     def _need_rebalance(self, physical_load: torch.Tensor) -> bool:
         balancedness = self._compute_balancedness_and_update(physical_load)
+        return self._gate(balancedness, "balancedness")
+
+    def _gate(self, balancedness: float, what: str) -> bool:
         if balancedness >= self.rebalance_min_balancedness:
             logger.info(
-                "EPLB gate @interval: balancedness=%.3f >= threshold=%.3f -> SKIP",
+                "EPLB gate @interval: %s=%.3f >= threshold=%.3f -> SKIP",
+                what,
                 balancedness,
                 self.rebalance_min_balancedness,
             )
             return False
         logger.info(
-            "EPLB gate @interval: balancedness=%.3f < threshold=%.3f -> REBALANCE",
+            "EPLB gate @interval: %s=%.3f < threshold=%.3f -> REBALANCE",
+            what,
             balancedness,
             self.rebalance_min_balancedness,
         )
         return True
+
+    def _step_balancedness(self, step_gpu_load: torch.Tensor) -> float:
+        """Per-step balancedness of the live placement: per layer, the sum over
+        steps of the mean GPU's load over the sum of the busiest GPU's, then
+        aggregated over layers like the window gate ('min' or 'mean')."""
+        load = step_gpu_load.to(torch.float64)
+        peak = load.max(dim=-1).values.sum(dim=0)
+        mean = load.mean(dim=-1).sum(dim=0)
+        per_layer = torch.ones_like(mean)
+        busy = peak > 0
+        per_layer[busy] = mean[busy] / peak[busy]
+        if self.rebalance_balancedness_agg == "mean":
+            return float(per_layer.mean().item())
+        return float(per_layer.min().item())
 
     def _compute_balancedness_and_update(self, physical_load: torch.Tensor) -> float:
         balancedness = self._compute_balancedness(physical_load)
@@ -2487,7 +2755,11 @@ def with_eplb_forward_monitor(fn):
             # under the no-mixed-batch invariant (see on_forward_pass_end).
             local_has_prefill = getattr(batch, "total_tokens_num_prefill", 0) > 0
             dp_any_has_prefill = getattr(self, "_eplb_any_rank_has_prefill", None)
-            manager.on_forward_pass_end(local_has_prefill, dp_any_has_prefill)
+            manager.on_forward_pass_end(
+                local_has_prefill,
+                dp_any_has_prefill,
+                local_step_load=is_pure_prefill and not is_dummy_run,
+            )
 
     return wrapper
 
