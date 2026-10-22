@@ -67,6 +67,50 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             self._rtp_mtp_request_capacity = max_batch
         self._atom_attn_pyobj = _Qwen4ExpAttnPyObj(self)
 
+    def copy_plugin_cache_blocks(self, mapping: torch.Tensor, tags: list[str]) -> None:
+        """Mirror RTP's tagged block relocations into QSA and PLE side pools.
+
+        RTP invokes this before eager forward *and* graph replay. A prefix hit
+        keeps the same physical block; only copy-on-write relocations appear
+        in ``mapping``. The RTP-owned KV/GDN pools are copied separately.
+        """
+        if mapping.device.type != "cpu" or mapping.ndim != 2 or mapping.shape[1] != 3:
+            raise ValueError("plugin cache copy requires a CPU int32 [N,3] mapping")
+        if mapping.dtype != torch.int32:
+            raise ValueError("plugin cache copy requires int32 block IDs")
+        if not mapping.numel():
+            return
+        side_pools: dict[str, list[torch.Tensor]] = {"full": [], "linear": []}
+        qsa_layers = [
+            module
+            for module in self._rtp_layer_maps[1].values()
+            if getattr(module, "is_qsa_attention", False)
+        ]
+        if qsa_layers:
+            self._rtp_forward_context_cls._bind_qsa_caches(
+                self, qsa_layers, int(self.kv_cache.get_seq_size_per_block("full"))
+            )
+            for module in qsa_layers:
+                side_pools["full"].extend(
+                    (module.raw_key_cache, module.compressed_key_cache)
+                )
+                if module.rope_position_cache is not None:
+                    side_pools["full"].append(module.rope_position_cache)
+        self._rtp_forward_context_cls._bind_ple_caches(
+            self, self.model, self._rtp_layer_maps[0]
+        )
+        if hasattr(self, "_rtp_ple_ngram"):
+            side_pools["linear"].extend((self._rtp_ple_ngram, self._rtp_ple_conv))
+        # Preserve RTP's row order: later copies may source an earlier dst.
+        for row, src, dst in mapping.tolist():
+            if row < 0 or row >= len(tags):
+                raise ValueError(f"plugin cache copy has invalid tag row {row}")
+            for pool in side_pools.get(tags[row], ()):
+                if src < 0 or dst < 0 or src >= pool.shape[0] or dst >= pool.shape[0]:
+                    raise ValueError("plugin cache copy has out-of-range block ID")
+                if src != dst:
+                    pool[dst].copy_(pool[src])
+
     def prepare_fmha_impl(self, inputs, is_cuda_graph: bool = False):
         tagged = inputs.attention_inputs
         if not isinstance(tagged, dict):
@@ -646,15 +690,15 @@ class ATOMQwen4Exp(ATOMQwen35Moe):
             raise ValueError(
                 "Qwen4Exp QSA cache requires positive, ratio-aligned block geometry"
             )
-        # RTP's prefix cache only retains its owned KV/linear-state pools. A
-        # prefix hit would skip the QSA index and PLE history writes while
-        # reusing their physical slots, so those separate pools cannot yet be
-        # restored correctly. Per-request reuse_cache is ANDed with this flag.
+        # Side pools follow RTP's tagged block relocations through
+        # copy_plugin_cache_blocks; leave the caller's reuse_cache setting intact.
         if getattr(kv_cache_config, "multi_task_prompt", None) or getattr(
             kv_cache_config, "multi_task_prompt_str", None
         ):
             raise ValueError("Qwen4Exp RTP plugin does not support cached task prompts")
-        kv_cache_config.reuse_cache = False
+        model_config.atom_qwen4_exp_prefix_cache_enabled = bool(
+            kv_cache_config.reuse_cache
+        )
 
         # _bind_qsa_caches allocates both BF16 arrays for *every* FULL block
         # on this rank: [block, 1, dim] and [block/ratio, 1, dim].

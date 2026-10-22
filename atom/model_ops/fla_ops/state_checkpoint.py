@@ -45,7 +45,9 @@ def _copy_checkpoints_kernel(
     stride_cd_s,  # conv_dst slot stride
     stride_cd_d,  # conv_dst channel stride
     stride_cd_l,  # conv_dst window-position stride
-    HKV: tl.constexpr,  # H * K * V, one full recurrent state
+    STATE_ELEMENTS: tl.constexpr,  # H * K * V, without per-slot padding
+    STATE_SLOT_STRIDE: tl.constexpr,
+    H_CHUNK_STRIDE: tl.constexpr,
     D: tl.constexpr,
     STATE_LEN: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -70,7 +72,7 @@ def _copy_checkpoints_kernel(
         # sequence's first chunk. The final state exists only in the row's
         # runtime slot, which the chunk kernel just wrote.
         idx = i_blk * BLOCK + tl.arange(0, BLOCK)
-        mask = idx < HKV
+        mask = idx < STATE_ELEMENTS
         dst_idx = idx
         if STATE_VK:
             dst_idx = idx // (K * V) * (K * V) + (idx % V) * K + (idx % (K * V)) // V
@@ -80,15 +82,15 @@ def _copy_checkpoints_kernel(
         # agree before the store.
         if tl.load(is_end + i_t) != 0:
             src_slot = tl.load(runtime_slots + i_t).to(tl.int64)
-            sv = tl.load(ssm_dst + src_slot * HKV + dst_idx, mask=mask, other=0.0).to(
-                ssm_dst.dtype.element_ty
-            )
+            sv = tl.load(
+                ssm_dst + src_slot * STATE_SLOT_STRIDE + dst_idx, mask=mask, other=0.0
+            ).to(ssm_dst.dtype.element_ty)
         else:
             src = tl.load(chunk_offsets + row).to(tl.int64) + off // CHUNK
-            sv = tl.load(h + src * HKV + idx, mask=mask, other=0.0).to(
+            sv = tl.load(h + src * H_CHUNK_STRIDE + idx, mask=mask, other=0.0).to(
                 ssm_dst.dtype.element_ty
             )
-        tl.store(ssm_dst + slot * HKV + dst_idx, sv, mask=mask)
+        tl.store(ssm_dst + slot * STATE_SLOT_STRIDE + dst_idx, sv, mask=mask)
     else:
         # ── conv window: the STATE_LEN tokens ending at the target, ────────
         # oldest first into positions [0, STATE_LEN) of the pool's [D, W]
@@ -143,6 +145,12 @@ def write_state_checkpoints(
     tokens ``num_spec`` older than the checkpoint -- and read that many rows
     before the target, into the previous sequence's tokens.
 
+    The recurrent state can occupy only the first part of a larger cache
+    block. Its slot stride therefore cannot be used as the number of state
+    elements or as the snapshot stride: doing so reads the wrong snapshot and
+    overwrites the adjacent convolution state. These three extents are passed
+    separately to the kernel.
+
     Neither conv tensor may be assumed contiguous, so the conv half indexes by
     real strides. ``conv_state`` reaches us as a ``transpose(-1, -2)`` view of a
     ``[slots, state_len, D]`` allocation, and ``x`` is a column slice of the
@@ -153,12 +161,22 @@ def write_state_checkpoints(
     n = rows.numel()
     if n == 0:
         return
-    hkv = ssm_state.stride(0)
+    state_elements = ssm_state.shape[1] * ssm_state.shape[2] * ssm_state.shape[3]
+    state_slot_stride = ssm_state.stride(0)
+    h_chunk_stride = h.stride(1)
+    state_vk = ssm_state.stride(-2) == 1
+    assert h.ndim == 5 and h.shape[2] == ssm_state.shape[1]
+    if state_vk:
+        assert h.shape[-2:] == (ssm_state.shape[-1], ssm_state.shape[-2])
+    else:
+        assert h.shape[-2:] == ssm_state.shape[-2:]
+    assert h.stride(-1) == 1 and h.stride(-2) == h.shape[-1]
+    assert state_slot_stride >= state_elements
     d, state_len = conv_state.shape[1], conv_state_len
     assert 0 < state_len <= conv_state.shape[2], "conv window wider than the pool"
     assert x.stride(-1) == 1, "conv input must be contiguous along the feature dim"
     BLOCK = 1024
-    nblk_ssm = triton.cdiv(hkv, BLOCK)
+    nblk_ssm = triton.cdiv(state_elements, BLOCK)
     grid = (n, nblk_ssm + triton.cdiv(d, BLOCK))
     _copy_checkpoints_kernel[grid](
         h,
@@ -176,13 +194,15 @@ def write_state_checkpoints(
         conv_state.stride(0),
         conv_state.stride(1),
         conv_state.stride(2),
-        HKV=hkv,
+        STATE_ELEMENTS=state_elements,
+        STATE_SLOT_STRIDE=state_slot_stride,
+        H_CHUNK_STRIDE=h_chunk_stride,
         D=d,
         STATE_LEN=state_len,
         CHUNK=chunk_size,
         BLOCK=BLOCK,
         NBLK_SSM=nblk_ssm,
-        K=ssm_state.shape[-2],
-        V=ssm_state.shape[-1],
-        STATE_VK=ssm_state.stride(-2) == 1,
+        K=h.shape[-2],
+        V=h.shape[-1],
+        STATE_VK=state_vk,
     )
