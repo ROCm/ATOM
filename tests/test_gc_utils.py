@@ -386,6 +386,18 @@ def test_the_env_sets_the_thresholds(monkeypatch):
     assert gc.get_threshold() == (123, 4, 5)
 
 
+def test_a_callers_own_thresholds_take_the_envs_place(monkeypatch):
+    """How the API server applies ATOM_API_GC_THRESHOLD."""
+    from atom.utils import envs
+
+    monkeypatch.setattr(envs, "ATOM_GC_THRESHOLD", "123,4,5")
+    gc.set_threshold(700, 10, 10)
+
+    tune_gc("700,10,100000")
+
+    assert gc.get_threshold() == (700, 10, 100000)
+
+
 @pytest.mark.parametrize(
     "value",
     [

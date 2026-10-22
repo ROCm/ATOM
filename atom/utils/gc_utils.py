@@ -22,8 +22,9 @@ import types
 logger = logging.getLogger("atom")
 
 
-def tune_gc() -> None:
-    """Raise this interpreter's collection thresholds from `ATOM_GC_THRESHOLD`.
+def tune_gc(thresholds: str | None = None) -> None:
+    """Raise this interpreter's collection thresholds from `ATOM_GC_THRESHOLD`,
+    or from `thresholds` when a caller has its own setting.
 
     Per-interpreter, so every process that serves calls it for itself -- an
     enumeration here has gone stale twice, so the rule is the documentation and
@@ -36,7 +37,8 @@ def tune_gc() -> None:
     """
     from atom.utils import envs
 
-    thresholds = envs.ATOM_GC_THRESHOLD
+    if thresholds is None:
+        thresholds = envs.ATOM_GC_THRESHOLD
     if not thresholds:
         return
     old = gc.get_threshold()
@@ -64,7 +66,7 @@ def tune_gc() -> None:
         # value. Restoring is what makes "ignored" true, whatever the reason --
         # and it is a no-op on the paths that never reached the call.
         gc.set_threshold(*old)
-        logger.warning("[gc] bad ATOM_GC_THRESHOLD=%r (%s), ignored", thresholds, exc)
+        logger.warning("[gc] bad GC threshold %r (%s), ignored", thresholds, exc)
         return
     logger.info("[gc] thresholds %s -> %s", old, gc.get_threshold())
 

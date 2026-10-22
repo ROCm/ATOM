@@ -697,6 +697,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # stops collection while the watch still reports the healthy shape.
     # See tune_gc in atom/utils/gc_utils.py.
     "ATOM_GC_THRESHOLD": lambda: os.getenv("ATOM_GC_THRESHOLD", "").strip(),
+    # The OpenAI API server's own ATOM_GC_THRESHOLD, in its place there. Its
+    # in-flight requests hold large containers (parsed messages, token id
+    # lists) that every gen-2 pass walks, and it was measured to reclaim
+    # nothing. Empty = ATOM_GC_THRESHOLD.
+    "ATOM_API_GC_THRESHOLD": lambda: os.getenv("ATOM_API_GC_THRESHOLD", "").strip(),
     # Whether the incremental detokenizer may reuse the delta it last emitted
     # in place of one of its two decodes per update. "auto" verifies at startup
     # that this tokenizer decodes a token span the same way wherever the window

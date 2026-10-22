@@ -1741,7 +1741,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     metrics_interval = envs.ATOM_METRICS_UPDATE_INTERVAL_S
     logger.info("Server started successfully and ready to accept requests")
-    tune_gc()
+    tune_gc(envs.ATOM_API_GC_THRESHOLD or None)
     maybe_attach_gc_debug_callback("api_server")
     await _refresh_metrics_once()
     # The engine was built in `main()`, so this is the last point before the
