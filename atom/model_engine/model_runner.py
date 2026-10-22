@@ -1872,6 +1872,44 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def _cap_allocator_below_device(self, total: int, non_torch: int, budget: int):
+        """ATOM_MIXED_ALLOC_HEADROOM_GB: keep that much of the device free.
+
+        Under mixed prefill+decode the caching allocator's cache grows past a
+        no-mixed run's (V4-Pro tp8: reserved 267-271 GiB vs 255-258, device
+        free ~0 vs 11+ GiB), into the memory HSA queues and RCCL allocate from
+        outside it. The cap is the device minus what is already held outside
+        the allocator minus the headroom -- NOT the budget: live memory on a
+        large mixed step can exceed the budget (5d859f432 capped there and
+        turned a fitting allocation into an OOM at c=1024). Set after the
+        profile has been read and before the KV cache and graphs allocate.
+        """
+        headroom = envs.ATOM_MIXED_ALLOC_HEADROOM_GB
+        if headroom <= 0 or not getattr(
+            self.config, "enable_mixed_prefill_decode", False
+        ):
+            return
+        cap = total - non_torch - int(headroom * (1 << 30))
+        if cap <= budget:
+            logger.warning(
+                "ATOM_MIXED_ALLOC_HEADROOM_GB=%.1f leaves the allocator %.2fGB, "
+                "not above the %.2fGB budget it sizes the KV cache within; "
+                "not capping",
+                headroom,
+                cap / (1 << 30),
+                budget / (1 << 30),
+            )
+            return
+        torch.cuda.set_per_process_memory_fraction(cap / total)
+        logger.info(
+            "Mixed prefill+decode: allocator capped at %.2fGB (device %.2fGB - "
+            "non_torch %.2fGB - headroom %.1fGB)",
+            cap / (1 << 30),
+            total / (1 << 30),
+            non_torch / (1 << 30),
+            headroom,
+        )
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config
@@ -1892,6 +1930,7 @@ class ModelRunner:
         safety_margin = int(total * 0.02)
 
         budget = int(total * config.gpu_memory_utilization)
+        self._cap_allocator_below_device(total, non_torch, budget)
         non_kv_overhead = peak_torch + non_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 

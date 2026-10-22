@@ -1111,6 +1111,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # steps the pure-prefill profile does not cover, e.g. mixed + DSpark on
     # DeepSeek-V4-Pro. Off: the runner's `forward` is not wrapped at all.
     "ATOM_PROBE_MEM": lambda: os.getenv("ATOM_PROBE_MEM", "0") == "1",
+    # GiB the caching allocator must leave free on the device under mixed
+    # prefill+decode (0 = no cap). Mixed steps' shapes change every step, and
+    # on DeepSeek-V4-Pro the allocator's cache grew 10-15 GiB past a no-mixed
+    # run's, down to ~0 GiB free -- the headroom HSA queues and RCCL allocate
+    # from. Caps reserved memory at `total - non_torch - this`. Experimental:
+    # measuring whether that headroom removes the intermittent mixed stalls.
+    "ATOM_MIXED_ALLOC_HEADROOM_GB": lambda: float(
+        os.getenv("ATOM_MIXED_ALLOC_HEADROOM_GB", "0")
+    ),
     # Per-segment output magnitude for a mixed batch's two halves. A segment
     # that is wrong usually shows it here -- zeros, NaN, or a norm an order off
     # the other half -- and that says WHICH half to read. Registered rather than
