@@ -51,7 +51,7 @@ class V4WorkflowTest(unittest.TestCase):
                 MODEL_NAMES="",
                 CASE_NAMES="",
                 ATOMESH_SLURM_SUBMIT_RUNNER="atomesh-cicd",
-                ATOMESH_SLURM_ACCOUNT="",
+                ATOMESH_SLURM_ACCOUNT="amd-atom",
                 ATOMESH_SLURM_PARTITION="",
                 ATOMESH_MODEL_ROOT="/models",
                 ATOMESH_LOG_ROOT="/logs",
@@ -86,7 +86,7 @@ class V4WorkflowTest(unittest.TestCase):
         self.assertEqual({cell["concurrency"][0] for cell in v4}, CONCURRENCIES)
         for cell in v4:
             self.assertEqual(cell["suite"], "weekly")
-            self.assertEqual(cell["runner"]["slurm_account"], "amd-frameworks")
+            self.assertEqual(cell["runner"]["slurm_account"], "amd-atom")
         self.assertTrue(any(cell["model"] == "DeepSeek-V4-Pro" for cell in cells))
         self.assertTrue(any(cell["model"] == "GLM-5.2-MXFP4" for cell in cells))
         self.assertTrue(all(not cell["eval_only"] for cell in cells))
