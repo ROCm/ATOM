@@ -194,6 +194,38 @@ def get_mp_context() -> ForkContext | SpawnContext:
     return multiprocessing.get_context("spawn")
 
 
+def run_exiting_on_crash(entry: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+    """Process target: run ``entry``; if it raises, report it and end the process now.
+
+    A worker that raises would otherwise leave through the normal interpreter
+    teardown -- thread joins, atexit, then the HIP/RCCL runtimes' static
+    destructors -- and that teardown can block on collectives whose peers will
+    never arrive. The process then outlives its own crash: its parent's
+    sentinel never fires, and the group sits until a peer's gloo timeout (30
+    minutes on DeepSeek-V4-Pro CI, where 7 of 8 runners had already printed an
+    OOM traceback). ``os._exit`` skips that teardown, the way a signal death
+    does, which the parent already detects at once.
+
+    A clean return and ``sys.exit(0)`` keep the normal teardown.
+    """
+    try:
+        entry(*args, **kwargs)
+    except BaseException as exc:
+        if isinstance(exc, SystemExit) and not exc.code:
+            raise
+        log = logging.getLogger("atom")
+        log.exception(
+            "%s crashed; exiting without interpreter teardown",
+            multiprocessing.current_process().name,
+        )
+        for handler in logging.getLogger().handlers + log.handlers:
+            handler.flush()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        code = exc.code if isinstance(exc, SystemExit) else None
+        os._exit(code if isinstance(code, int) else 1)
+
+
 def set_process_title(name: str, suffix: str = "", prefix: str | None = None) -> None:
     """Set the current process title (comm/cmdline) for ps/top/rocm-smi.
 
