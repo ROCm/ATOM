@@ -6,10 +6,65 @@ build-time mailbox layout (no GPU)."""
 import pytest
 import torch
 
-from atom.models.qwen3_5.mono import layout, packing
+from atom.models.qwen3_5.mono import layout
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config
 
 TOKEN_COUNTS = range(1, MAX_TOKENS + 1)
+
+
+# The layouts the kernel reads ATOM's FP8 and MXFP4 weights in, written out to check against aiter's
+# own shuffles.
+
+
+def shuffle_fp8(q: torch.Tensor) -> torch.Tensor:
+    """FP8 ``[..., N, K]`` in aiter's ``shuffle_weight(layout=(16, 16))`` order, the layout ATOM holds its
+    FP8 GEMM / MoE weights in: 16-row, 32-K tiles of two 16-K halves, each 16 rows x 16 contiguous K.
+    """
+
+    *_lead, rows, k = q.shape
+    if rows % 16 or k % 64:
+        raise ValueError(
+            f"FP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}"
+        )
+    w8 = q.view(torch.uint8).reshape(-1, rows // 16, 16, k // 32, 2, 16)
+    return w8.permute(0, 1, 3, 4, 2, 5).contiguous().view(-1)
+
+
+def pack_mxfp4(q: torch.Tensor) -> torch.Tensor:
+    """An MXFP4 bank [E, N, K / 2] in ATOM's gfx950 layout for gate / up NOT interleaved (aiter
+    ``moe_shuffle_weight(is_guinterleave=False)``: a [gate | up] bank shuffles as plain rows).
+    """
+    q = q.view(torch.uint8)
+    e, n, kp = q.shape
+    if n % 16 or kp % 64:
+        raise ValueError(
+            f"MXFP4 bank dimensions must be divisible by (16, 128), got {(n, kp * 2)}"
+        )
+    return (
+        q.view(e, n // 16, 16, kp // 64, 4, 16)
+        .permute(0, 1, 3, 4, 2, 5)
+        .contiguous()
+        .view(e, n, kp)
+    )
+
+
+def pack_mxfp4_scales(s: torch.Tensor) -> torch.Tensor:
+    """E8M0 scales [E, N, K / 32] in ATOM's gfx950 layout (aiter ``moe_shuffle_scale``,
+    ``is_guinterleave=False``); K / 32 padded to a multiple of 8 with 1.0 (0x7F)."""
+    s = s.view(torch.uint8)
+    e, n, kb = s.shape
+    kb8 = -(-kb // 8) * 8
+    if kb8 != kb:
+        s = torch.cat(
+            [s, torch.full((e, n, kb8 - kb), 0x7F, dtype=torch.uint8, device=s.device)],
+            dim=-1,
+        )
+    return (
+        s.view(e, n // 32, 2, 16, kb8 // 8, 2, 4)
+        .permute(0, 1, 4, 6, 3, 5, 2)
+        .contiguous()
+        .view(e, n, kb8)
+    )
 
 
 def _bytes(shape, lo=0, hi=256):
@@ -21,7 +76,7 @@ def test_fp8_matrices_read_in_atoms_shuffle(shape):
     shuffle = pytest.importorskip("aiter.ops.shuffle")
     q = _bytes(shape).view(torch.float8_e4m3fn)
     want = shuffle.shuffle_weight(q, layout=(16, 16)).view(torch.uint8).reshape(-1)
-    assert torch.equal(packing.shuffle_fp8(q), want)
+    assert torch.equal(shuffle_fp8(q), want)
 
 
 # the per-rank banks at TP 4: [gate | up] (2 x 256 rows, K = hidden), down (K = 256)
@@ -40,9 +95,9 @@ def test_mxfp4_bank_reads_in_atoms_gguu_shuffle(gate_up, n, k):
         is_guinterleave=False,
         gate_up=gate_up,
     )
-    assert torch.equal(packing.pack_mxfp4(w), want_w.view(torch.uint8).view(e, n, -1))
+    assert torch.equal(pack_mxfp4(w), want_w.view(torch.uint8).view(e, n, -1))
     assert torch.equal(
-        packing.pack_mxfp4_scales(s).reshape(-1), want_s.view(torch.uint8).reshape(-1)
+        pack_mxfp4_scales(s).reshape(-1), want_s.view(torch.uint8).reshape(-1)
     )
 
 
@@ -177,3 +232,15 @@ def test_baseline_m_is_the_graph_padded_decode_batch(tokens):
     m = layout.baseline_m(tokens)
     assert m == (tokens if tokens <= 8 else 16)
     assert layout.baseline_m(tokens, tokens_per_seq=4) == tokens
+
+
+def test_the_mono_package_imports_without_the_model():
+    """``from atom.models.qwen3_5 import mono`` loads the subpackage alone: not the model (and AITER)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; from atom.models.qwen3_5 import mono; "
+        "assert 'atom.models.qwen3_5.model' not in sys.modules, 'model imported'"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

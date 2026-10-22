@@ -24,6 +24,7 @@ from atom.models.qwen3_5.mono.layout import TL_POINTS, layout, shape_dims
 from atom.models.qwen3_5.mono.op import Qwen35MonoKernel, Qwen35Variant
 from atom.models.qwen3_5.mono.runner import (
     Qwen35MonoDecodeRunner,
+    check_inputs,
     raise_on_given_up_waits,
 )
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
@@ -49,7 +50,7 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         self.tp, self.rank = tp.world_size, tp.rank_in_group
         self.T = spec_steps + 1
         self.debug = envs.ATOM_MONO_DEBUG
-        self.max_seq = atom_config.max_model_len + 1
+        self.max_len = atom_config.max_model_len
         bind_agreed(lambda: self._bind_draft(draft), self.group)
         # ATOM_MONO_TIMELINE: the draft layer's stamps, apart from the target's (<prefix>_draft_...)
         tl_prefix = envs.ATOM_MONO_TIMELINE
@@ -82,19 +83,36 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             raise MonoUnsupported(
                 f"{cus} CUs: the kernel needs all {BLOCKS} CTAs co-resident"
             )
+        # the draft layer is built for the FP8 checkpoint (W8A8 projections and bank); the MXFP4
+        # checkpoint's draft keeps the original path
+        w13 = layer.mlp.experts.w13_weight
+        if w13.dtype != torch.float8_e4m3fn:
+            raise MonoUnsupported(
+                f"MTP layer experts {w13.dtype}: the draft runs mono with the FP8 checkpoint"
+            )
+        # its post-attention norm folds the all-reduce, as the target's layers' do
+        from atom.models.qwen3_5.model import allreduce_norm_fusion_enabled
+
+        if not allreduce_norm_fusion_enabled():
+            raise MonoUnsupported(
+                "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
+            )
         self.cfg = Q35Config(
             tp=self.tp,
             rank=self.rank,
+            weights="fp8",
             qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
         )
         self.full = [True]
         self.layers = [(LayerWeights(self.cfg, True), self._pack(0, layer))]
         self.layer_nums = [layer.self_attn.attn.layer_num]
-        # positions < max_model_len
-        rope = rope_tables(layer.self_attn.rotary_emb, self.cfg, self.max_seq - 1)
+        # positions < max_model_len, and the drafted tokens past it
+        rope = rope_tables(
+            layer.self_attn.rotary_emb, self.cfg, self.max_len, spare=self.T - 1
+        )
         if rope is None:
             raise MonoUnsupported(
-                f"the RoPE caches do not cover {self.max_seq - 1} positions"
+                f"the RoPE caches do not cover {self.max_len} positions"
             )
         self.cos, self.sin = rope
         logger.info("Qwen3.5 mono draft: rank %d bound the MTP layer", self.rank)
@@ -161,13 +179,17 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             bt = bt.repeat_interleave(T, 0)
         lc = get_forward_context().kv_cache_data[f"layer_{self.layer_nums[0]}"]
         built = self.by_t[T][S]
+        h = x.float().contiguous()
+        ins = {
+            "kv": (lc.k_cache, lc.v_cache, lc.k_scale, lc.v_scale, pos, ctx, bt, slots),
+            "rope": (self.cos, self.sin),
+        }
+        check_inputs(built, get_forward_context().kv_cache_data, h, [ins])
         # every draft launch is a step of its own mailboxes (its tag is layer 0's)
         built["mailboxes"].begin_step()
-        kv = (lc.k_cache, lc.v_cache, lc.k_scale, lc.v_scale, pos, ctx, bt, slots)
         out = built["ops"][0].forward(
-            x.float().contiguous(),
-            kv=kv,
-            rope=(self.cos, self.sin),
+            h,
+            **ins,
             layer=0,
             begin=False,
             tl=self.timeline.ptr(0) if self.timeline is not None else 0,

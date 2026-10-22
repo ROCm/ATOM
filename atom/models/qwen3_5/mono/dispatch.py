@@ -27,6 +27,7 @@ from torch import nn
 from atom.models.qwen3_5.mono.check import forward_checked
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, MAX_VERIFY_TOKENS, Q35Config
 from atom.models.qwen3_5.mono.layout import BS
+from atom.models.qwen3_5.mono.op import StepInputError
 from atom.mono.plan.shard import Shard, ShardError
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.deployment import common_refusals, first_refusal
@@ -68,7 +69,15 @@ _FIXED = {
     # a MoE block every layer
     "mlp_only_layers": ([], []),
     "decoder_sparse_step": (1, 1),
+    # Qwen3-Next's per-layer output scales: the kernel has none
+    "layer_scale": (False, False),
 }
+
+
+def rotary_factor(hf):
+    """The share of a head RoPE rotates: ``rope_parameters``' (Qwen3.5), else the flat field."""
+    rope = getattr(hf, "rope_parameters", None) or {}
+    return rope.get("partial_rotary_factor", getattr(hf, "partial_rotary_factor", None))
 
 
 def baseline_switches() -> list[tuple[str, bool]]:
@@ -94,6 +103,8 @@ def baseline_switches() -> list[tuple[str, bool]]:
         ("ATOM_USE_TRITON_MOE_DECODE=1", envs.ATOM_USE_TRITON_MOE_DECODE),
         ("ATOM_MOE_GU_ITLV=1", envs.ATOM_MOE_GU_ITLV),
         ("ATOM_USE_MODEL_SENSITIVE_RMSNORM=1", envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM),
+        # the UT-transform replay (``auto`` takes it only past 11 verify tokens, beyond MTP-3)
+        ("ATOM_REPLAYSSM_ROUTE=ut", envs.ATOM_REPLAYSSM_ROUTE == "ut"),
     ]
 
 
@@ -120,6 +131,11 @@ class Dims:
             got = getattr(hf, theirs, absent)
             if got != want:
                 raise ShardError(f"{theirs} {got!r}: the kernel is built for {want!r}")
+        got = rotary_factor(hf)
+        if got is None or got * ref.head_dim != ref.rope_dim:
+            raise ShardError(
+                f"partial_rotary_factor {got!r}: the kernel rotates {ref.rope_dim} of {ref.head_dim} dims"
+            )
         shard = Shard(self.tp)
         shard.split(hf.linear_num_key_heads, "GDN key heads")
         shard.split(hf.num_attention_heads, "attention heads")
@@ -179,6 +195,13 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     checks += [(not on, name) for name, on in baseline_switches()]
+    # ATOM_MONO_CHECK reruns the original layers from the host: eager plain decode only
+    checks += [
+        (
+            not envs.ATOM_MONO_CHECK or (atom_config.enforce_eager and k == 0),
+            "ATOM_MONO_CHECK without --enforce-eager or with a drafter",
+        )
+    ]
     return first_refusal(checks)
 
 
@@ -216,9 +239,20 @@ def step_supported(input_ids, T: int, replay: bool) -> bool:
         or bool(getattr(g, "replayssm", False)) != replay
     ):
         return False
+    # ReplaySSM: the kernel's flush rule (two verify windows to the record buffer) is the commit's
+    # only while both count the same window; the buffer's length is checked with its shape
     return (
-        g.slot_idx is not None if replay else g.spec_state_indices_tensor.shape[1] == T
+        g.slot_idx is not None and getattr(g, "replayssm_max_query_len", None) == T
+        if replay
+        else g.spec_state_indices_tensor.shape[1] == T
     )
+
+
+@functools.cache
+def _step_refused(path: str, why: str) -> None:
+    """Log once: a step whose tensors the kernel does not address, refused before any launch (the
+    check sees the same shapes on every rank, so every rank takes the original path)."""
+    logger.warning("Qwen3.5 mono %s: a step keeps the original path: %s", path, why)
 
 
 class MonoDecodeModel(nn.Module):
@@ -243,9 +277,12 @@ class MonoDecodeModel(nn.Module):
             and step_supported(input_ids, self._runner.T, self._runner.replay_cap > 0)
             and self._mono.ready(input_ids.numel())
         ):
-            if envs.ATOM_MONO_CHECK:
-                return forward_checked(self._mono.runner, input_ids, positions)
-            return self._mono.runner.forward(input_ids, positions)
+            try:
+                if envs.ATOM_MONO_CHECK:
+                    return forward_checked(self._mono.runner, input_ids, positions)
+                return self._mono.runner.forward(input_ids, positions)
+            except StepInputError as e:
+                _step_refused("decode", str(e))
         return self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kw
         )
@@ -300,7 +337,10 @@ class MonoDraftModel(nn.Module):
             h = m.pre_fc_norm_hidden(hidden_states)
             h = get_tp_group().all_gather(m.fc(torch.cat([e, h], dim=-1)))
             # the layer's f32 stream is what the original draft's add + norm normalizes
-            return final_norm(m.norm, self._runner.layer(h, positions))
+            try:
+                return final_norm(m.norm, self._runner.layer(h, positions))
+            except StepInputError as e:
+                _step_refused("draft", str(e))
         return self.model(
             input_ids,
             positions,

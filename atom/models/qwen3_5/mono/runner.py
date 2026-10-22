@@ -28,7 +28,11 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
 from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import TL_POINTS, layout, router_rows, shape_dims
-from atom.models.qwen3_5.mono.op import Qwen35MonoKernel, Qwen35Variant
+from atom.models.qwen3_5.mono.op import (
+    Qwen35MonoKernel,
+    Qwen35Variant,
+    StepInputError,
+)
 from atom.models.qwen3_5.mono.packing import pack_bf16
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
 from atom.mono.plan.execution import BLOCKS
@@ -105,6 +109,24 @@ def _need(i, name, t, shape, dtype=None, shuffled=None, nbytes=None):
         )
 
 
+def check_inputs(built, kvd, x, ins) -> None:
+    """Every layer's step tensors against what its kernel addresses, before the step's first launch;
+    raises ``StepInputError`` (the step keeps the original path). The KV and state pools are fixed once
+    bound, so after a width's first step only one layer of each kind is checked (the step's metadata).
+    """
+    ops = built["ops"]
+    each = [i for i, op in enumerate(ops) if op.full][:1] + [
+        i for i, op in enumerate(ops) if not op.full
+    ][:1]
+    layers = each if built.get("pools_checked") is kvd else range(len(ops))
+    for i in layers:
+        try:
+            ops[i].forward(x, **ins[i], check_only=True)
+        except StepInputError as e:
+            raise StepInputError(f"layer {i}: {e}") from None
+    built["pools_checked"] = kvd
+
+
 def language_model(causal_lm):
     """The module holding ``embed_tokens``, ``layers`` and ``norm``."""
     for m in causal_lm.modules():
@@ -139,7 +161,7 @@ class Qwen35MonoDecodeRunner:
         # ReplaySSM's record buffer length (0: the snapshot GDN state)
         self.replay_cap = replay_cap
         self.debug = envs.ATOM_MONO_DEBUG
-        self.max_seq = atom_config.max_model_len + 1
+        self.max_len = atom_config.max_model_len
         bind_agreed(lambda: self._bind(causal_lm), self.group)
         # ATOM_MONO_TIMELINE: every layer's stamps, saved after the warm-up steps (eager)
         tl_prefix = envs.ATOM_MONO_TIMELINE
@@ -206,11 +228,12 @@ class Qwen35MonoDecodeRunner:
         rope = rope_tables(
             rotary,
             self.cfg,
-            self.max_seq - 1,  # positions < max_model_len
+            self.max_len,  # positions < max_model_len
+            spare=self.T - 1,  # and the verify's drafted tokens past it
         )
         if rope is None:
             raise MonoUnsupported(
-                f"the RoPE caches do not cover {self.max_seq - 1} positions"
+                f"the RoPE caches do not cover {self.max_len} positions"
             )
         self.cos, self.sin = rope
         logger.info("Qwen3.5 mono: rank %d bound %d layers", self.rank, n)
@@ -555,33 +578,23 @@ class Qwen35MonoDecodeRunner:
 
         kvd = get_forward_context().kv_cache_data
         built = self.widths[x.shape[0]]
-        built["mailboxes"].begin_step()
+        ins = []
         for i, op in enumerate(built["ops"]):
             lc = kvd[f"layer_{self.layer_nums[i]}"]
             if op.full:
-                kv = (
-                    lc.k_cache,
-                    lc.v_cache,
-                    lc.k_scale,
-                    lc.v_scale,
-                    pos,
-                    ctx,
-                    bt,
-                    slots,
-                )
-                x = op.forward(
-                    x,
-                    kv=kv,
-                    rope=(self.cos, self.sin),
-                    layer=i,
-                    begin=False,
-                    tl=tl(i),
+                kv = (lc.k_cache, lc.v_cache, lc.k_scale, lc.v_scale)
+                ins.append(
+                    {"kv": kv + (pos, ctx, bt, slots), "rope": (self.cos, self.sin)}
                 )
             else:
                 state = (lc.k_cache, lc.v_cache) + gdn
                 if self.replay_cap:
                     state += (lc.replay_buf_k, lc.replay_buf_u, lc.replay_buf_g)
-                x = op.forward(x, gdn_state=state, layer=i, begin=False, tl=tl(i))
+                ins.append({"gdn_state": state})
+        check_inputs(built, kvd, x, ins)
+        built["mailboxes"].begin_step()
+        for i, op in enumerate(built["ops"]):
+            x = op.forward(x, **ins[i], layer=i, begin=False, tl=tl(i))
         eager = not torch.cuda.is_current_stream_capturing()
         if self.debug and eager:
             raise_on_given_up_waits(

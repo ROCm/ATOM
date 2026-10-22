@@ -45,9 +45,11 @@ class Qwen35Variant:
         peers=None,
     ):
         if full and cfg.local_kv_heads != 1:
-            raise ValueError("the full-attention kernel holds one K / V head per rank")
+            raise StepInputError(
+                "the full-attention kernel holds one K / V head per rank"
+            )
         if samples % tokens_per_seq:
-            raise ValueError(
+            raise StepInputError(
                 "an MTP verify launch holds whole sequences of tokens_per_seq rows"
             )
         self.cfg, self.S, self.full, self.rank, self.npes = (
@@ -127,6 +129,10 @@ class Qwen35Variant:
         self.mailboxes.begin_step()
 
 
+class StepInputError(ValueError):
+    """A step's tensors are not what the kernel addresses: the step keeps the original path."""
+
+
 class Qwen35MonoKernel:
     """One rank of one decoder layer: ``packed``, the kernel's view of ATOM's weights (shared by
     every launch width of the layer), run on a ``Qwen35Variant`` of its kind and width.
@@ -152,7 +158,7 @@ class Qwen35MonoKernel:
             rank,
             tokens_per_seq,
         ):
-            raise ValueError(
+            raise StepInputError(
                 "the variant was built for another sample count, layer kind or rank"
             )
         self.W, self.S, self.rank, self.npes, self.full = W, samples, rank, npes, W.full
@@ -170,6 +176,7 @@ class Qwen35MonoKernel:
         layer=0,
         begin=True,
         tl=0,
+        check_only=False,
     ):
         """One layer on the residual stream ``h`` [S, hidden] f32 -> the next layer's; updates the state in
         place. The stream is the value aiter's fused all-reduce RMSNorm normalizes (``residual +
@@ -184,14 +191,17 @@ class Qwen35MonoKernel:
         cursor and record buffers (k, u: bf16 [slots, hv, cap, 128]; g: f32 [slots, hv, cap]). Full attention: ``kv = (k_cache,
         v_cache, k_scale, v_scale, positions, context_lens, block_tables, slot_mapping)`` in ATOM's MHA pool layout (the
         new token goes to cache slot ``slot_mapping[s]``, -1 = no write) and ``rope = (cos, sin)``, f32
-        ``[positions, rope_dim / 2]``."""
+        ``[positions, rope_dim / 2]``.
+
+        Every tensor is checked against what the kernel addresses (shape, dtype, the strides it assumes)
+        first; ``check_only`` stops there. A mismatch raises ``StepInputError``."""
         cfg, S = self.W.cfg, self.S
         if (
             tuple(h.shape) != (S, cfg.hidden)
             or h.dtype != torch.float32
             or not h.is_contiguous()
         ):
-            raise ValueError(
+            raise StepInputError(
                 f"h must be contiguous float32 {(S, cfg.hidden)}, got {tuple(h.shape)} {h.dtype}"
             )
 
@@ -201,7 +211,9 @@ class Qwen35MonoKernel:
                 or t.dtype != torch.int32
                 or t.stride(-1) != 1
             ):
-                raise ValueError(f"{name} must be int32 {shape} with unit-stride rows")
+                raise StepInputError(
+                    f"{name} must be int32 {shape} with unit-stride rows"
+                )
 
         z = self.variant.zero
         conv = ssm = sl_in = sl_out = n_acc = z
@@ -221,11 +233,30 @@ class Qwen35MonoKernel:
                 16,
                 16,
             ):
-                raise ValueError(
+                raise StepInputError(
                     "k_cache must be FP8 [blocks, 1, head_dim / 16, 16, 16] (ATOM's MHA pool)"
                 )
-            if ks.dtype != torch.float32 or vs.dtype != torch.float32:
-                raise ValueError("k_scale / v_scale must be float32 [blocks, 1, 16]")
+            if vc.dtype != kc.dtype or vc.shape[1:] != (1, 1, cfg.head_dim, 16):
+                raise StepInputError(
+                    "v_cache must be FP8 [blocks, 1, 1, head_dim, 16] (ATOM's MHA pool)"
+                )
+            blocks = kc.shape[0]
+            for name, t in (("k_scale", ks), ("v_scale", vs)):
+                if t.dtype != torch.float32 or tuple(t.shape) != (blocks, 1, 16):
+                    raise StepInputError(f"{name} must be float32 [{blocks}, 1, 16]")
+            for name, t in (
+                ("k_cache", kc),
+                ("v_cache", vc),
+                ("k_scale", ks),
+                ("v_scale", vs),
+            ):
+                if vc.shape[0] != blocks or not t.is_contiguous():
+                    raise StepInputError(f"{name} must be contiguous, {blocks} blocks")
+            for name, t in (("cos", cos), ("sin", sin)):
+                if t.dtype != torch.float32 or t.dim() != 2 or not t.is_contiguous():
+                    raise StepInputError(
+                        f"{name} must be contiguous float32 [rows, rope_dim / 2]"
+                    )
             bt_stride = bt.stride(0)
         else:
             T = self.variant.T
@@ -234,7 +265,7 @@ class Qwen35MonoKernel:
                 conv, ssm, n_acc, sl_out, sl_in, wpos, rk, ru, rg = gdn_state
                 i32("n_accepted", n_acc, (S // T,))
                 if wpos.dtype != torch.int32 or not wpos.is_contiguous():
-                    raise ValueError("write_pos must be contiguous int32 [slots]")
+                    raise StepInputError("write_pos must be contiguous int32 [slots]")
                 rec = (cfg.hv, cap)
                 if (
                     rk.dtype != torch.bfloat16
@@ -247,7 +278,7 @@ class Qwen35MonoKernel:
                         rk.is_contiguous() and ru.is_contiguous() and rg.is_contiguous()
                     )
                 ):
-                    raise ValueError(
+                    raise StepInputError(
                         f"record buffers must be contiguous bf16 / f32 [slots, {cfg.hv}, {cap}, ...]"
                     )
             elif T == 1:
@@ -262,7 +293,7 @@ class Qwen35MonoKernel:
                 width,
                 cfg.conv_dim,
             ):
-                raise ValueError(
+                raise StepInputError(
                     f"conv_state must be bf16 [slots, {width}, {cfg.conv_dim}]"
                 )
             if ssm.dtype != torch.bfloat16 or tuple(ssm.shape[1:]) != (
@@ -270,11 +301,15 @@ class Qwen35MonoKernel:
                 cfg.linear_k_dim,
                 cfg.linear_v_dim,
             ):
-                raise ValueError(
+                raise StepInputError(
                     f"ssm_state must be bf16 [slots, {cfg.hv}, {cfg.linear_k_dim}, {cfg.linear_v_dim}] (K-major, as ATOM)"
                 )
             i32("slots_in", sl_in, (S // T if cap else S,))
             i32("slots_out", sl_out, (S,))
+            if not (conv.is_contiguous() and ssm.is_contiguous()):
+                raise StepInputError("conv_state and ssm_state must be contiguous")
+        if check_only:
+            return None
         if x_out is None:
             x_out = torch.empty_like(h)
         p = self.packed

@@ -361,6 +361,9 @@ def ffn_stages(ctx):
                     else:
                         m0, m1 = silu(g0) * v0, silu(g1) * v1
                     put2(mb("mid"), (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r, m0, m1)
+            # the routing (expert, weight) a slot -- no stage reads it (down routes for itself). Kept: with
+            # these stores gone the register allocator spills the FP8 8-row and MTP 4 / 8-row builds,
+            # which then fall back to the original path (measured 2026-10-20)
             if (c == 0) & (tid < S if shared else tid == 0):
                 sn = tid if shared else fx.Int32(sample)
                 sl = fx.Int32(0) if shared else slot
@@ -480,6 +483,9 @@ def ffn_stages(ctx):
     SH_DN_CHUNKS = (
         INTER // 64
     )  # the shared expert's down: one 64-K chunk a wave of its row group
+    assert (
+        not MX or SH_DN_CHUNKS <= DN_WPR
+    ), "the shared expert's down needs a wave a chunk"
     # 128-k chunks per wave in flight / prefetched before the mid wait (fewer past S = 8: register room)
     DN_BATCH = 9 if S <= 8 else 5
     DN_MID_BLOCKS = (DN_BLK + WAVES - 1) // WAVES  # mid blocks a lane quantizes

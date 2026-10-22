@@ -42,6 +42,7 @@ _HF = {
     "attention_bias": False,
     "mlp_only_layers": [],
     "mtp_num_hidden_layers": 1,
+    "rope_parameters": {"partial_rotary_factor": 0.25, "rope_theta": 10000000},
 }
 
 
@@ -63,6 +64,7 @@ def _atom_config(**overrides):
         # the multimodal checkpoint nests its text config
         "hf_config": SimpleNamespace(text_config=SimpleNamespace(**_HF)),
         "max_model_len": 1 << 18,
+        "enforce_eager": False,
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -81,6 +83,7 @@ def native(monkeypatch):
     monkeypatch.delenv("ATOM_REPLAYSSM_CACHE_LEN", raising=False)
     for setting, _ in dispatch.baseline_switches():
         monkeypatch.delenv(setting.split("=")[0], raising=False)
+    monkeypatch.delenv("ATOM_MONO_CHECK", raising=False)
 
 
 @pytest.mark.parametrize("k", [0, 1, 3])
@@ -150,6 +153,7 @@ def test_unsupported_deployment_is_refused(native, overrides, reason):
         ("norm_topk_prob", False),
         ("mlp_only_layers", [0]),
         ("decoder_sparse_step", 2),
+        ("layer_scale", True),
     ],
 )
 def test_a_setting_the_kernel_bakes_in_is_compared(native, field, value):
@@ -164,6 +168,28 @@ def test_a_missing_setting_is_refused(native, field):
     hf = {k: v for k, v in _HF.items() if k != field}
     reason = dispatch.config_refusal(_atom_config(hf_config=SimpleNamespace(**hf)))
     assert f"{field} None" in reason
+
+
+@pytest.mark.parametrize("rope", [{"partial_rotary_factor": 0.5}, {}])
+def test_a_rotary_share_other_than_the_kernels_is_refused(native, rope):
+    hf = SimpleNamespace(**{**_HF, "rope_parameters": rope})
+    reason = dispatch.config_refusal(_atom_config(hf_config=hf))
+    assert reason.startswith("partial_rotary_factor")
+
+
+def test_the_flat_rotary_field_is_read(native):
+    hf = {k: v for k, v in _HF.items() if k != "rope_parameters"}
+    hf = SimpleNamespace(**hf, partial_rotary_factor=0.25)
+    assert dispatch.config_refusal(_atom_config(hf_config=hf)) is None
+
+
+def test_the_layer_check_needs_eager_plain_decode(native, monkeypatch):
+    monkeypatch.setenv("ATOM_MONO_CHECK", "1")
+    why = "ATOM_MONO_CHECK without --enforce-eager or with a drafter"
+    assert dispatch.config_refusal(_atom_config()) == why
+    assert dispatch.config_refusal(_atom_config(enforce_eager=True)) is None
+    mtp = _atom_config(enforce_eager=True, speculative_config=_mtp(3))
+    assert dispatch.config_refusal(mtp) == why
 
 
 def test_a_non_bf16_model_is_refused(native):
@@ -293,7 +319,13 @@ def _verify(replay, requests, T=4):
         "spec_state_indices_tensor": slots,
         "replayssm": replay,
         "slot_idx": torch.zeros(requests, dtype=torch.int32) if replay else None,
+        "replayssm_max_query_len": T,
     }
+
+
+def test_a_replay_window_other_than_the_kernels_keeps_the_original_model(monkeypatch):
+    _context(monkeypatch, **{**_verify(True, 1), "replayssm_max_query_len": 5})
+    assert not dispatch.step_supported(_ids(4), 4, True)
 
 
 @pytest.mark.parametrize("replay", [True, False])
@@ -382,3 +414,15 @@ def test_draft_steps_follow_the_verify_width(monkeypatch, bs, rows, t):
     runner = object.__new__(draft_runner.Qwen35MonoDraftRunner)
     runner.T = 4
     assert runner.step_t(rows) == t
+
+
+@pytest.mark.parametrize(
+    "arch", ["Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"]
+)
+def test_both_architectures_install_mono(arch):
+    from atom.model_engine.model_runner import mono_decode_installers
+
+    assert (
+        mono_decode_installers[arch]
+        == "atom.models.qwen3_5.mono.dispatch.install_mono_decode"
+    )

@@ -13,8 +13,14 @@ The model's names resolve on first access, so importing a GPU-free submodule
 
 import importlib
 
+# the package's submodules: ``from atom.models.qwen3_5 import mono`` asks for the attribute
+# first, which must load the submodule alone (not the model, and with it AITER)
+_SUBMODULES = ("mono", "model")
+
 
 def __getattr__(name):
     if name.startswith("__"):
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in _SUBMODULES:
+        return importlib.import_module(f"{__name__}.{name}")
     return getattr(importlib.import_module(f"{__name__}.model"), name)

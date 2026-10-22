@@ -34,9 +34,7 @@ def _clone(args):
 def forward_checked(
     runner, input_ids: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
-    if runner.T > 1:
-        logger.info("Qwen3.5 mono check: verify step not checked")
-        return runner.forward(input_ids, positions)
+    assert runner.T == 1, "config_refusal keeps ATOM_MONO_CHECK off a drafter"
     pos, ctx, slots, bt, gdn = runner.step_inputs(input_ids, positions)
     kvd = get_forward_context().kv_cache_data
     lm = runner.lm

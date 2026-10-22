@@ -100,7 +100,10 @@ def mxfp4_qd(v0, v1):
 
 
 def div_rn(x, d, r):
-    """``x / d`` as an IEEE divide rounds it, given ``r`` = ``1 / d`` correctly rounded: Markstein's sequence
+    """Kept apart from ``atom.mono.device.ops.div_rn``, which returns +0 for x = -0: the divide (and the
+    FP8 byte a -0 quantizes to) keeps the sign.
+
+    ``x / d`` as an IEEE divide rounds it, given ``r`` = ``1 / d`` correctly rounded: Markstein's sequence
     (q0 = x r, the exact residual x - q0 d by fma, q0 + residual r), one reciprocal for many quotients. A zero
     ``x`` keeps its sign as the division does. Exact while x / d does not underflow; an underflowing quotient
     is far below any FP8 / bf16 step (and keeps its sign), so a value only rounded to those is unchanged.
