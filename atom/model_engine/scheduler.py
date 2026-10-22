@@ -4472,6 +4472,15 @@ class PrefillScheduler:
         """
         scheduled_seqs = {}
         num_scheduled_tokens = []
+        # Per-seq finality, which this scheduler did not report. Left unset,
+        # `ScheduledBatch.is_final_chunk` stays None and `produces_output()`
+        # answers True unconditionally ("if self.is_final_chunk is None:
+        # return True") -- so a batch of nothing but middle chunks claimed to
+        # produce output, and the draft pass ran for sequences that are
+        # mid-prompt. The non-disagg scheduler computes the same thing at its
+        # prefill batch, which is why that path can take the `align_only`
+        # branch and this one never could.
+        is_final_chunk: list[bool] = []
         num_batched_tokens = 0
         num_seqs = 0
         # Images for chunks that already landed on their rung, carried by the
@@ -4516,50 +4525,45 @@ class PrefillScheduler:
                 # a 226k prompt against a 16k budget asks for its 221184-token
                 # rung, never fits, and every request behind it stops too.
                 #
-                # The budget no longer CHUNKS, it only admits: a prompt either
-                # fits what is left of this batch and runs whole, or waits. So
-                # the only chunking left is the checkpoint rung, which is
-                # gated on prefix caching (`_prepare_prefill_checkpoint`
-                # returns early when the coordinator is disabled). With prefix
-                # caching off, every prefill batch is whole prompts and
-                # `produces_output()` is never false.
+                # The budget chunks ONLY what cannot run whole: a prompt that
+                # fits a full batch waits for one, a prompt longer than the
+                # budget entire is cut. So middle chunks come from two places
+                # now -- an over-budget prompt, and the checkpoint rung (gated
+                # on prefix caching via `_prepare_prefill_checkpoint`). With
+                # prefix caching off and every prompt under the budget, a
+                # prefill batch is whole prompts and `produces_output()` is
+                # never false.
                 budget = self.max_num_batched_tokens - num_batched_tokens
                 if budget <= 0:
                     break
                 num_new_tokens = seq.num_tokens - seq.num_cached_tokens
                 partial = False
-                # WHOLE SEQUENCES ONLY. A prompt that does not fit the budget
-                # left in this batch is not truncated into a chunk any more --
-                # it waits for a pass that can take all of it. Budget-chunking
-                # was the thing manufacturing middle chunks: a prompt cut here
-                # produces a forward with no output rows, and that is the batch
-                # shape the draft pass has to special-case.
+                # WHOLE SEQUENCES WHERE POSSIBLE, chunked where it is not.
                 #
-                # Previously this read:
-                #     if num_new_tokens > budget:
-                #         num_new_tokens = budget
-                #         partial = True
+                # A prompt that fits a full batch but not what is left of this
+                # one WAITS rather than being truncated: budget-chunking is
+                # what manufactured middle chunks, and a middle chunk is a
+                # forward with no output rows that every draft path then has to
+                # special-case.
                 #
-                # Cost of removing it: a prompt longer than
-                # `max_num_batched_tokens` ENTIRE can never fit any batch, and
-                # before this it was the only way such a prompt ran at all.
-                # Breaking on it would park it at the head of the queue and
-                # stall everything behind it, so it is skipped and named
-                # instead -- starving one request beats deadlocking the rank.
+                # But a prompt longer than `max_num_batched_tokens` ENTIRE can
+                # never fit any batch, and chunking is the only way it runs at
+                # all. Refusing it is not an option -- an agentic workload
+                # routinely sends prompts far past the budget (observed: a
+                # 226264-token request against a 16384 budget), and skipping
+                # them silently starves exactly the requests the benchmark is
+                # about. So the cut comes back for that case only.
                 if num_new_tokens > budget:
                     if num_new_tokens > self.max_num_batched_tokens:
-                        logger.error(
-                            "seq %s needs %d tokens but max_num_batched_tokens "
-                            "is %d: unrunnable without chunked prefill, skipping "
-                            "so it cannot block the queue. Raise "
-                            "--max_num_batched_tokens above the prompt length.",
-                            seq.id,
-                            num_new_tokens,
-                            self.max_num_batched_tokens,
-                        )
-                        continue
-                    # Fits a full batch, just not what is left of this one.
-                    break
+                        # Unrunnable whole at ANY batch size: chunk it, which is
+                        # what this scheduler did for everything before. Take
+                        # the remaining budget rather than the full one -- a
+                        # later pass continues from `num_cached_tokens`.
+                        num_new_tokens = budget
+                        partial = True
+                    else:
+                        # Fits a full batch, just not what is left of this one.
+                        break
                 # Stop on the rung decode picked, when it falls inside the
                 # chunk this pass can afford. A checkpoint holds the state as
                 # of a forward's LAST token, so the only way the image at
@@ -4584,6 +4588,9 @@ class PrefillScheduler:
                 seq.is_partial_prefill = partial
                 scheduled_seqs[seq.id] = seq
                 num_scheduled_tokens.append(num_new_tokens)
+                # Positionally aligned with `num_scheduled_tokens`, appended in
+                # the same place, so the two cannot describe different batches.
+                is_final_chunk.append(not partial)
                 num_batched_tokens += num_new_tokens
                 num_seqs += 1
                 # Read BEFORE the advance below, which is what decides whether
@@ -4619,6 +4626,7 @@ class PrefillScheduler:
                 total_tokens_num_prefill=num_batched_tokens,
                 total_seqs_num=num_seqs,
                 total_seqs_num_prefill=num_seqs,
+                is_final_chunk=is_final_chunk,
                 cu_stream_fraction=cu_fraction,
                 state_maintenance_ops=(
                     StateMaintenanceOps(checkpoint_stores=tuple(stores))
@@ -5300,5 +5308,20 @@ class DecodeScheduler(Scheduler):
             cu_stream_fraction=self.cu_fraction,
             state_maintenance_ops=self.block_manager.take_state_maintenance_ops(),
         )
+        # Both flags, not just one. `ScheduledBatch.__init__` snapshots
+        # `state_fork_src` for every seq exactly as it snapshots
+        # `is_first_decode`, and each describes ONE forward -- so each has to be
+        # cleared once that snapshot has been taken. The base `_schedule` clears
+        # both here; this override cleared only the second, so a forked sequence
+        # kept reporting the fork on every later decode step and
+        # `_V4Attention` kept sourcing its state from the fork's slot instead of
+        # the sequence's own ("every later batch for the same seq must read and
+        # write the same slot again").
+        #
+        # Reachable only with prefix caching: the fork is set in
+        # `StateSlotPool.checkpoint`, behind `applies(seq)` -- whose pool is
+        # built with `enabled=self.enable_prefix_caching` -- and
+        # `transfer.forks`. Prefix caching defaults ON, so that is most runs.
+        self._consume_state_forks(scheduled_seqs)
         self._consume_first_decode(scheduled_seqs)
         return (decode_batch, scheduled_seqs)

@@ -5925,9 +5925,34 @@ class RapidServeModelRunner(ModelRunner):
             # `mask_pad_tail` sentinels nothing, because `real_batch == batch`.
             # The two pad rows then scattered draft KV at whatever slot they
             # addressed. Measured directly: "role=prefill bs=14 ... anchors=16".
-            logits = logits[: batch.total_seqs_num]
-            sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
-            sampled_cpu = sampled.view(-1).tolist()
+            # A PURE MIDDLE CHUNK has no output rows, so `run_model` hands back
+            # `logits=None` -- "elif self._is_pure_middle_chunk(batch): ...
+            # logits = None". `ModelRunner.forward` never meets that here
+            # because it returns BEFORE `postprocess` for such a batch; this
+            # path has no early return, so it has to answer for it.
+            #
+            # Previously unreachable, which is why it was never handled: this
+            # scheduler did not report `is_final_chunk`, so `produces_output()`
+            # answered True unconditionally and logits were always computed.
+            # Making that field truthful is what exposed the branch.
+            if logits is None:
+                sampled = None
+                # One entry per scheduled seq, NOT an empty list. The engine
+                # builds its `PrefillDone` messages by zipping `req_ids` with
+                # these, so an empty list truncates the zip to nothing, no
+                # message is sent for the chunk, and decode never advances
+                # `num_cached_tokens` for it -- the prompt stalls mid-way with
+                # no error. A middle chunk still owes decode that message: it
+                # carries real KV and the hashes to publish. The VALUE is
+                # ignored, since `on_prefill_done` returns on `is_final=False`
+                # before reading `sampled_token_id`.
+                sampled_cpu = [0] * int(batch.total_seqs_num)
+            else:
+                logits = logits[: batch.total_seqs_num]
+                sampled = self.sampler(
+                    logits, temperatures, top_ks, top_ps, all_greedy
+                )
+                sampled_cpu = sampled.view(-1).tolist()
             if envs.ATOM_LOG_EMITTED_TOKENS:
                 # Prefill's own copy of the `[emit]` line. It needs one because
                 # this path never reaches `postprocess` -- it samples here and
