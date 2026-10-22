@@ -1773,7 +1773,13 @@ class MooncakeConnector(KVConnectorBase):
                 if addr not in self._verified_producers:
                     self._verify_producer(addr)
                     self._verified_producers.add(addr)
-                self._send_on_socket(addr, parts)
+                # Under the lock `close()` takes: once it returns nothing more
+                # is posted, since teardown then releases the memory a late
+                # request would have the producer write into.
+                with self._write_cv:
+                    if self._write_closed:
+                        return False
+                    self._send_on_socket(addr, parts)
         except Exception as e:
             logger.exception("[CONSUMER] failed to post write requests")
             self._write_request_error = e
@@ -1825,8 +1831,9 @@ class MooncakeConnector(KVConnectorBase):
             )
 
     def close(self) -> None:
-        """Stop posting at worker teardown; queued write requests are dropped
-        rather than sent while this process goes away."""
+        """Stop posting at worker teardown. Queued write requests, including a
+        batch the worker already took, are dropped rather than sent while this
+        process goes away; none is posted after this returns."""
         if self.is_producer:
             return
         with self._write_cv:

@@ -591,19 +591,27 @@ def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
     the first transfer frees the row, which needs its write request posted
     first. Posting only after the whole loop would deadlock."""
     posted = []
+    both_posted = threading.Event()
 
     def send(conn, addr):
         # The transfer completes as soon as it is posted, returning the row.
         posted.append(addr)
         conn._staging_slots.release(0)
+        if len(posted) == 2:
+            both_posted.set()
 
     conn = _one_row_staging_consumer(monkeypatch, send)
-    outcome = _receive_two(conn)
-    assert outcome["returned"], "second receive never got a staging row"
-    assert "error" not in outcome
-    conn.close()
-    conn._write_thread.join(5)
-    assert len(posted) == 2
+    try:
+        outcome = _receive_two(conn)
+        assert outcome["returned"], "second receive never got a staging row"
+        assert "error" not in outcome
+        # Returning means the second request was queued, not yet posted.
+        assert both_posted.wait(5), "second write request was never posted"
+        assert len(posted) == 2
+    finally:
+        conn.close()
+        if conn._write_thread is not None:
+            conn._write_thread.join(5)
 
 
 def test_a_failed_post_wakes_a_receive_waiting_for_a_staging_row(monkeypatch):
@@ -668,6 +676,37 @@ def test_close_drops_queued_requests_and_stops_the_worker(monkeypatch):
     assert not conn._post_queued_write_requests()
     conn._enqueue_write_requests([("tcp://p:1", [b"r1"])])
     assert sent == [] and conn._write_queue == []
+
+
+def test_nothing_is_posted_after_close_returns(monkeypatch):
+    """A batch the worker took before `close()` -- here, while it waits for the
+    device -- must not go out afterwards: teardown releases the memory the
+    producer would write into."""
+    mc, conn = _queue_only_consumer()
+    syncing, release = threading.Event(), threading.Event()
+
+    def blocked_sync(*_):
+        syncing.set()
+        release.wait(5)
+
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", blocked_sync)
+    sent = []
+    conn._send_on_socket = lambda addr, parts: sent.append(parts)
+    conn._enqueue_write_requests([("tcp://p:1", [b"r0"]), ("tcp://p:1", [b"r1"])])
+    result = {}
+    worker = threading.Thread(
+        target=lambda: result.update(more=conn._post_queued_write_requests()),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert syncing.wait(5)
+        conn.close()
+    finally:
+        release.set()
+        worker.join(5)
+    assert sent == []
+    assert result == {"more": False}
 
 
 def test_consumer_refuses_a_producer_with_other_slot_sizes(monkeypatch):
