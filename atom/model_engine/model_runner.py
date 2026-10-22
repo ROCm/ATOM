@@ -256,6 +256,25 @@ class tokenIDProcessor:
         )
         self.clean()
 
+    def _hold_for_copy_stream(self, *gpu_tensors: torch.Tensor | None) -> None:
+        """Keep each source's block out of the allocator until its D2H has run.
+
+        The sources are allocated on the default stream -- the rejection
+        sampler's `verdict` and `output_token_ids` are fresh `torch.empty`s
+        every step -- and read only by the copy queued on `async_copy_stream`.
+        The caching allocator does not see that read: once the caller drops
+        its last reference, the block goes to the default stream's next
+        allocation, and if the side-stream copy runs after that tensor is
+        written, the host reads the next step's data as this step's. The copy
+        runs late whenever `async_copy_stream`, or a hardware queue it shares
+        with other streams, has work in front of it. Under MTP the stale
+        `num_bonus` becomes `num_accepted_tokens`, which the GDN conv kernel
+        adds to the state offset unchecked.
+        """
+        for t in gpu_tensors:
+            if t is not None and t.is_cuda:
+                t.record_stream(self.async_copy_stream)
+
     def send_to_cpu_async(
         self,
         gpu_tensor: torch.Tensor,
@@ -274,6 +293,7 @@ class tokenIDProcessor:
                 else None
             )
             copy_done.record(self.async_copy_stream)
+        self._hold_for_copy_stream(gpu_tensor, gpu_logprobs)
         cpu_tensor_handle.append((cpu_tensor, copy_done))
         self.logprobs_cpu.append(cpu_logprobs)
 
@@ -302,6 +322,7 @@ class tokenIDProcessor:
             cpu_tensor = gpu_tensor.to("cpu", non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.async_copy_stream)
+        self._hold_for_copy_stream(gpu_tensor)
         # No reverse wait here. `gpu_tensor` is a draft pass's captured output,
         # so its address is fixed and the NEXT replay rewrites it -- but that
         # replay sits behind a whole target forward on the default stream, while
@@ -339,6 +360,7 @@ class tokenIDProcessor:
             cpu_num_rejected = num_rejected.to("cpu", non_blocking=True)
             cpu_num_bonus = num_bonus.to("cpu", non_blocking=True)
             copy_done.record(self.async_copy_stream)
+        self._hold_for_copy_stream(num_rejected, num_bonus)
         self.pending_mtp_status_copies.append(
             (cpu_num_rejected, cpu_num_bonus, copy_done)
         )
