@@ -1061,7 +1061,7 @@ models:
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
-          eval_concurrency: [128]
+          eval_concurrency: [128, 768]
 
         - name: minimax-m3-fp8-2p1d-dpa-tp8
           topology: 2p1d_dpa
@@ -1085,7 +1085,7 @@ models:
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
-          eval_concurrency: [128]
+          eval_concurrency: [128, 768]
 
         - name: minimax-m3-fp8-2p1d-dpa-tp8-eagle3
           topology: 2p1d_dpa_eagle3
@@ -1112,7 +1112,7 @@ models:
           benchmark:
             wait_server_timeout: 1800
           run_eval: true
-          eval_concurrency: [128]
+          eval_concurrency: [128, 768]
 
         - name: minimax-m3-fp8-1p1d-tp4-eagle3
           topology: 1p1d_eagle3
