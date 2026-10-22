@@ -210,18 +210,50 @@ def test_the_scheduler_reports_how_many_requests_it_could_still_abort(caplog):
 
 
 # ------------------------------------------------------------------------- the output object
-def test_the_output_object_carries_the_verdict_and_defaults_to_none():
+class _Ndarray:
+    """numpy.ndarray as far as ScheduledBatchOutput._copy_array_view looks: ``flags.owndata`` and
+    ``copy()``. A view (owndata False) must be copied; an owning array must be kept as is.
+    """
+
+    def __init__(self, owndata):
+        self.flags = SimpleNamespace(owndata=owndata)
+        self.copies = 0
+
+    def copy(self):
+        self.copies += 1
+        return _Ndarray(True)
+
+
+def _output_class():
     cls = _class_node(SCHED, "ScheduledBatchOutput")
     module = ast.Module(
         [ast.parse("from __future__ import annotations").body[0], cls], []
     )
-    ns = {}
+    ns = {
+        "np": SimpleNamespace(ndarray=_Ndarray)
+    }  # the constructor copies NumPy views (#2670)
     exec(compile(ast.fix_missing_locations(module), SCHED, "exec"), ns)  # noqa: S102
-    out_cls = ns["ScheduledBatchOutput"]
+    return ns["ScheduledBatchOutput"]
+
+
+def test_the_output_object_carries_the_verdict_and_defaults_to_none():
+    out_cls = _output_class()
     plain = out_cls([1], [(5,)], None, None, None)
     assert plain.aborted_req_ids is None
     verdict = out_cls([1], [], None, None, None, aborted_req_ids=[1])
     assert verdict.aborted_req_ids == [1]
+
+
+def test_the_verdict_field_and_the_numpy_view_copy_coexist():
+    """Upstream (#2670) copies the speculative NumPy views when the output is built so pinned D2H
+    storage is not held by the result; our abort field rides the same constructor."""
+    out_cls = _output_class()
+    view, owned = _Ndarray(owndata=False), _Ndarray(owndata=True)
+    out = out_cls([1], [], view, owned, None, aborted_req_ids=[7])
+    assert out.aborted_req_ids == [7]
+    assert view.copies == 1 and out.num_rejected is not view  # a view is copied
+    assert owned.copies == 0 and out.num_bonus is owned  # an owning array is kept
+    assert out.draft_token_ids is None  # nothing is allocated for an output-less batch
 
 
 # ------------------------------------------------- the launch gate in the runner
