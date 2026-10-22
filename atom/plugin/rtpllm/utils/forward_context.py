@@ -89,6 +89,7 @@ if triton is not None:
         sequence_lengths,
         read_slots,
         write_slots,
+        invalid_live_rows,
         rows,
         table_stride_row,
         table_stride_col,
@@ -102,6 +103,15 @@ if triton is not None:
         length = tl.load(sequence_lengths + row, live, 0)
         read_col = tl.maximum(length - 2, 0) // block_size
         write_col = tl.maximum(length - 1, 0) // block_size
+        # Block 0 is RTP's reserved padding block. A real row with a
+        # too-narrow table must be distinguishable from graph padding even
+        # though both still use block 0 as the safe fallback address.
+        first_page = tl.load(block_table + row * table_stride_row, live, 0)
+        invalid = (
+            live
+            & (first_page > 0)
+            & ((read_col >= table_cols) | (write_col + query_len - 1 >= table_cols))
+        )
         for token in tl.static_range(query_len):
             column = write_col + token
             slot = tl.load(
@@ -111,6 +121,7 @@ if triton is not None:
                 live & (column < table_cols) & (length >= 2),
                 -1,
             )
+            invalid |= live & (first_page > 0) & (slot < 0)
             # RTP reserves and zeroes state block 0 for Graph padding. The
             # recurrent consumer cannot safely dereference a negative slot.
             tl.store(write_slots + row * query_len + token, tl.maximum(slot, 0), live)
@@ -121,6 +132,10 @@ if triton is not None:
             live & (read_col < table_cols) & (length >= 2),
             -1,
         )
+        invalid |= live & (first_page > 0) & (previous < 0)
+        invalid_count = tl.sum(invalid.to(tl.int32), 0)
+        if invalid_count > 0:
+            tl.atomic_add(invalid_live_rows, invalid_count)
         for token in tl.static_range(query_len):
             tl.store(
                 read_slots + row * query_len + token, tl.maximum(previous, 0), live
