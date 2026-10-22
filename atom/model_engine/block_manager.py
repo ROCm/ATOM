@@ -272,12 +272,10 @@ class BlockManager:
         # from "no slots were ever created" (permanent).
         self.num_state_slots = int(pool_entries.get(STATE_SLOT_CLASS, 0))
         self.state_slots_per_req = int(pool_per_req.get(STATE_SLOT_CLASS, 1)) or 1
-        # P/D consumer only: state slots freed by finished requests, in two
-        # stages -- freed since the last output-reading postprocess, and freed
-        # before it (`release_held_state_slots`).
+        # P/D consumer only: state slots freed since the last output-reading
+        # postprocess (`release_held_state_slots`).
         self.state_release_lag = False
         self._held_state_slots: list[int] = []
-        self._cooling_state_slots: list[int] = []
         # Tokens between rungs of the checkpoint ladder, shared by every
         # Pool.STATE class (--state-checkpoint-interval-tokens).
         #
@@ -3194,34 +3192,28 @@ class BlockManager:
 
     @property
     def has_held_state_slots(self) -> bool:
-        return bool(self._held_state_slots or self._cooling_state_slots)
+        return bool(self._held_state_slots)
 
-    def release_held_state_slots(self, *, drained: bool = False) -> None:
-        """Advance freed state slots one output-reading postprocess (P/D
-        consumer only); a slot goes back after two.
+    def release_held_state_slots(self) -> None:
+        """Hand back state slots freed one step ago (P/D consumer only).
 
-        With deferred output a request is known finished a forward late, and
-        forwards already launched -- still carrying it, or a middle prefill
-        chunk of a cancelled one -- write its slot. Handed out at once, the
-        slot can receive another request's state by RDMA, which no stream
-        orders against them. A postprocess that reads output waits for the
-        previous output-producing forward, which may predate those forwards
-        (a middle chunk publishes nothing), so one is not enough; the second
-        reads a forward launched after the slot was freed, and stream order
-        then has every earlier forward finished -- on every TP rank, since
-        that forward ran a TP collective with them.
+        With deferred output a request is known finished one forward late, and
+        that forward -- already running, still carrying it -- writes its state
+        slot. Handed out at once, the slot can receive another request's state
+        by RDMA, which no stream orders against that forward. So a freed slot
+        waits for the next output-reading postprocess (its forward synchronized
+        on the previous one's tokens) or an idle drain (`drain_device`).
 
-        `drained`: the workers have synchronized (`drain_device`); everything
-        held goes back.
+        One step is enough because a slot is only ever freed inside
+        `postprocess` -- a cancellation just marks the request and is reaped
+        there too -- so the last forward that can write it is the one launched
+        right before, and the consumer runs no prefill for a P/D request
+        (`_abort_failed_remote_receive`): that forward is a decode, which
+        produces output, and the next output-reading postprocess reads it.
         """
-        if drained:
-            ready = self._cooling_state_slots + self._held_state_slots
+        if self._held_state_slots:
+            self.state.release_many(self._held_state_slots)
             self._held_state_slots = []
-        else:
-            ready = self._cooling_state_slots
-        self._cooling_state_slots, self._held_state_slots = self._held_state_slots, []
-        if ready:
-            self.state.release_many(ready)
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):

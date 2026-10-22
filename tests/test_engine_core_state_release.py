@@ -2,7 +2,7 @@
 """A P/D consumer whose state slots are all held must not stall.
 
 `BlockManager.release_held_state_slots` hands back a finished request's slot
-only after the forwards that may still write it have finished.
+one output-reading postprocess late, after the forward that may still write it.
 When admission fails because every slot is held, the scheduler returns an
 empty batch: no forward runs, so the engine step itself has to drain the
 workers and release the slots, or the queued request never starts.
@@ -30,8 +30,8 @@ class _BlockManager:
     def has_held_state_slots(self):
         return self.held
 
-    def release_held_state_slots(self, *, drained=False):
-        self.released_with.append(drained)
+    def release_held_state_slots(self):
+        self.released_with.append("release")
         self.held = False
 
 
@@ -62,7 +62,7 @@ def test_an_empty_batch_drains_and_releases_held_slots():
     core, bm, calls = _engine(batch)
     assert core._process_engine_step_inner() is False
     assert calls == ["drain_device"]
-    assert bm.released_with == [True] and not bm.has_held_state_slots
+    assert bm.released_with == ["release"] and not bm.has_held_state_slots
 
 
 def test_nothing_held_means_no_drain():
