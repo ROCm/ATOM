@@ -519,6 +519,9 @@ class EngineCore:
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
+            # Admission can fail because every state slot is held, which yields
+            # an empty batch rather than None; no forward will release them.
+            self._release_held_state_slots_when_idle()
             return False
 
         seqs = seqs.values()

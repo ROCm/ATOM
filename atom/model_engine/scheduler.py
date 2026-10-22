@@ -637,9 +637,13 @@ class Scheduler:
         )
         # A P/D consumer receives state by RDMA into slots the previous
         # tenant's in-flight step may still write (`advance_state_release_lag`).
+        # Not under pipeline parallelism: deferred output is off there
+        # (`tokenIDProcessor.is_deferred_out`), so a finished request has no
+        # forward still in flight, and the PP head runs its own loop.
         self.block_manager.state_release_lag = (
             kv_config_has_consumer(getattr(config, "kv_transfer_config", None))
             and self.block_manager.num_state_slots > 0
+            and getattr(config, "pipeline_parallel_size", 1) == 1
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
