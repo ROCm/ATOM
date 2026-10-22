@@ -41,9 +41,11 @@ TOKEN_BUCKETS = (
 # A batch sums many contexts. Keep fixed bounds across schedulers so their
 # histograms can be pooled, covering up to 1024 rows of 8M tokens each.
 BATCH_CONTEXT_BUCKETS = (*TOKEN_BUCKETS, *(2**power for power in range(24, 34)))
-# Bounds the retained contexts if snapshot pushes stall or requests are very
-# short; 2.4 requests/s over the default 120 s window keeps about 300.
-REQUEST_CONTEXT_CAP = 4096
+# Bounds the retained contexts at high request rates. Each one costs every
+# scrape about 13 us of the API server's Python (copied, then rendered), so
+# the cap holds that to ~14 ms; 2.4 requests/s over the default 120 s window
+# keeps about 300, and 20 requests/s still keeps each one for ~50 s.
+REQUEST_CONTEXT_CAP = 1024
 
 
 @dataclass

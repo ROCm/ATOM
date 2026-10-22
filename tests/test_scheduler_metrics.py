@@ -708,6 +708,20 @@ def test_request_contexts_expire_after_the_retention_window(monkeypatch):
     assert metrics.request_contexts() == []
 
 
+def test_request_contexts_keep_only_the_newest_at_high_request_rates():
+    from prometheus_client import CollectorRegistry
+
+    from atom.metrics.scheduler import REQUEST_CONTEXT_CAP
+
+    metrics = SchedulerMetrics(registry=CollectorRegistry())
+    for i in range(REQUEST_CONTEXT_CAP + 10):
+        seq = SimpleNamespace(external_request_id=f"request-{i}")
+        metrics._record_request_context("decode", i, seq, 100)
+    kept = contexts(metrics, "decode")
+    assert len(kept) == REQUEST_CONTEXT_CAP
+    assert kept[0][0] == "request-10"
+
+
 def test_request_contexts_reach_the_exporter_through_the_snapshot(monkeypatch):
     """The API server exports what the scheduler last published, with the
     scheduler's own labels (its `dp_rank` folds in the PP rank)."""

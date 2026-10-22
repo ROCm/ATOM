@@ -130,7 +130,7 @@ For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
 These are intentionally per-request metrics, but the API server exports each
 one only for `ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S` (default 120 s) after
-its first dispatch, at most 4096 per scheduler. Samples remain after request
+its first dispatch, at most 1024 per scheduler. Samples remain after request
 completion, so a scrape interval shorter than the window still sees even short
 requests; use `max_over_time` over the run to collect them all. The scheduler
 publishes them in its metrics snapshot, not in native multiprocess files,
