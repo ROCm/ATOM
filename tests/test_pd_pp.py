@@ -499,6 +499,93 @@ def test_mooncake_control_address_is_independent_of_rdma_device(
             conn.get_finished()
 
 
+def test_consumer_posts_each_receive_before_taking_the_next_staging_row(
+    monkeypatch,
+):
+    """With one staging row, the second receive waits in `acquire()` until
+    the first transfer frees the row, which needs its write request posted
+    first. Posting only after the whole loop would deadlock."""
+    from atom.kv_transfer.disaggregation.mooncake import mooncake_connector as mc
+
+    monkeypatch.setenv("ATOM_HOST_IP", "10.19.0.140")
+    monkeypatch.delenv("ATOM_MOONCAKE_IB_DEVICE", raising=False)
+    monkeypatch.delenv("MC_FORCE_TCP", raising=False)
+    monkeypatch.setattr(mc.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(mc.torch.cuda, "synchronize", lambda *a: None)
+    monkeypatch.setattr(mc.torch.cuda, "set_device", lambda *a: None)
+    monkeypatch.setattr(mc, "_ib_device_exists", lambda name: True)
+    monkeypatch.setattr(
+        mc, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(
+        mc, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    engine = MagicMock()
+    engine.initialize.return_value = 0
+    engine.get_rpc_port.return_value = 16578
+    monkeypatch.setattr(mc, "_MOONCAKE_AVAILABLE", True)
+    monkeypatch.setattr(mc, "TransferEngine", lambda: engine, raising=False)
+    monkeypatch.setattr(mc, "get_open_port", lambda: 41000)
+    monkeypatch.setattr(mc.zmq, "Context", MagicMock())
+    conn = mc.MooncakeConnector(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(pipeline_parallel_rank=0),
+            pipeline_parallel_size=1,
+            hf_config=SimpleNamespace(num_hidden_layers=2),
+            kv_cache_block_size=16,
+            decode_context_parallel_size=1,
+            dcp_config=SimpleNamespace(interleave_size=1),
+            kv_transfer_config={"kv_role": "kv_consumer", "protocol": "rdma"},
+        )
+    )
+    conn._notification_port = 42000
+    conn._has_slot_regions = True
+    conn._staging_pool_size = 1
+    conn._staging_slots = mc.SlotPool(1)
+    conn._staging_base_addr = 0
+    conn._staging_slot_bytes = 64
+    # The producer's transfer completes as soon as its request is posted,
+    # handing the staging row back.
+    posted = []
+
+    def send(addr, parts, repeat=1):
+        posted.append(addr)
+        conn._staging_slots.release(0)
+
+    conn._send_on_socket = send
+
+    def meta(i):
+        return ConnectorMetadata._build_req_meta(
+            req_id=f"r{i}",
+            local_block_ids=[i],
+            kv_transfer_params={
+                "remote_block_ids": [i],
+                "remote_host": "10.19.0.113",
+                "remote_handshake_port": 6301,
+                "tp_size": 1,
+                "transfer_id": i,
+            },
+        )
+
+    done = threading.Event()
+    worker = threading.Thread(
+        target=lambda: (
+            conn.start_load_kv(
+                SimpleNamespace(
+                    request_id_to_transfer_id={"r0": 0, "r1": 1},
+                    reqs_to_recv={"r0": meta(0), "r1": meta(1)},
+                )
+            ),
+            done.set(),
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert done.wait(10), "second receive never got a staging row"
+    conn._write_request_executor.shutdown(wait=True)
+    assert len(posted) == 2
+
+
 def test_mooncake_tcp_disables_rdma_device_even_when_configured():
     mc = pytest.importorskip(
         "atom.kv_transfer.disaggregation.mooncake.mooncake_connector"

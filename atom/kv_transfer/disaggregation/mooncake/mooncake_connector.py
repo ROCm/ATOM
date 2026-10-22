@@ -1510,8 +1510,8 @@ class MooncakeConnector(KVConnectorBase):
             metadata.request_id_to_transfer_id,
         )
 
-        write_requests: list[tuple[str, list[bytes]]] = []
         for req_id, meta in metadata.reqs_to_recv.items():
+            write_requests: list[tuple[str, list[bytes]]] = []
             remote_tp_size = meta.tp_size
             if remote_tp_size != self.tp_size:
                 remote_tp_rank = self.tp_rank % remote_tp_size
@@ -1700,7 +1700,9 @@ class MooncakeConnector(KVConnectorBase):
                     off,
                     dst_block_ids[:10],
                 )
-        if write_requests:
+            # Per request, not after the loop: the next request may block in
+            # `_staging_slots.acquire()` until a transfer already prepared here
+            # completes and frees its row, which needs its write request out.
             self._write_request_executor.submit(
                 self._post_write_requests, write_requests
             )
