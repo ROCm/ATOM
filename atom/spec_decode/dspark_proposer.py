@@ -265,7 +265,9 @@ class DSparkProposer(Drafter):
         """
         return None if self.draft_sampling is None else self._q_store
 
-    def stage_draft_sampling_host(self, batch, bs: int, group) -> None:
+    def stage_draft_sampling_host(
+        self, batch, bs: int, group, *, has_filter: bool
+    ) -> None:
         """Stage this step's temperatures, greedy mask and Philox key on the host.
 
         Called from `ModelRunner.prepare_sample`, which already holds
@@ -312,7 +314,7 @@ class DSparkProposer(Drafter):
         # Sized by the scheduled batch; the pad rows up to `running_bs` keep
         # the 1.0 / 1 seeded at allocation and nothing reads their q.
         self._staged_draft_bs = bs
-        if self.runner.sampling_has_row_filter:
+        if has_filter:
             # A batch with top-k or top-p on any row drafts greedily, the whole
             # batch of it, because the verify side drops such a batch to
             # exact-match acceptance batch-wide (`ModelRunner.postprocess`).

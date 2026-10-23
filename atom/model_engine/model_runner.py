@@ -1430,13 +1430,6 @@ class ModelRunner:
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         f32_kwargs = {"dtype": torch.float, "device": self.device}
 
-        # Does the batch currently being sampled carry an active top-k/top-p on
-        # any row? Written by `prepare_sample` and read in the same call by
-        # `DSparkProposer.stage_draft_sampling_host`, which has to know before
-        # the batch is drafted. Seeded False so a drafter reached before any
-        # `prepare_sample` (warmup, capture) sees the unfiltered answer.
-        self.sampling_has_row_filter = False
-
         # TODO: remove it in forward_context
         self.forward_vars = {
             "input_ids": self.tokenID_processor.input_ids,
@@ -2702,12 +2695,6 @@ class ModelRunner:
         needs_topk = (batch.top_ks != -1).any()
         needs_topp = (batch.top_ps < 1.0).any()
 
-        # Hand that same decision to the drafter, which runs later in this step.
-        # Set here rather than derived from the `top_ks`/`top_ps` returned below
-        # because those collapse a uniform filter to a host scalar and an absent
-        # one to None, so "any row filters" is a fact only this function knows.
-        self.sampling_has_row_filter = bool(needs_topk or needs_topp)
-
         # Uniform filters are already known on the CPU. Keep them as scalars
         # for AITER's fast dispatch instead of uploading and reading them back.
         top_ks = top_ps = None
@@ -2745,7 +2732,9 @@ class ModelRunner:
         # A no-op on every drafter but a DSpark one with lossless sampling.
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
-            drafter.stage_draft_sampling_host(batch, bs, group)
+            drafter.stage_draft_sampling_host(
+                batch, bs, group, has_filter=bool(needs_topk or needs_topp)
+            )
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]

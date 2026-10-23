@@ -231,7 +231,7 @@ class FakeProposer:
         self._draft_temps_buf = FakeBuffer(max_bs, np.float32, 1.0)
         self._draft_greedy_buf = FakeBuffer(max_bs, np.int32, 1)
         self._draft_seed_buf = FakeBuffer(1, np.int32, 0)
-        self.runner = type("Runner", (), {"sampling_has_row_filter": has_filter})()
+        self.has_filter = has_filter
         self._draft_sample_step = 0
         self._staged_draft_bs = -1
         self.bs = bs
@@ -243,7 +243,9 @@ class FakeProposer:
         )()
 
     def stage(self):
-        self.stage_draft_sampling_host(self.batch, self.bs, self.group)
+        self.stage_draft_sampling_host(
+            self.batch, self.bs, self.group, has_filter=self.has_filter
+        )
 
     @property
     def temps(self):
