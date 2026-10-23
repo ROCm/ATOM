@@ -260,9 +260,9 @@ class DSparkProposer(Drafter):
         acceptance batch-wide (`ModelRunner.postprocess`).
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
-        may read. False for a dummy forward, whose drafts are dropped: it
-        claims no slot and writes no q, so its ids (warmup's 0..n-1, the DP
-        dummy's -1) never enter the slot map.
+        may read. False for a dummy forward and an align-only middle chunk,
+        whose drafts are dropped: those claim no slot and write no q, so their
+        ids (warmup's 0..n-1, the DP dummy's -1) never enter the slot map.
         """
         if self.draft_sampling is None:
             return

@@ -2737,9 +2737,10 @@ class ModelRunner:
                 bs,
                 group,
                 has_filter=bool(needs_topk or needs_topp),
-                # A dummy forward's drafts are dropped, so it must not claim q
-                # slots or write q.
-                drafts_verifiable=not batch.is_dummy_run,
+                # A dummy forward's and an align-only propose's drafts are
+                # dropped, so they must not claim q slots or write q.
+                drafts_verifiable=not batch.is_dummy_run
+                and not self._is_pure_middle_chunk(batch),
             )
         if publication_group is None:
             group.publish(counts)

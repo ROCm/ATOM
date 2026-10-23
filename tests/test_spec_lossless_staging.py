@@ -173,6 +173,18 @@ def test_a_dummy_forward_claims_nothing_and_verifies_nothing(monkeypatch):
     assert verify(prop)[0] == -1
 
 
+def test_an_align_only_propose_writes_no_q_and_keeps_other_slots(monkeypatch):
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["d"]))
+    (d,) = dest(prop)[:1]
+    counts = stage(prop, batch(["m1", "m2"]), verifiable=False)
+    assert dest(prop)[:2] == [-1, -1]
+    assert counts["draft_q_row_base"] == 2
+    assert "m1" not in prop._q_slots and "m2" not in prop._q_slots
+    stage(prop, batch(["d"]))
+    assert verify(prop)[0] == d
+
+
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):
     """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
     previous batch's slot would write its q into a live request's rows."""

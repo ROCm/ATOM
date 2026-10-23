@@ -27,7 +27,12 @@ class DraftQSlots:
     target alone. The output distribution is unchanged; the cost is one step of
     speculation for one request.
 
-    ``evictions`` counts expiries.
+    The victim is usually a dead request, but nothing guarantees it. A request
+    waiting through a long prefill-first burst is not refreshed while more than
+    ``num_slots - live`` new ids claim slots, which a stream of prefill-only
+    (``max_tokens=1``) requests can do. ``evictions`` counts expiries of
+    entries that were drafted for, so a live-eviction rate shows up as a
+    number rather than as an unexplained acceptance dip.
     """
 
     def __init__(self, num_slots: int, rows_per_slot: int):
