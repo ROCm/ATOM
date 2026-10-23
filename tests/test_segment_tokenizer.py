@@ -2,6 +2,7 @@
 """`SegmentTokenizer` must return exactly what the plain encoder returns."""
 
 import random
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -365,6 +366,12 @@ def test_stored_prefixes_stay_within_the_budget(tok):
         assert seg._encode_segments(p) == tok.encode(p)
         assert seg._prefix_tokens <= 20_000
         assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
+        # Retained bytes, counted independently of `cost`.
+        held = sum(
+            e.ids.nbytes + sys.getsizeof(e.text) + e.cut_chars.nbytes + e.cut_ids.nbytes
+            for e in seg._prefixes.values()
+        )
+        assert held <= 4 * 20_000
 
 
 def test_concurrent_turns_stay_exact(tok):
@@ -393,6 +400,41 @@ def test_concurrent_turns_stay_exact(tok):
         t.join(60)
     assert not errors
     assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
+
+
+def test_added_token_heavy_prefixes_stay_within_the_budget(tok):
+    """Many added tokens mean many retained cut positions."""
+    seg = SegmentTokenizer.maybe_create(tok, 30_000)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(17)
+    for _ in range(6):
+        p = "<|begin|>" + _text(rng, 3000) + "<|User|>x" * 3000 + "<|Assistant|>"
+        assert seg._encode_segments(p) == tok.encode(p)
+        held = sum(
+            e.ids.nbytes + sys.getsizeof(e.text) + e.cut_chars.nbytes + e.cut_ids.nbytes
+            for e in seg._prefixes.values()
+        )
+        assert held <= 4 * 30_000
+
+
+def test_prefix_reuse_is_off_when_a_raw_token_overlaps_a_normalized_ones_end():
+    """Normalized `ab`, non-normalized `bc`: a prompt cut after `ab` and then
+    extended by `c` extracts `bc` from the raw text first."""
+    tok = _tokenizer_with(
+        [
+            AddedToken("<|User|>", special=True, normalized=False),
+            AddedToken("ab", normalized=True),
+            AddedToken("bc", special=True, normalized=False),
+        ]
+    )
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    assert seg is not None and not seg._prefix_ok
+    # The segment level alone stays exact past the verification window.
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(18)
+    p = "<|User|>" + _text(rng, 3000) + "ab"
+    assert seg._encode_segments(p) == tok.encode(p)
+    assert seg._encode_segments(p + "c") == tok.encode(p + "c")
 
 
 def test_verification_window_is_bounded():

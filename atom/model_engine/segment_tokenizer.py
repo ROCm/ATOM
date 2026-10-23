@@ -64,8 +64,36 @@ class _Prefix(NamedTuple):
 
     @property
     def cost(self) -> int:
-        """Budget units (one per int32 token id): the ids and the text."""
-        return len(self.ids) + sys.getsizeof(self.text) // 4
+        """Budget units of 4 bytes, one per int32 token id: everything kept."""
+        return (
+            self.ids.nbytes
+            + sys.getsizeof(self.text)
+            + self.cut_chars.nbytes
+            + self.cut_ids.nbytes
+        ) // 4
+
+
+def _cuts_are_stable(added, normalized) -> bool:
+    """Whether a prompt cut right after an added token `t` extracts the same
+    up to the cut whatever follows it -- what reusing a stored prefix needs.
+
+    Within one extraction pass that fails only when another added token
+    contains `t` (it could start at or before `t` and run past the cut):
+    leftmost-longest matching takes `t` first otherwise. Across passes it also
+    fails when a non-normalized token -- extracted from the raw text first --
+    could start inside a normalized `t` and run past the cut (normalized `ab`,
+    non-normalized `bc`, then `c` appended).
+    """
+    tokens = list(added)
+    if any(a != b and a in b for a in tokens for b in tokens):
+        return False
+    raw = [u for u in tokens if u not in normalized]
+    return not any(
+        t[-k:] == u[:k]
+        for t in normalized
+        for u in raw
+        for k in range(1, min(len(t), len(u)))
+    )
 
 
 def _alternation(tokens):
@@ -145,13 +173,7 @@ class SegmentTokenizer:
         )
         if not self.enabled:
             logger.info("segment tokenizer: off (added tokens are not plain splits)")
-        # A stored prefix ends right after an added token. Reusing it assumes
-        # no added token in the full prompt starts before that cut and ends
-        # after it, which holds when none contains another.
-        tokens = list(self._added)
-        self._prefix_ok = not any(
-            a != b and a in b for a in tokens for b in tokens if len(b) > len(a)
-        )
+        self._prefix_ok = _cuts_are_stable(self._added, normalized)
         self._prefixes: OrderedDict[int, _Prefix] = OrderedDict()
         self._prefix_buckets: dict[int, list[int]] = {}
         self._prefix_tokens = 0
