@@ -1089,7 +1089,7 @@ def _make_transfer_connector(prefill_data, captured):
     conn.done_sending = set()
     conn._wait_for_prefill_data = lambda _transfer_id: dict(prefill_data)
     conn._execute_block_slot_transfer = (
-        lambda request, target, src, dst, data, req_id, *, engine=None: captured.append(
+        lambda request, target, src, dst, data, req_id, ready_event=None, *, engine=None: captured.append(
             (request, target, src, dst, data, req_id, engine)
         )
         or True

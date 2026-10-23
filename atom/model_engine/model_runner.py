@@ -47,6 +47,7 @@ from atom.kv_transfer.disaggregation import (
     kv_config_has_producer,
 )
 from atom.metrics.gpu import GPUForwardMetrics, record_gpu_forward
+from atom.model_engine.compute_stream import high_priority_compute_stream_enabled
 from atom.model_engine.dynamic_chunking_worker import DynamicChunkingWorker
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.output_transfer import D2HQueue
@@ -982,6 +983,15 @@ class ModelRunner:
         setups that share the GPU with another process."""
         return 0
 
+    def _new_compute_priority_stream(self) -> torch.cuda.Stream:
+        """A new stream on this device at the priority the runner computes on.
+
+        One builder for every stream the runner computes on, so the decode
+        pool cannot drift from `_enter_compute_stream` in priority or device.
+        """
+        _, high = torch.cuda.Stream.priority_range()
+        return torch.cuda.Stream(self.device, priority=high)
+
     def _enter_compute_stream(self) -> torch.cuda.Stream | None:
         """Make a High-priority stream this thread's current stream.
 
@@ -991,22 +1001,18 @@ class ModelRunner:
         main branch instead of beside it. Only the stream a graph is launched
         from matters, not the one it was captured on, so making this the runner
         thread's current stream covers FULL, PIECEWISE and draft graphs.
+
+        `torch.cuda.set_stream` binds per thread, so this moves the runner
+        thread only. Another thread that enqueues work through
+        `torch.cuda.current_stream()` still sees the default stream and no
+        longer shares one with the forward, so anything that relied on that
+        implicit ordering has to wait on an event instead -- see the
+        KV-transfer send workers, which wait on the prefill's
+        `kv_cache_ready_event` before gathering state the forward writes.
         """
-        if not envs.ATOM_HIGH_PRIORITY_COMPUTE_STREAM:
+        if not high_priority_compute_stream_enabled(self.config):
             return None
-        if self.config.enable_tbo or self.config.enable_tbo_decode:
-            # UBatchWrapper computes on this stream, and a builder's
-            # tbo_comm_stream_priority (High on V4.1) puts comm ahead of the
-            # other ubatch's compute. ROCm has a single level above Normal, so
-            # a High compute stream would erase that ordering and share comm's
-            # queue pool.
-            logger.warning(
-                "ATOM_HIGH_PRIORITY_COMPUTE_STREAM is ignored with TBO enabled: "
-                "the compute stream would match the TBO comm stream's priority."
-            )
-            return None
-        _, high = torch.cuda.Stream.priority_range()
-        stream = torch.cuda.Stream(self.device, priority=high)
+        stream = self._new_compute_priority_stream()
         # Torch streams do not sync with the default stream; drain it first.
         torch.cuda.synchronize(self.device)
         torch.cuda.set_stream(stream)
@@ -4889,9 +4895,9 @@ class RapidServeModelRunner(ModelRunner):
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
         self._decode_streams[None] = (
-            torch.cuda.Stream(priority=self.compute_stream.priority)
+            self._new_compute_priority_stream()
             if self.compute_stream is not None
-            else torch.cuda.Stream()
+            else torch.cuda.Stream(self.device)
         )
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
