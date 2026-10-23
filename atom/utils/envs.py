@@ -720,6 +720,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with that many threads; set to 1 to fall back to the original sequential
     # per-expert path.
     "ATOM_LOADER_NUM_THREADS": lambda: int(os.getenv("ATOM_LOADER_NUM_THREADS", "16")),
+    # Tokens of prompt segments (the text between two added tokens) kept
+    # tokenized across requests, so a multi-turn conversation re-tokenizes only
+    # its new messages (`segment_tokenizer.SegmentTokenizer`); int32 ids, so
+    # the default is ~128 MB of host memory. 0 turns it off.
+    "ATOM_TOKENIZE_CACHE_TOKENS": lambda: int(
+        os.getenv("ATOM_TOKENIZE_CACHE_TOKENS", "32000000")
+    ),
     # Warm the page cache with a background sequential reader instead of
     # leaving it to demand faults through the mmap. Measured on a local NVMe:
     # the fault-driven pattern sustains 3.2 GB/s where the device does 6.9 and
