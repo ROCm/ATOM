@@ -1,0 +1,162 @@
+"""Bucketed BF16 weight broadcast over an isolated RCCL process group."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+import torch.distributed as dist
+
+_CMD_END = 0
+_CMD_BUCKET = 1
+_HEADER_WORDS = 4  # command, metadata bytes, payload bytes, version
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _missing_reloadable_names(
+    expected_names: set[str],
+    loaded_names: set[str],
+    *,
+    streamed_scales: bool = False,
+) -> list[str]:
+    """Return missing checkpoint weights, excluding generated/static parameters."""
+    from lumenrl.engine.inference.vllm_fp8_utils import (
+        TensorNameClass,
+        classify_tensor_name,
+    )
+
+    missing = expected_names - loaded_names
+    return sorted(
+        name
+        for name in missing
+        if classify_tensor_name(
+            name,
+            streamed_scales=streamed_scales,
+        )
+        is TensorNameClass.RELOADABLE
+    )
+
+
+def _encode_bucket(
+    weights: list[tuple[str, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not weights:
+        raise ValueError("cannot encode an empty weight bucket")
+    prepared: list[tuple[str, torch.Tensor]] = []
+    entries: list[dict[str, Any]] = []
+    offset = 0
+    for name, tensor in weights:
+        value = tensor.detach()
+        if not value.is_cuda:
+            value = value.to("cuda", non_blocking=True)
+        value = value.contiguous()
+        nbytes = _tensor_nbytes(value)
+        entries.append(
+            {
+                "name": name,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype).removeprefix("torch."),
+                "offset": offset,
+                "nbytes": nbytes,
+            }
+        )
+        prepared.append((name, value))
+        offset += nbytes
+
+    device = prepared[0][1].device
+    payload = torch.empty(offset, dtype=torch.uint8, device=device)
+    for entry, (_, value) in zip(entries, prepared):
+        start = int(entry["offset"])
+        end = start + int(entry["nbytes"])
+        payload[start:end].copy_(value.view(torch.uint8).reshape(-1))
+
+    raw_meta = json.dumps(entries, separators=(",", ":")).encode("utf-8")
+    metadata = torch.tensor(list(raw_meta), dtype=torch.uint8, device=device)
+    return metadata, payload
+
+
+def _broadcast_header(
+    group,
+    *,
+    device: torch.device,
+    command: int = 0,
+    metadata_bytes: int = 0,
+    payload_bytes: int = 0,
+    version: int = 0,
+) -> torch.Tensor:
+    header = torch.tensor(
+        [command, metadata_bytes, payload_bytes, version],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.broadcast(header, src=0, group=group)
+    return header
+
+
+@torch.no_grad()
+def send_weight_stream(
+    group,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    *,
+    bucket_size_bytes: int,
+    version: int,
+) -> dict[str, float]:
+    """Pack HF-named tensors into bounded GPU buckets and RCCL-broadcast them."""
+    if bucket_size_bytes <= 0:
+        raise ValueError("bucket_size_bytes must be positive")
+    device = torch.device("cuda", torch.cuda.current_device())
+    bucket: list[tuple[str, torch.Tensor]] = []
+    bucket_bytes = 0
+    total_bytes = 0
+    total_weights = 0
+    total_buckets = 0
+    started = time.perf_counter()
+
+    def flush() -> None:
+        nonlocal bucket, bucket_bytes, total_bytes, total_weights, total_buckets
+        if not bucket:
+            return
+        metadata, payload = _encode_bucket(bucket)
+        _broadcast_header(
+            group,
+            device=device,
+            command=_CMD_BUCKET,
+            metadata_bytes=metadata.numel(),
+            payload_bytes=payload.numel(),
+            version=version,
+        )
+        dist.broadcast(metadata, src=0, group=group)
+        dist.broadcast(payload, src=0, group=group)
+        total_bytes += payload.numel()
+        total_weights += len(bucket)
+        total_buckets += 1
+        bucket = []
+        bucket_bytes = 0
+
+    for name, tensor in weights:
+        nbytes = _tensor_nbytes(tensor)
+        if bucket and bucket_bytes + nbytes > bucket_size_bytes:
+            flush()
+        bucket.append((name, tensor))
+        bucket_bytes += nbytes
+        if bucket_bytes >= bucket_size_bytes:
+            flush()
+    flush()
+    _broadcast_header(group, device=device, command=_CMD_END, version=version)
+    torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    return {
+        "version": float(version),
+        "buckets": float(total_buckets),
+        "weights": float(total_weights),
+        "bytes": float(total_bytes),
+        "seconds": elapsed,
+        "gbps": (total_bytes * 8 / 1e9 / elapsed) if elapsed > 0 else 0.0,
+    }
