@@ -519,6 +519,27 @@ def test_turning_the_cache_off_releases_it(tok, monkeypatch):
     assert not seg._buckets
 
 
+def test_a_request_finishing_after_the_cache_turned_off_stores_nothing(tok):
+    """Another request turns the cache off (and clears it) while this one
+    encodes its missing segments; this one must not refill it."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    real_batch = seg._split.backend.encode_batch
+
+    def disabled_meanwhile(*a, **kw):
+        out = real_batch(*a, **kw)
+        with seg._lock:
+            seg.enabled = False
+            seg._lru.clear()
+            seg._buckets.clear()
+        return out
+
+    seg._split.backend = MagicMock(encode_batch=disabled_meanwhile)
+    p = _long_conversation(random.Random(28), 4) + "<|Assistant|>"
+    assert seg._encode_cached(p) == tok.encode(p)
+    assert not len(seg._lru) and seg._lru.bytes == 0 and not seg._buckets
+
+
 def test_trie_pattern_splits_like_a_flat_alternation():
     import re
 

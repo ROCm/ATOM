@@ -212,7 +212,9 @@ class SegmentTokenizer:
                 k: np.asarray(e.ids, dtype=np.int32) for k, e in zip(missing, encodings)
             }
             with self._lock:
-                for key, ids in fresh.items():
+                # Turned off (and cleared) while this request encoded: keep
+                # nothing, or it would be held with no reader.
+                for key, ids in fresh.items() if self.enabled else ():
                     # An empty encoding is not worth an entry.
                     if len(ids):
                         self._lru.put(key, ids, ids.nbytes)
@@ -315,6 +317,8 @@ class SegmentTokenizer:
         )
         bucket = hash(prompt[:_PREFIX_KEY_CHARS])
         with self._lock:
+            if not self.enabled:  # as for segments above
+                return
             pids = self._buckets.get(bucket, [])
             if replaces:
                 for pid in list(pids):
