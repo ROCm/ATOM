@@ -352,3 +352,33 @@ class TestKVOffloadEnv:
         )
         with pytest.raises(ValueError, match="ATOM_KV_OFFLOAD is off"):
             self._kv()
+
+
+class TestPrefillWorkspaceCli:
+    def _parse(self, argv):
+        parser = FlexibleArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        return EngineArgs.from_cli_args(parser.parse_args(argv))
+
+    def test_default_disabled(self):
+        args = self._parse([])
+        assert args.gqa_prefill_kv_workspace_mb == 0
+        assert args._get_engine_kwargs()["gqa_prefill_kv_workspace_mb"] == 0
+
+    @pytest.mark.parametrize("method", [None, "eagle3", "mtp"])
+    def test_budget_is_global_and_does_not_depend_on_drafter(self, method):
+        argv = ["--gqa-prefill-kv-workspace-mb", "8192"]
+        if method:
+            argv += ["--method", method, "--num-speculative-tokens", "3"]
+        if method == "eagle3":
+            argv += ["--draft-model", "test-draft"]
+        args = self._parse(argv)
+        with patch("atom.model_engine.arg_utils.SpeculativeConfig") as spec:
+            kwargs = args._get_engine_kwargs()
+        assert kwargs["gqa_prefill_kv_workspace_mb"] == 8192
+        if method:
+            assert "gqa_prefill_kv_workspace_mb" not in spec.call_args.kwargs
+
+    def test_rejects_fractional_mib(self):
+        with pytest.raises(SystemExit):
+            self._parse(["--gqa-prefill-kv-workspace-mb", "0.5"])
