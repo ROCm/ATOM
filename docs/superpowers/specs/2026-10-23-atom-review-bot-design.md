@@ -105,19 +105,66 @@ GitHub 也不发邮件，那台机器静默离线了数天）。
 **命名不沿用 `validate-kernel-pr`**：ATOM 验的不是 kernel，是端到端推理行为。
 名字错了会诱导后来者按 kernel 的思路加东西。
 
-### 3.2 命名空间
+### 3.2 命名与配置原则
+
+标识符改名：
 
 | aiter | ATOM |
 |---|---|
 | `@aiter-bot review` | `@atom-bot review` |
-| `AITER_*` 环境变量 | `ATOM_BOT_*` |
-| `AITER_BOT_TOKEN` | `ATOM_BOT_TOKEN` |
 | `.aiter-review-status` | `.atom-review-status` |
 | `<!-- aiter-bot review pr=N head=SHA -->` | `<!-- atom-bot review pr=N head=SHA -->` |
 
-环境变量前缀用 `ATOM_BOT_` 而非 `ATOM_`：ATOM 自身已大量使用 `ATOM_` 前缀的运行时
-环境变量（`ATOM_MOE_GU_ITLV` 等），bot 的配置混进同一命名空间会在 `atom/envs.py`
-的注册检查里制造噪声。
+### 配置分类原则
+
+aiter 有 15 个 `AITER_*` bot 配置变量（另 2 个 grep 命中是 aiter 自身的运行时宏，
+不属 bot 配置）。ATOM 不照单全收，按**三类三去处**重新归置：
+
+| 类别 | 去处 | 判据 | ATOM 的内容 |
+|---|---|---|---|
+| **秘密** | GitHub secrets → job env | 提交即泄露 | `ATOM_BOT_TOKEN` |
+| **机器事实** | runner `.env`，不进版本控制 | 值因机器而异，换台机器就得改 | agent 入口、refuter 入口、`TMPDIR`、`GH_CONFIG_DIR`、`PATH`、GPU 子集（§5.2） |
+| **策略** | **提交进仓库** | 对所有机器相同，且改动应当可审计 | 5 个 failure-class → owner 映射、3 个时间预算、探活超时 |
+
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_MODEL` / `TMPDIR` / `PATH` / `GH_CONFIG_DIR`
+的**名字**是 Anthropic SDK、POSIX、gh 的既定约定，不由本项目决定；
+它们的**值**是机器事实，归第二类。
+
+**可直接删除的 2 个**：`*_BOT_NAME` / `*_BOT_REPO`，均可从 `GITHUB_REPOSITORY` 推出。
+
+**时间预算必须提交，有一条硬理由**：`check_prompts.py` 中有断言要求
+`RUN_BUDGET < workflow 的 timeout-minutes`，而后者在版本控制里。一个**被提交的
+断言**约束着一个**没被提交的值**——这正是漂移的源头。两者一起提交，断言才有意义。
+
+ATOM 的预算值（aiter 对照：run budget 100 分钟 / job 120 分钟）：
+
+| 项 | ATOM | aiter | 说明 |
+|---|---|---|---|
+| `RUN_BUDGET` | **120 分钟** | 100 | 整轮 run，由 fetch / worker / refuter / validate 共享 |
+| workflow `timeout-minutes` | **150** | 120 | 必须严格大于上行，`check_prompts.py` 断言之 |
+| `AGENT_TIMEOUT` | 40 分钟 | 40 | 单次 agent 尝试；超时不重试 |
+
+ATOM 给到 2 小时而非 aiter 的 100 分钟，是因为 §6 的 validate 要在同一轮里起两次
+服务、跑两次 eval（见 §6.6）。留 30 分钟的 job 余量而非 aiter 的 20 分钟，
+同理——一个在 job 上限被硬杀的 run 死时没有任何分类状态，比超时更难排查。
+
+**owner 映射提交进仓库**（与 `authorized.txt` 同级）的权衡：aiter 把默认值写在
+`_notify.py` 里、用 repo var 作覆盖，好处是改 owner 不需要 committer 权限。
+ATOM 当前只有一名 owner，这个好处用不上，而"换 owner 是一个可审计的 PR 而非
+repo settings 里无人看见的一次修改"的好处是实的。若将来 on-call 轮转由非
+committer 调整，再加回覆盖通道。
+
+**曾经考虑并否决的方案**：把 GPU 子集也提交进仓库。用一个场景即可证伪——那将
+意味着**改我们自己这台机器用哪几张卡要发一个上游 PR**。GPU 子集是机器事实，
+与路径同类，归第二类。记录此否决，以免日后重提。
+
+**aiter 的问题不是"用了环境变量"，是把策略也放进了 `.env`。** 其
+RUNNER-SETUP.md 自己写了后果：
+
+> `.env` is not in version control -- so a value left here outlives the reason
+> it was added. Remove it once the default covers the case.
+
+与其事后清理，不如一开始就按类别放对地方。
 
 ## 4. 组件分类
 
@@ -157,15 +204,31 @@ ci_coverage / perf_claims 保留；新增 ATOM 特有的（cudagraph 捕获区�
 |---|---|---|
 | GPU | 8× MI308X gfx942 (DID 0x74a2) | 8× MI308X gfx942 (DID 0x74a2) |
 | GPU 占用 | **全满**：GLM-5.3 server 占 VRAM 98–99%，已运行两周 | **全空**：VRAM 0% |
-| review agent 模型 | 本地 GLM（`localhost:30000`），吃掉全部 8 卡 | `claude-glm` 走远程网关，不吃本机卡 |
+| review agent 模型 | 本地 GLM（`localhost:30000`），吃掉全部 8 卡 | 开发期走 AMD 网关（`claude-glm`），不吃本机卡 |
 | 盘 | `/mnt/raid0` 剩 9.4T | `/mnt/raid0` **100% 满**（剩 126G）；`/mnt/md0` 剩 9.6T |
 | 已有 runner | `/mnt/raid0/zufa/aiter-runner/actions-runner`（标签 `box308`） | 无 |
 | 共享性 | — | 多用户共享（ljin1 3.7T、yifehuan、anqfu、felix… 十余人） |
 
-**关键结论**：box308 把 8 张卡全部喂给了本地 GLM，一张不剩；srdc-24 的 review agent
-走远程网关，8 张卡全可留给端到端验证。所以开发阶段在 srdc-24 上做是对的，
-而且这个"模型后端放远程、GPU 留给验证"的安排必须写进 RUNNER-SETUP.md 当部署前提——
-否则下一个人照 box308 的样子装一遍，又会没有卡。
+### 5.1b 两阶段的模型后端，与由此而来的 GPU 账
+
+**开发期（srdc-24）**：review agent 走 AMD 网关（`claude-glm`）。本机 8 张卡全空，
+validate 不受影响。代价是网关配额——一次 review 要喂 SKILL.md 全文 +
+`rules_expanded.txt` + 完整 diff + 十余个 artifact，worker 与 refuter 各一轮且可重试，
+而网关限流为 2M uncached input token / 60s 并会发递增 Retry-After。
+**这是开发期风险，不是架构风险**：它影响迭代速度，不影响最终形态。
+P0 第一次真实 review 时应顺手记录 token 量，作为后续判断依据。
+
+**最终形态（box308）**：review agent 指向该机已在运行的 GLM-5.3
+（`localhost:30000`），零配额问题。
+
+**但由此产生一笔必须算清的 GPU 账**：box308 的 8 张卡正被那个 GLM 占死
+（VRAM 98–99%），而它同时是最终目标机。也就是说**最终形态下 validate 在 box308
+上没有卡可用**。这不是"以后再说"的问题，它决定 §6 的 validate 能不能在生产形态
+下成立。候选解见 §5.3，必须在 P3 之前定。
+
+设计约束（现在就要守住）：**不要写出任何假设"review 与 validate 必须同机"的代码**。
+`validate_pr.sh` 本就是独立可调用脚本，保持这一点，则"review 在 box308、validate
+在 srdc-24"始终是可选项。
 
 runner 装 `/mnt/md0`（剩 9.6T），不装 `/mnt/raid0`（已 100% 满）。
 RUNNER-SETUP 明确警告过根盘满会让 review 跑到一半失败。
@@ -272,7 +335,29 @@ delta 阈值**必须由实测决定，不得拍脑袋**。上线前先跑 N 次 
 验收标准：记录 N、每次的 delta、分布摘要，写入 `validate-atom-pr/SKILL.md`
 作为该阈值的依据，连同测定日期与所用 commit。
 
-### 6.5 报告行
+### 6.5 时长账 — 决定 validate 能否进 review job
+
+validate 不是跑个 pytest，而是起服务再打 eval，且 base / head 各来一遍：
+
+```
+base: 起服务 + 加载 8B 权重 + 200 题 GSM8K + 停服务
+head: 同上
+```
+
+两次模型加载 + 两次 eval，全部要塞进 §3.2 的 `RUN_BUDGET`（120 分钟），
+且与 fetch / worker / refuter 共享该预算。
+
+**这个数未实测。** 它决定 §6 的形态：
+
+- 若两轮总计可在约 60 分钟内完成 → validate 进 review job，卡上直接出
+  `Validation` 行（本设计的现有假设）。
+- 若超出 → 退回独立 job：review 卡先出，`@atom-bot validate` 另行触发，
+  结果事后补评论。
+
+**P2 的第一个动作就是实测这个数**，而不是先写接入代码。先写代码再发现塞不进，
+等于白写一轮接入逻辑。实测方法：在 srdc-24 上手工跑一遍完整的 base+head 流程并计时。
+
+### 6.6 报告行
 
 `Validation (deterministic)` 行照 aiter 的五态原样写：
 
@@ -290,6 +375,28 @@ delta 阈值**必须由实测决定，不得拍脑袋**。上线前先跑 N 次 
 ATOM 现有 582 行 SKILL.md 的规则没有真实 ATOM PR 编号作为证据
 （aiter 的 `rules.md` 每条规则都挂着真实 PR）。P1 的交付不是"把文件拆成两个"，
 而是"规则从真实 ATOM 评审历史里重新长一遍"。
+
+### 7.1b 语料：过去半年 ATOM 所有公开渠道的评论
+
+**取数范围**：近 6 个月（2026-04-23 起）ROCm/ATOM 的全部公开评论渠道——
+PR 顶层评论、PR inline review comments、review 正文、issue 评论。不设 reviewer
+白名单：外部协作者抓到的真问题与 maintainer 的同样算数；噪声在下一步筛掉。
+
+**排除**：机器人账号（copilot、各类 CI bot）的评论。
+
+**从评论到规则的路径**（三步，前两步可半自动，第三步必须人工）：
+
+1. **抽取**：按渠道拉全量评论，附带所在 PR 号、文件路径、改动类型。
+2. **聚类**：按"评论指向的缺陷类别"归并，而非按文字相似度。
+   一簇达到可辨认的规模即为候选 rule。
+3. **成文**：人工写 rule body，**必须挂至少一个真实 ATOM PR 编号作为证据**，
+   并指派给 `triage.py` 中某个 family。无 family 承载的 rule 永远不会被读到，
+   `triage.py expand` 对此会失败——这是 aiter 的既有约束，照搬。
+
+**验收**：每条新 rule 都能回答"若删掉它，什么样的真实 ATOM PR 会漏检"，
+并给出那个 PR 的编号。答不出的不收——这条判据借自 sglang 的
+`unit-test-admission.md`（"what future diff would turn this case red?
+If the only answer is editing the test itself, delete it"）。
 
 ### 7.2 候选 family
 
@@ -329,6 +436,32 @@ ATOM 的 `derive()` 必须做等价标定，拿真实 ATOM PR 历史跑：
 条件性内容进 `rules.md` 经 `triage.py expand` 到达评审者；
 可执行内容进脚本被调用。提高预算必须在 commit message 里说明理由。
 
+## 7.5 与 ATOM 现有 CI 的关系：各走各的专用 lane
+
+ATOM 现有 `atom-test.yaml` 在 PR 上会跑 accuracy matrix（`ci-gate` 之后），
+与 bot 的 validate 跑的是同一套 GSM8K。不理清关系会出三个问题：重复跑、
+结论冲突、抢同一批 runner。
+
+照 aiter 的做法：**bot 自带专用 CI，与仓库主 CI 完全分离**。
+aiter 有 `.github/workflows/review-bot-selftest.yml`，只负责守 bot 自己的代码。
+
+ATOM 对应地建 `.github/workflows/atom-review-bot-selftest.yml`：
+
+- **触发**：仅当 `.claude/skills/review-pr/**` 或
+  `.claude/skills/validate-atom-pr/**` 变化时。
+- **内容**：`selftest.sh`（守 `run_one.sh` 的各道 guard）+ `check_prompts.py`
+  （prompt 与 SKILL.md 的漂移）+ `triage.py mapping` 与 `MAPPING.md` 的一致性
+  + `triage.py` 的单元测试。
+- **跑在哪**：`ubuntu-latest`。全是纯逻辑检查，不需要 GPU、不碰自建机。
+
+三个问题的答案：
+
+| 问题 | 答案 |
+|---|---|
+| 重复跑？ | 不重复。主 CI 的 accuracy 是**跨 PR 的回归门禁**（绝对分 vs catalog baseline）；bot 的 validate 是**单 PR 的 base/head 配对比较**（delta）。量的是两件事。 |
+| 结论冲突听谁的？ | **主 CI**。它是 merge 门禁，样本量完整；bot 的 validate 是 advisory 证据，样本量小。冲突时卡上如实并列两者，不替人类做裁决。 |
+| 抢 runner？ | 不抢。主 CI 跑在 ROCm/ATOM 的 org runner（`linux-atom-do-mi350x-8` 等）；bot 跑在自带标签的专用 runner（`atom-bot-24`）。标签不重叠是硬要求（§8 P0）。 |
+
 ## 8. 分期与验收
 
 ### P0 — 链路跑通（srdc-24 + zufayu/ATOM fork）
@@ -339,10 +472,32 @@ ATOM 的 `derive()` 必须做等价标定，拿真实 ATOM PR 历史跑：
    标签：`atom-bot-24`（**不复用 `box308`**，否则 job 会被 aiter 的 runner 抢走）。
 2. 移植 §4.1 的 1200 行，改名。
 3. `atom-review-bot.yml` 四个 job。
-4. 在 fork 上造 PR，跑通 `@atom-bot review` 端到端。
+4. 在 fork 上造 PR，跑通评审链路至产出评审卡。
 
-**验收**：fork PR 上出现 atom-bot 发的评审卡；`preflight.sh` 全绿；
-`selftest.sh` 通过。
+**验收**：`card.md` 产出且 7 道 gate 全绿；`preflight.sh` 全绿；`selftest.sh` 通过。
+
+**注意验收标准不是"PR 上出现评论"**。bot 账号的 PAT 尚未发放，而 token 在 aiter
+那套里**只被发布链路用到** —— claim 👀、`_publish.py`、`_notify.py`、
+`queue_gate.py`、`watchdog.py`、`lost_review.py`。评审本身
+（fetch → worker → refuter → gates → collect）一行 token 都不用，而且是**故意的**：
+review step 跑的是 `--dangerously-skip-permissions` 的 headless agent、处理不可信的
+PR 内容，aiter 专门把 token 挡在那一步之外。
+
+因此无 token 不阻塞 P0，只需把验收落在评审质量上。相应降级：
+
+- `_publish.py` **默认即 dry-run**（其 docstring: *"Dry-run by default; --post
+  actually posts"*），不传 `--post` 正是所需形态。
+- claim 👀 步骤在无 token 时跳过。
+- `_notify.py` 无 token 时返回 0 且不发帖；`report` job 本就是为"review 说了但没
+  说出口"兜底而存在，该路径已有设计。
+
+### P0.5 — 发布链路（拿到 bot token 当天）
+
+配 `ATOM_BOT_TOKEN` secret，给 `_publish.py` 加 `--post`，恢复 claim 👀。
+
+**验收**：fork PR 上出现 atom-bot 发的评审卡；同一 head SHA 重复触发被去重。
+
+这样拆的收益是**评审质量与发布权限解耦**：前者不等 token 即可做完做透。
 
 ### P1 — skill 升级（重点）
 
@@ -376,7 +531,11 @@ ATOM 的 `derive()` 必须做等价标定，拿真实 ATOM PR 历史跑：
 | 项 | 状态 |
 |---|---|
 | 默认 GPU 子集 `6,7` 是否与同事冲突 | **待确认**：srdc-24 上是否有卡已被口头认领 |
-| box308 的 GPU 占用 | 已知，P3 解决，本期只留接口 |
+| atom-bot 账号 PAT | **待发放**。不阻塞 P0（评审链路不用 token），发布链路拆为 P0.5 |
+| box308 的 GPU 占用 | **已升级为必答项**：box308 既是最终目标机、其 8 卡又被 GLM-5.3 占死，故最终形态下 validate 无卡。P3 前必须在 §5.3 三个候选里选定 |
+| 开发期网关配额 | AMD 网关 2M uncached input token/60s。仅影响开发迭代速度，不影响最终形态（box308 用本地 GLM）。P0 首次真实 review 时记录 token 量 |
+| validate 两轮总时长 | **未实测**，决定 §6 能否进 review job。P2 的第一个动作就是实测（§6.5） |
+| ROCm/ATOM maintainer 是否接受自建机 workflow | 未确认。最便宜的信息源是问 aiter 当初怎么过的 |
 | refuter 跨家族 | aiter 自己承认 worker/refuter 同为 GLM 时对抗性偏弱；ATOM 新建时应一开始就把 refuter 指向 Opus（`ATOM_BOT_REFUTER_AGENT`） |
 | `authorized.txt` roster | 待定，P3 |
 | ROCm/ATOM repo admin 权限 | 待确认，P3 阻塞项 |
