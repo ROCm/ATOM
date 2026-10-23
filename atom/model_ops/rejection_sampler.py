@@ -79,7 +79,11 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 # TP rank draws the same uniforms. The key's high word names the purpose --
 # 0 is the draft's noise (`dspark_markov_sample`), and the two below are the
 # accept coins and the residual race -- so no two consumers can ever share a
-# stream, whatever their step counters do.
+# stream, whatever their step counters do. That holds for 64-bit offsets too:
+# `tl.rand` goes through `randint4x`, which always splits the offset into two
+# 32-bit Philox counters, so `philox` keeps the seed's high word as the second
+# key word (only a direct 64-bit-counter `philox` call would drop it). Pinned by
+# `test_the_key_purpose_word_separates_streams_at_any_offset_width`.
 _RATIO_ACCEPT_KEY = 1 << 32
 _RATIO_RESIDUAL_KEY = 2 << 32
 

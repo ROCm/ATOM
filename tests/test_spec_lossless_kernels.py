@@ -409,6 +409,38 @@ def test_q_is_read_through_the_row_base_not_the_batch_position():
     assert torch.equal(out, flat_out) and torch.equal(verdict, flat_verdict)
 
 
+@triton.jit
+def _uniforms(out_ptr, seed, base, WIDE: tl.constexpr, N: tl.constexpr):
+    offs = tl.arange(0, N)
+    if WIDE:
+        u = tl.rand(seed, base + offs.to(tl.int64))
+    else:
+        u = tl.rand(seed, offs)
+    tl.store(out_ptr + offs, u)
+
+
+@pytest.mark.parametrize("wide", [False, True], ids=["int32-offset", "int64-offset"])
+def test_the_key_purpose_word_separates_streams_at_any_offset_width(wide):
+    """Draft noise, accept coins and residual race differ only in the key's
+    high word (0, 1, 2); that word must reach Philox whether the offset is
+    32-bit (the coins) or 64-bit (the draft noise and the residual race)."""
+    from atom.model_ops.rejection_sampler import (
+        _RATIO_ACCEPT_KEY,
+        _RATIO_RESIDUAL_KEY,
+    )
+
+    step, n = 12345, 1024
+    base = 5 * 2**31 if wide else 0
+    streams = []
+    for purpose in (0, _RATIO_ACCEPT_KEY, _RATIO_RESIDUAL_KEY):
+        out = torch.empty(n, device=DEV)
+        _uniforms[(1,)](out, purpose | step, base, WIDE=wide, N=n)
+        streams.append(out)
+    for i in range(3):
+        for j in range(i + 1, 3):
+            assert not torch.equal(streams[i], streams[j]), (i, j)
+
+
 def test_the_same_key_gives_the_same_verdict():
     """What keeps TP ranks in agreement without exchanging coins."""
     torch.manual_seed(37)
