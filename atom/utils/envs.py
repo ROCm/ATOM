@@ -277,6 +277,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # moe_gemm_a16w4 / a4w4 / a8w4 path. Defaults to on for gfx94x, and for
     # gfx95x when ATOM_USE_TRITON_GEMM is set.
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Experimental AITER MegaMoeTP (ROCm/aiter#6514) for native M3 SP4/TP1.
+    "ATOM_SP_MOE_MEGA": lambda: os.getenv("ATOM_SP_MOE_MEGA", "0") == "1",
+    "ATOM_SP_MOE_MEGA_COMM_DTYPE": lambda: os.getenv(
+        "ATOM_SP_MOE_MEGA_COMM_DTYPE", "fp8"
+    ),
     # Split the routed experts by phase: FlyDSL fused_moe on prefill, the Triton
     # /gluon GUGU kernel on decode. Needs ATOM_USE_TRITON_MOE=1 (it narrows that
     # flag, it cannot enable Triton on its own) plus gfx1250 + ATOM_MOE_GU_ITLV=1
@@ -534,6 +539,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of the step (mono/runner.py finish_step) instead of the GPU hanging. Use
     # with --enforce-eager.
     "ATOM_MONO_DEBUG": lambda: os.getenv("ATOM_MONO_DEBUG", "0") == "1",
+    # Experimental TP4 QKV + replicated o_proj layout (native M3, SP1).
+    "ATOM_M3_TP_REPLICATED_O_PROJ": lambda: (
+        os.getenv("ATOM_M3_TP_REPLICATED_O_PROJ", "0") == "1"
+    ),
     # DeepSeek-V4.1: how many of an attention layer's branches leave the main
     # stream. 0 none; 1 the compressor, on the MoE's `alt_stream`, waited at
     # the scorer that first reads it; 2 the indexer as well, on one of its own.

@@ -1986,6 +1986,12 @@ class Config:
     dcp_config: DCPConfig = field(default_factory=DCPConfig)
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    # Ulysses shards tokens and exchanges them for heads around attention.
+    # Its workers use the PCP rank dimension.
+    sequence_parallel_size: int = 1
+    # Snapshot the experimental layout once and propagate it to all workers.
+    m3_tp_replicated_o_proj: bool = field(init=False, default=False)
+    sp_mega_moe_enabled: bool = field(init=False, default=False)
     enforce_eager: bool = False
     # Number of vocabulary positions that carry a real token. A checkpoint
     # whose embedding matrix is padded up to a friendlier width -- Qwen3 rounds
@@ -2159,7 +2165,120 @@ class Config:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
 
+    def _init_sequence_parallel(self) -> None:
+        """Validate Ulysses SP and assign its workers to the PCP dimension."""
+        sp = self.sequence_parallel_size
+        if self.parallel_config.data_parallel_size != 1:
+            raise ValueError(
+                "Ulysses SP currently requires data_parallel_size=1: the DP "
+                "MoE forward path does not gather/scatter SP token shards."
+            )
+        if self.tensor_parallel_size != 1:
+            raise ValueError(
+                f"--sequence-parallel-size {sp} requires --tensor-parallel-size 1: "
+                "Ulysses SP requires unsharded attention projections."
+            )
+        if self.prefill_context_parallel_size not in (1, sp):
+            raise ValueError(
+                "--sequence-parallel-size and --prefill-context-parallel-size "
+                "both claim the same rank dimension; set only one."
+            )
+        if self.enable_tbo or self.enable_tbo_decode:
+            raise ValueError("Ulysses SP does not support TBO token slicing.")
+        if self.speculative_config is not None:
+            raise ValueError(
+                "Ulysses SP does not support speculative decoding: draft model "
+                "inputs and auxiliary hidden states are not sequence-sharded."
+            )
+        # Local import: atom.utils pulls in atom.config at module scope.
+        from atom.utils import get_hf_text_config
+        from atom.utils.selector import Family, attn_family
+
+        hf_text = get_hf_text_config(self.hf_config)
+        if attn_family(hf_text) is not Family.MHA:
+            raise ValueError(
+                "Ulysses SP supports MHA models only; MLA and recurrent "
+                "attention do not exchange SP token shards."
+            )
+        for name in ("num_attention_heads", "num_key_value_heads"):
+            heads = getattr(hf_text, name, None)
+            if heads is None:
+                continue
+            valid = heads % sp == 0
+            if name == "num_key_value_heads" and heads < sp:
+                valid = sp % heads == 0
+            if not valid:
+                raise ValueError(
+                    f"--sequence-parallel-size {sp} is incompatible with "
+                    f"{name} ({heads}): heads must divide evenly across ranks, "
+                    "or KV heads must replicate evenly to query-head owners."
+                )
+        self.prefill_context_parallel_size = sp
+
+    def _validate_m3_tp_replicated_o_proj(self) -> None:
+        if not self.m3_tp_replicated_o_proj:
+            return
+        text = getattr(self.hf_config, "text_config", self.hf_config)
+        architectures = getattr(self.hf_config, "architectures", None) or ()
+        if is_plugin_mode() or not any(
+            arch
+            in (
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            )
+            for arch in architectures
+        ):
+            raise ValueError("ATOM_M3_TP_REPLICATED_O_PROJ requires native MiniMax-M3.")
+        if (
+            self.tensor_parallel_size != 4
+            or self.sequence_parallel_size != 1
+            or self.prefill_context_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.pipeline_parallel_size != 1
+            or self.parallel_config.data_parallel_size != 1
+            or self.enable_dp_attention
+            or self.dp_logical_size > 1
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ requires TP4, SP1, PCP1, DCP1, "
+                "PP1 and DP1 without DP attention."
+            )
+        if (
+            self.enable_expert_parallel
+            or self.moe_all2all_backend not in ("auto", "none")
+            or self.moe_backend != "standard"
+            or self.fake_eplb
+            or self.enable_tbo
+            or self.enable_tbo_decode
+            or self.speculative_config is not None
+            or self.dcp_config.indexer_dcp_only
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ does not support EP, routed MoE "
+                "all2all, fake EPLB, TBO, speculative decoding or indexer CP."
+            )
+        if (
+            self.torch_dtype != torch.bfloat16
+            or getattr(text, "hidden_size", None) != 6144
+            or getattr(text, "num_attention_heads", None) != 64
+            or getattr(text, "num_key_value_heads", None) != 4
+            or getattr(text, "head_dim", None) != 128
+        ):
+            raise ValueError(
+                "ATOM_M3_TP_REPLICATED_O_PROJ requires BF16 M3 activations, "
+                "hidden_size=6144, 64 query heads and 4 KV heads of dimension 128."
+            )
+        logger.info(
+            "Experimental M3 TP4 replicated o_proj enabled: TP QKV, output head "
+            "exchange, local FFN input, and owner-attention addition before TP "
+            "all-reduce. The accumulated residual stays outside QuickReduce."
+        )
+
     def __post_init__(self):
+        self.m3_tp_replicated_o_proj = envs.ATOM_M3_TP_REPLICATED_O_PROJ
+        self.sp_mega_moe_enabled = envs.ATOM_SP_MOE_MEGA
+        if self.sequence_parallel_size < 1:
+            raise ValueError("sequence_parallel_size must be at least 1")
         self.moe_all2all_backend = (
             str(self.moe_all2all_backend or "auto").strip().lower()
         )
@@ -2335,6 +2454,8 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        if self.sequence_parallel_size > 1:
+            self._init_sequence_parallel()
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:
@@ -2669,6 +2790,8 @@ class Config:
 
             self.state_replay_tokens = state_replay_tokens(self)
 
+        self._validate_m3_tp_replicated_o_proj()
+
     def _resolve_dynamic_chunking(self) -> None:
         """Validate dynamic chunking, or turn it off where it cannot size a chunk.
 
@@ -2746,6 +2869,18 @@ class Config:
         # runtime — the same stale-artifact hazard documented for the vocab-embed
         # flag below.
         factors.append(self.prefill_context_parallel_size)
+        # SP and PCP use the same rank dimension but different head shapes.
+        factors.append(self.sequence_parallel_size)
+        if getattr(self, "m3_tp_replicated_o_proj", False):
+            factors.append("m3_tp_replicated_o_proj_v2")
+        if getattr(self, "sp_mega_moe_enabled", False):
+            # This changes the decoder graph, including the next input norm
+            # and final norm. Never load a native SP artifact for this region.
+            factors.append("sp_mega_moe_full_fusion_v1")
+        # Expert layout and transport also change compiled shapes/subgraphs.
+        factors.append(
+            (self.enable_expert_parallel, self.moe_all2all_backend, self.moe_backend)
+        )
         # MiniMax-M3 indexer-only CP changes the FUSED QKV OUTPUT WIDTH: index_q
         # is this rank's one head under TP and all `sparse_num_index_heads` of
         # them under CP (minimax_m3/model.py, linear.py), so the traced graph and the
