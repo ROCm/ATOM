@@ -261,9 +261,13 @@ class DSparkProposer(Drafter):
     def kv_budget_reserve_bytes(self) -> int:
         """Per-step scratch the sampled draft and the ratio verify allocate.
 
-        Neither runs in the profiling forward (warmup is an all-greedy prefill),
-        so the allocator's peak never sees them. Both are bounded by the batch
-        and vocab tiling; see the two ops for the shapes.
+        The ratio verify never runs in the profiling forward (a prefill
+        verifies nothing), so the allocator's peak never sees its scratch. The
+        sampled draft does run there -- warmup's propose takes the lossless
+        branch -- but at warmup's batch, ``min(warmup tokens // max_model_len,
+        max_num_seqs)`` sequences, not at ``max_num_seqs``; it is reserved at
+        full size here, which double-counts the part warmup measured. Both are
+        bounded by the batch and vocab tiling; see the two ops for the shapes.
         """
         if self.draft_sampling is None:
             return 0
