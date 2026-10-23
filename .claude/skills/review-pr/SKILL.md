@@ -167,7 +167,7 @@ Backbone files ranked by git commit frequency (2025–2026) and blast radius:
 | **2** | `atom/model_ops/linear.py` | 49 | All linear layers (every model) | Wrong GEMM dispatch, wrong quant |
 | **2** | `atom/model_ops/attention_mha.py` | 46 | All MHA models | Wrong attention output |
 | **2** | `atom/model_ops/layernorm.py` | 32 | Norm + quant fusion path | Wrong scale, wrong dtype |
-| **2** | `atom/models/deepseek_v4.py` | 34 | DSv4 / Kimi-K2.5 specific | Wrong sparse MLA, SWA layout break |
+| **2** | `atom/models/deepseek_v4/__init__.py` | 34 | DSv4 / Kimi-K2.5 specific | Wrong sparse MLA, SWA layout break |
 
 
 **Tier-1 special rule**: When `model_runner.py` or `config.py` is touched, ask: does the change

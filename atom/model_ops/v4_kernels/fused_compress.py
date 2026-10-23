@@ -4,7 +4,7 @@
 """Fused Compressor boundary kernel for V4 attention (CSA / sparse_attn path).
 
 Replaces the Python pool → RMSNorm → RoPE → (quant) → kv_cache scatter
-chain in `Compressor.forward` (see `atom/models/deepseek_v4.py`).
+chain in `Compressor.forward` (see `atom/models/deepseek_v4/__init__.py`).
 
 SGLang plan-style batched dispatch (vs. the earlier per-seq launcher):
   Each compression boundary across the entire fwd is one row in

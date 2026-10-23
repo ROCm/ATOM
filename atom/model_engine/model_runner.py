@@ -152,6 +152,9 @@ support_model_arch_dict = {
 # metadata builder before they are bound. Architectures not listed here route
 # mono decode inside their own model class instead.
 mono_decode_installers = {
+    "DeepseekV4ForCausalLM": (
+        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
+    ),
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),

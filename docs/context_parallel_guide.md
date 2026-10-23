@@ -224,7 +224,7 @@ PCP + TBO **prefill** is supported only with `ATOM_PCP_MOE_MERGE=1` **and
 | `atom/model_engine/arg_utils.py` | `--prefill-context-parallel-size`, `--enable-tbo` CLI |
 | `atom/utils/envs.py` | `ATOM_PCP_MOE_MERGE` |
 | `atom/distributed/pcp_utils.py` | PCP communication and helper primitives |
-| `atom/models/deepseek_v4.py` | DeepSeek-V4 PCP forward path and MoE handling |
+| `atom/models/deepseek_v4/__init__.py` | DeepSeek-V4 PCP forward path and MoE handling |
 | `atom/model_ops/attentions/deepseek_v4_attn.py` | PCP attention metadata (incl. PCP + TBO prefill) |
 | `atom/model_engine/model_runner.py` | PCP token split and PCP + TBO grouping |
 | `atom/model_engine/llm_engine.py` | PCP / TBO / DP-attention validation |
