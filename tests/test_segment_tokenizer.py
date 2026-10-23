@@ -437,5 +437,22 @@ def test_prefix_reuse_is_off_when_a_raw_token_overlaps_a_normalized_ones_end():
     assert seg._encode_segments(p + "c") == tok.encode(p + "c")
 
 
+def test_a_prompt_spelling_a_whole_added_token_is_still_split():
+    """The raw pass must extract a non-normalized token from a prompt that
+    happens to equal a longer normalized token's spelling."""
+    long_tok = "x" * 200 + "<|raw|>"
+    tok = _tokenizer_with(
+        [
+            AddedToken("<|raw|>", special=True, normalized=False),
+            AddedToken(long_tok, normalized=True),
+        ]
+    )
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    assert seg is not None
+    seg._verified = seg_mod._VERIFY_FIRST
+    for prompt in (long_tok, "y" + long_tok, long_tok + "z"):
+        assert seg._encode_segments(prompt) == tok.encode(prompt), prompt[-20:]
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16

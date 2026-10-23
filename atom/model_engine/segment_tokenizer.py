@@ -259,25 +259,33 @@ class SegmentTokenizer:
         # Turned off while this request encoded: its ids are unchecked.
         return ids if enabled else self._tokenizer.encode(prompt)
 
-    def _parts(self, prompt: str) -> list[str]:
-        parts = [prompt]
+    def _parts(self, prompt: str) -> list[tuple[str, bool]]:
+        """`prompt` as `(text, is_added_token)` pieces, in the backend's order:
+        non-normalized added tokens out of the raw text, then normalized ones
+        out of what is left. Whether a piece was extracted is tracked, not
+        inferred from its spelling: text that happens to spell an added token
+        (the whole prompt, say) is still split by the passes."""
+        parts = [(prompt, False)]
         for pattern in (self._split_raw, self._split_normalized):
             if pattern is None:
                 continue
             nxt = []
-            for part in parts:
-                if part in self._added:
-                    nxt.append(part)
-                else:
-                    nxt.extend(p for p in pattern.split(part) if p)
+            for text, extracted in parts:
+                if extracted:
+                    nxt.append((text, True))
+                    continue
+                # A capturing split alternates text and matches.
+                for i, piece in enumerate(pattern.split(text)):
+                    if piece:
+                        nxt.append((piece, i % 2 == 1))
             parts = nxt
         return parts
 
     def _join(self, prompt: str) -> list[int]:
         """Segment-wise encoding without the cache (startup probe)."""
         out = list(self._head)
-        for part in self._parts(prompt):
-            if part in self._added:
+        for part, extracted in self._parts(prompt):
+            if extracted:
                 out.append(self._added[part])
             else:
                 out.extend(self._backend.encode(part, add_special_tokens=False).ids)
@@ -384,8 +392,8 @@ class SegmentTokenizer:
         # request may evict them while this one encodes its missing segments.
         found: dict[bytes, np.ndarray] = {}
         with self._lock:
-            for part in parts:
-                if part in self._added:
+            for part, extracted in parts:
+                if extracted:
                     keys.append(None)
                     continue
                 key = hashlib.blake2b(part.encode(), digest_size=16).digest()
@@ -415,7 +423,7 @@ class SegmentTokenizer:
                     self._cache[key] = ids
                     self._cached_tokens += len(ids)
             chars = start
-            for part, key in zip(parts, keys):
+            for (part, _), key in zip(parts, keys):
                 chars += len(part)
                 if key is None:
                     out.append(self._added[part])
