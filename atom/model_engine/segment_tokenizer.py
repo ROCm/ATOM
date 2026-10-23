@@ -11,7 +11,7 @@ in order:
    prompt (bucketed by its first characters) reuses those ids up to the last
    added token both share -- a turn's generation prompt is rewritten once it
    is answered, so the shared part usually ends a little before the stored
-   one.
+   one, and the later prompt then replaces it.
 2. Everything else, split at added tokens (`segment_split`): each text
    segment's ids are cached by content, and missing ones are encoded in one
    parallel batch. This also serves edits in the middle, shared system
@@ -51,8 +51,11 @@ _MIN_CACHED_CHARS = 100_000
 # Leading characters that bucket a conversation's stored prompt: long enough
 # to take in its first messages; a full comparison settles each candidate.
 _PREFIX_KEY_CHARS = 16_384
-# Stored prompts per bucket (forks of one conversation, look-alike starts).
-_PREFIX_BUCKET = 8
+# Stored prompts per bucket. Agentic conversations share a long system prompt
+# and tool list, so a bucket holds every concurrent conversation of a
+# deployment; a lookup's cost per other conversation is comparing about that
+# shared start.
+_PREFIX_BUCKET = 256
 # Characters compared per step when looking for where two prompts diverge.
 _COMPARE_CHUNK = 1 << 16
 
@@ -70,11 +73,15 @@ class _Prefix(NamedTuple):
 
     @property
     def payload_bytes(self) -> int:
+        # The arrays own their data, so getsizeof counts header and data; the
+        # tuple itself and its `len_chars` int are retained too.
         return (
-            sys.getsizeof(self.text)
-            + self.ids.nbytes
-            + self.cut_chars.nbytes
-            + self.cut_ids.nbytes
+            sys.getsizeof(self)
+            + sys.getsizeof(self.len_chars)
+            + sys.getsizeof(self.text)
+            + sys.getsizeof(self.ids)
+            + sys.getsizeof(self.cut_chars)
+            + sys.getsizeof(self.cut_ids)
         )
 
 
@@ -158,6 +165,10 @@ class SegmentTokenizer:
                             "encoder; turning the cache off"
                         )
                     self.enabled = False
+                    # Nothing reads the cache any more; release it. Requests
+                    # in flight keep their own references.
+                    self._lru.clear()
+                    self._buckets.clear()
                 elif self.enabled:
                     self._verified += 1
             return ref
@@ -230,7 +241,9 @@ class SegmentTokenizer:
         body = np.concatenate(chunks)
         out = body.tolist()
 
-        if new_cut_chars or base is not None:
+        # With no added token past the reused cut, the new entry would be a
+        # part of `base`, which already serves it.
+        if new_cut_chars:
             self._store_prefix(prompt, body, base, k, new_cut_chars, new_cut_ids)
         fresh_ids = sum(len(v) for v in fresh.values())
         self._count(len(out) - fresh_ids, fresh_ids, time.perf_counter() - t0, base)
@@ -242,22 +255,28 @@ class SegmentTokenizer:
         if not self._prefix_ok or len(prompt) <= _PREFIX_KEY_CHARS:
             return None, -1
         bucket = hash(prompt[:_PREFIX_KEY_CHARS])
+        # Peek: only the entry used is made recent, not every candidate.
         with self._lock:
             entries = [
-                e
-                for e in (
-                    self._lru.get(("p", pid)) for pid in self._buckets.get(bucket, ())
+                (pid, e)
+                for pid, e in (
+                    (pid, self._lru.peek(("p", pid)))
+                    for pid in self._buckets.get(bucket, ())
                 )
                 if e is not None
             ]
-        best, best_k, best_chars = None, -1, 0
-        for entry in entries:
+        best, best_pid, best_k, best_chars = None, None, -1, 0
+        for pid, entry in entries:
             shared = _shared_chars(
                 prompt, entry.text, min(len(prompt), entry.len_chars)
             )
             k = int(np.searchsorted(entry.cut_chars, shared, side="right")) - 1
             if k >= 0 and entry.cut_chars[k] > best_chars:
-                best, best_k, best_chars = entry, k, int(entry.cut_chars[k])
+                best, best_pid, best_k = entry, pid, k
+                best_chars = int(entry.cut_chars[k])
+        if best is not None:
+            with self._lock:
+                self._lru.get(("p", best_pid))
         return best, best_k
 
     def _store_prefix(self, prompt, body, base, k, new_cut_chars, new_cut_ids):
@@ -286,13 +305,20 @@ class SegmentTokenizer:
             cut_chars,
             cut_ids,
         )
-        extends = base is not None and k == len(base.cut_chars) - 1
+        # The new prompt supersedes `base` when what it does not share of
+        # `base` is added tokens only, no text: the previous turn's generation
+        # prompt, which the template rewrites once the turn is answered
+        # (DeepSeek-V4.1 thinking mode turns `<think>` into `</think>`).
+        # Text there is another conversation or a fork, kept beside it.
+        replaces = base is not None and int(base.cut_ids[-1] - base.cut_ids[k]) == (
+            len(base.cut_ids) - 1 - k
+        )
         bucket = hash(prompt[:_PREFIX_KEY_CHARS])
         with self._lock:
             pids = self._buckets.get(bucket, [])
-            if extends:
+            if replaces:
                 for pid in list(pids):
-                    if self._lru.get(("p", pid)) is base:
+                    if self._lru.peek(("p", pid)) is base:
                         self._lru.pop(("p", pid))
                         pids.remove(pid)
             pid = self._next_prefix

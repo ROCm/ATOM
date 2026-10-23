@@ -19,13 +19,48 @@ import re
 
 import numpy as np
 
+_END = ""  # marks a token's end in the trie; never a character
+
 
 def _alternation(tokens):
-    """A capturing leftmost-longest pattern for `tokens`, or None."""
-    tokens = sorted(tokens, key=len, reverse=True)
-    if not tokens:
+    """A capturing leftmost-longest pattern for `tokens`, or None.
+
+    Built from a trie of the tokens rather than one alternative per token:
+    a flat alternation of a thousand literals sharing a first character (a
+    tokenizer's `<|...|>` family) retries every literal at each such
+    character of the text, which made splitting slower than encoding."""
+    trie: dict = {}
+    for t in set(tokens):
+        node = trie
+        for ch in t:
+            node = node.setdefault(ch, {})
+        node[_END] = None
+    if not trie:
         return None
-    return re.compile("(" + "|".join(re.escape(t) for t in tokens) + ")")
+    return re.compile("(" + _trie_pattern(trie) + ")")
+
+
+def _trie_pattern(node: dict) -> str:
+    """The continuations below `node`. The children start with different
+    characters, so at most one can match, and a token ending at `node` is
+    taken only when no longer one matches: leftmost-longest, as before."""
+    alts = []
+    for ch, child in node.items():
+        if ch == _END:
+            continue
+        run = [ch]
+        # A chain of single children is one literal (also keeps the
+        # recursion shallow for very long tokens).
+        while _END not in child and len(child) == 1:
+            ((ch, child),) = child.items()
+            run.append(ch)
+        alts.append(re.escape("".join(run)) + _trie_pattern(child))
+    if not alts:
+        return ""
+    if len(alts) == 1:
+        return f"(?:{alts[0]})?" if _END in node else alts[0]
+    body = "(?:" + "|".join(alts) + ")"
+    return body + "?" if _END in node else body
 
 
 def _offset_sensitive(pre_tokenizer) -> bool:

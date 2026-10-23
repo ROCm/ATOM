@@ -32,6 +32,11 @@ class ByteLRU:
     def __contains__(self, key: Hashable) -> bool:
         return key in self._items
 
+    def peek(self, key: Hashable):
+        """The value for `key`, or None, leaving its recency alone."""
+        item = self._items.get(key)
+        return None if item is None else item[0]
+
     def get(self, key: Hashable):
         """The value for `key` (now most recently used), or None."""
         item = self._items.get(key)

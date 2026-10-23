@@ -20,7 +20,7 @@ from tokenizers import (
 from atom.model_engine import segment_tokenizer as seg_mod
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 
-SPECIALS = ["<|begin|>", "<|User|>", "<|Assistant|>", "<|end|>"]
+SPECIALS = ["<|begin|>", "<|User|>", "<|Assistant|>", "<|end|>", "<think>", "</think>"]
 WORDS = [
     "alpha",
     "beta",
@@ -398,6 +398,149 @@ def test_conversations_sharing_a_start_are_kept_apart_and_exact(tok):
     assert len(_stored(seg)) == 2
 
 
+def _covered_of_previous_turn(seg, prompts):
+    """Per later prompt: how many characters of the same conversation's
+    previous prompt the prefix level did not reuse."""
+    real = seg._find_prefix
+    covered = []
+
+    def find(p):
+        base, k = real(p)
+        covered.append(0 if base is None else int(base.cut_chars[k]))
+        return base, k
+
+    seg._find_prefix = find
+    missed, prev = [], {}
+    for c, p in prompts:
+        covered.clear()
+        assert seg._encode_cached(p) == seg._tokenizer.encode(p)
+        if c in prev:
+            missed.append(prev[c] - covered[0])
+        prev[c] = len(p)
+    return missed
+
+
+def test_many_conversations_sharing_a_start_each_reuse_their_previous_turn(tok):
+    """Concurrent agent conversations share the system prompt (and so a
+    bucket); more of them than a handful must not push each other out."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**8)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(21)
+    common = _long_conversation(rng, 0)
+    convs = [common + "<|User|>" + _text(rng, 30) for _ in range(40)]
+    prompts = []
+    for _ in range(3):
+        for c in range(len(convs)):
+            prompts.append((c, convs[c] + "<|Assistant|>"))
+            convs[c] += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
+    missed = _covered_of_previous_turn(seg, prompts)
+    assert max(missed) == 0, max(missed)
+    assert len(_stored(seg)) == len(convs)
+
+
+def test_a_rewritten_generation_prompt_replaces_the_stored_turn(tok):
+    """DeepSeek-V4.1 thinking mode ends the prompt in `<think>` and renders
+    the answered turn with `</think>`: the last cut is never shared, and the
+    conversation must still keep a single stored prompt."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(22)
+    history = _long_conversation(rng, 2)
+    prompts = []
+    for _ in range(6):
+        prompts.append((0, history + "<|Assistant|><think>"))
+        history += (
+            "<|Assistant|></think>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
+        )
+    missed = _covered_of_previous_turn(seg, prompts)
+    assert max(missed) == len("<think>"), missed
+    assert len(_stored(seg)) == 1
+
+
+def test_a_fork_keeps_the_stored_prompt_it_left(tok):
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(23)
+    base = _long_conversation(rng, 4)
+    long_tail = "<|User|>" + _text(rng, 2000) + "<|Assistant|>"
+    seg._encode_cached(base + long_tail)
+    fork = base + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
+    assert seg._encode_cached(fork) == tok.encode(fork)
+    assert len(_stored(seg)) == 2
+
+
+def test_a_divergence_with_no_new_added_token_stores_nothing(tok):
+    """Edited inside the last message, before the stored prompt's last added
+    token, with no added token after the edit: the new entry would be a part
+    of the stored one."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(24)
+    head = _long_conversation(rng, 6) + "<|User|>"
+    msg = _text(rng, 40)
+    seg._encode_cached(head + msg + "<|Assistant|>" + _text(rng, 30))
+    edited = head + msg[:-10] + " rewritten without markers"
+    assert seg._encode_cached(edited) == tok.encode(edited)
+    assert len(_stored(seg)) == 1
+
+
+def test_looking_up_a_prefix_refreshes_only_the_one_used(tok):
+    """Every candidate in the bucket is compared; only the one reused may
+    become recent, or stale entries outlive useful segments."""
+    import numpy as np
+
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(25)
+    common = _long_conversation(rng, 0)
+    a = common + "<|User|>" + _text(rng, 30) + "<|Assistant|>"
+    b = common + "<|User|>" + _text(rng, 30) + "<|Assistant|>"
+    seg._encode_cached(a)
+    seg._encode_cached(b)
+    seg._lru.put("marker", np.zeros(1, np.int32), 4)
+    base, _ = seg._find_prefix(b + "x")
+    assert base is not None and base.text == b
+    keys = list(seg._lru._items)
+    a_key = next(k for k in keys if isinstance(k, tuple) and seg._lru.peek(k).text == a)
+    assert keys.index(a_key) < keys.index("marker")
+
+
+def test_turning_the_cache_off_releases_it(tok, monkeypatch):
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    rng = random.Random(26)
+    seg._verified = seg_mod._VERIFY_FIRST
+    seg._encode_cached(_long_conversation(rng, 4))
+    assert len(seg._lru)
+    seg._verified = 0
+    monkeypatch.setattr(seg, "_encode_cached", lambda p: [0])
+    p = _conversation(rng, 4)
+    assert seg.encode(p) == tok.encode(p)
+    assert not seg.enabled and not len(seg._lru) and seg._lru.bytes == 0
+    assert not seg._buckets
+
+
+def test_trie_pattern_splits_like_a_flat_alternation():
+    import re
+
+    from atom.model_engine.segment_split import _alternation
+
+    def flat(tokens):
+        tokens = sorted(tokens, key=len, reverse=True)
+        return re.compile("(" + "|".join(re.escape(t) for t in tokens) + ")")
+
+    rng = random.Random(27)
+    alphabet = "ab<|>x."
+    for _ in range(2000):
+        tokens = {
+            "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 6)))
+            for _ in range(rng.randint(1, 12))
+        }
+        text = "".join(rng.choice(alphabet + "y") for _ in range(rng.randint(0, 60)))
+        assert _alternation(tokens).split(text) == flat(tokens).split(text)
+    long_tok = "x" * 50_000 + "<|raw|>"  # a long chain stays one literal
+    assert _alternation([long_tok, "<|raw|>"]).split("a" + long_tok)[1] == long_tok
+
+
 def _retained_by(fill):
     """Bytes still allocated after `fill()` returns, by tracemalloc."""
     import gc
@@ -538,6 +681,7 @@ def test_byte_lru_charges_overhead_and_evicts_oldest():
     lru = ByteLRU(3 * (ENTRY_OVERHEAD + 10), on_evict=lambda k, v: evicted.append(k))
     for k in "abc":
         lru.put(k, k, 10)
+    assert lru.peek("b") == "b"  # peeking leaves b the least recent
     assert lru.get("a") == "a"  # a is now the most recent
     lru.put("d", "d", 10)
     assert evicted == ["b"] and "b" not in lru
