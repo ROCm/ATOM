@@ -1,246 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792778810085,
+  "lastUpdate": 1792796028715,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "lirzhang@amd.com",
-            "name": "ZhangLirong",
-            "username": "ZhangLirong-amd"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "2c6034bd6326eb51d3c2cb2e5024b75e1ca69978",
-          "message": "fix: repair main after the #2276 / #2154 merge collision (#2294)\n\n#2276 and #2154 landed the same day. Each passed CI on its own branch, but\nthe merged tree fails three tests in tests/test_pd_pp.py because each PR\nchanged something the other's tests depend on.\n\n#2276 -> #2154's test:\n  - _execute_transfer now reads self._rail_pool, which only __init__ sets.\n    #2154's _make_transfer_connector builds the connector with\n    object.__new__, so the attribute is missing and the transfer raises\n    AttributeError. Give MooncakeConnector a class-level _rail_pool = None\n    so every construction path -- including an __init__ that aborts before\n    the matched-rail block -- falls back to the shared transfer_engine.\n  - _execute_block_slot_transfer grew a keyword-only `engine`; update\n    #2154's stub lambda to match the real signature.\n\n#2154 -> #2276's test:\n  - _execute_transfer now rejects a stateful transfer whose request carries\n    no src_slot_index. #2276's concurrency test sets has_slot_regions=True\n    on a fixture that never had one, so it fails before reaching the rail\n    selection it means to exercise. Supply the slot indices.\n\nThe production change is the _rail_pool default; the rest restores the\ntests to the current contract. tests/test_pd_pp.py: 95 passed.",
-          "timestamp": "2026-09-19T00:50:49+08:00",
-          "tree_id": "3498ebfb07112426b187d48bdeb40404af517e52",
-          "url": "https://github.com/ROCm/ATOM/commit/2c6034bd6326eb51d3c2cb2e5024b75e1ca69978"
-        },
-        "date": 1789756866369,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9454,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
-            "value": 67.05,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9416 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.01,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9424,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.9371,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9325 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
-            "value": 64.38,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9325 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 2.93,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro accuracy (GSM8K)",
-            "value": 0.9507,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Full-eval (1319 samples) 3-shot flexible-extract = 0.9522 ± 0.0059 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9515 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DEP RCCL accuracy (GSM8K)",
-            "value": 0.9545,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: PR #2110 regression coverage for DPA8 + EP8 using the native RCCL transport with EPLB disabled. Reuses the DeepSeek-V4-Pro 3-shot GSM8K baseline. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark accuracy (GSM8K)",
-            "value": 0.9515,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark MTP acceptance (%)",
-            "value": 43.39,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: DSpark spec-decode (7 tokens, dp-attention, PIECEWISE cudagraph) on the DeepSeek-V4-Pro-DSpark checkpoint. Spec-decode is lossless w.r.t. the target, so baseline reuses the DeepSeek-V4-Pro FP8 base (0.96); threshold 0.93 leaves ~3pp headroom for spec-decode / dp-attention run-to-run variance. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate — add it once measured to guard draft-head regressions. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro-DSpark"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro DSpark avg toks/fwd (tok/fwd)",
-            "value": 4.04,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
-            "value": 0.9568,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9575 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP MTP acceptance (%)",
-            "value": 66.12,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9575 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
-          },
-          {
-            "name": "ATOM::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
-            "value": 2.98,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.9249,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9272 | fewshot: 3 | Model: /models/amd/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP MTP acceptance (%)",
-            "value": 76.53,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.92 | Baseline: 0.9447 | BaselineModel: zai-org/GLM-5.2-FP8 | BaselineNote: Initial GLM-5.2-MXFP4 MTP online-quant native accuracy case. Threshold/baseline follow GLM-5.2-FP8 until MXFP4 MTP CI baseline is calibrated. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9272 | fewshot: 3 | Model: /models/amd/GLM-5.2-MXFP4"
-          },
-          {
-            "name": "ATOM::GLM-5.2-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.3,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::GLM-5.3-Flash-kpool-16shot accuracy (GSM8K)",
-            "value": 0.9682,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.9613 | BaselineModel: zai-org/GLM-5.3-Flash | BaselineNote: Guards the POOLED (kpool) indexer path. 16-shot prompts run 2763-3591 tokens, so every one of the 1319 questions exceeds index_topk=2048 and pooled scoring plus pooled top-k decide what the model attends to. The GLM-5.3-Flash entry above does NOT cover this: at or below index_topk the indexer selects every token, attention_mla runs dense, and the pooled selection is computed but never used -- a short-context score only shows the pooled writes did no harm. Measured 2026-08-28: flexible-extract=0.9659, strict-match=0.9666, matching the 0.9682/0.9689 of the dense 3-shot entry within run-to-run spread (two runs of identical code disagree on ~28 of 1319 questions in each direction). Needs --max-model-len 8192, not 4096: lm_eval samples its shots at random, the longest prompt is 3591 tokens, and 3591 + max_gen_toks 512 overflows a 4096 cap -- 4 requests then 400 and lm_eval aborts the whole eval after its retries. The short-context GLM-5.3-Flash entry (max-model-len 2048, 3-shot) was removed in favour of this one: below index_topk the indexer selects every token and attention_mla runs dense, so that entry exercised a strict subset of this path while costing a second 8-GPU nightly. Threshold stays at 0.94. This entry is test_level pr, so every unrelated PR runs it on 8 GPUs; repeat runs of IDENTICAL code have landed at 0.9613/0.9629/0.9644/0.9659, so a 0.96 threshold is cleared by 0.0013 in the worst case and would fail roughly one PR in four on unchanged code -- a gate that flaky trains people to re-run until green and stops carrying information. Baseline is the 0.9613 measured on this tree; the 0.9659 it replaced came from an earlier branch and is optimistic here. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9689 | fewshot: 16 | Model: /models/zai-org/GLM-5.3-Flash"
-          },
-          {
-            "name": "ATOM::Kimi-K2.7-Code-MXFP4 accuracy (GSM8K)",
-            "value": 0.9522,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.92 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.7-Code | BaselineNote: Kimi-K2.7-Code-MXFP4 native ATOM coverage; threshold inherited from Kimi-K2.5-MXFP4 until CI baseline is refreshed. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9522 | fewshot: 3 | Model: /models/amd/Kimi-K2.7-Code-MXFP4"
-          },
-          {
-            "name": "ATOM::Kimi-K3 accuracy (GSM8K)",
-            "value": 0.9538,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 | BaselineNote: Kimi-K3 (kimi_linear KDA+MLA, MXFP4 MoE) native ATOM FP8 kv-cache, TP8 (GSM8K 3-shot flexible-extract). Baseline 0.95; threshold 0.94 leaves ~1pp headroom. Refresh after the first CI run. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.953 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark accuracy (GSM8K)",
-            "value": 0.9598,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9606 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark MTP acceptance (%)",
-            "value": 50.91,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.94 | Baseline: 0.95 | BaselineModel: moonshotai/Kimi-K3 + Inferact/Kimi-K3-DSpark | BaselineNote: Kimi-K3 DSpark block spec-decode (7 tokens) on the Kimi-K3 target with the Inferact/Kimi-K3-DSpark draft. Spec-decode is lossless w.r.t. the target, so baseline reuses the Kimi-K3 FP8 base (0.95); threshold 0.94 matches the target. mtp_accept_threshold intentionally omitted until the first CI run reports the DSpark acceptance rate -- add it once measured. | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9606 | fewshot: 3 | Model: /models/moonshotai/Kimi-K3"
-          },
-          {
-            "name": "ATOM::Kimi-K3 DSpark avg toks/fwd (tok/fwd)",
-            "value": 4.56,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4-Preview accuracy (GSM8K)",
-            "value": 0.9158,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: meta-llama/Llama-3.3-70B-Instruct | BaselineNote: HF page inaccessible; needs CI measurement of baseline | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.6315 | fewshot: 3 | Model: /models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview"
-          },
-          {
-            "name": "ATOM::MiniMax-M3-MXFP4 accuracy (GSM8K)",
-            "value": 0.9401,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.93 | Baseline: 0.9363 | BaselineModel: amd/MiniMax-M3-MXFP4 | BaselineNote: FP4 M3 tp8. GSM8K 5-shot chat (apply_chat_template + fewshot_as_multiturn, num_concurrent=32, max_gen_toks=16384) | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9409 | fewshot: 5 | Model: /models/amd/MiniMax-M3-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.8969,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8832 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.6732,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7968 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
-            "value": 0.8628,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8484 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
-            "value": 84.4,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8484 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.53,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
-            "value": 0.8529,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.8415 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP accuracy (GSM8K)",
-            "value": 0.8529,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.834 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP MTP acceptance (%)",
-            "value": 84.37,
-            "unit": "%",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605. HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.834 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
-          },
-          {
-            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
-            "value": 3.53,
-            "unit": "tok/fwd"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.8893,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1259 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.8954,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35370878254 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202609181524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1387 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -310858,6 +310620,7058 @@ window.BENCHMARK_DATA = {
             "value": 0.5951,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986960948 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610231620 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1198 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9a0a5202bc28e9fd092b39199f6698e459d1d77d",
+          "message": "refactor: one graph mechanism per region, settled DP step shapes, cheaper V4.1 decode prep (#2688)\n\n* Revert \"feat(dsv4): enable Mono decode by default (#2586)\"\n\nThis reverts commit 2c772a5441f6efa012d53ee2e47d55646ab56f83.\n\n* refactor: one graph mechanism per region, settled DP step shapes, cheaper V4.1 decode prep\n\nGraph regions\n- TokenGraph (token buckets) and ReqGraph (request buckets) in\n  atom/utils/region_graph.py are the runner's two graph mechanisms; decode,\n  the V4.1 prefill decoder (DecoderGraph) and the DSpark draft record and\n  replay through them. Bucket lookups live on the graphs (TokenGraph.bucket,\n  __contains__), not in the forward context.\n- Prefill graph recording is one pass (_record_prefill_graphs); capture\n  boilerplate is shared (_build_capture); dummy prefill and decode share\n  dummy_execution.\n\nDP step shape\n- ForwardMode.decide runs the step's single DP exchange and settles the\n  running tokens per DP rank into a runner-owned numpy buffer in place.\n  DPMetadata holds only that table; gather_running_tokens is the one\n  all-reduce path (skipped at dp=1). set_forward_context takes the table as a\n  required argument; num_tokens names become scheduled/running tokens.\n\nV4.1 decode preparation (64k ISL, conc 4, TP4: prepare_decode 310 -> 176 us,\ndecode step median 3105 -> 2919 us, mean GPU idle per step 169 -> 34 us)\n- Step indptrs are filled by their first reader (PagedAttentionCache.indptrs)\n  and dropped by begin_forward, like unit tiles: a mono step fills none, a\n  graphed forward records the fill.\n- The FP4 score stage's walk plan is laid out on the device in the mono\n  step-meta launch (step_meta._walk_plan); index_plan.fill_walk_plan stays as\n  its host reference, checked against it on random steps. WalkPlanner and the\n  installers' metadata_builder argument are gone.\n- prepare_batch_step finds group members by name instead of scanning every\n  member twice; CompressPlan drops cu_compress_cpu / compress_plan_cpu, which\n  nothing read.\n- The previous step's speculative status is taken after the input ids are\n  staged, published and their fill launched: that wait is the step's one CPU\n  block on the GPU, and only the attention metadata after it reads the status.\n\nCleanup\n- Patch-style branches, duplicate plumbing and dead code removed across the\n  runner, attention builders (shared Fp4LaunchStorages, V4/MLA indexer rows),\n  MoE, plugins and tests; docs updated to match.\n\nValidation: V4.1-Flash TP4 GSM8K 3-shot 0.9242 (CI baseline 0.9224); unit\ntests in the affected areas pass apart from the known environment failures.\n\n* fix: mark region graph live sets ClassVar; skip decoder graph tests without triton\n\n* fix: keep the logits workspace and V4 transfer-region tests importable without aiter\n\n* chore: drop the indexer package's copy of the logits workspace",
+          "timestamp": "2026-10-23T16:27:37Z",
+          "url": "https://github.com/ROCm/ATOM/commit/9a0a5202bc28e9fd092b39199f6698e459d1d77d"
+        },
+        "date": 1792796028062,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 110.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 935.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 261.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 8.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 2010.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 18101.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 2072.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 60.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 950.34,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8563.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 600.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 15.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2338.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 21127.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 3744.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 104.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1269.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11414.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 811.55,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 23.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 379.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3383.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 325.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 10.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1636.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 14788.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1293,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 37.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 644.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5794.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 461.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 11.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 throughput (tok/s)",
+            "value": 132.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1114.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 TTFT (ms)",
+            "value": 270.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 TPOT (ms)",
+            "value": 7.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.45,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 48.4,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 2295.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 20666.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 2218.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 52.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.54,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 51.39,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1168.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10530.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 629.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 12.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.61,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 53.69,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 2449.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 22135.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 4123.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 98.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.57,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 52.41,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1550.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 13937.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 876.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 19.21,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.51,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 50.49,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 552.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4923.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 457.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 6.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.69,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 56.2,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 1960.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 17714.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1335.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 30.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.54,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 51.22,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 813.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7311.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 524.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 9.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.52,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 50.65,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-MXFP4 MTP3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 throughput (tok/s)",
+            "value": 91.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 769.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 TTFT (ms)",
+            "value": 252.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 TPOT (ms)",
+            "value": 10.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=1 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 throughput (tok/s)",
+            "value": 2357.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21225.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 TTFT (ms)",
+            "value": 1760.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 TPOT (ms)",
+            "value": 51.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 throughput (tok/s)",
+            "value": 941.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8486.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 TTFT (ms)",
+            "value": 465.92,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 TPOT (ms)",
+            "value": 16.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 throughput (tok/s)",
+            "value": 2802.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 25319.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 TTFT (ms)",
+            "value": 3179.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 TPOT (ms)",
+            "value": 86.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 throughput (tok/s)",
+            "value": 1332.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11978.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 TTFT (ms)",
+            "value": 673.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 TPOT (ms)",
+            "value": 22.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 throughput (tok/s)",
+            "value": 313.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2794.88,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 TTFT (ms)",
+            "value": 300.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 TPOT (ms)",
+            "value": 12.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 throughput (tok/s)",
+            "value": 1872.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16916.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 TTFT (ms)",
+            "value": 1025.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 TPOT (ms)",
+            "value": 32.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 throughput (tok/s)",
+            "value": 554.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4984.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 TTFT (ms)",
+            "value": 382.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 TPOT (ms)",
+            "value": 13.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 throughput (tok/s)",
+            "value": 5583.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 Total Tput (tok/s)",
+            "value": 50290.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 TTFT (ms)",
+            "value": 12525.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 TPOT (ms)",
+            "value": 167.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=1024 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 throughput (tok/s)",
+            "value": 2369.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21329.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 TTFT (ms)",
+            "value": 3797.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 TPOT (ms)",
+            "value": 49.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 throughput (tok/s)",
+            "value": 3745.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 33840.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 TTFT (ms)",
+            "value": 5336.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 TPOT (ms)",
+            "value": 61.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 throughput (tok/s)",
+            "value": 4835.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 43529.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 TTFT (ms)",
+            "value": 7330.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 TPOT (ms)",
+            "value": 96.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=512 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 throughput (tok/s)",
+            "value": 1571.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 14201.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 TTFT (ms)",
+            "value": 2978.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 TPOT (ms)",
+            "value": 36.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 throughput (tok/s)",
+            "value": 3376.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 30398.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 TTFT (ms)",
+            "value": 4579.28,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 TPOT (ms)",
+            "value": 31.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.25,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 32.09,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 throughput (tok/s)",
+            "value": 4355.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 39350.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 TTFT (ms)",
+            "value": 6084.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 TPOT (ms)",
+            "value": 50.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.11,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 30.09,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 throughput (tok/s)",
+            "value": 5298.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 47697.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 TTFT (ms)",
+            "value": 8637.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 TPOT (ms)",
+            "value": 85.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 Accept Length (tok/fwd)",
+            "value": 3.01,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 Acceptance Rate (%)",
+            "value": 28.73,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=512 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 throughput (tok/s)",
+            "value": 2308.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 20855.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 TTFT (ms)",
+            "value": 3970.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 TPOT (ms)",
+            "value": 22.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.41,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 34.37,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA DSpark 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 throughput (tok/s)",
+            "value": 6318.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 Total Tput (tok/s)",
+            "value": 56906.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 TTFT (ms)",
+            "value": 13116.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 TPOT (ms)",
+            "value": 146.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 Accept Length (tok/fwd)",
+            "value": 2.63,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 Acceptance Rate (%)",
+            "value": 54.17,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=1024 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 3343.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 30104.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 4337.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 32.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.62,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 53.92,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 4423.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 39971.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 5810.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 50.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.62,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 54.13,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 throughput (tok/s)",
+            "value": 5502,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 49531.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 TTFT (ms)",
+            "value": 8061.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 TPOT (ms)",
+            "value": 83.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 Accept Length (tok/fwd)",
+            "value": 2.61,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 Acceptance Rate (%)",
+            "value": 53.73,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=512 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 2009.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 18155.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 3554.76,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 27.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.64,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 54.68,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA MTP3 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 throughput (tok/s)",
+            "value": 5630.12,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 Total Tput (tok/s)",
+            "value": 50707.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 TTFT (ms)",
+            "value": 11288.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 TPOT (ms)",
+            "value": 167.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=1024 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 throughput (tok/s)",
+            "value": 3974.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 35911.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 TTFT (ms)",
+            "value": 4920.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 TPOT (ms)",
+            "value": 57.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 throughput (tok/s)",
+            "value": 5210.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 46906.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 TTFT (ms)",
+            "value": 6687.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 TPOT (ms)",
+            "value": 89.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro DPA TBO 8192/1024 c=512 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 throughput (tok/s)",
+            "value": 8111.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 Total Tput (tok/s)",
+            "value": 72999.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 TTFT (ms)",
+            "value": 185385.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 TPOT (ms)",
+            "value": 303.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=4096 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 throughput (tok/s)",
+            "value": 5052.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 Total Tput (tok/s)",
+            "value": 45483.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 TTFT (ms)",
+            "value": 6508.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 TPOT (ms)",
+            "value": 92.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro EPLB r0 MegaMoE MegaMoE 8192/1024 c=512 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 throughput (tok/s)",
+            "value": 186.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1569.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 TTFT (ms)",
+            "value": 264.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 TPOT (ms)",
+            "value": 5.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.5,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 50.14,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=1 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 2515.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 22647.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 1922.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 48.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.7,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 56.81,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1329.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 11982.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 491.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 11.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.76,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 58.72,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 2855.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 25797.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 3956.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 84.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.65,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 54.87,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1719.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 15457.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 698.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 17.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.68,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 55.86,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 568.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 5066.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 338.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 6.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.71,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 56.97,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 2157.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 19494.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1118.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 27.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.69,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 56.21,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 890.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 8003.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 384.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 8.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.77,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 59.01,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro MTP3 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 throughput (tok/s)",
+            "value": 2347.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21137.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 TTFT (ms)",
+            "value": 1902.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 TPOT (ms)",
+            "value": 51.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 throughput (tok/s)",
+            "value": 2774.45,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 25067.66,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 TTFT (ms)",
+            "value": 3263.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 TPOT (ms)",
+            "value": 87.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 throughput (tok/s)",
+            "value": 1771.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16007.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 TTFT (ms)",
+            "value": 1161.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 TPOT (ms)",
+            "value": 33.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::DeepSeek-V4-Pro TBO 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 throughput (tok/s)",
+            "value": 85.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 716.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 TTFT (ms)",
+            "value": 324.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 TPOT (ms)",
+            "value": 11.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 throughput (tok/s)",
+            "value": 1494.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 13455.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 TTFT (ms)",
+            "value": 2606.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 TPOT (ms)",
+            "value": 81.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 throughput (tok/s)",
+            "value": 655.22,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5903.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 TTFT (ms)",
+            "value": 611.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 TPOT (ms)",
+            "value": 23.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 throughput (tok/s)",
+            "value": 1393.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 12588.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 TTFT (ms)",
+            "value": 81147.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 TPOT (ms)",
+            "value": 91.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 888.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 7984.89,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 TTFT (ms)",
+            "value": 875.17,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 TPOT (ms)",
+            "value": 34.24,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 269.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2401.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 TTFT (ms)",
+            "value": 412.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 TPOT (ms)",
+            "value": 14.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 throughput (tok/s)",
+            "value": 1165.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 10532.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 TTFT (ms)",
+            "value": 1408.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 TPOT (ms)",
+            "value": 52.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 throughput (tok/s)",
+            "value": 434.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 3908.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 TTFT (ms)",
+            "value": 540.9,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 TPOT (ms)",
+            "value": 17.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 throughput (tok/s)",
+            "value": 185.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1562.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 TTFT (ms)",
+            "value": 384.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 TPOT (ms)",
+            "value": 5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.89,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 63.15,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 1733.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 15613.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 7412.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 64.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 64.53,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 921.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 8308.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 668.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 16.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.91,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 63.66,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 1710.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 15453.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 72758.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 66.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 64.73,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1240.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 11152.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 949.19,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 24.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.93,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 64.38,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 489.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4357.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 448.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 7.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.92,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 63.84,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 1609.82,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 14546.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1579.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 37.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.9,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 63.26,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 672.78,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6048.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 519.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 11.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.91,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 63.65,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-FP8 MTP3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 157.77,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1330.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 276.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 6.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 828.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 7467.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 577.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 18.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2320.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 20961.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 3742.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 104.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1150.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 10340.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 750.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 26.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 334.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2979.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 354.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 11.46,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1524.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 13776.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1181.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 39.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 556.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 5001.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 425.85,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 13.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 throughput (tok/s)",
+            "value": 285.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 2408.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 TTFT (ms)",
+            "value": 336.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 TPOT (ms)",
+            "value": 3.16,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.91,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 63.81,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 2300.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 20719.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 2277.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 52.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.86,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 61.92,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1198.61,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10802.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 578.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 12.5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.87,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 62.49,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 2512.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 22703.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 4218.95,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 96.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.87,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 62.42,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 1582.38,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 14226.27,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 882.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 18.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.9,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 63.18,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 592.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 5283.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 397.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 6.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.81,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 60.35,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 1993.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 18017.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 1306.89,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 30.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.84,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 61.28,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 876.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7877.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 456,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 8.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.88,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 62.61,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::GLM-5.2-MXFP4 MTP3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 throughput (tok/s)",
+            "value": 310.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 2616.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 TTFT (ms)",
+            "value": 85.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 TPOT (ms)",
+            "value": 3.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=1 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 throughput (tok/s)",
+            "value": 5465.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 49208.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 TTFT (ms)",
+            "value": 503.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 TPOT (ms)",
+            "value": 22.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=128 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 throughput (tok/s)",
+            "value": 2293.63,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 20666.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 TTFT (ms)",
+            "value": 142.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 TPOT (ms)",
+            "value": 6.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 throughput (tok/s)",
+            "value": 7284.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 65821.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 TTFT (ms)",
+            "value": 907.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 TPOT (ms)",
+            "value": 33.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=256 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 throughput (tok/s)",
+            "value": 3182,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 28602.5,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 TTFT (ms)",
+            "value": 197.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 TPOT (ms)",
+            "value": 9.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 throughput (tok/s)",
+            "value": 940.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 8381.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 TTFT (ms)",
+            "value": 97.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 TPOT (ms)",
+            "value": 4.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 throughput (tok/s)",
+            "value": 4354.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 39343.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 TTFT (ms)",
+            "value": 299.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 TPOT (ms)",
+            "value": 14.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 throughput (tok/s)",
+            "value": 1513.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 13606.42,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 TTFT (ms)",
+            "value": 116.41,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 TPOT (ms)",
+            "value": 5.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::gpt-oss-120b 8192/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 113.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 958.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 169.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 8.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 2345.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 21120.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 1261.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 52.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1067.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 9617.65,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 335.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 14.4,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 2885.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 26070.76,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 2286.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 85.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1428.16,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 12837.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 480.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 21.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 435.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3881.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 225.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 8.83,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1860.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 16805.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 744.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 33.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 729.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6553.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 268.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 10.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K2.7-Code-MXFP4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 throughput (tok/s)",
+            "value": 65.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 555.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 TTFT (ms)",
+            "value": 588.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 TPOT (ms)",
+            "value": 14.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=1 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 throughput (tok/s)",
+            "value": 1262.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 11362.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 TTFT (ms)",
+            "value": 3913.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 TPOT (ms)",
+            "value": 95.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 throughput (tok/s)",
+            "value": 573.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 5171.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 TTFT (ms)",
+            "value": 910.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 TPOT (ms)",
+            "value": 26.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 throughput (tok/s)",
+            "value": 1252.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 11317.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 TTFT (ms)",
+            "value": 35922.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 TPOT (ms)",
+            "value": 161.63,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 throughput (tok/s)",
+            "value": 797.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 7171.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 TTFT (ms)",
+            "value": 1490.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 TPOT (ms)",
+            "value": 37.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 throughput (tok/s)",
+            "value": 198.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 1763.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 TTFT (ms)",
+            "value": 731.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 TPOT (ms)",
+            "value": 19.22,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 throughput (tok/s)",
+            "value": 993.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 8973.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 TTFT (ms)",
+            "value": 2230.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 TPOT (ms)",
+            "value": 60.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 throughput (tok/s)",
+            "value": 320.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 2884.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 TTFT (ms)",
+            "value": 933.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 TPOT (ms)",
+            "value": 23.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 throughput (tok/s)",
+            "value": 101.75,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 858.99,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 TTFT (ms)",
+            "value": 787.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 TPOT (ms)",
+            "value": 8.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.79,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 25.52,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=1 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 throughput (tok/s)",
+            "value": 1141.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 10284.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 TTFT (ms)",
+            "value": 50926,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 TPOT (ms)",
+            "value": 54.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.02,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 28.88,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=128 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 throughput (tok/s)",
+            "value": 684.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 6174.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 TTFT (ms)",
+            "value": 984.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 TPOT (ms)",
+            "value": 21.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 3.04,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 29.1,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=16 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 throughput (tok/s)",
+            "value": 1151.35,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 10413.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 TTFT (ms)",
+            "value": 147245.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 TPOT (ms)",
+            "value": 54.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.05,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 29.35,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=256 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 throughput (tok/s)",
+            "value": 905.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 8147.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 TTFT (ms)",
+            "value": 1674.37,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 TPOT (ms)",
+            "value": 32.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 3.05,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 29.28,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=32 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 throughput (tok/s)",
+            "value": 351.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3138.25,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 TTFT (ms)",
+            "value": 928.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 TPOT (ms)",
+            "value": 10.05,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 28.35,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=4 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 throughput (tok/s)",
+            "value": 1122.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 10147.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 TTFT (ms)",
+            "value": 2446.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 TPOT (ms)",
+            "value": 53.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 28.62,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=64 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 throughput (tok/s)",
+            "value": 499.54,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 4495.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 TTFT (ms)",
+            "value": 913.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 TPOT (ms)",
+            "value": 14.62,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 3.09,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 29.82,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 _gpu_count",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Kimi-K3 DSpark 8192/1024 c=8 _tp",
+            "value": 8,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 64.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 541.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 294.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 15.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=1 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 1495.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 13465.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 2484.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 81.67,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=128 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 700.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 6310.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 599.02,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 21.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=16 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 1437.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 12992.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 55547.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 113.91,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=256 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 989.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 8893.64,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 870.79,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 30.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=32 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 227.93,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 2030.3,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 380.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 16.93,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=4 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 1275.4,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 11523.01,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 1451.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 47.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=64 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 414.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 3729.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 452.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 18.39,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Llama-3.3-70B-Instruct-MXFP4 8192/1024 c=8 _tp",
+            "value": 1,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 347.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 2930,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 243.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 2.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 3716.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 33460.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 1143.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 32.66,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1563.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 14085.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 511.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 9.57,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 4577.23,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 41356.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 2027.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 52.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 2098.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 18861.14,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 518.7,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 14.44,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 905.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 8061.59,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 281.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 4.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 2959.79,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 26741.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 697.12,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 20.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 1128.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 10148.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 628.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 6.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 throughput (tok/s)",
+            "value": 525.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 4445.87,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 TTFT (ms)",
+            "value": 250.42,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 TPOT (ms)",
+            "value": 1.65,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.73,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 57.81,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 throughput (tok/s)",
+            "value": 4255.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 38395.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 TTFT (ms)",
+            "value": 1332.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 TPOT (ms)",
+            "value": 28.08,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.71,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 56.98,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1955.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 17651.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 TTFT (ms)",
+            "value": 411.26,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 TPOT (ms)",
+            "value": 7.51,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.5,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 50.03,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 throughput (tok/s)",
+            "value": 4588.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 41543.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 TTFT (ms)",
+            "value": 2339.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 TPOT (ms)",
+            "value": 52.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.7,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 56.55,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 throughput (tok/s)",
+            "value": 2780.19,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 25041.36,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 TTFT (ms)",
+            "value": 603.1,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 TPOT (ms)",
+            "value": 10.47,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.64,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 54.82,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 throughput (tok/s)",
+            "value": 1053.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 9400.72,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 TTFT (ms)",
+            "value": 258.78,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 TPOT (ms)",
+            "value": 3.34,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.42,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 47.45,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 throughput (tok/s)",
+            "value": 3629.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 32860.95,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 TTFT (ms)",
+            "value": 857.15,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 TPOT (ms)",
+            "value": 16.27,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.74,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 57.96,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 throughput (tok/s)",
+            "value": 1412.06,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 12718.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 TTFT (ms)",
+            "value": 260.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 TPOT (ms)",
+            "value": 5.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.61,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 53.59,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP4 EAGLE3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 throughput (tok/s)",
+            "value": 179.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1510.11,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 TTFT (ms)",
+            "value": 274.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 TPOT (ms)",
+            "value": 5.3,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 throughput (tok/s)",
+            "value": 2910.13,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 26199.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 TTFT (ms)",
+            "value": 1319.14,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 TPOT (ms)",
+            "value": 41.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 throughput (tok/s)",
+            "value": 1162.48,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10474.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 TTFT (ms)",
+            "value": 504.59,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 TPOT (ms)",
+            "value": 13.04,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 throughput (tok/s)",
+            "value": 3575.96,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 32309.41,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 TTFT (ms)",
+            "value": 2364.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 TPOT (ms)",
+            "value": 68.01,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 1563.71,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 14055.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 TTFT (ms)",
+            "value": 1513.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 TPOT (ms)",
+            "value": 18.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 527.2,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4696.05,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 TTFT (ms)",
+            "value": 316.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 TPOT (ms)",
+            "value": 7.18,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 throughput (tok/s)",
+            "value": 2229.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 20146.37,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 TTFT (ms)",
+            "value": 795.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 TPOT (ms)",
+            "value": 27.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 throughput (tok/s)",
+            "value": 783.97,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7047.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 TTFT (ms)",
+            "value": 492.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 TPOT (ms)",
+            "value": 9.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 throughput (tok/s)",
+            "value": 315.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 2667.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 TTFT (ms)",
+            "value": 276.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 TPOT (ms)",
+            "value": 2.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 2.66,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 55.44,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 throughput (tok/s)",
+            "value": 3255.67,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 29371.17,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 TTFT (ms)",
+            "value": 1494.73,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 TPOT (ms)",
+            "value": 36.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 2.44,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 47.91,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1517.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 13700.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 TTFT (ms)",
+            "value": 645.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 TPOT (ms)",
+            "value": 9.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 2.53,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 50.92,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 throughput (tok/s)",
+            "value": 3715.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 33642.58,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 TTFT (ms)",
+            "value": 2666.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 TPOT (ms)",
+            "value": 64.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 2.45,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 48.28,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 throughput (tok/s)",
+            "value": 2157.03,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 19428.51,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 TTFT (ms)",
+            "value": 701.49,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 TPOT (ms)",
+            "value": 13.69,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 2.54,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 51.37,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 throughput (tok/s)",
+            "value": 795.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 7097.43,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 TTFT (ms)",
+            "value": 298.99,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 TPOT (ms)",
+            "value": 4.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 2.65,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 55.15,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 throughput (tok/s)",
+            "value": 2713.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 24568.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 TTFT (ms)",
+            "value": 1004.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 TPOT (ms)",
+            "value": 21.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 2.45,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 48.35,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 throughput (tok/s)",
+            "value": 1000.24,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 9009.39,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 TTFT (ms)",
+            "value": 380.87,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 TPOT (ms)",
+            "value": 7.25,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 2.32,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 43.85,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::MiniMax-M3-MXFP8 EAGLE3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 throughput (tok/s)",
+            "value": 125.53,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1058.21,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 TTFT (ms)",
+            "value": 192.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 TPOT (ms)",
+            "value": 7.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 throughput (tok/s)",
+            "value": 2678.85,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 24117.74,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 TTFT (ms)",
+            "value": 1356.23,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 TPOT (ms)",
+            "value": 45.58,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 throughput (tok/s)",
+            "value": 1129.04,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 10173.26,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 TTFT (ms)",
+            "value": 361.74,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 TPOT (ms)",
+            "value": 13.56,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 throughput (tok/s)",
+            "value": 3325.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 30050.18,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 TTFT (ms)",
+            "value": 2410.88,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 TPOT (ms)",
+            "value": 73.36,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 throughput (tok/s)",
+            "value": 1628.49,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 14638.31,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TTFT (ms)",
+            "value": 518.94,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 TPOT (ms)",
+            "value": 18.6,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 throughput (tok/s)",
+            "value": 444.56,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 3959.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 TTFT (ms)",
+            "value": 266.53,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 TPOT (ms)",
+            "value": 8.61,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 throughput (tok/s)",
+            "value": 2168.47,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 19591.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 TTFT (ms)",
+            "value": 815.07,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 TPOT (ms)",
+            "value": 28.11,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 throughput (tok/s)",
+            "value": 762.02,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 6849.8,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 TTFT (ms)",
+            "value": 300.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 TPOT (ms)",
+            "value": 9.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 throughput (tok/s)",
+            "value": 331.52,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 2794.81,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 TTFT (ms)",
+            "value": 199.72,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 TPOT (ms)",
+            "value": 2.81,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 Accept Length (tok/fwd)",
+            "value": 3.27,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 Acceptance Rate (%)",
+            "value": 75.79,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 throughput (tok/s)",
+            "value": 3724.68,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 33533.33,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 TTFT (ms)",
+            "value": 1446.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 TPOT (ms)",
+            "value": 32.32,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 Accept Length (tok/fwd)",
+            "value": 3.49,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 Acceptance Rate (%)",
+            "value": 83.07,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 throughput (tok/s)",
+            "value": 1975,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 17795.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 TTFT (ms)",
+            "value": 379.75,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 TPOT (ms)",
+            "value": 7.52,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 Accept Length (tok/fwd)",
+            "value": 3.52,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 Acceptance Rate (%)",
+            "value": 83.94,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 throughput (tok/s)",
+            "value": 4127.69,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 37294.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 TTFT (ms)",
+            "value": 2605.77,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 TPOT (ms)",
+            "value": 58.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 Accept Length (tok/fwd)",
+            "value": 3.49,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 Acceptance Rate (%)",
+            "value": 83.16,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 throughput (tok/s)",
+            "value": 2480.86,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 22300.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 TTFT (ms)",
+            "value": 570.96,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 TPOT (ms)",
+            "value": 11.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 Accept Length (tok/fwd)",
+            "value": 3.37,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 Acceptance Rate (%)",
+            "value": 78.98,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 throughput (tok/s)",
+            "value": 950.84,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 8469.62,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 TTFT (ms)",
+            "value": 252.13,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 TPOT (ms)",
+            "value": 3.82,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 Accept Length (tok/fwd)",
+            "value": 3.48,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 Acceptance Rate (%)",
+            "value": 82.65,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 throughput (tok/s)",
+            "value": 3083.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 27862.44,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 TTFT (ms)",
+            "value": 871.43,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 TPOT (ms)",
+            "value": 19.48,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 Accept Length (tok/fwd)",
+            "value": 3.49,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 Acceptance Rate (%)",
+            "value": 82.98,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 throughput (tok/s)",
+            "value": 1471.91,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 13230.92,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 TTFT (ms)",
+            "value": 296.06,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 TPOT (ms)",
+            "value": 5,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 Accept Length (tok/fwd)",
+            "value": 3.58,
+            "unit": "tok/fwd",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 Acceptance Rate (%)",
+            "value": 86.07,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP3 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 throughput (tok/s)",
+            "value": 141.73,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 Total Tput (tok/s)",
+            "value": 1194.83,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 TTFT (ms)",
+            "value": 189.33,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 TPOT (ms)",
+            "value": 6.86,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=1 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 throughput (tok/s)",
+            "value": 3017.9,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 Total Tput (tok/s)",
+            "value": 27170.15,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 TTFT (ms)",
+            "value": 1374.84,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 TPOT (ms)",
+            "value": 40.29,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=128 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 throughput (tok/s)",
+            "value": 1240.55,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 Total Tput (tok/s)",
+            "value": 11178.07,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 TTFT (ms)",
+            "value": 361.71,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 TPOT (ms)",
+            "value": 12.31,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=16 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 throughput (tok/s)",
+            "value": 3608.46,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 Total Tput (tok/s)",
+            "value": 32603.09,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 TTFT (ms)",
+            "value": 2430.2,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 TPOT (ms)",
+            "value": 67.45,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=256 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 throughput (tok/s)",
+            "value": 1714.57,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 Total Tput (tok/s)",
+            "value": 15411.98,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 TTFT (ms)",
+            "value": 498.35,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 TPOT (ms)",
+            "value": 17.68,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=32 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 throughput (tok/s)",
+            "value": 479.94,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 Total Tput (tok/s)",
+            "value": 4275.08,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 TTFT (ms)",
+            "value": 254.09,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 TPOT (ms)",
+            "value": 7.97,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=4 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 throughput (tok/s)",
+            "value": 2475.29,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 Total Tput (tok/s)",
+            "value": 22363.7,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 TTFT (ms)",
+            "value": 792.38,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 TPOT (ms)",
+            "value": 24.54,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=64 _tp",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 throughput (tok/s)",
+            "value": 785.1,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 Total Tput (tok/s)",
+            "value": 7057.28,
+            "unit": "tok/s",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 TTFT (ms)",
+            "value": 332.98,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 TPOT (ms)",
+            "value": 9.64,
+            "unit": "ms",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39986964223 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | Docker: rocm/atom-dev:latest"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _gpu_count",
+            "value": 4,
+            "unit": ""
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 8192/1024 c=8 _tp",
+            "value": 4,
+            "unit": ""
           }
         ]
       }
