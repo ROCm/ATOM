@@ -2,7 +2,6 @@
 """`SegmentTokenizer` must return exactly what the plain encoder returns."""
 
 import random
-import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,6 +34,15 @@ WORDS = [
     "hello,",
     "world!",
 ]
+
+
+def _stored(seg):
+    """The stored prompts (the prefix level) currently in the LRU."""
+    return [v for k, (v, _) in seg._lru._items.items() if isinstance(k, tuple)]
+
+
+def _segments(seg):
+    return [k for k in seg._lru._items if not isinstance(k, tuple)]
 
 
 def _text(rng, n):
@@ -97,18 +105,18 @@ def test_special_token_spelling_inside_text_still_splits(tok):
 
 
 def test_eviction_keeps_results_exact(tok):
-    seg = SegmentTokenizer.maybe_create(tok, 64)
+    seg = SegmentTokenizer.maybe_create(tok, 4096)
     rng = random.Random(2)
     for _ in range(20):
         prompt = _conversation(rng, 6)
         assert seg.encode(prompt) == tok.encode(prompt)
-    assert seg._cached_tokens <= 64
+    assert seg._lru.bytes <= 4096
 
 
 def test_a_mismatch_turns_the_cache_off(tok, monkeypatch):
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     prompt = _conversation(random.Random(3), 4)
-    monkeypatch.setattr(seg, "_encode_segments", lambda p: [0])
+    monkeypatch.setattr(seg, "_encode_cached", lambda p: [0])
     assert seg.encode(prompt) == tok.encode(prompt)
     assert not seg.enabled
     monkeypatch.undo()
@@ -138,7 +146,7 @@ def test_short_prompts_are_encoded_whole(tok, monkeypatch):
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
     prompt = _conversation(random.Random(5), 4)
     assert seg.encode(prompt) == tok.encode(prompt)
-    assert seg._stats[3] == 0 and seg._cached_tokens == 0
+    assert seg._stats[3] == 0 and len(seg._lru) == 0
 
 
 def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
@@ -149,17 +157,18 @@ def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
     prompt = _conversation(rng, 6)
     assert seg.encode(prompt) == tok.encode(prompt)
     longer = prompt + "<|User|>" + _text(rng, 30)
-    real = seg._backend.encode_batch
+    real = seg._split.backend.encode_batch
 
     def evict_then_encode(texts, **kw):
         with seg._lock:
-            seg._cache.clear()
-            seg._cached_tokens = 0
+            seg._lru.clear()
         return real(texts, **kw)
 
-    monkeypatch.setattr(seg, "_backend", MagicMock(encode_batch=evict_then_encode))
+    monkeypatch.setattr(
+        seg._split, "backend", MagicMock(encode_batch=evict_then_encode)
+    )
     seg._verified = seg_mod._VERIFY_FIRST  # unchecked, as in steady state
-    assert seg._encode_segments(longer) == tok.encode(longer)
+    assert seg._encode_cached(longer) == tok.encode(longer)
 
 
 def _normalized_tokenizer(normalizer):
@@ -190,14 +199,14 @@ def test_normalized_added_tokens_need_an_identity_normalizer():
     tok = seg._tokenizer
     seg._verified = seg_mod._VERIFY_FIRST
     prompt = "<|User|>a\u0301 caf\u0301e" * 3
-    assert seg._encode_segments(prompt) == tok.encode(prompt)
+    assert seg._encode_cached(prompt) == tok.encode(prompt)
 
 
 def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
     """They would take an entry each but no token budget, so eviction would
     never bound them."""
     seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
-    real = seg._backend.encode_batch
+    real = seg._split.backend.encode_batch
 
     def drop_whitespace(texts, **kw):
         return [
@@ -205,11 +214,11 @@ def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
             for t, e in zip(texts, real(texts, **kw))
         ]
 
-    monkeypatch.setattr(seg, "_backend", MagicMock(encode_batch=drop_whitespace))
+    monkeypatch.setattr(seg._split, "backend", MagicMock(encode_batch=drop_whitespace))
     seg._verified = seg_mod._VERIFY_FIRST
     for n in range(1, 50):
-        seg._encode_segments("<|User|>" + " " * n + "<|Assistant|>")
-    assert len(seg._cache) == 0 and seg._cached_tokens == 0
+        seg._encode_cached("<|User|>" + " " * n + "<|Assistant|>")
+    assert not _segments(seg)
 
 
 def _tokenizer_with(added, pre=None):
@@ -245,7 +254,7 @@ def test_cross_pass_overlap_follows_the_backends_extraction_order():
     assert seg is not None
     seg._verified = seg_mod._VERIFY_FIRST  # past the window: unchecked
     prompt = "alpha x<|User|>beta" * 3
-    assert seg._encode_segments(prompt) == tok.encode(prompt)
+    assert seg._encode_cached(prompt) == tok.encode(prompt)
 
 
 def test_offset_sensitive_pre_tokenizers_are_refused():
@@ -271,7 +280,7 @@ def test_a_result_finished_after_the_cache_turned_off_is_not_returned(tok, monke
         seg.enabled = False
         return [0]
 
-    monkeypatch.setattr(seg, "_encode_segments", wrong_and_meanwhile_disabled)
+    monkeypatch.setattr(seg, "_encode_cached", wrong_and_meanwhile_disabled)
     assert seg.encode(prompt) == tok.encode(prompt)
 
 
@@ -279,14 +288,14 @@ def test_a_check_finishing_after_the_cache_turned_off_does_not_count(tok, monkey
     seg = SegmentTokenizer.maybe_create(tok, 10**6)
     seg._verified = seg_mod._VERIFY_FIRST - 1
     prompt = _conversation(random.Random(10), 4)
-    real = seg._encode_segments
+    real = seg._encode_cached
 
     def disabled_meanwhile(p):
         ids = real(p)
         seg.enabled = False
         return ids
 
-    monkeypatch.setattr(seg, "_encode_segments", disabled_meanwhile)
+    monkeypatch.setattr(seg, "_encode_cached", disabled_meanwhile)
     assert seg.encode(prompt) == tok.encode(prompt)
     assert seg._verified == seg_mod._VERIFY_FIRST - 1 and not seg.enabled
 
@@ -308,11 +317,11 @@ def test_a_later_turn_reuses_the_earlier_prompt_exactly(tok):
         # The generation prompt ends a turn; the next one replaces it, so a
         # later prompt diverges from the stored one just before its end.
         ask = prompt + "<|Assistant|>"
-        assert seg._encode_segments(ask) == tok.encode(ask)
+        assert seg._encode_cached(ask) == tok.encode(ask)
         prompt += "<|Assistant|>" + _text(rng, 15) + "<|User|>" + _text(rng, 25)
-    assert seg._prefix_hits >= 5
+    assert seg._stats[4] >= 5
     # One stored prefix per conversation: each turn replaced the one before.
-    assert len(seg._prefixes) == 1
+    assert len(_stored(seg)) == 1
 
 
 def test_divergence_mid_prefix_reuses_up_to_the_last_shared_added_token(tok):
@@ -320,11 +329,11 @@ def test_divergence_mid_prefix_reuses_up_to_the_last_shared_added_token(tok):
     seg._verified = seg_mod._VERIFY_FIRST
     rng = random.Random(12)
     base = _long_conversation(rng, 6)
-    seg._encode_segments(base)
+    seg._encode_cached(base)
     edited = base[: len(base) - 30] + "rewritten tail<|User|>" + _text(rng, 20)
-    hits = seg._prefix_hits
-    assert seg._encode_segments(edited) == tok.encode(edited)
-    assert seg._prefix_hits == hits + 1
+    hits = seg._stats[4]
+    assert seg._encode_cached(edited) == tok.encode(edited)
+    assert seg._stats[4] == hits + 1
 
 
 def test_prefix_fast_path_is_off_when_an_added_token_contains_another():
@@ -350,71 +359,107 @@ def test_conversations_sharing_a_start_are_kept_apart_and_exact(tok):
     for _ in range(3):
         for p in (a, b):
             ask = p + "<|Assistant|>"
-            assert seg._encode_segments(ask) == tok.encode(ask)
+            assert seg._encode_cached(ask) == tok.encode(ask)
         a += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
         b += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
-    assert len(seg._prefix_buckets) == 1
-    assert len(seg._prefixes) == 2
+    assert len(seg._buckets) == 1
+    assert len(_stored(seg)) == 2
+
+
+def _retained_by(fill):
+    """Bytes still allocated after `fill()` returns, by tracemalloc."""
+    import gc
+    import tracemalloc
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        keep = fill()
+        gc.collect()
+        return tracemalloc.get_traced_memory()[0] - before, keep
+    finally:
+        tracemalloc.stop()
+
+
+def test_many_small_segments_stay_within_the_budget(tok):
+    """Per-entry overhead dominates single-token segments; the budget counts
+    retained bytes, not token ids."""
+    budget = 1 << 20
+
+    def fill():
+        seg = SegmentTokenizer.maybe_create(tok, budget)
+        seg._verified = seg_mod._VERIFY_FIRST
+        for b in range(30):
+            p = "".join(f"<|User|>{b}_{i}" for i in range(1000))
+            assert seg._encode_cached(p) == tok.encode(p)
+        return seg
+
+    held, seg = _retained_by(fill)
+    assert seg._lru.bytes <= budget
+    # The cache, the tokenizer it wraps and allocator slack: within 1.5x.
+    assert held <= 1.5 * budget, held
 
 
 def test_stored_prefixes_stay_within_the_budget(tok):
-    seg = SegmentTokenizer.maybe_create(tok, 20_000)
-    seg._verified = seg_mod._VERIFY_FIRST
-    rng = random.Random(15)
-    for _ in range(12):
-        p = _long_conversation(rng, 4) + "<|Assistant|>"
-        assert seg._encode_segments(p) == tok.encode(p)
-        assert seg._prefix_tokens <= 20_000
-        assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
-        # Retained bytes, counted independently of `cost`.
-        held = sum(
-            e.ids.nbytes + sys.getsizeof(e.text) + e.cut_chars.nbytes + e.cut_ids.nbytes
-            for e in seg._prefixes.values()
-        )
-        assert held <= 4 * 20_000
+    budget = 200_000
+
+    def fill():
+        seg = SegmentTokenizer.maybe_create(tok, budget)
+        seg._verified = seg_mod._VERIFY_FIRST
+        rng = random.Random(15)
+        for _ in range(12):
+            p = _long_conversation(rng, 4) + "<|Assistant|>"
+            assert seg._encode_cached(p) == tok.encode(p)
+            assert seg._lru.bytes <= budget
+        return seg
+
+    held, seg = _retained_by(fill)
+    assert _stored(seg)
+    assert held <= 1.5 * budget, held
 
 
 def test_concurrent_turns_stay_exact(tok):
     """Threads advancing conversations that share a start: lookups, stores
-    and evictions interleave."""
-    import threading
+    and evictions interleave. A worker's exception fails the test."""
+    from concurrent.futures import ThreadPoolExecutor
 
-    seg = SegmentTokenizer.maybe_create(tok, 60_000)
+    seg = SegmentTokenizer.maybe_create(tok, 400_000)
     seg._verified = seg_mod._VERIFY_FIRST
     common = _long_conversation(random.Random(16), 2)
-    errors = []
 
     def worker(i):
         rng = random.Random(100 + i)
         p = common + "<|User|>" + _text(rng, 20)
         for _ in range(8):
             ask = p + "<|Assistant|>"
-            if seg._encode_segments(ask) != tok.encode(ask):
-                errors.append(i)
+            assert seg._encode_cached(ask) == tok.encode(ask), i
             p += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 15)
+        return i
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(60)
-    assert not errors
-    assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
+    with ThreadPoolExecutor(6) as pool:
+        futures = [pool.submit(worker, i) for i in range(6)]
+        assert sorted(f.result(timeout=120) for f in futures) == list(range(6))
+    assert seg._lru.bytes <= 400_000
+    assert seg._lru.bytes == sum(c for _, c in seg._lru._items.values())
 
 
 def test_added_token_heavy_prefixes_stay_within_the_budget(tok):
     """Many added tokens mean many retained cut positions."""
-    seg = SegmentTokenizer.maybe_create(tok, 30_000)
-    seg._verified = seg_mod._VERIFY_FIRST
-    rng = random.Random(17)
-    for _ in range(6):
-        p = "<|begin|>" + _text(rng, 3000) + "<|User|>x" * 3000 + "<|Assistant|>"
-        assert seg._encode_segments(p) == tok.encode(p)
-        held = sum(
-            e.ids.nbytes + sys.getsizeof(e.text) + e.cut_chars.nbytes + e.cut_ids.nbytes
-            for e in seg._prefixes.values()
-        )
-        assert held <= 4 * 30_000
+    budget = 400_000
+
+    def fill():
+        seg = SegmentTokenizer.maybe_create(tok, budget)
+        seg._verified = seg_mod._VERIFY_FIRST
+        rng = random.Random(17)
+        for _ in range(6):
+            p = "<|begin|>" + _text(rng, 3000) + "<|User|>x" * 3000 + "<|Assistant|>"
+            assert seg._encode_cached(p) == tok.encode(p)
+        return seg
+
+    held, seg = _retained_by(fill)
+    assert seg._lru.bytes <= budget
+    assert held <= 1.5 * budget, held
 
 
 def test_prefix_reuse_is_off_when_a_raw_token_overlaps_a_normalized_ones_end():
@@ -433,8 +478,8 @@ def test_prefix_reuse_is_off_when_a_raw_token_overlaps_a_normalized_ones_end():
     seg._verified = seg_mod._VERIFY_FIRST
     rng = random.Random(18)
     p = "<|User|>" + _text(rng, 3000) + "ab"
-    assert seg._encode_segments(p) == tok.encode(p)
-    assert seg._encode_segments(p + "c") == tok.encode(p + "c")
+    assert seg._encode_cached(p) == tok.encode(p)
+    assert seg._encode_cached(p + "c") == tok.encode(p + "c")
 
 
 def test_a_prompt_spelling_a_whole_added_token_is_still_split():
@@ -451,7 +496,69 @@ def test_a_prompt_spelling_a_whole_added_token_is_still_split():
     assert seg is not None
     seg._verified = seg_mod._VERIFY_FIRST
     for prompt in (long_tok, "y" + long_tok, long_tok + "z"):
-        assert seg._encode_segments(prompt) == tok.encode(prompt), prompt[-20:]
+        assert seg._encode_cached(prompt) == tok.encode(prompt), prompt[-20:]
+
+
+def test_byte_lru_charges_overhead_and_evicts_oldest():
+    from atom.model_engine.byte_lru import ENTRY_OVERHEAD, ByteLRU
+
+    evicted = []
+    lru = ByteLRU(3 * (ENTRY_OVERHEAD + 10), on_evict=lambda k, v: evicted.append(k))
+    for k in "abc":
+        lru.put(k, k, 10)
+    assert lru.get("a") == "a"  # a is now the most recent
+    lru.put("d", "d", 10)
+    assert evicted == ["b"] and "b" not in lru
+    assert lru.bytes == 3 * (ENTRY_OVERHEAD + 10)
+    lru.put("huge", "x", 10**9)  # larger than the budget: not kept
+    assert "huge" not in lru and lru.bytes <= lru.budget
+    assert lru.pop("a") == "a" and evicted == ["b"]  # pop does not notify
+
+
+def test_shared_chars_finds_the_first_difference():
+    from atom.model_engine.segment_tokenizer import _shared_chars
+
+    rng = random.Random(19)
+    a = "".join(rng.choice("ab") for _ in range(300_000))
+    for n in (0, 1, 65_535, 65_536, 65_537, 200_001, 299_999):
+        b = a[:n] + ("x" if n < len(a) else "") + a[n + 1 :]
+        assert _shared_chars(a, b, len(a)) == n
+    assert _shared_chars(a, a, len(a)) == len(a)
+    assert _shared_chars(a, a, 1234) == 1234
+
+
+def test_hashing_encoding_and_assembly_run_outside_the_lock(tok, monkeypatch):
+    """The lock guards lookups and bookkeeping only; work that grows with
+    the prompt must not hold it."""
+    import hashlib
+
+    import numpy as np
+
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    real_hash, real_concat = hashlib.blake2b, np.concatenate
+    real_batch = seg._split.backend.encode_batch
+    held = []
+
+    def watch(fn):
+        def wrapped(*a, **kw):
+            held.append(seg._lock.locked())
+            return fn(*a, **kw)
+
+        return wrapped
+
+    monkeypatch.setattr(seg_mod.hashlib, "blake2b", watch(real_hash))
+    monkeypatch.setattr(seg_mod.np, "concatenate", watch(real_concat))
+    monkeypatch.setattr(
+        seg._split, "backend", MagicMock(encode_batch=watch(real_batch))
+    )
+    rng = random.Random(20)
+    prompt = _long_conversation(rng, 6)
+    for _ in range(3):
+        ask = prompt + "<|Assistant|>"
+        assert seg._encode_cached(ask) == tok.encode(ask)
+        prompt += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
+    assert held and not any(held)
 
 
 def test_verification_window_is_bounded():
