@@ -1,19 +1,5 @@
 # DeepSeek-V4 Usage Guide
 
-V4-Pro TP8 Mono decode uses the existing `ATOM_MONO_ENABLE` switch, enabled by
-default; `ATOM_MONO_ENABLE=0` keeps the native path. Its model wrapper is
-installed after weight and drafter loading, like V4.1. Eligible ordinary decode
-request widths are 1/2/4; MTP3 target verification supports widths 1/2. Both
-require FP8 KV, FP4 index, and prefix caching disabled. Both accept the native
-default `use_index_cache=false`, `index_topk_freq=1`; no `--hf-overrides` is
-needed for that schedule. Ordinary decode also supports `use_index_cache=true`
-with `index_topk_freq=4` and no custom `index_topk_pattern`. Mono binds the
-native model's resolved index schedule without changing it.
-DSpark Mono remains disabled in production. Deployment and step contracts live
-in `atom/models/deepseek_v4/mono/profile.py`. V4 prepares packed weights before
-KV allocation and publishes rotating cache state through its private serving
-integration. Unsupported deployments and steps use the existing native path.
-
 [DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro) is a million-token-context Mixture-of-Experts (MoE) large language model from DeepSeek. It builds on the V3.2 architecture with hash-based expert routing (3 hash layers + sigmoid + bias), a Compressed Sparse Attention (CSA) indexer that selects top-1024 prior tokens per query, and Multi-Latent Attention (MLA) with LoRA-compressed QKV projections. Weights are stored natively in FP8 (E4M3) with UE8M0 block-scaled scales. ATOM ships built-in support via the `DeepseekV4ForCausalLM` architecture — no `--trust-remote-code` is needed.
 
 ## Preparing environment
@@ -165,7 +151,7 @@ Override knobs (escape hatches, normally not needed):
 
 #### Auto-detection logic
 
-The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4/__init__.py)):
+The routed-expert quant spec is resolved in this priority order (see [`_detect_v4_routed_quant_spec`](../atom/models/deepseek_v4.py)):
 
 1. **HF config `expert_dtype`** — if `config.json` declares `expert_dtype` (e.g. `"fp8"` / `"fp4"`), use it directly.
 2. **Parser-derived layer spec** — if the ckpt's `quantization_config.layer_quant_config` (Quark) or global config (compressed-tensors / generic) directly produces a per-layer spec for `ffn.experts.*.w*`, that wins.

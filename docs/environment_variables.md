@@ -144,7 +144,7 @@ cannot affect a server that does not use the feature.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, DeepSeek-V4 and DeepSeek-V4.1 deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. |
+| **ATOM_MONO_ENABLE** | bool | 1 (true) | Enable fused decode for supported GLM-5.2, Kimi-K3, MiniMax-M3, and DeepSeek-V4.1 deployments and step geometries. Unsupported configurations and forwards keep the production path; `0` disables every Mono runner. |
 
 ### MiniMax-M3
 
@@ -322,7 +322,7 @@ from `GPU_MAX_HW_QUEUES`, not from where the forks sit.
 
 ## V4 attention backend (Migration)
 
-Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4/__init__.py`
+Selects between the legacy per-seq Python dispatch path in `atom/models/deepseek_v4.py`
 and the new batched `V4AttentionBackend` (`atom/model_ops/v4_attention_backend.py`).
 The new backend removes ~256 GPU→CPU `.item()` syncs per forward and is required
 to enable CUDAGraph capture for V4. Legacy stays available during PR-A migration
