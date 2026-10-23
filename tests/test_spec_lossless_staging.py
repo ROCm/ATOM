@@ -82,9 +82,11 @@ def batch(req_ids, temperatures=None, *, dummy=False):
     )
 
 
-def stage(prop, b, *, has_filter=False):
+def stage(prop, b, *, has_filter=False, verifiable=True):
     g = group(prop)
-    prop.stage_draft_sampling_host(b, len(b.req_ids), g, has_filter=has_filter)
+    prop.stage_draft_sampling_host(
+        b, len(b.req_ids), g, has_filter=has_filter, drafts_verifiable=verifiable
+    )
     return {name: g.counts[g.indices[name]] for name in LOSSLESS}
 
 
@@ -127,7 +129,9 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
     assert prop.draft_probs_row_base(["a"]) is None
     # Staging is a no-op rather than an error.
-    prop.stage_draft_sampling_host(batch(["a"]), 1, None, has_filter=False)
+    prop.stage_draft_sampling_host(
+        batch(["a"]), 1, None, has_filter=False, drafts_verifiable=True
+    )
 
 
 def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
@@ -155,6 +159,18 @@ def test_a_verify_finds_the_rows_its_drafts_were_written_to(monkeypatch):
     assert verify(prop)[:3] == [drafted["c"], -1, drafted["a"]]
     # The same requests draft back into the rows they own.
     assert dest(prop)[0] == drafted["c"] and dest(prop)[2] == drafted["a"]
+
+
+def test_a_dummy_forward_claims_nothing_and_verifies_nothing(monkeypatch):
+    """Warmup and DP dummies carry ids 0..n-1 and -1; none may enter the map,
+    or a real request 0 would later verify against a dummy's q."""
+    prop = proposer(monkeypatch)
+    stage(prop, batch([0, 1, -1], dummy=True), verifiable=False)
+    assert dest(prop)[:3] == [-1, -1, -1] and verify(prop)[:3] == [-1, -1, -1]
+    assert len(prop._q_slots) == 0
+    # A real request 0 afterwards has no q to verify.
+    stage(prop, batch([0]))
+    assert verify(prop)[0] == -1
 
 
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):

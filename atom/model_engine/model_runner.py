@@ -2733,7 +2733,13 @@ class ModelRunner:
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
             drafter.stage_draft_sampling_host(
-                batch, bs, group, has_filter=bool(needs_topk or needs_topp)
+                batch,
+                bs,
+                group,
+                has_filter=bool(needs_topk or needs_topp),
+                # A dummy forward's drafts are dropped, so it must not claim q
+                # slots or write q.
+                drafts_verifiable=not batch.is_dummy_run,
             )
         if publication_group is None:
             group.publish(counts)

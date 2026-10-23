@@ -246,7 +246,7 @@ class DSparkProposer(Drafter):
         return self._q_store
 
     def stage_draft_sampling_host(
-        self, batch, bs: int, group, *, has_filter: bool
+        self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool
     ) -> None:
         """Stage this step's draft sampling inputs and both q row bases.
 
@@ -258,6 +258,11 @@ class DSparkProposer(Drafter):
         ``has_filter``: some row carries top-k or top-p. Such a batch drafts
         greedily, the whole of it, because the verify drops it to exact-match
         acceptance batch-wide (`ModelRunner.postprocess`).
+
+        ``drafts_verifiable``: this step's propose emits drafts a later verify
+        may read. False for a dummy forward, whose drafts are dropped: it
+        claims no slot and writes no q, so its ids (warmup's 0..n-1, the DP
+        dummy's -1) never enter the slot map.
         """
         if self.draft_sampling is None:
             return
@@ -280,13 +285,16 @@ class DSparkProposer(Drafter):
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may expire a request of this same
         # batch, whose verify must still read the slot its drafts came from.
-        self._q_slots.verify_bases(req_ids, verify.np)
+        if batch.is_dummy_run:
+            verify.np[:bs] = -1
+        else:
+            self._q_slots.verify_bases(req_ids, verify.np)
         # Every row the block runs must name a destination, the pad rows up to
         # `running_bs` included, and a pad row left holding a larger previous
         # batch's base would write its q into a live request's slot. So clear
         # back down to wherever the last claim reached.
         hi = max(bs, self._draft_row_base_hi)
-        if bs:
+        if drafts_verifiable and bs:
             self._q_slots.claim_bases(req_ids, dest.np)
             dest.np[bs:hi] = -1
             self._draft_row_base_hi = bs
