@@ -4,7 +4,7 @@
 
 import logging
 
-from atom.model_ops.qwen4_exp.qsa_attention import Qwen4ExpQSAPrepared
+from atom.models.qwen4_exp_mono.native_qsa import PreparedQsa, prepare
 from atom.mono.runtime.compare import compare
 
 logger = logging.getLogger("atom")
@@ -186,11 +186,9 @@ def qsa_reference(
     mono_raw,
     ref_raw,
 ):
-    prepared = Qwen4ExpQSAPrepared(
-        seam.gate, seam.query, step.metadata, seam.index_query
-    )
+    prepared = PreparedQsa(seam.gate, seam.query, step.metadata, seam.index_query)
     mono_cache = qsa_cache_rows(step, clone=True)
-    reference = layer.self_attn.prepare(positions, mixed)
+    reference = prepare(layer.self_attn, positions, mixed)
     check_qsa_pre(
         rank,
         layer_id,

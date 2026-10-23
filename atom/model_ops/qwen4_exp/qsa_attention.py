@@ -32,7 +32,6 @@ arithmetically once the group is behind the current chunk. That is what
 raw index keys so pooling can read them back.
 """
 
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import aiter
@@ -50,7 +49,6 @@ from atom.model_ops.qwen4_exp.ops.gated import sigmoid_mul
 from atom.model_ops.qwen4_exp.ops.qsa import (
     qsa_apply_mrope,
     qsa_compress_groups,
-    qsa_norm_rope_cache,
     qsa_select_paged_tokens,
     qsa_sparse_paged_gqa,
     qsa_store_rows,
@@ -179,25 +177,6 @@ class Qwen4ExpIndexer(nn.Module):
         return keys
 
 
-@dataclass(frozen=True)
-class Qwen4ExpQSAPrepared:
-    """Native K1 -> K2 seam for one QSA layer.
-
-    The native path keeps this as tensor views.  Qwen MonoKernel owns the same
-    fields in graph-stable buffers, allowing K1 to move into FlyDSL without
-    repeating projections or cache writes in the temporary native K2 path.
-    """
-
-    gate: torch.Tensor
-    query: torch.Tensor
-    qsa: object | None
-    index_query: torch.Tensor | None
-    key: torch.Tensor | None = None
-    value: torch.Tensor | None = None
-    hidden_states: torch.Tensor | None = None
-    positions: torch.Tensor | None = None
-
-
 class Qwen4ExpAttention(nn.Module):
     """Full attention with QSA selection, owning its three paged caches."""
 
@@ -316,13 +295,13 @@ class Qwen4ExpAttention(nn.Module):
         self.compressed_key_cache = compressed_key_cache
         self.rope_position_cache = rope_position_cache
 
-    def _prepare_index(
+    def _select_tokens(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         qsa,
     ) -> torch.Tensor:
-        """Project the index plane and publish its raw/compressed cache rows."""
+        """Update both index caches, then return the per-token selection."""
         index_q, raw_key = self.indexer.project_qk(hidden_states, positions)
         qsa_store_rows(self.raw_key_cache, qsa.slot_mapping, raw_key)
         if self.rope_position_cache is not None:
@@ -348,11 +327,6 @@ class Qwen4ExpAttention(nn.Module):
             self.compressed_key_cache, qsa.compressed_slot_mapping, normalized
         )
 
-        return index_q
-
-    def _select_prepared(self, index_q: torch.Tensor, qsa) -> torch.Tensor:
-        """Start QSA K2 from the query and caches published by K1."""
-
         return qsa_select_paged_tokens(
             index_q,
             self.compressed_key_cache,
@@ -363,68 +337,34 @@ class Qwen4ExpAttention(nn.Module):
             self.indexer.token_topk,
             self.indexer.compress_ratio,
             max_seq_len=qsa.max_seq_len,
-            allow_flydsl=bool(
-                getattr(get_forward_context().context, "is_prefill", False)
-            ),
+            allow_flydsl=get_forward_context().context.is_prefill,
         )
 
-    def _select_tokens(
-        self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        qsa,
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Compatibility entry for callers that still execute K1 and K2 together."""
-
-        return Qwen4ExpAttention._select_prepared(
-            self,
-            Qwen4ExpAttention._prepare_index(self, hidden_states, positions, qsa),
-            qsa,
-        )
-
-    def prepare(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        *,
-        fuse_norm_rope_cache: bool = False,
-    ) -> Qwen4ExpQSAPrepared:
-        """Prepare QSA projections and caches, with an optional Mono batch front."""
-
         num_tokens = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)
         gate, q, k, v = qkv.split(
             [self.q_size, self.q_size, self.kv_size, self.kv_size], -1
         )
+        # Normalization and cache writes accept packed token strides without copies.
+        q, k = self.qk_norm(q, k)
+        query, key = qsa_apply_mrope(
+            self.rotary_emb,
+            positions,
+            q.view(num_tokens, self.num_heads, self.head_dim),
+            k.view(num_tokens, self.num_kv_heads, self.head_dim),
+        )
+        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         forward_context = get_forward_context()
         qsa = forward_context.attn_metadata.qsa_metadata
-        if qsa is not None:
-            qsa = qsa.for_tokens(num_tokens)
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        if fuse_norm_rope_cache and qsa is not None:
-            query = qsa_norm_rope_cache(
-                q.view(num_tokens, self.num_heads, self.head_dim),
-                k.view(num_tokens, self.num_kv_heads, self.head_dim),
-                value,
-                self.qk_norm,
-                self.rotary_emb,
-                positions,
-                self.k_cache,
-                self.v_cache,
-                qsa.slot_mapping,
+        if qsa is None:
+            attn_out = self._profile_attention(
+                query, key, value, hidden_states, positions
             )
         else:
-            q, k = self.qk_norm(q, k)
-            query, key = qsa_apply_mrope(
-                self.rotary_emb,
-                positions,
-                q.view(num_tokens, self.num_heads, self.head_dim),
-                k.view(num_tokens, self.num_kv_heads, self.head_dim),
-            )
-            if qsa is None:
-                return Qwen4ExpQSAPrepared(
-                    gate, query, None, None, key, value, hidden_states, positions
-                )
+            qsa = qsa.for_tokens(num_tokens)
             aiter.reshape_and_cache_flash(
                 key,
                 value,
@@ -435,78 +375,24 @@ class Qwen4ExpAttention(nn.Module):
                 self._unit_scale,
                 self._unit_scale,
             )
-        index_query = self._prepare_index(hidden_states, positions, qsa)
-        return Qwen4ExpQSAPrepared(gate, query, qsa, index_query)
-
-    def attend(
-        self,
-        prepared: Qwen4ExpQSAPrepared,
-        selected: torch.Tensor | None = None,
-        output_gate: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Run QSA selection and attention from the prepared K1 seam."""
-
-        if prepared.qsa is None:
-            if any(
-                value is None
-                for value in (
-                    prepared.key,
-                    prepared.value,
-                    prepared.hidden_states,
-                    prepared.positions,
-                )
-            ):
-                raise RuntimeError("profile QSA seam is missing K1 tensors")
-            attn_out = self._profile_attention(
-                prepared.query,
-                prepared.key,
-                prepared.value,
-                prepared.hidden_states,
-                prepared.positions,
-            )
-        else:
-            if prepared.index_query is None:
-                raise RuntimeError("decode QSA seam is missing the index query")
-            if selected is None:
-                selected = self._select_prepared(prepared.index_query, prepared.qsa)
-            forward_context = get_forward_context()
+            selected = self._select_tokens(hidden_states, positions, qsa)
             attn_out = qsa_sparse_paged_gqa(
-                prepared.query,
+                query,
                 self.k_cache,
                 self.v_cache,
                 selected,
-                prepared.qsa.block_tables,
-                prepared.qsa.token_to_req,
+                qsa.block_tables,
+                qsa.token_to_req,
                 softmax_scale=self.scaling,
                 num_decode_requests=(
                     None
                     if forward_context.context.is_prefill
-                    else prepared.qsa.block_tables.shape[0]
+                    else qsa.block_tables.shape[0]
                 ),
-                output_gate=output_gate,
             )
 
-        return attn_out
-
-    def finish(
-        self,
-        prepared: Qwen4ExpQSAPrepared,
-        selected: torch.Tensor | None = None,
-        *,
-        gate_in_attention: bool = False,
-    ) -> torch.Tensor:
-        """Apply the native output gate and projection to QSA attention."""
-        fuse_gate = gate_in_attention and prepared.qsa is not None
-        attn_out = self.attend(prepared, selected, prepared.gate if fuse_gate else None)
-        gated = attn_out.reshape(prepared.gate.shape[0], -1)
-        if not fuse_gate:
-            gated = sigmoid_mul(gated, prepared.gate)
+        gated = sigmoid_mul(attn_out.reshape(num_tokens, -1), gate)
         return self.o_proj(gated)
-
-    def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        return self.finish(self.prepare(positions, hidden_states))
 
     def _profile_attention(self, query, key, value, hidden_states, positions):
         """Exercise real indexer, cache and sparse workspaces before pool sizing.

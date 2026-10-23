@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from atom.models.qwen4_exp_mono.shapes import (
     QSA_COMPRESS_RATIO,
-    QSA_DIRECT_CONTEXT,
     QSA_INDEX_BUDGET,
 )
 
@@ -16,18 +15,6 @@ INDEX_SEGMENT = 2048
 INDEX_GROUPS_PER_TASK = 16
 SELECTED_GROUPS = QSA_INDEX_BUDGET // QSA_COMPRESS_RATIO
 SELECT_FAN = INDEX_SEGMENT // SELECTED_GROUPS
-
-
-def context_buckets(max_model_len: int) -> tuple[int, ...]:
-    return tuple(
-        sorted(
-            {
-                min(QSA_DIRECT_CONTEXT, max_model_len),
-                min(QSA_INDEX_BUDGET, max_model_len),
-                max_model_len,
-            }
-        )
-    )
 
 
 @dataclass(frozen=True)

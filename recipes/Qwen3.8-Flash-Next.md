@@ -100,18 +100,21 @@ layouts fuse MLP HC up with the MoE front. TP8 B2 keeps separate HC and front
 launches. Batch GDN combines recurrence and norm without a global core buffer.
 QSA retains native projections, selection/index-cache preparation and sparse
 attention. Batch Q/K norm, mRoPE and K/V publication share one kernel; TP1
-folds the output gate into split-K attention reduction, while TP8 stages it
+uses the native attention reduction and output gate, while TP8 stages the gate
 into output projection LDS. Collectives retain their native implementation.
 MTP and plugin serving are outside this Mono deployment contract.
 Use prefix caching disabled for the validated configuration. Mono sizes its
-QSA scores, candidate lists and graph buckets from `--max-model-len`, within
+QSA scores and candidate lists from `--max-model-len`, within
 the checkpoint's context capacity. TP1 uses a fixed-LDS exact selection tree
 when that capacity exceeds 8,192 tokens; 8,192 remains a selection segment,
 not a deployment limit. Resource admission still applies to each build.
-TP8 retains native sparse attention above 256 tokens.
+TP8 retains native sparse attention when the metadata context bound exceeds
+256 tokens. Native FULL capture sets this bound to the deployment capacity,
+so its captured QSA seam remains safe across short and long request contexts.
 
 For single-request decode, TP1 uses one shared GDN launcher for ordinary and PLE layers and two-launch
-QSA, with separate short/full context graphs. TP8 uses rank-local attention, in-kernel reductions and expert-owned
+QSA. FULL graphs use the native batch/query-length keys and the deployment
+context capacity; no context-dependent capture policy is added to the engine. TP8 uses rank-local attention, in-kernel reductions and expert-owned
 MoE. For QSA contexts above 256 tokens, TP8 keeps native sparse attention and
 its attention all-reduce between Mono projection and finish kernels.
 
@@ -136,8 +139,8 @@ QSA K1/K2 share composition factories, and GDN K2 shares the TP8 finish
 factory. S1 and batch launchers share static weight bindings, while native
 metadata and state views bind per step. Immutable layer records retain module
 and weight ownership. `MonoState` owns persistent S1 buffers; per-width builds
-own named batch workspaces. `WidthBuilds` compiles and checks resources before
-TP agreement and caching, and remembers a refusal for that width only.
+own named batch workspaces. The Qwen build factory compiles and validates its kernel resources before
+`WidthBuilds` performs TP agreement and caching, and remembers a refusal for that width only.
 `PERSISTENT_ROWS=(1,)` and `BATCH_ROWS=(2,4)` distinguish the two schedules;
 both serve ordinary one-token-per-request decode.
 Kernel dimensions live in `shapes.py`/`dims.py`; deployment checks live in

@@ -18,7 +18,7 @@ from atom.models.qwen4_exp_mono.shapes import (
 class TP1Build:
     gdn_layer: object
     qsa_pre: object
-    qsa_post: dict[int, object]
+    qsa_post: object
 
 
 class TP1Execution(LayerExecution):
@@ -29,22 +29,11 @@ class TP1Execution(LayerExecution):
             return batch.build(tokens, self.runner.device, tp=1)
         gdn = gdn_layer.build_gdn_layer(self.runner._build_key(tokens, LayerKind.GDN))
         pre = qsa_pre.build_qsa_pre(self.runner._build_key(tokens, LayerKind.QSA))
-        # Context buckets share one launcher for each numerical schedule.
-        posts = {}
-        for context in self.runner.context_buckets:
-            direct = context <= QSA_DIRECT_CONTEXT
-            if direct not in posts:
-                posts[direct] = qsa_post.build_qsa_post(
-                    self.runner._build_key(tokens, LayerKind.QSA), direct=direct
-                )
-        return TP1Build(
-            gdn,
-            pre,
-            {
-                context: posts[context <= QSA_DIRECT_CONTEXT]
-                for context in self.runner.context_buckets
-            },
+        post = qsa_post.build_qsa_post(
+            self.runner._build_key(tokens, LayerKind.QSA),
+            direct=self.runner.max_model_len <= QSA_DIRECT_CONTEXT,
         )
+        return TP1Build(gdn, pre, post)
 
     @staticmethod
     def kernels(build):
@@ -53,14 +42,10 @@ class TP1Execution(LayerExecution):
         return [
             (build.gdn_layer, gdn_layer.ABI),
             (build.qsa_pre, qsa_pre.ABI),
-            *[
-                (launcher, qsa_post.ABI)
-                for launcher in dict.fromkeys(build.qsa_post.values())
-            ],
+            (build.qsa_post, qsa_post.ABI),
         ]
 
-    @staticmethod
-    def check_resources(build, tokens):
+    def check_resources(self, build, tokens):
         if isinstance(build, batch.BatchBuild):
             contract.check_batch(build)
             return
@@ -70,18 +55,12 @@ class TP1Execution(LayerExecution):
         contract.check_launcher(
             build.qsa_pre, max_sgpr_spill=contract.sgpr_spill_limit(tokens, "qsa_pre")
         )
-        for launcher in dict.fromkeys(build.qsa_post.values()):
-            # The shared launcher is compiled for deployment capacity.
-            context = max(
-                context
-                for context, bound in build.qsa_post.items()
-                if bound is launcher
-            )
-            stage = (
-                "qsa_direct"
-                if context <= QSA_DIRECT_CONTEXT
-                else "qsa_full" if context <= 8192 else "qsa_tree"
-            )
-            contract.check_launcher(
-                launcher, max_sgpr_spill=contract.sgpr_spill_limit(tokens, stage)
-            )
+        capacity = self.runner.max_model_len
+        stage = (
+            "qsa_direct"
+            if capacity <= QSA_DIRECT_CONTEXT
+            else "qsa_full" if capacity <= 8192 else "qsa_tree"
+        )
+        contract.check_launcher(
+            build.qsa_post, max_sgpr_spill=contract.sgpr_spill_limit(tokens, stage)
+        )

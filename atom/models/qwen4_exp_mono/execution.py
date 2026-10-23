@@ -5,7 +5,6 @@
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
-from atom.model_ops.qwen4_exp.qsa_attention import Qwen4ExpQSAPrepared
 from atom.models.qwen4_exp_mono import batch
 from atom.models.qwen4_exp_mono.check import (
     check_finish,
@@ -34,8 +33,9 @@ from atom.models.qwen4_exp_mono.launch_args import (
 from atom.models.qwen4_exp_mono.launch_args import (
     pointer as p,
 )
+from atom.models.qwen4_exp_mono.native_qsa import PreparedQsa
+from atom.models.qwen4_exp_mono.native_qsa import finish as finish_qsa
 from atom.models.qwen4_exp_mono.shapes import QSA_DIRECT_CONTEXT
-from atom.utils.forward_context import get_forward_context
 
 
 class LayerExecution:
@@ -272,7 +272,7 @@ class LayerExecution:
         values = self.finish_values(layer_id, weights, streams, raw, view)
         values["scratch"] = p(view.qsa_post_scratch)
         if self.distributed and step.max_seq_len > QSA_DIRECT_CONTEXT:
-            prepared = Qwen4ExpQSAPrepared(
+            prepared = PreparedQsa(
                 view.qsa.gate, view.qsa.query, step.metadata, view.qsa.index_query
             )
             attn_out = tensor_model_parallel_all_reduce(
@@ -295,15 +295,9 @@ class LayerExecution:
                 )
                 self.launch(build.tp8_qsa_k2, qsa_tp8.K2_ABI, values)
             else:
-                metadata = get_forward_context().attn_metadata.qsa_metadata
-                context = next(
-                    b
-                    for b in self.runner.context_buckets
-                    if int(metadata.max_seq_len) <= b
-                )
-                self.launch(build.qsa_post[context], qsa_post.ABI, values)
+                self.launch(build.qsa_post, qsa_post.ABI, values)
         if self.runner.check:
-            reference_attn = layer.self_attn.finish(reference)
+            reference_attn = finish_qsa(layer.self_attn, reference)
             if self.distributed:
                 reference_attn = tensor_model_parallel_all_reduce(reference_attn)
             check_qsa_post(self.runner.rank, layer_id, attn_out, reference_attn)

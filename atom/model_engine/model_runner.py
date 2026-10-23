@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import time
-from bisect import bisect_left
 from contextlib import contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
@@ -3216,15 +3215,7 @@ class ModelRunner:
                     logits = self.model.compute_logits(hidden_states)
                     return logits, hidden_states
 
-                max_q_len = forward_context.attn_metadata.max_seqlen_q
-                graph_key = (running_bs, max_q_len)
-                context_buckets = getattr(self, "_cudagraph_context_buckets", ())
-                if context_buckets:
-                    max_context_len = int(forward_context.attn_metadata.max_seqlen_k)
-                    context_bucket = context_buckets[
-                        bisect_left(context_buckets, max_context_len)
-                    ]
-                    graph_key = (running_bs, max_q_len, context_bucket)
+                graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
                 self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
@@ -4114,27 +4105,8 @@ class ModelRunner:
         build_capture = self.attn_metadata_builder.build_for_cudagraph_capture
         _build_params = inspect.signature(build_capture).parameters
         supports_dynamic_q_len = "max_q_len" in _build_params
-        supports_dynamic_context = "max_context_len" in _build_params
         # Whether it supports a ragged num_tokens_pad (zero-copy-q attn-core graphs).
         supports_ragged_capture = "num_tokens_pad" in _build_params
-        context_buckets = tuple(
-            sorted(
-                set(
-                    getattr(
-                        self.attn_metadata_builder,
-                        "cudagraph_context_buckets",
-                        (),
-                    )
-                )
-            )
-        )
-        if context_buckets and not supports_dynamic_context:
-            raise RuntimeError(
-                "attention metadata declares context graph buckets but its "
-                "capture builder has no max_context_len parameter"
-            )
-        self._cudagraph_context_buckets = context_buckets
-        capture_contexts = context_buckets or (None,)
 
         raw_build_capture = build_capture
 
@@ -4165,11 +4137,7 @@ class ModelRunner:
                 raise
 
         with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
-            for max_q_len, max_context_len in (
-                (q_len, context_len)
-                for q_len in q_buckets
-                for context_len in capture_contexts
-            ):
+            for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
                     if self.rank == 0
@@ -4177,12 +4145,7 @@ class ModelRunner:
                 )
                 for bs in capture_range:
                     if self.rank == 0:
-                        suffix = (
-                            "" if max_context_len is None else f", {max_context_len=}"
-                        )
-                        capture_range.set_description(
-                            f"Capturing {bs=}, {max_q_len=}{suffix}"
-                        )
+                        capture_range.set_description(f"Capturing {bs=}, {max_q_len=}")
 
                     num_tokens = bs * max_q_len
                     if _piecewise and self._piecewise_skip_capture(num_tokens):
@@ -4192,13 +4155,12 @@ class ModelRunner:
                     # its handful of Python statements just fold into the next
                     # iteration's window.
                     self._capture_trace_tag = f"bs_{bs}_q_{max_q_len}"
-                    capture_args = {"bs": bs}
                     if supports_dynamic_q_len:
-                        capture_args["max_q_len"] = max_q_len
-                    if max_context_len is not None:
-                        capture_args["max_context_len"] = max_context_len
-                        self._capture_trace_tag += f"_ctx_{max_context_len}"
-                    attn_metadata, context = build_capture(**capture_args)
+                        attn_metadata, context = build_capture(
+                            bs=bs, max_q_len=max_q_len
+                        )
+                    else:
+                        attn_metadata, context = build_capture(bs=bs)
                     if self.use_mrope:
                         mrope_positions = self._mrope_positions_view(num_tokens)
                         mrope_positions.copy_(
@@ -4323,12 +4285,9 @@ class ModelRunner:
                                     )
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()
-                    graph_key = (bs, max_q_len)
-                    if max_context_len is not None:
-                        graph_key = (bs, max_q_len, max_context_len)
-                    self.graphs[graph_key] = graph
+                    self.graphs[(bs, max_q_len)] = graph
                     if self.logits_in_graph and ubatch_slices is None:
-                        self.graph_logits[graph_key] = graph_logits
+                        self.graph_logits[(bs, max_q_len)] = graph_logits
                     torch.cuda.synchronize()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the

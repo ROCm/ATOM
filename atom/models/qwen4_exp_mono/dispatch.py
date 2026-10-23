@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from atom.models.qwen4_exp_mono.config import config_refusal, enabled_widths
-from atom.models.qwen4_exp_mono.qsa_plan import context_buckets
 from atom.mono.runtime.consensus import MonoUnsupported
 from atom.mono.runtime.route import LazyRunner
 from atom.utils.forward_context import get_forward_context
@@ -105,8 +104,10 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
         logger.info("Qwen mono off: %s", why)
         return model
     if metadata_builder is not None:
-        metadata_builder.cudagraph_context_buckets = context_buckets(
-            atom_config.max_model_len
+        from atom.models.qwen4_exp_mono.cache import MonoCacheBuilder
+
+        metadata_builder.model_runner.attn_metadata_builder = MonoCacheBuilder(
+            metadata_builder
         )
     return MonoDecodeModel(
         model, atom_config.tensor_parallel_size, atom_config.max_model_len

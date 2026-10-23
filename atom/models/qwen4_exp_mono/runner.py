@@ -19,7 +19,6 @@ from atom.models.qwen4_exp_mono.plan import (
     MonoBuild,
     make_plan,
 )
-from atom.models.qwen4_exp_mono.qsa_plan import context_buckets
 from atom.models.qwen4_exp_mono.shapes import SUPPORTED_TP
 from atom.models.qwen4_exp_mono.state import MonoState
 from atom.models.qwen4_exp_mono.step_meta import (
@@ -30,6 +29,7 @@ from atom.models.qwen4_exp_mono.tp1 import TP1Execution
 from atom.models.qwen4_exp_mono.tp8 import TP8Execution
 from atom.models.qwen4_exp_mono.weights import bind_model
 from atom.mono.plan.execution import BLOCKS
+from atom.mono.runtime.compile import compile_kernels
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.widths import WidthBuilds
 from atom.utils import envs
@@ -44,7 +44,6 @@ class QwenMonoRunner:
     def __init__(self, model, max_model_len=8192) -> None:
         self.model = model
         self.max_model_len = max_model_len
-        self.context_buckets = context_buckets(max_model_len)
         self.rank = get_tensor_model_parallel_rank()
         self.tp = get_tensor_model_parallel_world_size()
         self.group = get_tp_group().cpu_group
@@ -57,7 +56,6 @@ class QwenMonoRunner:
             self.execution.kernels,
             self.group,
             "Qwen mono",
-            validate=self.execution.check_resources,
         )
         self._closed = False
         self._running = False
@@ -101,7 +99,10 @@ class QwenMonoRunner:
     def _build_width(self, tokens: int):
         if tokens not in enabled_widths(self.tp):
             raise ValueError(f"Qwen MonoKernel has no {tokens}-token build")
-        return self.execution.build(tokens)
+        built = self.execution.build(tokens)
+        compile_kernels(self.execution.kernels(built))
+        self.execution.check_resources(built, tokens)
+        return built
 
     def prepare(self, tokens: int) -> bool:
         if tokens not in enabled_widths(self.tp):

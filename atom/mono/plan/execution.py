@@ -12,14 +12,6 @@ THREADS = 512
 WAVES = THREADS // 64
 LDS_BYTES = 160 * 1024  # a CU's LDS: one CTA's whole
 
-# Every persistent CTA owns eight waves, two on each of a CU's four execution
-# units.  Keep the compiler occupancy cap explicit: register-lifetime changes
-# must not silently make a second polling CTA resident on the same CU.
-PERSISTENT_VALUE_ATTRS = {
-    "rocdl.waves_per_eu": WAVES // 4,
-    "rocdl.flat_work_group_size": f"{THREADS},{THREADS}",
-}
-
 
 def first_task(bid, base):
     """CTA ``bid``'s first task of a stage placed from CTA ``base`` (any count of

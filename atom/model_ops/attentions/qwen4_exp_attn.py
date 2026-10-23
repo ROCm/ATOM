@@ -152,7 +152,6 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         cache = super().build_kv_cache_tensor(module)
         if hasattr(module, "base_linear_attention"):
             from atom.model_ops.fla_ops.gdn_flydsl import select_policy
-            from atom.models.qwen4_exp_mono.config import gdn_cache_layout_supported
             from atom.utils import envs
 
             attention = module.impl
@@ -167,14 +166,10 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
             )
-            mono_vk = gdn_cache_layout_supported(attention, self.replayssm)
-            if policy.decode or mono_vk:
+            if policy.decode:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
                 # Triton fallback and checkpoint stores honor the inner strides.
-                # Qwen Mono uses the same layout on gfx950 even though the
-                # standalone FlyDSL decode policy remains gfx942-only: its
-                # persistent recurrence emitter requires contiguous K vectors.
                 cache.v_cache = cache.v_cache.transpose(-1, -2)
         return cache
 
@@ -688,7 +683,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             ),
         }
 
-    def build_for_cudagraph_capture(self, bs: int, max_context_len: int | None = None):
+    def build_for_cudagraph_capture(self, bs: int):
         """Decode-graph metadata pointing at the same buffers replay writes.
 
         Every tensor here is a slice of a persistent buffer that
@@ -714,11 +709,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             num_tokens,
             np.full(bs, int(attn_metadata.max_seqlen_q), dtype=np.int64),
             num_tokens,
-            max_seq_len=(
-                runner.config.max_model_len
-                if max_context_len is None
-                else int(max_context_len)
-            ),
+            max_seq_len=runner.config.max_model_len,
         )
 
         slots = self._ple_state_slots(attn_metadata.gdn_metadata)

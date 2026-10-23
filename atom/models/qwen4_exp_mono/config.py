@@ -2,6 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """The exact Qwen3.8-Flash-Next deployment served by the mono runtime."""
 
+from copy import copy
+
 import torch
 
 from atom.models.qwen4_exp_mono.shapes import (
@@ -148,12 +150,10 @@ def config_refusal(atom_config) -> str | None:
         return "ATOM_MONO_ENABLE is off"
     tp = atom_config.tensor_parallel_size
     expert_owned = bool(atom_config.enable_expert_parallel)
-    checks = common_refusals(
-        atom_config,
-        Dims,
-        SUPPORTED_TP,
-        allow_expert_parallel=True,
-    )
+    # Qwen owns its EP admission below; keep the engine's config immutable.
+    admission = copy(atom_config)
+    admission.enable_expert_parallel = False
+    checks = common_refusals(admission, Dims, SUPPORTED_TP)
     checks += [
         (tp in ENABLED_TP, f"TP {tp} production gate"),
         (

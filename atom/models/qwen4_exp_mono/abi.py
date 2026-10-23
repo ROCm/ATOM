@@ -34,10 +34,16 @@ class StructuredAbi:
         from flydsl.expr.typing import Int32, Int64
 
         from atom.mono.device.ops import launcher
-        from atom.mono.plan.execution import BLOCKS, PERSISTENT_VALUE_ATTRS, THREADS
+        from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 
         argument_type = self.argument_type
         current_stream = fx.Stream(None)
+        # Qwen's polling CTAs must not acquire a second resident CTA after a
+        # register-lifetime change. This occupancy cap belongs to this kernel ABI.
+        value_attrs = {
+            "rocdl.waves_per_eu": WAVES // 4,
+            "rocdl.flat_work_group_size": f"{THREADS},{THREADS}",
+        }
 
         @launcher(name)
         def launch(
@@ -47,7 +53,7 @@ class StructuredAbi:
             stream: fx.Stream = current_stream,
         ):
             _ = keyed
-            kernel(a, scratch, layer, value_attrs=PERSISTENT_VALUE_ATTRS).launch(
+            kernel(a, scratch, layer, value_attrs=value_attrs).launch(
                 grid=(BLOCKS,), block=(THREADS,), stream=stream
             )
 

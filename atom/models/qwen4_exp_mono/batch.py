@@ -14,7 +14,7 @@ from typing import NamedTuple
 import torch
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
-from atom.model_ops.qwen4_exp.ops.hc_fused import hc_rows
+from atom.models.qwen4_exp_mono import native_qsa
 from atom.models.qwen4_exp_mono.dims import Dims
 from atom.models.qwen4_exp_mono.kernels import (
     batch_front,
@@ -31,6 +31,7 @@ from atom.models.qwen4_exp_mono.layout import (
     finish_scratch_bytes,
     finish_scratch_layout,
 )
+from atom.models.qwen4_exp_mono.native_hc import mix_rows
 from atom.mono.runtime.abi import KernelAbi
 
 
@@ -242,11 +243,9 @@ def mix(module, streams, pending, built=None):
     block, raw = pending if pending is not None else (None, None)
     injected = module.block_inject_weight is not None
     use_mfma = built is not None and built.hc is not None
-    fn = batch_hc.run if use_mfma else hc_rows
+    fn = batch_hc.run if use_mfma else mix_rows
     options = (
-        {"kernel": built.hc.up if injected else built.hc.final}
-        if use_mfma
-        else {"output_tile": 4 if streams.shape[0] == 2 else 8}
+        {"kernel": built.hc.up if injected else built.hc.final} if use_mfma else {}
     )
     h, mixed, r = fn(
         streams,
@@ -296,9 +295,9 @@ def attention(built, static, step, mixed):
 def qsa_attention(module, positions, mixed, built=None, static=None):
     """Project QSA natively, fuse batch norm/cache, then select causal indices."""
     prepared = (
-        module.prepare(positions, mixed)
+        native_qsa.prepare(module, positions, mixed)
         if built is None
-        else module.prepare(positions, mixed, fuse_norm_rope_cache=True)
+        else native_qsa.prepare(module, positions, mixed, fuse_norm_rope_cache=True)
     )
     return qsa_finish(module, prepared, built, static)
 
@@ -314,11 +313,9 @@ def qsa_finish(module, prepared, built=None, static=None):
             module.indexer.token_topk,
             module.indexer.compress_ratio,
         )
-    if built is None:
-        return module.finish(prepared, selected)
-    if built.qsa_output is None:
-        return module.finish(prepared, selected, gate_in_attention=True)
-    attention = module.attend(prepared, selected)
+    if built is None or built.qsa_output is None:
+        return native_qsa.finish(module, prepared, selected)
+    attention = native_qsa.attend(module, prepared, selected)
     output = built.buffers.output
     built.qsa_output(
         attention.data_ptr(),

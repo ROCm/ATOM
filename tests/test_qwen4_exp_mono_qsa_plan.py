@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Deployment capacity covers every score, candidate and graph bucket."""
+"""Deployment capacity covers every score and candidate list."""
 
 import random
 from itertools import pairwise
@@ -14,7 +14,6 @@ from atom.models.qwen4_exp_mono.qsa_plan import (
     SELECT_FAN,
     SELECTED_GROUPS,
     QsaPlan,
-    context_buckets,
 )
 
 
@@ -31,10 +30,6 @@ def test_capacity_covers_paged_scores_and_selection(capacity):
     assert SELECT_FAN * SELECTED_GROUPS == INDEX_SEGMENT
     for children, parents in zip(plan.lists, plan.lists[1:]):
         assert (parents - 1) * SELECT_FAN < children <= parents * SELECT_FAN
-    buckets = context_buckets(capacity)
-    assert buckets[-1] == capacity
-    assert len(buckets) == len(set(buckets))
-    assert buckets[0] == min(256, capacity)
 
 
 def test_every_candidate_list_fits_disjoint_workspace():
@@ -65,10 +60,3 @@ def test_8k_keeps_one_selection_list_and_no_tree_storage():
 def test_nonpositive_capacity_is_rejected(capacity):
     with pytest.raises(ValueError, match="positive"):
         QsaPlan(capacity)
-
-
-@pytest.mark.parametrize("capacity", [1, 256, 257, 2048, 2049, 8192, 32768])
-def test_all_visible_graph_bucket_is_preserved(capacity):
-    assert context_buckets(capacity) == tuple(
-        sorted({min(256, capacity), min(2048, capacity), capacity})
-    )
