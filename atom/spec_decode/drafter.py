@@ -388,10 +388,6 @@ class Drafter(abc.ABC):
         publication, which is what carries them to the device."""
         return
 
-    def record_draft_probs_slots(self, req_ids) -> None:
-        """Park the q just drafted into each request's own persistent rows."""
-        return
-
     @property
     def draft_kv_duplicates_propose(self) -> bool:
         """Is `compute_draft_kv` the pass propose's first draft step redoes?

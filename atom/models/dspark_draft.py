@@ -38,25 +38,28 @@ class DraftSampling:
     Bound once, at drafter init, and never rebound: the block head is
     cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
     ``capture_epilogue=True``), so every address here is baked into the
-    recording. That is also why the per-step seed is a one-element device
-    tensor rather than a python int: the value has to be refreshable from
-    outside the recording.
+    recording. That is also why the per-step seed and row bases are device
+    tensors rather than python ints: their values are refreshed outside it.
 
-    Sized at ``max_num_seqs``; the block runs at ``running_bs <= max_num_seqs``
-    and slices.
+    The per-row tensors are sized at ``max_num_seqs``; the block runs at
+    ``running_bs <= max_num_seqs`` and slices.
     """
 
-    #: [max_bs, T, V] fp32 -- q, the distribution each draft token was drawn
-    #: from. Read a step later by the accept kernel, so it outlives the pass
-    #: and cannot live in the graph's private pool.
-    probs: torch.Tensor
+    #: [slots * T, V] fp32 -- q, the distribution each draft token was drawn
+    #: from, one block of T rows per live request. Read a step later by the
+    #: accept kernel, so it outlives the pass and cannot live in the graph's
+    #: private pool.
+    q_store: torch.Tensor
+    #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
+    #: position k goes to row ``base + k``. Negative writes nothing.
+    q_row_base: torch.Tensor
     #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
     temperatures: torch.Tensor
     #: [max_bs] int32, nonzero where the draw is an argmax -- i.e. where the
     #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
     #: predicate ``Sampler`` itself tests.
     greedy_mask: torch.Tensor
-    #: [1] int32, the Philox key. Must hold the same value on every TP/PCP rank.
+    #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor
 
 
@@ -205,29 +208,27 @@ class DSparkDraftModel(nn.Module):
         sampling = self.draft_sampling
         assert sampling is not None, "sample_block_lossless needs bound buffers"
         bs, num_draft, vocab = base_logits.shape
-        probs = sampling.probs
-        assert probs.shape[1] >= num_draft and probs.shape[2] == vocab, (
-            f"q buffer is {tuple(probs.shape[1:])} per request but the block is "
-            f"[{num_draft}, {vocab}]; the accept kernel indexes the two as one"
+        assert sampling.q_store.shape[1] == vocab, (
+            f"q store rows are {sampling.q_store.shape[1]} wide but the block "
+            f"scores {vocab} ids; the accept kernel indexes the two as one"
         )
-        # The counter stride is the buffer's max batch, not this step's, so the
-        # uniform a (position, row, id) draws does not move when the batch does.
-        position_stride = probs.shape[0] * vocab
-        temperatures = sampling.temperatures[:bs]
-        greedy_mask = sampling.greedy_mask[:bs]
-
+        # The noise counter stride is the buffer's max batch, not this step's,
+        # so the uniform a (position, row, id) draws does not move with the
+        # batch, and no two positions of one block share a counter.
+        position_stride = sampling.q_row_base.shape[0] * vocab
         out_ids = anchor_ids.new_empty(bs, num_draft + 1)
         out_ids[:, 0] = anchor_ids
         for k in range(num_draft):
-            # `probs[:bs, k]` is [bs, V] with the vocab axis contiguous and a
-            # T*V row stride -- the op takes the stride, so no copy.
+            # Row b's q for position k lands at q_store[q_row_base[b] + k].
             self.markov_head.sample_next_q(
                 out_ids[:, k],
                 base_logits[:, k],
                 out_ids[:, k + 1],
-                probs[:bs, k],
-                temperatures,
-                greedy_mask,
+                sampling.q_store,
+                sampling.q_row_base[:bs],
+                k,
+                sampling.temperatures[:bs],
+                sampling.greedy_mask[:bs],
                 sampling.seed,
                 k * position_stride,
             )

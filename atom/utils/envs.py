@@ -609,13 +609,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # branch to route a single row into), so such a batch also drafts greedily
     # for that step and runs exactly the flag-off pair.
     #
-    # Costs exactly what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid:
-    # q is a full-vocab fp32 tensor per draft position and has to cross the step
-    # boundary. Twice over -- the block head's scratch, plus a persistent store
-    # of 2 x max_num_seqs per-request row blocks, because an intervening
-    # prefill-only step would otherwise overwrite the scratch rows a decode
-    # request's pending verify reads. The draft step also de-fuses, trading step
-    # latency for acceptance. Temperature-0 is unaffected: an all-greedy batch
+    # Costs what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid: q is a
+    # full-vocab fp32 row per draft position and has to cross the step
+    # boundary, so the draft writes it into a persistent store of
+    # 2 x max_num_seqs per-request row blocks -- 2 * max_num_seqs * T * V * 4
+    # bytes, allocated before the KV cache is sized (1.25 GiB at max_num_seqs=64,
+    # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The draft
+    # step also de-fuses, trading step latency for acceptance. Temperature-0 is unaffected: an all-greedy batch
     # keeps the exact-match kernel, and a greedy row in a mixed batch draws a
     # delta q that makes the ratio rule degenerate to exact match.
     #

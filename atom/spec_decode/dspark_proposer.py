@@ -9,9 +9,11 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import get_pcp_world_size
+from atom.model_ops.dspark_markov_sample import dspark_markov_sample_unsupported
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
+from atom.spec_decode.draft_q_slots import DraftQSlots
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import CpuGpuBuffer, envs
@@ -20,10 +22,10 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-#: Persistent q slots, as a multiple of `max_num_seqs`; one slot holds one live
-#: request's block of T rows. Slots are reclaimed by expiry
-#: (`DSparkProposer._claim_q_slot`), and the headroom above the live set is what
-#: keeps the victim a dead request rather than a running one.
+#: Persistent q slots, as a multiple of `max_num_seqs`; one slot holds one
+#: request's block of T rows. Slots are reclaimed by expiry (`DraftQSlots`), and
+#: the headroom above the live set is what makes the expired entry usually a
+#: finished request rather than a running one.
 _Q_SLOT_OVERSUBSCRIBE = 2
 
 
@@ -58,22 +60,20 @@ class DSparkProposer(Drafter):
 
     #: Lossless speculative sampling, bound by `_init_lossless_sampling`. Class
     #: defaults because `propose` reads these every step and the proposer is
-    #: reachable in a half-built state; None means "greedy block sampler", and
-    #: None rather than `{}` / `[]` so no container is shared across instances.
+    #: reachable in a half-built state; None means "greedy block sampler".
     draft_sampling = None
-    _draft_probs_flat = None
-    _draft_probs_row_base_buf = None
     _q_store = None
-    _q_rows_buf = None
-    _q_slot_of = None
-    _q_free = None
+    _q_slots = None
     _draft_sample_step = 0
     _draft_temps_buf = None
     _draft_greedy_buf = None
     _draft_seed_buf = None
+    _draft_row_base_buf = None
+    _verify_row_base_buf = None
     #: How many sequences the last `stage_draft_sampling_host` covered, so
     #: `propose` can check it is drafting that same batch.
     _staged_draft_bs = -1
+    _draft_row_base_hi = 0
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -108,13 +108,14 @@ class DSparkProposer(Drafter):
         why it defaults off, and why it arms both halves of the feature at once.
         """
         self.draft_sampling = None
-        self._draft_probs_flat = None
-        self._draft_probs_row_base_buf = None
         self._q_store = None
-        self._q_rows_buf = None
-        self._q_slot_of = {}
-        self._q_free = []
+        self._q_slots = None
         self._draft_sample_step = 0
+        # How many sequences the last `stage_draft_sampling_host` covered, so
+        # `propose` can check it is drafting that same batch.
+        self._staged_draft_bs = -1
+        # Leading entries of the draft row base that may still name a slot.
+        self._draft_row_base_hi = 0
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
         model = getattr(self, "model", None)
@@ -123,13 +124,12 @@ class DSparkProposer(Drafter):
             # because "not ported yet" is not an operator error.
             return
         if self.config.pipeline_parallel_size > 1:
-            # The draft's temperatures / greedy mask / seed ride the runner's
-            # `sampling` publication group, and PP gives that group a ring (one
-            # cloned buffer set per in-flight microbatch), while the block head
-            # binds one address. Falls back rather than keeping a private copy,
-            # because PP has no use for the feature anyway: `spec_decode_local
-            # = pp_size == 1`, so such an engine drafts for handoff and never
-            # reaches the ratio accept rule the draft half pairs with.
+            # The draft's sampling inputs ride the runner's `sampling`
+            # publication group, and PP gives that group a ring (one cloned
+            # buffer set per in-flight microbatch), while the block head binds
+            # one address. PP has no use for the feature anyway:
+            # `spec_decode_local = pp_size == 1`, so such an engine drafts for
+            # handoff and never reaches the ratio accept rule.
             logger.warning(
                 "ATOM_SPEC_LOSSLESS_SAMPLING is not implemented under pipeline "
                 "parallelism (pp=%d): such an engine drafts for handoff and "
@@ -143,8 +143,7 @@ class DSparkProposer(Drafter):
             # PCP decodes redundantly and aligns by broadcasting the draft ids,
             # because the ranks' kernels do not agree bit-for-bit. q would have
             # to be broadcast with them -- a full-vocab fp32 tensor per step --
-            # or rank>0 tests `q(x)` for an `x` it did not draw. Falls back
-            # rather than raising: the fallback is the shipped behaviour.
+            # or rank>0 tests `q(x)` for an `x` it did not draw.
             logger.warning(
                 "ATOM_SPEC_LOSSLESS_SAMPLING is not implemented under PCP "
                 "(pcp=%d): the draft ids are broadcast across PCP ranks but "
@@ -153,277 +152,174 @@ class DSparkProposer(Drafter):
                 get_pcp_world_size(),
             )
             return
+        head = self.model.markov_head
+        unsupported = dspark_markov_sample_unsupported(
+            head.markov_w1.weight, head.markov_w2.weight
+        )
+        if unsupported is not None:
+            # Checked once here so the sampled op never has to fail mid-serve.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING: the fused sampled draft cannot "
+                "run (%s). Falling back to greedy proposal with exact-match "
+                "acceptance.",
+                unsupported,
+            )
+            return
         max_bs = self.config.max_num_seqs
         t = self.draft_tokens_per_seq
         vocab = int(self.model.vocab_size)
-        # [max_bs, T, V] fp32, allocated once: a capture bakes the address, and
-        # the accept kernel reads it a step after the pass that wrote it, so it
-        # cannot come from the graph's private pool either.
-        probs = torch.empty((max_bs, t, vocab), dtype=torch.float32, device=self.device)
-        # The block head's three scalar inputs. Staged on the host by
-        # `stage_draft_sampling_host` and uploaded by the runner's existing
-        # batched `sampling` publication, which is why they are CpuGpuBuffers
-        # in a publication group rather than plain device tensors.
-        # Fixed-address like `probs`, since the block head is captured.
+        q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
+        # [slots * T, V] fp32, allocated once, before the KV cache is sized, so
+        # the budget sees it. One row block per live request rather than per
+        # batch slot: the verify that reads a request's q runs a step after the
+        # propose that wrote it, with the batch reordered in between and
+        # possibly prefill-only steps proposing for other requests.
+        self._q_store = torch.empty(
+            (q_slots * t, vocab), dtype=torch.float32, device=self.device
+        )
+        self._q_slots = DraftQSlots(q_slots, t)
+        # Everything the captured block head reads, plus the verify's row base,
+        # as members of the runner's `sampling` publication: staged on the host
+        # by `stage_draft_sampling_host` inside the forward's preparation window
+        # and uploaded by the batched H2D `prepare_sample` already issues. The
+        # owner's `begin()` waits out the previous upload before any of them is
+        # rewritten, so a host running a step ahead cannot change a row base
+        # the GPU has yet to read.
         pin = torch.device(self.device).type != "cpu"
+
+        def staged(size, dtype):
+            return CpuGpuBuffer(
+                size,
+                dtype=dtype,
+                device=self.device,
+                pin_memory=pin,
+                publication_group="sampling",
+            )
+
         buffers = {
-            "draft_temperatures": CpuGpuBuffer(
-                max_bs,
-                dtype=torch.float32,
-                device=self.device,
-                pin_memory=pin,
-                publication_group="sampling",
-            ),
-            "draft_greedy_mask": CpuGpuBuffer(
-                max_bs,
-                dtype=torch.int32,
-                device=self.device,
-                pin_memory=pin,
-                publication_group="sampling",
-            ),
-            "draft_sample_seed": CpuGpuBuffer(
-                1,
-                dtype=torch.int32,
-                device=self.device,
-                pin_memory=pin,
-                publication_group="sampling",
-            ),
+            "draft_temperatures": staged(max_bs, torch.float32),
+            "draft_greedy_mask": staged(max_bs, torch.int32),
+            "draft_sample_seed": staged(1, torch.int32),
+            # First q row each batch row drafts into; -1 writes nothing.
+            "draft_q_row_base": staged(max_bs, torch.int32),
+            # First q row each request's drafts were drawn into; -1 means none.
+            "verify_q_row_base": staged(max_bs, torch.int32),
         }
-        # Default 1.0 rather than 0: the fabricated tail rows between
-        # `scheduled_bs` and `running_bs` are never staged or uploaded, so they
-        # keep this seed, and a 0 would divide by zero in the kernel.
-        buffers["draft_temperatures"].np[:] = 1.0
-        buffers["draft_temperatures"].gpu.fill_(1.0)
-        buffers["draft_greedy_mask"].np[:] = 1
-        buffers["draft_greedy_mask"].gpu.fill_(1)
+        # Rows past the staged batch are never published, so their seeds must
+        # already be harmless: temperature 1.0 rather than a 0 the kernel would
+        # divide by, and row base -1 so a pad row writes no q.
+        for name, value in (
+            ("draft_temperatures", 1.0),
+            ("draft_greedy_mask", 1),
+            ("draft_q_row_base", -1),
+            ("verify_q_row_base", -1),
+        ):
+            buffers[name].np[:] = value
+            buffers[name].gpu.fill_(value)
         self.metadata_buffers.update(buffers)
         self._draft_temps_buf = buffers["draft_temperatures"]
         self._draft_greedy_buf = buffers["draft_greedy_mask"]
         self._draft_seed_buf = buffers["draft_sample_seed"]
+        self._draft_row_base_buf = buffers["draft_q_row_base"]
+        self._verify_row_base_buf = buffers["verify_q_row_base"]
         self.draft_sampling = DraftSampling(
-            probs=probs,
+            q_store=self._q_store,
+            q_row_base=self._draft_row_base_buf.gpu,
             temperatures=self._draft_temps_buf.gpu,
             greedy_mask=self._draft_greedy_buf.gpu,
             seed=self._draft_seed_buf.gpu,
         )
-        # Flat `[max_bs * T, V]` view: one row per (batch slot, position), the
-        # way the block head addresses the scratch it writes.
-        self._draft_probs_flat = probs.view(max_bs * t, vocab)
-        # The persistent q, one row block per live request rather than per
-        # batch slot. The scratch above is addressed by batch slot because that
-        # is what the captured head can write, and a batch slot belongs to one
-        # step: ATOM never mixes prefill and decode, so a prefill-only step
-        # still runs propose and overwrites the rows a decode request's pending
-        # verify will read. `record_draft_probs_slots` copies out of the scratch
-        # into here after every propose.
-        q_slots = _Q_SLOT_OVERSUBSCRIBE * max_bs
-        self._q_store = torch.empty(
-            (q_slots * t, vocab), dtype=torch.float32, device=self.device
-        )
-        # req_id -> its persistent slot, in least-recently-drafted order (a
-        # plain dict is insertion-ordered and `record_draft_probs_slots`
-        # re-inserts). Keyed by req_id, not by position: continuous batching
-        # reorders the batch between the propose that wrote q and the verify
-        # that reads it.
-        self._q_slot_of = {}
-        self._q_free = list(range(q_slots - 1, -1, -1))
-        self._draft_probs_row_base_buf = CpuGpuBuffer(
-            max_bs,
-            dtype=torch.int32,
-            device=self.device,
-            pin_memory=torch.device(self.device).type != "cpu",
-        )
-        # Destination rows of the copy-out, int64 because that is what
-        # `Tensor.index_copy_` takes.
-        self._q_rows_buf = CpuGpuBuffer(
-            max_bs * t,
-            dtype=torch.int64,
-            device=self.device,
-            pin_memory=torch.device(self.device).type != "cpu",
-        )
         self.model.bind_draft_sampling(self.draft_sampling)
         if self.runner.rank == 0:
             logger.info(
-                "Lossless speculative sampling armed: draft q scratch "
-                "[%d, %d, %d] fp32 (%.0f MiB) + %d persistent slots (%.0f MiB)",
-                max_bs,
+                "Lossless speculative sampling armed: draft q store %d slots x "
+                "[%d, %d] fp32 (%.0f MiB)",
+                q_slots,
                 t,
                 vocab,
-                probs.numel() * 4 / 2**20,
-                q_slots,
                 self._q_store.numel() * 4 / 2**20,
             )
 
     @property
     def draft_probs(self) -> torch.Tensor | None:
-        """``[slots * T, V]`` fp32 q, or None when the greedy pair is running.
-
-        The persistent store, not the block head's scratch: a row here belongs
-        to a request for as long as that request lives, which is what lets a
-        verify find the q its drafts were drawn from across the prefill steps
-        that ran in between. `draft_probs_row_base` resolves req_id -> row.
-        """
-        return None if self.draft_sampling is None else self._q_store
+        """``[slots * T, V]`` fp32 q, or None when the greedy pair is running."""
+        return self._q_store
 
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, has_filter: bool
     ) -> None:
-        """Stage this step's temperatures, greedy mask and Philox key on the host.
+        """Stage this step's draft sampling inputs and both q row bases.
 
-        Called from `ModelRunner.prepare_sample`, which already holds
-        `batch.temperatures` as a numpy array and is already publishing a
-        batched `sampling` H2D, so three more members ride along in that group
-        for free. Nothing here needs the device: the greedy mask is a pure
-        function of `batch.temperatures`, which only ever existed on the host.
-        Doing it on the device instead costs several `[bs]`-sized launches of
-        pure overhead on the critical path between the target forward and the
-        draft.
+        Called from `ModelRunner.prepare_sample`, inside the forward's
+        preparation window, so every member rides that function's `sampling`
+        H2D. The block head is captured and bakes these buffers' addresses;
+        only their contents change, and only here.
 
-        The buffers' addresses stay fixed for the process (the block head is
-        captured and bakes them); only the contents vary, and they are
-        refreshed outside any recording -- the publication is part of host
-        preparation, strictly before the forward.
-
-        Reads the runner's own per-request sampling parameters rather than
-        taking them as arguments, so the temperature the draft divides by is
-        the number the target's verify softmax will divide by:
-        `rejection_sampler._ratio_target_probs` reads the runner's buffer and
-        this stages from the same `batch.temperatures`. The one case where the
-        two deliberately differ is a top-k/top-p batch, which drafts greedily;
-        see below.
+        ``has_filter``: some row carries top-k or top-p. Such a batch drafts
+        greedily, the whole of it, because the verify drops it to exact-match
+        acceptance batch-wide (`ModelRunner.postprocess`).
         """
         if self.draft_sampling is None:
             return
         temps = self._draft_temps_buf
         mask = self._draft_greedy_buf
         seed = self._draft_seed_buf
+        dest = self._draft_row_base_buf
+        verify = self._verify_row_base_buf
         # The Philox key. A plain SPMD counter, so every TP rank reaches the
-        # same number without exchanging it -- ranks drawing different uniforms
-        # draft different blocks, and rank-local `num_bonus_tokens` then
-        # disagrees with the broadcast `sampled_tokens`.
+        # same number without exchanging it.
         seed.np[0] = self._draft_sample_step
         self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
         counts = group.counts
-        counts[group.indices["draft_sample_seed"]] = 1
-        # A 0-row batch has nothing to stage and `[:0]` writes would publish a
-        # zero-length member, so leave the buffers alone.
-        counts[group.indices["draft_temperatures"]] = bs or None
-        counts[group.indices["draft_greedy_mask"]] = bs or None
+        index = group.indices
+        counts[index["draft_sample_seed"]] = 1
+        counts[index["draft_temperatures"]] = bs or None
+        counts[index["draft_greedy_mask"]] = bs or None
+        counts[index["verify_q_row_base"]] = bs or None
+        self._staged_draft_bs = bs
+        req_ids = batch.req_ids[:bs]
+        # Verify bases before claims: a claim may expire a request of this same
+        # batch, whose verify must still read the slot its drafts came from.
+        self._q_slots.verify_bases(req_ids, verify.np)
+        # Every row the block runs must name a destination, the pad rows up to
+        # `running_bs` included, and a pad row left holding a larger previous
+        # batch's base would write its q into a live request's slot. So clear
+        # back down to wherever the last claim reached.
+        hi = max(bs, self._draft_row_base_hi)
+        if bs:
+            self._q_slots.claim_bases(req_ids, dest.np)
+            dest.np[bs:hi] = -1
+            self._draft_row_base_hi = bs
+        else:
+            dest.np[:hi] = -1
+            self._draft_row_base_hi = 0
+        counts[index["draft_q_row_base"]] = hi or None
         if not bs:
             return
-        # Sized by the scheduled batch; the pad rows up to `running_bs` keep
-        # the 1.0 / 1 seeded at allocation and nothing reads their q.
-        self._staged_draft_bs = bs
         if has_filter:
-            # A batch with top-k or top-p on any row drafts greedily, the whole
-            # batch of it, because the verify side drops such a batch to
-            # exact-match acceptance batch-wide (`ModelRunner.postprocess`).
-            # Left sampling it would pair a sampled draft with exact-match
-            # acceptance, strictly worse than either pure mode.
-            #
-            # Both halves, not just the mask: `greedy_mask` alone replaces the
-            # race's denominator, leaving the published q a full
-            # `softmax(logits/T)` the token was not drawn from, which breaks
-            # losslessness. Clamping the draft's temperature makes q a true
-            # delta, sound under either accept rule -- which matters because
-            # propose and verify are a step apart, so this batch's drafts meet
-            # the next step's filters.
-            #
-            # The draft's own copy of the temperature, not the target's:
-            # `rejection_sampler` reads `forward_vars["temperatures"]`, which is
-            # untouched here, so the target's p keeps the request's real T.
+            # Clamp the draft's own temperature as well as setting the mask:
+            # the mask alone makes the draw an argmax but leaves the published
+            # q a full `softmax(logits/T)`. Clamped, q is a near-delta on the
+            # drafted id, sound under either accept rule -- which matters
+            # because this batch's drafts meet the next step's filters.
+            # `rejection_sampler` reads the target's own temperatures, which
+            # are untouched here.
             temps.np[:bs] = SAMPLER_EPS
             mask.np[:bs] = 1
         else:
-            # The same clamp `prepare_sample` applies to the target's copy, so
-            # the two divide by the same number row for row.
+            # The clamp `prepare_sample` applies to the target's copy, so the
+            # two divide by the same number row for row.
             np.maximum(batch.temperatures, SAMPLER_EPS, out=temps.np[:bs])
-            # A greedy row is one whose temperature was at or below SAMPLER_EPS
-            # before `prepare_sample` clamped it -- the same predicate `Sampler`
-            # tests, so a row cannot be greedy to the target and stochastic to
-            # the draft. Pre-clamp is the same set: `max(t, EPS) <= EPS` iff
-            # `t <= EPS`.
+            # The predicate `Sampler` tests, so a row cannot be greedy to the
+            # target and stochastic to the draft.
             mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
 
-    def _claim_q_slot(self) -> int:
-        """A free persistent q slot, recycling the stalest live one if need be.
-
-        This is the release path. Nothing tells a worker that a request
-        finished, was aborted or was preempted -- `ModelRunner` is handed a
-        `ScheduledBatch`, never a departure -- so a slot is reclaimed by
-        expiry: `_q_slot_of` is in least-recently-drafted order, and the
-        stalest entry is dropped when the free list runs out.
-
-        Dropping it from the map is the safety half. A returning request is
-        then simply absent, so `draft_probs_row_base` answers the -1 sentinel
-        and the kernel rejects at position 1, rather than reading the row its
-        old slot now holds for somebody else.
-
-        The victim is a dead request, not a running one: at most
-        `max_num_seqs` requests are running, each refreshed by the propose that
-        drafted its live block, so with `_Q_SLOT_OVERSUBSCRIBE x max_num_seqs`
-        slots the stalest entry has sat out at least `max_num_seqs` proposes.
-        Expiring rather than raising for the same reason the PCP guard warns:
-        the sentinel costs one request one step's speculation, an exception
-        costs the engine.
-        """
-        if self._q_free:
-            return self._q_free.pop()
-        return self._q_slot_of.pop(next(iter(self._q_slot_of)))
-
-    def record_draft_probs_slots(self, req_ids) -> None:
-        """Park the q just drafted into each request's own persistent rows.
-
-        Must run after every propose that wrote q, align-only ones included:
-        the captured head always writes the scratch at batch-slot rows
-        `[0, running_bs)`, so a propose that does not copy out leaves its q
-        where the next propose will overwrite it.
-
-        One `index_copy_` of `len(req_ids) * T` rows, outside the recording:
-        the destination rows are this step's, so they cannot be baked.
-        """
-        if self.draft_sampling is None:
-            return
-        t = self.draft_tokens_per_seq
-        rows = self._q_rows_buf.np
-        for i, req_id in enumerate(req_ids):
-            # pop-then-insert, so a request that already owns a slot keeps it
-            # and moves to the fresh end of the eviction order.
-            slot = self._q_slot_of.pop(req_id, None)
-            if slot is None:
-                slot = self._claim_q_slot()
-            self._q_slot_of[req_id] = slot
-            rows[i * t : (i + 1) * t] = range(slot * t, (slot + 1) * t)
-        n = len(req_ids) * t
-        self._q_store.index_copy_(
-            0, self._q_rows_buf.copy_to_gpu(n), self._draft_probs_flat[:n]
-        )
-
     def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
-        """``[len(req_ids)]`` int32: each request's first q row, for the accept
-        kernel's indirection.
-
-        A request absent from the map has no live q this step, and the kernel is
-        told so with the negative sentinel -1. With persistent slots the only
-        way to be absent is to have never drafted, or to have been expired by
-        `_claim_q_slot`.
-
-        The sentinel is -1 and not 0 because row 0 is in range and holds q > 0:
-        it would pass the kernel's probability guard, and `coin * q < p` would
-        then accept unconditionally against another request's distribution --
-        a wrong-row read that looks like a win rather than failing loudly.
-        In-range was never the safety property; being the right row is.
-        """
+        """``[len(req_ids)]`` int32: each request's first q row, as staged for
+        this step by `stage_draft_sampling_host`, or None unarmed."""
         if self.draft_sampling is None:
             return None
-        t = self.draft_tokens_per_seq
-        slots = self._q_slot_of
-        buf = self._draft_probs_row_base_buf
-        n = len(req_ids)
-        buf.np[:n] = [
-            slots[req_id] * t if req_id in slots else -1 for req_id in req_ids
-        ]
-        return buf.copy_to_gpu(n)
+        return self._verify_row_base_buf.gpu[: len(req_ids)]
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

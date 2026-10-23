@@ -540,9 +540,9 @@ def dspark_markov_argmax_tp(
 #
 # This deliberately gives up the property the op above exists for. q has to
 # leave the kernel for the probability-ratio accept rule to have anything to
-# test, and q is `[B, V]` -- a full-vocab fp32 tensor per block position, the
-# one thing the module docstring says this is written not to materialize. See
-# `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for the trade, and
+# test, and q is `[B, V]` -- a full-vocab fp32 row per request and block
+# position, the one thing the module docstring says this is written not to
+# materialize. See `envs.ATOM_SPEC_LOSSLESS_SAMPLING` for the trade, and
 # `atom/model_ops/rejection_sampler.py` for the consumer.
 #
 # Arithmetic: `probs = softmax(step_logits.float() / temperatures[:, None])`,
@@ -553,22 +553,27 @@ def dspark_markov_argmax_tp(
 # whose temperature was at or below `SAMPLER_EPS` before the caller clamped it;
 # `greedy_mask` carries that and the row falls out as a plain argmax.
 #
-# Two deviations from the obvious eager spelling. The noise is drawn in-kernel
-# from Philox rather than handed in as a `[B, V]` `exp_noise` tensor -- another
-# full-vocab tensor per block position, and a pre-drawn one needs a host RNG the
-# captured graph cannot have. And the softmax is online (per-tile max and sumexp
-# combined in a second launch), so V is read once per block position rather than
-# three times.
+# Where q goes. Each row writes its distribution straight into the persistent
+# q store, at row `q_row_base[row] + position`: the block that row's request
+# owns. A negative base writes nothing (pad rows, a dummy forward, an
+# align-only propose) and such a row drafts id 0, which nobody reads.
 #
-# CUDA-graph safety. The seed is a device int32 scalar whose address is baked at
-# capture and whose value is refreshed outside the recording; the per-position
-# offset base is a host int derived from the static block width. No host RNG, no
-# `.item()`, no data-dependent shape.
+# The noise is drawn in-kernel from Philox rather than handed in as a `[B, V]`
+# tensor, and the softmax is online (per-tile max and sumexp combined in a
+# second launch, `softmax_tiles`), so V is read once per block position.
 #
-# TP/PCP determinism. Every rank must draw the same uniforms or the drafts fork:
-# `num_bonus_tokens` is rank-local while `sampled_tokens` is broadcast from rank
-# 0, so a desync leaves the anchor gather on a -1 column. Philox keyed on an
-# SPMD step counter gives that; `rejection_sampler.py` does the same.
+# CUDA-graph safety. The seed and the row bases are device tensors whose
+# addresses are baked at capture and whose values are refreshed outside the
+# recording; the position and noise offset are host ints fixed by the block
+# width. No host RNG, no `.item()`, no data-dependent shape.
+#
+# TP determinism. Every rank must draw the same uniforms or the drafts fork.
+# Philox keyed on an SPMD step counter gives that. The key's high word is 0
+# here; the accept rule's draws use other high words (`rejection_sampler`), so
+# the two can never share a stream whatever their counters do.
+#
+# Addressing is int64 throughout: `[max_bs, T, V]` logits and a
+# `[2 * max_bs * T, V]` store both pass 2**31 elements at serving sizes.
 
 # Bandwidth-bound over V rather than MFMA-bound, so a wider V tile than the
 # GEMV's.
@@ -582,28 +587,29 @@ def _dspark_markov_sample_stage1(
     w1_ptr,
     w2_ptr,
     temperatures_ptr,
+    q_row_base_ptr,
     embed_out_ptr,
-    scaled_out_ptr,
+    q_ptr,
     part_max_ptr,
     part_sum_ptr,
     num_rows,
     vocab_size,
     rank,
+    position,
     stride_base_row,
     stride_prev,
     stride_w1_vocab,
     stride_embed_row,
     stride_w2_vocab,
-    stride_scaled_row,
     BLOCK_ROW: tl.constexpr,
     BLOCK_V: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """One (V tile, row tile): bias GEMV, add base, scale by 1/T, publish
-    ``s`` plus this tile's (max, sum exp(s - max)).
+    """One (V tile, row tile): bias GEMV, add base, scale by 1/T, write ``s``
+    into the row's q row and publish this tile's (max, sum exp(s - max)).
 
-    ``s`` lands in the caller's q buffer, which stage 3 then normalizes in
-    place: the alternative is a second `[B, V]` scratch for no gain.
+    ``s`` lands in q itself, which stage 3 then normalizes in place: the
+    alternative is a second `[B, V]` scratch for no gain.
     """
     tile = tl.program_id(0)
     offs_row = tl.program_id(1) * BLOCK_ROW + tl.arange(0, BLOCK_ROW)
@@ -617,7 +623,7 @@ def _dspark_markov_sample_stage1(
         offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
         k_mask = offs_k < rank
         embed = tl.load(
-            w1_ptr + prev[:, None] * stride_w1_vocab + offs_k[None, :],
+            w1_ptr + prev[:, None].to(tl.int64) * stride_w1_vocab + offs_k[None, :],
             mask=row_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
@@ -628,14 +634,14 @@ def _dspark_markov_sample_stage1(
                 mask=row_mask[:, None] & k_mask[None, :],
             )
         w2 = tl.load(
-            w2_ptr + offs_v[None, :] * stride_w2_vocab + offs_k[:, None],
+            w2_ptr + offs_v[None, :].to(tl.int64) * stride_w2_vocab + offs_k[:, None],
             mask=v_mask[None, :] & k_mask[:, None],
             other=0.0,
         )
         acc = tl.dot(embed, w2, acc)
 
     base = tl.load(
-        base_ptr + offs_row[:, None] * stride_base_row + offs_v[None, :],
+        base_ptr + offs_row[:, None].to(tl.int64) * stride_base_row + offs_v[None, :],
         mask=row_mask[:, None] & v_mask[None, :],
         other=0.0,
     )
@@ -645,10 +651,12 @@ def _dspark_markov_sample_stage1(
     temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
     scaled = (base.to(tl.float32) + acc) / temperature[:, None]
     scaled = tl.where(v_mask[None, :], scaled, float("-inf"))
+    q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
+    q_row = (q_base + position).to(tl.int64) * vocab_size
     tl.store(
-        scaled_out_ptr + offs_row[:, None] * stride_scaled_row + offs_v[None, :],
+        q_ptr + q_row[:, None] + offs_v[None, :],
         scaled,
-        mask=row_mask[:, None] & v_mask[None, :],
+        mask=(row_mask & (q_base >= 0))[:, None] & v_mask[None, :],
     )
 
     tile_max, tile_sum = tile_max_sumexp(scaled, v_mask[None, :])
@@ -658,7 +666,8 @@ def _dspark_markov_sample_stage1(
 
 @triton.jit
 def _dspark_markov_sample_stage3(
-    scaled_ptr,
+    q_ptr,
+    q_row_base_ptr,
     row_max_ptr,
     row_inv_z_ptr,
     greedy_mask_ptr,
@@ -667,8 +676,8 @@ def _dspark_markov_sample_stage3(
     part_idx_ptr,
     num_rows,
     vocab_size,
+    position,
     noise_offset,
-    stride_scaled_row,
     BLOCK_V: tl.constexpr,
 ):
     """One (row, V tile): normalize ``s`` into q in place, then run the
@@ -687,23 +696,25 @@ def _dspark_markov_sample_stage3(
     offs_v = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     v_mask = offs_v < vocab_size
 
-    offs = row * stride_scaled_row + offs_v
-    scaled = tl.load(scaled_ptr + offs, mask=v_mask, other=float("-inf"))
+    q_base = tl.load(q_row_base_ptr + row)
+    has_q = q_base >= 0
+    # A row with no destination loads -inf everywhere, so its probabilities are
+    # 0, its keys tie at 0 and it drafts the tile's first id. Nothing reads it.
+    offs = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * vocab_size + offs_v
+    scaled = tl.load(q_ptr + offs, mask=v_mask & has_q, other=float("-inf"))
     row_max = tl.load(row_max_ptr + row)
     inv_z = tl.load(row_inv_z_ptr + row)
-    probs = tl.where(v_mask, tl.exp(scaled - row_max) * inv_z, 0.0)
-    tl.store(scaled_ptr + offs, probs, mask=v_mask)
+    probs = tl.where(v_mask & has_q, tl.exp(scaled - row_max) * inv_z, 0.0)
+    tl.store(q_ptr + offs, probs, mask=v_mask & has_q)
 
     # Philox, keyed on a device scalar every rank fills with the same SPMD step
-    # counter. The flat element index is the counter offset, so a given (step,
+    # counter. The flat element index is the counter, so a given (step,
     # position, row, id) draws one uniform, the same one on every rank.
     seed = tl.load(seed_ptr)
-    u = tl.rand(seed, noise_offset + row * vocab_size + offs_v)
+    u = tl.rand(seed, noise_offset + row.to(tl.int64) * vocab_size + offs_v)
     # `-log(u)` rather than `-log(1 - u)`: tl.rand is [0, 1), so E = -log(u) is
     # in (0, inf] and the key probs / E is always finite (u == 0 gives key 0,
-    # which simply loses the race). With `1 - u`, a small u rounds the
-    # complement to exactly 1.0, E is then -0.0 and probs / -0.0 is -inf --
-    # harmless only because the zero happened to come out negative.
+    # which simply loses the race).
     exp_noise = -tl.log(u)
     greedy = tl.load(greedy_mask_ptr + row) != 0
     denom = tl.where(greedy, 1.0, exp_noise)
@@ -723,7 +734,9 @@ def _dspark_markov_sample_fake(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
     out: torch.Tensor,
-    probs_out: torch.Tensor,
+    q_store: torch.Tensor,
+    q_row_base: torch.Tensor,
+    position: int,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     seed: torch.Tensor,
@@ -737,39 +750,53 @@ def _dspark_markov_sample_fake(
     )
 
 
-def _torch_dspark_markov_sample(
+def dspark_markov_sample_reference(
     base_logits: torch.Tensor,
     prev_ids: torch.Tensor,
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
-    out: torch.Tensor,
-    probs_out: torch.Tensor,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
-    seed: torch.Tensor,
-    noise_offset: int,
-) -> torch.Tensor:
-    """The reference this op replaces, with the markov bias folded in.
+    exp_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The eager spelling of the op, for tests: ``(ids [B], q [B, V])``.
 
-    Kept as the out-of-range fallback and as the thing the kernel is tested
-    against. It draws its noise from the global RNG, so it is not rank-safe and
-    not reachable on the serving path; `_fused_is_supported` gates it.
+    Takes its ``[B, V]`` Exp(1) noise as an argument rather than drawing it,
+    so a test can feed it the same draws the kernel would make, or none.
     """
     markov_embed = markov_w1[prev_ids]
     bias = torch.matmul(markov_embed.float(), markov_w2.float().t())
-    probs_out.copy_(
-        torch.softmax(
-            (base_logits.float() + bias) / temperatures[:, None].float(), dim=-1
-        )
+    q = torch.softmax(
+        (base_logits.float() + bias) / temperatures[:, None].float(), dim=-1
     )
-    exp_noise = torch.empty_like(probs_out).exponential_(1)
     noise = torch.where(greedy_mask.bool()[:, None], 1.0, exp_noise)
-    out.copy_((probs_out / noise).argmax(dim=-1))
-    return markov_embed
+    return (q / noise).argmax(dim=-1), q
+
+
+def dspark_markov_sample_unsupported(
+    markov_w1: torch.Tensor, markov_w2: torch.Tensor
+) -> str | None:
+    """Why the fused sampled op cannot run these weights, or None if it can.
+
+    Checked once, when lossless sampling is armed, so an unsupported head
+    keeps the greedy pair rather than failing on the first sampled step.
+    """
+    if not markov_w1.is_cuda:
+        return "the markov head is not on a GPU"
+    # tl.dot wants one dtype for both operands, and bf16/fp16 are the only ones
+    # whose products are exactly representable in the fp32 accumulator.
+    if markov_w1.dtype is not markov_w2.dtype or markov_w1.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return f"markov weights are {markov_w1.dtype}/{markov_w2.dtype}"
+    if markov_w1.stride(1) != 1 or markov_w2.stride(1) != 1:
+        return "markov weights are not contiguous along the rank axis"
+    return None
 
 
 @torch_compile_guard(
-    gen_fake=_dspark_markov_sample_fake, mutates_args=["out", "probs_out"]
+    gen_fake=_dspark_markov_sample_fake, mutates_args=["out", "q_store"]
 )
 def dspark_markov_sample(
     base_logits: torch.Tensor,
@@ -777,7 +804,9 @@ def dspark_markov_sample(
     markov_w1: torch.Tensor,
     markov_w2: torch.Tensor,
     out: torch.Tensor,
-    probs_out: torch.Tensor,
+    q_store: torch.Tensor,
+    q_row_base: torch.Tensor,
+    position: int,
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     seed: torch.Tensor,
@@ -794,19 +823,24 @@ def dspark_markov_sample(
         out:          [B]     int32/int64 destination for the ids. A strided
                               view is fine -- that is how the caller's own
                               `[B, T + 1]` block becomes the destination.
-        probs_out:    [B, V]  fp32 destination for q. Used as scratch for the
-                              unnormalized scores first, so it must not alias
-                              anything live.
+        q_store:      [N, V]  fp32 persistent q; row ``q_row_base[b] +
+                              position`` receives row b's distribution. Used as
+                              scratch for the unnormalized scores first.
+        q_row_base:   [B]     int32; negative writes nothing.
+        position:             host int, this block position.
         temperatures: [B]     fp32, pre-clamped away from 0 by the caller.
         greedy_mask:  [B]     int32, nonzero where the draw is an argmax.
         seed:         [1]     int32 device scalar. Must hold the same value on
-                              every TP/PCP rank; see the module notes.
+                              every TP rank; see the module notes.
         noise_offset:         host int, the Philox counter base for this block
-                              position. Static (position * B * V), so it does
-                              not make the launch data-dependent.
+                              position. Static (position * max_B * V), so it
+                              does not make the launch data-dependent.
 
     Returns:
         ``[B, r]`` ``W1[prev_ids]``, for the same reason the greedy op returns it.
+
+    Raises rather than falling back: an eager fallback would draw from the
+    global RNG, which TP ranks do not share, and the drafts would fork.
     """
     if base_logits.dim() != 2 or markov_w1.dim() != 2 or markov_w2.dim() != 2:
         raise ValueError("dspark_markov_sample expects 2-D base_logits/w1/w2")
@@ -823,32 +857,33 @@ def dspark_markov_sample(
             "or int64 an id block is made of"
         )
     if (
-        probs_out.shape != (num_rows, vocab_size)
-        or probs_out.dtype is not torch.float32
+        q_store.dim() != 2
+        or q_store.shape[1] != vocab_size
+        or q_store.dtype is not torch.float32
+        or not q_store.is_contiguous()
     ):
         raise ValueError(
-            f"probs_out {tuple(probs_out.shape)} {probs_out.dtype} is not the "
-            f"[{num_rows}, {vocab_size}] fp32 the accept kernel reads q from"
+            f"q_store {tuple(q_store.shape)} {q_store.dtype} is not a contiguous "
+            f"[N, {vocab_size}] fp32 store the accept kernel reads q from"
         )
-    if probs_out.stride(1) != 1:
-        raise ValueError("probs_out rows must be contiguous over the vocab axis")
-    if num_rows == 0 or not _fused_is_supported(
-        base_logits, prev_ids, out, markov_w1, markov_w2
+    if (
+        q_row_base.shape != (num_rows,)
+        or q_row_base.dtype is not torch.int32
+        or q_row_base.stride(0) != 1
     ):
-        return _torch_dspark_markov_sample(
-            base_logits,
-            prev_ids,
-            markov_w1,
-            markov_w2,
-            out,
-            probs_out,
-            temperatures,
-            greedy_mask,
-            seed,
-            noise_offset,
+        raise ValueError(
+            f"q_row_base {tuple(q_row_base.shape)} {q_row_base.dtype} is not a "
+            f"contiguous [{num_rows}] int32"
         )
+    if base_logits.stride(1) != 1:
+        raise ValueError("base_logits rows must be contiguous over the vocab axis")
+    why = dspark_markov_sample_unsupported(markov_w1, markov_w2)
+    if why is not None:
+        raise ValueError(f"dspark_markov_sample cannot run: {why}")
     device = base_logits.device
     markov_embed = torch.empty(num_rows, rank, dtype=markov_w1.dtype, device=device)
+    if num_rows == 0:
+        return markov_embed
     block_row = min(
         _MAX_BLOCK_ROW, max(_MIN_BLOCK_ROW, triton.next_power_of_2(num_rows))
     )
@@ -869,19 +904,20 @@ def dspark_markov_sample(
         markov_w1,
         markov_w2,
         temperatures,
+        q_row_base,
         markov_embed,
-        probs_out,
+        q_store,
         part_max,
         part_sum,
         num_rows,
         vocab_size,
         rank,
+        position,
         stride_base_row=base_logits.stride(0),
         stride_prev=prev_ids.stride(0),
         stride_w1_vocab=markov_w1.stride(0),
         stride_embed_row=markov_embed.stride(0),
         stride_w2_vocab=markov_w2.stride(0),
-        stride_scaled_row=probs_out.stride(0),
         BLOCK_ROW=block_row,
         BLOCK_V=_BLOCK_V,
         BLOCK_K=_BLOCK_K,
@@ -904,7 +940,8 @@ def dspark_markov_sample(
     part_key = torch.empty((sample_tiles, num_rows), **f32)
     part_idx = torch.empty((sample_tiles, num_rows), dtype=torch.int32, device=device)
     _dspark_markov_sample_stage3[(num_rows, sample_tiles)](
-        probs_out,
+        q_store,
+        q_row_base,
         row_max,
         row_inv_z,
         greedy_mask,
@@ -913,8 +950,8 @@ def dspark_markov_sample(
         part_idx,
         num_rows,
         vocab_size,
+        position,
         noise_offset,
-        stride_scaled_row=probs_out.stride(0),
         BLOCK_V=_SAMPLE_BLOCK_V,
         num_warps=4,
         num_stages=2,

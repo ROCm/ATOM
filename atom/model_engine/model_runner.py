@@ -3769,18 +3769,6 @@ class ModelRunner:
         # same count.
         if draft_token is not None and get_pcp_world_size() > 1:
             draft_token = get_pcp_group().broadcast(draft_token.contiguous(), src=0)
-        # The draft distribution q: the block head wrote it at this step's batch
-        # slots, and the verify that tests it runs after other batches have
-        # reused those slots -- ATOM never mixes prefill and decode, so a
-        # prefill-only step in between overwrites every decode request's q.
-        # This copies each request's rows out into the persistent block it owns,
-        # keyed by req_id. Positional, like `record_ell` below: the block was
-        # drafted from `next_token_ids`, in batch-slot order.
-        #
-        # Above the align_only return on purpose: an align-only propose still
-        # writes the q scratch at rows `[0, running_bs)`, so skipping the
-        # copy-out would strand its q where the next propose overwrites it.
-        self.drafter.record_draft_probs_slots(batch.req_ids[: batch.total_seqs_num])
         if align_only:
             return None
         # DSpark Phase 2: stash this step's scheduler-chosen ell keyed by req_id,

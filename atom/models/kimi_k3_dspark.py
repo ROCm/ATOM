@@ -173,7 +173,9 @@ class DSparkMarkovHead(nn.Module):
         token_ids: torch.Tensor,  # [B]   x_{k-1}
         base_logits: torch.Tensor,  # [B, V]
         out: torch.Tensor,  # [B]   destination for x_k
-        probs_out: torch.Tensor,  # [B, V] fp32 destination for q_k
+        q_store: torch.Tensor,  # [rows, V] fp32 persistent q
+        q_row_base: torch.Tensor,  # [B] int32, first q_store row per batch row
+        position: int,  # k: this position's row is q_row_base + k
         temperatures: torch.Tensor,  # [B]
         greedy_mask: torch.Tensor,  # [B] int32
         seed: torch.Tensor,  # [1] int32, device
@@ -187,10 +189,6 @@ class DSparkMarkovHead(nn.Module):
         distribution the other exists not to materialize), so a caller that
         takes the wrong one fails loudly rather than silently drafting under a
         policy the accept rule does not match.
-
-        No unfused spelling is offered: it would need a rank-safe ``[B, V]``
-        noise draw, which the global RNG cannot give under TP. The op's own
-        torch fallback is the only reference, and it is test-only.
         """
         return dspark_markov_sample(
             base_logits,
@@ -198,7 +196,9 @@ class DSparkMarkovHead(nn.Module):
             self.markov_w1.weight,
             self.markov_w2.weight,
             out,
-            probs_out,
+            q_store,
+            q_row_base,
+            position,
             temperatures,
             greedy_mask,
             seed,

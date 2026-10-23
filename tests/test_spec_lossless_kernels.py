@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
-"""The probability-ratio verify (`rejection_sample` with ``draft_probs``)
-against its law: the emitted tokens follow the target's p whatever q the drafts
-came from, and a request without q falls back to p.
+"""The two kernels lossless speculative sampling adds, against their laws.
+
+* `dspark_markov_sample`: each row draws ``x ~ q = softmax((base + bias) / T)``
+  and writes q into the persistent store at its own row block, nowhere else.
+* The probability-ratio verify (`rejection_sample` with ``draft_probs``): the
+  emitted tokens follow the target's p whatever q the drafts came from; a
+  request without q falls back to p.
 
 Statistical checks use fixed seeds and tolerances several standard errors
 wide, so they are deterministic on a given platform and fail only on a real
-bias. The properties that hold for every coin (residual support, row-base
-indirection, rank-consistent draws) are asserted exactly.
+bias. The properties that hold for every coin (destination rows, residual
+support, rank-consistent draws) are asserted exactly.
 """
 
 import pytest
@@ -16,13 +20,176 @@ pytest.importorskip("aiter", reason="the samplers are AITER/Triton ops")
 if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
 
+from atom.model_ops.dspark_markov_sample import (
+    dspark_markov_argmax,
+    dspark_markov_sample,
+    dspark_markov_sample_reference,
+)
 from atom.model_ops.rejection_sampler import (
     _RATIO_BLOCK_V,
     rejection_sample,
 )
+from atom.model_ops.sampler import SAMPLER_EPS
 
 DEV = "cuda"
 ANCHOR = 0
+
+
+def tables(rows, vocab, rank, seed=1201):
+    torch.manual_seed(seed)
+    kw = {"dtype": torch.bfloat16, "device": DEV}
+    return (
+        torch.randn(rows, vocab, **kw),
+        torch.randint(0, vocab, (rows,), dtype=torch.int64, device=DEV),
+        torch.randn(vocab, rank, **kw) * 0.1,
+        torch.randn(vocab, rank, **kw) * 0.1,
+    )
+
+
+def draft_args(rows, temperature=1.0, greedy=False, step=0):
+    return (
+        torch.full((rows,), temperature, device=DEV),
+        torch.full((rows,), int(greedy), dtype=torch.int32, device=DEV),
+        torch.tensor([step], dtype=torch.int32, device=DEV),
+    )
+
+
+# ---- draft: dspark_markov_sample --------------------------------------------
+
+
+def test_each_row_writes_its_q_at_its_own_block_and_nowhere_else():
+    rows, vocab, rank, t = 6, 3000, 64, 4
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    store = torch.full((10 * t, vocab), -7.0, device=DEV)
+    # Two rows without a destination, the others scattered and out of order.
+    row_base = torch.tensor([8, -1, 0, 4, -1, 6], dtype=torch.int32, device=DEV) * t
+    row_base = torch.where(row_base < 0, -1, row_base).to(torch.int32)
+    position = 2
+    temps, greedy, seed = draft_args(rows, temperature=0.8)
+    out = torch.empty(rows, dtype=torch.int64, device=DEV)
+    dspark_markov_sample(
+        base, prev, w1, w2, out, store, row_base, position, temps, greedy, seed, 0
+    )
+    _, ref_q = dspark_markov_sample_reference(
+        base, prev, w1, w2, temps, greedy, torch.ones(rows, vocab, device=DEV)
+    )
+    written = set()
+    for r, b in enumerate(row_base.tolist()):
+        if b >= 0:
+            torch.testing.assert_close(
+                store[b + position], ref_q[r], rtol=1e-3, atol=1e-6
+            )
+            written.add(b + position)
+    untouched = [i for i in range(store.shape[0]) if i not in written]
+    assert (store[untouched] == -7.0).all(), "a row was written outside its block"
+    assert ((out >= 0) & (out < vocab)).all()
+
+
+@pytest.mark.parametrize("rows", [1, 32])
+def test_at_temperature_zero_it_drafts_what_the_argmax_kernel_drafts(rows):
+    """The flag-on draft at T=0 is the flag-off draft, chained position by
+    position, and the q it publishes is the delta on that id."""
+    vocab, rank, steps = 2048, 128, 4
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    temps, greedy, seed = draft_args(rows, temperature=SAMPLER_EPS, greedy=True)
+    store = torch.zeros(rows * steps, vocab, device=DEV)
+    row_base = torch.arange(rows, dtype=torch.int32, device=DEV) * steps
+    drawn, ref = prev, prev
+    for k in range(steps):
+        ref_ids = torch.empty(rows, dtype=torch.int64, device=DEV)
+        dspark_markov_argmax(base, ref, w1, w2, ref_ids)
+        ids = torch.empty(rows, dtype=torch.int64, device=DEV)
+        dspark_markov_sample(
+            base, drawn, w1, w2, ids, store, row_base, k, temps, greedy, seed, 0
+        )
+        assert torch.equal(ids, ref_ids), k
+        q = store[row_base.long() + k]
+        expected = torch.zeros_like(q).scatter_(1, ids.view(-1, 1), 1.0)
+        torch.testing.assert_close(q, expected, rtol=0, atol=0)
+        drawn, ref = ids, ref_ids
+
+
+def test_sampled_ids_follow_the_q_they_publish():
+    rows, vocab, rank = 8192, 48, 16
+    base, prev, w1, w2 = tables(1, vocab, rank, seed=5)
+    base, prev = base.expand(rows, -1).contiguous(), prev.expand(rows).contiguous()
+    temps, greedy, seed = draft_args(rows, temperature=1.3, step=11)
+    store = torch.empty(rows, vocab, device=DEV)
+    row_base = torch.arange(rows, dtype=torch.int32, device=DEV)
+    out = torch.empty(rows, dtype=torch.int64, device=DEV)
+    dspark_markov_sample(
+        base, prev, w1, w2, out, store, row_base, 0, temps, greedy, seed, 0
+    )
+    q = store[0]
+    assert torch.allclose(store, q.expand_as(store))
+    freq = torch.bincount(out, minlength=vocab).float() / rows
+    # ~4 standard errors of the largest cell.
+    torch.testing.assert_close(freq, q, rtol=0, atol=0.025)
+
+
+def test_the_draws_depend_on_the_key_alone():
+    """TP ranks run this independently and must draft the same ids."""
+    rows, vocab, rank = 64, 1000, 32
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    row_base = torch.arange(rows, dtype=torch.int32, device=DEV)
+    results = []
+    for step in (3, 3, 4):
+        temps, greedy, seed = draft_args(rows, step=step)
+        out = torch.empty(rows, dtype=torch.int64, device=DEV)
+        store = torch.empty(rows, vocab, device=DEV)
+        dspark_markov_sample(
+            base, prev, w1, w2, out, store, row_base, 0, temps, greedy, seed, 0
+        )
+        results.append(out)
+    assert torch.equal(results[0], results[1])
+    assert not torch.equal(results[0], results[2])
+
+
+def test_rows_past_two_gib_of_elements_are_addressed_correctly():
+    """A `[2 * 512 * 16, 163840]` store passes 2**31 elements; so does the base
+    logits' row stride at large batch. Both must be int64 in the kernel."""
+    vocab, rank = 163840, 64
+    big = 2**31 // vocab + 4  # first row past 2**31 elements, plus margin
+    store = torch.zeros(big + 1, vocab, device=DEV)
+    torch.manual_seed(3)
+    stride = 2**31 + 64
+    flat = torch.randn(stride + vocab, dtype=torch.bfloat16, device=DEV)
+    base = flat.as_strided((2, vocab), (stride, 1))
+    prev = torch.tensor([1, 2], dtype=torch.int64, device=DEV)
+    w1 = torch.randn(vocab, rank, dtype=torch.bfloat16, device=DEV) * 0.1
+    w2 = torch.randn(vocab, rank, dtype=torch.bfloat16, device=DEV) * 0.1
+    temps, greedy, seed = draft_args(2)
+    row_base = torch.tensor([big, 0], dtype=torch.int32, device=DEV)
+    out = torch.empty(2, dtype=torch.int64, device=DEV)
+    dspark_markov_sample(
+        base, prev, w1, w2, out, store, row_base, 0, temps, greedy, seed, 0
+    )
+    _, ref_q = dspark_markov_sample_reference(
+        base.contiguous(), prev, w1, w2, temps, greedy, torch.ones(2, vocab, device=DEV)
+    )
+    torch.testing.assert_close(store[big], ref_q[0], rtol=1e-3, atol=1e-7)
+    torch.testing.assert_close(store[0], ref_q[1], rtol=1e-3, atol=1e-7)
+
+
+def test_unsupported_weights_raise_rather_than_drafting_off_the_global_rng():
+    rows, vocab, rank = 4, 64, 16
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    temps, greedy, seed = draft_args(rows)
+    with pytest.raises(ValueError, match="cannot run"):
+        dspark_markov_sample(
+            base,
+            prev,
+            w1.float(),
+            w2.float(),
+            torch.empty(rows, dtype=torch.int64, device=DEV),
+            torch.empty(rows, vocab, device=DEV),
+            torch.arange(rows, dtype=torch.int32, device=DEV),
+            0,
+            temps,
+            greedy,
+            seed,
+            0,
+        )
 
 
 # ---- verify: the probability-ratio rule ---------------------------------------
