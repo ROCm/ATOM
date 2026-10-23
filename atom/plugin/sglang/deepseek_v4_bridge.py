@@ -35,7 +35,7 @@ def _fp4_rowgroup_decode_enabled() -> bool:
         from atom.model_ops.v4_kernels import fp4_indexer_enabled
 
         dtype = get_current_atom_config().index_cache_dtype
-    except Exception:
+    except Exception:  # noqa: BLE001 - ATOM config is absent outside a loaded model
         return False
     if not fp4_indexer_enabled(dtype):
         return False
