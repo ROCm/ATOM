@@ -185,6 +185,21 @@ def max_schedulable_decode_bs(
 _kv_config_has_producer = kv_config_has_producer
 
 
+def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
+    """Do the sampled ids have to agree across a parallel group this step?
+
+    Only when they feed back as device-side input to the next forward, which is
+    exactly these two: deferred-out hands them on as `prev_token_ids`, and a
+    drafter consumes them as its draft input. Otherwise `prepare_sampled_ids`
+    returns through the host and leaves no GPU state to diverge from.
+
+    One predicate for both the PCP and the TP broadcast, which have to stay the
+    same condition -- they are the same question asked of two groups, and two
+    copies of it would eventually answer differently.
+    """
+    return is_deferred_out or has_drafter
+
+
 class TokenLocations(NamedTuple):
     """How each request in this decode batch gets its anchor token.
 
@@ -3323,8 +3338,8 @@ class ModelRunner:
         # moe_pcp_merge all_reduce then sums MoE partials from mismatched hidden
         # states -- the very thing its own comment assumes cannot happen. Pin the
         # ids to rank 0. Same condition as the TP broadcast below.
-        if get_pcp_world_size() > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        if get_pcp_world_size() > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_pcp_group().broadcast(
                 sampled_tokens.contiguous(), src=0
@@ -3332,12 +3347,12 @@ class ModelRunner:
 
         # Drafter input must agree across TP ranks.
         # Only the ids, on purpose: the sampler is stochastic (independent noise
-        # for n>1 fan-out). num_bonus_tokens is not -- it is a deterministic
-        # function of target_probs and the draft ids, which TP ranks share
-        # bit-for-bit, so broadcasting it here would be a no-op. Only PCP needs
-        # it (its target_probs differ), and syncs it above.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        # for n>1 fan-out). The verdict is not -- it is a deterministic function
+        # of target_probs and the draft ids, which TP ranks share bit-for-bit,
+        # so broadcasting it here would be a no-op. Only PCP needs it (its
+        # target_probs differ), and syncs it above.
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3350,6 +3365,12 @@ class ModelRunner:
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
+            # TP only, and the asymmetry with the ids above is deliberate rather
+            # than an oversight: logprobs never feed the next forward, they just
+            # leave through the output channel, and only worker 0 has one -- a
+            # non-zero rank's copy is dropped. So PCP, whose ranks genuinely do
+            # differ here, needs no broadcast, while this TP one (a no-op on
+            # bit-identical inputs) is kept as it was.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 

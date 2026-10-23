@@ -68,10 +68,10 @@ from atom.distributed.pcp_utils import (
     pcp_allgather_rankmajor,
     pcp_allgather_rerange,
     pcp_merged_tp_grid,
-    pcp_split_active,
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
+    pcp_split_active,
 )
 from atom.model_loader.loader import WeightsMapper
 from atom.model_loader.weight_utils import local_model_dir
@@ -3648,8 +3648,10 @@ class Expert(nn.Module):
     ):
         super().__init__()
         # `tp_grid` overrides the (size, rank) both projections shard on. The
-        # shared expert passes the pcp-folded grid so it shards like FusedMoE
-        # instead of being replicated on every pcp rank; None keeps the TP group.
+        # shared expert passes whatever `pcp_merged_tp_grid` picked, so it is
+        # cut across pcp instead of replicated on every pcp rank; None keeps the
+        # TP group. A grid coarser than pcp*tp is answered by the caller's
+        # pre-scale, not here -- this only sizes the weights.
         grid = (
             {"override_tp_size": tp_grid[0], "override_tp_rank": tp_grid[1]}
             if tp_grid is not None
@@ -3813,11 +3815,16 @@ class MoE(nn.Module):
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
-            # Shard on the pcp-folded grid when moe_pcp_merge is on, so the
-            # shared expert stops being a full replica on every pcp rank. Its
-            # partials are then summed by the same tp all_reduce + pcp
+            # Cut on the pcp-folded grid when moe_pcp_merge is on, so the shared
+            # expert stops being a full replica on every pcp rank. Its partials
+            # are then summed by the same tp all_reduce + pcp
             # reduce_scatter/all_reduce the routed experts already ride.
-            self._shared_pcp_sharded = pcp_merged_tp_grid()
+            # `align=128` is the same block-scale granularity the FusedMoE above
+            # pads to; the grid steps down to a coarser divisor rather than hand
+            # the weight loader a shard that splits a scale block.
+            self._shared_pcp_grid = pcp_merged_tp_grid(
+                shard_dim=args.moe_inter_dim, align=128
+            )
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -3825,11 +3832,23 @@ class MoE(nn.Module):
                 quant_config=qc,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
-                tp_grid=self._shared_pcp_sharded,
+                tp_grid=(
+                    None
+                    if self._shared_pcp_grid is None
+                    else (self._shared_pcp_grid.size, self._shared_pcp_grid.rank)
+                ),
             )
         else:
-            self._shared_pcp_sharded = None
+            self._shared_pcp_grid = None
             self.shared_experts = None
+        # What `combine_outputs` owes the collectives downstream: `g/(pcp*tp)`
+        # for a grid that cut it g ways, `1/pcp_size` for one left on the TP
+        # group (grid None). Unused when there is no separate shared expert.
+        self._shared_prescale = (
+            self._shared_pcp_grid.prescale
+            if self._shared_pcp_grid is not None
+            else 1.0 / max(get_pcp_world_size(), 1)
+        )
         if self.is_hash_layer:
             # Inject hash routing into FusedMoE.select_experts via the
             # custom_routing_function hook (added in atom/model_ops/moe.py).
@@ -3983,14 +4002,17 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # A pcp-sharded shared expert emits a partial sum, like routed, so the
-            # downstream pcp reduce_scatter/all_reduce sums it correctly as-is.
-            # A replicated one gets counted pcp_size times there instead, so it
-            # needs the 1/pcp_size pre-scale to come back out at 1x.
-            if self._shared_pcp_sharded is None and (
+            # The tp all_reduce below and the pcp reduce_scatter/all_reduce in
+            # Block between them sum all pcp*tp rank contributions. A shared
+            # expert cut g ways is held by pcp*tp/g of those ranks, so its sum
+            # comes back that many times too large -- `_shared_prescale` is the
+            # g/(pcp*tp) that lands it at 1x. Cut on the whole folded grid it is
+            # 1.0 (a genuine partial sum, like routed, nothing to undo); left
+            # replicated on the TP group it is the familiar 1/pcp_size.
+            if self._shared_prescale != 1.0 and (
                 _moe_pcp_merge_active() or _moe_pcp_merge_decode_active()
             ):
-                shared = shared * (1.0 / get_pcp_world_size())
+                shared = shared * self._shared_prescale
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether

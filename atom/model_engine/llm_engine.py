@@ -163,13 +163,21 @@ class LLMEngine:
             # TBO stripes positions per request group; the draft prefill split
             # stripes the batch as one flat global sequence. The shards disagree
             # on length and order, so refuse rather than crash inside the draft.
+            # Last, so the two branches above have already had their say: both
+            # clear enable_tbo, which means this can only fire at -tp 1 with
+            # merge on. Deliberately conservative -- it keys on the config, so a
+            # run whose token counts would never reach TBO's threshold is
+            # refused too; the alternative is a per-step decision that cannot be
+            # made at startup.
             if config.enable_tbo and config.speculative_config is not None:
                 raise ValueError(
                     "prefill_context_parallel_size > 1 (-pcp) with speculative "
                     "decoding is not supported under TBO: TBO's PCP prefill "
                     "splits per request group, which the draft model's global "
-                    "round-robin query split does not match. Drop --enable-tbo "
-                    "or run without a draft model."
+                    "round-robin query split does not match. Drop --enable-tbo, "
+                    "or run without a draft model. Note -tp > 1 already "
+                    "disables TBO under PCP (see above), so this only affects "
+                    "-tp 1 (e.g. -tp 1 -pcp 8)."
                 )
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size

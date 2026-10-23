@@ -19,33 +19,54 @@ Groups:
   * row ownership        --- `pcp_round_robin_split` vs `pcp_round_robin_query_indices`
   * metadata padding     --- `pcp_pad_dense` vs `pcp_pad_indptr`
   * ragged reindex       --- `pcp_reindex_ragged`
+  * folded MoE grid      --- `pcp_merged_tp_grid` vs `FusedMoEParallelConfig.make`
 """
 
-import pytest
-import torch
+import importlib
+from types import SimpleNamespace
 
+import pytest
+from import_guard import skip_if_dependency_missing
+
+torch = pytest.importorskip("torch")
+
+# atom.config first, so a circular import on the mainline path cannot be
+# mistaken for an absent dependency below.
 try:
+    import atom.config
     import atom.distributed.pcp_utils as pu
+    from atom.model_ops import moe as moe_mod
     from atom.spec_decode import eagle_proposer as ep
 
-    _IMPORT_ERR = None
-except Exception as exc:  # pragma: no cover - env without aiter/triton
-    _IMPORT_ERR = exc
-
-pytestmark = pytest.mark.skipif(
-    _IMPORT_ERR is not None,
-    reason=f"requires full atom import env: {_IMPORT_ERR}",
-)
+    # NOT `import aiter.dist.parallel_state as aps`: aiter's __init__ rebinds
+    # its `dist` attribute to torch.distributed after the real subpackage is
+    # already in sys.modules, so the `as` form's attribute walk lands on torch
+    # and raises. The repo's own `from aiter.dist.parallel_state import X` is
+    # unaffected (that reads sys.modules). The module object is what is needed
+    # here: moe.py imports those names *inside* the function under test, so
+    # only patching the real module reaches it.
+    aps = importlib.import_module("aiter.dist.parallel_state")
+except ImportError as _e:  # pragma: no cover - env without aiter/triton
+    # Not `except Exception`: that is the exact mistake import_guard.py was
+    # written about -- it swallows a SyntaxError in the module under test and
+    # reports the silence as a skip.
+    skip_if_dependency_missing(_e, "requires full atom import env")
 
 HID = 4
 WS = 4
 
 
 def _inputs(n):
-    """Row i carries the value i everywhere, so a shard's provenance is readable."""
-    ids = torch.arange(n, dtype=torch.int32)
-    pos = torch.arange(n, dtype=torch.int32)
-    hid = torch.arange(n, dtype=torch.float32)[:, None].repeat(1, HID)
+    """Row i carries i+1 everywhere, so a shard's provenance is readable.
+
+    i+1, not i: padding fills with zero, so starting at 1 leaves 0 as a
+    sentinel that cannot be confused with real row 0 -- otherwise the
+    ownership assertions below have to exempt the one value most likely to
+    expose an off-by-one.
+    """
+    ids = torch.arange(1, n + 1, dtype=torch.int32)
+    pos = torch.arange(1, n + 1, dtype=torch.int32)
+    hid = torch.arange(1, n + 1, dtype=torch.float32)[:, None].repeat(1, HID)
     return ids, pos, hid
 
 
@@ -76,15 +97,17 @@ def test_pads_to_a_multiple_and_splits_round_robin(monkeypatch):
 
     # Round-robin, NOT contiguous chunks -- this is the convention the metadata
     # builder reindexes to, so a chunked split would silently mismatch it.
-    assert seen[0] == [0, 4, 8]
-    assert seen[1] == [1, 5, 9]
-    assert seen[2] == [2, 6, 0]  # global row 10 is pad -> zero
-    assert seen[3] == [3, 7, 0]  # global row 11 is pad -> zero
+    assert seen[0] == [1, 5, 9]
+    assert seen[1] == [2, 6, 10]
+    assert seen[2] == [3, 7, 0]  # global row 10 is pad -> zero
+    assert seen[3] == [4, 8, 0]  # global row 11 is pad -> zero
 
-    # Every real row is owned by exactly one rank.
+    # Every real row is owned by exactly one rank -- no exemptions, since 0 is
+    # now only ever padding.
     real = [v for rows in seen.values() for v in rows]
-    for row in range(10):
-        assert real.count(row) == 1 or row == 0, f"row {row} owned {real.count(row)}x"
+    for row in range(1, 11):
+        assert real.count(row) == 1, f"row {row} owned {real.count(row)}x"
+    assert real.count(0) == 2, "exactly the two pad rows"
 
 
 def test_all_three_tensors_shard_identically(monkeypatch):
@@ -100,14 +123,14 @@ def test_exact_multiple_needs_no_pad(monkeypatch):
     ids, pos, hid = _inputs(8)
     d_ids, _, _, n_global, _ = _split(monkeypatch, ids, pos, hid, rank=3)
     assert n_global == 8
-    assert d_ids.tolist() == [3, 7]
+    assert d_ids.tolist() == [4, 8]
 
 
 def test_pcp1_is_a_no_op(monkeypatch):
     ids, pos, hid = _inputs(5)
-    d_ids, d_pos, d_hid, n_global, ws = _split(monkeypatch, ids, pos, hid, rank=0, ws=1)
+    d_ids, _, d_hid, n_global, ws = _split(monkeypatch, ids, pos, hid, rank=0, ws=1)
     assert (n_global, ws) == (5, 1)
-    assert d_ids.tolist() == list(range(5))
+    assert d_ids.tolist() == list(range(1, 6))
     assert d_hid.shape == (5, HID)
 
 
@@ -233,3 +256,169 @@ def test_reindex_ragged_handles_an_all_empty_shard():
     ip_local, idx_local = pu.pcp_reindex_ragged(kv_indptr, kv_indices, owned)
     assert ip_local.tolist() == [0, 0, 0]
     assert idx_local.numel() == 0
+
+
+# --------------------------------------------------------------------------
+# folded MoE grid --- `pcp_merged_tp_grid`
+#
+# DSV4's `moe_inter_dim`, the dimension the shared expert is cut along. 3072 /
+# 128 = 24, so the folded grid can only cut it 1/2/4/8 ways before a block-quant
+# scale block would straddle two ranks.
+# --------------------------------------------------------------------------
+
+INTER = 3072
+
+
+def _cfg(**over):
+    base = {
+        "enable_dp_attention": False,
+        "moe_ep_flatten_tp_across_dp": False,
+        "enable_expert_parallel": False,
+        "dp_logical_size": 0,
+        "moe_all2all_backend": "auto",
+        "enable_low_latency": False,
+    }
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank, merge="1", cfg=None):
+    """Present one (pcp, tp) rank position to BOTH folds under test.
+
+    Patched in two namespaces on purpose: `pcp_merged_tp_grid` reads the pcp
+    helpers and tp group out of `pcp_utils`, while `FusedMoEParallelConfig.make`
+    reads its tp group out of `moe` and imports the pcp ones from aiter inside
+    the call. Same numbers, so the two can be compared.
+    """
+    cfg = cfg if cfg is not None else _cfg()
+    m.setenv("ATOM_PCP_MOE_MERGE", merge)
+    tp = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank)
+    m.setattr(pu, "get_pcp_world_size", lambda: pcp_size)
+    m.setattr(pu, "get_pcp_rank", lambda: pcp_rank)
+    m.setattr(pu, "get_tp_group", lambda: tp)
+    m.setattr(moe_mod, "get_tp_group", lambda: tp)
+    m.setattr(moe_mod, "get_current_atom_config", lambda: cfg)
+    m.setattr(atom.config, "get_current_atom_config", lambda: cfg)
+    m.setattr(aps, "get_prefill_context_model_parallel_world_size", lambda: pcp_size)
+    m.setattr(aps, "get_prefill_context_model_parallel_rank", lambda: pcp_rank)
+    return cfg
+
+
+@pytest.mark.parametrize("pcp_size, tp_size", [(8, 1), (2, 4), (4, 2)])
+def test_folded_grid_agrees_with_fused_moe(monkeypatch, pcp_size, tp_size):
+    """The two folds must produce the same (size, rank) on every rank.
+
+    This is the invariant, not the formula: routed and shared ride the same tp
+    all_reduce + pcp collective, so if the two disagree about which slice a rank
+    owns, one of them is double-counted on every layer of every token. `pcp8` is
+    tp=1, where both flatten orders coincide and cannot be told apart -- the
+    mixed configs are what actually discriminate.
+    """
+    for flat in range(pcp_size * tp_size):
+        pcp_rank, tp_rank = divmod(flat, tp_size)
+        with monkeypatch.context() as m:
+            cfg = _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
+            grid = pu.pcp_merged_tp_grid()
+            fused = moe_mod.FusedMoEParallelConfig.make(tp_size, 1, cfg)
+        assert grid is not None
+        assert (grid.size, grid.rank) == (fused.tp_size, fused.tp_rank), (
+            f"pcp{pcp_size}xtp{tp_size} flat={flat}: "
+            f"grid={grid.size, grid.rank} fused={fused.tp_size, fused.tp_rank}"
+        )
+        assert grid.prescale == 1.0  # whole grid -> nothing to undo
+
+
+def test_the_reversed_flatten_would_be_caught(monkeypatch):
+    """The agreement test above has to be able to go red.
+
+    Both orders are permutations of 0..N-1, so "every shard owned once" passes
+    either way -- only agreement with moe.py separates them. Pin that the
+    reversed mapping really does differ, so the test above is not vacuous.
+    """
+    pcp_size, tp_size = 2, 4
+    differs = 0
+    for flat in range(pcp_size * tp_size):
+        pcp_rank, tp_rank = divmod(flat, tp_size)
+        with monkeypatch.context() as m:
+            _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
+            grid = pu.pcp_merged_tp_grid()
+        reversed_rank = tp_rank * pcp_size + pcp_rank  # the mapping to avoid
+        differs += grid.rank != reversed_rank
+    assert differs > 0
+
+
+@pytest.mark.parametrize(
+    "pcp_size, tp_size, want",
+    [
+        (8, 1, (8, 1.0)),  # 3072/8 = 384, a 128 multiple -> the whole grid
+        (16, 1, (8, 0.5)),  # 3072/16 = 192 is not -> step down to 8
+        (8, 2, (8, 0.5)),  # same ceiling reached from the other axis
+        (2, 8, None),  # steps all the way down to tp -> stay on the TP group
+    ],
+)
+def test_steps_down_to_a_block_aligned_grid(monkeypatch, pcp_size, tp_size, want):
+    """A shard that would split a 128 scale block faults in the weight loader.
+
+    `tp*pcp = 16` is where DSV4 hits it: 3072/16 = 192, and `narrow` then runs
+    off the end of a 3-row scale. Step down instead of crashing at load.
+    """
+    with monkeypatch.context() as m:
+        _as_rank(m, pcp_size, 0, tp_size, 0)
+        grid = pu.pcp_merged_tp_grid(shard_dim=INTER, align=128)
+    if want is None:
+        assert grid is None
+        return
+    size, prescale = want
+    assert (grid.size, grid.prescale) == (size, prescale)
+    assert INTER % grid.size == 0 and (INTER // grid.size) % 128 == 0
+
+
+def test_prescale_matches_how_often_a_shard_is_summed(monkeypatch):
+    """`prescale` is only correct if the shards tile the ranks evenly.
+
+    The collectives downstream sum all pcp*tp contributions blindly. Cut g ways,
+    every shard must land on exactly pcp*tp/g ranks -- then and only then is the
+    sum uniformly g/(pcp*tp) too large and a scalar can undo it.
+    """
+    pcp_size, tp_size = 16, 1
+    held = {}
+    prescale = None
+    for flat in range(pcp_size * tp_size):
+        pcp_rank, tp_rank = divmod(flat, tp_size)
+        with monkeypatch.context() as m:
+            _as_rank(m, pcp_size, pcp_rank, tp_size, tp_rank)
+            grid = pu.pcp_merged_tp_grid(shard_dim=INTER, align=128)
+        held[grid.rank] = held.get(grid.rank, 0) + 1
+        prescale = grid.prescale
+    assert sorted(held) == list(range(8)), "shards 0..7 all present"
+    assert set(held.values()) == {2}, f"uneven: {held}"
+    assert prescale == pytest.approx(1 / 2)
+
+
+@pytest.mark.parametrize(
+    "pcp_size, tp_size, merge",
+    [(1, 8, "1"), (8, 1, "0")],  # no pcp to fold / fold switched off
+)
+def test_no_grid_when_the_fold_is_off(monkeypatch, pcp_size, tp_size, merge):
+    with monkeypatch.context() as m:
+        _as_rank(m, pcp_size, 0, tp_size, 0, merge=merge)
+        assert pu.pcp_merged_tp_grid() is None
+
+
+@pytest.mark.parametrize("flag", ["enable_dp_attention", "moe_ep_flatten_tp_across_dp"])
+def test_flatten_tp_across_dp_is_refused(monkeypatch, flag):
+    """moe.py folds DP into TP before pcp; nothing sums that axis back for a
+    module carried only by the tp all_reduce + the pcp collective."""
+    with monkeypatch.context() as m:
+        _as_rank(m, 8, 0, 1, 0, cfg=_cfg(**{flag: True}))
+        with pytest.raises(ValueError, match="flatten-TP-across-DP"):
+            pu.pcp_merged_tp_grid()
+
+
+def test_needs_id_sync_is_one_predicate_for_both_groups():
+    """PCP and TP gate their id broadcast on the same question."""
+    mr = pytest.importorskip("atom.model_engine.model_runner")
+    assert mr._needs_id_sync(False, False) is False
+    assert mr._needs_id_sync(True, False) is True
+    assert mr._needs_id_sync(False, True) is True
+    assert mr._needs_id_sync(True, True) is True
