@@ -104,6 +104,19 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    if IS_CONTINUOUS_BATCHING:  # noqa: SIM102
+        # A row with no state slot (PAD_SLOT_ID < 0, e.g. the DP dummy decode)
+        # must not read or write state: write zeros and stop, as the
+        # sigmoid-gating update kernel below does.
+        if tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64) < 0:
+            for i_t in range(T):
+                tl.store(
+                    p_o + i_t * HV * V,
+                    tl.zeros([BV], dtype=p_o.dtype.element_ty),
+                    mask=mask_v,
+                )
+            return
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
