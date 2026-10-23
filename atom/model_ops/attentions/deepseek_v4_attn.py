@@ -93,7 +93,10 @@ from atom.model_ops.attentions.pool_layout.sub_pool_spec import (
 )
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
     CSA_INDEXER_SCALE,
+    FP4_GFX950_FLYDSL,
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
+    FP4_OPUS_LAYOUTS,
     MAIN_KV_NOPE,
     fp4_indexer_block_fields,
     fp4_indexer_layout_for_arch,
@@ -139,6 +142,13 @@ from atom.utils.h2d import h2d_producer
 
 _FP4_OPUS_DECODE_Q1_VARIANT = "qlen1_kv64"
 _FP4_OPUS_DECODE_Q4_VARIANT = "qlen4_kv64"
+
+
+def _fp4_opus_decode_variants(layout: str) -> tuple[str, ...]:
+    if layout == FP4_GFX950_OPUS:
+        return (_FP4_OPUS_DECODE_Q1_VARIANT,)
+    return (_FP4_OPUS_DECODE_Q1_VARIANT, _FP4_OPUS_DECODE_Q4_VARIANT)
+
 
 logger = logging.getLogger("atom")
 
@@ -287,10 +297,10 @@ class AttentionMetaData_DSV4(AttentionMetaData):
     for its class: HCA has a per-token count of its own, and the bare name read
     as if it covered both."""
     fp4_decode_topk: torch.Tensor | None = None
-    """int32 GPU `[decode_rows, index_topk]` -- the gfx950 FP4 decode scorer's
+    """int32 GPU `[decode_rows, index_topk]` -- the gfx950 FlyDSL FP4 decode scorer's
     top-k, at a fixed address. Narrow PIECEWISE scores in the batch-keyed
     `_attn_compress` core and the token-keyed dense piece reads it here; None
-    when that scorer is off (FP8, gfx1250, prefill)."""
+    when that scorer is off (FP8, OPUS, prefill)."""
     block_tables_per_token: torch.Tensor | None = None
     """int32 GPU `[decode_rows, block_table_cols]` — compressed-cache block
     table expanded from sequences to query rows by a device-side gather. It
@@ -568,9 +578,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         # FP4 indexer cache (the native single-node default except on gfx942).
         # When enabled, the CSA Indexer KV is
-        # stored as packed FP4 E2M1 + per-group(32) e8m0 scale. gfx950 keeps
-        # the `pa_mqa_logits_fp4` preshuffle; gfx1250 uses OPUS natural rows.
-        # Both are written by `fused_compress_attn(quant_mode="fp4")`. The
+        # stored as packed FP4 E2M1 + per-group(32) e8m0 scale. gfx950 selects
+        # the OPUS or FlyDSL permutation; gfx1250 uses OPUS natural rows.
+        # Both are written by `fused_compress_attn` (fp4/fp4_gfx950_opus mode). The
         # scoring path is selected from the same architecture layout policy.
         # Explicit fp8 keeps the existing FP8 (+fp32 scale) path byte-identical.
         # `--index_cache_dtype` remains an explicit override. This is the
@@ -584,15 +594,23 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             getattr(model_runner.config, "index_cache_dtype", None), warn=True
         )
         self.indexer_layout = (
-            fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
+            fp4_indexer_layout_for_arch(get_gfx(), envs.ATOM_V4_UNIFIED_MQA)
+            if self._indexer_fp4
+            else "fp8"
         )
-        # The gfx950 FP4 decode scorer: a row-group launch planned from the
+        if self._indexer_fp4:
+            logger.info(
+                "DeepSeek-V4 FP4 MQA: %s (ATOM_V4_UNIFIED_MQA=%s)",
+                self.indexer_layout,
+                envs.ATOM_V4_UNIFIED_MQA,
+            )
+        # The gfx950 FlyDSL FP4 decode scorer: a row-group launch planned from the
         # sequence count, scored in the batch-keyed core (`fp4_decode_topk`).
         self._fp4_rowgroup_decode = (
-            self._indexer_fp4 and self.indexer_layout != FP4_GFX1250_NATURAL
+            self._indexer_fp4 and self.indexer_layout == FP4_GFX950_FLYDSL
         )
-        if self.indexer_layout == FP4_GFX1250_NATURAL:
-            if self.max_bs > 2048:
+        if self.indexer_layout in FP4_OPUS_LAYOUTS:
+            if self.indexer_layout == FP4_GFX1250_NATURAL and self.max_bs > 2048:
                 raise ValueError(
                     f"gfx1250 OPUS FP4 MQA supports batch <= 2048, got max_bs={self.max_bs}"
                 )
@@ -600,11 +618,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 pa_mqa_logits_mxfp4_block_table_width,
             )
 
-            # Size for every compiled gfx1250 kernel instance. The qlen=1 and
-            # qlen=4 variants currently share a 64-token KV tile, but the AITER
-            # helper is the ABI authority if a future instance changes it.
+            # Size for every compiled instance, including gfx950's 256-token
+            # KV tile. The helper owns the page-table lookahead requirement.
             opus_cols = pa_mqa_logits_mxfp4_block_table_width(
                 self.max_model_len_idx,
+                device=self.device,
                 kv_block_size=self.csa_rows_per_block,
             )
             if opus_cols > self.block_table_cols:
@@ -1810,6 +1828,8 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # STABLE bool rather than kv_cache.dtype, so a traced piece and the
             # eager op can never disagree (see Indexer._indexer_fp4).
             module._indexer_fp4 = bool(self._indexer_fp4)
+            if module.indexer_layout != self.indexer_layout:
+                raise ValueError("FP4 MQA backend changed after Indexer construction")
             if self._indexer_fp4:
                 # FP4: separate e8m0 scale pool consumed by the
                 # `pa_mqa_logits_fp4` kernels alongside `kv_cache`.
@@ -1839,7 +1859,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 module.kv_cache = idx_kv
                 if self._indexer_fp4:
                     # FP4 path: bind the matching uint8 e8m0 scale pool.
-                    # `fused_compress_attn(quant_mode="fp4")` writes both in
+                    # `fused_compress_attn` (fp4/fp4_gfx950_opus) writes both in
                     # the architecture-selected preshuffle/natural layout.
                     module.cache_scale = runner.v4_csa_idx_kv_scale[pos]
                 else:
@@ -1873,7 +1893,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                     )
                 # Indexer-inner cache is always fp8 (independent of
                 # kv_cache_dtype); it has no separate rope pool.
-                module.quant_mode = "fp4" if self._indexer_fp4 else "per_row_fp8"
+                module.quant_mode = (
+                    "fp4_gfx950_opus"
+                    if self.indexer_layout == FP4_GFX950_OPUS
+                    else (
+                        "fp4_gfx950_flydsl"
+                        if self.indexer_layout == FP4_GFX950_FLYDSL
+                        else "fp4" if self._indexer_fp4 else "fp8_per_row"
+                    )
+                )
                 module.kv_cache_rope = None
             elif ratio in (CSA_RATIO, HCA_RATIO):
                 table = (
@@ -1902,7 +1930,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         layer_id_from_prefix,
                         self.rope_head_dim,
                     )
-                    module.quant_mode = "group_fp8"
+                    module.quant_mode = "fp8_group"
                 else:
                     module.kv_cache_rope = None
                     module.quant_mode = "none"
@@ -2137,10 +2165,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
     ) -> None:
         from aiter.ops.opus.pa_mqa_logits_mxfp4 import pa_mqa_logits_mxfp4_plan
 
+        # The plan and launch share this row count, including graph padding.
+        # Metadata gives padding rows empty windows even when their batch id is -1.
         total_q = int(positions_gpu.shape[0])
         variant = (
             _FP4_OPUS_DECODE_Q1_VARIANT
-            if attn_metadata.max_seqlen_q == 1
+            if self.indexer_layout == FP4_GFX950_OPUS or attn_metadata.max_seqlen_q == 1
             else _FP4_OPUS_DECODE_Q4_VARIANT
         )
         meta["fp4_opus_plan"] = pa_mqa_logits_mxfp4_plan(
@@ -2257,9 +2287,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         Reuses `attn_metadata.batch_id_per_q_token` ([padded_T] int32), also set
         by `_attach_v4_per_fwd_meta`.
 
-        DECODE fast path: publishes the FP4 graph metadata (fixed-capacity
-        sequence boundaries on gfx950, an OPUS plan on gfx1250), or an empty
-        dict for FP8. Everything else here is prefill-only —
+        DECODE fast path: publishes an OPUS plan on gfx950/gfx1250, or an empty
+        dict for FP8 and FlyDSL. FlyDSL consumes the step's sequence boundaries
+        in the batch-keyed core. Everything else here is prefill-only —
         `deepgemm_fp8_paged_mqa_logits` and `top_k_per_row_decode` read paged KV
         through `attn_metadata.csa_n_committed_per_token`, never the
         packed-cumsum / per-token `cu_starts/cu_ends` layout this builds.
@@ -2274,7 +2304,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # prepare_*/CG-capture path).
         bs = scheduled_bs
 
-        # DECODE short-circuit: only the gfx1250 OPUS plan is needed here.
+        # DECODE short-circuit: only the OPUS plan is needed here.
         # The prefill-only derivations
         # further down (CPU cumsum + H2D for `cu_committed_gpu`; GPU launches
         # for `seq_base`/`visible_end`/`cu_ends`) feed `_score_topk_prefill`
@@ -2283,7 +2313,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         if attn_metadata.state is AttnState.DECODE:
             meta = {}
             # The OPUS decode plan, once per fwd rather than per CSA layer.
-            if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
+            if self._indexer_fp4 and self.indexer_layout in FP4_OPUS_LAYOUTS:
                 self._refresh_fp4_opus_decode_plan(
                     attn_metadata,
                     positions_gpu,
@@ -2364,7 +2394,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         }
 
         if self._indexer_fp4:
-            if self.indexer_layout == FP4_GFX1250_NATURAL:
+            if self.indexer_layout in FP4_OPUS_LAYOUTS:
                 self._build_fp4_opus_prefill_plans(
                     attn_metadata=attn_metadata,
                     meta=meta,
@@ -3069,9 +3099,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 scheduled_tokens,
                 positions_gpu=positions,
                 cu_seqlens_q_cpu=(
-                    cu_seqlens_q_np
-                    if self.indexer_layout == FP4_GFX1250_NATURAL
-                    else None
+                    cu_seqlens_q_np if self.indexer_layout in FP4_OPUS_LAYOUTS else None
                 ),
             )
         # Two-source paged_2src index buffers (extend + per-ratio prefix).
@@ -3122,9 +3150,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 scheduled_bs,
                 scheduled_tokens,
                 cu_seqlens_q_cpu=(
-                    cu_seqlens_q_np
-                    if self.indexer_layout == FP4_GFX1250_NATURAL
-                    else None
+                    cu_seqlens_q_np if self.indexer_layout in FP4_OPUS_LAYOUTS else None
                 ),
             )
         self._attach_tbo_prefill_cpu_lens(attn_metadata, scheduled_bs)
@@ -3410,7 +3436,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ub_num_tokens,
             positions_gpu=positions_gpu,
             cu_seqlens_q_cpu=(
-                ub_cu if self.indexer_layout == FP4_GFX1250_NATURAL else None
+                ub_cu if self.indexer_layout in FP4_OPUS_LAYOUTS else None
             ),
             reuse_cu_seqlens_q=True,
             buf_prefix_ubatch=p,
@@ -3554,7 +3580,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # matching run_model's per-group pcp_round_robin_split.
         group_positions = var["positions"].gpu[gts:gte]
         group_cu = None
-        if self.indexer_layout == FP4_GFX1250_NATURAL:
+        if self.indexer_layout in FP4_OPUS_LAYOUTS:
             group_cu = np.zeros(group_bs + 1, dtype=np.int32)
             np.cumsum(ext, dtype=np.int32, out=group_cu[1:])
         self._apply_pcp_reindex(
@@ -4587,7 +4613,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             "publication_group": f"{prefix}v4_indexer",
         }
         buffers = {f"{prefix}v4_indexer_cu_committed": CpuGpuBuffer(bs + 1, **i32)}
-        if getattr(self, "indexer_layout", None) == FP4_GFX1250_NATURAL:
+        if getattr(self, "indexer_layout", None) in FP4_OPUS_LAYOUTS:
             # Each nonempty query chunk contributes at most one extra request
             # fragment per boundary and one leading zero. Across all chunks:
             # entries <= bs + 2 * chunks (+ one PCP dummy request).
@@ -4724,10 +4750,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             token_map.publication_group = "v4_tokens"
         # FP4 indexer decode plans use caller-held buffers: CUDAGraph captures
         # both their addresses and the launch grid. Keep one set per kernel
-        # instance because qlen=1 decode uses a one-wave CTA while speculative
-        # decode keeps the general four-row CTA.
+        # instance. gfx1250 has one/four-row variants; gfx950 always schedules
+        # one row per tile, including speculative decode.
         if self._indexer_fp4:
-            if self.indexer_layout == FP4_GFX1250_NATURAL:
+            if self.indexer_layout in FP4_OPUS_LAYOUTS:
                 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
                     pa_mqa_logits_mxfp4_plan_buffers,
                 )
@@ -4740,10 +4766,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                             bs,
                             variant=variant,
                         )
-                        for variant in (
-                            _FP4_OPUS_DECODE_Q1_VARIANT,
-                            _FP4_OPUS_DECODE_Q4_VARIANT,
-                        )
+                        for variant in _fp4_opus_decode_variants(self.indexer_layout)
                     }
                 }
             else:
@@ -4872,7 +4895,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                 mnbt, publication_group=f"{p}v4_indexer", **i32
             )
             bufs.update(self._indexer_staging_buffers(bs, mnbt, prefix=p))
-            if self._indexer_fp4 and self.indexer_layout == FP4_GFX1250_NATURAL:
+            if self._indexer_fp4 and self.indexer_layout in FP4_OPUS_LAYOUTS:
                 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
                     pa_mqa_logits_mxfp4_plan_buffers,
                 )
@@ -4884,10 +4907,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         bs,
                         variant=variant,
                     )
-                    for variant in (
-                        _FP4_OPUS_DECODE_Q1_VARIANT,
-                        _FP4_OPUS_DECODE_Q4_VARIANT,
-                    )
+                    for variant in _fp4_opus_decode_variants(self.indexer_layout)
                 }
 
             for ratio, is_overlap in self._unique_compress_ratios_overlap:

@@ -53,7 +53,8 @@ from atom.model_ops.attentions.pool_layout.entry_arena import (
 )
 from atom.model_ops.attentions.pool_layout.paged_state_copy import plan_segmented_copy
 from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
-    FP4_GFX950_PRESHUFFLE,
+    FP4_GFX950_FLYDSL,
+    FP4_GFX950_OPUS,
     FP4_GFX1250_NATURAL,
     main_kv_plane_fields,
 )
@@ -429,7 +430,7 @@ class TestTheBuilderDeclaresWhatItDrops:
             compress_ratios = (0, 0, 4, 128, 4, 128, 4, -1)
             _kv_fp8 = False
             _indexer_fp4 = False
-            indexer_quant_mode = "per_row_fp8"
+            indexer_quant_mode = "fp8_per_row"
             indexer_layout = "fp8"
             _field_window_dtype = torch.bfloat16
             _field_window_layers = (43,)
@@ -502,14 +503,18 @@ class TestTheBuilderDeclaresWhatItDrops:
         stub._indexer_fp4 = True
         stub.indexer_quant_mode = "fp4"
 
-        stub.indexer_layout = FP4_GFX950_PRESHUFFLE
+        stub.indexer_layout = FP4_GFX950_FLYDSL
         gfx950 = Builder.state_transfer(stub).paged_layout_id
         stub.indexer_layout = FP4_GFX1250_NATURAL
         gfx1250 = Builder.state_transfer(stub).paged_layout_id
 
-        assert ":index=fp4-gfx950-preshuffle:" in gfx950
+        assert ":index=fp4-gfx950-flydsl:" in gfx950
         assert ":index=fp4-gfx1250-natural:" in gfx1250
         assert gfx950 != gfx1250
+        stub.indexer_layout = FP4_GFX950_OPUS
+        opus950 = Builder.state_transfer(stub).paged_layout_id
+        assert ":index=fp4-gfx950-opus:" in opus950
+        assert opus950 not in (gfx950, gfx1250)
 
 
 class TestPageUnitAddressesAreArithmetic:
@@ -553,7 +558,7 @@ class TestPageUnitAddressesAreArithmetic:
             pool_geometry = _Geo()
             csa_layers = tuple(range(self.N_CSA))
             _indexer_fp4 = False
-            indexer_quant_mode = "per_row_fp8"
+            indexer_quant_mode = "fp8_per_row"
             indexer_layout = "fp8"
             _page_unit_region_cache = None
             _page_unit_region_owners = ()
@@ -643,7 +648,7 @@ class TestPageUnitRegionsValidateTheirOwnAddresses:
         stub._page_unit_region_cache = None
         stub._page_unit_region_owners = ()
         stub._indexer_fp4 = False
-        stub.indexer_quant_mode = "per_row_fp8"
+        stub.indexer_quant_mode = "fp8_per_row"
         stub.indexer_layout = "fp8"
         stub.csa_layers = [0]
         stub.model_runner = SimpleNamespace(v4_csa_idx_kv=idx)
