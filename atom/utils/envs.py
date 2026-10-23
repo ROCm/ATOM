@@ -451,6 +451,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB": lambda: int(
         os.getenv("ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB", "2048")
     ),
+    # DeepSeek-V4 prefill indexer under plain TP: each TP rank scores and
+    # top-ks only its slice of the query rows (each against the full key set)
+    # and the [rows, topk] results are all-gathered back over TP. The indexer is
+    # replicated across TP, so without this every rank repeats the same scoring.
+    # 0 restores the full per-rank scoring.
+    "ATOM_V4_INDEXER_QSPLIT": lambda: os.getenv("ATOM_V4_INDEXER_QSPLIT", "1") == "1",
     # DCP sparse (DSA) prefill: when QREP is active, produce the whole DCP
     # group's query heads locally, as decode does, instead of AllGather Q. The
     # pynccl gather lands rank-major, so the dim=1 reshape after it also copies

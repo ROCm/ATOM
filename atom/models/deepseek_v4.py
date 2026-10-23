@@ -39,6 +39,7 @@ from aiter import (
 from aiter import silu_and_mul as aiter_silu_and_mul
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import (
@@ -102,7 +103,7 @@ from atom.model_ops.quant_v4 import act_quant_inplace
 from atom.model_ops.sparse_attn_v4 import (
     hc_split_sinkhorn,
 )
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import chunked_row_topk, qsplit_gather_rows
 from atom.model_ops.triton_hash_topk import hash_topk_triton
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.utils import atom_parameter, shuffle_weights
@@ -1479,7 +1480,8 @@ class Indexer(nn.Module):
         # needs all 64 heads at every rank to compute the per-token
         # compressed-position topk locally without cross-rank all_reduce.
         # Sharding wq_b would force an extra all_reduce on `index_score`
-        # after the per-head sum.
+        # after the per-head sum. Prefill splits the query ROWS across TP
+        # instead (`qsplit`, see `_prefill_chunked_topk`).
         self.wq_b = ReplicatedLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1838,6 +1840,7 @@ class Indexer(nn.Module):
         topk: int,
         device: torch.device,
         score_chunk,
+        qsplit: tuple | None = None,
     ) -> torch.Tensor:
         """Chunk query rows so each per-chunk ``[chunk_rows, row_width]`` fp32
         logits buffer stays within ``ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB``, then
@@ -1851,37 +1854,52 @@ class Indexer(nn.Module):
         the returned top-k.
 
         The dense logits column dim (``row_width`` = ``total_committed`` for FP8,
-        ``_max_model_len_idx`` for FP4) is unbounded by ``max_num_batched_tokens``,
-        so a burst of long-context requests can push a single un-chunked
-        allocation to tens of GiB (#1376). ``chunk_tokens`` shrinks as
-        ``row_width`` grows. When a single chunk already fits, the loop runs
-        once (``chunk_start==0`` and ``chunk_end==total_tokens``) and matches the
-        single-shot path — callers can detect that to reuse a schedule
-        precomputed outside the fwd.
+        the batch's max committed length for FP4) is unbounded by
+        ``max_num_batched_tokens``, so a burst of long-context requests can push
+        a single un-chunked allocation to tens of GiB (#1376). ``chunk_tokens``
+        shrinks as ``row_width`` grows.
+
+        ``qsplit`` (set by the metadata builder under plain TP) scores only this
+        rank's rows and all-gathers the rest over the TP group: the indexer is
+        replicated across TP, so every rank would otherwise repeat the same work.
 
         Returns ``[total_tokens, topk]`` int32 (raw kernel output; caller remaps).
         """
-        topk_out = torch.empty((total_tokens, topk), dtype=torch.int32, device=device)
-        chunk_tokens = sparse_indexer_row_chunk(
-            total_tokens, row_width, SPARSE_INDEXER_LOGITS_BUDGET_MB
+        # The row windows and ``qsplit`` come from the builder's token count; a
+        # query batch of any other height would be split for the wrong rows.
+        assert row_ends.shape[0] == total_tokens, (
+            f"indexer got {total_tokens} query rows, metadata built for "
+            f"{row_ends.shape[0]}"
         )
-        for chunk_start in range(0, total_tokens, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, total_tokens)
-            rs = row_starts[chunk_start:chunk_end]
-            re = row_ends[chunk_start:chunk_end]
-            logits = score_chunk(chunk_start, chunk_end, rs, re)
+
+        def select(logits, lo, hi, out_rows):
             top_k_per_row_prefill(
                 logits,
-                rs,
-                re,
-                topk_out[chunk_start:chunk_end],
+                row_starts[lo:hi],
+                row_ends[lo:hi],
+                out_rows,
                 None,  # values not needed, only indices
-                chunk_end - chunk_start,
+                hi - lo,
                 logits.stride(0),
                 logits.stride(1),
                 k=topk,
             )
-        return topk_out
+
+        return chunked_row_topk(
+            total_rows=total_tokens,
+            row_width=row_width,
+            budget_mb=SPARSE_INDEXER_LOGITS_BUDGET_MB,
+            topk=topk,
+            device=device,
+            qsplit=qsplit,
+            score_chunk=lambda lo, hi: score_chunk(
+                lo, hi, row_starts[lo:hi], row_ends[lo:hi]
+            ),
+            select=select,
+            gather=lambda out, rows_per_rank, slot_lo: qsplit_gather_rows(
+                out, rows_per_rank, slot_lo, get_tp_group().device_group
+            ),
+        )
 
     def _score_topk_prefill(
         self,
@@ -1958,6 +1976,7 @@ class Indexer(nn.Module):
             topk=topk,
             device=device,
             score_chunk=_score,
+            qsplit=indexer_meta.get("qsplit"),
         )
         seq_base = indexer_meta["seq_base_per_token_gpu"].unsqueeze(
             1
@@ -2232,8 +2251,8 @@ class Indexer(nn.Module):
         The dense `[chunk_rows, max_model_len_idx]` fp32 logits is chunked on the
         Q dim via `_prefill_chunked_topk` (same OOM guard as FP8). In the common
         SINGLE-chunk case the schedule (cta_info/n_ctas) precomputed ONCE outside
-        the fwd by the metadata builder is reused as-is (no schedule work in the
-        fwd). Only when the buffer would exceed budget and the loop actually
+        the fwd by the metadata builder -- over this rank's rows under `qsplit` --
+        is reused as-is (no schedule work in the fwd). Only when the buffer would exceed budget and the loop actually
         splits does each chunk rebuild the schedule for its rows (cta_info
         encodes absolute row ids, so a slice of the full schedule won't do)."""
         from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
@@ -2276,11 +2295,15 @@ class Indexer(nn.Module):
             f"block_size=256 (CSA rows per block = block_size // 4)."
         )
 
+        qsplit = indexer_meta.get("qsplit")
+        whole = (0, total_tokens) if qsplit is None else qsplit[3:]
+
         def _score(chunk_start, chunk_end, rs, re):
-            if chunk_start == 0 and chunk_end == total_tokens:
+            if (chunk_start, chunk_end) == whole:
                 # Single chunk (common case): reuse the schedule precomputed once
-                # outside the fwd (metadata builder, sized to the full
-                # prefill_rows) — no compute_prefill_schedule here.
+                # outside the fwd (metadata builder, sized to this rank's rows
+                # under qsplit, else the whole prefill) — no
+                # compute_prefill_schedule here.
                 cta_info, n_ctas = full_cta_info, full_n_ctas
             else:
                 # Multi-chunk (logits would exceed budget): rebuild the schedule
@@ -2332,6 +2355,7 @@ class Indexer(nn.Module):
             topk=topk,
             device=device,
             score_chunk=_score,
+            qsplit=qsplit,
         )  # [total_tokens, topk] int32, raw seq-local
 
     def _score_topk_decode_fp4_flydsl(

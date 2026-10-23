@@ -48,7 +48,10 @@ from typing import Any, cast
 import numpy as np
 import torch
 from aiter import dtypes
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.jit.utils.chip_info import get_gfx
 
 from atom.distributed.pcp_utils import (
@@ -114,7 +117,11 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
     visible_hca,
 )
 from atom.model_ops.attentions.token_layout.batch_ids import build_batch_ids
-from atom.model_ops.sparse_indexer_chunk import sparse_indexer_row_chunk
+from atom.model_ops.sparse_indexer_chunk import (
+    indexer_qsplit_world,
+    qsplit_rows,
+    sparse_indexer_row_chunk,
+)
 from atom.model_ops.v4_kernels import (
     FP4_MQA_BLOCK_K,
     FP4_MQA_PARALLEL_UNIT_NUM,
@@ -127,6 +134,7 @@ from atom.model_ops.v4_kernels import (
     write_v4_paged_decode_indices,
     write_v4_paged_prefill_indices,
 )
+from atom.plugin.prepare import is_plugin_mode
 from atom.utils import CpuGpuBuffer, envs, upload_numpy
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import (
@@ -585,6 +593,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         )
         self.indexer_layout = (
             fp4_indexer_layout_for_arch(get_gfx()) if self._indexer_fp4 else "fp8"
+        )
+        self._indexer_qsplit_world = self._indexer_qsplit_world_size(
+            model_runner.config
         )
         # The gfx950 FP4 decode scorer: a row-group launch planned from the
         # sequence count, scored in the batch-keyed core (`fp4_decode_topk`).
@@ -2231,6 +2242,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         meta["fp4_prefill_max_seq_len"] = max_seq_len
         meta["fp4_opus_prefill_chunks"] = plans
 
+    def _indexer_qsplit_world_size(self, config) -> int:
+        """See ``indexer_qsplit_world``; read once, the inputs are fixed per run."""
+        tp = get_tensor_model_parallel_world_size()
+        physical_tp = (
+            torch.distributed.get_world_size(get_tp_group().device_group)
+            if tp > 1
+            else tp
+        )
+        return indexer_qsplit_world(
+            tp,
+            physical_tp=physical_tp,
+            enabled=envs.ATOM_V4_INDEXER_QSPLIT,
+            plugin=is_plugin_mode(),
+            gfx1250_opus=self.indexer_layout == FP4_GFX1250_NATURAL,
+            dp_attention=bool(config.enable_dp_attention),
+            tbo=bool(config.enable_tbo or config.enable_tbo_decode),
+            pcp=get_pcp_world_size(),
+            dcp=int(config.decode_context_parallel_size),
+        )
+
     def _build_v4_indexer_meta(
         self,
         *,
@@ -2362,6 +2393,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             # seq-local, vs the FP8 path's GLOBAL packed cu_ends).
             "visible_end_gpu": visible_end_gpu,
         }
+        if self._indexer_qsplit_world > 1:
+            # (world, rows_per_rank, slot_lo, row_lo, row_hi): see qsplit_rows.
+            meta["qsplit"] = (self._indexer_qsplit_world,) + qsplit_rows(
+                total_tokens, get_tp_group().rank_in_group, self._indexer_qsplit_world
+            )
 
         if self._indexer_fp4:
             if self.indexer_layout == FP4_GFX1250_NATURAL:
@@ -2416,16 +2452,26 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             #     few rows too, because the logits budget shrinks the Q chunk as
             #     the row widens. At rows=1024 / W~32768 the floor is worth ~8%.
             # max() of both axes -> correct rows AND adequate chunk parallelism.
-            prefill_rows = int(visible_end_gpu.shape[0])
-            prefill_parallel_unit_num = max(self._fp4_parallel_unit_num, prefill_rows)
-            _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
-                batch_id_per_q_token.to(torch.int32),
-                local_starts,
-                visible_end_gpu,
-                self._fp4_block_k,
-                prefill_parallel_unit_num,
-                fp4_prefill_max_seq_len,
+            # Under the query-row split (`qsplit`) the schedule covers only this
+            # rank's rows: cta_info encodes row ids relative to the rows it is
+            # launched over, which is the rank's slice.
+            row_lo, row_hi = (
+                meta["qsplit"][3:] if "qsplit" in meta else (0, total_tokens)
             )
+            prefill_rows = row_hi - row_lo
+            prefill_cta_info = prefill_n_ctas = None
+            if prefill_rows > 0:
+                prefill_parallel_unit_num = max(
+                    self._fp4_parallel_unit_num, prefill_rows
+                )
+                _, prefill_cta_info, prefill_n_ctas = compute_prefill_schedule(
+                    batch_id_per_q_token[row_lo:row_hi].to(torch.int32),
+                    local_starts[row_lo:row_hi],
+                    visible_end_gpu[row_lo:row_hi],
+                    self._fp4_block_k,
+                    prefill_parallel_unit_num,
+                    fp4_prefill_max_seq_len,
+                )
             meta["fp4_prefill_cta_info"] = prefill_cta_info
             meta["fp4_prefill_n_ctas"] = prefill_n_ctas
             meta["fp4_prefill_local_starts"] = local_starts
