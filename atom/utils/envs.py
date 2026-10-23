@@ -1105,6 +1105,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # How the UVA path page-locks a shard: 1 copies it into exactly-sized
+    # page-locked memory on several threads; 0 registers the checkpoint
+    # mapping in place, which is slower at startup (one thread, under the HIP
+    # runtime lock). Copying needs the HIP runtime; elsewhere it
+    # registers in place regardless.
+    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.

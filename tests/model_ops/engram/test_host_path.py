@@ -666,6 +666,72 @@ def test_enabling_the_same_range_twice_registers_once(monkeypatch):
     assert cudart.calls == 2
 
 
+class FakeHostAllocator:
+    """Page-locked allocations backed by ctypes buffers kept alive here."""
+
+    def __init__(self, refuse_call=None):
+        self.refuse_call = refuse_call
+        self.live = {}
+        self.calls = 0
+
+    def alloc(self, nbytes):
+        import ctypes
+
+        self.calls += 1
+        if self.calls == self.refuse_call:
+            return None
+        buf = ctypes.create_string_buffer(nbytes)
+        self.live[ctypes.addressof(buf)] = buf
+        return ctypes.addressof(buf)
+
+    def free(self, ptr):
+        del self.live[ptr]
+
+
+def test_copied_shard_holds_exactly_the_rows_the_kernel_addresses(monkeypatch):
+    from atom.model_ops.engram import tables as tables_mod
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(tables_mod, "_host_allocator", lambda: allocator)
+    weight = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+    scale = torch.full((6, 2), 2.0).to(torch.float8_e8m0fnu)
+    table = HostEmbeddingTable(weight, num_rows=6, head_dim=8, scale=scale)
+    assert table.enable_uva(2, 5) is True
+    got_w, got_s, start, end = table.registered_shard()
+    assert (start, end) == (2, 5)
+    assert torch.equal(got_w, weight[2:5])
+    assert torch.equal(got_s, scale[2:5].view(torch.uint8))
+    # Copies, not views of the checkpoint mapping.
+    assert got_w.data_ptr() != weight[2:5].data_ptr()
+    assert len(allocator.live) == 2
+    table.disable_uva()
+    assert allocator.live == {} and table._uva is None
+    table.disable_uva()
+
+
+def test_refused_scale_copy_frees_the_values_it_took(monkeypatch):
+    from atom.model_ops.engram import tables as tables_mod
+
+    allocator = FakeHostAllocator(refuse_call=2)
+    monkeypatch.setattr(tables_mod, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is False
+    assert allocator.live == {} and table._uva is None
+
+
+def test_without_a_host_allocator_the_mapping_is_registered_in_place(monkeypatch):
+    from atom.model_ops.engram import tables as tables_mod
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(tables_mod, "_host_allocator", lambda: None)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(cudart.registered) == 2
+    weight, _, _, _ = table.registered_shard()
+    assert weight.data_ptr() == table._tensor.data_ptr()
+
+
 class FakeGroup:
     def __init__(self, world_size, rank_in_group=0):
         self.world_size = world_size
