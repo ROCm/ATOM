@@ -156,3 +156,24 @@ def test_release_kv_cache_leaves_the_indexer_rebindable(monkeypatch):
     assert isinstance(indexer.kv_cache, list)
     assert indexer.kv_cache[0].numel() == 0
     owner.indexer.k_cache.kv_cache[0] = torch.empty(1)  # what waking does
+
+
+def test_release_kv_cache_resets_routed_experts_capturer(monkeypatch):
+    """Sleep must drop the capture singleton or wake under-counts free KV."""
+    from atom.model_ops.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+
+    RoutedExpertsCapturer.init(num_slots=4, num_layers=2, top_k=2, device="cpu")
+    assert RoutedExpertsCapturer.get() is not None
+    runner = SimpleNamespace(
+        kv_cache=torch.empty(1),
+        config=SimpleNamespace(num_kvcache_blocks=7),
+        model=nn.Sequential(),
+        label="test",
+    )
+    runner._get_models_with_kv = lambda: [runner.model]
+    monkeypatch.setattr(memory_manager, "set_kv_cache_data", lambda _value: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MemoryManagerMixin._release_kv_cache(runner)
+
+    assert RoutedExpertsCapturer.get() is None

@@ -196,6 +196,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
     # another the day the two stop agreeing.
     BACKEND: ClassVar[type[AiterBackend]] = AiterBackend
     BLOCK_TABLE_EXTENDER: ClassVar[list[list[int]]] = [[]]
+    supplies_token_slots = True
     # EagleProposer fuses the per-draft-step position bump into
     # prepare_mtp_decode's kernel when this is set (block-paged MHA draft).
     fuse_mtp_decode_position_update = True

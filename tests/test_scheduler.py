@@ -3260,3 +3260,274 @@ def test_cancel_without_sampled_output_releases_state_and_pages(partial):
     assert scheduler.total_finished_requests == 1
     scheduler.kv_connector.request_finished.assert_called_once_with(seq)
     scheduler.kv_connector.send_finished.assert_called_once_with(seq.id)
+
+
+class TestRoutedExpertPatches:
+    def _output(self, seq_id, tokens, routed=None):
+        return ScheduledBatchOutput(
+            req_ids=[seq_id],
+            token_ids=[tuple(tokens)],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            routed_experts=routed,
+        )
+
+    @staticmethod
+    def _patch(*segments):
+        """``(req_id, start, rows)`` segments as one step's batch-order patch."""
+        from atom.model_ops.fused_moe.routed_experts_capturer import (
+            RoutedExpertsPatch,
+        )
+
+        lens = [len(rows) for _, _, rows in segments]
+        return RoutedExpertsPatch(
+            np.asarray([r for r, _, _ in segments], np.int64),
+            np.asarray([s for _, s, _ in segments], np.int64),
+            np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
+            np.concatenate([rows for _, _, rows in segments]),
+        )
+
+    def test_postprocess_merges_contiguous_patches(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        first = np.arange(8, dtype=np.int16).reshape(4, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, first))),
+        )
+        np.testing.assert_array_equal(seq.routed_experts, first)
+        nxt = np.array([[[8, 9]]], dtype=np.int16)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [11], self._patch((seq.id, 4, nxt))),
+        )
+        assert seq.routed_expert_rows == 5
+        np.testing.assert_array_equal(seq.routed_experts[4:], nxt)
+
+    def test_postprocess_deferred_overlap_overwrites_last_row(
+        self, scheduler, seq_factory
+    ):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        first = np.arange(8, dtype=np.int16).reshape(4, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, first))),
+        )
+        nxt = np.array([[[80, 81], [82, 83]]], dtype=np.int16).reshape(2, 1, 2)
+        start = seq.routed_expert_rows - 1
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [11], self._patch((seq.id, start, nxt))),
+        )
+        assert seq.routed_expert_rows == 5
+        np.testing.assert_array_equal(seq.routed_experts[:3], first[:3])
+        np.testing.assert_array_equal(seq.routed_experts[3:], nxt)
+
+    def test_postprocess_gap_fills_uncaptured(self, scheduler, seq_factory):
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        scheduler.add(seq)
+        scheduler.schedule()
+        zeros = np.zeros((2, 1, 1), dtype=np.int16)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, zeros))),
+        )
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(
+                seq.id, [11], self._patch((seq.id, 4, np.ones((1, 1, 1), np.int16)))
+            ),
+        )
+        assert seq.routed_experts[:, 0, 0].tolist() == [0, 0, -1, -1, 1]
+
+    def test_postprocess_applies_each_segment_in_order(self, scheduler, seq_factory):
+        """Two requests in one step, plus a prefix segment ahead of a step one."""
+        a = seq_factory([1, 2, 3, 4])
+        b = seq_factory([5, 6, 7, 8])
+        scheduler.add(a)
+        scheduler.add(b)
+        scheduler.schedule()
+        rows = np.arange(12, dtype=np.int16).reshape(6, 1, 2)
+        patch = self._patch(
+            (a.id, 0, rows[:2]), (b.id, 0, rows[2:5]), (b.id, 3, rows[5:])
+        )
+        scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[a.id, b.id],
+                token_ids=[(10,), (11,)],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+                routed_experts=patch,
+            ),
+        )
+        np.testing.assert_array_equal(a.routed_experts, rows[:2])
+        np.testing.assert_array_equal(b.routed_experts, rows[2:])
+
+    def test_prefix_hit_plans_cached_range_once(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4, 5, 6])
+        seq.type = SequenceType.PREFILL
+        batch = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[2],
+            total_tokens_num=2,
+            total_seqs_num=1,
+            num_cached_tokens=[4],
+        )
+        scheduler._plan_routed_prefixes(batch, {seq.id: seq})
+        assert batch.routed_prefix_ranges == [(0, 0, 4)]
+        assert seq.routed_forwarded_end == 6
+        again = ScheduledBatch(
+            seqs={seq.id: seq},
+            num_scheduled_tokens=[2],
+            total_tokens_num=2,
+            total_seqs_num=1,
+            num_cached_tokens=[4],
+        )
+        scheduler._plan_routed_prefixes(again, {seq.id: seq})
+        assert again.routed_prefix_ranges == []
+
+    def test_chunked_prefill_plans_no_prefix(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4, 5, 6])
+        seq.type = SequenceType.PREFILL
+        for cached in (0, 3):
+            batch = ScheduledBatch(
+                seqs={seq.id: seq},
+                num_scheduled_tokens=[3],
+                total_tokens_num=3,
+                total_seqs_num=1,
+                num_cached_tokens=[cached],
+            )
+            scheduler._plan_routed_prefixes(batch, {seq.id: seq})
+            assert batch.routed_prefix_ranges == []
+        assert seq.routed_forwarded_end == 6
+
+    def test_postprocess_suffix_replace_then_trim_on_finish(
+        self, scheduler, seq_factory
+    ):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(
+                seq.id,
+                [10],
+                self._patch((seq.id, 0, np.arange(8, dtype=np.int16).reshape(4, 1, 2))),
+            ),
+        )
+        replacement = np.array([[[1, 1], [2, 2]]], dtype=np.int16).reshape(2, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [11], self._patch((seq.id, 1, replacement))),
+        )
+        assert seq.routed_expert_rows == 3
+        finished = scheduler.postprocess(
+            list(scheduler.running), self._output(seq.id, [2])
+        )
+        assert finished[0].leave_reason == "eos"
+        # prompt 4 + tokens 10,11,eos => num_tokens=7, keep 6? Wait:
+        # started with 4 prompt tokens, appended 10, 11, then eos 2.
+        # num_tokens = 7, trim to 6. We only have 3 rows so truncate is no-op
+        # unless rows exceed num_tokens-1.
+        assert seq.routed_expert_rows == 3
+
+    def test_postprocess_trim_overlong_routes_on_eos(self, scheduler, seq_factory):
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        # 8 route rows, then EOS: num_tokens becomes 5, keep 4.
+        extra = np.arange(16, dtype=np.int16).reshape(8, 1, 2)
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [2], self._patch((seq.id, 0, extra))),
+        )
+        assert finished[0].leave_reason == "eos"
+        assert seq.routed_experts.shape[0] == seq.num_tokens - 1
+
+    def test_preempt_keeps_accumulated_routes(self, scheduler, seq_factory):
+        sp = SamplingParams(ignore_eos=True, max_tokens=100)
+        seq = seq_factory([1, 2, 3, 4], sampling_params=sp)
+        scheduler.add(seq)
+        scheduler.schedule()
+        rows = np.arange(8, dtype=np.int16).reshape(4, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
+        )
+        assert scheduler.preempt(seq)
+        np.testing.assert_array_equal(seq.routed_experts, rows)
+        assert seq.routed_expert_rows == 4
+
+    def test_middle_chunk_empty_tokens_still_merges_patch(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4, 5, 6, 7, 8])
+        scheduler.add(seq)
+        scheduler.schedule()
+        chunk = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
+        empty = ScheduledBatchOutput(
+            req_ids=[seq.id],
+            token_ids=[],
+            num_rejected=None,
+            num_bonus=None,
+            draft_token_ids=None,
+            routed_experts=self._patch((seq.id, 0, chunk)),
+        )
+        scheduler.postprocess(list(scheduler.running), empty)
+        np.testing.assert_array_equal(seq.routed_experts, chunk)
+
+    def test_abort_does_not_clear_accumulated_routes(self, scheduler, seq_factory):
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        rows = np.arange(4, dtype=np.int16).reshape(2, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, rows))),
+        )
+        seq.status = SequenceStatus.ABORTED
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+        assert finished == [seq]
+        np.testing.assert_array_equal(seq.routed_experts, rows)
+
+    def test_abort_trims_overlong_routes_and_freezes_them(self, scheduler, seq_factory):
+        scheduler._return_routed_experts = True
+        seq = seq_factory([1, 2, 3, 4])
+        scheduler.add(seq)
+        scheduler.schedule()
+        extra = np.arange(16, dtype=np.int16).reshape(8, 1, 2)
+        scheduler.postprocess(
+            list(scheduler.running),
+            self._output(seq.id, [10], self._patch((seq.id, 0, extra))),
+        )
+        seq.status = SequenceStatus.ABORTED
+        finished = scheduler.postprocess(
+            list(scheduler.running),
+            ScheduledBatchOutput(
+                req_ids=[],
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+        )
+        assert finished == [seq]
+        routes = seq.routed_experts
+        assert routes.shape[0] == seq.num_tokens - 1
+        assert routes is seq.routed_experts
+        assert not routes.flags.writeable

@@ -62,7 +62,8 @@ def common_refusals(
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``;
-    no expert, data, pipeline or context parallelism, no TBO, not a plugin.
+    no expert, data, pipeline or context parallelism, no TBO, not a plugin,
+    no routed-expert capture (the fused kernels route in-kernel and never write it).
 
     ``piecewise_cudagraph_required`` gates one more check: no piecewise
     cudagraph. MiniMax-M3 and DeepSeek-V4.1 mono wraps the *compiled* inner
@@ -86,6 +87,7 @@ def common_refusals(
         (atom_config.prefill_context_parallel_size == 1, "prefill CP"),
         (not (atom_config.enable_tbo or atom_config.enable_tbo_decode), "TBO"),
         (not (is_vllm() or is_sglang()), "plugin mode"),
+        (not atom_config.enable_return_routed_experts, "routed-expert capture"),
         (
             not _takes_weight_updates(atom_config),
             "rollout weight updates (mono caches copies a sync cannot reach)",
