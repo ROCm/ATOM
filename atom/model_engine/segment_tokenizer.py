@@ -30,6 +30,10 @@ logger = logging.getLogger("atom")
 
 # Prompts checked against the plain encoder before the cache is trusted.
 _VERIFY_FIRST = 4
+# Prompts shorter than this (characters, ~25K tokens) are encoded whole:
+# splitting, hashing and joining cost more than they save there (DeepSeek-V4.1
+# AgentX, ISL < 32K: +18 ms TTFT p50 through the cache).
+_MIN_CACHED_CHARS = 100_000
 
 
 class SegmentTokenizer:
@@ -97,7 +101,7 @@ class SegmentTokenizer:
         )
 
     def encode(self, prompt: str) -> list[int]:
-        if not self.enabled:
+        if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
             return self._tokenizer.encode(prompt)
         ids = self._encode_segments(prompt)
         if self._verified < _VERIFY_FIRST:

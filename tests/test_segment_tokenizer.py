@@ -40,6 +40,12 @@ def _text(rng, n):
     return " ".join(rng.choice(WORDS) for _ in range(n))
 
 
+@pytest.fixture(autouse=True)
+def _cache_every_prompt(monkeypatch):
+    """The test prompts are short; route them through the cache anyway."""
+    monkeypatch.setattr(seg_mod, "_MIN_CACHED_CHARS", 0)
+
+
 @pytest.fixture(scope="module")
 def tok():
     rng = random.Random(0)
@@ -124,6 +130,14 @@ def test_not_created_when_an_added_token_strips_whitespace():
     backend.add_special_tokens([AddedToken("<|User|>", lstrip=True, special=True)])
     tok = transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
     assert SegmentTokenizer.maybe_create(tok, 1_000_000) is None
+
+
+def test_short_prompts_are_encoded_whole(tok, monkeypatch):
+    monkeypatch.setattr(seg_mod, "_MIN_CACHED_CHARS", 10**9)
+    seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
+    prompt = _conversation(random.Random(5), 4)
+    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg._stats[3] == 0 and seg._cached_tokens == 0
 
 
 def test_verification_window_is_bounded():
