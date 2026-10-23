@@ -3267,6 +3267,8 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
+        # Set where the sampled ids were already broadcast with the verdict.
+        tokens_synced = False
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3351,13 +3353,31 @@ class ModelRunner:
                 _g = get_pcp_group()
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
                 verdict = _g.broadcast(verdict, src=0)
+            elif draft_probs is not None and get_tp_group().world_size > 1:
+                # The ratio rule decides on each rank from that rank's own p, q
+                # and coins. Exact match decided from a broadcast target draw,
+                # so its verdict agreed by construction; this one agrees only
+                # while p and q are bitwise equal across ranks, and one that is
+                # not leaves rank-local accept counts against rank 0's tokens.
+                # Take rank 0's decision with its tokens, in the one collective
+                # the tokens already needed.
+                n = sampled_tokens.numel()
+                packed = get_tp_group().broadcast(
+                    torch.cat((sampled_tokens.reshape(-1), verdict.reshape(-1))),
+                    src=0,
+                )
+                sampled_tokens = packed[:n].view(sampled_tokens.shape)
+                verdict = packed[n:].view(verdict.shape)
+                tokens_synced = True
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        if (
+            not tokens_synced
+            and get_tp_group().world_size > 1
+            and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
