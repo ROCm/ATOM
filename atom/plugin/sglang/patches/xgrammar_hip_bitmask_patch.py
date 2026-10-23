@@ -1,46 +1,102 @@
-"""Avoid HIP segfault in xgrammar's CUDA bitmask kernel.
+"""Stopgap when this GPU's arch is missing from the image's sgl_kernel.
 
-On ROCm, SGLang's default xgrammar path calls
-``sgl_kernel.apply_token_bitmask_inplace_cuda``, which segfaults when
-``response_format={"type":"json_object"}`` (and other constrained-decoding
-requests) apply the vocab mask.
+``sgl_kernel.apply_token_bitmask_inplace_cuda`` works on an arch it was
+built for. The SGLang release image is built on MI355X, so
+``common_ops.so`` contains only gfx950 code objects. On MI308X (gfx942)
+HIP reports no compatible code object and every ``sgl_kernel`` GPU op
+SIGSEGVs, including the xgrammar vocab-mask apply used by
+``response_format={"type":"json_object"}``.
 
-CUDA builds use a Triton kernel, but that launch requests
-``num_warps`` that exceeds MI300 wavefront limits for fp32 logits
-(``OutOfResources: threads Required: 2048, Hardware limit: 1024``).
-CPU xgrammar apply also rejects device logits.
+Replace that binding with a Torch GPU ``masked_fill_`` only when the
+current device arch is absent from ``common_ops*.so``. A gfx950 device
+keeps the native kernel. Other ``sgl_kernel`` ops (for example MTP
+``verify_tree_greedy``) have the same image gap and are not covered here.
 
-This patch replaces the HIP binding with a pure-Torch GPU apply
-(packed int32 bitmask → ``masked_fill_(-inf)``), matching the CUDA
-semantic without the broken native/Triton launches. Logits past the
-bitmask coverage are also set to ``-inf`` so padded vocab slots cannot
-be sampled.
+TODO: remove this patch once the image ships a gfx942 ``sgl_kernel``.
 
-Disable with ``ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK=0``
-(legacy alias ``ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK`` still honored).
+Disable with ``ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK=0``.
 """
 
 from __future__ import annotations
 
 import logging
-import os
+import re
+from pathlib import Path
 
 import torch
+
+from atom.utils import envs
 
 logger = logging.getLogger("atom.plugin.sglang.xgrammar_hip_bitmask")
 
 _BITS_PER_BLOCK = 32
+_GFX_ARCH_RE = re.compile(rb"amdgcn-amd-amdhsa--(gfx[0-9a-z]+)")
 
 
 def _env_enabled() -> bool:
-    # Prefer the Torch-named flag; keep the old Triton-named alias.
-    for name in (
-        "ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK",
-        "ATOM_SGLANG_XGRAMMAR_HIP_TRITON_BITMASK",
-    ):
-        if name in os.environ:
-            return os.environ[name] != "0"
-    return True
+    return bool(envs.ATOM_SGLANG_XGRAMMAR_HIP_TORCH_BITMASK)
+
+
+def _gfx_arch_token(gcn_arch_name: str) -> str:
+    return gcn_arch_name.split(":")[0].strip()
+
+
+def _embedded_gfx_archs_from_blob(blob: bytes) -> set[str]:
+    return {match.group(1).decode() for match in _GFX_ARCH_RE.finditer(blob)}
+
+
+def _should_replace_native_bitmask(device_arch: str, embedded_archs: set[str]) -> bool:
+    """True only when the device arch is known and absent from sgl_kernel."""
+
+    arch = _gfx_arch_token(device_arch)
+    if not arch or not embedded_archs:
+        return False
+    return arch not in embedded_archs
+
+
+def _current_device_arch() -> str:
+    if not torch.cuda.is_available():
+        return ""
+    name = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "") or ""
+    return _gfx_arch_token(str(name))
+
+
+def _sgl_kernel_embedded_archs() -> set[str]:
+    try:
+        import sgl_kernel
+    except Exception:  # noqa: BLE001 - CPU-only or outlines-only installs
+        logger.info("sgl_kernel not importable; keep native xgrammar bitmask")
+        return set()
+
+    root = Path(sgl_kernel.__file__).resolve().parent
+    blobs = sorted(root.glob("common_ops*.so"))
+    if not blobs:
+        logger.info("no sgl_kernel common_ops*.so under %s", root)
+        return set()
+
+    archs: set[str] = set()
+    for path in blobs:
+        archs.update(_embedded_gfx_archs_from_blob(path.read_bytes()))
+    return archs
+
+
+def _device_lacks_sgl_kernel_code_object() -> bool:
+    device_arch = _current_device_arch()
+    embedded = _sgl_kernel_embedded_archs()
+    replace = _should_replace_native_bitmask(device_arch, embedded)
+    if replace:
+        logger.info(
+            "sgl_kernel code objects %s do not include %s",
+            sorted(embedded),
+            device_arch,
+        )
+    else:
+        logger.info(
+            "keep native xgrammar bitmask; device=%r embedded=%s",
+            device_arch,
+            sorted(embedded),
+        )
+    return replace
 
 
 def _apply_bitmask_torch_gpu(
@@ -48,7 +104,7 @@ def _apply_bitmask_torch_gpu(
     bitmask: torch.Tensor,
     indices: list[int] | torch.Tensor | None = None,
 ) -> None:
-    """Apply packed int32 token bitmask on GPU via Torch (HIP-safe)."""
+    """Apply packed int32 token bitmask on GPU via Torch."""
 
     if bitmask.dtype != torch.int32:
         raise TypeError(f"bitmask must be int32, got {bitmask.dtype}")
@@ -92,7 +148,7 @@ def _apply_bitmask_hip_safe(logits, vocab_mask, indices=None) -> None:
 
 
 def apply_xgrammar_hip_bitmask_patch() -> None:
-    """Replace HIP module binding so apply_vocab_mask uses Torch GPU apply."""
+    """Replace the HIP bitmask binding only when this arch has no code object."""
 
     if not _env_enabled():
         logger.info("Skip xgrammar HIP bitmask patch (env disabled)")
@@ -107,8 +163,7 @@ def apply_xgrammar_hip_bitmask_patch() -> None:
 
     try:
         # Importing the module binds apply_token_bitmask_inplace_cuda into
-        # its globals; methods look that name up at call time, so replacing
-        # the binding is enough for both XGrammarGrammar and XGrammarBackend.
+        # its globals; methods look that name up at call time.
         from sglang.srt.constrained import xgrammar_backend as xg
     except Exception:  # noqa: BLE001 - outlines-only installs
         logger.info("xgrammar backend not importable; skip HIP bitmask patch")
@@ -117,15 +172,16 @@ def apply_xgrammar_hip_bitmask_patch() -> None:
     if getattr(xg, "_atom_hip_bitmask_patched", False):
         return
 
-    if not getattr(xg, "_is_hip", False) and not hasattr(
-        xg, "apply_token_bitmask_inplace_cuda"
-    ):
-        logger.info("xgrammar backend not on HIP CUDA bitmask path; skip")
+    if not hasattr(xg, "apply_token_bitmask_inplace_cuda"):
+        logger.info("xgrammar backend has no apply_token_bitmask_inplace_cuda; skip")
+        return
+
+    if not _device_lacks_sgl_kernel_code_object():
         return
 
     xg.apply_token_bitmask_inplace_cuda = _apply_bitmask_hip_safe
     xg._atom_hip_bitmask_patched = True
     logger.info(
         "Patched xgrammar HIP vocab-mask apply to Torch GPU; "
-        "avoids sgl_kernel CUDA bitmask segfault and Triton OutOfResources"
+        "sgl_kernel has no code object for this device"
     )
