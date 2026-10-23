@@ -1512,13 +1512,15 @@ class V4MonoSession:
             int(context.context.running_bs),
             int(context.attn_metadata.max_seqlen_q),
         )
-        tail_capture = (
-            capture
-            and self.profile.name == ORDINARY_PROFILE.name
+        exact_tail = (
+            self.profile.name == ORDINARY_PROFILE.name
             and graph_key == (3, 1)
             and 4 in self.builder.model_runner.capture_sizes
+            and (capture or self.graph_is_current(graph_key))
         )
-        if not tail_capture and not self.profile.accepts_graph(*graph_key):
+        # Native ladders may already contain C3. Serve it through the same
+        # prepared exact graph as a padded C4 tail, never an uncaptured width.
+        if not exact_tail and not self.profile.accepts_graph(*graph_key):
             self.refusal = (
                 f"graph shape {graph_key} is not enabled for V4 Mono "
                 f"{self.profile.name} profile"
