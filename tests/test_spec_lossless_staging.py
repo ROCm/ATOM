@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
-"""ATOM_SPEC_LOSSLESS_SAMPLING's host side: arming and per-step staging, run
-through the real `DSparkProposer` methods on CPU buffers.
+"""ATOM_SPEC_LOSSLESS_SAMPLING's host side: arming, per-step staging, and the
+verify policy, run through the real `DSparkProposer` methods on CPU buffers.
 
 What staging owes the kernels: every row the captured block head runs names a
-destination (a slot its own request owns, or -1, for the pad rows), every
-verifying request names the rows its drafts were drawn into (or -1), and all of
-it rides the protected `sampling` publication, so a host running ahead cannot
-rewrite a row base the GPU has yet to read.
+destination (a slot its own request owns, or -1), every verifying request names
+the rows its drafts were drawn into (or -1), and all of it rides the protected
+`sampling` publication, so a host running ahead cannot rewrite a row base the
+GPU has yet to read.
 """
 
 from types import SimpleNamespace
@@ -18,6 +18,7 @@ from torch import nn
 
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
+from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.spec_decode import dspark_proposer
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -127,7 +128,10 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
     assert prop.draft_sampling is None and prop.draft_probs is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.draft_probs_row_base(["a"]) is None
+    assert prop.lossless_verify_inputs(2, all_greedy=False, has_filter=False) == (
+        None,
+        None,
+    )
     assert prop.kv_budget_reserve_bytes() == 0
     # Staging is a no-op rather than an error.
     prop.stage_draft_sampling_host(
@@ -238,3 +242,28 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     assert counts["draft_temperatures"] is None
     assert counts["verify_q_row_base"] is None
     assert counts["draft_q_row_base"] == 2 and dest(prop)[:2] == [-1, -1]
+
+
+# ---- verify policy ----------------------------------------------------------
+
+
+def test_only_an_unfiltered_sampled_batch_reaches_the_ratio_rule(monkeypatch):
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["a", "b"]))
+    q, base = prop.lossless_verify_inputs(2, all_greedy=False, has_filter=False)
+    assert q is prop._q_store and base.shape == (2,)
+    for all_greedy, has_filter in ((True, False), (False, True), (True, True)):
+        assert prop.lossless_verify_inputs(
+            2, all_greedy=all_greedy, has_filter=has_filter
+        ) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "all_greedy, has_q, draws",
+    [(True, False, False), (False, False, True), (False, True, False)],
+)
+def test_the_target_draw_is_taken_exactly_when_exact_match_needs_it(
+    all_greedy, has_q, draws
+):
+    q = torch.zeros(1) if has_q else None
+    assert RejectionSampler.needs_target_draw(all_greedy, q) is draws

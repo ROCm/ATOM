@@ -499,45 +499,6 @@ def _ratio_sample(
     )
 
 
-def _assert_unfiltered(top_ks, top_ps) -> None:
-    """Internal invariant: no caller reaches the ratio path with a filter on.
-
-    ``ModelRunner.postprocess`` drops ``draft_probs`` for a filtered batch, so
-    this should be unreachable -- it is kept because the thing it guards is
-    silent: the draft drew from an UNFILTERED ``softmax(logits / T)``, and a
-    ratio test against a filtered target ``p`` would bias the emitted
-    distribution with nothing in the output to show for it.
-
-    ``top_ks`` is ATOM's ``-1 means disabled`` convention and ``top_ps`` its
-    ``1.0 means disabled`` one (see ``Sampler.forward``); either may also arrive
-    as None or as a uniform python scalar.
-    """
-
-    def _active_k(value) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, torch.Tensor):
-            return bool((value > 0).any().item())
-        return value > 0
-
-    def _active_p(value) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, torch.Tensor):
-            return bool((value < 1.0).any().item())
-        return value < 1.0
-
-    if _active_k(top_ks) or _active_p(top_ps):
-        raise ValueError(
-            "probability-ratio speculative acceptance was handed a top-k/top-p "
-            "batch: the draft drew from an UNFILTERED softmax(logits / T), so "
-            "the ratio test against a filtered target p would change the "
-            "emitted distribution without saying so. The caller must pass "
-            "draft_probs=None for a filtered batch, which falls back to "
-            "exact-match acceptance and is still lossless."
-        )
-
-
 def acceptance_length_to_rates(length: float, n: int) -> list[float]:
     """Mean acceptance length -> per-position *unconditional* acceptance rates.
 
@@ -604,6 +565,21 @@ class RejectionSampler(nn.Module):
         # that takes that path, so no two steps replay a stream.
         self._ratio_step = 0
 
+    @staticmethod
+    def needs_target_draw(all_greedy: bool, draft_probs) -> bool:
+        """Does this verify step have to draw the target's own tokens?
+
+        `Sampler.sample_verification_tokens` (plus, under TP, a broadcast of
+        its result) feeds the exact-match kernel and nothing else. The ratio
+        path reads `draft_probs` and the logits instead, so the draw is skipped
+        exactly when `draft_probs` is given -- not whenever the batch is
+        sampled: a sampled batch with no q (flag off, a filtered batch) still
+        verifies by exact match, and without the draw that kernel would fall
+        back to the target argmax, a different and lossy rule for a stochastic
+        request. An all-greedy batch never needed it.
+        """
+        return not all_greedy and draft_probs is None
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
@@ -614,21 +590,16 @@ class RejectionSampler(nn.Module):
         *,
         target_token_ids: torch.Tensor | None = None,
         # ---- probability-ratio path ----------------------------------------
-        # [num_draft_rows, vocab_size] fp32: the q each draft token was drawn
-        # from. None selects exact-match acceptance.
+        # [num_q_rows, vocab_size] fp32: the q each draft token was drawn from.
+        # None selects exact-match acceptance. Never given for a top-k/top-p
+        # batch (`Drafter.lossless_verify_inputs`): p here is unfiltered.
         draft_probs: torch.Tensor | None = None,
-        # [batch_size] int32: first q row of each request, from the drafter's
-        # req_id -> slot map. Negative means "no live q"; see the kernel.
+        # [batch_size] int32: first q row of each request. Negative means "no
+        # live q"; see `_ratio_accept_kernel`.
         draft_probs_row_base: torch.Tensor | None = None,
         # [batch_size] fp32, pre-clamped. Required with draft_probs.
         temperatures: torch.Tensor | None = None,
-        # The caller drops draft_probs for a filtered batch, so these are
-        # disabled whenever the ratio path is live.
-        top_ks: torch.Tensor | int | None = None,
-        top_ps: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if draft_probs is not None:
-            _assert_unfiltered(top_ks, top_ps)
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
         # need to ensure it's contiguous to satisfy the assertion in rejection_sample.
@@ -669,8 +640,8 @@ def rejection_sample(
     num_spec_steps: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_draft_rows, vocab_size] fp32, or None. The q each draft token was
-    # drawn from; None keeps the exact-match acceptance below. Rows are reached
+    # [num_q_rows, vocab_size] fp32, or None. The q each draft token was drawn
+    # from; None keeps the exact-match acceptance below. Rows are reached
     # through `draft_probs_row_base`, not `start_idx`.
     draft_probs: torch.Tensor | None,
     # [num_tokens, vocab_size]
@@ -723,17 +694,10 @@ def rejection_sample(
             "softmax(target_logits / T), not softmax(target_logits)"
         )
         # The ratio branch below sits above the relaxed one, so the relaxed
-        # path would simply never run. The two are not combinable: relaxed
-        # acceptance is deliberately not distribution-preserving, while the
-        # ratio rule's entire claim is that it is.
-        #
-        # An assert, not a raise: the pair is refused when any drafter is
-        # constructed (`Drafter.__init__`), so reaching here means that gate
-        # was bypassed. Re-checking on the verify path cost a per-step
-        # branch in every TP worker for a condition that cannot change after
-        # startup -- both flags are read at import -- and it only fired on a
-        # sampled unfiltered batch, so an all-greedy batch silently ran relaxed
-        # instead of being refused.
+        # path would simply never run, and the two are not combinable: relaxed
+        # acceptance is deliberately not distribution-preserving. The pair is
+        # refused when any drafter is constructed (`Drafter.__init__`), so this
+        # only fires if that gate was bypassed.
         assert RELAXED_TOP_N <= 1, (
             "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
             "mutually exclusive; this should have been refused at drafter "

@@ -842,7 +842,7 @@ class KimiK3DSpark(DSparkDraftModel):
         # loop: the block head is captured, so whichever side is taken at warmup
         # is the one every replay runs.
         if self.draft_sampling is not None:
-            return self.sample_block_lossless(base_logits, anchor_ids)
+            return self._sample_block_lossless(base_logits, anchor_ids)
         bs, T, _ = base_logits.shape
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
@@ -851,5 +851,47 @@ class KimiK3DSpark(DSparkDraftModel):
             # The column is the op's destination, so no id is written twice.
             self.markov_head.sample_next(
                 out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+            )
+        return out_ids[:, 1:]
+
+    def _sample_block_lossless(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """The sampled twin of `_sample_block`:
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            q_k      <- softmax(logits_k / T)   -- written to q_store[base + k]
+            x_k      <- q_k                     -- drawn, not argmaxed
+
+        Each row writes its q straight into the persistent row block its
+        request owns, ``draft_sampling.q_row_base`` naming the block; the
+        accept kernel reads it back from there a step later.
+        """
+        sampling = self.draft_sampling
+        bs, num_draft, vocab = base_logits.shape
+        assert sampling.q_store.shape[1] == vocab, (
+            f"q store rows are {sampling.q_store.shape[1]} wide but the block "
+            f"scores {vocab} ids; the accept kernel indexes the two as one"
+        )
+        # The noise counter stride is the buffer's max batch, not this step's,
+        # so the uniform a (position, row, id) draws does not move with the
+        # batch, and no two positions of one block share a counter.
+        position_stride = sampling.q_row_base.shape[0] * vocab
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            self.markov_head.sample_next_q(
+                out_ids[:, k],
+                base_logits[:, k],
+                out_ids[:, k + 1],
+                sampling.q_store,
+                sampling.q_row_base[:bs],
+                k,
+                sampling.temperatures[:bs],
+                sampling.greedy_mask[:bs],
+                sampling.seed,
+                k * position_stride,
             )
         return out_ids[:, 1:]

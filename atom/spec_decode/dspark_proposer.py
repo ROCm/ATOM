@@ -62,22 +62,11 @@ class DSparkProposer(Drafter):
     driven by a confidence schedule (variable-length, Level B) verification.
     """
 
-    #: Lossless speculative sampling, bound by `_init_lossless_sampling`. Class
-    #: defaults because `propose` reads these every step and the proposer is
-    #: reachable in a half-built state; None means "greedy block sampler".
+    #: Lossless speculative sampling's binding; None keeps the greedy pair. The
+    #: two attributes every hook reads first, so a proposer that never ran
+    #: `_init_lossless_sampling` (tests build them bare) answers "not armed".
     draft_sampling = None
     _q_store = None
-    _q_slots = None
-    _draft_sample_step = 0
-    _draft_temps_buf = None
-    _draft_greedy_buf = None
-    _draft_seed_buf = None
-    _draft_row_base_buf = None
-    _verify_row_base_buf = None
-    #: How many sequences the last `stage_draft_sampling_host` covered, so
-    #: `propose` can check it is drafting that same batch.
-    _staged_draft_bs = -1
-    _draft_row_base_hi = 0
 
     def __init__(self, atom_config, device: torch.device, runner):
         super().__init__(atom_config, device, runner)
@@ -277,7 +266,7 @@ class DSparkProposer(Drafter):
 
         ``has_filter``: some row carries top-k or top-p. Such a batch drafts
         greedily, the whole of it, because the verify drops it to exact-match
-        acceptance batch-wide (`ModelRunner.postprocess`).
+        acceptance batch-wide (`lossless_verify_inputs`).
 
         ``drafts_verifiable``: this step's propose emits drafts a later verify
         may read. False for a dummy forward and an align-only middle chunk,
@@ -342,12 +331,23 @@ class DSparkProposer(Drafter):
             # target and stochastic to the draft.
             mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
 
-    def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
-        """``[len(req_ids)]`` int32: each request's first q row, as staged for
-        this step by `stage_draft_sampling_host`, or None unarmed."""
-        if self.draft_sampling is None:
-            return None
-        return self._verify_row_base_buf.gpu[: len(req_ids)]
+    def lossless_verify_inputs(self, bs: int, *, all_greedy: bool, has_filter: bool):
+        """The verify step's ``(draft_probs, q_row_base)``, or ``(None, None)``.
+
+        ``(None, None)`` keeps exact-match verification; anything else selects
+        the probability-ratio rule in `rejection_sampler.rejection_sample`.
+
+        * An all-greedy batch keeps the exact-match kernel, so the flag is a
+          bit-for-bit no-op there. A greedy row inside a mixed batch is matched
+          exactly by the ratio kernel itself.
+        * A batch with top-k or top-p on any row keeps exact match: p in the
+          ratio path is a plain temperature softmax, and exact match against
+          the target's own filtered draw is lossless. The draft side pairs with
+          it by drafting such a batch greedily.
+        """
+        if self.draft_sampling is None or all_greedy or has_filter:
+            return None, None
+        return self._q_store, self._verify_row_base_buf.gpu[:bs]
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

@@ -673,76 +673,6 @@ def _profile_runner_stage(method):
     return wrapped
 
 
-def _lossless_verify_inputs(drafter, req_ids, *, all_greedy, top_ks, top_ps):
-    """The verify step's `(draft_probs, draft_probs_row_base)`, or `(None, None)`.
-
-    `(None, None)` is the shipped exact-match verification; anything else is the
-    probability-ratio rule in `rejection_sampler.rejection_sample`. Three ways to
-    stay on exact match, and they are different claims:
-
-    * **No q published.** Every drafter but a DSpark one armed with
-      `ATOM_SPEC_LOSSLESS_SAMPLING` inherits `Drafter`'s no-op hooks and answers
-      `None`. This is the default, since the flag defaults off.
-    * **`all_greedy`.** At temperature 0 the two rules coincide -- a greedy draft
-      is a delta q and `sum_x min(p, q) = p(x*)` -- so the ratio kernel would buy
-      nothing and could only move the answer by an ulp. Keeping the exact-match
-      kernel is what makes the flag a bit-for-bit no-op on a greedy batch;
-      `tests/test_spec_lossless_no_op_at_t0.py` pins it.
-    * **Any row carries top-k or top-p.** `rejection_sampler._ratio_target_probs`
-      builds p as a plain temperature softmax and does not filter it, so a
-      filtered row verified by the ratio rule would accept against -- and draw
-      its correction token from -- the unfiltered target, silently serving a
-      distribution the request did not ask for. Exact match against the target's
-      own filtered draw stays lossless: the draft token does not depend on the
-      target's fresh noise, and the emitted token is the target's sample.
-
-    The filter test is batch-wide, not per row, and that is a property of the
-    kernel rather than a shortcut: `rejection_ratio_sample_kernel` has one accept
-    rule for the whole launch and no exact-match branch to route a row into.
-    Routing per row would mean teaching the ratio path to materialize a filtered
-    fp32 `[num_tokens, V]` p, which is a verify-hot-path change this does not
-    make. The drafter pairs with it by also drafting such a batch greedily
-    (`DSparkProposer.stage_draft_sampling_host`), so a filtered batch runs
-    exactly the flag-off pair rather than a sampled draft under exact match.
-
-    Host-side throughout, so it costs no sync: `prepare_sample` sets `top_ks` and
-    `top_ps` to None exactly when no row filters. It raises nothing -- a filtered
-    batch must degrade, not kill a TP worker.
-    """
-    if all_greedy or drafter is None:
-        return None, None
-    draft_probs = drafter.draft_probs
-    if draft_probs is None or top_ks is not None or top_ps is not None:
-        return None, None
-    return draft_probs, drafter.draft_probs_row_base(req_ids)
-
-
-def _needs_verification_sample(all_greedy, draft_probs) -> bool:
-    """Does this verify step have to draw the target's own tokens?
-
-    `Sampler.sample_verification_tokens` is a full filtered sample over a
-    `[num_draft_tokens, V]` logit block plus, under TP, a broadcast of its
-    result. It is the input to `rejection_sample`'s exact-match kernel and to
-    nothing else: the ratio branch is checked first, reads `draft_probs` and
-    `target_p`, and never dereferences `target_token_ids`. On the ratio path
-    the whole draw would be computed and thrown away.
-
-    The skip condition is `draft_probs is not None`, and it is deliberately not
-    `not all_greedy`. Those differ exactly on the batches this feature does not
-    touch: a non-greedy batch with no q published (the flag off, a filtered
-    batch, a model without `supports_lossless_draft`, the step after a request
-    was expired out of the q slot map). Skipping the draw there would leave
-    `target_token_ids=None` on a path that still reaches the exact-match
-    kernel, which then falls through to `topk_select(target_probs, 1)` -- the
-    target argmax. Requiring a stochastic request's draft to equal the argmax
-    is a different, lossy acceptance rule.
-
-    `all_greedy` still suppresses the draw, as it always did: a greedy batch
-    wants that argmax, and `Sampler` would have produced it anyway.
-    """
-    return not all_greedy and draft_probs is None
-
-
 class ModelRunner:
 
     def __init__(self, rank: int, config: Config):
@@ -2732,10 +2662,10 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
-        # The draft's copy of the same three facts, staged into the same
-        # publication so the upload stays a single batched H2D. Here and not in
-        # `propose` because everything it needs is on the host at this point.
-        # A no-op on every drafter but a DSpark one with lossless sampling.
+        # The draft's copy of the same facts, plus where its q goes, staged into
+        # the same publication so the upload stays a single batched H2D and is
+        # covered by this forward's staging window. A no-op on every drafter but
+        # a DSpark one with lossless sampling.
         drafter = getattr(self, "drafter", None)
         if drafter is not None:
             drafter.stage_draft_sampling_host(
@@ -3371,24 +3301,21 @@ class ModelRunner:
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
             # Lossless acceptance: compare against the q the draft actually drew
-            # from (`coin * q < p`) instead of requiring the draft token to equal
-            # the target's own draw. Published by the previous step's propose and
-            # keyed back onto this batch by req_id, since the scheduler reorders
-            # between the two. Resolved before the verification sample below,
-            # because it decides whether that sample is needed at all.
+            # from (`u * q < p`) instead of requiring the draft token to equal
+            # the target's own draw. Resolved before the verification sample
+            # below, because it decides whether that sample is needed at all.
             # An all-greedy batch always verifies by exact match, so it never
-            # asks (and never touches the drafter or the batch's req_ids).
+            # asks. `top_ks`/`top_ps` are None exactly when no row filters.
             draft_probs = draft_probs_row_base = None
-            if not all_greedy:
-                draft_probs, draft_probs_row_base = _lossless_verify_inputs(
-                    getattr(self, "drafter", None),
-                    batch.req_ids[:bs],
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and not all_greedy:
+                draft_probs, draft_probs_row_base = drafter.lossless_verify_inputs(
+                    bs,
                     all_greedy=all_greedy,
-                    top_ks=top_ks,
-                    top_ps=top_ps,
+                    has_filter=top_ks is not None or top_ps is not None,
                 )
             target_token_ids = None
-            if _needs_verification_sample(all_greedy, draft_probs):
+            if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3414,8 +3341,6 @@ class ModelRunner:
                 draft_probs=draft_probs,
                 draft_probs_row_base=draft_probs_row_base,
                 temperatures=temperatures,
-                top_ks=top_ks,
-                top_ps=top_ps,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16

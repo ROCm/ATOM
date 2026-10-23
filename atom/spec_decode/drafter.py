@@ -360,24 +360,16 @@ class Drafter(abc.ABC):
 
     # ---- lossless speculative sampling (DSpark-only; no-ops elsewhere) ----
     #
-    # These four no-ops are the guard. `EagleProposer` and every MTP/EAGLE3
-    # drafter inherits them unchanged, which keeps the probability-ratio accept
-    # rule unreachable from any flavor that has not been ported: the runner
-    # calls the hooks unconditionally and gets None back.
-    #
-    # Typed hooks rather than `getattr(drafter, "draft_probs", None)` probes:
-    # a flavor that renames one should break the call site, not quietly stop
-    # publishing q.
+    # These no-ops are the guard. `EagleProposer` and every MTP/EAGLE3 drafter
+    # inherits them unchanged, which keeps the probability-ratio accept rule
+    # unreachable from any flavor that has not been ported: the runner calls
+    # the hooks unconditionally and gets None back.
 
     @property
     def draft_probs(self) -> torch.Tensor | None:
         """``[slots * T, V]`` fp32 q, one row block per live request, or None
         when this drafter proposes greedily -- every flavor but DSpark, and
         DSpark with ``ATOM_SPEC_LOSSLESS_SAMPLING=0``, which is the default."""
-        return None
-
-    def draft_probs_row_base(self, req_ids) -> torch.Tensor | None:
-        """``[len(req_ids)]`` int32 mapping each request to its first q row."""
         return None
 
     def stage_draft_sampling_host(
@@ -387,6 +379,11 @@ class Drafter(abc.ABC):
         and claim their counts in `prepare_sample`'s own `sampling` H2D
         publication, which is what carries them to the device."""
         return
+
+    def lossless_verify_inputs(self, bs: int, *, all_greedy: bool, has_filter: bool):
+        """``(draft_probs, q_row_base)`` for the ratio accept rule, or
+        ``(None, None)`` for exact match."""
+        return None, None
 
     def kv_budget_reserve_bytes(self) -> int:
         """Device scratch this drafter allocates per step outside the profiled

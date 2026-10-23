@@ -68,8 +68,8 @@ class DSparkDraftModel(nn.Module):
 
     supports_block_graph = True
 
-    #: Does this flavor's markov head provide ``sample_next_q``, and does its
-    #: ``_sample_block`` branch on ``draft_sampling``? An explicit class flag
+    #: Does this flavor's ``_sample_block`` branch on ``draft_sampling`` and
+    #: draw from, and publish, a real q? An explicit class flag
     #: rather than a ``hasattr(head, "sample_next_q")`` probe:
     #: ``DSparkMarkovHead`` is a name carried by two independent classes, so a
     #: duck-typed probe would arm the other flavor the day its head grew one.
@@ -184,52 +184,3 @@ class DSparkDraftModel(nn.Module):
         argument whose shape says how many requests there are.
         """
         raise NotImplementedError
-
-    def sample_block_lossless(
-        self,
-        base_logits: torch.Tensor,  # [B, T, V]
-        anchor_ids: torch.Tensor,  # [B]
-    ) -> torch.Tensor:
-        """Markov-biased left-to-right sampling over the computed block.
-
-            logits_k <- U_k + B(x_{k-1}, .)
-            q_k      <- softmax(logits_k / T)        -- published
-            x_k      <- q_k                          -- drawn, not argmaxed
-
-        Lives here rather than in each flavor because the flavors carry
-        near-identical ``_sample_block``s that must stay in sync, and the thing
-        most likely to drift between them is the noise offset below -- a
-        position that reused another's Philox counter would correlate two draws
-        inside one block and quietly bias q.
-
-        See ``atom/model_ops/dspark_markov_sample.py`` for why this trades away
-        the fused op's "never materialize [B, V]" property.
-        """
-        sampling = self.draft_sampling
-        assert sampling is not None, "sample_block_lossless needs bound buffers"
-        bs, num_draft, vocab = base_logits.shape
-        assert sampling.q_store.shape[1] == vocab, (
-            f"q store rows are {sampling.q_store.shape[1]} wide but the block "
-            f"scores {vocab} ids; the accept kernel indexes the two as one"
-        )
-        # The noise counter stride is the buffer's max batch, not this step's,
-        # so the uniform a (position, row, id) draws does not move with the
-        # batch, and no two positions of one block share a counter.
-        position_stride = sampling.q_row_base.shape[0] * vocab
-        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
-        out_ids[:, 0] = anchor_ids
-        for k in range(num_draft):
-            # Row b's q for position k lands at q_store[q_row_base[b] + k].
-            self.markov_head.sample_next_q(
-                out_ids[:, k],
-                base_logits[:, k],
-                out_ids[:, k + 1],
-                sampling.q_store,
-                sampling.q_row_base[:bs],
-                k,
-                sampling.temperatures[:bs],
-                sampling.greedy_mask[:bs],
-                sampling.seed,
-                k * position_stride,
-            )
-        return out_ids[:, 1:]
