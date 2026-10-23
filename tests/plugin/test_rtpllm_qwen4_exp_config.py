@@ -1188,6 +1188,52 @@ def test_qwen4_exp_mtp_draft_graph_warmup_keeps_padding_rows(monkeypatch, draft_
     assert query_start_loc.tolist() == [i * width for i in range(4)]
 
 
+@pytest.mark.parametrize("capturing", [False, True])
+def test_qwen4_exp_mtp_draft_graph_rejects_uneven_live_lengths(monkeypatch, capturing):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    attn_inputs = SimpleNamespace(
+        is_prefill=True,
+        is_target_verify=False,
+        prefill_cuda_graph_copy_params=SimpleNamespace(),
+        input_lengths_device=torch.tensor([1, 5], dtype=torch.int32),
+    )
+    with pytest.raises(
+        (ValueError, RuntimeError),
+        match="full-width live requests",
+    ):
+        RTPQwen4ExpContext._build_query_start_loc_for_plugin(
+            attn_inputs=attn_inputs,
+            seq_lens=torch.tensor([18, 18], dtype=torch.int32),
+            num_tokens=6,
+            device=torch.device("cpu"),
+            cg_bufs={
+                "mtp_window_width": 3,
+                "query_start_loc": torch.tensor([0, 3, 6], dtype=torch.int32),
+            },
+        )
+
+
+def test_qwen4_exp_mtp_draft_capture_keeps_padding_rows(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    attn_inputs = SimpleNamespace(
+        is_prefill=True,
+        is_target_verify=False,
+        prefill_cuda_graph_copy_params=SimpleNamespace(),
+        input_lengths_device=torch.tensor([3, 3, 0], dtype=torch.int32),
+    )
+    query_start_loc = RTPQwen4ExpContext._build_query_start_loc_for_plugin(
+        attn_inputs=attn_inputs,
+        seq_lens=torch.tensor([18, 18, 16], dtype=torch.int32),
+        num_tokens=9,
+        device=torch.device("cpu"),
+        cg_bufs={
+            "mtp_window_width": 3,
+            "query_start_loc": torch.tensor([0, 3, 6, 9], dtype=torch.int32),
+        },
+    )
+    assert query_start_loc.tolist() == [0, 3, 6, 9]
+
+
 def test_qwen4_exp_generation_prefill_is_not_mtp_window(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn_inputs = SimpleNamespace(

@@ -2290,6 +2290,43 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
         fixed_draft_prefill = cls._is_fixed_mtp_draft_prefill(
             attn_inputs, num_tokens, batch_size, cg_bufs
         )
+        draft_width = (cg_bufs or {}).get("mtp_window_width")
+        if (
+            draft_width in (2, 3, 4)
+            and getattr(attn_inputs, "is_prefill", False)
+            and not getattr(attn_inputs, "is_target_verify", False)
+            and getattr(attn_inputs, "prefill_cuda_graph_copy_params", None) is not None
+        ):
+            if not fixed_draft_prefill:
+                raise ValueError(
+                    "RTP MTP draft prefill requires batch_size * window_width tokens"
+                )
+            input_lengths = RTPForwardContext._non_empty_int32(
+                getattr(attn_inputs, "input_lengths_device", None), device=device
+            )
+            if input_lengths is None:
+                input_lengths = RTPForwardContext._non_empty_int32(
+                    getattr(attn_inputs, "input_lengths", None), device=device
+                )
+            if input_lengths is None or input_lengths.numel() != batch_size:
+                raise ValueError(
+                    "RTP MTP draft prefill requires one input length per request"
+                )
+            # Graph replay refreshes input_lengths_device, so the captured
+            # assertion also checks live requests. A zero-length row is Graph
+            # padding; every non-padding row must fill its fixed window.
+            valid_lengths = torch.all(
+                (input_lengths == draft_width) | (input_lengths == 0)
+            )
+            if in_capture:
+                torch._assert_async(
+                    valid_lengths,
+                    "RTP MTP draft prefill requires full-width live requests",
+                )
+            elif not bool(valid_lengths):
+                raise ValueError(
+                    "RTP MTP draft prefill requires full-width live requests"
+                )
         if in_capture and cg_bufs is not None:
             return cg_bufs["query_start_loc"][: batch_size + 1]
 
