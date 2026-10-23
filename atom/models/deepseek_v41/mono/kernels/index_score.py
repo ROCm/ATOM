@@ -336,10 +336,13 @@ def _selected_rows(c, t, ident):
     (``stage_ilist``): inside the winners' branches each load was a round trip
     in series, and the attention's keys wait on none."""
     a = c["args"]
+    # FULL layers use history columns, not compacted candidate columns.
+    # Keep the speculative candidate load inside this token's row.
+    cand_ident = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(ident, 0))
     cand = fx.Int32(
         bo.buffer_load(
             rsrc(a["icand"]),
-            t * ip.TOPK_BLOCKS + fx.max(ident, 0) // TILE,
+            t * ip.TOPK_BLOCKS + cand_ident // TILE,
             vec_width=1,
             dtype=T.i32,
         )
