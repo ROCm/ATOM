@@ -212,6 +212,26 @@ def test_piecewise_cudagraph_does_not_refuse_the_served_deployment():
     assert config_refusal(atom_config) is None
 
 
+@pytest.mark.parametrize(
+    ("device", "kv_transfer_config", "reason"),
+    [
+        ({"arch": "gfx942"}, None, "not gfx950"),
+        ({"cus": 240}, None, "240 CUs"),
+        ({}, {"kv_connector": "lmcache"}, "KV connector"),
+    ],
+)
+def test_the_persistent_kernel_preconditions_refuse_glm(
+    fake_gpu, device, kv_transfer_config, reason
+):
+    atom_config = _served_tp4_fp8_mtp4_config()
+    fake_gpu()
+    assert config_refusal(atom_config) is None
+    atom_config.kv_transfer_config = kv_transfer_config
+    fake_gpu(**device)
+    why = config_refusal(atom_config)
+    assert why is not None and reason in why
+
+
 _MISSING = object()
 
 

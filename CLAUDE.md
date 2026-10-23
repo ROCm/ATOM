@@ -80,11 +80,12 @@ Key entry points:
   gate can reach them without AITER or FlyDSL. GLM-5.2's single `kernels/kernel.py` covers the
   whole layer, `kernels/op.py` is its host wrapper, and `kernels/geometry.py` /
   `kernels/geometry_config.py` hold its launch geometry and its own `LayerConfig`.
-  What is NOT GLM-5.2's sits in `atom/mono/`: the storage vocabulary and host-side
-  weight preparation in `mono/weights/` (`config` the enum vocabulary and
+  GLM-5.2's storage vocabulary and host-side weight preparation are in
+  `atom/models/glm52/mono/storage/` (`config` the enum vocabulary and
   `LayerConfig`, `formats` MX conversion, `packing`, `layer` the `LayerWeights`
-  ABI), ATOM's MXFP4 index arithmetic in `plan/tiles.py`, and the HIP IPC wrapper
-  in `runtime/hip_ipc.py`. `runtime/peer_memory.py` now holds BOTH peer-buffer
+  ABI). What is NOT GLM-5.2's sits in `atom/mono/`: ATOM's MXFP4 index
+  arithmetic in `plan/tiles.py` and the HIP IPC wrapper in `runtime/hip_ipc.py`.
+  `runtime/peer_memory.py` now holds BOTH peer-buffer
   implementations side by side — `PeerBuffer` (aiter's heap) and
   `SymmetricPeerBuffer` (HIP directly, GLM-5.2's) — because they are different
   implementations rather than two copies, and merging them is a GPU behaviour

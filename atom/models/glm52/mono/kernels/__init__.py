@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from atom.models.glm52.mono.kernels.op import Glm5MonoKernel
     from atom.models.glm52.mono.kernels.tp4_op import Glm5TP4MonoKernel
-    from atom.mono.weights.layer import LayerWeights
+    from atom.models.glm52.mono.storage.layer import LayerWeights
 
 __all__ = ["Glm5MonoKernel", "Glm5TP4MonoKernel", "LayerWeights"]
 
@@ -27,7 +27,7 @@ def __getattr__(name: str):
 
         return Glm5TP4MonoKernel
     if name == "LayerWeights":
-        from atom.mono.weights.layer import LayerWeights
+        from atom.models.glm52.mono.storage.layer import LayerWeights
 
         return LayerWeights
     raise AttributeError(name)

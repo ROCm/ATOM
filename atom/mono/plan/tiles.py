@@ -25,6 +25,9 @@ def atom_mxfp4_weight_index(row_group, k_chunk, lane, step, k_size):
 
 
 def atom_mxfp4_scale_index(row, col, cols):
+    """Byte of e8m0 scale (row, col) in aiter's ``shuffle_scale`` layout:
+    ``view(rows/32, 2, 16, cols/8, 2, 4).permute(0, 3, 5, 2, 4, 1)``, where the
+    columns are zero-padded to a multiple of 8 (hence the ceil in ``cols``)."""
     r32, a, b = row // 32, (row // 16) % 2, row % 16
     c8, d, e = col // 8, (col // 4) % 2, col % 4
     return ((((r32 * ((cols + 7) // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a

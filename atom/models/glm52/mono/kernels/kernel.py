@@ -47,7 +47,6 @@ https://github.com/SemiAnalysisAI/InferenceX/tree/8ac98344b038a3f2da20a565fe9b97
 """
 
 import math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -167,6 +166,7 @@ from atom.mono.device.ops import uniform as _uniform
 from atom.mono.device.ops import uniform_f32 as _uniform_f32
 from atom.mono.device.ops import xred as _xred
 from atom.mono.device.ops import xshfl as _xshfl
+from atom.utils import envs
 
 
 # ------------------------------------------------- selection tree, per token
@@ -395,7 +395,7 @@ def build_glm5_monokernel(
     # ``MONO_DN_HOIST=0`` restores the per-unit expert resolution the
     # ``DN_HOIST`` group below replaces, for an in-process A/B. Both are
     # bit-identical; see the comment at ``dn_expert``.
-    _DN_HOIST = os.environ.get("MONO_DN_HOIST", "1") == "1"
+    _DN_HOIST = envs.MONO_DN_HOIST
     # How many attention heads a `split` task stages into the Q tile. It reads
     # only its own head group's WAVES rows, so staging all H of them polls and
     # stores H // WAVES times the q words it uses. Narrowing it is
@@ -405,17 +405,17 @@ def build_glm5_monokernel(
     # ``MONO_R2_OFF=1`` turns off every round-2 schedule change at once, so the
     # pair can be A/B'd against the previous kernel in a single interleaved
     # process. All of them are bit-identical.
-    _R2_OFF = os.environ.get("MONO_R2_OFF", "0") == "1"
+    _R2_OFF = envs.MONO_R2_OFF
     # How many (sample, group) cells of ``stage_x_pairs_ptpc`` share one poll
     # batch and one ``block_maxs``. 1 restores the per-cell walk; <= 0 batches
     # every cell. Changing it is bit-identical; see ``ptpc_stage_chunk``.
     PTPC_CHUNK = 1 if _R2_OFF else ptpc_stage_chunk(S)
     _PTPC_LEGACY_POLL = _R2_OFF
-    _SPLIT_QHEADS = not _R2_OFF and os.environ.get("MONO_SPLIT_QHEADS", "1") == "1"
+    _SPLIT_QHEADS = not _R2_OFF and envs.MONO_SPLIT_QHEADS
     # ``MONO_UG_SCALE_PAIR=0`` restores the per-unit 1-byte MXFP4 scale gather
     # in the up/gate stage, for an in-process A/B. Both are bit-identical; see
     # ``atom_mxfp4_scale_pair`` and the comment in ``ug8_units``.
-    _UG_SCALE_PAIR = not _R2_OFF and os.environ.get("MONO_UG_SCALE_PAIR", "1") == "1"
+    _UG_SCALE_PAIR = not _R2_OFF and envs.MONO_UG_SCALE_PAIR
     QHEADS = (
         WAVES
         if (_SPLIT_QHEADS and heads % WAVES == 0 and (WAVES * KV_LORA // 4) % THREADS == 0)

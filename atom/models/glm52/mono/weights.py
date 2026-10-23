@@ -26,13 +26,13 @@ from atom.models.glm52.mono.kernels.layout import (
     INDEX_HEADS,
     INDEX_Q_ROWS,
 )
-from atom.mono.runtime.consensus import MonoUnsupported
-from atom.mono.weights.layer import (
+from atom.models.glm52.mono.storage.layer import (
     LayerWeights,
     atom_mxfp4_storage_view,
     linear_bf16,
     linear_ptpc_fp8,
 )
+from atom.mono.runtime.consensus import MonoUnsupported
 
 # ``indexer.wk_weights_proj`` packs two row blocks into one BF16 linear: the
 # first ``INDEX_DIM`` rows are the index-K projection (`w_index_k`), the next

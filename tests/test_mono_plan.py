@@ -143,3 +143,27 @@ def test_source_digest_refuses_a_missing_path(tmp_path, monkeypatch):
 
 def test_symbol_params_are_the_sym_fields():
     assert symbol_params(_Key(4, 1e-6, 2)) == {"s": 4}
+
+
+@pytest.mark.parametrize("cols", [8, 12, 16, 20])
+def test_scale_index_addresses_aiters_shuffled_scale_plane(cols):
+    """The index must hit the byte aiter's ``shuffle_scale`` (zero-padded to
+    a multiple of 8 columns, then viewed/permuted) put each scale at, for
+    columns that do and do not fill the last 8-wide group."""
+    torch = pytest.importorskip("torch")
+    from atom.mono.plan.tiles import atom_mxfp4_scale_index
+
+    rows = 64
+    scale = torch.arange(rows * cols).view(rows, cols)
+    padded_cols = (cols + 7) // 8 * 8
+    padded = torch.zeros(rows, padded_cols, dtype=scale.dtype)
+    padded[:, :cols] = scale
+    shuffled = (
+        padded.view(rows // 32, 2, 16, padded_cols // 8, 2, 4)
+        .permute(0, 3, 5, 2, 4, 1)
+        .contiguous()
+        .flatten()
+    )
+    for row in range(rows):
+        for col in range(cols):
+            assert shuffled[atom_mxfp4_scale_index(row, col, cols)] == scale[row, col]

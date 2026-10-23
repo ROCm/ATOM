@@ -14,8 +14,8 @@ Three layers, cheapest first:
    ``_write_block_preshuffle``, ``_compute_ref_scale``, ``run_torch``).  It
    needs neither a GPU nor aiter.
 2. ``_kernel_plane`` writes the same input through
-   ``tp4_layout.index_fp8_data_dword`` / ``index_fp8_scale_dword`` -- the
-   address arithmetic ``tp4_kernel.py`` itself calls -- and through
+   ``layout.index_fp8_data_dword`` / ``index_fp8_scale_dword`` -- the
+   address arithmetic ``kernel.py`` itself calls -- and through
    ``_ue8m0_scale``, the integer-exponent form of the scale the kernel
    computes.  Layer 1 and layer 2 must agree byte for byte.
 3. ``test_aiter_writer_matches_oracle`` runs the real production writer
@@ -36,7 +36,7 @@ import math
 import pytest
 import torch
 
-from atom.models.glm52.mono.kernels.tp4_layout import (
+from atom.models.glm52.mono.kernels.layout import (
     INDEX_ALIGNED_DIM,
     INDEX_DIM,
     INDEX_TILE,
@@ -213,7 +213,7 @@ def test_harness_rejects_a_multiplied_scale():
 
 
 def _build_index_writer(tokens: int, page: int = PAGE):
-    """A one-wave-per-token FlyDSL kernel holding tp4_kernel's FP8 write verbatim.
+    """A one-wave-per-token FlyDSL kernel holding kernel.py's FP8 write verbatim.
 
     The CPU layers above cannot see whether the kernel's *expressions* lower to
     those bytes: whether ``cvt_pk_fp8_f32`` emits OCP E4M3 on this arch, whether
@@ -223,7 +223,7 @@ def _build_index_writer(tokens: int, page: int = PAGE):
     runs the same twenty lines on their own.
 
     The quantize block below is a copy of the ``const_expr(index_fp8)`` branch in
-    ``tp4_kernel.py``'s cache stage, and a copy is a thing that can drift -- keep
+    ``kernel.py``'s cache stage, and a copy is a thing that can drift -- keep
     them together.
     """
 
@@ -234,7 +234,7 @@ def _build_index_writer(tokens: int, page: int = PAGE):
     from flydsl.expr import range_constexpr, rocdl
     from flydsl.expr.typing import Int64, T
 
-    from atom.models.glm52.mono.kernels.tp4_layout import fp8_pe_upper_pair_lane
+    from atom.models.glm52.mono.kernels.layout import fp8_pe_upper_pair_lane
     from atom.mono.device.ops import bpermute_i32
     from atom.mono.device.ops import rsrc as _rsrc
     from atom.mono.device.ops import xred as _xred

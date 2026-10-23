@@ -88,7 +88,7 @@ def _preshuffle_linear_weight(weight):
 def _preshuffled_mxfp4_linear(source):
     import torch
 
-    from atom.mono.weights.formats import (
+    from atom.models.glm52.mono.storage.formats import (
         dequantize_mxfp4,
         quantize_mxfp4,
     )
@@ -716,7 +716,7 @@ def test_glm_bf16_linear_mapping():
     import torch
 
     module = _glm_mono_weights_module()
-    from atom.mono.weights.layer import linear_bf16
+    from atom.models.glm52.mono.storage.layer import linear_bf16
 
     weight = torch.arange(2 * 5 * 3, dtype=torch.float32).to(torch.bfloat16).view(10, 3)
     linear = SimpleNamespace(
@@ -757,8 +757,8 @@ def test_glm_recipe_per_token_fp8_attention_mapping():
     import torch
 
     module = _glm_mono_weights_module()
-    from atom.mono.weights.layer import linear_ptpc_fp8
-    from atom.mono.weights.packing import pack_ptpc_fp8
+    from atom.models.glm52.mono.storage.layer import linear_ptpc_fp8
+    from atom.models.glm52.mono.storage.packing import pack_ptpc_fp8
 
     source = torch.randn(16, 64, dtype=torch.bfloat16)
     linear, _ = _preshuffled_per_token_fp8_linear(source)
@@ -966,7 +966,7 @@ def test_glm_fp8_fused_576_cache_has_explicit_device_io():
 def test_shared_linear_weight_unshuffle_round_trip():
     import torch
 
-    from atom.mono.weights.layer import _unshuffle_linear_weight
+    from atom.models.glm52.mono.storage.layer import _unshuffle_linear_weight
 
     native = torch.arange(16 * 64, dtype=torch.int32).to(torch.uint8).view(16, 64)
     shuffled = _preshuffle_linear_weight(native)
@@ -974,7 +974,7 @@ def test_shared_linear_weight_unshuffle_round_trip():
     restored = _unshuffle_linear_weight(shuffled)
     assert torch.equal(restored, native)
 
-    from atom.mono.weights.packing import pack_a16w4_weight
+    from atom.models.glm52.mono.storage.packing import pack_a16w4_weight
 
     assert torch.equal(pack_a16w4_weight(restored), shuffled.reshape(-1))
 
@@ -982,7 +982,7 @@ def test_shared_linear_weight_unshuffle_round_trip():
 def test_shared_linear_scale_unshuffle_round_trip():
     import torch
 
-    from atom.mono.weights.layer import _unshuffle_linear_scale
+    from atom.models.glm52.mono.storage.layer import _unshuffle_linear_scale
 
     native = torch.arange(2 * 256 * 16, dtype=torch.int32).to(torch.uint8).view(512, 16)
     shuffled = (
@@ -994,7 +994,7 @@ def test_shared_linear_scale_unshuffle_round_trip():
     restored = _unshuffle_linear_scale(shuffled, experts=2, rows=256, groups=16)
     assert torch.equal(restored, native.view(2, 256, 16))
 
-    from atom.mono.weights.packing import pack_a16w4_scale
+    from atom.models.glm52.mono.storage.packing import pack_a16w4_scale
 
     assert torch.equal(pack_a16w4_scale(restored), shuffled.reshape(-1))
 
@@ -1023,8 +1023,8 @@ def test_shared_mxfp4_linear_round_trip():
 
     import torch
 
+    from atom.models.glm52.mono.storage.layer import linear_bf16
     from atom.mono.runtime.consensus import MonoUnsupported
-    from atom.mono.weights.layer import linear_bf16
 
     source = torch.randn(256, 256, dtype=torch.bfloat16)
     linear, expected = _preshuffled_mxfp4_linear(source)
@@ -1064,7 +1064,7 @@ def test_shared_mxfp4_linear_round_trip():
 def test_shared_mxfp4_linear_dequantizes_only_requested_rows(monkeypatch):
     import torch
 
-    from atom.mono.weights import layer as weights
+    from atom.models.glm52.mono.storage import layer as weights
 
     source = torch.randn(256, 256, dtype=torch.bfloat16)
     linear, expected = _preshuffled_mxfp4_linear(source)
@@ -1092,7 +1092,7 @@ def test_shared_mxfp4_linear_dequantizes_only_requested_rows(monkeypatch):
 def test_shared_bf16_linear_is_unchanged():
     import torch
 
-    from atom.mono.weights.layer import linear_bf16
+    from atom.models.glm52.mono.storage.layer import linear_bf16
 
     weight = torch.randn(32, 64, dtype=torch.bfloat16)
     linear = SimpleNamespace(
@@ -1129,7 +1129,7 @@ def test_atom_expert_storage_matches_consumer_abi():
         Mxfp4ScaleLayout,
         Mxfp4WeightLayout,
     )
-    from atom.mono.weights.layer import (
+    from atom.models.glm52.mono.storage.layer import (
         LayerWeights,
         prepare_aiter_mxfp4_expert_storage,
         prepare_mxfp4_expert_storage,
@@ -1175,7 +1175,7 @@ def test_glm_fused_shared_expert_storage_is_canonicalized():
         Mxfp4ScaleLayout,
         Mxfp4WeightLayout,
     )
-    from atom.mono.weights.layer import (
+    from atom.models.glm52.mono.storage.layer import (
         LayerWeights,
         prepare_mxfp4_expert_storage,
     )

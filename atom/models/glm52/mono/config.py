@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from atom.models.glm52.mono.kernels.geometry import BLOCKS
 from atom.models.glm52.mono.kernels.geometry_config import (
     EPS,
     GLM5_AGENTX_BATCHES,
@@ -21,7 +22,11 @@ from atom.models.glm52.mono.kernels.geometry_config import (
 from atom.models.glm52.mono.kernels.layout import INDEX_SEG, index_cp_world
 from atom.models.utils import is_neox_rope_style
 from atom.mono.plan.shard import Shard
-from atom.mono.runtime.deployment import common_refusals, first_refusal
+from atom.mono.runtime.deployment import (
+    common_refusals,
+    first_refusal,
+    persistent_kernel_refusals,
+)
 from atom.plugin.prepare import is_plugin_mode
 from atom.utils import envs
 
@@ -231,17 +236,6 @@ def model_geometry_refusal(hf_config, shard, tp_size: int) -> str | None:
     return None
 
 
-def _is_gfx950() -> bool:
-    """True on gfx950, and on no device at all -- a contract check builds
-    compile-only and never binds one, as ``_cu_count`` does for K3."""
-    import torch
-
-    if not torch.cuda.is_available():
-        return True
-    arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName
-    return arch.startswith("gfx950")
-
-
 def config_refusal(atom_config) -> str | None:
     """Why this deployment cannot use GLM-5.2 mono, or None."""
     hf = atom_config.hf_config
@@ -259,17 +253,15 @@ def config_refusal(atom_config) -> str | None:
     checks = [(envs.ATOM_MONO_ENABLE, "switched off")]
     checks += common_refusals(
         atom_config, Dims, SUPPORTED_TP, piecewise_cudagraph_required=False
-    ) + [
+    )
+    checks += persistent_kernel_refusals(atom_config, BLOCKS)
+    checks += [
         (geometry is not None, "native geometry"),
         (getattr(hf, "model_type", None) == "glm_moe_dsa", "model type"),
         (not atom_config.enable_dp_attention, "DP attention"),
         (not is_plugin_mode(), "plugin mode"),
         (not envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV, "shuffled MLA cache"),
         (envs.ATOM_MLA_PAGE_SIZE == 1, "segmented MLA cache"),
-        # the kernel is built for gfx950's 163,840 B LDS budget and the runner
-        # always asks for native FP4 MFMA; another arch would be admitted here
-        # and fail at compile/launch instead of falling back
-        (_is_gfx950(), "not gfx950"),
     ]
     if geometry is not None:
         why = model_geometry_refusal(hf, geometry, tp_size)

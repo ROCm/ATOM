@@ -115,6 +115,34 @@ def common_refusals(
     return checks
 
 
+def persistent_kernel_refusals(atom_config, blocks) -> list[tuple[bool, str]]:
+    """``(holds, why not)`` of what a persistent mono kernel needs of the
+    machine: one CTA a CU with all ``blocks`` of them resident, because a spin
+    wait on another CTA only makes progress while that CTA runs, built for
+    gfx950's MFMA and LDS, and no KV connector, whose copy kernels run on
+    another stream and can hold CUs. A kernel that does not get these hangs in
+    its spin instead of refusing by name.
+
+    No device passes: a contract check builds compile-only and never binds one.
+    """
+    import torch
+
+    props = (
+        torch.cuda.get_device_properties(torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else None
+    )
+    cus = None if props is None else props.multi_processor_count
+    return [
+        (props is None or props.gcnArchName.startswith("gfx950"), "not gfx950"),
+        (cus in (None, blocks), f"{cus} CUs, the kernels need {blocks}"),
+        # the field is a dict that defaults to empty, so this is a truthiness
+        # test, as every other reader of it in ATOM does: `is None` refuses
+        # every deployment
+        (not getattr(atom_config, "kv_transfer_config", None), "KV connector"),
+    ]
+
+
 def first_refusal(checks) -> str | None:
     """The reason of the first check that does not hold, or None."""
     return next((why for ok, why in checks if not ok), None)

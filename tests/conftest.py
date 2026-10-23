@@ -255,3 +255,20 @@ def seq_factory():
         return Sequence(token_ids, block_size, sampling_params=sp, **kwargs)
 
     return make_sequence
+
+
+@pytest.fixture
+def fake_gpu(monkeypatch):
+    """``fake_gpu(arch, cus)`` makes ``torch.cuda`` report one such device
+    (default: a gfx950 with the 256 CUs a persistent mono kernel needs)."""
+    import torch
+
+    def install(arch="gfx950", cus=256):
+        props = SimpleNamespace(
+            gcnArchName=f"{arch}:sramecc+:xnack-", multi_processor_count=cus
+        )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
+
+    return install

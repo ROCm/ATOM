@@ -44,9 +44,9 @@ from atom.models.glm52.mono.kernels.geometry_config import (
     KvCacheLayout,
     glm5_kernel_samples,
 )
+from atom.models.glm52.mono.storage.layer import LayerWeights
 from atom.models.glm52.mono.weights import bf16_vector, layer_weights
 from atom.mono.runtime.consensus import MonoUnsupported, tp_uniform_local_validation
-from atom.mono.weights.layer import LayerWeights
 from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 

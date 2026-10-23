@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import torch
 
-from atom.mono.weights.config import (
+from atom.models.glm52.mono.storage.config import (
     AttentionWeight,
     ExpertWeight,
     LayerConfig,
