@@ -146,11 +146,14 @@ def freeze_gc_heap(context: str) -> int:
     """
     from atom.utils import envs
 
+    global _heap_frozen
+
     if not envs.ATOM_GC_FREEZE:
         return 0
     gc.collect()
     before = gc.get_freeze_count()
     gc.freeze()
+    _heap_frozen = True
     total = gc.get_freeze_count()
     logger.info(
         "[gc] %s: froze %d objects (%d already frozen)", context, total - before, before
@@ -163,21 +166,115 @@ def unfreeze_gc_heap() -> None:
     frozen object is invisible to the collector, so an engine destroyed inside
     a live interpreter would leave its weights and KV cache unreachable *and*
     uncollectable, which presents as a GPU memory leak."""
+    global _heap_frozen
+
     frozen = gc.get_freeze_count()
     if frozen:
         logger.info("[gc] unfroze %d objects", frozen)
     gc.unfreeze()
+    _heap_frozen = False
 
 
-def _attach_gc_timing(context: str, interval_s: float) -> None:
+# Set by `freeze_gc_heap`. A slow gen-2 pass before it is startup state, which
+# the freeze is about to take out of reach, so only later ones are censused.
+_heap_frozen = False
+CENSUS_GAP_S = 900.0
+
+
+def _type_name(tp: type) -> str:
+    if tp.__module__ == "builtins":
+        return tp.__qualname__
+    return f"{'.'.join(tp.__module__.split('.')[-2:])}.{tp.__qualname__}"
+
+
+def _holder(r: object, skip: tuple, depth: int = 1) -> str:
+    """Who `r` is, for a referrer line: code for frames and coroutines, the
+    class for instances, and one level further up for a bare container."""
+    kind = type(r)
+    if kind is types.FunctionType:
+        return f"func:{r.__qualname__}"
+    if kind in _CODE_ATTR:
+        return f"{kind.__name__}:{getattr(r, _CODE_ATTR[kind]).co_qualname}"
+    name = _type_name(kind)
+    if depth > 0 and type(r) in (dict, list, tuple):
+        up = []
+        for x in gc.get_referrers(r):
+            if not any(x is s for s in skip):
+                up.append(_holder(x, skip, depth - 1))
+            if len(up) == 3:
+                break
+        name += "<" + "|".join(up)
+    return name
+
+
+def log_gc_heap_census(
+    context: str, pass_ms: float, top: int = 15, big: int = 10_000, chase: int = 3
+) -> None:
+    """Log what the oldest generation holds: the commonest types, the element
+    count every full pass walks, and the largest containers with who holds
+    them. Stalls this process for about one full pass per container chased.
+
+    Referrers are found among the collected generations only: a holder that
+    was frozen at startup shows as its container's other holders, or not at
+    all, never as itself.
+    """
+    t = time.perf_counter()
+    objs = gc.get_objects(generation=2)
+    by_type: dict[type, int] = {}
+    elems = 0
+    bigs: list[tuple[int, int]] = []
+    for i, o in enumerate(objs):
+        tp = type(o)
+        by_type[tp] = by_type.get(tp, 0) + 1
+        if tp in (list, tuple, dict, set):
+            k = len(o)
+            elems += k
+            if k >= big:
+                bigs.append((k, i))
+    ranked = sorted(by_type.items(), key=lambda kv: -kv[1])[:top]
+    bigs.sort(reverse=True)
+    big_s = []
+    for rank, (k, i) in enumerate(bigs[:8]):
+        o = objs[i]
+        if type(o) is dict:
+            key, value = next(iter(o.items()), (None, None))
+            inner = f"{_type_name(type(key))}->{_type_name(type(value))}"
+        else:
+            inner = _type_name(type(next(iter(o), None)))
+        desc = f"{type(o).__name__}[{inner}]x{k}"
+        if rank < chase:
+            refs = [r for r in gc.get_referrers(o) if r is not objs]
+            desc += "<-" + "|".join(_holder(r, (objs, refs)) for r in refs[:4])
+            refs = None
+        big_s.append(desc)
+    o = None
+    total = len(objs)
+    objs = None
+    logger.info(
+        "[gc-census] ctx=%s pass_ms=%.0f census_ms=%.0f gen2=%d elems=%d nbig=%d "
+        "top=%s big=%s",
+        context,
+        pass_ms,
+        (time.perf_counter() - t) * 1e3,
+        total,
+        elems,
+        len(bigs),
+        ",".join(f"{_type_name(tp)}:{c}" for tp, c in ranked),
+        ";".join(big_s) or "-",
+    )
+
+
+def _attach_gc_timing(context: str, interval_s: float, census_ms: int = 0) -> None:
     """Log, every `interval_s`, how many collections each generation ran here,
-    their total and their longest pause.
+    their total and their longest pause; with `census_ms`, also a census of
+    the oldest generation after a gen-2 pass that slow, at most once every
+    `CENSUS_GAP_S`.
 
     Cheap enough to leave on under load, unlike `ATOM_GC_DEBUG`: two clock
     reads per pass and no heap walk. Reported from the callback itself, so an
     idle process says nothing rather than needing a timer thread.
     """
-    state = {"t0": 0.0, "since": time.perf_counter()}
+    state = {"t0": 0.0, "since": time.perf_counter(), "census": None}
     n, total, longest = [0, 0, 0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
 
     def _time(phase: str, info: dict) -> None:
@@ -192,6 +289,15 @@ def _attach_gc_timing(context: str, interval_s: float) -> None:
         n[gen] += 1
         total[gen] += dt
         longest[gen] = max(longest[gen], dt)
+        if (
+            census_ms
+            and gen == 2
+            and _heap_frozen
+            and dt * 1e3 >= census_ms
+            and (state["census"] is None or now - state["census"] >= CENSUS_GAP_S)
+        ):
+            state["census"] = now
+            log_gc_heap_census(context, dt * 1e3)
         if now - state["since"] < interval_s:
             return
         logger.info(
@@ -220,7 +326,7 @@ def maybe_attach_gc_debug_callback(context: str) -> None:
     from atom.utils import envs
 
     if envs.ATOM_GC_TIMING_S > 0:
-        _attach_gc_timing(context, envs.ATOM_GC_TIMING_S)
+        _attach_gc_timing(context, envs.ATOM_GC_TIMING_S, envs.ATOM_GC_CENSUS_SLOW_MS)
     if not envs.ATOM_GC_DEBUG:
         return
 

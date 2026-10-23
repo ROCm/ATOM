@@ -49,11 +49,13 @@ def _leave_gc_as_found():
     was_enabled = gc.isenabled()
     thresholds = gc.get_threshold()
     baseline, warned = gc_utils._reclaim_baseline, gc_utils._reclaim_warned
+    frozen = gc_utils._heap_frozen
     yield
     gc.unfreeze()
     gc.collect()
     gc.set_threshold(*thresholds)
     gc_utils._reclaim_baseline, gc_utils._reclaim_warned = baseline, warned
+    gc_utils._heap_frozen = frozen
     if was_enabled:
         gc.enable()
 
@@ -670,3 +672,67 @@ def test_gc_timing_reports_each_generation_once_per_interval(monkeypatch):
         "max_ms=3.0/5.0/200.0"
     )
     assert lines == [expected]
+
+
+class _Holder:
+    def __init__(self):
+        self.held = [_Cycle() for _ in range(64)]
+
+
+def test_the_census_names_what_a_big_container_holds_and_who_holds_it(monkeypatch):
+    """The type counts say what grew; the container line says where it hangs,
+    which is the half a fix needs."""
+    from atom.utils import gc_utils
+
+    lines = []
+    monkeypatch.setattr(gc_utils.logger, "info", lambda msg, *a: lines.append(msg % a))
+    gc.collect()
+    gc.freeze()  # the test process's own heap; only what follows is counted
+    holder = _Holder()
+    gc.collect()
+    gc.collect()  # twice: survivors of the first land in the oldest generation
+
+    gc_utils.log_gc_heap_census("PP3TP0", 250.0, big=64)
+
+    (line,) = lines
+    assert line.startswith("[gc-census] ctx=PP3TP0 pass_ms=250 ")
+    assert "test_gc_utils._Cycle:" in line
+    assert "list[test_gc_utils._Cycle]x64<-test_gc_utils._Holder" in line
+    del holder
+
+
+def test_a_census_waits_for_the_freeze_a_slow_pass_and_its_gap(monkeypatch):
+    from atom.utils import gc_utils
+
+    clock = [100.0]
+    calls = []
+    monkeypatch.setattr(gc_utils.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(
+        gc_utils, "log_gc_heap_census", lambda ctx, ms: calls.append((ctx, ms))
+    )
+    monkeypatch.setattr(gc_utils.logger, "info", lambda *a: None)
+    gc.disable()
+    gc_utils._attach_gc_timing("PP0TP0", 30, census_ms=150)
+    callback = gc.callbacks[-1]
+    try:
+
+        def collect(gen, ms):
+            callback("start", {"generation": gen})
+            clock[0] += ms / 1e3
+            callback("stop", {"generation": gen})
+
+        gc_utils._heap_frozen = False
+        collect(2, 400)  # the freeze's own pass: startup state, not censused
+        gc_utils._heap_frozen = True
+        collect(2, 100)  # fast enough
+        collect(1, 300)  # not the oldest generation
+        collect(2, 200)
+        clock[0] += gc_utils.CENSUS_GAP_S - 1
+        collect(2, 300)  # within the gap of the last census
+        clock[0] += 1
+        collect(2, 300)
+    finally:
+        gc.callbacks.remove(callback)
+
+    assert [ms for _, ms in calls] == pytest.approx([200.0, 300.0])
+    assert {ctx for ctx, _ in calls} == {"PP0TP0"}

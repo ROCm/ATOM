@@ -709,6 +709,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Every this many seconds, log each serving process's collections per
     # generation: count, total and longest pause. 0 = off.
     "ATOM_GC_TIMING_S": lambda: _nonnegative_int_env("ATOM_GC_TIMING_S", 0),
+    # With ATOM_GC_TIMING_S: after a gen-2 pass at least this many ms, once the
+    # heap is frozen, log what the oldest generation holds (at most every
+    # 15 min per process; stalls it for about a pass per container). 0 = off.
+    "ATOM_GC_CENSUS_SLOW_MS": lambda: _nonnegative_int_env("ATOM_GC_CENSUS_SLOW_MS", 0),
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
     # Thresholds are per-interpreter, but this is one variable, read by every
     # process that serves -- and only the frontend was measured to reclaim
