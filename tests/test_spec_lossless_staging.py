@@ -50,7 +50,7 @@ class FakeDraftModel:
         self.bound = sampling
 
 
-def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None):
+def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None, **config):
     monkeypatch.setenv("ATOM_SPEC_LOSSLESS_SAMPLING", "1" if lossless else "0")
     monkeypatch.setattr(dspark_proposer, "get_pcp_world_size", lambda: pcp)
     # CPU stand-in weights; the GPU arming check has its own test below.
@@ -58,7 +58,9 @@ def proposer(monkeypatch, *, lossless=True, pp=1, pcp=1, model=None):
         dspark_proposer, "dspark_markov_sample_unsupported", lambda w1, w2: None
     )
     prop = DSparkProposer.__new__(DSparkProposer)
-    prop.config = SimpleNamespace(max_num_seqs=MAX_BS, pipeline_parallel_size=pp)
+    prop.config = SimpleNamespace(
+        max_num_seqs=MAX_BS, pipeline_parallel_size=pp, **config
+    )
     prop.device = torch.device("cpu")
     prop.runner = SimpleNamespace(rank=1)
     prop.metadata_buffers = {}
@@ -122,8 +124,19 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
         {"pp": 2},
         {"pcp": 2},
         {"model": SimpleNamespace(supports_lossless_draft=False)},
+        {"kv_transfer_config": {"kv_role": "kv_producer"}},
+        {"kv_transfer_config": {"connectors": [{"kv_role": "kv_producer"}]}},
+        {"enable_rapidserve": True, "disagg_is_decode": False},
     ],
-    ids=["flag-off", "pp", "pcp", "unported-flavor"],
+    ids=[
+        "flag-off",
+        "pp",
+        "pcp",
+        "unported-flavor",
+        "pd-producer",
+        "pd-producer-multi",
+        "rapidserve-prefill",
+    ],
 )
 def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
@@ -138,6 +151,18 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop.stage_draft_sampling_host(
         batch(["a"]), 1, None, has_filter=False, drafts_verifiable=True
     )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"kv_transfer_config": {"kv_role": "kv_consumer"}},
+        {"enable_rapidserve": True, "disagg_is_decode": True},
+    ],
+    ids=["pd-consumer", "rapidserve-decode"],
+)
+def test_the_verifying_side_of_a_disaggregated_pair_still_arms(monkeypatch, config):
+    assert proposer(monkeypatch, **config).draft_sampling is not None
 
 
 def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):

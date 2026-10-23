@@ -9,6 +9,7 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import get_pcp_world_size
+from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.dspark_markov_sample import (
     dspark_markov_sample_scratch_bytes,
     dspark_markov_sample_unsupported,
@@ -143,6 +144,22 @@ class DSparkProposer(Drafter):
                 "the distribution they were drawn from is not. Falling back to "
                 "greedy proposal with exact-match acceptance.",
                 get_pcp_world_size(),
+            )
+            return
+        kv_cfg = getattr(self.config, "kv_transfer_config", None) or {}
+        if kv_config_has_producer(kv_cfg) or (
+            getattr(self.config, "enable_rapidserve", False)
+            and not getattr(self.config, "disagg_is_decode", False)
+        ):
+            # A P/D producer (or RapidServe's prefill process) drafts only to
+            # hand the drafts off; it never verifies, and the consumer has no
+            # q for a handed-off request anyway. Armed, it would allocate the
+            # q store, reserve scratch off its KV budget and run the de-fused
+            # draft every step for nothing.
+            logger.warning(
+                "ATOM_SPEC_LOSSLESS_SAMPLING is not used on a P/D producer "
+                "(prefill) engine: it drafts for handoff and verifies nothing. "
+                "Keeping the greedy draft here; the decode engine still arms."
             )
             return
         head = self.model.markov_head
