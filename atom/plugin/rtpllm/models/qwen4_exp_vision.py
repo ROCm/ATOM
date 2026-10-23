@@ -65,4 +65,4 @@ class Qwen4ExpVisionMixin:
         return cls._vision_parameter_count(mm_related_params) * 2
 
 
-register_multimodal_mixin("atom_qwen4_exp", Qwen4ExpVisionMixin)
+register_multimodal_mixin(["atom_qwen4_exp", "atom_qwen4_exp_mtp"], Qwen4ExpVisionMixin)

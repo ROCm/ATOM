@@ -499,11 +499,14 @@ class RTPForwardContext:
         block_ratio = int(seq_size_per_block // kernel_seq_size_per_block)
         bs_now = int(kernel_block_table.shape[0])
         kernel_cols = int(kernel_block_table.shape[1])
-        if kernel_cols < block_ratio or kernel_cols % block_ratio != 0:
-            return kernel_block_table.to(
-                device=kernel_block_table.device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-        physical_cols = (kernel_cols + block_ratio - 1) // block_ratio
+        if kernel_cols < block_ratio:
+            raise ValueError(
+                "RTP plugin kernel block table has no complete physical page"
+            )
+        # MTP Graph tables can append reserved state columns that do not make
+        # up a full physical page. Never reinterpret those kernel block IDs as
+        # physical page IDs; only recover complete groups of block_ratio.
+        physical_cols = kernel_cols // block_ratio
         in_capture = torch.cuda.is_current_stream_capturing()
         if in_capture and cg_bufs is not None:
             if triton is None:
@@ -2090,8 +2093,6 @@ class RTPForwardQwen35HybridContext(RTPForwardContext):
             layer_group_map=layer_group_map,
             cg_bufs=cg_bufs,
         )
-        if metadata.spec_state_indices_tensor is not None:
-            return metadata
         output_slots = metadata.non_spec_state_indices_tensor
         device = output_slots.device
         next_lengths = None

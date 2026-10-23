@@ -260,7 +260,6 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         if not getattr(self._rtp_model_config, "atom_qwen4_exp_mtp_target", False):
             return outputs
         hc = outputs.hidden_states.flatten(1)
-        self._mtp_target_hidden_states = hc
         mixed, _ = self.model.model.hyper_connection_mixer.mix(hc)
         return PyModelOutputs(mixed, hc)
 
@@ -349,14 +348,6 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
         with open(os.path.join(ckpt_path, "config.json"), encoding="utf-8") as file:
             return int(json.load(file)["image_token_id"])
 
-    def get_mtp_target_hidden_states(self, num_tokens: int):
-        hidden = getattr(self, "_mtp_target_hidden_states", None)
-        if hidden is None:
-            return None
-        if num_tokens >= 0 and num_tokens > hidden.shape[0]:
-            raise ValueError("Qwen4Exp MTP requested more HC rows than produced")
-        return hidden if num_tokens < 0 else hidden[:num_tokens]
-
     def _extract_positions(self, inputs, model_device, token_num):
         # The draft consumes target HC states, but its QSA cache still uses
         # logical token positions. MRoPE's T row can differ after an image.
@@ -426,7 +417,15 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             if is_mtp_draft_prefill:
                 starts = attn_inputs.prefix_lengths_device
                 width = int(self._rtp_model_config.gen_num_per_cycle) + 1
-                if starts is not None and starts.numel() * width == token_num:
+                query_lengths = getattr(attn_inputs, "input_lengths", None)
+                fixed_window = (
+                    starts is not None
+                    and query_lengths is not None
+                    and starts.numel() * width == token_num
+                    and query_lengths.numel() == starts.numel()
+                    and bool(torch.all(query_lengths == width).item())
+                )
+                if fixed_window:
                     logical = (
                         starts.to(device=model_device, dtype=torch.int32)[:, None]
                         + torch.arange(width, device=model_device, dtype=torch.int32)[
@@ -747,13 +746,39 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
                 bert_embedding_inputs=inputs.bert_embedding_inputs,
             )
         else:
-            inputs.attention_inputs_by_tag = {"full": tagged}
+            # PyModelInputs is a fixed pybind class, not a dynamic namespace.
+            inputs = SimpleNamespace(
+                input_ids=inputs.input_ids,
+                input_hiddens=inputs.input_hiddens,
+                combo_position_ids=inputs.combo_position_ids,
+                embedding_inputs=inputs.embedding_inputs,
+                multimodal_inputs=inputs.multimodal_inputs,
+                attention_inputs=tagged,
+                attention_inputs_by_tag={"full": tagged},
+                bert_embedding_inputs=inputs.bert_embedding_inputs,
+            )
         if bool(getattr(fmha_impl, "is_cuda_graph", False)):
             inputs.attention_inputs.is_cuda_graph = True
         input_ids = inputs.input_ids
         model_device = self._get_model_device()
         if input_ids.device != model_device:
             input_ids = input_ids.to(device=model_device, non_blocking=True)
+        is_multimodal = bool(
+            getattr(
+                getattr(self._rtp_model_config, "mm_model_config", None),
+                "is_multimodal",
+                False,
+            )
+        )
+        if is_multimodal:
+            # The draft does not run ViT, but it still embeds RTP's image
+            # placeholder rows and hashes their IDs in its own PLE state.
+            image_token_id = self._image_token_id
+            input_ids = torch.where(
+                input_ids >= self._rtp_model_config.vocab_size,
+                image_token_id,
+                input_ids,
+            )
         hc_input = inputs.input_hiddens
         if hc_input is None or hc_input.numel() == 0:
             raise ValueError("Qwen4Exp MTP requires target HC hidden states")
@@ -768,6 +793,11 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
         if hc_input.device != model_device:
             hc_input = hc_input.to(device=model_device, non_blocking=True)
         positions = self._extract_positions(inputs, model_device, input_ids.numel())
+        rope_positions = (
+            self._rope_positions(inputs, model_device, input_ids.numel())
+            if is_multimodal
+            else positions
+        )
         with self._rtp_forward_context_cls.bind(
             model=self.model,
             runtime=self,
@@ -783,10 +813,11 @@ class _ATOMQwen4ExpMTPRuntime(_ATOMQwen4ExpRuntime):
             from atom.utils.forward_context import get_forward_context
 
             get_forward_context().context.is_draft = True
+            if is_multimodal:
+                get_forward_context().context.positions = rope_positions
             with use_custom_atom_config(self.model.atom_config):
-                hc = self.model(input_ids, positions + 1, hc_input)
+                hc = self.model(input_ids, rope_positions + 1, hc_input)
         hc = hc.flatten(1)
-        self._mtp_target_hidden_states = hc
         mixed = self.model._head_input(hc)
         return PyModelOutputs(mixed, hc)
 

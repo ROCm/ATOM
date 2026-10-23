@@ -41,22 +41,37 @@ class Qwen4ExpImageEmbedding(Qwen3_5MoeImageEmbedding):
 
     @torch.inference_mode()
     def embedding(self, data, **kwargs):
-        pixel_values = data[0].to(self._device, dtype=self._data_type)
-        grid_thw = data[1].to(self._device)
-        embeddings = self.visual(pixel_values, grid_thw)
-        return embeddings, self.get_position_ids(grid_thw)[0]
+        embeddings = self._encode_images(data[0], data[1])
+        return torch.cat(embeddings), torch.cat(self.get_position_ids(data[1]))
+
+    def _encode_images(self, pixel_values, grid_thw):
+        # This ViT uses unmasked attention across its entire input. Each grid
+        # row must be encoded independently, including multiple images within
+        # one request, or patches from different images attend to each other.
+        patch_counts = grid_thw.to(device="cpu").prod(-1).tolist()
+        if not patch_counts or sum(patch_counts) != pixel_values.shape[0]:
+            raise ValueError("Qwen4Exp vision patches do not match image grids")
+        pixels = pixel_values.to(self._device, dtype=self._data_type)
+        grids = grid_thw.to(self._device)
+        return [
+            self.visual(patches, grid.unsqueeze(0))
+            for patches, grid in zip(pixels.split(patch_counts), grids)
+        ]
 
     @torch.inference_mode()
     def batched_embedding(self, data_list, mm_types, **kwargs):
         if not all(mm_type == MMUrlType.IMAGE for mm_type in mm_types):
             return super().batched_embedding(data_list, mm_types, **kwargs)
-        pixel_values = torch.cat([data[0] for data in data_list]).to(
-            self._device, dtype=self._data_type
-        )
-        grid_thw = torch.cat([data[1] for data in data_list]).to(self._device)
-        embeddings = self.visual(pixel_values, grid_thw)
-        counts = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
-        return list(zip(embeddings.split(counts), self.get_position_ids(grid_thw)))
+        outputs = []
+        for data in data_list:
+            pixel_values, grid_thw = data[0], data[1]
+            outputs.extend(
+                zip(
+                    self._encode_images(pixel_values, grid_thw),
+                    self.get_position_ids(grid_thw),
+                )
+            )
+        return outputs
 
 
 class Qwen4ExpVisionMixinImpl(BaseMultiModalMixin):

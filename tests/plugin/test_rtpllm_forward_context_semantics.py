@@ -363,16 +363,26 @@ def test_recover_physical_block_table_accepts_expanded_kernel_layout():
     assert recovered.cpu().tolist() == [[56]]
 
 
-def test_recover_physical_block_table_keeps_compact_physical_layout():
+def test_recover_physical_block_table_discards_incomplete_reserved_columns():
     compact = torch.tensor([[7, 8, 9]], dtype=torch.int32)
 
+    # Only a complete ratio-sized group describes one physical page.
+    with pytest.raises(ValueError, match="no complete physical page"):
+        RTPForwardContext._recover_physical_block_table_from_kernel(
+            compact,
+            seq_size_per_block=1024,
+            kernel_seq_size_per_block=16,
+        )
+
+
+def test_recover_physical_block_table_trims_mtp_reserved_columns():
+    kernel = torch.tensor([[28, 29, 30, 31, 32, 33, 34, 35, 999]], dtype=torch.int32)
     recovered = RTPForwardContext._recover_physical_block_table_from_kernel(
-        compact,
-        seq_size_per_block=1024,
+        kernel,
+        seq_size_per_block=64,
         kernel_seq_size_per_block=16,
     )
-
-    assert recovered.cpu().tolist() == [[7, 8, 9]]
+    assert recovered.tolist() == [[7, 8]]
 
 
 def test_plugin_attention_metadata_keeps_indexer_block_table_expanded():
