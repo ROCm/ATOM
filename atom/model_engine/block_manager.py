@@ -3,13 +3,15 @@
 
 import array
 import logging
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import islice
 from math import inf, isinf
 from time import monotonic
 from weakref import WeakKeyDictionary
 
 import numpy as np
-import xxhash
 
 from atom.config import Config, DCPConfig
 from atom.distributed.kv_events import (
@@ -22,7 +24,17 @@ from atom.distributed.kv_events import (
 )
 from atom.model_engine.block_pool import BlockPool
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointCoordinator
+from atom.model_engine.page_unit_checkpoint import (
+    PagedStateCheckpointCoordinator,
+    checkpoint_copy_ops_per_batch,
+)
+from atom.model_engine.prefix_hash import (
+    block_hash,
+    chained_block_hashes,
+    full_prompt_blocks,
+    hash_block_size_for,
+    prompt_fingerprint,
+)
 from atom.model_engine.sequence import Sequence
 from atom.model_engine.state_cache import StateCache, StateCheckpointCache
 from atom.model_engine.state_pool import StateSlotPool
@@ -31,6 +43,8 @@ from atom.model_engine.state_runtime import (
     StateMaintenanceOps,
     StateRuntime,
     StateTransfer,
+    midstep_target_ok,
+    snap_midstep_position,
 )
 from atom.utils import envs
 
@@ -107,6 +121,67 @@ class JointBoundaryDecision:
     skip_reason: str | None = None
 
 
+# Evicted or remapped hashes kept for `_CachedWalk` revalidation; a memo
+# older than this many is re-walked.
+_RECENT_INDEX_CHANGES = 8192
+
+
+def draft_kv_lookahead(num_speculative_tokens: int) -> int:
+    """KV positions past `len(seq)` that one forward's MTP draft round writes.
+
+    `EagleProposer.propose` runs the draft `k = num_speculative_tokens` times
+    per forward. Step 0 writes the target's own slots; each of the `k - 1`
+    mid-steps after it bumps `context_lens` and writes one token at
+    `context_lens - 1`. So a forward whose target context ends at `C` writes
+    draft KV through position `C + k - 2`, and `C <= len(seq)` at schedule time
+    (prefill: `C` is the chunk end; decode: `C = len(seq) - num_rejected`, the
+    placeholders the scheduler appended assume full acceptance). The draft
+    therefore needs `k - 1` positions past `len(seq)`.
+
+    A position past the row's allocated blocks reads its block id from the
+    zeroed tail of the block table, so the write lands in physical block 0 --
+    another request's KV, or the units of a PAGE state checkpoint.
+    """
+    return max(0, int(num_speculative_tokens or 0) - 1)
+
+
+# Blocks `_hit_walk` hashes per round past the cached prompt chain, doubling
+# from MIN to MAX; bounds the hashing wasted past the first miss.
+_WALK_HASH_ROUND_MIN = 64
+_WALK_HASH_ROUND_MAX = 1024
+# Blocks `_hit_walk` looks up per round on the cached chain: the first block
+# alone, then 16, growing 4x; bounds the lookups past the first miss to ~4x
+# the hit.
+_WALK_LOOKUP_ROUND_MIN = 16
+
+
+@dataclass(slots=True)
+class _PrefixWalk:
+    """`_walk_prefix`'s contiguous HBM hit (`ids[i]` holds `hashes[i]`): what
+    `_evaluate` reads, the delayer memoises and, on the fast walk, `allocate`
+    claims (`_take_admission_walk` revalidates the claimed ids)."""
+
+    num_tokens: int
+    cache_seed: int
+    index_version: int
+    hashes: list[int]
+    ids: list[int]
+
+
+@dataclass(slots=True)
+class _CachedWalk:
+    """A walk memoised for `can_allocate_memoized`. `watched`: every hash
+    whose index entry it read (the hit and the first miss, `boundary_hash`,
+    None if the hit reaches the last reusable block)."""
+
+    walk: _PrefixWalk
+    index_clears: int
+    index_changes_seen: int
+    watched: set[int]
+    boundary_hash: int | None
+    boundary_id: int
+
+
 class BlockManager:
     def __init__(
         self,
@@ -130,15 +205,40 @@ class BlockManager:
         # Prefix-cache hashing / reuse granularity: under DCP one block_table
         # entry maps to a virtual block of `block_size * dcp_world_size` global
         # tokens (see _hash_block_size). == block_size when DCP is off.
-        self.hash_block_size = self.block_size * self.dcp_world_size
+        self.hash_block_size = hash_block_size_for(self.block_size, self.dcp_world_size)
+        # `draft_kv_lookahead`: positions past `len(seq)` a forward's draft
+        # round writes. Set by the scheduler, which knows whether this engine
+        # drafts; admission charges for it and `may_append` allocates it.
+        self.draft_lookahead = 0
         self.min_final_prefill_rows = getattr(config, "min_final_prefill_rows", 0)
+        self.state_replay_tokens = getattr(config, "state_replay_tokens", 0)
         self.enable_prefix_caching = config.enable_prefix_caching
-        # Content hashes only: pool hits and resource fit are always rechecked.
-        # Weak keys keep this scheduler-side cache out of request serialization.
-        self._prefill_probe_hashes: WeakKeyDictionary[
-            Sequence, tuple[int, list[int]]
-        ] = WeakKeyDictionary()
+        # Each seq's prompt-block hash chain, as `(cache_seed, chain)`
+        # (`_prompt_hashes`). Content hashes only: pool hits and resource fit
+        # are always rechecked. Weak keys keep this scheduler-side cache out of
+        # request serialization.
+        self._prompt_hash_chains: WeakKeyDictionary[Sequence, tuple[int, list[int]]] = (
+            WeakKeyDictionary()
+        )
+        # `_adopt_shipped_chain` outcomes; rejections should stay at 0.
+        self.shipped_chains_adopted: int = 0
+        self.shipped_chains_rejected: int = 0
         self.total_evicted_blocks: int = 0
+        # `can_allocate_memoized`'s memo, validated against the hashes
+        # evicted or remapped since (`_note_index_change`) and `clear_cache`.
+        self._cached_walks: WeakKeyDictionary[Sequence, _CachedWalk] = (
+            WeakKeyDictionary()
+        )
+        self._recent_index_changes: deque[int] = deque(maxlen=_RECENT_INDEX_CHANGES)
+        self._index_changes = 0
+        self._index_clears = 0
+        self.walk_memo: bool = envs.ATOM_PREFIX_WALK_MEMO
+        # `_hit_walk`, whose ids `allocate` claims; off = per-block walks.
+        self.fast_prefix_walk: bool = envs.ATOM_PREFIX_FAST_WALK
+        # Each seq's last fast walk, for its `allocate` to claim.
+        self._admission_walks: WeakKeyDictionary[Sequence, _PrefixWalk] = (
+            WeakKeyDictionary()
+        )
 
         kv_events = getattr(config, "kv_events_config", None)
         self._events_enabled: bool = bool(kv_events and kv_events.enable)
@@ -153,6 +253,7 @@ class BlockManager:
             on_evict=self._record_evicted,
             cache_policy=envs.ATOM_PREFIX_CACHE_POLICY,
             protected_ratio=envs.ATOM_PREFIX_CACHE_PROTECTED_RATIO,
+            on_remap=self._note_index_change,
         )
         # Per-request cache slot pool. Used by attention types with a
         # stateful per-request buffer (GDN recurrent state, V4 compressor
@@ -189,6 +290,8 @@ class BlockManager:
         self.state_checkpoint_interval_tokens = max(
             -1, int(getattr(config, "state_checkpoint_interval_tokens", 0) or 0)
         )
+        # See ATOM_STATE_CHECKPOINT_END_MARGIN and `_record_checkpoint_end`.
+        self.state_checkpoint_end_margin = envs.ATOM_STATE_CHECKPOINT_END_MARGIN
         # Independent of the interval, because the demand rung is not part of
         # the grid: it is the one placement a *refused* hit makes for itself.
         # See `_record_checkpoint_demand` for what turning it off is testing.
@@ -216,6 +319,7 @@ class BlockManager:
         from atom.model_engine.state_offload import (
             state_tier_capability,
             state_tier_chunk_tokens,
+            state_tier_cpu_bytes,
         )
 
         # A capability derived from the whole config, not the connector's name.
@@ -245,6 +349,7 @@ class BlockManager:
                 self.kv,
                 checkpoint_spec,
                 enabled=enabled,
+                readable_midstep=state_runtime.transfer.readable_midstep,
             )
         # The rolling state class: per-request slots plus a content index over
         # the free ones. A checkpoint IS a free slot whose content is still
@@ -262,6 +367,18 @@ class BlockManager:
         self._state_checkpoint_cache: StateCheckpointCache = (
             self.paged_state_checkpoints or self.state
         )
+        # Where a readable backend can snapshot inside a forward; see
+        # `midstep_target_ok`. Zero for a backend that cannot.
+        self.midstep_grid = state_runtime.transfer.midstep_grid
+        self.midstep_min_offset = state_runtime.transfer.midstep_min_offset
+        if self.paged_state_checkpoints is not None:
+            # A PAGE midstep checkpoint is copied into a scratch slot from
+            # this pool, then stored from there, within the copy budget the
+            # runner's descriptor staging is sized to: one definition for both.
+            self.paged_state_checkpoints.attach_midstep_scratch(
+                self.state,
+                checkpoint_copy_ops_per_batch(getattr(config, "max_num_seqs", 0)),
+            )
         # A checkpoint is filed under the content hash of the last block it
         # covers, so a rung that isn't a hash-block boundary can never be looked
         # up — the ladder would checkpoint into a void. The interval defaults to
@@ -371,6 +488,16 @@ class BlockManager:
             self.state_offload = StateOffloadIndex(
                 can_store=self.state_tier_capability.can_store_state,
                 can_load=self.state_tier_capability.can_load_state,
+                # The codec stores one `image_bytes` image per entry (the
+                # worker turns the tier off unless its entry is exactly that).
+                # Not `slot_bytes`: under MTP a slot holds more than an image
+                # (DSpark3: 42.45 vs 29.51 MiB), and dividing by it would cap
+                # this index a third below the codec, hiding images it holds.
+                max_cpu_entries=(
+                    state_tier_cpu_bytes() // checkpoint_spec.image_bytes
+                    if checkpoint_spec is not None
+                    else None
+                ),
             )
             # Attached rather than passed at construction: the coordinator is
             # built before the switch is read (it needs `checkpoint_spec`,
@@ -392,20 +519,15 @@ class BlockManager:
         # anchor fires on nearly every prompt and would drown the convergence
         # signal `chunks_cut_for_demand` exists to expose.
         self.chunks_cut_for_end: int = 0
+        # Ladder, demand or anchor positions a forward covered but could not
+        # snapshot even after moving back onto its grid: too close to the
+        # forward's start for the conv window, or the forward started off the
+        # block grid. Each is a checkpoint the cutting ladder would have kept.
+        self.midstep_positions_unreadable: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: array.array, prefix: int = -1):
-        h = xxhash.xxh64()
-        if prefix != -1:
-            h.update(prefix.to_bytes(8, "little"))
-        # dtype pinned even though every caller now passes an `array("i")`:
-        # `np.array` infers int64 from a list and int32 from an array, so the
-        # digest used to depend on the caller's Python type. int64 is what
-        # lists gave, which leaves every hash recorded before that where it
-        # was -- and keeps a caller who does pass a list from silently
-        # computing a different one.
-        h.update(np.asarray(token_ids, dtype=np.int64).tobytes())
-        return h.intdigest()
+        return block_hash(token_ids, prefix)
 
     def complete_previous_state_batch(self) -> None:
         """Complete state reads and copies issued by the previous batch."""
@@ -451,6 +573,11 @@ class BlockManager:
                 totals[k] = totals.get(k, 0) + v
         return totals
 
+    def _note_index_change(self, h: int) -> None:
+        """`h` left the KV index or moved to another block id."""
+        self._index_changes += 1
+        self._recent_index_changes.append(h)
+
     def _record_evicted(self, h: int) -> None:
         """A hash the block pool just dropped: report it, and settle the state.
 
@@ -461,6 +588,7 @@ class BlockManager:
         can reach and spends live ones to make room for them.
         """
         self.total_evicted_blocks += 1
+        self._note_index_change(h)
         if self._event_log is not None:
             self._event_log.append(_make_block_removed([h]))
         self._state_checkpoint_cache.unindex(h)
@@ -474,7 +602,10 @@ class BlockManager:
         pass. `allocate` protects the one checkpoint it is about to pin and
         sees the pins taken before it; `may_append` runs only in a pass that
         scheduled no prefill (`scheduler.py`, `if num_seqs_prefill > 0` returns
-        first), so every pin was already released at the top of that pass.
+        first), so every pin was already released at the top of that pass --
+        except for the draft lookahead an admission allocates right after its
+        `allocate`, which `can_allocate` charged in the same units check
+        (`draft_lookahead_blocks`), against the same protected checkpoint.
         Under contention the reachable outcome is a refused admission, not
         this.
 
@@ -592,6 +723,18 @@ class BlockManager:
         )[0]
         return int((local_len + self.block_size - 1) // self.block_size)
 
+    def draft_lookahead_blocks(self, seq_len: int) -> int:
+        """Blocks past `num_pool_blocks(seq_len)` that `draft_lookahead` adds.
+
+        What admission charges on top of the prompt, so the block `may_append`
+        takes for a forward ending at `seq_len` was paid for in the same pass.
+        """
+        if not self.draft_lookahead:
+            return 0
+        return self.num_pool_blocks(
+            seq_len + self.draft_lookahead
+        ) - self.num_pool_blocks(seq_len)
+
     @property
     def max_pool_tokens(self) -> int:
         """Longest prompt, in global tokens, whose KV fits an entirely empty pool.
@@ -618,7 +761,7 @@ class BlockManager:
         lo = 0
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self.num_pool_blocks(mid) <= capacity:
+            if self.num_pool_blocks(mid) + self.draft_lookahead_blocks(mid) <= capacity:
                 lo = mid
             else:
                 hi = mid - 1
@@ -637,6 +780,115 @@ class BlockManager:
     def _hash_block_tokens(self, seq: Sequence, i: int) -> array.array:
         hbs = self.hash_block_size
         return seq.token_ids[i * hbs : (i + 1) * hbs]
+
+    def _replay_hit(self, seq: Sequence, compressed_hit: int, hit: int) -> int:
+        """`hit` widened to `compressed_hit` when replaying is cheaper.
+
+        Without a replay the forward resumes at the checkpoint `hit`, or at the
+        LMCache MP hit (`kv_prefix_tokens`) if that is further, which brings its
+        state image along. A replay resumes `state_replay_tokens` below the
+        furthest full-attention KV: the HBM `compressed_hit`, or LMCache's
+        KV-only reach (`kv_only_tokens`) when that is further, in which case
+        the connector loads the KV past the HBM hit first (`replay_kv_load`).
+        Records on `seq` whether the hit it returns replays (`replay_start`).
+        """
+        hbs = self.hash_block_size
+        seq.replays_hit = seq.replay_kv_load = False
+        if not self.state_replay_tokens or not seq.has_per_req_cache:
+            return hit
+        # The connector skips a load under OFFLOAD_MIN_LOAD_TOKENS, so neither
+        # LMCache figure counts unless it clears that above where it starts.
+        min_load = envs.OFFLOAD_MIN_LOAD_TOKENS
+        resume = hit * hbs
+        tier_hit = int(seq.offload_joint.kv_prefix_tokens or 0)
+        if tier_hit - resume >= min_load:
+            resume = tier_hit
+        in_hbm = compressed_hit * hbs
+        end = in_hbm
+        tier_kv = int(seq.offload_joint.kv_only_tokens or 0)
+        if tier_kv - in_hbm >= min_load:
+            end = tier_kv
+        if end - resume <= self.state_replay_tokens:
+            return hit
+        seq.replays_hit = True
+        seq.replay_kv_load = end > in_hbm
+        return compressed_hit
+
+    def fall_back_to_hbm_replay(self, seq: Sequence) -> None:
+        """A replay's KV-only load will not run: replay below the HBM hit.
+
+        The state slot is fresh (`allocate` restored no checkpoint), so the HBM
+        hit is no place to resume; the forward replays below it instead, and
+        rewrites the blocks past it the load would have filled.
+        """
+        seq.replay_kv_load = False
+
+    def _prompt_hashes(self, seq: Sequence) -> list[int]:
+        """`seq`'s prompt-block hash chain, computed once per `cache_seed`;
+        starts from the frontend's when it checks out (`_adopt_shipped_chain`)."""
+        seed = seq.cache_seed
+        cached = self._prompt_hash_chains.get(seq)
+        if cached is None or cached[0] != seed:
+            cached = (seed, self._adopt_shipped_chain(seq))
+            self._prompt_hash_chains[seq] = cached
+        return cached[1]
+
+    def _adopt_shipped_chain(self, seq: Sequence) -> list[int]:
+        """The frontend's chain for `seq` (consumed), or `[]` to hash here.
+        Adopted only if it was minted for this block size and seed from these
+        prompt tokens (`prompt_fingerprint`), and its first, middle and last
+        links rehash equal here (the same hash function). Then trusted whole:
+        walks, `allocate` and `hash_blocks` read it."""
+        shipped = getattr(seq, "prompt_hash_chain", None)
+        if shipped is None:
+            return []
+        seq.prompt_hash_chain = None
+        hbs, seed = self.hash_block_size, seq.cache_seed
+        n = full_prompt_blocks(seq, hbs)
+        packed = shipped.hashes
+        if (shipped.hash_block_size, shipped.cache_seed, len(packed)) != (hbs, seed, n):
+            return self._reject_shipped_chain(
+                f"minted for hash block {shipped.hash_block_size}, seed "
+                f"{shipped.cache_seed}, {len(packed)} blocks; this engine wants "
+                f"{hbs}, {seed}, {n}"
+            )
+        if (shipped.num_prompt_tokens, shipped.fingerprint) != (
+            seq.num_prompt_tokens,
+            prompt_fingerprint(seq),
+        ):
+            return self._reject_shipped_chain("it was minted from other tokens")
+        chain = packed.tolist()
+
+        def link_holds(i: int) -> bool:
+            prev = chain[i - 1] if i else seed
+            return chain[i] == self.compute_hash(self._hash_block_tokens(seq, i), prev)
+
+        if n and not all(map(link_holds, {0, n // 2, n - 1})):
+            return self._reject_shipped_chain("its hashes differ from this engine's")
+        self.shipped_chains_adopted += 1
+        return chain
+
+    def _reject_shipped_chain(self, why: str) -> list[int]:
+        # Warn once: a frontend/engine mismatch repeats on every request.
+        if not self.shipped_chains_rejected:
+            logger.warning(
+                "Prefix cache: rehashing a prompt chain the frontend shipped, "
+                "%s. Prefix hits are unaffected; the scheduler thread pays "
+                "the hashing.",
+                why,
+            )
+        self.shipped_chains_rejected += 1
+        return []
+
+    def _block_hash(self, seq: Sequence, chain: list[int], i: int, prev: int) -> int:
+        """Chained hash of block `i` given block `i - 1`'s hash `prev`, read
+        from or appended to `chain` (`_prompt_hashes`, full prompt blocks)."""
+        if i < len(chain):
+            return chain[i]
+        h = self.compute_hash(self._hash_block_tokens(seq, i), prev)
+        if i == len(chain) and i < full_prompt_blocks(seq, self.hash_block_size):
+            chain.append(h)
+        return h
 
     def _gated_hit(
         self,
@@ -861,10 +1113,15 @@ class BlockManager:
         boundary addressable. Resumes from the last APPENDED hash: on a miss the
         caller's loop variable holds a hash that is not in the chain.
         """
+        prompt = self._prompt_hashes(seq)
         chain = list(block_hashes)
+        k = min(len(chain), len(prompt))
+        if k and (chain[0], chain[k - 1]) != (prompt[0], prompt[k - 1]):
+            prompt = []  # Not a prefix of the prompt chain: hash past it.
+        chain += prompt[len(chain) : blocks]
         h = chain[-1] if chain else seq.cache_seed
         for i in range(len(chain), blocks):
-            h = self.compute_hash(self._hash_block_tokens(seq, i), h)
+            h = self._block_hash(seq, prompt, i, h)
             chain.append(h)
         return chain
 
@@ -881,16 +1138,18 @@ class BlockManager:
         record: bool = True,
         *,
         block_hashes: list[int] | None = None,
-        reuse_hashes: bool = False,
     ) -> int:
         """Return number of cache-hit blocks (>=0) if seq fits, else -1.
 
         `record=False` returns the same fit and HBM hit without committing
-        joint-load fields or joint-boundary counters. Checkpoint demand/end
-        and hit instrumentation still refresh; demand counters deduplicate per
-        request. An optional `block_hashes` output
+        joint-load fields or joint-boundary counters. Checkpoint demand/end,
+        hit instrumentation and `Sequence.replays_hit` (whether the hit it
+        returns replays, which `replay_start` reads for it) still refresh;
+        demand counters deduplicate per request. An optional `block_hashes` output
         lets the scheduler defer `record_allocation` until after its wait and
         token-budget checks, reusing this probe's chain without another walk.
+        `_admission_walk` then `_evaluate`; `can_allocate_memoized` evaluates a
+        memoised walk the same way.
 
         The hit count is the contiguous run of cache hits starting at the
         prompt's first block. On the first miss we break: subsequent blocks
@@ -902,46 +1161,41 @@ class BlockManager:
         Caller (scheduler) passes the returned hit count to `allocate()`,
         avoiding a second hash pass.
         """
+        return self._evaluate(seq, self._admission_walk, record, block_hashes)
+
+    def _evaluate(
+        self,
+        seq: Sequence,
+        walk_of: Callable[[Sequence], _PrefixWalk],
+        record: bool,
+        block_hashes: list[int] | None,
+    ) -> int:
+        """`can_allocate` over the walk `walk_of(seq)` returns; everything but
+        the walk is asked afresh on every call."""
         # Active Slots are preallocated; PAGE checkpoints share the KV pool.
         #
         # The full per-request width, because that is what `allocate` will take:
         # gating on one slot would admit a request the pool cannot give a
         # rollback set to.
-        if block_hashes is None:
-            block_hashes = []
-        else:
+        if block_hashes is not None:
             block_hashes.clear()
         if seq.has_per_req_cache and not self.state.has_free(self.state_slots_per_req):
             return -1
         if not self.enable_prefix_caching:
-            if not self._has_page_units(self.num_pool_blocks(len(seq))):
+            if not self._has_page_units(
+                self.num_pool_blocks(len(seq)) + self.draft_lookahead_blocks(len(seq))
+            ):
                 return -1
             return 0
         # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
         # read the WHOLE history, so this stays a full front-to-back chained
         # match). Record each block's hash for the SWA scan below.
-        h = seq.cache_seed
-        compressed_hit = 0
-        cached_hashes = None
-        if reuse_hashes:
-            seed, cached_hashes = self._prefill_probe_hashes.get(seq, (h, []))
-            if seed != h:
-                cached_hashes = []
-            self._prefill_probe_hashes[seq] = (h, cached_hashes)
-        immutable_blocks = seq.num_prompt_tokens // self.hash_block_size
-        for i in range(self._n_hash_blocks(seq) - 1):
-            token_ids = self._hash_block_tokens(seq, i)
-            if cached_hashes is not None and i < len(cached_hashes):
-                h = cached_hashes[i]
-            else:
-                h = self.compute_hash(token_ids, h)
-                if cached_hashes is not None and i < immutable_blocks:
-                    cached_hashes.append(h)
-            block_id = self.kv.lookup(h)
-            if block_id == -1 or self.kv.block(block_id).token_ids != token_ids:
-                break
-            block_hashes.append(h)
-            compressed_hit += 1
+        walk = walk_of(seq)
+        if block_hashes is None:
+            block_hashes = walk.hashes  # read, never extended, below
+        else:
+            block_hashes += walk.hashes
+        compressed_hit = len(walk.hashes)
         # Step 2: SWA only needs the trailing window before the boundary to be
         # present (SWA is local). Scan right-to-left within the compressed prefix
         # for the largest boundary whose window is SWA-cached (vLLM
@@ -955,26 +1209,35 @@ class BlockManager:
         # so a boundary is only resumable where somebody checkpointed the state.
         # `_gated_hit` settles the two gates jointly; neither can be applied to
         # the other's answer.
-        num_cached_blocks = self._gated_hit(seq, compressed_hit, block_hashes)
+        resumable = self._gated_hit(seq, compressed_hit, block_hashes)
+        # A checkpoint far below the compressed hit loses to a bounded replay,
+        # which keeps the whole hit and rebuilds the state at its end.
+        num_cached_blocks = self._replay_hit(seq, compressed_hit, resumable)
         # Instrumentation: the pre-gate hit, so EngineStats can separate reuse
         # the gates declined (compressed_hit - num_cached_blocks) from reuse
         # lost to compressed eviction (everything above compressed_hit).
         seq.num_compressed_hit_blocks = compressed_hit
         # Free-pool demand: blocks we actually reuse minus those already used
         # (shared ref); blocks we drop from the hit become fresh → counted.
-        num_new_blocks = self._n_hash_blocks(seq)
-        for i in range(num_cached_blocks):
-            if self.kv.is_used(self.kv.lookup(block_hashes[i])):
-                num_new_blocks -= 1
+        # Plus the draft round's lookahead past the prompt, which the scheduler
+        # allocates right after `allocate` (`may_append(..., lookahead=)`).
+        num_new_blocks = (
+            self._n_hash_blocks(seq)
+            - self.kv.count_used(walk.ids, num_cached_blocks)
+            + self.draft_lookahead_blocks(len(seq))
+        )
         protected_hash = (
             block_hashes[num_cached_blocks - 1] if num_cached_blocks else None
         )
         # After `num_new_blocks`, not before: the demand's room check has to
         # account for what this very admission is about to take, or it reads a
         # pool it then drains itself.
+        #
+        # `resumable`, not the replayed hit: the counterfactual is asked of the
+        # gates, whose answer a replay does not change.
         self._record_checkpoint_demand(
             seq,
-            hit=num_cached_blocks,
+            hit=resumable,
             compressed_hit=compressed_hit,
             block_hashes=block_hashes,
             live_blocks=num_new_blocks,
@@ -996,12 +1259,179 @@ class BlockManager:
         # argument, and `_record_checkpoint_end` derives its position from
         # `num_prompt_tokens` alone. Its one reader is `midstep_positions`.
         #
-        # Which makes it free today: the call returns at its first line while
-        # no backend declares `readable_midstep` (see
-        # `GDNStateMixin.state_transfer`). Kept in place, and in the right
-        # place, because that is a policy decision and this is not.
+        # Free unless a backend declares `readable_midstep`: the call returns
+        # at its first line otherwise. Qwen GDN does under
+        # `ATOM_GDN_STATE_MIDSTEP=1`, and then every admission pays it.
         self._extend_hash_chain(seq, block_hashes)
         return num_cached_blocks
+
+    def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
+        """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
+        prompt = self._prompt_hashes(seq)
+        if self.fast_prefix_walk:
+            hashes, ids = self._hit_walk(seq, prompt)
+        else:
+            hashes, ids, h = [], [], seq.cache_seed
+            for i in range(self._n_hash_blocks(seq) - 1):
+                h = self._block_hash(seq, prompt, i, h)
+                block_id = self.kv.lookup(h)
+                if block_id == -1 or self.kv.block(block_id).token_ids != (
+                    self._hash_block_tokens(seq, i)
+                ):
+                    break
+                hashes.append(h)
+                ids.append(block_id)
+        return _PrefixWalk(
+            seq.num_tokens, seq.cache_seed, self.kv.index_version, hashes, ids
+        )
+
+    def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
+        """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`
+        (`_take_admission_walk`)."""
+        walk = self._walk_prefix(seq)
+        if self.fast_prefix_walk:
+            self._admission_walks[seq] = walk
+        return walk
+
+    def _hit_walk(self, seq: Sequence, prompt: list[int]) -> tuple[list, list]:
+        """`(hashes, block ids)` of `seq`'s contiguous HBM prefix hit.
+
+        Looks the cached prompt chain up with `map` in rounds growing from the
+        first block alone (`_WALK_LOOKUP_ROUND_MIN`), so a cold prompt costs
+        one lookup, and hashes ahead in rounds past it. Tokens are compared on
+        the last hit block only: indexed contents cannot change (`publish`
+        revokes a block's old hash, `allocate` unindexes first), so a mismatch
+        is a 64-bit hash collision,
+        and then every block is compared as the per-block walk did. A collision
+        on an interior block alone goes undetected (vLLM compares none).
+        """
+        n = self._n_hash_blocks(seq) - 1
+        get = self.kv.index_get
+        hashes: list[int] = []
+        ids: list = []
+        hash_round = _WALK_HASH_ROUND_MIN
+        look = 1
+        while len(hashes) < n:
+            k = len(hashes)
+            if k < len(prompt):
+                new = prompt[k : min(n, k + look)]
+                look = max(4 * look, _WALK_LOOKUP_ROUND_MIN)
+            else:
+                end = min(n, k + hash_round)
+                new = chained_block_hashes(
+                    seq.token_ids,
+                    self.hash_block_size,
+                    k,
+                    end,
+                    hashes[-1] if k else seq.cache_seed,
+                )
+                if k == len(prompt):
+                    # Prompt blocks only: those past it can still change.
+                    full = full_prompt_blocks(seq, self.hash_block_size)
+                    prompt += new[: max(0, full - k)]
+                hash_round = min(2 * hash_round, _WALK_HASH_ROUND_MAX)
+            new_ids = list(map(get, new))
+            try:
+                miss = new_ids.index(None)
+            except ValueError:
+                hashes += new
+                ids += new_ids
+                continue
+            hashes += new[:miss]
+            ids += new_ids[:miss]
+            break
+        last = len(ids) - 1
+        if last >= 0 and self.kv.block(ids[last]).token_ids != (
+            self._hash_block_tokens(seq, last)
+        ):
+            for i, block_id in enumerate(ids):
+                if self.kv.block(block_id).token_ids != self._hash_block_tokens(seq, i):
+                    del hashes[i:], ids[i:]
+                    break
+        return hashes, ids
+
+    def _take_admission_walk(self, seq: Sequence, blocks: int) -> _PrefixWalk | None:
+        """`seq`'s last fast walk if its first `blocks` ids, all `allocate`
+        claims, still hold (consumed either way). Past its `index_version` they
+        hold while their hashes still resolve to the same ids."""
+        walk = self._admission_walks.pop(seq, None)
+        if (
+            walk is None
+            or walk.num_tokens != seq.num_tokens
+            or walk.cache_seed != seq.cache_seed
+        ):
+            return None
+        k = min(blocks, len(walk.ids))
+        if walk.index_version != self.kv.index_version and (
+            list(map(self.kv.index_get, walk.hashes[:k])) != walk.ids[:k]
+        ):
+            return None
+        return walk
+
+    def can_allocate_memoized(self, seq: Sequence) -> int:
+        """`can_allocate(seq, record=False)` for the delayer and the DP chunk
+        cost, with the walk memoised per seq. The same `_evaluate`, so state
+        room, the gates, the replay, checkpoint demand/end, the used hit blocks
+        and the fit are re-asked on every call, and the answer is the exact
+        probe's.
+
+        The walk is reused while nothing it read moved: no `watched` hash was
+        evicted or remapped to another block (`_note_index_change`; more than
+        `_RECENT_INDEX_CHANGES` since the last check re-walks), no
+        `clear_cache`, the first miss still resolves the same (a hit only grows
+        by a publish of that hash), and token count and seed are unchanged.
+        """
+        walk_of = self._memoised_walk if self.walk_memo else self._walk_prefix
+        return self._evaluate(seq, walk_of, False, None)
+
+    def _memoised_walk(self, seq: Sequence) -> _PrefixWalk:
+        memo = self._cached_walks.get(seq)
+        if memo is not None and self._walk_still_valid(seq, memo):
+            return memo.walk
+        walk = self._walk_prefix(seq)
+        hit = len(walk.hashes)
+        boundary_hash = None
+        boundary_id = -1
+        if hit < self._n_hash_blocks(seq) - 1:
+            # Read back from the prompt chain, where the walk left it.
+            prev = walk.hashes[-1] if hit else seq.cache_seed
+            boundary_hash = self._block_hash(seq, self._prompt_hashes(seq), hit, prev)
+            boundary_id = self.kv.lookup(boundary_hash)
+        watched = set(walk.hashes)
+        if boundary_hash is not None:
+            watched.add(boundary_hash)
+        self._cached_walks[seq] = _CachedWalk(
+            walk=walk,
+            index_clears=self._index_clears,
+            index_changes_seen=self._index_changes,
+            watched=watched,
+            boundary_hash=boundary_hash,
+            boundary_id=boundary_id,
+        )
+        return walk
+
+    def _walk_still_valid(self, seq: Sequence, memo: _CachedWalk) -> bool:
+        """Whether the KV index still answers `memo`'s walk the same way. Costs
+        the index changes since the last check, not the prompt length."""
+        if (
+            memo.walk.num_tokens != seq.num_tokens
+            or memo.walk.cache_seed != seq.cache_seed
+            or memo.index_clears != self._index_clears
+        ):
+            return False
+        new = self._index_changes - memo.index_changes_seen
+        if new:
+            if new > len(self._recent_index_changes):
+                return False
+            watched = memo.watched
+            for h in islice(reversed(self._recent_index_changes), new):
+                if h in watched:
+                    return False
+            memo.index_changes_seen = self._index_changes
+        return (
+            memo.boundary_hash is None
+            or self.kv.lookup(memo.boundary_hash) == memo.boundary_id
+        )
 
     def record_allocation(
         self, seq: Sequence, num_cached_blocks: int, block_hashes: list[int]
@@ -1027,6 +1457,8 @@ class BlockManager:
         requeue the seq rather than run a forward over shared blocks.
         """
         assert not seq.block_table
+        # Admitted: the delayer no longer probes this seq.
+        self._cached_walks.pop(seq, None)
         # Two extents, and they are not the same number. `num_cached_blocks` is
         # what the request may call cached -- it needs a resumable state behind
         # it. `claim_blocks` is what it may point its block table at: every
@@ -1039,15 +1471,27 @@ class BlockManager:
         # `num_cached_blocks` this request will ever treat as computed, and
         # claiming further would pin blocks the forward is about to overwrite.
         hbs = self._hash_block_size()
+        requested_blocks = num_cached_blocks
         claim_blocks = max(
             num_cached_blocks,
             int(seq.offload_joint.claim_tokens or 0) // hbs,
         )
         h = seq.cache_seed
         hit_hash = -1
-        for i in range(claim_blocks):
-            token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+        # Claim the probe's ids as one run; the loop walks only the rest (a
+        # joint tail past the HBM hit, or everything if the walk is stale).
+        claimed = 0
+        walk = self._take_admission_walk(seq, claim_blocks)
+        if walk is not None and (claimed := min(claim_blocks, len(walk.ids))):
+            ids = walk.ids[:claimed]
+            self.kv.claim_many(ids)
+            seq.block_table.extend(ids)
+            h = walk.hashes[claimed - 1]
+            if cached := min(claimed, num_cached_blocks):
+                hit_hash = walk.hashes[cached - 1]
+        prompt = self._prompt_hashes(seq)
+        for i in range(claimed, claim_blocks):
+            h = self._block_hash(seq, prompt, i, h)
             block_id = self.kv.lookup(h)
             if block_id == -1:
                 # Evicted between `can_allocate` and here. For the widened joint
@@ -1088,6 +1532,13 @@ class BlockManager:
             # last one actually claimed, whichever way the loop exits.
             if i < num_cached_blocks:
                 hit_hash = h
+        if self.state_replay_tokens and seq.replays_hit:
+            # A replay starts from a fresh state slot, never a checkpoint: it
+            # rebuilds the state below whatever the claim above reached.
+            hit_hash = -1
+            if num_cached_blocks < requested_blocks:
+                # A KV-only load past the hit would start above a gap.
+                seq.replay_kv_load = False
         # Pin the restore before fresh blocks can evict its checkpoint.
         state_holds = True
         if seq.has_per_req_cache and self.paged_state_checkpoints is not None:
@@ -1175,12 +1626,16 @@ class BlockManager:
         and at a `hit`, the state (one hash block); and in a forward finishing
         the prompt, `min_final_prefill_rows` rows before its end (decoder
         bounded replay), on the hash-block grid. `start` itself everywhere
-        else."""
+        else. And at a hit `can_allocate` admitted with no checkpoint behind
+        its state (`_replay_hit`, DeepSeek-V4), the state's receptive field,
+        `state_replay_tokens`."""
         if not (seq.has_per_req_cache and start):
             return start
         hbs = self.hash_block_size
         if hit and self.state.transfer.replays:
             start -= hbs
+        elif hit and self.state_replay_tokens and seq.replays_hit:
+            start -= self.state_replay_tokens
         short = self.min_final_prefill_rows - (seq.num_tokens - start)
         if short > 0:
             start = (start - short) // hbs * hbs
@@ -1630,6 +2085,7 @@ class BlockManager:
         start_tokens: int | None = None,
         next_forward_tokens: int | None = None,
         aimed: bool = True,
+        replay_until: int | None = None,
     ) -> None:
         """Register hashes for blocks finalized by the most recent step.
 
@@ -1648,18 +2104,30 @@ class BlockManager:
 
         `next_forward_tokens` reaches `checkpointers_at`; see there. Left
         unset it reads the prompt's remainder, which is the prefill answer.
+
+        `replay_until`: where the forward resumed if it started below that
+        point, as the batch was scheduled (`ScheduledBatch.replaying`). Nothing
+        below it is published or checkpointed: those blocks are the hit's, and
+        a forward ending below it leaves a replay's state still inexact. One
+        ending right at it publishes nothing either, but a DeepSeek-V4 bounded
+        replay has rebuilt the state whole there, so that may be checkpointed.
+        Left unset it reads `seq.replay_until`, which under pipeline
+        parallelism a later chunk's scheduling may already have moved.
         """
         if not self.enable_prefix_caching:
             return
         hbs = self._hash_block_size()
         base = seq.num_cached_tokens if start_tokens is None else start_tokens
         # A replaying forward's rows below where it resumed are published.
-        start = max(base, seq.replay_until) // hbs
+        until = seq.replay_until if replay_until is None else replay_until
+        start = max(base, until) // hbs
         end = (base + num_new_tokens) // hbs
         # A finished or preempted seq has had its block table released; the
         # deferred publish paths can still reach it with a stale token count.
         end = min(end, len(seq.block_table))
-        if start >= end:
+        if start >= end and not (
+            seq.replays_hit and until and base + num_new_tokens == until
+        ):
             return
         h = self._chain_parent_hash(seq, start)
         if h is None:
@@ -1671,9 +2139,15 @@ class BlockManager:
         store_run_parent: int | None = h if h != -1 else None
         store_run_hashes: list[int] = []
         store_run_tokens: list[int] = []
+        # Prompt blocks the seq's chain covers (`_prompt_hashes`) are named
+        # from it; only the rest are hashed here.
+        known = self._prompt_hash_chains.get(seq)
+        known = known[1] if known and known[0] == seq.cache_seed else ()
+        if 0 < start <= len(known) and known[start - 1] != h:
+            known = ()
         for i in range(start, end):
             token_ids = self._hash_block_tokens(seq, i)
-            h = self.compute_hash(token_ids, h)
+            h = known[i] if i < len(known) else self.compute_hash(token_ids, h)
             self.kv.publish(seq.block_table[i], h, token_ids)
             if record:
                 store_run_hashes.append(h)
@@ -1867,6 +2341,14 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
+        # replay bounds what the missing checkpoint costs. A demand would cut
+        # every replay admission's forward at the hit and write a checkpoint
+        # there, for a branch at that exact hit that may never come:
+        # conversations resume at prompt ends, which the anchor covers, the
+        # hit included (`scheduler._cut_floor` lets it land there).
+        if seq.replays_hit:
+            demand = 0
         # A demand is an instruction to cut a prefill chunk onto a rung, and
         # that cut costs the request a forward. Buying one for a store
         # `begin_store` is about to refuse is the only part of this funnel
@@ -1946,6 +2428,19 @@ class BlockManager:
         # than the model's final forward runs would back off below it
         # (`replay_start`), recomputing what the checkpoint saves.
         room = max(room, self.min_final_prefill_rows)
+        # The next turn re-renders this prompt's last few tokens (the chat
+        # template's generation prompt), so an anchor must sit before them too.
+        # Measured on Qwen3.5 AgentX: with no margin, prompts of length
+        # 16k + 1 put the divergence inside the anchor's block, and their
+        # follow-ups resumed from the anchor 1 time in 282 (95.6% otherwise).
+        #
+        # The larger of the room and the margin, not their sum. Against no
+        # margin the anchor moves back by up to `ceil((margin - room) / block)`
+        # blocks -- one for Qwen3.5's 5 over a PAGE room of 0 -- so a margin
+        # wider than a block costs a verbatim resend several blocks, and a
+        # prompt shorter than `margin + block` keeps no anchor (`end` below is
+        # 0). Pinned by `TestPromptEndAnchorTemplateMargin`.
+        room = max(int(room), self.state_checkpoint_end_margin)
         # The rightmost grid position that still leaves `room` behind it.
         #
         # Not simply `num_prompt_tokens` floored: a checkpoint at P binds the
@@ -1998,7 +2493,7 @@ class BlockManager:
         blocks the forward just finished, and this would be a hash pass over the
         whole prompt on every admission, spent on nothing.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             seq.block_hashes = []
             return
         # The continuation itself -- resume from the last APPENDED hash (on a
@@ -2043,29 +2538,76 @@ class BlockManager:
         one nobody dared remove. `test_interval_zero_reserves_nothing` pins the
         behavior end to end rather than the check.
         """
-        if not self.state.readable_midstep or not self.state.applies(seq):
+        if not self._midstep_applies(seq):
             return []
         interval = self.state_checkpoint_interval_tokens
         hbs = self.hash_block_size
+        grid, min_offset = self.midstep_grid, self.midstep_min_offset
         hashes = seq.block_hashes
         rung = 0
         if limit := self.checkpoint_limit(seq):
             rung = min(end, limit)
             rung -= rung % interval
-        out = []
+        out = {}
         for pos in sorted(
             {p for p in (rung, seq.checkpoint_demand_pos, seq.checkpoint_end_pos) if p}
         ):
             if not start < pos <= end:
                 continue
             assert not pos % hbs, f"checkpoint position {pos} is off the {hbs} grid"
-            nblocks = pos // hbs
+            # The state the kernel materialized at or before `pos`. It must
+            # still be a block boundary to have a hash, which holds exactly
+            # when this forward starts on one -- the scheduler keeps non-final
+            # chunk ends on the block grid (`align_midstep_chunk`) for that.
+            snapped = snap_midstep_position(pos, start, end, grid)
+            if snapped % hbs or not midstep_target_ok(
+                snapped, start, end, grid, min_offset
+            ):
+                self.midstep_positions_unreadable += 1
+                continue
+            nblocks = snapped // hbs
             # A position past the chain is one `_extend_hash_chain` could not
             # name — nothing to file it under, so it cannot be found again.
             if nblocks > len(hashes):
                 continue
-            out.append((pos, hashes[nblocks - 1]))
-        return out
+            out[snapped] = hashes[nblocks - 1]
+        return sorted(out.items())
+
+    def midstep_anchor(self, seq: Sequence, start: int, end: int) -> int:
+        """Where this forward files the prompt-end anchor, or 0.
+
+        `checkpoint_end_pos` moved onto the forward's grid, as
+        `midstep_positions` moves it. The class that ranks checkpoints by
+        whether they are the anchor compares against this, not the unsnapped
+        position, or the anchor it actually filed is ranked as a guess.
+        """
+        anchor = seq.checkpoint_end_pos
+        if not (anchor and start < anchor <= end):
+            return 0
+        return snap_midstep_position(anchor, start, end, self.midstep_grid)
+
+    def _midstep_applies(self, seq: Sequence) -> bool:
+        cache = self._state_checkpoint_cache
+        return cache.readable_midstep and cache.applies(seq)
+
+    def align_midstep_chunk(self, seq: Sequence, start: int, chunk: int) -> int:
+        """`chunk` shortened so a non-final prefill chunk ends on a block boundary.
+
+        A readable class needs no cut onto its rungs, so the budget alone ends
+        a chunk -- anywhere. The next chunk would then start off the block
+        grid, every position on *its* grid would be off it too, and
+        `midstep_positions` would have to drop them all: for a prompt longer
+        than one batch, the anchor along with them. Giving back under one
+        block of this forward's budget keeps the next start on the grid.
+
+        Unchanged when the chunk finishes the prompt, or when it is shorter
+        than reaching the next boundary.
+        """
+        if not self._midstep_applies(seq) or start + chunk >= seq.num_tokens:
+            return chunk
+        hbs = self.hash_block_size
+        aligned = (start + chunk) // hbs * hbs - start
+        return aligned if aligned > 0 else chunk
 
     def plan_midstep(self, seq: Sequence, start: int, end: int) -> None:
         """Reserve a destination slot for every checkpoint this forward covers.
@@ -2079,13 +2621,14 @@ class BlockManager:
         one forward, so a second plan for the same seq means the first forward
         never ran — hand its slots back rather than leak them.
         """
-        if not self.state.readable_midstep:
+        if not self._state_checkpoint_cache.readable_midstep:
             return
         if seq.midstep_reservations:
             self.cancel_midstep(seq)
-        seq.midstep_reservations = self.state.reserve_midstep(
+        seq.midstep_reservations = self._state_checkpoint_cache.reserve_midstep(
             seq, self.midstep_positions(seq, start, end)
         )
+        seq.midstep_anchor_pos = self.midstep_anchor(seq, start, end)
 
     def commit_midstep(self, seq: Sequence) -> None:
         """File this forward's reservations, now that its bytes exist.
@@ -2096,7 +2639,7 @@ class BlockManager:
         """
         if not seq.midstep_reservations:
             return
-        self.state.publish_midstep(seq.midstep_reservations, seq)
+        self._state_checkpoint_cache.publish_midstep(seq.midstep_reservations, seq)
         # The rightmost published position, for the decode-side spacing rule in
         # `checkpointers_at`. Generation is never midstep-readable — its
         # forwards end where acceptance puts them — so it still measures from
@@ -2106,13 +2649,15 @@ class BlockManager:
             seq.last_checkpoint_pos, max(p for _g, p, _h in seq.midstep_reservations)
         )
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def cancel_midstep(self, seq: Sequence) -> None:
         """Hand back reservations whose forward is not going to run."""
         if not seq.midstep_reservations:
             return
-        self.state.cancel_midstep(seq.midstep_reservations)
+        self._state_checkpoint_cache.cancel_midstep(seq.midstep_reservations)
         seq.midstep_reservations = []
+        seq.midstep_anchor_pos = 0
 
     def checkpoint_cut(
         self, seq: Sequence, start: int, end: int, *, record: bool = True
@@ -2211,6 +2756,7 @@ class BlockManager:
             "demands_declined_no_room": self.demands_declined_no_room,
             "chunks_cut_for_demand": self.chunks_cut_for_demand,
             "chunks_cut_for_end": self.chunks_cut_for_end,
+            "midstep_positions_unreadable": self.midstep_positions_unreadable,
             "joint_boundaries": self.joint_boundaries,
             "state_hbm": self.state_hbm_boundaries,
             "state_tier": self.state_tier_boundaries,
@@ -2648,6 +3194,7 @@ class BlockManager:
         # Covers preemption too, which frees through here and re-prefills.
         seq.num_hashed_tokens = 0
         seq.replay = None
+        seq.replays_hit = seq.replay_kv_load = False
         # Likewise the demand: it describes one admission against one cache
         # state, and a re-admitted seq gets a fresh answer from `can_allocate`
         # — including a fresh place in both funnel counters.
@@ -2716,31 +3263,62 @@ class BlockManager:
         seq.offload_joint.load_hash = -1
         seq.offload_joint.reset_joint()
 
-    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+    def can_append(
+        self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0
+    ) -> bool:
+        """Whether the pool can back what `may_append` takes for this step.
+
+        Sized on `len(seq) + max(num_new_tokens, lookahead)`. A decode step's
+        `num_new_tokens` (`1 + mtp_k`) already exceeds its draft lookahead
+        (`mtp_k - 1`), so the lookahead never raises the bar there; it is
+        passed so the check states what it covers.
+        """
         seq_len = len(seq)
         current_blocks = len(seq.block_table)
         ebs = self._effective_block_size()
-        needed_blocks = (seq_len + num_new_tokens + ebs - 1) // ebs
+        reach = seq_len + max(num_new_tokens, lookahead)
+        needed_blocks = (reach + ebs - 1) // ebs
         new_blocks_needed = max(0, needed_blocks - current_blocks)
         return self._has_page_units(new_blocks_needed)
 
-    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
-        # Note: in disaggregated (P/D) mode the scheduler skips this call on
-        # the first decode step after remote prefill, because blocks were
-        # already allocated during the KV transfer phase.
+    def may_append(self, seq: Sequence, num_new_tokens: int = 1, lookahead: int = 0):
+        """Allocate every block this step's KV writes land in.
+
+        The target writes up to `len(seq) - 1`; the draft round writes
+        `lookahead` positions past that (`draft_kv_lookahead`). Checking that
+        the pool has room (`can_append`) is not the same as allocating it: a
+        position past the last allocated block reads block id 0 from the zeroed
+        block-table tail, and the write lands in whoever owns physical block 0.
+        """
+        # Note: in disaggregated (P/D) mode the scheduler skips the
+        # `num_new_tokens` half on the first decode step after remote prefill,
+        # because those blocks were already allocated during the KV transfer.
         block_table = seq.block_table
         seq_len = len(seq)
         # Check if we need to allocate a new block
         # When len(seq) % block_size == 1, we need a new block for the next token
         # When block_size == 1, every token needs a new block
         ebs = self._effective_block_size()
+        needed_blocks = 0
         if 0 < seq_len % ebs <= num_new_tokens or ebs == 1:
             needed_blocks = (seq_len + ebs - 1) // ebs
-            while len(block_table) < needed_blocks:
-                # Decode-generated blocks: token not finalized yet (depends on
-                # sampling / speculative verification), so we cannot compute a
-                # correct hash here.  Just allocate the block without hashing.
-                block_table.append(self._fresh_block())
+        if lookahead:
+            needed_blocks = max(needed_blocks, (seq_len + lookahead + ebs - 1) // ebs)
+        while len(block_table) < needed_blocks:
+            # Decode-generated blocks: token not finalized yet (depends on
+            # sampling / speculative verification), so we cannot compute a
+            # correct hash here.  Just allocate the block without hashing.
+            block_table.append(self._fresh_block())
+
+    def draft_writes_allocated(self, seq: Sequence) -> bool:
+        """Whether `seq`'s blocks reach the end of this forward's draft round.
+
+        `len(seq) + draft_lookahead` positions, the bound `draft_kv_lookahead`
+        derives. The scheduler checks it on every sequence it schedules.
+        """
+        ebs = self._effective_block_size()
+        reach = len(seq) + self.draft_lookahead
+        return len(seq.block_table) * ebs >= reach
 
     # ---------------- KV event API ---------------- #
 
@@ -2758,6 +3336,7 @@ class BlockManager:
         future requests."""
         self.kv.clear_index()
         self._state_checkpoint_cache.clear_index()
+        self._index_clears += 1
         if self._event_log is not None:
             self._event_log.append(_make_all_cleared())
 

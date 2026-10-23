@@ -465,5 +465,35 @@
     "accuracy_baseline": 0.9447,
     "accuracy_baseline_model": "zai-org/GLM-5.2-FP8",
     "_baseline_note": "20-shot GSM8K is lossless for MTP; threshold follows GLM-5.2-FP8 until MXFP4 MTP-specific CI baseline is calibrated."
+  },
+  {
+    "model_name": "DeepSeek-V4.1-Flash TP4",
+    "model_path": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "extra_args": "--tensor-parallel-size 4 --tokenizer-mode deepseek_v4 --kv-cache-dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 64",
+    "env_vars": "VLLM_USE_BREAKABLE_CUDAGRAPH=1\nATOM_V41_EXPERIMENTAL_CUDAGRAPH=1",
+    "runner": "atom-plugin-acc-validation-runner-vllm",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 20,
+    "accuracy_test_threshold": 0.91,
+    "accuracy_baseline": 0.9303,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "_baseline_note": "DeepSeek-V4.1 on the vLLM plugin. Three of these arguments are forced, not chosen: the runtime takes --kv-cache-dtype auto/bfloat16/nvfp4 and refuses the fp8 this harness supplies by default, prefix caching is refused because a block-table hit restores the compressed pages but not the per-request CSA2 state read alongside them (the harness already passes --no-enable-prefix-caching), and the two env vars are what keep cudagraph_mode at the FULL_AND_PIECEWISE the harness asks for instead of falling back to eager. max-model-len is 8192 because the checkpoint's own 1M would price the KV pool out of the box this was measured on. Baseline 0.9303 flexible-extract (strict identical) is one full 1319-question 20-shot run of this exact recipe, driven by .github/scripts/atom_oot_test.sh itself rather than a stand-in. One run, so read it as a point and not as a noise estimate: the 0.91 bar leaves 2pp, and a single red should be rerun before it is believed. This is the non-speculative cell; the DSpark one below shares every other argument, so the pair isolates speculation. Coverage boundary, since max-model-len reads like one and is not: 8192 is sized for the KV pool (the checkpoint's own max_position_embeddings is 1048576), not for what the indexer sees. Measured, the 20-shot prompts are 3411 tokens at p50 and 3736 at most, so the token-level selection is exercised -- index_topk is 512, picked out of ~3.4k, past a sliding_window of 128. The block-level candidate stage is not: candidate_topk_blocks (2048) x candidate_block_size (8) is 16384 tokens, which 8192 cannot reach, so that stage never discards anything here. Raising max-model-len would NOT close that -- gsm8k's prompts are 3.4k whatever the limit is. Covering it needs a long-context task, not a bigger flag."
+  },
+  {
+    "model_name": "DeepSeek-V4.1-Flash DSpark TP4",
+    "model_path": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "extra_args": "--tensor-parallel-size 4 --tokenizer-mode deepseek_v4 --kv-cache-dtype auto --gpu-memory-utilization 0.9 --max-model-len 8192 --max-num-batched-tokens 8192 --max-num-seqs 64 --speculative-config '{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"kv_cache_dtype\":\"fp8_ds_mla\"}'",
+    "env_vars": "VLLM_USE_BREAKABLE_CUDAGRAPH=1\nATOM_V41_EXPERIMENTAL_CUDAGRAPH=1",
+    "runner": "atom-plugin-acc-validation-runner-vllm",
+    "test_level": "nightly",
+    "priority": "P0",
+    "lm_eval_num_fewshot": 20,
+    "accuracy_test_threshold": 0.91,
+    "accuracy_baseline": 0.9253,
+    "accuracy_baseline_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+    "mtp_accept_threshold": 0.35,
+    "mtp_per_pos_threshold": "0.55,0.40,0.25,0.18,0.10",
+    "_baseline_note": "DeepSeek-V4.1 on the vLLM plugin. Three of these arguments are forced, not chosen: the runtime takes --kv-cache-dtype auto/bfloat16/nvfp4 and refuses the fp8 this harness supplies by default, prefix caching is refused because a block-table hit restores the compressed pages but not the per-request CSA2 state read alongside them (the harness already passes --no-enable-prefix-caching), and the two env vars are what keep cudagraph_mode at the FULL_AND_PIECEWISE the harness asks for instead of falling back to eager. max-model-len is 8192 because the checkpoint's own 1M would price the KV pool out of the box this was measured on. DSpark is fixed at 5 draft tokens by the model's config gate, and the draft is the target checkpoint's own mtp.* stages, so there is no separate draft model to point at. The draft needs its own kv_cache_dtype in the speculative config: it writes fp8_ds_mla onto the CacheConfig it would otherwise share with the target, which the target's gate then rejects. Baseline 0.9253 is the mean of two full 1319-question 20-shot runs of this recipe on fresh servers, 0.9249 and 0.9257 flexible-extract (strict within 0.0008 of flexible both times). Two runs, 0.08pp apart -- read that as a lower bound on the noise, not the noise. The non-speculative cell above measured 0.9303 the same way; the 0.5pp between them is well inside the 0.0072 standard error either run reports. The acceptance floors are the gate that matters here: verification is lossless w.r.t. the target, so a draft head that reads the wrong hidden states, or an output projection no checkpoint ever filled, leaves every answer correct and shows up only in these numbers. Measured 0.4729 and 0.4705 overall across the two runs, per position 0.7785/0.6243/0.4299/0.3214/0.2102 and 0.7898/0.6411/0.4248/0.3063/0.1906, against 0.008 overall when the target's LM head was not shared into the draft. The floors sit roughly 70% of measured, clear of both run-to-run movement and anything a broken draft can reach. Coverage boundary, since max-model-len reads like one and is not: 8192 is sized for the KV pool (the checkpoint's own max_position_embeddings is 1048576), not for what the indexer sees. Measured, the 20-shot prompts are 3411 tokens at p50 and 3736 at most, so the token-level selection is exercised -- index_topk is 512, picked out of ~3.4k, past a sliding_window of 128. The block-level candidate stage is not: candidate_topk_blocks (2048) x candidate_block_size (8) is 16384 tokens, which 8192 cannot reach, so that stage never discards anything here. Raising max-model-len would NOT close that -- gsm8k's prompts are 3.4k whatever the limit is. Covering it needs a long-context task, not a bigger flag."
   }
 ]

@@ -31,10 +31,14 @@ Caller responsibilities (no copies done here):
     fully written by this kernel.)
   - Compute and stage the four indptr buffers and the per-seq scalar inputs.
 
+``swa_floor[bid]`` is 0 except for a seq replaying a prefix whose window was
+not restored (`Replay.start`): its ring holds nothing below that position, so
+no token may read the ring there.
+
 Per-token quantities (kernel-computed from inputs; mirror the formulas in
 ``_build_paged_prefill_meta``):
   token_pos_in_chunk[t] = positions[t] - chunk_start[bid]
-  swa_low[t]            = max(positions[t] - win + 1, 0)
+  swa_low[t]            = max(positions[t] - win + 1, swa_floor[bid])
   extend_count[t]       = min(token_pos_in_chunk[t] + 1, win)
   prefix_swa_count[t]   = max(chunk_start[bid] - swa_low[t], 0)
 
@@ -64,7 +68,12 @@ from atom.model_ops.v4_kernels.pool_index import (
 from atom.utils.decorators import mark_trace
 
 
-@triton.jit
+# The SWA floor is a runtime switch, and neither it nor its pointer is
+# specialized: as a constexpr (or a specialized int) the floored variant
+# compiled on the first replay, mid-serving, and so would a floor tensor whose
+# alignment differs from the pointer standing in for it without a replay (a
+# TBO ubatch's slice of the state slots).
+@triton.jit(do_not_specialize=["swa_floor_per_seq_ptr", "has_swa_floor"])
 def _v4_paged_prefill_indices_kernel(
     # Per-token inputs.
     positions_ptr,  # [T] int — global token position
@@ -73,6 +82,8 @@ def _v4_paged_prefill_indices_kernel(
     chunk_start_per_seq_ptr,  # [bs] int — current chunk's absolute start position
     cu_seqlens_q_per_seq_ptr,  # [bs] int — per-seq prefix sum start in per-fwd kv tensor
     state_slot_per_seq_ptr,  # [bs] int — per-seq SWA ring slot
+    swa_floor_per_seq_ptr,  # [bs] int — lowest ring position a seq may read
+    has_swa_floor,  # 1 when some seq replays; 0 leaves the pointer unread
     block_tables_ptr,  # [bs, MAX_BLOCKS] int — compressed pool block ids (HCA)
     bt_stride_bs,  # row stride of block_tables
     # Indptrs (already cumsum'd by caller, all length [T+1]).
@@ -137,6 +148,8 @@ def _v4_paged_prefill_indices_kernel(
     # Per-token derived quantities (single-pass arithmetic).
     token_pos_in_chunk = pos - chunk_start
     swa_low = tl.maximum(pos - win + 1, 0)
+    if has_swa_floor != 0:
+        swa_low = tl.maximum(swa_low, tl.load(swa_floor_per_seq_ptr + bid))
     extend_count = tl.minimum(token_pos_in_chunk + 1, win)
     prefix_swa_count = tl.maximum(chunk_start - swa_low, 0)
 
@@ -257,6 +270,7 @@ def write_v4_paged_prefill_indices(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    swa_floor_per_seq: torch.Tensor | None = None,
     prefix: str = "",
 ) -> None:
     """One-shot GPU build of the V4 paged-prefill index buffers.
@@ -313,6 +327,8 @@ def write_v4_paged_prefill_indices(
       geometry:                  the pool's `UnifiedPoolGeometry`; supplies one
                                   `WindowParams` per compress class plus the
                                   envelope stride the compress section needs.
+      swa_floor_per_seq:         ``[bs]``   int or None — lowest ring position
+                                  each seq may read. None reads from 0.
     """
     if T == 0:
         return
@@ -355,6 +371,9 @@ def write_v4_paged_prefill_indices(
         chunk_start_per_seq,
         cu_seqlens_q_per_seq,
         state_slot_per_seq,
+        # Any int pointer will do when no seq replays: the load is skipped.
+        swa_floor_per_seq if swa_floor_per_seq is not None else state_slot_per_seq,
+        int(swa_floor_per_seq is not None),
         block_tables,
         block_tables.stride(0),
         extend_indptr,
@@ -401,6 +420,7 @@ def write_v4_paged_prefill_indices_reference(
     geometry: UnifiedPoolGeometry,
     hca_ratio: int = 128,
     hca_rows_per_block: int = 1,
+    swa_floor_per_seq: torch.Tensor | None = None,
 ) -> None:
     """Pure-Python equivalent of ``write_v4_paged_prefill_indices``.
     Per-token Python loop — slow but readable; used for unit-test bit-exact
@@ -420,6 +440,11 @@ def write_v4_paged_prefill_indices_reference(
     pos_cpu = positions[:T].cpu().tolist()
     cs_per_seq_cpu = chunk_start_per_seq.cpu().tolist()
     cu_q_cpu = cu_seqlens_q_per_seq.cpu().tolist()
+    floor_cpu = (
+        swa_floor_per_seq.cpu().tolist()
+        if swa_floor_per_seq is not None
+        else [0] * len(cs_per_seq_cpu)
+    )
     block_tables_cpu = block_tables.cpu()
     ext_indptr_cpu = extend_indptr.cpu().tolist()
     swa_indptr_cpu = prefix_swa_indptr.cpu().tolist()
@@ -437,7 +462,7 @@ def write_v4_paged_prefill_indices_reference(
         n_hca = (pos + 1) // hca_ratio
 
         token_pos_in_chunk = pos - chunk_start
-        swa_low = max(pos - win + 1, 0)
+        swa_low = max(pos - win + 1, floor_cpu[bid])
         extend_count = min(token_pos_in_chunk + 1, win)
         prefix_swa_count = max(chunk_start - swa_low, 0)
 
