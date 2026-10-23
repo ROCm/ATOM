@@ -132,6 +132,7 @@ cannot affect a server that does not use the feature.
 | **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 | **ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB** | int | 2048 | Sparse (DSA) indexer dense fp32 logits budget, in MiB. Prefill scores query rows in chunks within it. It also sizes the decode logits workspace (`max_model_len` wide, allocated once and counted in the KV budget) and so how many bands a decode step is scored in: lowering it saves memory but adds launches. `0` keeps only aiter's hard 2 GiB buffer-descriptor cap. |
 
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
