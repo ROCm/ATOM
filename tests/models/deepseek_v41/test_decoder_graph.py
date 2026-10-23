@@ -6,6 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+# the tail's row gather is a Triton kernel
+pytest.importorskip("triton")
+
 from atom.models.deepseek_v41 import decoder_graph
 from atom.models.deepseek_v41.decoder_graph import DecoderGraph
 

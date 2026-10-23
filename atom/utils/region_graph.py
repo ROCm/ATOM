@@ -368,7 +368,7 @@ class TokenGraph:
     # Each declared region is a break (`eager_region`).
     _record = staticmethod(_record_segments)
     # The live graphs of this class, not of a subclass (`captured_sizes`).
-    _live: "weakref.WeakSet[TokenGraph]" = weakref.WeakSet()
+    _live: ClassVar["weakref.WeakSet[TokenGraph]"] = weakref.WeakSet()
     # phase -> `captured_sizes`, read every step: whatever changes a live
     # graph's `_captured`, or which graphs live, clears it.
     _sizes: ClassVar[dict[str | None, tuple[int, ...]]] = {}
@@ -516,7 +516,7 @@ class ReqGraph(TokenGraph):
 
     _record = staticmethod(_record_whole)
     # Its own set, so request buckets stay out of `captured_sizes`.
-    _live: "weakref.WeakSet[ReqGraph]" = weakref.WeakSet()
+    _live: ClassVar["weakref.WeakSet[ReqGraph]"] = weakref.WeakSet()
 
 
 def token_graph(cls: type | None = None, *, per_phase: bool = False):
