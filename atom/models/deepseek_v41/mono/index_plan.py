@@ -231,44 +231,59 @@ def score_tasks(bounds, owners, ctas, width_log2_max):
     return counts, spans, width_log2
 
 
-def fill_walk_plan(bounds, owners, plan):
-    """The FP4 plane's FULL-layer score tasks of a step, on the host: ``plan``
-    [ctas, 4] int32 gets a (lead, span, ch0, ch1) a CTA -- chunks [ch0, ch1)
-    of the ``span`` tokens from ``lead``, a piece: at most WALK_ROWS adjacent
-    tokens of one owner (one page table), scored off each key load -- and
-    zeros past the last task. ``bounds`` and ``owners`` are the step's rows
-    (int numpy). Every piece gets ceil(need / width) tasks sharing its chunks
-    evenly, at the smallest width that fits them all in ``ctas``: a width one
-    chunk too wide left a wave per CTA a step behind the rest."""
-    n, ctas = bounds.shape[0], plan.shape[0]
-    plan.fill(0)
+def walk_pieces(owners):
+    """A step's rows as pieces, ``(lead, span)``: at most WALK_ROWS adjacent
+    tokens of one owner (one page table), scored off each key load. ``owners``
+    is the step's rows' requests (int numpy); every ratio's plan shares them."""
+    n = owners.shape[0]
     t = np.arange(n)
     run_start = np.ones(n, dtype=bool)
     run_start[1:] = owners[1:] != owners[:-1]
     run_first = np.maximum.accumulate(np.where(run_start, t, 0))
     lead = np.flatnonzero(run_start | ((t - run_first) % WALK_ROWS == 0))
-    span = np.diff(lead, append=n)
-    need = np.maximum.reduceat(np.where(scored(bounds), cdiv(bounds, CHUNK), 0), lead)
-    live = need > 0
-    lead, span, need = lead[live], span[live], need[live]
+    return lead, np.diff(lead, append=n)
+
+
+def fill_walk_plan(bounds, pieces, plan):
+    """The FP4 plane's FULL-layer score tasks of a step, on the host -- the
+    reference ``step_meta._walk_plan`` lays them out by on the device: ``plan``
+    [ctas, 4] int32 gets a (lead, span, ch0, ch1) a CTA -- chunks [ch0, ch1)
+    of the ``span`` tokens from ``lead``, one of ``pieces`` (`walk_pieces`) --
+    and zeros past the last task. ``bounds`` is the step's rows (int numpy).
+    Every piece gets ceil(need / width) tasks sharing its chunks evenly, at the
+    smallest width that fits them all in ``ctas``: a width one chunk too wide
+    left a wave per CTA a step behind the rest."""
+    ctas = plan.shape[0]
+    plan.fill(0)
+    lead, span = pieces
+    # A piece's chunks are its widest row's: `scored` and `cdiv` are monotone.
+    top = np.maximum.reduceat(bounds, lead)
+    need = np.where(scored(top), cdiv(top, CHUNK), 0)
+    # (lead, span, need, tasks) a piece; tasks is need at width 1
+    record = np.array((lead, span, need, need))
+    if not need.all():
+        record = record[:, need > 0]
+    need, k = record[2], record[3]
     if not need.size:
         return
     assert need.size < ctas, (need.size, ctas)
-    # the width search's range: ceil(total / ctas), the least that could fit,
-    # to ceil(total / (ctas - pieces)), which does (a piece's ceil adds under
-    # one task); feasibility is monotone, so the first width that fits
     total = int(need.sum())
-    lo = max(cdiv(total, ctas), 1)
-    widths = np.arange(lo, max(cdiv(total, ctas - need.size), lo) + 1)[:, None]
-    width = lo + int(np.argmax(cdiv(need, widths).sum(1) <= ctas))
-    k = cdiv(need, width)
+    if total > ctas:
+        # the width search's range: ceil(total / ctas), the least that could
+        # fit, to ceil(total / (ctas - pieces)), which does (a piece's ceil adds
+        # under one task); feasibility is monotone, so the first width that fits
+        lo = cdiv(total, ctas)
+        widths = np.arange(lo, max(cdiv(total, ctas - need.size), lo) + 1)[:, None]
+        width = lo + int(np.argmax(cdiv(need, widths).sum(1) <= ctas))
+        k[:] = cdiv(need, width)
     piece = np.repeat(np.arange(need.size), k)
     i = np.arange(piece.size) - np.repeat(np.cumsum(k) - k, k)
+    lead, span, need, k = record[:, piece]
     tasks = plan[: piece.size]
-    tasks[:, 0] = lead[piece]
-    tasks[:, 1] = span[piece]
-    tasks[:, 2] = i * need[piece] // k[piece]
-    tasks[:, 3] = (i + 1) * need[piece] // k[piece]
+    tasks[:, 0] = lead
+    tasks[:, 1] = span
+    tasks[:, 2] = i * need // k
+    tasks[:, 3] = (i + 1) * need // k
 
 
 # a REINDEX token's chunks at most: its candidate blocks' rows

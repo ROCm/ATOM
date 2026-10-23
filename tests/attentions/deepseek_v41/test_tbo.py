@@ -73,7 +73,7 @@ def make_parent(device, lengths=(10, 4), starts=(3, 8), replaying=None):
         cu.np[i + 1] = cu.np[i] + length
     cu.copy_to_gpu(len(lengths) + 1)
     builder.engram = None
-    parent, _ = builder.prepare_prefill(batch, len(lengths))
+    parent, _ = builder.prepare_prefill(batch, len(lengths), batch.total_tokens_num)
     parent.engram_embeddings = {
         layer: torch.arange(sum(lengths) * 4, device=device).view(1, -1, 4) + layer
         for layer in (1, 3)
@@ -145,15 +145,13 @@ def test_prefill_slices_keep_absolute_positions_and_independent_plans(device, cu
             steps[0].plans[ratio].compress_plan_gpu.data_ptr()
             != steps[1].plans[ratio].compress_plan_gpu.data_ptr()
         )
-    for ratio in steps[0].indptrs:
-        assert (
-            steps[0].indptrs[ratio][0].data_ptr()
-            != steps[1].indptrs[ratio][0].data_ptr()
+    if device == "cuda":
+        first, second, whole = (
+            parent.cache.indptrs(step) for step in (*steps, parent.step)
         )
-        assert (
-            steps[0].indptrs[ratio][0].data_ptr()
-            != parent.step.indptrs[ratio][0].data_ptr()
-        )
+        for ratio in first:
+            assert first[ratio][0].data_ptr() != second[ratio][0].data_ptr()
+            assert first[ratio][0].data_ptr() != whole[ratio][0].data_ptr()
     for field in ("selected", "candidates", "tiles"):
         getattr(steps[0], field)[2] = torch.tensor([17])
         steps[1].begin_forward()
@@ -252,7 +250,7 @@ def test_kv_release_keeps_persistent_ubatch_buffers_for_rebind(device):
         total_tokens_num=14,
         total_seqs_num=2,
     )
-    parent, _ = builder.prepare_prefill(batch, 2)
+    parent, _ = builder.prepare_prefill(batch, 2, batch.total_tokens_num)
     part = UBatchSlice(slice(0, 2), slice(7, 14))
     child = builder.build_ubatch_prefill_metadata(parent, part, 2, 0)
     torch.testing.assert_close(child.step.positions, parent.step.positions[7:14])
@@ -1000,8 +998,12 @@ def test_tbo_children_do_not_replay_late_layer_tails(monkeypatch, ubatch_idx):
         parent, part, part.request_slice.stop, ubatch_idx=ubatch_idx
     )
     assert child.ubatch_slices is None
-    width = child.attn_metadata.step.width
-    # without the worker context the child looks like a replayable prefill
+    step = child.attn_metadata.step
+    # only a whole prefill's step carries a decoder plan, never a child's
+    assert step.decoder is None and replayable(child, step.width) is False
+    # given one, the worker context still keeps the child on every row
+    step.decoder = object()
+    width = step.width
     assert replayable(child, width) is True
     monkeypatch.setitem(
         ubatching._THREAD_ID_TO_CONTEXT, threading.get_ident(), ubatch_idx

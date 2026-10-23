@@ -31,13 +31,19 @@ from atom.model_ops.engram.device.staging import (
     engram_staging,
 )
 from atom.model_ops.v4_kernels import make_compress_plans
+from atom.models.deepseek_v41.bounded_replay import (
+    ReplayPlan,
+    decoder_replay_unsupported,
+    lay_out_tail,
+    tail_spans,
+    tail_width,
+)
 from atom.models.deepseek_v41.config import AttentionMode, build_attention_topology
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
-from .indices import fill_step_indptrs
 from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
 from .score_planner import ScorePlanner
 
@@ -45,6 +51,8 @@ logger = logging.getLogger("atom")
 
 # the forward_vars buffer of Engram's live count and dead flags (``EngramStep``)
 ENGRAM_ROWS = "v41_engram_rows"
+# the prefix of the step buffers a bounded replay's decoder rows publish into
+DECODER_ROWS = "tail_"
 
 
 def _compress_plan_buffer_names(ratio):
@@ -88,8 +96,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
 
     @property
     def h2d_group_members(self):
-        # Plans, state slots and step rows have no GPU consumer until
-        # begin_step builds its indptrs. Derive members from producer groups.
+        # Plans, state slots and step rows have no GPU consumer before
+        # begin_step publishes them. Derive members from producer groups.
         return {
             "v41_metadata": tuple(
                 name
@@ -125,15 +133,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         ]
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
-        from atom.models.deepseek_v41.bounded_replay import (
-            decoder_replay_unsupported,
-        )
-
-        # Whether prefills report per-stage token counts under DP attention
-        # (`dp_stage_report`): the runtime model replays exactly when this
-        # holds (`DeepseekV41RuntimeModel.__init__`). The DP width is not
-        # read here -- DPA rank expansion settles it after this builder is
-        # made; `prepare_model` asks only when it is above one.
+        # Whether a serving prefill gets a decoder tail (`_publish_decoder`):
+        # the runtime model replays exactly when this holds
+        # (`DeepseekV41RuntimeModel.__init__`).
         self._decoder_replays = (
             getattr(model_runner.config, "enable_decoder_swa_bounded_replay", False)
             and decoder_replay_unsupported(self.config) is None
@@ -185,8 +187,9 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # the step buffers, owned by the runner like every other builder's
         # (V4, MLA, MHA): one set per microbatch. Reuse is fenced twice. The
         # pinned host sources wait for the H2D publication owner's completion
-        # event. The device copies, and the indptr fills below, are issued on
-        # the compute stream, after every reader: the workers' side streams
+        # event. The device copies, and each microbatch's indptr fill (by its
+        # first reader), are issued on the compute stream, after every reader
+        # of the last forward's: the workers' side streams
         # rejoin it inside attention, and `UBatchWrapper._run_ubatches` orders
         # the comm stream before it however the microbatches exit. These fixed
         # allocations precede the memory profile: get_num_blocks accounts
@@ -208,6 +211,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 }
                 for _ in range(self._NUM_TBO_UBATCHES)
             ]
+        # A replaying prefill's decoder runs on rows of its own, the tail,
+        # published as a step at addresses of its own (`_publish_decoder`), so
+        # a recording of the decoder reads what every replay of it publishes.
+        # Fenced like the `ub{i}_` copies.
+        if self._decoder_replays:
+            model_runner.forward_vars.update(
+                self._step_buffer_copies(DECODER_ROWS, self._step_buffer_names())
+                | self._decoder_layout_buffers()
+            )
         # Before the memory profile, so the budget counts it; and so before
         # the pool is sized, which its packed logits follow: the weights are
         # in, so what is left of the budget bounds the PAGEs from above.
@@ -240,6 +252,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             )
 
     step_planners = ()
+    _decoder_replays = False
 
     def add_step_planner(self, planner):
         """Have `planner` lay its per-step tables out of each step's staged rows
@@ -367,23 +380,22 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         left = int(total * utilization) - torch.cuda.memory_allocated(self.device)
         return max(1, left // self.geometry.paged_bytes)
 
-    def dp_stage_report(self, batch):
-        """Decoder bounded replay under DP attention: this rank's decoder and
-        last-layer token counts for the step's DP sync
-        (`bounded_replay.decoder_stage_report`)."""
-        if not self._decoder_replays:
-            return None
-        from atom.models.deepseek_v41.bounded_replay import decoder_stage_report
-
-        return decoder_stage_report(batch, self.geometry.window_size)
+    def _idle(self, batch):
+        """An idle DP rank's dummy step on the serving pool, not a warmup's
+        (which runs before the pool exists)."""
+        return batch.is_dummy_run and self.cache is not None
 
     def step_needs_eager(self, batch):
         """True when the step's rows cannot all be packed at once: a captured
-        graph scores one band, so such a step runs eagerly, in bands.
+        graph scores one band, so such a step runs eagerly, in bands. Also for
+        a prefill carrying images, which no token graph runs: image rows route
+        on their mask.
 
         A row sees at most its request's context; shared prefixes, counted
         once in the pool, are why the pool-sized buffer can fall short.
         """
+        if batch.total_tokens_num_prefill > 0 and batch.multimodal_data:
+            return True
         return not self.score_workspace.fits(
             batch.num_scheduled_tokens, batch.context_lens
         )
@@ -595,7 +607,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         # Once graphs bind the serving pool, an idle DP rank must publish
         # padding into that pool's metadata. A fresh scratch cache would refill
         # different indptr addresses while replay still reads the captured ones.
-        if batch.is_dummy_run and self.cache is not None:
+        if self._idle(batch):
             return self._prepare_idle(
                 batch,
                 running_bs,
@@ -772,6 +784,10 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             query_prefix_republish_reason=query_prefix_republish_reason,
         )
         step.request_resumes = resumes
+        # A serving prefill, an idle rank's included; not a warmup's, which
+        # computes every row.
+        if self._decoder_replays and is_prefill and cache is self.cache:
+            step.decoder = self._publish_decoder(step, rows, cache, running_bs)
         metadata = self._assemble_metadata(
             cache,
             step,
@@ -789,6 +805,68 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             ),
         )
         return metadata, step.positions
+
+    def _publish_decoder(self, step, rows, cache, running_bs):
+        """The `ReplayPlan` of the rows a replaying prefill's decoder runs on:
+        each finishing request's last window rows (`tail_spans`), its window
+        starting there, laid out for ``running_bs`` requests (`lay_out_tail`)
+        as a step of their own in the `DECODER_ROWS` buffers -- one set of
+        addresses per request bucket, so its recording (`DecoderGraph`) reads
+        what every replay publishes. No compress plan: the forward's
+        compression ran over every row."""
+        window = self.geometry.window_size
+        picks = tail_spans(step, window)
+        width = tail_width(running_bs, window, self.max_num_batched_tokens)
+        layout = lay_out_tail(picks, running_bs, width)
+        lengths = np.asarray([n for _, n, _ in picks], dtype=np.int32)
+        spans = tuple(
+            RequestSpan(span.request_id, span.end - n, int(offset), n, span.slot)
+            for (span, n, _), offset in zip(picks, np.cumsum(lengths) - lengths)
+        )
+        groups = getattr(self.model_runner, "h2d_groups", None)
+        group = None if groups is None else groups.get(f"{DECODER_ROWS}v41_step")
+
+        def stage(name, values, pad_to=None):
+            # Before `prepare_batch_step`, which publishes the group.
+            return self._stage(
+                f"{DECODER_ROWS}{name}",
+                np.asarray(values, dtype=np.int32),
+                pad_to,
+                publication_group=group,
+            )
+
+        slots = stage("state_slot_out", [span.slot for span in spans], running_bs)
+        floors = stage("replay_start", [span.position for span in spans], running_bs)
+        plan = {
+            name: stage(name, getattr(layout, name))
+            for name in ("rows", "query_ids", "last", "query_ptrs", "last_rows")
+        }
+        tail = prepare_batch_step(
+            spans,
+            self.device,
+            block_tables=[rows[i] for _, _, i in picks],
+            is_prefill=True,
+            buffers=self._prefixed_buffers(DECODER_ROWS),
+            buffer_prefix=DECODER_ROWS,
+            running_bs=running_bs,
+            running_tokens=width,
+            max_q_len=window,
+            state_slot_out=slots,
+            ratios=tuple(ratio for ratio, _ in self.geometry.compress_ratios),
+            publication_group=group,
+        )
+        tail.request_floors = tail.request_positions.astype(np.int32)
+        tail.request_cached_until = np.zeros(len(spans), np.int32)
+        cache.publish_replay_layout(tail, running_bs, floors=floors)
+        return ReplayPlan(
+            tail=tail,
+            tail_rows=plan["rows"],
+            query_ids=plan["query_ids"],
+            last=plan["last"],
+            query_ptrs=plan["query_ptrs"],
+            last_rows=plan["last_rows"],
+            filled=layout.filled,
+        )
 
     @staticmethod
     def _assemble_metadata(
@@ -868,14 +946,18 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 histories[k] = mapping.advance_history(None, compressed)[0]
         return resumes, floors, cached, histories
 
-    def prepare_prefill(self, batch, running_bs):
+    def prepare_prefill(self, batch, running_bs, running_tokens):
         return self._prepare(
             batch,
             running_bs,
-            batch.total_tokens_num,
+            running_tokens,
             query_prefix_ready=True,
             is_prefill=True,
         )
+
+    # Every launch outside the model's eager regions is sized by the token
+    # count alone, so a prefill may pad to a recorded token-graph bucket.
+    supports_token_graph = True
 
     _NUM_TBO_UBATCHES = 2
     # V4's ubatch publication protocol: resume the runner's sealed owner for a
@@ -900,8 +982,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         """`ub{i}_` copies of every buffer a V4.1 step and its compress plans
         are staged into, with the parent's shapes and dtypes."""
         var = self.model_runner.forward_vars
-        names = ["positions", "cu_seqlens_q", "batch_id_per_q_token", "block_tables"]
-        names += [visible_buffer_name(r) for r, _ in self.geometry.compress_ratios]
+        names = self._step_buffer_names()
         for ratio, _ in self.geometry.compress_ratios:
             names += _compress_plan_buffer_names(ratio).values()
         # Step planners (including packed FP4 score offsets) need independent
@@ -916,30 +997,70 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         ]
         buffers = {}
         for i in range(self._NUM_TBO_UBATCHES):
-            prefix = f"ub{i}_"
-            for name in names:
-                src = var[name]
-                group = (
-                    "v4_plans" if src.publication_group == "v4_plans" else "v41_step"
-                )
-                buffers[f"{prefix}{name}"] = CpuGpuBuffer(
-                    *src.cpu.shape,
-                    dtype=src.cpu.dtype,
-                    device=self.device,
-                    pin_memory=self.device != "cpu",
-                    publication_group=f"{prefix}{group}",
-                )
+            buffers |= self._step_buffer_copies(f"ub{i}_", names)
         return buffers
 
-    def _ubatch_buffers(self, ubatch_idx):
-        """This microbatch's step buffers under their parent names."""
-        prefix = f"ub{ubatch_idx}_"
+    def _step_buffer_names(self):
+        """The buffers `prepare_batch_step` stages a step into."""
+        names = ["positions", "cu_seqlens_q", "batch_id_per_q_token", "block_tables"]
+        return names + [
+            visible_buffer_name(r) for r, _ in self.geometry.compress_ratios
+        ]
+
+    def _step_buffer_copies(self, prefix, names):
+        """A row domain's own copies of ``names``, as ``{prefix}name`` with the
+        parent's shapes and dtypes: a step of other rows than the forward's,
+        published at addresses of its own (`prepare_batch_step`)."""
+        var = self.model_runner.forward_vars
+        buffers = {}
+        for name in names:
+            src = var[name]
+            group = "v4_plans" if src.publication_group == "v4_plans" else "v41_step"
+            buffers[f"{prefix}{name}"] = CpuGpuBuffer(
+                *src.cpu.shape,
+                dtype=src.cpu.dtype,
+                device=self.device,
+                pin_memory=self.device != "cpu",
+                publication_group=f"{prefix}{group}",
+            )
+        return buffers
+
+    def _decoder_layout_buffers(self):
+        """What a tail publishes beside its step (`_publish_decoder`): its
+        slots and window starts, one per request, and its `TailLayout`."""
+        bs, tokens = self.max_bs, self.max_num_batched_tokens
+        sizes = {
+            "state_slot_out": bs,
+            "replay_start": bs,
+            "rows": tokens,
+            "query_ids": tokens,
+            "last": bs,
+            "query_ptrs": bs + 1,
+            "last_rows": bs,
+        }
+        return {
+            f"{DECODER_ROWS}{name}": CpuGpuBuffer(
+                size,
+                dtype=torch.int32,
+                device=self.device,
+                pin_memory=self.device != "cpu",
+                publication_group=f"{DECODER_ROWS}v41_step",
+            )
+            for name, size in sizes.items()
+        }
+
+    def _prefixed_buffers(self, prefix):
+        """A row domain's step buffers under their parent names."""
         var = self.model_runner.forward_vars
         return {
             name[len(prefix) :]: buffer
             for name, buffer in var.items()
             if name.startswith(prefix)
         }
+
+    def _ubatch_buffers(self, ubatch_idx):
+        """This microbatch's step buffers under their parent names."""
+        return self._prefixed_buffers(f"ub{ubatch_idx}_")
 
     @contextmanager
     def ubatch_forward(self, metadata):
@@ -1027,9 +1148,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             # Indexed by this microbatch's rows, not the parent's. Before the
             # indptrs, which count each row's window from its floor.
             metadata.cache.publish_replay_layout(step, running_bs)
-            step.indptrs = fill_step_indptrs(
-                step, self.geometry, self._ubatch_indptrs[ubatch_idx]
-            )
+            step.indptr_buffers = self._ubatch_indptrs[ubatch_idx]
         return self._assemble_metadata(
             metadata.cache,
             step,
@@ -1243,3 +1362,86 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             running_bs=bs,
             running_tokens=tokens,
         )
+
+    @property
+    def prefill_req_graph_sizes(self):
+        """The decoder's request buckets (`DecoderGraph`,
+        `ATOM_DECODER_GRAPH_SIZES`) a step can hold: no more requests than a
+        batch, one window each within the token buffer
+        (`build_for_req_graph_capture`); a larger step's tail runs eagerly.
+        Not on an FP8 index plane, whose tile tables follow each request's
+        context (`PagedAttentionCache.unit_tiles`), which a recording would
+        fix."""
+        if not (self._decoder_replays and self.geometry.index_fp4):
+            return ()
+        window = self.geometry.window_size
+        return tuple(
+            n
+            for n in envs.ATOM_DECODER_GRAPH_SIZES
+            if n <= self.max_bs and n * window <= self.max_num_batched_tokens
+        )
+
+    def build_for_token_graph_capture(self, tokens):
+        """A prefill of ``tokens`` rows for recording that token-graph bucket:
+        final requests from position 0 of one window each (the last takes the
+        remainder). On the serving pool for the reason
+        `build_for_cudagraph_capture` binds it, every row on placeholder PAGE
+        0. The regions run for real on it; the segments only need its shape."""
+        if not 0 < tokens <= self.max_num_batched_tokens:
+            raise ValueError("CSA2 token-graph shape exceeds the token buffer")
+        window = self.geometry.window_size
+        lengths = (window,) * (tokens // window) + (
+            (tokens % window,) * bool(tokens % window)
+        )
+        if len(lengths) > self.max_bs:
+            lengths = (tokens,)
+        return self._build_for_prefill_capture(lengths, finishing=True)
+
+    def build_for_req_graph_capture(self, running_bs, finishing):
+        """A prefill of ``running_bs`` requests of one window each, for
+        recording that request bucket of the decoder (`DecoderGraph`): with
+        every request ``finishing`` its prompt, or none, the tail a DP rank
+        runs to join its peers' decoder."""
+        if running_bs * self.geometry.window_size > self.max_num_batched_tokens:
+            raise ValueError("CSA2 request-graph shape exceeds the token buffer")
+        return self._build_for_prefill_capture(
+            (self.geometry.window_size,) * running_bs, finishing=finishing
+        )
+
+    def _build_for_prefill_capture(self, lengths, finishing):
+        """A prefill of requests of ``lengths`` from position 0, each
+        ``finishing`` its prompt or not, on the serving pool."""
+        if self.cache is None:
+            raise RuntimeError("Allocate the serving cache before graph capture")
+        count, tokens = len(lengths), sum(lengths)
+        pages = -(-max(lengths) // self.block_size)
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=tuple(range(count)),
+            num_scheduled_tokens=lengths,
+            context_lens=lengths,
+            state_slots_committed=tuple(range(count)),
+            block_tables=((0,) * pages,) * count,
+            total_seqs_num=count,
+            total_tokens_num=tokens,
+            total_tokens_num_prefill=tokens,
+            is_final_chunk=None if finishing else (False,) * count,
+            replaying={},
+        )
+        metadata, positions = self._prepare(
+            batch, count, tokens, is_prefill=True, engram_live=False
+        )
+        metadata.dummy = True
+        self.prepare_model_inputs(
+            self.model_runner.forward_vars["input_ids"].gpu[:tokens], metadata
+        )
+        context = Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=count,
+            scheduled_tokens=tokens,
+            running_bs=count,
+            running_tokens=tokens,
+        )
+        return metadata, context

@@ -7,25 +7,25 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import nn
 
-from atom.model_ops.attentions.token_layout.gather import gather_rows
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.engram.device.staging import EngramStagedRows
 from atom.utils.backends import set_model_tag
 from atom.utils.decorators import support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, token_graph
 
 from .bounded_replay import (
-    build_replay_plan,
     carry_selections,
     decoder_replay_unsupported,
+    decoder_runs,
+    decoder_stages,
     late_layer_start,
-    placeholder_rows_of,
-    planned_stage_tokens,
     replayable,
-    rows_of,
     run_decoder_stages,
+    tail_width,
 )
 from .config import validate_tbo_parallelism
+from .decoder_graph import DecoderGraph
 from .model import Block
 from .multimodal import DeepseekV41MultimodalModel
 
@@ -89,7 +89,12 @@ def v41_attention(
     context = get_forward_context()
     metadata = context.attn_metadata
     if not metadata.step.requests:
-        return torch.zeros_like(hidden)
+        # one output row per query where a layer is asked for some
+        # (`metadata.queries`): a tail of padding's layer 39
+        rows = (
+            hidden.shape[-2] if metadata.queries is None else len(metadata.queries.rows)
+        )
+        return hidden.new_zeros(*hidden.shape[:-2], rows, hidden.shape[-1])
     layer, rope = context.no_compile_layers[layer_name]
     # `hidden` arrives normed: the mHC seam (`pre_delayed`) applies the norm
     # before this boundary, so only the attention body runs here.
@@ -127,6 +132,9 @@ class RuntimeBlock(Block):
             return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
         return v41_attention(normed, self.layer_name)
 
+    # A TR-graph break: the lookup it consumes is staged beside the forward,
+    # and a recorded segment cannot wait on that stream's events.
+    @eager_region()
     def engram_forward(self, residual, embeddings, image_mask):
         return v41_engram(residual, self.layer_name)
 
@@ -151,6 +159,9 @@ class _Stage(nn.Module):
         return state
 
 
+# Per phase, all three stages: a decode forward computes no `kv` for the
+# attention region (`_attend`), which a prefill step reads.
+@token_graph(per_phase=True)
 @support_torch_compile(
     dynamic_arg_dims={"input_ids": 0, "positions": 0, "inputs_embeds": 0}
 )
@@ -178,21 +189,7 @@ def _batched(tensors):
     return tuple(None if t is None else t[None] for t in tensors)
 
 
-def _gather_attention_rows(rows, normed, *seam):
-    """Keep BF16 hidden, optional fused quantization and mHC state aligned."""
-    if isinstance(normed, tuple):
-        hidden, quant, scale, *seam = gather_rows(
-            rows,
-            normed[0],
-            normed[1],
-            normed[2].view(torch.uint8),
-            *seam,
-            dim=1,
-        )
-        return (hidden, quant, scale.view(torch.float8_e8m0fnu)), *seam
-    return gather_rows(rows, normed, *seam, dim=1)
-
-
+@token_graph(per_phase=True)
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "inputs_embeds": 0})
 class _EarlyLayers(_Stage):
     """Under bounded replay: embedding, the Engram fork and the layers before
@@ -207,6 +204,7 @@ class _EarlyLayers(_Stage):
         return _rows_first(state.fields())
 
 
+@token_graph(per_phase=True)
 @support_torch_compile(
     dynamic_arg_dims={
         "residual": 0,
@@ -278,6 +276,13 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.replay = True
         self.decoder_start, self.last_layer = split - 1, layers - 1
         self.decoder_specs = self.topology[self.decoder_start : layers]
+        self.parallel_config = config.parallel_config
+        # What sizes a tail (`bounded_replay.tail_width`), for a rank that runs
+        # beside one without laying it out.
+        self.window, self.tail_capacity = (
+            hf.sliding_window,
+            config.max_num_batched_tokens,
+        )
         self.early = _EarlyLayers(
             atom_config=config, owner=self, last=self.decoder_start
         )
@@ -286,21 +291,26 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             self.late = _LateLayers(
                 atom_config=config, owner=self, first=split, last=self.last_layer
             )
+        self.decoder = DecoderGraph(self)
         logger.info(
             "Decoder SWA bounded replay: a prefill finishing its prompt runs "
             "the decoder (layers %d..%d) on its last window rows only and layer "
             "%d's query on its last row; one that does not stops at layer %d's "
             "compression (under DP attention it joins a peer's decoder "
-            "collectives on one placeholder row)",
+            "collectives on a tail of padding)",
             self.decoder_start,
             self.last_layer,
             self.last_layer,
             self.decoder_start,
         )
 
+    # TR-graph breaks: both decide on the live step whether there is
+    # anything to stage or join.
+    @eager_region()
     def begin_forward(self, hidden, engram_embeddings):
         v41_begin_forward(hidden)
 
+    @eager_region()
     def end_forward(self, hidden, engram_embeddings):
         v41_end_forward(hidden)
 
@@ -343,17 +353,24 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         if not self.replay:
             return self.backbone(input_ids, positions, inputs_embeds)
         state = SinglePassHCState(*_batched(self.early(input_ids, inputs_embeds)))
-        forward, num_tokens = get_forward_context(), input_ids.numel()
-        plan = None
-        if replayable(forward, num_tokens):
+        forward, running_tokens = get_forward_context(), input_ids.numel()
+        if replayable(forward, running_tokens):
             step = forward.attn_metadata.step
-            window = forward.attn_metadata.cache.geometry.window_size
-            plan = step.replay = build_replay_plan(step, window)
-        self._check_stage_report(forward, plan, num_tokens)
-        if plan is not None:
-            return self._replayed(state, num_tokens, plan)
+            step.replay = step.decoder
+            return self._replayed(state, running_tokens, step.decoder)
+        # Every row through every layer; beside replaying DP peers, under the
+        # tail's stages they run (`decoder_stages`).
+        running_bs = forward.context.running_bs
+        stages = decoder_stages(
+            forward,
+            self.parallel_config,
+            tail_width(running_bs, self.window, self.tail_capacity),
+            running_bs,
+            replaying=False,
+        )
         hidden = run_decoder_stages(
             forward,
+            stages,
             lambda: self._layer(self.decoder_start, state),
             self._late_layers,
             lambda late: self._layer(self.last_layer, late),
@@ -361,93 +378,36 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
         self.end_forward(hidden, None)
         return hidden.squeeze(0)
 
-    def _check_stage_report(self, forward, plan, num_tokens):
-        """Under DP attention, check this forward runs the token counts its
-        rank reported to the group (`decoder_stage_report`): a rank that ran
-        others would leave its peers waiting in a collective. The replay
-        decision itself is the reported one (`replayable`); this guards the
-        counts, computed from the batch on one side and the plan on the
-        other."""
-        stages = getattr(forward, "dp_stages", None)
-        if stages is None:
-            return
-        reported = tuple(
-            stages.stages[name].local_tokens for name in ("decoder", "last_layer")
-        )
-        planned = planned_stage_tokens(plan, num_tokens)
-        if planned != reported:
-            raise RuntimeError(
-                f"this DP rank runs {planned} decoder/last-layer tokens but "
-                f"reported {reported} to its DP group"
-            )
-
-    def _replayed(self, state, num_tokens, plan):
+    def _replayed(self, state, running_tokens, plan):
         """The forward's rows cut as `bounded_replay` lays them out: layer 20
         compresses every row; the requests that finish their prompts run the
-        decoder on their tails, layer 39's query on their last row, which alone
-        comes out. Every other row is zero: only each request's last row is
-        read (the LM head's), and a chunk that holds none has its logits
-        discarded.
-
-        Under DP attention each stage's MoE collectives are sized as the
-        group agreed (`run_decoder_stages`), and a rank with no tail joins
-        them on one placeholder row while a peer has decoder work."""
+        decoder on their tails (`DecoderGraph`), layer 39's query on their last
+        row, which alone comes out. Every other row is zero: only each
+        request's last row is read (the LM head's), and a chunk that holds
+        none has its logits discarded. A rank finishing no prompt runs the
+        decoder on its tail of padding while a DP peer runs it
+        (`decoder_runs`): attention sees no request and writes no cache, so
+        the rows only feed the collectives. V4.1 rejects EPLB
+        (`validate_runtime_config`), so their routing reaches no expert-load
+        statistics."""
         forward = get_forward_context()
         metadata = forward.attn_metadata
         step, cache = metadata.step, metadata.cache
         layer, rope = self.layers[self.decoder_start], self._rope(self.decoder_start)
         normed, *seam = layer.prepare_attention(state, None, None)
         del state
+        # A fused-quant `normed` carries its BF16 rows first.
         hidden = normed[0] if isinstance(normed, tuple) else normed
         layer.attn._compress_batch(hidden, cache, step, rope)
-        full = hidden.new_zeros(num_tokens, self.config.hidden_size)
-        if plan.tail is not None:
+        full = hidden.new_zeros(running_tokens, self.config.hidden_size)
+        if decoder_runs(forward):
             carry_selections(step, plan, self.decoder_specs)
-            normed, *seam = _gather_attention_rows(plan.tail_rows, normed, *seam)
-
-            def last_layer(tail):
-                with rows_of(metadata, plan.tail, plan.q39, plan.q39.rows):
-                    return self._layer(self.last_layer, tail, plan.q39)
-
-            with rows_of(metadata, plan.tail, rows=plan.tail_rows):
-                last = run_decoder_stages(
-                    forward,
-                    lambda: layer.ffn_forward(
-                        layer.attention_forward(normed, None, None, rope), *seam
-                    ),
-                    self._late_layers,
-                    last_layer,
-                )
-            self._move_aux_rows(plan.tail_rows)
-            full[plan.last_rows] = last.collapse().squeeze(0)
-        elif forward.dp_stages is not None and forward.dp_stages.active:
-            self._join_decoder_collectives(forward, layer, rope, normed, seam)
+            last = self.decoder.run(forward, plan, normed, seam)
+            if plan.tail.requests:
+                self._move_aux_rows(plan.tail_rows[: plan.filled])
+                full[plan.last_rows] = last[: plan.last_rows.numel()]
         self.end_forward(full, None)
         return full
-
-    def _join_decoder_collectives(self, forward, layer, rope, normed, seam):
-        """Join the decoder's DP collectives without a tail of one's own.
-
-        A rank whose prefill finishes no prompt runs none of the decoder, but
-        while a peer has decoder work its MoE gathers count on this rank once
-        per layer. It runs the decoder on its first row under a request-less
-        step (`placeholder_rows_of`): attention returns zeros and writes no
-        cache, so the row only feeds the collectives, and its output is
-        dropped. V4.1 rejects EPLB (`validate_runtime_config`), so the row's
-        routing reaches no expert-load statistics."""
-        metadata = forward.attn_metadata
-        hidden = normed[0] if isinstance(normed, tuple) else normed
-        rows = torch.zeros(1, dtype=torch.int32, device=hidden.device)
-        normed, *seam = _gather_attention_rows(rows, normed, *seam)
-        with placeholder_rows_of(metadata, rows):
-            run_decoder_stages(
-                forward,
-                lambda: layer.ffn_forward(
-                    layer.attention_forward(normed, None, None, rope), *seam
-                ),
-                self._late_layers,
-                lambda late: self._layer(self.last_layer, late),
-            )
 
     def _move_aux_rows(self, rows):
         """Decoder-layer aux captures wrote the tail's rows at the buffer's head;

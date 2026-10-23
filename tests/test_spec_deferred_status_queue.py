@@ -270,18 +270,18 @@ def _graph_runner(*, is_pd_producer: bool, drafter: bool = True) -> ModelRunner:
     runner.tokenID_processor = SimpleNamespace(is_pd_producer=is_pd_producer)
     if drafter:
         runner.drafter = SimpleNamespace(mtp_k=3)
-    runner.enforce_eager = False
-    runner._piecewise_cg_active = lambda: False
-    runner.graphs = {(8, 4): object()}
+    runner._tr_hybrid_active = lambda: False
+    # mtp_k=3: the request bucket of 8 requests verifying 3 drafts each
+    runner.req_graph = {(8, 3)}
     return runner
 
 
 def test_only_a_producer_with_a_drafter_may_miss_a_recording():
-    """Everywhere else a missing `(bs, q)` is a capture gap, and handing
+    """Everywhere else a missing request bucket is a capture gap, and handing
     `decide` no shapes keeps it a `KeyError` at replay instead of a silent
     eager step."""
     producer = _graph_runner(is_pd_producer=True)
-    assert set(ModelRunner._producer_graph_shapes(producer)) == {(8, 4)}
+    assert (8, 3) in ModelRunner._producer_graph_shapes(producer)
 
     assert (
         ModelRunner._producer_graph_shapes(_graph_runner(is_pd_producer=False)) is None
@@ -293,7 +293,7 @@ def test_only_a_producer_with_a_drafter_may_miss_a_recording():
         is None
     )
 
-    producer.enforce_eager = True
+    producer.req_graph = None  # enforce_eager: nothing recorded
     assert ModelRunner._producer_graph_shapes(producer) is None
 
 

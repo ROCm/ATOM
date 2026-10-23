@@ -18,7 +18,9 @@ try:
     from atom.model_ops.attentions.aiter_mla import (
         AiterMLAMetadataBuilder,
         _pad_prefill_mla_draft_tail,
+        indexes_by_token_table,
     )
+    from atom.model_ops.indexer import ConcatKeys, concat_rows
 except (ImportError, RuntimeError) as exc:
     pytest.skip(f"aiter MLA backend unavailable: {exc}", allow_module_level=True)
 
@@ -589,11 +591,21 @@ def _capture_metadata_builder(dcp_world_size, *, is_sparse):
         var["dcp_local_context_lens"] = _FakeMetadataBuffer(bs)
 
     builder = object.__new__(AiterMLAMetadataBuilder)
-    builder.model_runner = SimpleNamespace(forward_vars=var)
+    builder.model_runner = SimpleNamespace(
+        forward_vars=var,
+        block_size=1,
+        config=SimpleNamespace(max_model_len=1024),
+    )
     builder.block_size = 1
     builder.is_sparse = is_sparse
     builder.dcp_world_size = dcp_world_size
+    builder.index_kpool = 1
+    builder._indexer_fp4 = False
+    builder.index_logits_workspace = None
     builder._publishes_dcp_local_lens = is_sparse and dcp_world_size > 1
+    builder.indexes_by_token_table = indexes_by_token_table(
+        is_sparse, dcp_world_size, builder.index_kpool
+    )
     builder._tbo_full_running_bs = 0
     builder.dtype_q = None
     builder.set_mla_persistent_worker_buffers = lambda *args, **kwargs: {}
@@ -669,3 +681,30 @@ def test_ubatch_metadata_views_full_dcp_local_context_buffer():
         torch.tensor([13, 14], dtype=torch.int32),
     )
     assert "ub1_dcp_local_context_lens" not in var
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_a_tbo_prefill_ubatch_scores_against_the_whole_steps_keys(world):
+    """A token split can cut a request in two: the second ubatch's rows of it
+    see keys the first ubatch's tokens wrote, so an ubatch scores against the
+    step's gathered keys -- row starts unrebased -- and under DCP this rank's
+    share of its own rows."""
+    keys = ConcatKeys(
+        block_tables=torch.zeros(2, 4, dtype=torch.int32),
+        cu_committed=torch.tensor([0, 6, 10], dtype=torch.int32),
+        total=10,
+        row_starts=torch.tensor([0] * 6 + [6] * 4, dtype=torch.int32),
+    )
+    step = concat_rows(torch.arange(1, 11, dtype=torch.int32), keys)
+    builder = SimpleNamespace(dcp_rank=world - 1, dcp_world_size=world)
+    # Tokens 4..10: the last two of request 0, then request 1.
+    ub_slice = SimpleNamespace(token_slice=slice(4, 10), request_slice=slice(0, 2))
+
+    rows = AiterMLAMetadataBuilder._ubatch_prefill_index_rows(
+        builder, step, None, None, ub_slice
+    )
+
+    assert rows.row_ends.tolist() == list(range(5, 11))
+    assert rows.concat.total == 10
+    assert rows.concat.row_starts.tolist() == [0, 0, 6, 6, 6, 6]
+    assert rows.split.world == world

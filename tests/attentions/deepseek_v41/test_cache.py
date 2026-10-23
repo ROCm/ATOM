@@ -62,10 +62,9 @@ def window_lens(geo, *, start, extend):
         plan_buffers=buffers,
         extra_write=0,
     )
-    # No host plan is a forward that closes no group.
     return {
-        ratio: np.zeros(0) if rows is None else rows[:, 3]
-        for ratio, rows in ((r, p.compress_plan_cpu) for r, p in plans.items())
+        ratio: buffers[ratio]["compress"].np[: plan.num_compress, 3]
+        for ratio, plan in plans.items()
     }
 
 

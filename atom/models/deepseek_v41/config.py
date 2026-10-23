@@ -344,9 +344,9 @@ def validate_runtime_config(config):
     graph_mode = getattr(config.compilation_config, "cudagraph_mode", None)
     for name, enabled in (
         (
-            "CUDAGraph mode (use FULL, PIECEWISE or enforce_eager=True)",
+            "CUDAGraph mode (use FULL, TR_HYBRID or enforce_eager=True)",
             not config.enforce_eager
-            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE),
+            and graph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.TR_HYBRID),
         ),
         (
             "torch.compile level (use 0 or 3)",

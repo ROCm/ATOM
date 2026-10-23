@@ -13,6 +13,7 @@ TOKEN_ROW_BYTES = {
     "res_out": HC * HIDDEN * 2,
     "pend": HIDDEN * 2,
     "normed": HIDDEN * 2,
+    "x": HIDDEN * 2,
     "aux": HIDDEN * 2,
     "out": HIDDEN * 2,
     "pre_in": HC * 4,
@@ -37,7 +38,7 @@ def own_count(s, tp):
 def own_view(c, names):
     """``c`` seen from this rank's tokens: S their count, ``t0`` the first one's
     row of the step, and each per-token argument in ``names`` moved to it."""
-    n = own_count(c["S"], c["d"].tp)
+    n = own_count(c["S"], c["d"].ranks)
     t0 = c["rank"] * n
     lo = fx.Int64(t0)
     args = dict(c["args"])

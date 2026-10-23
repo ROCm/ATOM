@@ -54,7 +54,7 @@ class UBatchSlice:
 
 def maybe_create_ubatch_slices(
     num_reqs: int,
-    num_tokens: int,
+    scheduled_tokens: int,
     num_ubatches: int = 2,
     is_prefill: bool = False,
     num_scheduled_tokens: np.ndarray | None = None,
@@ -97,7 +97,7 @@ def maybe_create_ubatch_slices(
                 return None
         # Prefill: token-balanced split
         if token_split:
-            if num_tokens < num_ubatches:
+            if scheduled_tokens < num_ubatches:
                 return None
             return _split_prefill_token_midpoint(
                 num_reqs,
@@ -115,7 +115,7 @@ def maybe_create_ubatch_slices(
     # Decode: uniform split by request count
     slices = []
     reqs_per_ub = num_reqs // num_ubatches
-    tokens_per_req = num_tokens // num_reqs if num_reqs > 0 else 1
+    tokens_per_req = scheduled_tokens // num_reqs if num_reqs > 0 else 1
 
     for i in range(num_ubatches):
         req_start = i * reqs_per_ub

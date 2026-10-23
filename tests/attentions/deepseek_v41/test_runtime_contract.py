@@ -379,7 +379,7 @@ def test_supported_cache_and_piecewise_graph_modes(cache_dtype, graph):
             index_cache_dtype="fp8",
             enforce_eager=not graph,
             compilation_config=SimpleNamespace(
-                level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                level=0, cudagraph_mode=CUDAGraphMode.TR_HYBRID
             ),
         )
     )
@@ -416,7 +416,7 @@ def test_native_dspark_passes_production_admission(graph, dynamic, tp_size, leve
         compilation_config=SimpleNamespace(
             level=level,
             cudagraph_mode=(
-                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.PIECEWISE
+                CUDAGraphMode.FULL if level == 3 else CUDAGraphMode.TR_HYBRID
             ),
         ),
         hf_config=SimpleNamespace(),
@@ -455,7 +455,7 @@ def test_level3_requires_full_graph_or_eager_runtime():
             runtime_config(
                 enforce_eager=False,
                 compilation_config=SimpleNamespace(
-                    level=3, cudagraph_mode=CUDAGraphMode.PIECEWISE
+                    level=3, cudagraph_mode=CUDAGraphMode.TR_HYBRID
                 ),
             )
         )

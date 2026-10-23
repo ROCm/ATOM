@@ -265,7 +265,7 @@ class DeepseekV41DSpark(DSparkDraftModel):
         if plan is not None:
             # A replayed forward ran the decoder, whose rows these come from,
             # on its tail alone: the draft's window takes the same rows.
-            if plan.tail is None:
+            if not plan.tail.requests:
                 return
             rows, step = plan.tail_rows, plan.tail
             aux_concat, positions = aux_concat[rows], positions[rows]

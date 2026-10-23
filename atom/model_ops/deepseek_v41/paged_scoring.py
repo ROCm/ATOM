@@ -1,91 +1,63 @@
 # SPDX-License-Identifier: MIT
-"""CSA2 index scoring, straight out of the paged index plane.
+"""CSA2 index scoring, straight out of the paged index plane, through the
+shared scorer (`atom.model_ops.indexer.score_topk`).
 
-The only index scorer there is: it hands the plane to
-`deepgemm_fp8_paged_mqa_logits` (FP8) or `flydsl_pa_mqa_logits_fp4` (FP4,
-`index_plane`) and never materializes a key, and what it asks in return is
-that visibility be a per-row prefix.
+What is CSA2's here is how a layer's rows read the plane, said as the shared
+`IndexRows`: FP8 rows each off their own tile list (`unit_tiles`); FP4 rows a
+request's together off its PAGE table (`Fp4MqaRaggedMetadata`), their logits
+packed by visibility (`PackedRows`) where the step laid them out so. A layer
+bounded by an earlier layer's candidates scores only those blocks: the kept
+list is handed over as the block table (`candidate_table`), so the width is
+`candidate_topk_blocks` blocks and not a whole context, and its columns are
+lifted back to compressed-row ids after. A layer producing candidates picks
+them off each band's logits before its top-k.
 
-A layer bounded by an earlier layer's candidates scores only those blocks: the
-kept list is handed over as the block table (`candidate_table`), so the width
-is `candidate_topk_blocks` blocks and not a whole context.
-
-Each query row is its own batch item (`next_n=1`) with its own bound and its
-own tile list, so nothing here is a function of the batch's composition: a
-prefill token, a decode token and a drafted token are the same row to it, and
-a ragged batch needs no uniform query length. DeepSeek-V4's own paged scorer
-reshapes `[bs, next_n]` and does demand one, which is why V4 keeps a separate
-concatenated-key scorer for prefill and this file does not. FP4 is the
-exception where it can be: a layer scoring requests' whole contexts hands the
-kernel a request's rows as one sequence (`Fp4MqaRaggedMetadata`), sharing
-each key load, each row still with its own bound.
+Each query row is its own batch item (`next_n=1`) with its own bound, so
+nothing here is a function of the batch's composition: a prefill token, a
+decode token and a drafted token are the same row to it, and a ragged batch
+needs no uniform query length.
 
 Scoring a prefill batch here rather than by concatenating the batch's keys was
 measured on the production geometry: `/app/logs_claude/v41_index_scorer_record.md`.
-The two arrangements pick identical rows and run within 15% of each other, and
-this one's logits are `1/batch` of the other's because its columns are one
-request's rows rather than every request's.
 """
 
 import torch
-from aiter import dtypes
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
-from aiter.ops.quant import dynamic_per_token_scaled_quant, rope_rotate_activation
-from aiter.ops.topk import top_k_per_row_decode
-from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
-from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.sparse_indexer_chunk import logits_rows
-from atom.model_ops.v4_kernels import scale_indexer_weights
+from atom.model_ops.indexer import (
+    IndexCache,
+    fold_query_scale,
+    fp4_rows,
+    fp8_rows,
+    quantize_query,
+    quantize_query_rows,
+    score_topk,
+)
 
 from .candidate_table import lift_candidate_selection
 from .indexer import pick_candidate_blocks, pick_candidate_blocks_packed
 
-
-def quantize_query_rows(query):
-    """E4M3 with one FP32 scale per `(token, head)` row.
-
-    Not ATOM's `quantize_fp8`, whose grid is group-32 E8M0: the scorer
-    dequantizes Q by folding one scale into that head's weight, so the row is
-    the quantization block and the scale is a plain float.
-    """
-    rows = query.reshape(-1, query.shape[-1])
-    stored = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
-    scale = torch.empty((rows.shape[0], 1), dtype=torch.float32, device=rows.device)
-    dynamic_per_token_scaled_quant(stored, rows, scale)
-    return stored.view_as(query), scale
+__all__ = [
+    "quantize_query_fp4",
+    "quantize_query_rows",
+    "score_topk_paged",
+    "score_topk_quantized",
+]
 
 
 def quantize_query_fp4(query, rope, positions):
     """`(values, scales)` of the index query before its RoPE, `query` [rows,
-    heads, dim], in one launch: V4's fused RoPE + FP4 quant (aiter
-    `rope_rotate_activation`), the rotated values rounded to `query`'s dtype
-    first (`round_rope`) as V4.1's RoPE writes them, then the official FP4
-    arithmetic (E2M1, one ceil-E8M0 a 32-dim group). Each row its own sequence
-    of one: values [rows, 1, heads, dim / 2], scales in the row-group scorer's
-    packed order."""
-    rows, heads, dim = query.shape
-    values = torch.empty(
-        rows, 1, heads, dim // 2, dtype=torch.uint8, device=query.device
-    )
-    scales = torch.empty(
-        rows, 1, dim // 128, 4, 16, -(-(heads // 16) // 4) * 4,
-        dtype=torch.uint8, device=query.device,
-    )  # fmt: skip
-    rope_rotate_activation(
-        values.view(dtypes.fp4x2),
+    heads, dim], in one launch, the rotated values rounded to `query`'s dtype
+    first as V4.1's RoPE writes them, then the official FP4 arithmetic (E2M1,
+    one ceil-E8M0 a 32-dim group). Each row its own sequence of one."""
+    return quantize_query(
         query,
         rope.cos_cache,
         rope.sin_cache,
         positions,
         rope.rope_dim,
-        out_scale=scales,
-        group_size=32,
-        shuffle_scale=True,
-        do_rotate_act=False,
+        fp4=True,
         round_rope=True,
     )
-    return values, scales
 
 
 def score_topk_paged(
@@ -102,37 +74,17 @@ def score_topk_paged(
     candidate_count=0,
     workspace=None,
 ):
-    """`(selected, candidate blocks)` for a whole forward's query rows.
+    """`(selected, candidate blocks)` for a whole forward's FP8 query rows:
+    `query` rotated, quantized here, its scale folded into the head weights.
 
     `selected` is `[rows, topk]` ascending compressed-row ids, -1 padded, the
-    layout `build_indices` reads. Rows past a row's own visibility are never
-    picked: both kernels take `visible` as the bound, so the columns the
-    scorer left unwritten are outside it.
-
-    `units` is the owner's FP8 `IndexUnits` (an FP4 query is quantized with
-    its RoPE, `quantize_query_fp4`, and scored by `score_topk_quantized`). The
-    block the kernel pages by comes off it, which is the only place it is a
-    fact rather than a restatement. The width follows it: a row's whole
-    context, or the kept blocks alone. Which one does not reach the caller --
-    `selected` is compressed-row ids either way.
-
-    `candidates` (`CandidateBlocks`, bound once a forward and shared by every
-    layer they bound) limits this layer to an earlier layer's blocks and
-    `candidate_count` makes this layer that earlier one; never both.
-
-    Rows run in bands bounded by both the index addressing limit and the
-    shared logits memory budget. In a 1M-context configuration, the address
-    limit alone allows an 8 GiB temporary, even for short live contexts.
-    The band is taken from `workspace` when given, else allocated.
+    layout `build_indices` reads. `candidates` (`CandidateBlocks`) limits this
+    layer to an earlier layer's blocks and `candidate_count` makes this layer
+    that earlier one; never both. The plane is `workspace`'s when given.
     """
     rows, heads = weights.shape
     q_fp8, q_scale = quantize_query_rows(query)
-    # Q's scale is dequantized by folding it into its head's weight, which is
-    # the only place the kernel has for it. Elementwise, so the whole batch's
-    # goes in one launch and a band takes its slice.
-    scaled = scale_indexer_weights(
-        weights.contiguous(), q_scale.view(rows, heads, 1), weights_scale
-    )
+    scaled = fold_query_scale(weights, q_scale.view(rows, heads, 1), weights_scale)
     return score_topk_quantized(
         q_fp8,
         scaled,
@@ -168,38 +120,20 @@ def score_topk_quantized(
     head weights with the query scale and `weights_scale` folded in. FP4:
     `query` is `quantize_query_fp4`'s pair and `scaled` the head weights, the
     kernel applying `weight_scale` to them. The mono decode computes both
-    itself. The rest, `workspace` included, as there.
+    itself.
 
     `ragged` (`Fp4MqaRaggedMetadata`, FP4) scores each of its sequences' rows
-    off the sequence's block table, sharing each key load, and `tiles` is then
-    unused. Without it each row is its own sequence on its own `tiles` (or
-    candidate) row; a candidate-bounded layer's rows always are.
-
+    off the sequence's block table, and `tiles` is then unused. Without it
+    each row is its own sequence on its own `tiles` (or candidate) row.
     `packed` (`PackedRows`, with `ragged`) scores into `workspace`'s packed
     logits rather than a plane, the step's rows laid out band by band.
     """
-    if packed is not None:
-        assert ragged is not None and workspace is not None and workspace.packed
-        assert candidates is None, "candidate rows keep their own tables"
-        return _score_topk_packed(
-            query,
-            scaled,
-            units,
-            ragged,
-            packed,
-            workspace,
-            topk=topk,
-            block_size=block_size,
-            candidate_count=candidate_count,
-            weight_scale=weight_scale,
-        )
-    rows = scaled.shape[0]
-    tile = units.values.shape[1]
     # Producing candidates reads scores at their real columns, so a layer that
     # also scored inside someone else's would have two meanings for a column.
     assert not (candidate_count and candidates is not None)
-    compacted = candidates is not None
-    if compacted:
+    tile = units.values.shape[1]
+    cache = IndexCache(units.values, units.scales if units.fp4 else None, tile)
+    if candidates is not None:
         # One number reached by two paths: the geometry pages the plane at
         # `candidate_block_size`, and this is where they have to agree.
         assert candidates.rows_per_block == tile, (
@@ -213,200 +147,92 @@ def score_topk_quantized(
     elif ragged is not None:
         # Every block of each request, PAGE by PAGE, and the row's own
         # visibility into it.
-        table, bound, width = ragged.block_tables, visible, _ragged_width(ragged, tile)
+        table, bound = ragged.block_tables, visible
+        width = ragged.block_tables.shape[1] * ragged.pages_per_block * tile
     else:
         # Every block the request owns, and the row's own visibility into it.
         table, bound, width = tiles, visible, tiles.shape[1] * tile
-    device = scaled.device
-    selected = torch.empty(rows, topk, dtype=torch.int32, device=device)
+    if packed is not None:
+        assert ragged is not None and workspace is not None and workspace.packed
+        bound = packed.visible
+    rows = _index_rows(cache, scaled, table, bound, width, ragged, packed, workspace)
+    count = scaled.shape[0]
     chosen = (
-        torch.empty(rows, candidate_count, dtype=torch.int32, device=device)
+        torch.empty(count, candidate_count, dtype=torch.int32, device=scaled.device)
         if candidate_count
         else None
     )
-    band = (
-        logits_rows(rows, width)
-        if workspace is None
-        else workspace.logits_rows(rows, width)
+    selected = score_topk(
+        query,
+        scaled,
+        cache,
+        rows,
+        topk=topk,
+        weight_scale=weight_scale,
+        stable=True,
+        on_band=(
+            None
+            if not candidate_count
+            else _picker(bound, block_size, chosen, packed, workspace, width)
+        ),
     )
-    # One band's plane, reused; a short last band is a prefix of it.
-    logits = (
-        torch.empty(min(rows, band), width, dtype=torch.float32, device=device)
-        if workspace is None
-        else workspace.logits(min(rows, band), width)
-    )
-    for start in range(0, rows, band):
-        count = min(band, rows - start)
-        span = slice(start, start + count)
-        seen, scores = bound[span], logits[:count]
-        by_sequence = ragged is not None
-        if by_sequence:
-            band_ragged = ragged.band(start, count, rows)
-        elif units.fp4:
-            # every row its own sequence on its own table row
-            starts = (
-                torch.arange(count + 1, dtype=torch.int32, device=device)
-                if workspace is None
-                else workspace.row_starts(count)
-            )
-            band_ragged = Fp4MqaRaggedMetadata(starts, 1, table[span])
-        else:
-            band_ragged = None
-        _band_logits(
-            query,
-            scaled,
-            units,
-            span,
-            scores,
-            seen,
-            None if by_sequence else table[span],
-            width,
-            weight_scale,
-            band_ragged,
-        )
-        if candidate_count:
-            pick_candidate_blocks(scores, seen, block_size, chosen[span])
-        top_k_per_row_decode(
-            scores,
-            1,
-            seen,
-            selected[span],
-            count,
-            scores.stride(0),
-            scores.stride(1),
-            k=topk,
-            stable=True,
-        )
-    if compacted:
+    if candidates is not None:
         # Columns of the compacted width, which only this function knows how to
         # read; every caller past it wants compressed-row ids.
         lift_candidate_selection(selected, candidates.ids, rows_per_block=tile)
     # Ascending already: `stable=True` is aiter's deterministic ascending,
     # smallest-index-first emit with `-1` for a short row, which is the order
-    # the attention kernel sums its prefix in. Re-sorting it here was a kernel
-    # that changed nothing, ties included.
+    # the attention kernel sums its prefix in.
     return selected, chosen
 
 
-def _ragged_width(ragged, tile):
-    """Columns of the plane `ragged`'s block tables span, `tile` rows a PAGE."""
-    return ragged.block_tables.shape[1] * ragged.pages_per_block * tile
-
-
-def _score_topk_packed(
-    query,
-    scaled,
-    units,
-    ragged,
-    packed,
-    workspace,
-    *,
-    topk,
-    block_size,
-    candidate_count,
-    weight_scale,
-):
-    """`score_topk_quantized` for a whole-context FP4 layer, its logits
-    packed: each band's rows scored, picked from and top-k'd in place. The
-    top-k is told the plane width the rows stand for, so it runs what that
-    plane would and picks what it would."""
-    plane_width = _ragged_width(ragged, units.values.shape[1])
-    rows, device = scaled.shape[0], scaled.device
-    selected = torch.empty(rows, topk, dtype=torch.int32, device=device)
-    chosen = (
-        torch.empty(rows, candidate_count, dtype=torch.int32, device=device)
-        if candidate_count
-        else None
+def _index_rows(cache, scaled, table, bound, width, ragged, packed, workspace):
+    """This layer's rows as the shared scorer reads them."""
+    if not cache.fp4:
+        return fp8_rows(bound, width, workspace, table)
+    count, heads = scaled.shape
+    starts = (
+        None
+        if ragged is not None
+        else (
+            workspace.row_starts(count)
+            if workspace is not None
+            else torch.arange(count + 1, dtype=torch.int32, device=scaled.device)
+        )
     )
-    logits, maxima = workspace.packed_logits(), workspace.packed_maxima()
-    for first, end in packed.bands:
-        span, count = slice(first, end), end - first
-        seen, offsets = packed.visible[span], packed.offsets[span]
-        _band_logits(
-            query,
-            scaled,
-            units,
-            span,
-            logits,
-            seen,
-            None,
-            plane_width,
-            weight_scale,
-            ragged.band(first, count, rows),
-            out_offsets=offsets,
-        )
-        if candidate_count:
-            pick_candidate_blocks_packed(
-                logits,
-                offsets,
-                maxima,
-                packed.block_offsets[span],
-                seen,
-                block_size,
-                chosen[span],
-                plane_width,
-            )
-        top_k_per_row_decode(
-            logits,
-            1,
-            seen,
-            selected[span],
-            count,
-            0,
-            1,
-            k=topk,
-            stable=True,
-            row_starts=offsets,
-            plane_width=plane_width,
-        )
-    return selected, chosen
-
-
-def _band_logits(
-    query,
-    scaled,
-    units,
-    span,
-    scores,
-    seen,
-    table,
-    width,
-    weight_scale,
-    ragged,
-    out_offsets=None,
-):
-    """Rows `span`'s logits into `scores`, each row seeing `seen` columns: FP8
-    of the pages its `table` row lists, FP4 by `ragged`'s sequences, a
-    sequence's rows sharing each key load. FP4 `out_offsets`: `scores` is flat,
-    row r at its offset."""
-    page_rows = units.values.shape[1]
-    if units.fp4:
-        values, scales = query
-        flydsl_pa_mqa_logits_fp4(
-            values[span],
-            scales[span],
-            units.values,
-            units.scales,
-            weights=scaled[span],
-            max_seq_len=width,
-            weight_scale=weight_scale,
-            kv_block_size=page_rows,
-            out=scores,
-            out_offsets=out_offsets,
-            **ragged.kernel_args(
-                seen, heads=scaled.shape[1], page_size=page_rows, max_seq_len=width
-            ),
-        )
-        return
-    count, heads = scores.shape[0], scaled.shape[1]
-    deepgemm_fp8_paged_mqa_logits(
-        query[span].view(count, 1, heads, query.shape[-1]),
-        units.values.unsqueeze(-2),
-        scaled[span],
-        scores,
-        seen,
-        table,
+    return fp4_rows(
+        bound,
         width,
-        KVBlockSize=page_rows,
-        Preshuffle=True,
+        workspace,
+        ragged,
+        heads=heads,
+        page_size=cache.rows_per_block,
+        row_tables=None if ragged is not None else table,
+        row_starts=starts,
+        bands=None if packed is None else packed.bands,
+        packed_offsets=None if packed is None else packed.offsets,
     )
+
+
+def _picker(bound, block_size, chosen, packed, workspace, width):
+    """Each band's candidate blocks, off its logits before their top-k."""
+    if packed is None:
+
+        def pick(scores, span):
+            pick_candidate_blocks(scores, bound[span], block_size, chosen[span])
+
+        return pick
+
+    def pick_packed(scores, span):
+        pick_candidate_blocks_packed(
+            scores,
+            packed.offsets[span],
+            workspace.packed_maxima(),
+            packed.block_offsets[span],
+            packed.visible[span],
+            block_size,
+            chosen[span],
+            width,
+        )
+
+    return pick_packed

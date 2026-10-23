@@ -36,6 +36,7 @@ from atom.model_ops.engram.device.hashing import engram_snapshot_indices
 from atom.model_ops.engram.device.staging import EngramStaging
 from atom.model_ops.engram.device.uva import uva_gather_into
 from atom.model_ops.v4_kernels import sparse_attn_v4_paged_2src
+from atom.utils.region_graph import join_stream
 
 logger = logging.getLogger("atom")
 
@@ -192,7 +193,7 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
         # Once graphs bind the serving pool, an idle DP rank must publish
         # padding into that pool's metadata. A fresh scratch cache would refill
         # different indptr addresses while replay still reads the captured ones.
-        if batch.is_dummy_run and self.cache is not None and cache_override is None:
+        if self._idle(batch) and cache_override is None:
             return self._prepare_idle(
                 batch,
                 running_bs,
@@ -422,9 +423,7 @@ def _attend_block(
         hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
     )
     qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
-    selecting = self._fork_select(
-        hidden, qr, qr_scale, cache, step, rope, compressed=compressed
-    )
+    self._fork_select(hidden, qr, qr_scale, cache, step, rope, compressed=compressed)
     if queries is not None:
         qr, qr_scale = queries.take(qr, qr_scale)
     query = self.wq_b(qr, x_scale=qr_scale).unflatten(-1, (self.heads, self.head_dim))
@@ -440,11 +439,9 @@ def _attend_block(
             self.spec.layer_id, None, kv_normed, rope, step
         )
         cache.rotate_query(query, rope, queries.positions)
-    # A forked compressor is already inside this join, having been waited
-    # at the scorer; where the scorer itself was not forked it waited on
-    # the main stream instead and there is nothing left to join here.
-    if selecting is not None:
-        selecting.wait_stream(self.index_stream)
+    # A forked compressor was already waited at the scorer, on whichever
+    # stream that ran; joining it again costs one wait and keeps one rule.
+    join_stream(self.index_stream, self.compress_stream)
     prefix, prefix_indptr, second, second_indptr = (
         cache.attention_indices(self.spec, step)
         if queries is None

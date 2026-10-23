@@ -295,11 +295,11 @@ def _is_minimax_m3_owner(owner: Any) -> bool:
 
 
 def install_minimax_mono_plugin_refusal() -> None:
-    """Refuse MiniMax mono before the piecewise cudagraph check.
+    """Refuse MiniMax mono before the TR_HYBRID cudagraph check.
 
     ``#2419`` builds every ``_config_refusal`` clause up front. SGLang leaves
     ``compilation_config.cudagraph_mode`` as None, so
-    ``requires_piecewise_compilation`` crashes before the ``plugin mode``
+    ``uses_tr_hybrid`` crashes before the ``plugin mode``
     clause can refuse. Mono is unsupported here; return that reason without
     reading ``cudagraph_mode``.
     """

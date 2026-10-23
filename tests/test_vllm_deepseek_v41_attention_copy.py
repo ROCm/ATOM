@@ -37,9 +37,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 CORE = ROOT / "atom/models/deepseek_v41/attention.py"
 PLUGIN = ROOT / "atom/plugin/vllm/v41_core_overrides.py"
 
-# sha256 of core's `Attention.forward`, comments and blank lines stripped.
-CORE_PREPARE_DIGEST = "4f502d41815e8e82"
-CORE_FORWARD_DIGEST = "ae2d04bba437a30e"
+# sha256 of core's `Attention.forward` and `_attend`, comments and blank
+# lines stripped.
+CORE_PREPARE_DIGEST = "6e6ba60ac60f4825"
+CORE_FORWARD_DIGEST = "1137e7d2471869cd"
 
 
 @pytest.fixture
@@ -154,11 +155,13 @@ def test_plugin_quantized_qkv_preserves_bf16_auxiliary_readers(
 
 
 def _core_forward() -> str:
-    """`Attention.forward`'s source, by AST rather than by text markers.
+    """The source of the attention half the plugin copies: `Attention.forward`
+    and `_attend`, the region it attends in, by AST rather than by text
+    markers.
 
-    `forward` is the last method in its class, so a "next def" marker has
-    nothing to find -- and a marker that silently matches to end-of-file
-    would fold every later edit into the digest.
+    A "next def" marker would have nothing to find after the class's last
+    method -- and a marker that silently matches to end-of-file would fold
+    every later edit into the digest.
     """
     src = CORE.read_text()
     cls = next(
@@ -166,12 +169,13 @@ def _core_forward() -> str:
         for n in ast.parse(src).body
         if isinstance(n, ast.ClassDef) and n.name == "Attention"
     )
-    fn = next(
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward"
-    )
+    lines = src.split("\n")
     return "\n".join(
         line.rstrip()
-        for line in src.split("\n")[fn.lineno - 1 : fn.end_lineno]
+        for name in ("forward", "_attend")
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == name
+        for line in lines[fn.lineno - 1 : fn.end_lineno]
         if line.strip() and not line.strip().startswith("#")
     )
 

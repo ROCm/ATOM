@@ -159,8 +159,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the nearest state checkpoint by more than the window's receptive field,
     # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
     # to rebuild every layer's window and compressor state exactly.
-    "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
-    in {"1", "true", "yes", "on"},
+    "ATOM_DSV4_STATE_REPLAY": lambda: (
+        os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
     # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
     # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
     # Store, no LMCache). Unset = off.
@@ -191,10 +192,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request on that immutable cache owner. Existing sessions never spill;
     # child correlation ids are independently load-placed rather than
     # inheriting their parent's owner.
-    "ATOM_DP_SESSION_AFFINITY": lambda: os.getenv(
-        "ATOM_DP_SESSION_AFFINITY", "0"
-    ).lower()
-    in {"1", "true", "yes", "on"},
+    "ATOM_DP_SESSION_AFFINITY": lambda: (
+        os.getenv("ATOM_DP_SESSION_AFFINITY", "0").lower() in {"1", "true", "yes", "on"}
+    ),
     # --- DP prefill cost balancing (DP attention with more than one rank) ---
     # Under DP attention every rank prefills in the same lockstep step and the
     # step lasts as long as the slowest rank. With the same token budget, a rank
@@ -305,8 +305,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # where the mori shared-memory transport is unavailable or undesirable.
     # The fallback gathers hidden/router rows across DP ranks, computes only
     # the locally owned experts, then reduce-scatters the outputs.
-    "ATOM_DISABLE_MORI_EP": lambda: os.getenv("ATOM_DISABLE_MORI_EP", "0").lower()
-    in {"1", "true", "yes", "on"},
+    "ATOM_DISABLE_MORI_EP": lambda: (
+        os.getenv("ATOM_DISABLE_MORI_EP", "0").lower() in {"1", "true", "yes", "on"}
+    ),
     # Use mori dispatch_combine_v2 (FlyDSL/cco, gfx1250 wave32) instead of the
     # production mori v1 (mori.ops.EpDispatchCombineOp) for the EP+DP MoE
     # all2all. v1 is authored for gfx942/950 and does not run on gfx1250; v2 is
@@ -320,7 +321,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This also selects the transport: 1 binds aiter's MegaMoEGfx1250, which owns
     # the fused dispatch/combine pair, 0 binds mori's v2 op-layer running plain
     # gather, i.e. the untouched upstream baseline. Formerly ATOM_MORI_V2_FUSED.
-    "ATOM_MEGA_STAGE2_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1"),
+    "ATOM_MEGA_STAGE2_FUSED": lambda: os.getenv("ATOM_MEGA_STAGE2_FUSED", "1") == "1",
     # MegaMoE combine (return-trip) wire: bf16 | fp8 | fp4. Prefill-only; decode
     # always combines in bf16. Ignored unless ATOM_MEGA_STAGE2_FUSED is on.
     "ATOM_MEGA_COMBINE_WIRE": lambda: os.getenv("ATOM_MEGA_COMBINE_WIRE", "bf16"),
@@ -329,7 +330,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows directly. Needs ATOM_MEGA_STAGE2_FUSED and an fp8/fp4
     # MEGA_DISPATCH_WIRE; a bf16 wire keeps the token-major path regardless of
     # this flag.
-    "ATOM_MEGA_STAGE1_FUSED": lambda: (os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1"),
+    "ATOM_MEGA_STAGE1_FUSED": lambda: os.getenv("ATOM_MEGA_STAGE1_FUSED", "1") == "1",
     # Reuse a small MegaMoEV2 instance for native DP-unified small decode/
     # verify/draft forwards on the supported EP8, 48-experts-per-rank layout. Set to 0
     # to keep the configured max_num_batched_tokens capacity for every graph.
@@ -432,7 +433,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 1 to read Qwen GDN state checkpoints out of the chunk kernel's
     # interior states instead of cutting prefill chunks onto them. PAGE path
     # only (Qwen3-Next / Qwen3.5); see `PagedStateCheckpointCoordinator`.
-    "ATOM_GDN_STATE_MIDSTEP": lambda: (os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1"),
+    "ATOM_GDN_STATE_MIDSTEP": lambda: os.getenv("ATOM_GDN_STATE_MIDSTEP", "0") == "1",
     # DSA sparse-indexer prefill: KV-dimension chunk size (in tokens) for
     # `fp8_mqa_logits`. The dense logits buffer is [prefill_tokens, total_kv];
     # total_kv = sum of all co-scheduled prefill contexts and is NOT bounded by
@@ -463,10 +464,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DCP_PREFILL_QREP": lambda: os.getenv("ATOM_DCP_PREFILL_QREP", "0") == "1",
     # DCP sparse prefill: use the non-persistent fp8 gqa64 MLA kernel, which
     # needs no work metadata. On by default; needs an aiter with ROCm/aiter#6132.
-    "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: os.getenv(
-        "ATOM_DCP_SPARSE_PREFILL_NONPS", "1"
-    )
-    == "1",
+    "ATOM_DCP_SPARSE_PREFILL_NONPS": lambda: (
+        os.getenv("ATOM_DCP_SPARSE_PREFILL_NONPS", "1") == "1"
+    ),
     # GLM-5.2 (glm_moe_dsa): enable the fused indexer qk-rope + fp8-quant + kv-cache
     # kernel (indexer_qk_rope_quant_and_cache), same path DeepSeek-V3.2 uses. GLM's
     # indexer dims (index_head_dim=128, qk_rope_head_dim=64, per_1x128, neox rope) are
@@ -518,7 +518,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so this switch alone does nothing. What it cannot serve is refused by
     # name in atom.models.glm52.mono.config.indexer_cp_refusal, and a refusal
     # leaves the fused indexer running exactly as it does with CP off.
-    "ATOM_GLM52_INDEXER_CP": lambda: (os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1"),
+    "ATOM_GLM52_INDEXER_CP": lambda: os.getenv("ATOM_GLM52_INDEXER_CP", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py). Use with --enforce-eager.
     "ATOM_MONO_CHECK": lambda: os.getenv("ATOM_MONO_CHECK", "0") == "1",
@@ -541,6 +541,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # periods and the noise floor under them are in the environment doc, and
     # end-to-end throughput is too coarse to see an effect that size.
     "ATOM_DSV41_SIDE_STREAMS": lambda: int(os.getenv("ATOM_DSV41_SIDE_STREAMS", "0")),
+    # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
+    # comma-separated token counts to record. A prefill longer than the largest
+    # runs eagerly; empty records none. The default tops out at 3072 because
+    # the pool grows with the largest bucket (16384 costs ~10 GB per GPU on
+    # V4.1 TP4) while prefills that long are GPU-bound and gain little. Only
+    # an attention backend with `supports_token_graph` takes them.
+    "ATOM_TOKEN_GRAPH_SIZES": lambda: tuple(
+        int(s)
+        for s in os.getenv("ATOM_TOKEN_GRAPH_SIZES", "256,512,1024,2048,3072").split(
+            ","
+        )
+        if s.strip()
+    ),
+    # Under DP with a drafter, the largest token-bucket TR graph to record: a
+    # decode bucket past it never runs under DP, and recording it only grows
+    # the graph pool.
+    "ATOM_TOKEN_GRAPH_DP_MAX_TOKENS": lambda: int(
+        os.getenv("ATOM_TOKEN_GRAPH_DP_MAX_TOKENS", "512")
+    ),
+    # DeepSeek-V4.1's decoder on a bounded-replay prefill's tail, recorded as a
+    # request graph (`models/deepseek_v41/decoder_graph.py`): the comma-separated
+    # `running_bs` to record at. Any other runs the same tail eagerly; empty
+    # records none.
+    "ATOM_DECODER_GRAPH_SIZES": lambda: tuple(
+        int(s)
+        for s in os.getenv("ATOM_DECODER_GRAPH_SIZES", "1,2,3,4,8,16").split(",")
+        if s.strip()
+    ),
     # Kimi-K3 DSpark draft: fuse the per-layer context-row KV write
     # (K3DSparkMLAAttention.write_context_kv) into one Triton kernel --
     # RMSNorm(kv_c) + rope(k_pe) + concat + paged-cache store, versus today's
@@ -656,10 +684,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_METRICS_UPDATE_INTERVAL_S": lambda: _positive_float_env(
         "ATOM_METRICS_UPDATE_INTERVAL_S", "1.0"
     ),
-    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: os.getenv(
-        "ATOM_ENABLE_METRICS_DEVICE_TIMER", "0"
-    )
-    == "1",
+    "ATOM_ENABLE_METRICS_DEVICE_TIMER": lambda: (
+        os.getenv("ATOM_ENABLE_METRICS_DEVICE_TIMER", "0") == "1"
+    ),
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     # Move the startup heap (model, compiled graph, tokenizer, KV block pool)
     # into CPython's permanent generation once warmup is done, so collections
@@ -680,11 +707,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # that this tokenizer decodes a token span the same way wherever the window
     # starts; "on"/"off" pin it. Unrelated to the KV prefix cache.
     # See enable_delta_reuse in atom/entrypoints/openai/streaming_dispatch.py.
-    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: os.getenv(
-        "ATOM_DETOKENIZER_DELTA_REUSE", "auto"
-    )
-    .strip()
-    .lower(),
+    "ATOM_DETOKENIZER_DELTA_REUSE": lambda: (
+        os.getenv("ATOM_DETOKENIZER_DELTA_REUSE", "auto").strip().lower()
+    ),
     # How often the reused delta is checked against a real decode once reuse is
     # on. 1 checks every update; a mismatch corrects that call's output and
     # turns reuse off for the process.  Text, not int, for the reason
@@ -789,7 +814,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
     # Force Triton attention fallbacks where available. Set to 1 to bypass
     # optional ASM/OPUS fast paths during debugging.
-    "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
+    "ATOM_FORCE_ATTN_TRITON": lambda: os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1",
     # Force the OPUS kernel for DeepSeek-V4 fp8 sparse prefill instead of the
     # aiter asm kernel (`mla_sparse_prefill_fp8_asm`, the default). Escape hatch
     # for the asm path; that kernel is gfx1250-only and hard-requires H == 128,
@@ -813,7 +838,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Route the paged decode to aiter's FlyDSL kernel (with its work planner)
     # instead of gluon. Needs aiter with #5809.
-    "ATOM_PA_FLYDSL": lambda: (os.getenv("ATOM_PA_FLYDSL", "0") == "1"),
+    "ATOM_PA_FLYDSL": lambda: os.getenv("ATOM_PA_FLYDSL", "0") == "1",
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
@@ -847,8 +872,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group so each rank reads [H, V/dp] instead of the full [H, V], exchanging
     # only the packed [N, 2]. Active only for a unified (rectangular) pure-DP
     # draft step; everything else falls back to the replicated local argmax.
-    "ATOM_DP_DRAFT_ARGMAX": lambda: os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower()
-    in ("1", "true"),
+    "ATOM_DP_DRAFT_ARGMAX": lambda: (
+        os.getenv("ATOM_DP_DRAFT_ARGMAX", "1").lower() in ("1", "true")
+    ),
     # Row count (running_tokens) above which it falls back: the hidden gather
     # grows with rows, so the shard only pays at small M. ~256 is the V4-Pro
     # crossover.
@@ -872,16 +898,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_FUSE_SHARED_EXPERT": lambda: (
         os.getenv("ATOM_FUSE_SHARED_EXPERT", "1").lower() == "1"
     ),
-    # Opt-in: MoE shared||routed fork inside a PIECEWISE-captured piece. Capture
-    # holds it and GSM8K is unmoved; off until a throughput win is shown. Shared
-    # dispatcher, so this moves V2/V3.2/K3 too. See docs.
-    "ATOM_DUAL_STREAM_PIECEWISE": lambda: os.getenv("ATOM_DUAL_STREAM_PIECEWISE", "0")
-    == "1",
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",
     # --- MoE all2all (MoRI) wire format ---
-    "ATOM_MORI_FP4_DISPATCH": lambda: (os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1"),
+    "ATOM_MORI_FP4_DISPATCH": lambda: os.getenv("ATOM_MORI_FP4_DISPATCH", "0") == "1",
     # Combine-side codec. "none" (the MoRI default) sends bf16 back;
     # "fp8_blockwise" selects EpCombineIntraNodeKernel_*_fp8bwq_*.
     "ATOM_MORI_COMBINE_QUANT": lambda: os.getenv("ATOM_MORI_COMBINE_QUANT", "none"),
@@ -900,9 +921,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional Cargo features for the Atomesh package build (e.g. "ext-proc").
     "ATOM_MESH_FEATURES": lambda: os.getenv("ATOM_MESH_FEATURES", "").strip(),
     # Route the OpenAI-compatible server entrypoint through Atomesh.
-    "USE_ATOMESH_ENTRYPOINTS": lambda: (
-        os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"
-    ),
+    "USE_ATOMESH_ENTRYPOINTS": lambda: os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1",
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
@@ -997,7 +1016,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # fragmented short-input prefills / small partial tail chunks batch into one
     # forward instead of firing many tiny ones.
     "ATOM_ENABLE_PREFILL_DELAYER": lambda: (
-        os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1") == "1"
+        os.getenv("ATOM_ENABLE_PREFILL_DELAYER", "1").lower() in ("1", "true")
     ),
     # Fill target: release prefill once accumulated pending tokens reach
     # target_fill * max_num_batched_tokens (averaged across prefillable ranks).
@@ -1018,9 +1037,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_PREFILL_DELAYER_PARTIAL_MAX_TICKS", "100")
     ),
     # Consecutive non-growing ticks after which the coalescer gives up waiting
-    # (burst ended, more won't come) and releases.
+    # (burst ended, more won't come) and releases, including while some DP rank
+    # has no prefill.
     "ATOM_PREFILL_DELAYER_STALL_TICKS": lambda: int(
         os.getenv("ATOM_PREFILL_DELAYER_STALL_TICKS", "10")
+    ),
+    # With DP prefill cost balancing: also release while some DP rank has no
+    # prefill when the work expected to reach that rank in a held decode step
+    # can't pay for the requests it delays, or once they have waited as long
+    # as the decode stall of one unaligned prefill step.
+    "ATOM_PREFILL_DELAYER_COST_GATE": lambda: (
+        os.getenv("ATOM_PREFILL_DELAYER_COST_GATE", "1").lower() in ("1", "true")
     ),
     # KV high watermark: at/above this KV usage a prefillable rank force-releases
     # (can't accumulate a bigger batch anyway).
@@ -1052,7 +1079,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Memoise a waiting request's prefix walk across the per-tick probes (the
     # delayer, the DP chunk-cost estimate; `BlockManager.can_allocate_memoized`).
     # "0" re-walks every tick.
-    "ATOM_PREFIX_WALK_MEMO": lambda: (os.getenv("ATOM_PREFIX_WALK_MEMO", "1") == "1"),
+    "ATOM_PREFIX_WALK_MEMO": lambda: os.getenv("ATOM_PREFIX_WALK_MEMO", "1") == "1",
     # Hash the prompt block chain in the frontend and ship it to the engine.
     # "0" leaves all hashing to the engine.
     "ATOM_FRONTEND_PREFIX_HASH": lambda: (
@@ -1060,7 +1087,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
     # claims. "0" walks block by block with a token compare per block.
-    "ATOM_PREFIX_FAST_WALK": lambda: (os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1"),
+    "ATOM_PREFIX_FAST_WALK": lambda: os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1",
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.

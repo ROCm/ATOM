@@ -89,12 +89,12 @@ def _build_prefill_case(seq_lens):
 
     rng = np.random.default_rng(0)
 
-    # topk_indices holds FLAT KV indices here (not within-sequence positions).
-    # Token t of seq b selects `counts[t]` positions of its own causal window;
-    # a strided-then-wrapped pick keeps the selection non-contiguous.
+    # topk_indices holds positions within the token's sequence, as the shared
+    # scorer emits them. Token t selects `counts[t]` positions of its own
+    # causal window; a strided-then-wrapped pick keeps the selection
+    # non-contiguous.
     topk = np.full((num_tokens, PRE_TOPK), -1, dtype=np.int32)
     for t in range(num_tokens):
-        b = batch_id_per_q_token[t]
         n = counts[t]
         p = local_off[t]
         sel = (np.arange(n, dtype=np.int64) * 7919) % (p + 1)
@@ -105,7 +105,7 @@ def _build_prefill_case(seq_lens):
         # indistinguishable. Shuffle it back.
         sel = np.unique(sel)
         rng.shuffle(sel)
-        topk[t, : len(sel)] = cu_k[b] + sel.astype(np.int32)
+        topk[t, : len(sel)] = sel.astype(np.int32)
         kv_indptr[t + 1] = kv_indptr[t] + len(sel)
 
     max_blocks = int(
@@ -142,7 +142,6 @@ def _run_prefill(case, interleave=1):
             g["kv_indptr"],
             g["batch_id_per_q_token"],
             g["topk"],
-            g["cu_k"],
             g["block_table"],
             r,
             PRE_W,
@@ -175,7 +174,6 @@ def test_prefill_filter(seq_lens, interleave, world):
     case = _build_prefill_case(np.asarray(seq_lens, dtype=np.int32))
     per_rank = _run_prefill(case, interleave)
 
-    cu_k = case["cu_k"]
     bid = case["batch_id_per_q_token"]
     bt = case["block_table"]
     topk = case["topk"]
@@ -210,10 +208,7 @@ def test_prefill_filter(seq_lens, interleave, world):
             ind, buf, cnts = per_rank[r]
             slots = buf[ind[t] : ind[t + 1]]
             exp_slots = [
-                slot
-                for p in (want - cu_k[b])
-                for owner, slot in [_writer(b, p)]
-                if owner == r
+                slot for p in want for owner, slot in [_writer(b, p)] if owner == r
             ]
 
             # Contract: a row this rank owns nothing of gets one valid dummy
@@ -236,10 +231,9 @@ def test_prefill_filter(seq_lens, interleave, world):
             assert cnts[t] == len(
                 exp_slots
             ), f"token={t} rank={r}: owned_count {cnts[t]} != {len(exp_slots)}"
-            assert list(slots) == exp_slots, (
-                f"token={t} rank={r}: slots {list(slots)[:8]}... "
-                f"!= {exp_slots[:8]}..."
-            )
+            assert (
+                list(slots) == exp_slots
+            ), f"token={t} rank={r}: slots {list(slots)[:8]}... != {exp_slots[:8]}..."
 
         # Partition: every candidate is claimed by exactly one rank -- neither
         # dropped nor double-claimed, which is what cp_lse_ag_out_rs needs.

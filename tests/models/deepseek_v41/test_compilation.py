@@ -336,7 +336,7 @@ def test_idle_prefill_runs_padding_ffn_without_attention_or_cache_writes(monkeyp
         total_seqs_num=1,
         total_tokens_num=8,
     )
-    metadata, positions = builder.prepare_prefill(batch, 2)
+    metadata, positions = builder.prepare_prefill(batch, 2, batch.total_tokens_num)
     metadata.engram_embeddings = Rows()
     step = metadata.step
     assert step.requests == () and step.is_prefill and not step.decode
