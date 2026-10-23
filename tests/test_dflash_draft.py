@@ -871,6 +871,10 @@ def test_dspark_proposer_hands_the_target_model_to_the_draft():
 
 def _guard_refuses(draft_hf):
     """Mirror of `config.py` 2352-2358, the predicate under the DCP guard."""
+    # get_attn_backend resolves to aiter_attention, which imports aiter at module
+    # load. Skip per test, not per module, so the source-only guard test below
+    # still runs on the CPU-only CI runner.
+    pytest.importorskip("aiter")
     from atom.spec_decode.draft_kv import needs_non_causal_kv
     from atom.utils.selector import attn_family, get_attn_backend
 
@@ -963,6 +967,9 @@ def test_dcp_guard_message_names_the_real_reason():
 
 def _entry_tokens(block_size, dcp, non_causal_gqa):
     """Call the real property against a minimal stub."""
+    # dspark_proposer imports triton at module load; the CPU-only CI runner has
+    # none. The pure-arithmetic mirrors below do not need it and keep running.
+    pytest.importorskip("triton")
     from atom.spec_decode.dspark_proposer import DSparkProposer
 
     stub = types.SimpleNamespace(
