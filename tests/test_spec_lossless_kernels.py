@@ -148,6 +148,24 @@ def test_a_greedy_row_without_a_destination_still_drafts_the_argmax():
     assert (store == -7.0).all()
 
 
+def test_a_sampled_row_without_a_destination_drafts_the_argmax():
+    """Pad, dummy and align-only rows write no q; they draft the argmax
+    rather than id 0, so a misclassified step would still propose sensibly."""
+    rows, vocab, rank = 16, 2048, 64
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    temps, greedy, seed = draft_args(rows, temperature=1.0, step=3)
+    store = torch.full((4, vocab), -7.0, device=DEV)
+    row_base = torch.full((rows,), -1, dtype=torch.int32, device=DEV)
+    ref = torch.empty(rows, dtype=torch.int64, device=DEV)
+    dspark_markov_argmax(base, prev, w1, w2, ref)
+    out = torch.empty(rows, dtype=torch.int64, device=DEV)
+    dspark_markov_sample(
+        base, prev, w1, w2, out, store, row_base, 0, temps, greedy, seed, 0
+    )
+    assert torch.equal(out, ref)
+    assert (store == -7.0).all()
+
+
 def test_sampled_ids_follow_the_q_they_publish():
     rows, vocab, rank = 8192, 48, 16
     base, prev, w1, w2 = tables(1, vocab, rank, seed=5)

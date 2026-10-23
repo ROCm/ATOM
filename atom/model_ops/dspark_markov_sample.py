@@ -715,15 +715,16 @@ def _dspark_markov_sample_stage3(
 
     q_base = tl.load(q_row_base_ptr + row)
     has_q = q_base >= 0
-    # A sampled row with no destination loads -inf everywhere, so its
-    # probabilities are 0, its keys tie at 0 and it drafts the tile's first id.
-    # Nothing reads it.
     offs = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * vocab_size + offs_v
     scaled = tl.load(q_ptr + offs, mask=v_mask & has_q, other=float("-inf"))
     row_max = tl.load(row_max_ptr + row)
     inv_z = tl.load(row_inv_z_ptr + row)
     greedy = tl.load(greedy_mask_ptr + row) != 0
-    if greedy:
+    # A row with no destination publishes nothing and drafts its argmax, like
+    # a greedy one: its drafts are meant to be dropped, but if one ever were
+    # verified it would be a sensible block, not a run of id 0.
+    delta = greedy | (q_base < 0)
+    if delta:
         argmax = tl.load(row_argmax_ptr + row)
         probs = tl.where(v_mask & (offs_v == argmax), 1.0, 0.0)
     else:
@@ -739,7 +740,7 @@ def _dspark_markov_sample_stage3(
     # in (0, inf] and the key probs / E is always finite (u == 0 gives key 0,
     # which simply loses the race).
     exp_noise = -tl.log(u)
-    denom = tl.where(greedy, 1.0, exp_noise)
+    denom = tl.where(delta, 1.0, exp_noise)
     key = tl.where(v_mask, probs / denom, -1.0)
 
     tile_best = tl.max(key, axis=0)
