@@ -14,14 +14,15 @@ Ported from SGLang's DSA round-robin CP path
 """
 
 import logging
+from functools import cache
 from typing import NamedTuple, Optional
 
 import torch
-
 from aiter.dist.parallel_state import (
     get_pcp_group,
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
+    get_tp_group,
 )
 
 
@@ -44,7 +45,34 @@ class PcpBalGroup(NamedTuple):
     )
 
 
+class PcpSharedGrid(NamedTuple):
+    """How a pcp-redundant per-token module is cut. See `pcp_merged_tp_grid`.
+
+    `size` ways, this rank holding shard `rank`, and `prescale` the factor its
+    output needs before the tp/pcp collectives sum it -- `size / (pcp * tp)`,
+    which is 1.0 exactly when the cut uses the whole folded grid.
+    """
+
+    size: int
+    rank: int
+    prescale: float
+
+
 logger = logging.getLogger("atom")
+
+
+@cache
+def _warn_unaligned_fold(shard_dim: int, pcp_size: int, full: int, align: int) -> None:
+    """Once per distinct shape, not once per layer -- every block asks."""
+    logger.warning(
+        "PCP merge: leaving a %d-wide tensor replicated across the %d pcp "
+        "ranks -- no divisor of the %d-wide folded grid cuts it into "
+        "%d-aligned pieces, so it keeps the 1/pcp_size pre-scale instead.",
+        shard_dim,
+        pcp_size,
+        full,
+        align,
+    )
 
 
 def get_pcp_world_size() -> int:
@@ -57,6 +85,125 @@ def get_pcp_rank() -> int:
 
 def pcp_is_enabled() -> bool:
     return get_pcp_world_size() > 1
+
+
+def pcp_split_active(dsa_fallback_topk: int | None) -> bool:
+    """Did PCP row-split the CURRENT prefill forward?
+
+    The mechanism every model shares -- pcp enabled, real prefill, not a
+    dummy/warmup run -- lives here once. The one genuine difference stays a
+    parameter: a backend that falls back to dense MHA on short batches is not
+    PCP-wired there, so it must pass its threshold and gets False below it.
+    `aiter_mla.py` (the V3.2 / deepseek_v2 family) has that fallback keyed on
+    `max_seqlen_k > index_topk`; DeepSeek-V4's attention has no such branch, so
+    it passes None and every prefill counts.
+
+    Merging the two conditions instead of parameterising them would be wrong in
+    both directions: V4 would wrongly report "not split" for prompts under its
+    own index_topk, and the v2 family would wrongly report "split" for batches
+    that never reached the sparse path.
+
+    Reads only batch-global state, so every PCP rank gets the same answer --
+    which is what lets a caller gate a collective on it. It is NOT stable across
+    a step: a drafter that rewrites `is_prefill` or bumps `max_seqlen_k` changes
+    the answer, so evaluate it while the target's own forward context still
+    stands, not partway through drafting.
+    """
+    from atom.utils.forward_context import get_forward_context
+
+    if not pcp_is_enabled():
+        return False
+    ctx = get_forward_context()
+    context = getattr(ctx, "context", None)
+    if context is None:
+        return False
+    if not bool(context.is_prefill) or bool(getattr(context, "is_dummy_run", False)):
+        return False
+    if dsa_fallback_topk is None:
+        return True
+    attn_metadata = getattr(ctx, "attn_metadata", None)
+    if attn_metadata is None:
+        return False
+    return int(getattr(attn_metadata, "max_seqlen_k", 0)) > int(dsa_fallback_topk)
+
+
+def pcp_merged_tp_grid(
+    shard_dim: int | None = None, align: int = 1
+) -> PcpSharedGrid | None:
+    """How to cut a pcp-redundant per-token module, or None to leave it on TP.
+
+    Lets a module that is otherwise replicated across PCP shard on (a divisor
+    of) the same `pcp_size * tp_size` grid FusedMoE folds onto, so the existing
+    tp all_reduce + pcp reduce_scatter/all_reduce sum its partials for free.
+
+    The counting argument is the whole correctness story. Those two collectives
+    between them sum all `pcp_size * tp_size` rank contributions. Cut `g` ways
+    with shard index `flat_rank % g`, and `g | pcp*tp` makes every shard land on
+    exactly `pcp*tp/g` ranks, so the sum comes back `pcp*tp/g` too large --
+    hence `prescale`. The two hand-written cases this generalises: `g == pcp*tp`
+    needs no scale, and `g == tp_size` (replicated across PCP, i.e. this
+    returning None) is the familiar `1/pcp_size`.
+
+    `shard_dim` with `align` is what keeps `g` from outrunning the checkpoint:
+    block-quantised scales only slice on `align` boundaries, so a `g` that cuts
+    `shard_dim` into non-`align` pieces would fault in the weight loader. We
+    step down to the largest divisor that stays clean rather than failing, and
+    return None once that is just the TP group -- the path the model has always
+    taken. `flat_rank` stays `pcp_rank * tp_size + tp_rank`, matching
+    `FusedMoEParallelConfig.make`, so a TP group owns a contiguous run and its
+    PCP partner the next one.
+
+    One level of that fold is deliberately NOT mirrored: `make` folds DP into TP
+    first when `flatten_tp_across_dp_for_moe`. A module summed only by the tp
+    all_reduce + the pcp collective never gets a DP reduce, so following it
+    there would shard into pieces nothing adds back up. That combination is
+    refused below instead.
+    """
+    from atom.config import get_current_atom_config
+    from atom.utils import envs
+
+    pcp_size = get_pcp_world_size()
+    if pcp_size <= 1 or not bool(envs.ATOM_PCP_MOE_MERGE):
+        return None
+    cfg = get_current_atom_config()
+    # Same disjunction as moe.py's `flatten_tp_across_dp_for_moe`. The first
+    # half is already refused at startup (llm_engine.py, PCP + DP-attention);
+    # the second defaults off and only the vLLM plugin sets it, so this guards
+    # a door that is shut rather than one anyone walks through today.
+    if getattr(cfg, "enable_dp_attention", False) or getattr(
+        cfg, "moe_ep_flatten_tp_across_dp", False
+    ):
+        raise ValueError(
+            "ATOM_PCP_MOE_MERGE=1 cannot be combined with MoE's "
+            "flatten-TP-across-DP (enable_dp_attention or "
+            "moe_ep_flatten_tp_across_dp): the routed experts would shard "
+            "across pcp*dp*tp while the pcp-folded modules shard across "
+            "pcp*tp, and no collective sums the dp dimension back for the "
+            "latter. Set ATOM_PCP_MOE_MERGE=0 or drop the flatten."
+        )
+    tp_size = get_tp_group().world_size
+    tp_rank = 0 if tp_size == 1 else get_tp_group().rank_in_group
+    full = pcp_size * tp_size
+
+    size = tp_size
+    for cand in range(full, tp_size - 1, -1):
+        if full % cand:
+            continue
+        if shard_dim is None or (
+            shard_dim % cand == 0 and (shard_dim // cand) % align == 0
+        ):
+            size = cand
+            break
+    if size <= tp_size:
+        # Nothing the TP group does not already cut -- stay on it.
+        if shard_dim is not None and full > tp_size:
+            _warn_unaligned_fold(shard_dim, pcp_size, full, align)
+        return None
+    return PcpSharedGrid(
+        size=size,
+        rank=(get_pcp_rank() * tp_size + tp_rank) % size,
+        prescale=size / full,
+    )
 
 
 def pcp_pad_len(

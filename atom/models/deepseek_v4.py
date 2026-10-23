@@ -67,9 +67,11 @@ from atom.distributed.pcp_utils import (
     pcp_all_reduce,
     pcp_allgather_rankmajor,
     pcp_allgather_rerange,
+    pcp_merged_tp_grid,
     pcp_pad_len,
     pcp_reduce_scatter,
     pcp_round_robin_split,
+    pcp_split_active,
 )
 from atom.model_loader.loader import WeightsMapper
 from atom.model_loader.weight_utils import local_model_dir
@@ -3642,8 +3644,19 @@ class Expert(nn.Module):
         quant_config: Any | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        tp_grid: tuple[int, int] | None = None,
     ):
         super().__init__()
+        # `tp_grid` overrides the (size, rank) both projections shard on. The
+        # shared expert passes whatever `pcp_merged_tp_grid` picked, so it is
+        # cut across pcp instead of replicated on every pcp rank; None keeps the
+        # TP group. A grid coarser than pcp*tp is answered by the caller's
+        # pre-scale, not here -- this only sizes the weights.
+        grid = (
+            {"override_tp_size": tp_grid[0], "override_tp_rank": tp_grid[1]}
+            if tp_grid is not None
+            else {}
+        )
         # Fused [w1; w3] (gate_up_proj): both share input x, both ColumnParallel
         # — standard llama/dsv2 fusion. Disk still split; routed via
         # packed_modules_mapping in DeepseekV4ForCausalLM.
@@ -3653,6 +3666,7 @@ class Expert(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            **grid,
         )
         self.w2 = RowParallelLinear(
             inter_dim,
@@ -3661,6 +3675,7 @@ class Expert(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.w2",
+            **grid,
         )
         self.swiglu_limit = swiglu_limit
         # Switch: route clamp + silu(gate)*up [+ weights] + per-token FP8 1x128
@@ -3800,6 +3815,16 @@ class MoE(nn.Module):
 
         if not self._fuse_shared_into_routed:
             # self.experts.num_fused_shared_experts = 0
+            # Cut on the pcp-folded grid when moe_pcp_merge is on, so the shared
+            # expert stops being a full replica on every pcp rank. Its partials
+            # are then summed by the same tp all_reduce + pcp
+            # reduce_scatter/all_reduce the routed experts already ride.
+            # `align=128` is the same block-scale granularity the FusedMoE above
+            # pads to; the grid steps down to a coarser divisor rather than hand
+            # the weight loader a shard that splits a scale block.
+            self._shared_pcp_grid = pcp_merged_tp_grid(
+                shard_dim=args.moe_inter_dim, align=128
+            )
             self.shared_experts = Expert(
                 args.dim,
                 args.moe_inter_dim,
@@ -3807,9 +3832,23 @@ class MoE(nn.Module):
                 quant_config=qc,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
+                tp_grid=(
+                    None
+                    if self._shared_pcp_grid is None
+                    else (self._shared_pcp_grid.size, self._shared_pcp_grid.rank)
+                ),
             )
         else:
+            self._shared_pcp_grid = None
             self.shared_experts = None
+        # What `combine_outputs` owes the collectives downstream: `g/(pcp*tp)`
+        # for a grid that cut it g ways, `1/pcp_size` for one left on the TP
+        # group (grid None). Unused when there is no separate shared expert.
+        self._shared_prescale = (
+            self._shared_pcp_grid.prescale
+            if self._shared_pcp_grid is not None
+            else 1.0 / max(get_pcp_world_size(), 1)
+        )
         if self.is_hash_layer:
             # Inject hash routing into FusedMoE.select_experts via the
             # custom_routing_function hook (added in atom/model_ops/moe.py).
@@ -3963,18 +4002,17 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         if shared is not None:
-            # PCP with ATOM_PCP_MOE_MERGE=1 (non-fused shared only): the shared expert
-            # is NOT pcp-sharded (its MergedColumn/RowParallelLinear bind to the
-            # 4-card tp group, so every pcp rank holds the same shared weights
-            # and computes the same full shared output — pcp-redundant). After
-            # this combine the result rides through Block.forward's pcp
-            # reduce_scatter, which SUMS the pcp partners. Without correction the
-            # shared part would be summed pcp_size times (doubled for pcp=2). So
-            # pre-scale shared by 1/pcp_size: the reduce_scatter then RESTORES it
-            # to 1x instead of multiplying. routed is genuinely pcp-sharded
-            # (partial sum) so it must NOT be scaled — only shared.
-            if _moe_pcp_merge_active() or _moe_pcp_merge_decode_active():
-                shared = shared * (1.0 / get_pcp_world_size())
+            # The tp all_reduce below and the pcp reduce_scatter/all_reduce in
+            # Block between them sum all pcp*tp rank contributions. A shared
+            # expert cut g ways is held by pcp*tp/g of those ranks, so its sum
+            # comes back that many times too large -- `_shared_prescale` is the
+            # g/(pcp*tp) that lands it at 1x. Cut on the whole folded grid it is
+            # 1.0 (a genuine partial sum, like routed, nothing to undo); left
+            # replicated on the TP group it is the familiar 1/pcp_size.
+            if self._shared_prescale != 1.0 and (
+                _moe_pcp_merge_active() or _moe_pcp_merge_decode_active()
+            ):
+                shared = shared * self._shared_prescale
             routed = routed + shared
         if self.tp_size > 1:
             # ATOM AR layer decides internally (via _tbo_aware_tp_reduce) whether
@@ -4594,10 +4632,10 @@ def _pcp_active() -> bool:
     not dummy/warmup run). Decode runs PCP-redundant (full KV, no split); the
     warmup dummy run has no valid KV cache so it must skip the split path.
     """
-    if get_pcp_world_size() <= 1:
-        return False
-    fc = get_forward_context()
-    return fc.context.is_prefill and not fc.context.is_dummy_run
+    # Policy: V4's attention has no length-keyed dense fallback (that branch is
+    # aiter_mla.py's, i.e. the deepseek_v2 family), so every real prefill splits
+    # -- hence None. Mechanism shared with deepseek_v2 via pcp_split_active.
+    return pcp_split_active(None)
 
 
 def _moe_pcp_merge_active() -> bool:
@@ -4823,6 +4861,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
         "shared_experts.w3": ("shared_experts.gate_up_proj", 1),
     }
+
+    def pcp_split_active(self) -> bool:
+        """Did this model's last forward PCP row-split? Callers outside the model
+        (the drafter, via ModelRunner) ask here rather than re-deriving the gate,
+        so the family-specific policy stays in one place."""
+        return _pcp_active()
 
     def __init__(self, config: Config, prefix: str = "") -> None:
         super().__init__()

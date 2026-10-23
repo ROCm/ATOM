@@ -19,7 +19,6 @@ import tqdm
 from aiter import destroy_dist_env, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
-    get_pcp_group,
     get_pp_group,
     get_tp_group,
     graph_capture,
@@ -30,6 +29,7 @@ from torch.profiler import record_function
 from atom.config import Config, CUDAGraphMode, set_current_atom_config
 from atom.distributed.pcp_utils import (
     PcpBalGroup,
+    get_pcp_group,
     get_pcp_world_size,
     pcp_allgather_rerange,
     pcp_pad_len,
@@ -183,6 +183,21 @@ def max_schedulable_decode_bs(
 # Re-exported under the old private name: this module is where the predicate
 # used to live and where callers (and tests) still import it from.
 _kv_config_has_producer = kv_config_has_producer
+
+
+def _needs_id_sync(is_deferred_out: bool, has_drafter: bool) -> bool:
+    """Do the sampled ids have to agree across a parallel group this step?
+
+    Only when they feed back as device-side input to the next forward, which is
+    exactly these two: deferred-out hands them on as `prev_token_ids`, and a
+    drafter consumes them as its draft input. Otherwise `prepare_sampled_ids`
+    returns through the host and leaves no GPU state to diverge from.
+
+    One predicate for both the PCP and the TP broadcast, which have to stay the
+    same condition -- they are the same question asked of two groups, and two
+    copies of it would eventually answer differently.
+    """
+    return is_deferred_out or has_drafter
 
 
 class TokenLocations(NamedTuple):
@@ -3307,18 +3322,37 @@ class ModelRunner:
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16
             # ULP, flipping ~24% of the near-tie verify argmaxes). Accept counts
             # then differ per rank and the emitted streams fork. Sync the
-            # decision instead: the ids and the verdict.
+            # verdict here; it is spec-only and must land before the three
+            # values unpacked from it. The ids are synced below, outside this
+            # branch, so the non-spec paths get them too.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                _g = get_pcp_group()
-                sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
-                verdict = _g.broadcast(verdict, src=0)
+                verdict = get_pcp_group().broadcast(verdict, src=0)
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
+        # PCP ranks run the same forward redundantly and are consistent only
+        # while their kernels agree bit-for-bit -- they don't (~1 bf16 ULP, which
+        # flips near-tie argmaxes). Measured: ~1.8% of sampled ids differ, and
+        # deferred-out feeds them straight back as the next step's input, so the
+        # moe_pcp_merge all_reduce then sums MoE partials from mismatched hidden
+        # states -- the very thing its own comment assumes cannot happen. Pin the
+        # ids to rank 0. Same condition as the TP broadcast below.
+        if get_pcp_world_size() > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
+        ):
+            sampled_tokens = get_pcp_group().broadcast(
+                sampled_tokens.contiguous(), src=0
+            )
+
         # Drafter input must agree across TP ranks.
-        if get_tp_group().world_size > 1 and (
-            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
+        # Only the ids, on purpose: the sampler is stochastic (independent noise
+        # for n>1 fan-out). The verdict is not -- it is a deterministic function
+        # of target_probs and the draft ids, which TP ranks share bit-for-bit,
+        # so broadcasting it here would be a no-op. Only PCP needs it (its
+        # target_probs differ), and syncs it above.
+        if get_tp_group().world_size > 1 and _needs_id_sync(
+            self.tokenID_processor.is_deferred_out, hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
@@ -3331,6 +3365,12 @@ class ModelRunner:
             sampled_logprobs = log_probs.gather(
                 -1, sampled_tokens.to(torch.long).unsqueeze(-1)
             ).squeeze(-1)
+            # TP only, and the asymmetry with the ids above is deliberate rather
+            # than an oversight: logprobs never feed the next forward, they just
+            # leave through the output channel, and only worker 0 has one -- a
+            # non-zero rank's copy is dropped. So PCP, whose ranks genuinely do
+            # differ here, needs no broadcast, while this TP one (a no-op on
+            # bit-identical inputs) is kept as it was.
             if get_tp_group().world_size > 1 and self.tokenID_processor.is_deferred_out:
                 sampled_logprobs = get_tp_group().broadcast(sampled_logprobs, src=0)
 
@@ -3461,10 +3501,23 @@ class ModelRunner:
         self._mark_staging_h2d_enqueued()
         logits, hidden_states = self.run_model(input_ids, batch)
 
+        # Whether that forward row-split for PCP, settled HERE and cached: the
+        # drafters below rewrite the very state the gate reads (is_prefill,
+        # max_seqlen_k), so it has only one truthful moment. This also has to be
+        # plain Python on the caller side -- a hook or a model-side assignment
+        # would be skipped on a cudagraph replay while its device work still ran,
+        # leaving per-rank answers that deadlock anything gated on them.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            get_forward_context().context.pcp_split_rows = (
+                self.model.pcp_split_active()
+                if hasattr(self.model, "pcp_split_active")
+                else False
+            )
+
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
 
-        drafter = getattr(self, "drafter", None)
         # An output-less batch still runs propose() for its DP collectives.
         will_align_draft = (
             self._dp_draft_lockstep_active()

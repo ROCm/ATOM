@@ -11,6 +11,11 @@ from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
 from atom.config import Config
+from atom.distributed.pcp_utils import (
+    get_pcp_world_size,
+    pcp_allgather_rerange,
+    pcp_pad_len,
+)
 from atom.model_loader.loader import load_model
 from atom.spec_decode.draft_graph import DraftGraph
 from atom.utils import CpuGpuBuffer, resolve_obj_by_qualname
@@ -449,10 +454,33 @@ class Drafter(abc.ABC):
         row-aligned to ``target_hidden_states`` (the tensor they accompany), or
         None if this drafter captures no aux. The fixed capture buffers are
         sliced to ``target_hidden_states``' row count — the caller never juggles
-        token counts."""
+        token counts.
+
+        A PCP prefill gathers its rows back only at the very end of the target
+        forward, so these hooks -- sitting on intermediate layers -- captured
+        this rank's 1/pcp round-robin stripe. Gather here so the row alignment
+        promised above actually holds; without it most of the rows the caller
+        reads are the previous forward's leftovers, which halves DSpark's
+        acceptance rate.
+
+        Both `pcp_split_rows` and the row arithmetic are batch-global, so every
+        rank takes the same branch -- required, since this is a collective.
+        Deliberately NOT keyed on how many rows the hooks wrote: that bookkeeping
+        is plain Python inside a hook whose device-side copy is captured into the
+        decode cudagraph, so it stops updating on replay while the copy keeps
+        running, and the resulting per-rank disagreement deadlocks here.
+        """
         if not self._captures_aux:
             return None
         n = target_hidden_states.shape[0]
+        pcp_ws = get_pcp_world_size()
+        ctx = getattr(get_forward_context(), "context", None)
+        if pcp_ws > 1 and n > 0 and getattr(ctx, "pcp_split_rows", False):
+            n_local = pcp_pad_len(n, pcp_ws) // pcp_ws
+            return [
+                pcp_allgather_rerange(buf[:n_local], pcp_ws)[:n]
+                for buf in self._aux_buffers
+            ]
         return [buf[:n] for buf in self._aux_buffers]
 
     def anchors_to_gpu(self, anchors: list[int]) -> torch.Tensor:

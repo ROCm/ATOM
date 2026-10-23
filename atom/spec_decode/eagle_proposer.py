@@ -26,18 +26,22 @@ logger = logging.getLogger("atom")
 
 
 def _pcp_active_for_draft_model(draft_model: nn.Module) -> bool:
-    # DeepSeek V2/DSA draft models share this sparse-MLA PCP gate.
-    from atom.models.deepseek_v2 import _pcp_active
+    """Whether this draft prefill must be split onto 1/pcp query rows.
 
-    if _pcp_active():
-        return True
+    Asks the draft model's own gate. The previous version tried v2's gate first
+    and fell back to v4's only for a class literally named `DeepseekV4MTP`,
+    which sent every other V4-backed drafter (DSpark's `DeepseekV4DSpark`) to
+    the wrong family's policy -- v2 additionally requires
+    `max_seqlen_k > index_topk`, a dense-fallback threshold V4's attention does
+    not have.
 
-    if draft_model.__class__.__name__ != "DeepseekV4MTP":
-        return False
-
-    from atom.models.deepseek_v4 import _pcp_active as _pcp_active_v4
-
-    return _pcp_active_v4()
+    Reads the answer ModelRunner settled right after the target forward, so it
+    is also immune to the draft loop bumping `max_seqlen_k` or clearing
+    `is_prefill` underneath it.
+    """
+    del draft_model  # the answer is a property of the batch, not of the flavor
+    ctx = getattr(get_forward_context(), "context", None)
+    return bool(getattr(ctx, "pcp_split_rows", False))
 
 
 def _pcp_split_draft_inputs(
@@ -50,7 +54,7 @@ def _pcp_split_draft_inputs(
     A draft prefill reuses the target's attn_metadata, already reindexed to
     1/pcp by the builder, so its q rows must be split to match or aiter aborts
     on `kv_indptr_prefix length must be N+1`. Both draft prefill entry points
-    need this: `propose()`'s i==0 step and `precompute_context_kv`.
+    need this: `propose()`'s i==0 step and `compute_draft_kv`.
 
     Callers gate on `_pcp_active_for_draft_model` first. Returns the shards
     plus (n_global, pcp_ws) for callers that must all-gather back.
@@ -327,9 +331,6 @@ class EagleProposer(Drafter):
         `propose(align_only=True)` for its collectives -- the same redo -- so
         `draft_kv_duplicates_propose` has the runner skip this call there.
 
-        NOTE: unverified against real weights. `build_drafter` routes anything
-        carrying `dspark_block_size` to `DSparkProposer`, and every model on
-        hand takes that branch.
         """
         if not next_token_ids:
             return
