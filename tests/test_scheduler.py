@@ -624,6 +624,20 @@ class TestSchedule:
         batch, _ = sched.schedule()
         assert batch.total_seqs_num_prefill == 2
 
+    def test_prefill_follows_scheduler_max_num_seqs(self, seq_factory):
+        sched = Scheduler(
+            MockConfig(
+                max_num_seqs=2,
+                scheduler_max_num_seqs=1,
+                max_num_batched_tokens=1000,
+                num_kvcache_blocks=100,
+            )
+        )
+        for _ in range(5):
+            sched.add(seq_factory([1, 2, 3, 4]))
+        batch, _ = sched.schedule()
+        assert batch.total_seqs_num_prefill == 1
+
     def test_remote_kv_decode_promotion_respects_max_num_seqs(self, seq_factory):
         """A PD consumer ready for first-decode must NOT be promoted into a full
         running queue — the bug that let decode-side running climb to 2x

@@ -600,7 +600,7 @@ class Scheduler:
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
     ):
-        self.max_num_seqs = config.max_num_seqs
+        self.max_num_seqs = config.scheduler_max_num_seqs or config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         # DP prefill cost balancing, on whenever DP attention runs more than
         # one rank: every rank estimates the cost of its chunk at the whole
@@ -4918,7 +4918,7 @@ class PrefillScheduler:
     _METRICS_ROLE = "prefill"
 
     def __init__(self, config: Config, disagg_cu_shm_name: str = ""):
-        self.max_num_seqs = config.max_num_seqs
+        self.max_num_seqs = config.scheduler_max_num_seqs or config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.block_manager = None  # blocks managed by decode process
         pc = getattr(config, "parallel_config", None)

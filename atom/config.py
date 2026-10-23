@@ -1979,6 +1979,11 @@ class Config:
     enable_encoder_swa_bounded_replay: bool = True
     scheduler_delay_factor: float = 0.0
     max_num_seqs: int = 512
+    # What the scheduler admits when it is lower than `max_num_seqs`: a DSpark
+    # block drafter's buffers need room for two sequences (see
+    # `_size_engine_for_dspark_drafter`), so `--max-num-seqs 1` keeps the user's 1 here and
+    # raises `max_num_seqs` to 2. None means the scheduler follows `max_num_seqs`.
+    scheduler_max_num_seqs: int | None = None
     max_model_len: int | None = None
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
@@ -2158,6 +2163,20 @@ class Config:
         if len(sizes) == 1:
             return list(range(1, 9)) + list(range(16, sizes[0] + 1, 16))
         return list(sizes)
+
+    def _size_engine_for_dspark_drafter(self) -> None:
+        # The block drafter first-compiles at B >= 2 (torch.compile cannot mark a
+        # size-1 batch dim dynamic), and every per-sequence buffer is sized by
+        # `max_num_seqs`, so a 1 here fails at warmup. Size the engine for 2 and
+        # let the scheduler keep running one.
+        if self.max_num_seqs != 1:
+            return
+        self.scheduler_max_num_seqs = 1
+        self.max_num_seqs = 2
+        logger.info(
+            "DSpark needs per-sequence buffers for 2 sequences: --max-num-seqs 1 "
+            "sizes the engine for 2 and the scheduler still runs 1 at a time"
+        )
 
     def __post_init__(self):
         self.moe_all2all_backend = (
@@ -2463,6 +2482,8 @@ class Config:
             num_spec = self.speculative_config.num_speculative_tokens
             is_dspark = getattr(self.speculative_config, "use_dspark", lambda: False)()
             draft_cfg = self.speculative_config.draft_model_hf_config
+            if is_dspark:
+                self._size_engine_for_dspark_drafter()
             if not is_dspark:
                 # Sequential drafters (MTP / Eagle): one drafted token per
                 # backbone pass, and the drafter just repeats that pass, so the

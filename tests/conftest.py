@@ -65,6 +65,7 @@ class MockConfig:
             "dynamic_chunking_smooth_factor": 0.75,
             "dynamic_chunking_min_chunk_size": 4096,
             "max_num_seqs": 4,
+            "scheduler_max_num_seqs": None,
             "max_num_batched_tokens": 64,
             "long_prefill_token_threshold": 0,
             "decode_context_parallel_size": 1,
