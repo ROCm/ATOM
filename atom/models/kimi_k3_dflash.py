@@ -125,7 +125,8 @@ take ONE PER-TENSOR scale and neither can take anything else:
 SGLang stores nothing else either -- it refuses, "Only support per-tensor
 scaling factor for fp8 KV cache" (`srt/layers/quantization/kv_cache.py:76`) --
 and defaults the value to 1.0 when the checkpoint carries no scale, which this
-one does not. So the pool declares NO per-token scale planes
+one does not (verified, see `_store_cfg`). So the pool declares NO per-token
+scale planes
 (`mha_kv_scale_fields(per_tensor_scales=True)`) and the scale is a python 1.0.
 
 `float()` on a multi-element tensor raises ValueError, which
@@ -411,6 +412,15 @@ class KimiK3DFlashAttention(nn.Module):
         (attention_mha.py:182). It is also what SGLang does, one layer up:
         "Only support per-tensor scaling factor for fp8 KV cache"
         (`srt/layers/quantization/kv_cache.py:76`).
+
+        NO SCALE LOADER, AND NONE NEEDED FOR THIS CHECKPOINT. The 1.0 is never
+        read from disk, and here it does not shadow a calibrated value: the
+        SpecForge DFlash draft (RadixArk/Kimi-K3-DSpark @ 3c5bac30) ships no KV
+        scales -- all 62 tensors are BF16, config.json has no
+        quantization_config, and no tensor name contains "scale". A draft that
+        DID ship a calibrated scalar k_scale/v_scale would be silently run at
+        1.0 (this guard only catches multi-element ones), with lower acceptance
+        as the only symptom; supporting one needs a loader, not this guard.
         """
         if self._store is not None:
             return self._store
