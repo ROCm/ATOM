@@ -1017,7 +1017,7 @@ class Scheduler:
                 resume = self._offload_prefill_start(seq)
                 # A replayed hit resumes as one, as admission starts it.
                 cached = self.block_manager.replay_start(
-                    seq, resume, hit=seq.replays_hit
+                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
                 if probed_tokens >= budget:
@@ -1180,7 +1180,7 @@ class Scheduler:
             if self._is_offload_prefill_resume(seq):
                 resume = seq.num_cached_tokens
                 start = self.block_manager.replay_start(
-                    seq, resume, hit=seq.replays_hit
+                    seq, resume, hit=self.block_manager.tier_resume_replays(seq)
                 )
             else:
                 # Runs on every tick with prefill work, holds included: reuse
@@ -2215,7 +2215,7 @@ class Scheduler:
                 # the forward replays below where the load left
                 # `num_cached_tokens` -- the KV-only reach, or the HBM hit if
                 # the load did not run (`Sequence.replay_kv_load`).
-                replayed = seq.replays_hit
+                replayed = self.block_manager.tier_resume_replays(seq)
                 start = self.block_manager.replay_start(
                     seq, seq.num_cached_tokens, hit=replayed
                 )
