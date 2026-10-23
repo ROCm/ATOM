@@ -500,6 +500,30 @@ class TestQuarkParser:
         assert result.global_spec.quant_type == QuantType.per_1x32
         assert result.global_spec.quant_dtype == FP4X2
         assert result.global_spec.is_dynamic is False
+        assert result.global_spec.activation_dtype is None
+        assert result.global_spec.weight_block_size is None
+
+    @pytest.mark.parametrize(
+        "input_dtype, native", [("fp8_e4m3", True), ("fp4_e2m1", False)]
+    )
+    def test_mxfp4_weight_activation_dtype(self, input_dtype, native):
+        mx = {"qscheme": "per_group", "group_size": 32, "scale_format": "e8m0"}
+        result = QuarkParser().parse(
+            {
+                "quant_method": "quark",
+                "global_quant_config": {
+                    "weight": {**mx, "dtype": "fp4_e2m1", "is_dynamic": False},
+                    "input_tensors": {**mx, "dtype": input_dtype, "is_dynamic": True},
+                },
+            }
+        )
+        spec = result.global_spec
+        assert spec.quant_type == QuantType.per_1x32
+        assert spec.quant_dtype == FP4X2
+        # The `torch` this copy of quant_spec closed over is a MagicMock.
+        e4m3 = _qs.torch.float8_e4m3fn
+        assert spec.activation_dtype == (e4m3 if native else None)
+        assert spec.weight_block_size == ((1, 32) if native else None)
 
     def test_two_stage_nvfp4(self):
         parser = QuarkParser()

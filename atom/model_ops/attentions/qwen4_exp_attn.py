@@ -147,6 +147,11 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     """GDN hybrid plus the QSA side caches and the PLE state."""
 
     BACKEND = Qwen4ExpBackend
+    # Store the recurrent state VK even when the decode policy does not need
+    # it: set (before the caches are allocated) by a consumer that reads the
+    # state in place as VK, the mono decode (``qwen4_exp.mono``). ATOM's own
+    # kernels take either layout through the view's strides.
+    gdn_state_vk = False
 
     def _build_gdn_cache_tensor(self, module):
         cache = super().build_kv_cache_tensor(module)
@@ -166,7 +171,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
             )
-            if policy.decode:
+            if policy.decode or self.gdn_state_vk:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
                 # Triton fallback and checkpoint stores honor the inner strides.

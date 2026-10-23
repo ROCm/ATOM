@@ -15,7 +15,7 @@ from aiter import QuantType, dtypes
 from atom.config import QuantizationConfig
 from atom.model_ops import embed_head
 from atom.model_ops.qwen4_exp import ple_layer
-from atom.models import qwen4_exp
+from atom.models.qwen4_exp import model as qwen4_exp
 from atom.quant_spec import LayerQuantConfig
 
 
@@ -178,6 +178,121 @@ def test_gdn_projection_storage_and_scales(monkeypatch, tp, rank, quantized):
     )
     layer.out_proj.weight_scale.weight_loader(layer.out_proj.weight_scale, out_scale)
     torch.testing.assert_close(layer.out_proj.weight_scale, out_scale)
+
+
+def mxfp4_config(native_w4a8=False):
+    # The exclusions of the converted MXFP4 checkpoint (Quark glob semantics).
+    config = QuantizationConfig()
+    config.quant_method = "quark"
+    native = (
+        {"weight_block_size": (1, 32), "activation_dtype": torch.float8_e4m3fn}
+        if native_w4a8
+        else {}
+    )
+    config.global_spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32, quant_dtype=dtypes.fp4x2, **native
+    )
+    config.exclude_layers = ["*.linear_attn.in_proj_b", "*.linear_attn.in_proj_a"]
+    return config
+
+
+@pytest.mark.parametrize("native_w4a8", [False, True])
+@pytest.mark.parametrize("tp,rank", [(1, 0), (2, 0), (2, 1)])
+def test_gdn_mxfp4_projection_storage(monkeypatch, tp, rank, native_w4a8):
+    from atom.model_ops import linear
+
+    group = SimpleNamespace(world_size=tp, rank_in_group=rank)
+    monkeypatch.setattr(linear, "get_tp_group", lambda: group)
+    monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_world_size", lambda: tp)
+    monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_rank", lambda: rank)
+    monkeypatch.setattr(
+        qwen4_exp, "LinearAttention", lambda *args, **kwargs: torch.nn.Identity()
+    )
+    config = SimpleNamespace(
+        hidden_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen4_exp.Qwen4ExpLinearAttention(
+        SimpleNamespace(torch_dtype=torch.bfloat16),
+        config,
+        qwen4_exp._Qwen4ExpQuantizationConfig(mxfp4_config(native_w4a8)),
+        prefix="model.layers.0.linear_attn",
+    )
+    assert layer.quantized_inputs
+    assert (
+        layer.in_proj_qkvz.weight.dtype == layer.out_proj.weight.dtype == dtypes.fp4x2
+    )
+    assert layer.in_proj_ba.weight.dtype == layer.conv1d.weight.dtype == torch.bfloat16
+    # MXFP8 activations select the native W4A8 linear, row-wise E8M0 scales.
+    for module in (layer.in_proj_qkvz, layer.out_proj):
+        assert module.native_a8_group_rows == (1 if native_w4a8 else None)
+    # Packed E2M1 bytes [N, K/2] and E8M0 scales [N, K/32] load as raw bytes.
+    widths = [layer.key_dim, layer.key_dim, layer.value_dim, layer.value_dim]
+    rows = torch.arange(sum(widths))[:, None]
+    weight = ((rows * 7 + torch.arange(config.hidden_size // 2)) % 251).to(torch.uint8)
+    scale = (127 + (rows + torch.arange(config.hidden_size // 32)) % 5).to(torch.uint8)
+    offset = 0
+    for source, count in ((".in_proj_qkv", sum(widths[:3])), (".in_proj_z", widths[3])):
+        target, shard = layer.packed_modules_mapping[source]
+        module = getattr(layer, target[1:])
+        for name, values in (("weight", weight), ("weight_scale", scale)):
+            param = getattr(module, name)
+            param.weight_loader(param, values[offset : offset + count], shard)
+        offset += count
+    for name, values in (("weight", weight), ("weight_scale", scale)):
+        expected = torch.cat([part.chunk(tp, 0)[rank] for part in values.split(widths)])
+        assert torch.equal(
+            getattr(layer.in_proj_qkvz, name).view(torch.uint8), expected
+        )
+
+
+@pytest.mark.parametrize(
+    "quant, fp8_activations",
+    [("mxfp4_w4a8", True), ("mxfp4", False), ("ptpc_fp8", False), (None, False)],
+)
+def test_moe_fp8_activations_follow_the_experts_spec(
+    monkeypatch, quant, fp8_activations
+):
+    # MXFP4 experts run on MXFP8 activations only when the checkpoint says so.
+    fused = {}
+    monkeypatch.setattr(qwen4_exp, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        qwen4_exp,
+        "is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        qwen4_exp, "MergedReplicatedLinear", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(qwen4_exp, "Qwen3NextMLP", lambda *args, **kwargs: None)
+    monkeypatch.setattr(qwen4_exp, "FusedMoE", lambda **kwargs: fused.update(kwargs))
+    monkeypatch.setattr(qwen4_exp, "install_stacked_expert_loaders", lambda e: None)
+    if quant == "ptpc_fp8":
+        config = QuantizationConfig()
+        config.global_spec = LayerQuantConfig(
+            quant_type=QuantType.per_Token, quant_dtype=dtypes.fp8
+        )
+    elif quant is not None:
+        config = mxfp4_config(native_w4a8=quant == "mxfp4_w4a8")
+    qwen4_exp.Qwen4ExpSparseMoeBlock(
+        SimpleNamespace(
+            num_experts=4,
+            num_experts_per_tok=2,
+            hidden_size=64,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            hidden_act="silu",
+        ),
+        None if quant is None else qwen4_exp._Qwen4ExpQuantizationConfig(config),
+        prefix="model.layers.0.mlp",
+    )
+    assert fused["mxfp4_fp8_activations"] is fp8_activations
 
 
 @pytest.mark.parametrize(

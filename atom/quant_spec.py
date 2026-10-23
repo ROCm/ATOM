@@ -408,6 +408,36 @@ def _quark_weight_spec(
     return weight_fp4, NVFP4_DTYPE
 
 
+def _is_mx_group32(spec: dict | None, dtype_prefix: str) -> bool:
+    return (
+        isinstance(spec, dict)
+        and str(spec.get("dtype", "")).lower().startswith(dtype_prefix)
+        and spec.get("qscheme") == "per_group"
+        and spec.get("group_size") == 32
+        and spec.get("scale_format") == "e8m0"
+    )
+
+
+def _quark_native_w4a8(weight: dict, input_tensors: dict | list | None) -> dict:
+    """Native W4A8 fields for MXFP4 weights with dynamic MXFP8 activations.
+
+    Quark's MXFP4 default quantizes activations to FP4 too (A4W4). A checkpoint
+    that declares E4M3 group-32 E8M0 inputs instead asks for the native W4A8
+    linear, which keeps the weight bytes and scales as stored.
+    """
+    if (
+        _is_mx_group32(weight, "fp4")
+        and not weight.get("is_dynamic")
+        and _is_mx_group32(input_tensors, "fp8_e4m3")
+        and input_tensors.get("is_dynamic") is True
+    ):
+        return {
+            "weight_block_size": (1, 32),
+            "activation_dtype": torch.float8_e4m3fn,
+        }
+    return {}
+
+
 def _build_quark_layer_spec(layer_dict: dict) -> LayerQuantConfig:
     """Build a :class:`LayerQuantConfig` from a single Quark per-layer dict."""
     weight = layer_dict.get("weight", {}) or {}
@@ -422,6 +452,7 @@ def _build_quark_layer_spec(layer_dict: dict) -> LayerQuantConfig:
         ),
         is_dynamic=_parse_is_dynamic(input_tensors),
         quant_method="quark",
+        **_quark_native_w4a8(weight, input_tensors),
     )
 
 

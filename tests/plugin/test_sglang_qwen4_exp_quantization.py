@@ -10,7 +10,7 @@ pytest.importorskip("aiter.ops.enum", exc_type=ImportError)
 from aiter import QuantType, dtypes
 
 from atom.config import QuantizationConfig
-from atom.models import qwen4_exp
+from atom.models.qwen4_exp import model as qwen4_exp
 from atom.quant_spec import LayerQuantConfig
 
 

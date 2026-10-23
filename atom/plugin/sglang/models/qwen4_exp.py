@@ -98,7 +98,7 @@ def hide_fused_shared_expert_suffix(experts: Any, install: Any) -> None:
 
 
 def install_routed_stacked_expert_loader() -> None:
-    import atom.models.qwen4_exp as native
+    import atom.models.qwen4_exp.model as native
 
     current = native.install_stacked_expert_loaders
     if getattr(current, "_atom_hides_fused_shared_suffix", False):
