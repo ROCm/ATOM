@@ -152,6 +152,7 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         cache = super().build_kv_cache_tensor(module)
         if hasattr(module, "base_linear_attention"):
             from atom.model_ops.fla_ops.gdn_flydsl import select_policy
+            from atom.models.qwen4_exp_mono.config import gdn_cache_layout_supported
             from atom.utils import envs
 
             attention = module.impl
@@ -166,10 +167,14 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
             self._flydsl_prefill_enabled = (
                 getattr(self, "_flydsl_prefill_enabled", False) or policy.prefill
             )
-            if policy.decode:
+            mono_vk = gdn_cache_layout_supported(attention, self.replayssm)
+            if policy.decode or mono_vk:
                 # Physical VK storage, exposed as a logical KV view. This is
                 # zero-copy and preserves all gather/scatter/fork interfaces.
                 # Triton fallback and checkpoint stores honor the inner strides.
+                # Qwen Mono uses the same layout on gfx950 even though the
+                # standalone FlyDSL decode policy remains gfx942-only: its
+                # persistent recurrence emitter requires contiguous K vectors.
                 cache.v_cache = cache.v_cache.transpose(-1, -2)
         return cache
 
