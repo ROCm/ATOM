@@ -327,28 +327,27 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 publish(c["put"], c["irdy"], t, 1, tid == 0)
 
 
-@traced
 def _selected_rows(c, t, ident):
     """Column ``ident`` of token t as a selection holds it (a REINDEX layer's
     compacted column lifted back to the row it stands for) and as the
     attention reads it: its pool row, through the block table (``attention.
     _key_row``'s arithmetic; every layer sharing this selection shares its KV
-    owner, so its row). Loaded for every element before the top-k
-    (``stage_ilist``): inside the winners' branches each load was a round trip
-    in series, and the attention's keys wait on none."""
+    owner, so its row). Issue the loads for every element from ``after_keys``
+    before the top-k passes, allowing pool-table reads to overlap the passes.
+    Keep candidate loads branch-free and inside the token's candidate row;
+    FULL and padding discard their values. Branching around each candidate
+    load can serialize these prefetches through the in-order load counter."""
     a = c["args"]
-    row = fx.Int32(ident)
-    # Only live REINDEX columns need a candidate lookup.
-    if (a["ilift"] != 0) & (ident >= 0):
-        cand = fx.Int32(
-            bo.buffer_load(
-                rsrc(a["icand"]),
-                t * ip.TOPK_BLOCKS + ident // TILE,
-                vec_width=1,
-                dtype=T.i32,
-            )
+    cand = fx.Int32(
+        bo.buffer_load(
+            rsrc(a["icand"]),
+            ip.candidate_offset(t, ident),
+            vec_width=1,
+            dtype=T.i32,
         )
-        row = cand * TILE + ident % TILE
+    )
+    lifted = cand * TILE + fx.max(ident, 0) % TILE
+    row = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident))
     toff = fx.Int32(
         bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
     )
