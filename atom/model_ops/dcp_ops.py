@@ -1282,11 +1282,12 @@ def dcp_decode_candidate_exchange_fused(
     )
 
     # Half the payload of the (score, gid) exchange. Still moved as int32 so no
-    # float canonicalization can touch the bits; bitcast back is free.
+    # float canonicalization can touch the bits; bitcast back is free. Every
+    # indexer layer gathers once per step, so take aiter's custom all-gather
+    # where it applies, as the LSE and query-head gathers do.
     n_cand = dcp_world_size * k_loc
     gathered_sc = (
-        get_dcp_group()
-        .all_gather(send.view(torch.int32), dim=0)
+        dcp_all_gather(get_dcp_group(), send.view(torch.int32), 0)
         .view(dcp_world_size, num_decode_tokens, k_loc)
         .permute(1, 0, 2)
         .reshape(num_decode_tokens, n_cand)

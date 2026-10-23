@@ -168,6 +168,7 @@ def test_spawned_metrics_are_exported_without_snapshots_and_restart_cleanly():
     env = dict(os.environ)
     env.pop("PROMETHEUS_MULTIPROC_DIR", None)
     env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
+    env["ATOM_METRICS_PER_REQUEST_CONTEXT"] = "1"
     results = []
     for _ in range(2):
         result = subprocess.run(

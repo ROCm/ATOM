@@ -239,6 +239,9 @@ class CoreManager:
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
         # path that never streams, which the output thread checks for.
         self._flush_stream_batch_fn = None
+        # Whether _async_output_handler drains outputs_queue. The output thread
+        # reads it too, and starts before the end of __init__.
+        self._asyncio_mode = getattr(config, "asyncio_mode", False)
         # Longest prompt the KV pool can hold, reported by each rank's READY.
         # None until the first one arrives, and thereafter the smallest across
         # ranks: a DP rank sizes its pool from its own free memory, so a prompt
@@ -586,7 +589,6 @@ class CoreManager:
         self._finalizer = weakref.finalize(self, self.close)
         self.async_output_queue = asyncio.Queue() if config.asyncio_mode else None
         self._output_handler_task = None
-        self._asyncio_mode = config.asyncio_mode
 
     def _record_ready_payload(self, data) -> None:
         """Fold one rank's READY facts into the manager's view of capacity."""
@@ -774,7 +776,14 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        # Only LLMEngine.step()/generate() and asyncio mode
+                        # read outputs_queue. The API server, the one caller
+                        # that wires the flush hook, delivers through the
+                        # callbacks; queued for it, every finished Sequence
+                        # would stay reachable for the life of the process
+                        # and slow each gen-2 GC pass.
+                        if self._flush_stream_batch_fn is None or self._asyncio_mode:
+                            self.outputs_queue.put_nowait(seqs)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
@@ -2054,7 +2063,6 @@ class DisaggCoreManager(CoreManager):
         self._finalizer = weakref.finalize(self, self.close)
         self.async_output_queue = None
         self._output_handler_task = None
-        self._asyncio_mode = config.asyncio_mode
 
     def _wait_for_single_ready(self, idx: int):
         """Block until output_sockets[idx] sends a READY signal."""
