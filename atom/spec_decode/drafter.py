@@ -241,7 +241,7 @@ class Drafter(abc.ABC):
         all_gather that goes INTO the recording, so a synthetic context left
         describing the target bakes a collective the pass never runs at.
         """
-        if not self.draft_graphs:
+        if not self.draft_graphs or not self.runner.capture_sizes:
             return
         runner = self.runner
         capture_sizes = sorted(runner.capture_sizes)  # capture leaves it descending

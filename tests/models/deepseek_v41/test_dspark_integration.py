@@ -413,3 +413,27 @@ def test_engram_rows_carry_live_tokens_and_dead_flags():
     # a capture's synthetic batch: no live token
     builder._prepare(batch, 2, 8, engram_live=False)
     assert rows.np[0] == 0
+
+
+def test_draft_block_attention_uses_draft_step_and_context_kv():
+    from atom.model_ops.deepseek_v41.draft_block import draft_step
+    from atom.models.deepseek_v41.dspark import DraftBlock
+
+    step = draft_step(torch.arange(8).view(1, 8), torch.tensor([7]), 5, 8)
+    hidden = torch.randn(1, 5, 4)
+    cache, rope = object(), object()
+    calls = []
+
+    class Attention(nn.Module):
+        def forward(self, normed, scale, context_kv, draft, rotary):
+            calls.append((scale, context_kv, draft, rotary))
+            return normed + draft.positions.unsqueeze(-1)
+
+    block = DraftBlock.__new__(DraftBlock)
+    nn.Module.__init__(block)
+    block.attn = Attention()
+    actual = block.attention_forward(hidden, cache, step, rope)
+    torch.testing.assert_close(actual, hidden + step.positions.unsqueeze(-1))
+    assert len(calls) == 1
+    scale, context_kv, draft, rotary = calls[0]
+    assert scale is None and context_kv is cache and draft is step and rotary is rope

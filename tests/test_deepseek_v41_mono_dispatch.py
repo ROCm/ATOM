@@ -9,18 +9,10 @@ import torch
 
 pytest.importorskip("aiter")
 
+from atom.config import CUDAGraphMode
 from atom.models.deepseek_v41.mono import config as mono_config
 from atom.models.deepseek_v41.mono import dispatch
 from atom.mono.runtime import deployment
-
-
-class _Mode:
-    def __init__(self, piecewise):
-        self.piecewise = piecewise
-
-    def requires_piecewise_compilation(self):
-        return self.piecewise
-
 
 _HF = {
     "sliding_window": 128,
@@ -42,7 +34,9 @@ def _atom_config(**overrides):
         "prefill_context_parallel_size": 1,
         "enable_tbo": False,
         "enable_tbo_decode": False,
-        "compilation_config": SimpleNamespace(level=0, cudagraph_mode=_Mode(False)),
+        "compilation_config": SimpleNamespace(
+            level=0, cudagraph_mode=CUDAGraphMode.NONE
+        ),
         "kv_cache_dtype": "bf16",
         "index_cache_dtype": "fp8",
         "speculative_config": SimpleNamespace(
@@ -65,8 +59,26 @@ def native(monkeypatch):
 
 
 @pytest.mark.parametrize("tp", [2, 4, 8])
-def test_supported_deployment_has_no_refusal(native, tp):
-    assert mono_config.config_refusal(_atom_config(tensor_parallel_size=tp)) is None
+@pytest.mark.parametrize(
+    "mode",
+    [
+        CUDAGraphMode.NONE,
+        CUDAGraphMode.FULL,
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        CUDAGraphMode.FULL_AND_PIECEWISE,
+    ],
+)
+def test_supported_deployment_has_no_refusal(native, tp, mode):
+    config = _atom_config(tensor_parallel_size=tp)
+    config.compilation_config.cudagraph_mode = mode
+    assert mono_config.config_refusal(config) is None
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.AF_PIECEWISE])
+def test_piecewise_decode_is_refused(native, mode):
+    config = _atom_config()
+    config.compilation_config.cudagraph_mode = mode
+    assert mono_config.config_refusal(config) == "piecewise decode cudagraph"
 
 
 def test_no_speculative_decoding_is_served(native):
@@ -105,7 +117,7 @@ def test_per_request_verify_lengths_are_served(native, schedule, ragged):
         (
             {
                 "compilation_config": SimpleNamespace(
-                    level=0, cudagraph_mode=_Mode(True)
+                    level=0, cudagraph_mode=CUDAGraphMode.PIECEWISE
                 )
             },
             "piecewise",
@@ -276,6 +288,33 @@ def test_refused_deployment_is_not_wrapped(native, monkeypatch):
     assert isinstance(wrapped, dispatch.MonoDecodeModel)
     # attributes the runner never overrides pass through to the wrapped model
     assert wrapped.in_features == 2
+
+
+def test_hybrid_wraps_target_and_draft_but_keeps_prefill_on_original(
+    native, monkeypatch
+):
+    class Model(torch.nn.Module):
+        def forward(self, ids, positions):
+            return "prefill"
+
+    config = _atom_config()
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+    drafter = SimpleNamespace(model=_Draft())
+    model = dispatch.install_mono_decode(Model(), config, drafter, None)
+    assert isinstance(model, dispatch.MonoDecodeModel)
+    assert isinstance(drafter.model, dispatch.MonoDraftModel)
+    rows = []
+    model._mono = SimpleNamespace(
+        ready=lambda n: rows.append(n) or True,
+        runner=SimpleNamespace(forward=lambda ids, positions: "mono"),
+    )
+    fwd = _context(monkeypatch)
+    ids = torch.zeros(6, dtype=torch.int64)
+    for prefill in (True, False, True, False):
+        fwd.context.is_prefill = prefill
+        fwd.attn_metadata.step.decode = not prefill
+        assert model(ids, ids) == ("prefill" if prefill else "mono")
+    assert rows == [6, 6]
 
 
 def test_fp4_index_plane_plans_its_walk_with_each_step(native, monkeypatch):

@@ -262,6 +262,8 @@ class ForwardMode:
         local_tbo: tuple[bool, bool, int, int],
         max_seqlen_q: int,
         graph_shapes: Collection[tuple[int, int]] | None = None,
+        supports_piecewise_prefill: bool = False,
+        capture_sizes_by_q: dict[int, np.ndarray] | None = None,
         dp_stage_report: "BoundedReplayDPReport | None" = None,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
@@ -338,6 +340,9 @@ class ForwardMode:
         # ascending int32 (`ModelRunner.capture_sizes_np`, sorted where it is
         # built and never mutated), so the insertion point IS the smallest size
         # that holds the batch, and running off the end IS "no recording can".
+        # Select after the DP reduction: all ranks must use the agreed Q.
+        if capture_sizes_by_q is not None and unified and not is_prefill:
+            capture_sizes = capture_sizes_by_q.get(max_seqlen_q, ())
         rung = int(np.searchsorted(capture_sizes, unified_bs))
         on_ladder = rung < len(capture_sizes)
         running_bs = int(capture_sizes[rung]) if on_ladder else unified_bs
@@ -376,6 +381,13 @@ class ForwardMode:
             captured_tokens=captured_tokens,
             is_block_drafter=is_block_drafter,
             max_seqlen_q=max_seqlen_q,
+            piecewise_prefill=(
+                supports_piecewise_prefill
+                and dp_size == 1
+                and not (enforce_eager or step_needs_eager or tbo_on)
+                and not batch.is_dummy_run
+                and not getattr(batch, "multimodal_data", None)
+            ),
         )
         return cls(
             use_cudagraph=use_cudagraph,
@@ -403,6 +415,7 @@ class ForwardMode:
         captured_tokens,
         is_block_drafter: bool,
         max_seqlen_q: int,
+        piecewise_prefill: bool = False,
     ) -> tuple[int, bool]:
         """``(running_tokens, piecewise_captured)``.
 
@@ -416,10 +429,14 @@ class ForwardMode:
             # allocated.
             return scheduled_tokens, False
         if is_prefill:
-            # Reachable on one rank only: a group of one is unified whatever it
-            # runs, while under DP any prefill clears `unified` above. Prompts
-            # are ragged, so no product recovers a height and this rank's own
-            # count is the whole answer.
+            # Opt-in backends separate request-shaped attention from dense
+            # work, which can pad by total tokens independently of BS.
+            if piecewise_prefill and captured_tokens:
+                recorded = next(
+                    (n for n in captured_tokens if n >= scheduled_tokens), None
+                )
+                if recorded is not None:
+                    return recorded, True
             return scheduled_tokens, False
 
         # The batch was rounded onto the ladder AFTER the sync, so this runs rows
@@ -619,6 +636,10 @@ class Context:
 class AttentionMetaData:
     """Attention metadata for prefill and decode batched together."""
 
+    # Published by an opting-in backend after ordinary metadata preparation.
+    # None leaves AF attention eager while preserving its output boundary.
+    cudagraph_key: tuple | None = None
+
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
@@ -715,7 +736,9 @@ class AttentionMetaData:
         kpool_total_pools: int | None = None,
         num_cached_tokens: torch.Tensor | None = None,
         seq_starts: torch.Tensor | None = None,
+        cudagraph_key: tuple | None = None,
     ):
+        self.cudagraph_key = cudagraph_key
         self.has_cached = has_cached
         self.total_kv = total_kv
         self.kpool_total_pools = kpool_total_pools

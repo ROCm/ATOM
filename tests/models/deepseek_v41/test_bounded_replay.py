@@ -317,20 +317,18 @@ def test_only_an_unpadded_prefill_replays(overrides, expected):
 def test_a_row_step_sees_its_rows_image_mask(monkeypatch):
     """The decoder layers' MoE router reads the forward's image mask; while a row
     step runs it must be that step's rows, and the outer one's afterwards."""
-    pytest.importorskip("triton")
-    from atom.model_ops.attentions.deepseek_v41 import indices
-
     outer = SimpleNamespace(indptrs={1: 0}, tiles={1: 0})
-    inner = SimpleNamespace(indptrs={}, tiles={})
+    inner = SimpleNamespace(indptrs={}, tiles={}, result_buffers=None)
     rows = torch.tensor([167 + i for i in range(133)] + list(range(300, 320)))
     mask = (torch.arange(320) % 3 == 0)[None]
     metadata = SimpleNamespace(
         step=outer,
         queries=None,
         image_mask=mask,
-        cache=SimpleNamespace(geometry=None, indptr_buffers=None),
+        cache=SimpleNamespace(
+            update_step=lambda step, **kw: setattr(step, "indptrs", {"filled": True})
+        ),
     )
-    monkeypatch.setattr(indices, "fill_step_indptrs", lambda *a: {"filled": True})
     seen = {}
     with rows_of(metadata, inner, rows=rows):
         seen["mask"] = metadata.image_mask.clone()
@@ -400,6 +398,16 @@ def test_a_replayed_history_marks_image_positions_dead(image):
     )
     assert histories[0].tolist() == [-1, -1]
     assert sorted(histories[1].tolist()) == ([5, 7] if image is None else [-1, 5])
+
+
+@pytest.mark.parametrize("dp", [False, True])
+def test_piecewise_token_padding_preserves_single_rank_replay(dp):
+    from atom.config import CUDAGraphMode
+
+    forward = _forward([500], **{"step.width": 512})
+    forward.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+    forward.dp_metadata = object() if dp else None
+    assert replayable(forward, 512) is (not dp)
 
 
 # ── DP attention: the step's DP sync carries each stage's token counts ───

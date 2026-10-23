@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """PAGE-backed global keys and complete, relocatable CSA2 request state."""
 
+from functools import cache
+
 import numpy as np
 import torch
 
@@ -16,7 +18,7 @@ from atom.model_ops.attentions.pool_layout.v41_pool_geometry import (
 )
 from atom.model_ops.blockscale import quantize_fp4
 from atom.model_ops.blockscale_kernels.quantization import FP8_DTYPE
-from atom.model_ops.deepseek_v41.candidate_table import bind_candidates
+from atom.model_ops.deepseek_v41.candidate_table import CandidateBlocks, bind_candidates
 from atom.model_ops.deepseek_v41.compressor import compress_batch
 from atom.model_ops.deepseek_v41.dspark import gather_window_rows
 from atom.model_ops.deepseek_v41.index_plane import IndexUnits
@@ -33,6 +35,7 @@ from atom.model_ops.v4_kernels.state_writes import (
     swa_write,
 )
 from atom.utils import CpuGpuBuffer, upload_numpy
+from atom.utils.cuda_graph import StableOutputs
 
 from .indices import (
     build_indices,
@@ -42,6 +45,27 @@ from .indices import (
 )
 from .metadata import prepare_batch_step
 from .speculative import TentativeState
+
+
+@cache
+def _shared_result_specs(specs):
+    """Cross-layer results for a topology, independent of requests and buckets."""
+    selections, candidates, readers = {}, {}, {}
+    for spec in specs:
+        if spec.topk_owner is not None and spec.topk_owner != spec.layer_id:
+            selections[spec.topk_owner] = None
+        if spec.mode.value == "reindex" and spec.candidate_source is not None:
+            source = spec.candidate_source
+            candidates[source] = None
+            readers.setdefault(source, []).append(spec.layer_id)
+    return (
+        tuple(selections),
+        tuple(candidates),
+        tuple(
+            (source, layers[0]) for source, layers in readers.items() if len(layers) > 1
+        ),
+        tuple(sorted({spec.ratio for spec in specs if spec.ratio})),
+    )
 
 
 class PagedAttentionCache:
@@ -72,6 +96,9 @@ class PagedAttentionCache:
         device,
         max_tokens=0,
         workspace=None,
+        *,
+        topology=(),
+        candidate_count=0,
     ):
         if pages < 1 or slots < 1:
             raise ValueError("A paged cache needs positive PAGE and STATE capacities")
@@ -79,6 +106,9 @@ class PagedAttentionCache:
         # The scorer's `ScoreWorkspace`, owned by the builder so the startup
         # profile's throwaway cache and the serving one share it.
         self.workspace = workspace
+        self.topology = tuple(topology)
+        self.candidate_count = candidate_count
+        self.result_buffers = StableOutputs()
         self.packed = geometry.packed
         self.indptr_device, self.max_tokens, self.indptr_buffers = device, 0, {}
         index_offsets, boundary = geometry.paged_extents(pages)
@@ -287,6 +317,7 @@ class PagedAttentionCache:
         cached_until=None,
         finals=None,
         start_histories=None,
+        fixed_results=False,
     ):
         """`floors`, `cached_until`, `finals`, `start_histories`: per request,
         on the host, `BatchStep`'s `request_*` and `start_histories`; None for
@@ -359,12 +390,13 @@ class PagedAttentionCache:
         # parameter and see this step -- it would see the one recorded with the
         # graph. The cache outlives every step, so reading it from here is live.
         self.current_step = step
-        if not step.positions.is_cuda:
-            return step
-        self._reserve_indptrs(step.width)
-        # Before the indptrs, which count each row's window from its floor.
-        self.publish_replay_layout(step, count if running_bs is None else running_bs)
-        step.indptrs = fill_step_indptrs(step, self.geometry, self.indptr_buffers)
+        if step.positions.is_cuda:
+            self._reserve_indptrs(step.width)
+        self.update_step(
+            step,
+            running_bs=count if running_bs is None else running_bs,
+            fixed_results=fixed_results,
+        )
         return step
 
     def publish_replay_layout(self, step, running_bs):
@@ -375,10 +407,19 @@ class PagedAttentionCache:
         zeros = self._replay_start_zeros(running_bs)
         step.swa_replay_start = step.swa_cached_until = zeros
         if step.request_floors.any() and not step.decode:
-            step.swa_replay_start, step.swa_cached_until = upload_numpy(
-                np.stack((step.request_floors, step.request_cached_until)),
-                step.positions.device,
+            layout = self.result_buffers.empty(
+                ("replay_layout", step.positions.data_ptr()),
+                (2, self.num_slots),
+                dtype=torch.int32,
+                device=step.positions.device,
+            )[:, : len(step.request_floors)]
+            layout.copy_(
+                upload_numpy(
+                    np.stack((step.request_floors, step.request_cached_until)),
+                    step.positions.device,
+                )
             )
+            step.swa_replay_start, step.swa_cached_until = layout.unbind()
 
     def _replay_start_zeros(self, running_bs):
         """Every request's window from position 0: what a step that is not a
@@ -619,14 +660,160 @@ class PagedAttentionCache:
             rope=rope,
         )
 
+    def update_step(
+        self,
+        step,
+        *,
+        running_bs=None,
+        indptr_buffers=None,
+        queries=None,
+        fixed_results=False,
+    ):
+        """Publish a normal, microbatch or tail view before its layers execute.
+
+        Request inputs already have storage. Only selections carried across
+        layers need bindings here: replay skips their Python publication.
+        Derived results acquire their output slots in the existing accessors.
+        """
+        if step.positions.is_cuda:
+            if running_bs is not None:
+                self.publish_replay_layout(step, running_bs)
+            indexed = step if queries is None else queries.index
+            indexed.indptrs = fill_step_indptrs(
+                indexed,
+                self.geometry,
+                self.indptr_buffers if indptr_buffers is None else indptr_buffers,
+            )
+        if not fixed_results or not step.requests:
+            return
+        specs = step.layer_specs or self.topology
+        if not specs:
+            return
+        selections, candidates, producers, ratios = _shared_result_specs(specs)
+        step.result_buffers = self.result_buffers
+        if step.buffer_namespace is None:
+            step.buffer_namespace = (
+                step.positions.data_ptr(),
+                step.batch_ids.data_ptr(),
+            )
+        ns = step.buffer_namespace
+        device = step.positions.device
+        capacity = max(self.max_tokens, step.width)
+        step.token_capacity = capacity
+        step.request_capacity = self.num_slots
+
+        def result(kind, owner, columns):
+            return self.result_buffers.empty(
+                (ns, kind, owner),
+                (1, step.width, columns),
+                capacity=capacity * columns,
+                dtype=torch.int32,
+                device=device,
+            )
+
+        # A tail may already carry an external owner's results in these slots.
+        for owner in selections:
+            if owner not in step.selected:
+                step.selected[owner] = result(
+                    "selected", owner, self.geometry.index_topk
+                )
+        for owner in candidates:
+            if owner not in step.candidates:
+                step.candidates[owner] = result(
+                    "candidates", owner, self.candidate_count
+                )[0]
+        step.candidate_producers.update(producers)
+        if not self.geometry.index_fp4:
+            for ratio in ratios:
+                self.unit_tiles(step, ratio)
+        if step.decode and splits_window(step, self.geometry):
+            rows = result("window", None, self.geometry.window_size).flatten()
+            step.window_rows = build_window_rows(
+                step,
+                self.geometry,
+                self.geometry.window(specs[0].layer_id, self.num_pages),
+                step.indptrs[specs[0].ratio][1],
+                out=rows,
+            )
+
+    def selection_outputs(self, spec, step):
+        """Only topology-declared shared results are fixed scorer destinations.
+
+        ``store_selection`` also publishes local results. Reusing those from a
+        warmup would make FULL capture write into storage owned by that step,
+        instead of allocating its temporaries inside the graph pool.
+        """
+        if step.result_buffers is None:
+            return None
+        selections, candidates, _, _ = _shared_result_specs(
+            step.layer_specs or self.topology
+        )
+        selected = (
+            step.selected.get(spec.layer_id) if spec.layer_id in selections else None
+        )
+        return (
+            None if selected is None else selected[0],
+            (
+                step.candidates.get(spec.layer_id)
+                if spec.produces_candidates and spec.layer_id in candidates
+                else None
+            ),
+        )
+
+    def store_selection(self, spec, step, selected, chosen):
+        """Expose results already written by the scorer; no staging copy."""
+        step.selected[spec.layer_id] = selected.unsqueeze(0)
+        if chosen is not None:
+            step.candidates[spec.layer_id] = chosen
+
+    def graph_layout(self, step, queries=None):
+        """Launch layout over the builder's fixed-address execution view.
+
+        Request values never enter the key. Compression capacities and packed
+        score bands do: they change the recorded launch grid. A partial-query
+        boundary currently runs eagerly; its consumers still use stable slots.
+        """
+        if step.result_buffers is None or not step.requests or queries is not None:
+            return None
+        return (
+            id(self),
+            step.buffer_namespace,
+            step.decode,
+            step.width,
+            self.max_tokens,
+            step.token_capacity,
+            step.request_capacity,
+            step.cu_seqlens_q.numel(),
+            step.slots.data_ptr(),
+            step.block_tables.data_ptr(),
+            tuple(step.block_tables.shape),
+            None if step.swa_replay_start is None else step.swa_replay_start.data_ptr(),
+            None if step.swa_cached_until is None else step.swa_cached_until.data_ptr(),
+            step.max_q_len,
+            bool(step.request_cached_until.any()),
+            tuple(
+                (
+                    r,
+                    p.compress_plan_gpu.shape[0],
+                    p.write_plan_gpu.shape[0],
+                    p.key_rope_positions_gpu.numel(),
+                )
+                for r, p in step.plans.items()
+            ),
+            tuple(step.planned_host.items()),
+            tuple(
+                (r, t.data_ptr(), tuple(t.shape), tuple(t.stride()))
+                for r, t in step.tiles.items()
+            ),
+            tuple(step.candidate_producers.items()),
+        )
+
     def unit_tiles(self, step, ratio):
         """Tile ids per query token: one table per ratio, shared by its owners.
 
-        Memoized on the step and dropped by `begin_forward` rather than built
-        with it, unlike the indptrs: a table built outside the graph is one a
-        replay reads without rebuilding. With a `workspace` the table is its
-        ratio's fixed rows, rewritten each step; without one, a fresh
-        allocation.
+        The backend prepares this batch-only input once before the layer walk.
+        Standalone eager callers may still request it lazily. A workspace owns
+        the table's address; private eager caches use a stable result slot.
         """
         table = step.tiles.get(ratio)
         if table is None:
@@ -648,15 +835,62 @@ class PagedAttentionCache:
                 workspace=step.tile_workspace or self.workspace,
                 ratio=ratio,
             )
+            if (
+                step.result_buffers is not None
+                and self.workspace is None
+                and step.tile_workspace is None
+            ):
+                table = step.tiles[ratio] = self.result_buffers.deliver(
+                    (step.buffer_namespace, "tiles", ratio),
+                    table,
+                    capacity=(
+                        step.token_capacity
+                        * step.block_tables.shape[1]
+                        * self.geometry.index_blocks_per_page(ratio)
+                    ),
+                )
         return table
 
-    def candidate_blocks(self, step, source, ratio):
+    def candidate_blocks(self, step, source, ratio, *, layer=None):
         """Layer `source`'s candidates bound to their requests' PAGEs at this
         ratio: one per forward, shared by every REINDEX layer they bound.
         Memoized on the step for the reason `unit_tiles` is."""
         bound = step.candidate_blocks.get(source)
-        if bound is None:
-            bound = step.candidate_blocks[source] = bind_candidates(
+        if step.result_buffers is not None and source in step.candidate_producers:
+            if bound is None:
+                ids = step.candidates[source]
+                ns, capacity = step.buffer_namespace, step.token_capacity
+                table = step.result_buffers.empty(
+                    (ns, "candidate_table", source),
+                    ids.shape,
+                    capacity=capacity * ids.shape[-1],
+                    dtype=ids.dtype,
+                    device=ids.device,
+                )
+                context = step.result_buffers.empty(
+                    (ns, "candidate_context", source),
+                    (step.width,),
+                    capacity=capacity,
+                    dtype=torch.int32,
+                    device=ids.device,
+                )
+                bound = step.candidate_blocks[source] = CandidateBlocks(
+                    ids, table, context, self.geometry.index_block_rows
+                )
+            if layer == step.candidate_producers[source]:
+                bind_candidates(
+                    step.candidates[source],
+                    step.block_tables,
+                    step.batch_ids,
+                    self.geometry.index_blocks_per_page(ratio),
+                    step.visible[ratio],
+                    rows_per_block=self.geometry.index_block_rows,
+                    out=(bound.table, bound.context),
+                )
+            return bound
+        if bound is None or step.result_buffers is not None:
+            # A single AF consumer owns this temporary inside its region.
+            bound = bind_candidates(
                 step.candidates[source],
                 step.block_tables,
                 step.batch_ids,
@@ -664,6 +898,8 @@ class PagedAttentionCache:
                 step.visible[ratio],
                 rows_per_block=self.geometry.index_block_rows,
             )
+            if step.result_buffers is None:
+                step.candidate_blocks[source] = bound
         return bound
 
     def _scatter_rows(self, pages, step, value, ratio):
@@ -868,7 +1104,30 @@ class PagedAttentionCache:
         first = spec.index_group_start if spec.index_group_size > 1 else spec.layer_id
         split = splits_window(step, self.geometry)
         built = step.group_indices.get(first)
-        if built is None:
+        if step.result_buffers is not None and spec.index_group_size == 1:
+            built = self._index_group(spec, step, first, 1)
+        elif step.result_buffers is not None:
+            if built is None:
+                layers = 1 if split else spec.index_group_size
+                columns = self.geometry.batch_topk(
+                    spec.ratio
+                ) + self.geometry.window_size * (not split)
+                prefix = step.result_buffers.empty(
+                    (step.buffer_namespace, "indices", first),
+                    (layers, step.width * columns),
+                    capacity=layers * step.token_capacity * columns,
+                    dtype=torch.int64 if self.geometry.packed else torch.int32,
+                    device=step.positions.device,
+                )
+                pptr, eptr, _ = step.indptrs[spec.ratio]
+                # Empty, but shares an existing allocation instead of a slot.
+                extend = step.batch_ids[:0]
+                built = step.group_indices[first] = (prefix, pptr, extend, eptr)
+            if spec.layer_id == first:
+                self._index_group(
+                    spec, step, first, 1 if split else spec.index_group_size, out=built
+                )
+        elif built is None:
             layers = 1 if split else spec.index_group_size
             built = self._index_group(spec, step, first, layers)
             step.group_indices[first] = built
@@ -885,7 +1144,7 @@ class PagedAttentionCache:
         source, which its window rows index."""
         return self.pool[self.geometry.window(layer, self.num_pages).ring_start :]
 
-    def _index_group(self, spec, step, first, layers):
+    def _index_group(self, spec, step, first, layers, *, out=None):
         """One build covering `layers` consecutive layers from `first`.
 
         The per-layer ring offset is read off the geometry rather than
@@ -907,4 +1166,5 @@ class PagedAttentionCache:
             spec.ratio,
             layers,
             stride,
+            out=out,
         )

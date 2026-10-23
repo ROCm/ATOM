@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from atom.config import CUDAGraphMode
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateTransfer
 from atom.model_loader.weight_utils import local_model_dir
@@ -37,7 +38,6 @@ from atom.utils.forward_context import AttentionMetaData, AttnState, Context
 
 from .cache import PagedAttentionCache
 from .checkpoints import StateCopies
-from .indices import fill_step_indptrs
 from .metadata import RequestSpan, prepare_batch_step, visible_buffer_name
 from .score_planner import ScorePlanner
 
@@ -66,6 +66,8 @@ class DeepseekV41Backend(AttentionBackend):
 
 
 class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
+    topology = ()
+    capture_attention = False
     capture_owns_cu_seqlens_q = True
     tbo_comm_stream_priority = -1
 
@@ -123,6 +125,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         topology = build_attention_topology(self.config)[
             : self.config.num_hidden_layers
         ]
+        self.topology = tuple(topology)
+        self.capture_attention = (
+            model_runner.config.compilation_config.level == 3
+            and model_runner.config.compilation_config.cudagraph_mode
+            in (CUDAGraphMode.AF_PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE)
+            and not model_runner.config.enforce_eager
+        )
         speculative = model_runner.config.speculative_config
         num_drafts = 0 if speculative is None else speculative.num_speculative_tokens
         from atom.models.deepseek_v41.bounded_replay import (
@@ -411,6 +420,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.device,
             max_tokens=self.max_num_batched_tokens,
             workspace=self.score_workspace,
+            topology=self.topology,
+            candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
         )
         self.copies = StateCopies(
             self.cache, self.model_runner.state_runtime.checkpoint_spec, self.max_bs
@@ -615,6 +626,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                topology=self.topology,
+                candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
             )
             if batch.is_dummy_run
             else self.cache
@@ -733,6 +746,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 else np.asarray(batch.is_final_chunk)[scheduled]
             ),
             start_histories=histories,
+            fixed_results=self.capture_attention and not batch.is_dummy_run,
             publication_group=step_group,
             query_prefix_ready=query_prefix_ready,
             query_prefix_republish_reason=query_prefix_republish_reason,
@@ -756,8 +770,8 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         )
         return metadata, step.positions
 
-    @staticmethod
     def _assemble_metadata(
+        self,
         cache,
         step,
         rows,
@@ -790,7 +804,13 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         metadata.engram_embeddings = (
             {} if engram_embeddings is None else engram_embeddings
         )
+        metadata.cudagraph_key = self.cudagraph_key(metadata)
         return metadata
+
+    def cudagraph_key(self, metadata):
+        if not self.capture_attention or metadata.dummy:
+            return None
+        return metadata.cache.graph_layout(metadata.step, metadata.queries)
 
     @staticmethod
     def _token_mask(batch, spans, tokens):
@@ -833,6 +853,15 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
                 )
                 histories[k] = mapping.advance_history(None, compressed)[0]
         return resumes, floors, cached, histories
+
+    supports_piecewise_prefill = True
+
+    def prepare_prefill_padded(self, batch, running_bs, running_tokens):
+        # The request spans stay exact; begin_step marks the padded rows with
+        # batch_id=-1 and extends per-token metadata to the chosen graph bucket.
+        return self._prepare(
+            batch, running_bs, running_tokens, query_prefix_ready=True, is_prefill=True
+        )
 
     def prepare_prefill(self, batch, running_bs):
         return self._prepare(
@@ -989,13 +1018,14 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         step.request_floors = parent.request_floors[rs].copy()
         step.request_cached_until = parent.request_cached_until[rs].copy()
         step.request_resumes = None if resumes is None else resumes.copy()
-        if step.positions.is_cuda:
-            # Indexed by this microbatch's rows, not the parent's. Before the
-            # indptrs, which count each row's window from its floor.
-            metadata.cache.publish_replay_layout(step, running_bs)
-            step.indptrs = fill_step_indptrs(
-                step, self.geometry, self._ubatch_indptrs[ubatch_idx]
-            )
+        metadata.cache.update_step(
+            step,
+            running_bs=running_bs,
+            indptr_buffers=(
+                self._ubatch_indptrs[ubatch_idx] if step.positions.is_cuda else None
+            ),
+            fixed_results=self.capture_attention and not metadata.dummy,
+        )
         return self._assemble_metadata(
             metadata.cache,
             step,
@@ -1153,6 +1183,34 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
     def commit_speculative_state(self, metadata, last_token_indices):
         if metadata.cache.pending is not None:
             metadata.cache.commit_tentative(metadata.step, last_token_indices)
+
+    def build_for_piecewise_capture(self, num_tokens):
+        """Capture dense token buckets without binding request-shaped attention."""
+        if not 0 < num_tokens <= self.max_num_batched_tokens:
+            raise ValueError("CSA2 piecewise capture exceeds the token buffer")
+        batch = SimpleNamespace(
+            is_dummy_run=False,
+            req_ids=(),
+            num_scheduled_tokens=(),
+            context_lens=(),
+            state_slots_committed=(),
+            total_seqs_num=0,
+            total_tokens_num=0,
+            is_final_chunk=None,
+            replaying={},
+        )
+        metadata, positions = self._prepare(batch, 1, num_tokens, engram_live=False)
+        metadata.dummy = True
+        metadata.engram_embeddings = {}
+        return metadata, Context(
+            positions=positions,
+            is_prefill=True,
+            is_dummy_run=False,
+            scheduled_bs=0,
+            scheduled_tokens=0,
+            running_bs=1,
+            running_tokens=num_tokens,
+        )
 
     def build_for_cudagraph_capture(self, bs, max_q_len=1):
         # Binds the serving allocation, as V4 does: a scratch cache would bake

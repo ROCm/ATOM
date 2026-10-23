@@ -137,6 +137,8 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=running_tokens,
                 workspace=self.score_workspace,
+                topology=self.topology,
+                candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
             )
         cached = getattr(self, "_capture_dummy", None)
         if cached is None:
@@ -153,6 +155,8 @@ class VllmDeepseekV41MetadataBuilder(DeepseekV41MetadataBuilder):
                 self.device,
                 max_tokens=ceiling_tokens,
                 workspace=self.score_workspace,
+                topology=self.topology,
+                candidate_count=getattr(self.config, "candidate_topk_blocks", 0),
             )
             self._capture_dummy = cached
         elif (

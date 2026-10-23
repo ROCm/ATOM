@@ -92,7 +92,8 @@ def replayable(forward, num_tokens: int) -> bool:
     A prefill may, image rows and input embeddings included (the decoder's
     only image-aware op, the MoE router, reads its rows' slice of the mask;
     see `rows_of`). Decode, warmup, draft and TBO microbatches compute every
-    row, and so do padded steps.
+    row. Single-rank PIECEWISE token padding can still replay the live
+    requests' tails.
 
     Under DP attention the decision is not made here: each rank decided from
     its batch before the step (`replays_batch`) and told its group, and it
@@ -113,16 +114,22 @@ def replayable(forward, num_tokens: int) -> bool:
         return False
     # Workers clear ubatch_slices to prevent recursive splitting. Their live
     # TBO context still identifies them, including the child at token offset 0.
+    from atom.config import CUDAGraphMode
     from atom.utils.tbo.ubatching import tbo_active
 
     if tbo_active():
         return False
     step = getattr(metadata, "step", None)
+    # Single-rank token padding does not change request spans or the tail plan.
+    token_padding = (
+        getattr(forward, "cudagraph_runtime_mode", None) == CUDAGraphMode.PIECEWISE
+        and getattr(forward, "dp_metadata", None) is None
+    )
     return not (
         step is None
         or step.decode
         or num_tokens != step.width
-        or step.width != step.scheduled
+        or (step.width != step.scheduled and not token_padding)
     )
 
 
@@ -269,9 +276,26 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     query_ids = np.full(len(rows), -1, np.int64)
     query_ids[last] = batch_ids[last]
     device = step.positions.device
+    tokens, requests = step.token_capacity, step.request_capacity
+    namespace = (step.buffer_namespace, "tail")
     up = _upload(
         device,
         torch.int32,
+        buffers=step.result_buffers,
+        namespace=(namespace, "int"),
+        capacities={
+            "rows": tokens,
+            "cu": requests + 1,
+            "batch_ids": tokens,
+            "floors": requests,
+            "cached_until": requests,
+            "slots": requests,
+            "requests": requests,
+            "last": requests,
+            "query_ids": tokens,
+            "query_ptrs": requests + 1,
+            "last_rows": requests,
+        },
         rows=rows,
         cu=np.concatenate(([0], ends)),
         batch_ids=batch_ids,
@@ -288,9 +312,22 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     up |= _upload(
         device,
         step.positions.dtype,
+        buffers=step.result_buffers,
+        namespace=(namespace, "position"),
+        capacities={"positions": tokens, "last_positions": requests},
         positions=positions,
         last_positions=positions[last],
     )
+
+    def keep(name, tensor, capacity):
+        return (
+            tensor
+            if step.result_buffers is None
+            else step.result_buffers.deliver(
+                (namespace, name), tensor, capacity=capacity
+            )
+        )
+
     tail = BatchStep(
         tuple(
             RequestSpan(s.request_id, int(start), int(end - n), n, s.slot)
@@ -300,12 +337,24 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
         up["cu"],
         up["slots"],
         up["batch_ids"],
-        step.block_tables.index_select(0, up["requests"]),
+        keep(
+            "block_tables",
+            step.block_tables.index_select(0, up["requests"]),
+            requests * step.block_tables.shape[1],
+        ),
         scheduled=int(ends[-1]),
         max_q_len=int(lengths.max()),
-        visible=dict(
-            zip(step.visible, _gather_rows(up["rows"], *step.visible.values()))
-        ),
+        is_prefill=True,
+        visible={
+            r: keep(("visible", r), value, tokens)
+            for r, value in zip(
+                step.visible, _gather_rows(up["rows"], *step.visible.values())
+            )
+        },
+        result_buffers=step.result_buffers,
+        buffer_namespace=namespace,
+        token_capacity=tokens,
+        request_capacity=requests,
         request_positions=starts.astype(np.int32),
         swa_replay_start=up["floors"],
         swa_cached_until=up["cached_until"],
@@ -323,18 +372,30 @@ def build_replay_plan(step: BatchStep, window: int) -> ReplayPlan:
     )
 
 
-def _upload(device, dtype, **arrays):
-    """``arrays`` on ``device`` as ``dtype``, in one copy."""
-    names = list(arrays)
-    host = np.concatenate([np.asarray(arrays[k]) for k in names]).astype(
-        torch.empty(0, dtype=dtype).numpy().dtype
+def _upload(device, dtype, *, buffers=None, namespace=None, capacities=None, **arrays):
+    """Upload one dtype once, with fixed field offsets in persistent storage.
+
+    Packing by the live lengths would move every following field even inside a
+    fixed-size allocation. Reserve each field at its backend capacity instead.
+    """
+    sizes = {
+        name: len(value) if buffers is None else capacities[name]
+        for name, value in arrays.items()
+    }
+    host = np.zeros(
+        sum(sizes.values()), dtype=torch.empty(0, dtype=dtype).numpy().dtype
     )
-    return dict(
-        zip(
-            names,
-            upload_numpy(host, device).split([len(arrays[k]) for k in names]),
-        )
-    )
+    fields, offset = {}, 0
+    for name, value in arrays.items():
+        if len(value) > sizes[name]:
+            raise ValueError(f"{name} needs {len(value)} rows, capacity {sizes[name]}")
+        fields[name] = slice(offset, offset + len(value))
+        host[fields[name]] = value
+        offset += sizes[name]
+    value = upload_numpy(host, device)
+    if buffers is not None:
+        value = buffers.deliver(namespace, value, capacity=host.size)
+    return {name: value[field] for name, field in fields.items()}
 
 
 def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
@@ -348,10 +409,29 @@ def carry_selections(parent: BatchStep, plan: ReplayPlan, specs) -> None:
         ({s.candidate_source for s in specs} - {None} - own) & parent.candidates.keys()
     )
     rows, tail = plan.tail_rows, plan.tail
+    tail.layer_specs = tuple(specs)
     taken = _gather_rows(rows, *(parent.selected[o] for o in owners), dim=1)
-    tail.selected.update(zip(owners, taken))
+    for owner, value in zip(owners, taken):
+        tail.selected[owner] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "selected", owner),
+                value,
+                capacity=tail.token_capacity * value.shape[0] * value.shape[2],
+            )
+        )
     taken = _gather_rows(rows, *(parent.candidates[s] for s in sources))
-    tail.candidates.update(zip(sources, taken))
+    for source, value in zip(sources, taken):
+        tail.candidates[source] = (
+            value
+            if tail.result_buffers is None
+            else tail.result_buffers.deliver(
+                (tail.buffer_namespace, "candidates", source),
+                value,
+                capacity=tail.token_capacity * value.shape[1],
+            )
+        )
 
 
 @contextlib.contextmanager
@@ -366,14 +446,14 @@ def rows_of(metadata, step, queries=None, rows=None):
     now hold the inner step's contents: a reader after this fails loudly
     instead of reading them; the next forward's ``begin_step`` rebuilds both.
     """
-    # Triton-backed; imported here so this module imports without it.
-    from atom.model_ops.attentions.deepseek_v41.indices import fill_step_indptrs
-
-    indexed = step if queries is None else queries.index
-    indexed.indptrs = fill_step_indptrs(
-        indexed, metadata.cache.geometry, metadata.cache.indptr_buffers
+    metadata.cache.update_step(
+        step, queries=queries, fixed_results=step.result_buffers is not None
     )
     outer = metadata.step, metadata.queries, metadata.image_mask
+    outer_key = getattr(metadata, "cudagraph_key", None)
+    metadata.cudagraph_key = (
+        metadata.cache.graph_layout(step, queries) if outer_key is not None else None
+    )
     metadata.step, metadata.queries = step, queries
     if rows is not None and outer[2] is not None:
         # [1, tokens]: an MoE router routes image rows by it
@@ -382,5 +462,6 @@ def rows_of(metadata, step, queries=None, rows=None):
         yield
     finally:
         metadata.step, metadata.queries, metadata.image_mask = outer
+        metadata.cudagraph_key = outer_key
         outer[0].indptrs = {}
         outer[0].tiles.clear()

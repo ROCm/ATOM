@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import math
 import os
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -9,10 +10,9 @@ from typing import Any, NamedTuple
 from unittest.mock import patch
 
 import torch
-from aiter import logger
 
 from atom.config import Config, CUDAGraphMode
-from atom.utils import compilation_counter, weak_ref_tensors
+from atom.utils import compilation_counter, logger, weak_ref_tensors
 from atom.utils.forward_context import get_forward_context
 from atom.utils.graph_holders import register_graph_holder
 
@@ -338,20 +338,65 @@ class StableOutputs:
     op sits inside PIECEWISE, whether or not anything was ever captured.
     """
 
-    def __init__(self):
+    def __init__(self, *, capacity: int = 0, token_dim: int = 0):
         self._slots: dict = {}
+        self.capacity, self.token_dim = capacity, token_dim
+
+    def empty(self, key, shape, *, dtype, device, capacity=None):
+        """Return contiguous result storage, optionally a fixed-capacity prefix.
+
+        ``capacity`` is the number of elements reserved for this role, fixed by
+        its owner. Flatten before taking the prefix, then reshape: grouped
+        planes must stay contiguous even when their active row width changes.
+        Active shapes never create additional slots within that capacity.
+        """
+        shape = tuple(shape)
+        count = math.prod(shape)
+        if capacity is not None and count > capacity:
+            raise ValueError(f"Buffer needs {count} elements, capacity {capacity}")
+        storage_shape = shape if capacity is None else (capacity,)
+        key = (key, storage_shape, dtype, torch.device(device))
+        if key not in self._slots:
+            self._slots[key] = torch.empty(storage_shape, dtype=dtype, device=device)
+        buf = self._slots[key]
+        return buf if capacity is None else buf[:count].view(shape)
 
     def slot(self, key, sample: torch.Tensor) -> torch.Tensor:
-        """This key's persistent buffer, shaped from `sample` on first use."""
+        """Return a stable slot, optionally a view into fixed token capacity.
+
+        Capacity never grows: captured graphs retain these addresses. Roles
+        share token prefixes only when the caller opts into a fixed capacity.
+        """
+        if self.capacity:
+            shape = list(sample.shape)
+            tokens = shape[self.token_dim]
+            if tokens > self.capacity:
+                raise ValueError(
+                    f"Buffer needs {tokens} tokens, capacity {self.capacity}"
+                )
+            shape[self.token_dim] = self.capacity
+            key = (key, tuple(shape), sample.dtype, sample.device)
+        else:
+            key = (key, tuple(sample.shape), sample.dtype, sample.device)
         buf = self._slots.get(key)
         if buf is None:
-            buf = torch.empty_like(sample)
+            buf = sample.new_empty(shape) if self.capacity else torch.empty_like(sample)
             self._slots[key] = buf
-        return buf
+        return buf.narrow(self.token_dim, 0, tokens) if self.capacity else buf
 
-    def deliver(self, key, out: torch.Tensor) -> torch.Tensor:
-        """Copy an eagerly computed `out` into its slot and return the slot."""
-        buf = self.slot(key, out)
+    def deliver(self, key, out: torch.Tensor, *, capacity=None) -> torch.Tensor:
+        """Copy `out` into its slot, optionally bounded by capacity in elements.
+
+        An explicit capacity uses a contiguous prefix, as in ``empty``. Without
+        it, the store's configured token capacity and axis apply, as in ``slot``.
+        """
+        buf = (
+            self.slot(key, out)
+            if capacity is None
+            else self.empty(
+                key, out.shape, dtype=out.dtype, device=out.device, capacity=capacity
+            )
+        )
         buf.copy_(out)
         return buf
 
@@ -368,8 +413,19 @@ class CudagraphCaptureRunner:
     Holds its own graph pool, isolated from the dense-piece pool.
     """
 
-    def __init__(self, capture_error_mode: str = "thread_local"):
+    def __init__(
+        self,
+        capture_error_mode: str = "thread_local",
+        *,
+        outputs=None,
+        token_dim=0,
+        max_entries=32,
+    ):
         self._graphs: dict = {}
+        self.outputs = (
+            outputs if outputs is not None else StableOutputs(token_dim=token_dim)
+        )
+        self.max_entries = max_entries
         self._pool = None
         self._capture_error_mode = capture_error_mode
         # A runner is a module-level global of the model that uses it
@@ -394,6 +450,13 @@ class CudagraphCaptureRunner:
 
     def has_graph(self, key) -> bool:
         return key in self._graphs
+
+    def can_capture(self, key) -> bool:
+        """Whether a live key fits the budget; existing keys remain replayable.
+
+        Startup capture has its own planned shapes and does not use this gate.
+        """
+        return self.has_graph(key) or len(self._graphs) < self.max_entries
 
     def input_buffers(
         self, named_args: dict, input_names: tuple, zero_copy: frozenset
@@ -456,6 +519,61 @@ class CudagraphCaptureRunner:
             if out_buf is not None:
                 out_buf.copy_(result)
         self._graphs[key] = {"graph": graph, "in": refresh, "out": out_buf}
+
+    def capture_on_demand(self, key, in_bufs, refresh, compute_fn, output_slot):
+        """Record a live core after warmup, returning that warmup's result once."""
+        if not hasattr(self, "capture_stream"):
+            self.capture_stream = torch.cuda.Stream()
+        current = torch.cuda.current_stream()
+        self.capture_stream.wait_stream(current)
+        with torch.cuda.stream(self.capture_stream):
+            warm = compute_fn(**in_bufs)
+            slot = None if warm is None else output_slot(warm)
+            self.capture(key, in_bufs, refresh, compute_fn, slot)
+            self._graphs[key]["read_from"] = in_bufs
+            # The callable retains backend metadata and external allocations
+            # for both explicit-key and backend-keyed live capture.
+            self._graphs[key]["compute"] = compute_fn
+            if slot is not None:
+                slot.copy_(warm)
+        current.wait_stream(self.capture_stream)
+        return slot
+
+    def run(self, key, tensors, compute_fn, output_slot, *, zero_copy):
+        """Capture a region over an explicitly prepared backend layout.
+
+        The backend owns non-argument buffers and their generation in ``key``.
+        Direct tensor arguments must retain their address; copied arguments may
+        change address but must retain layout. Python mutations are not replayed.
+        A new layout falls back once this runner's recording budget is exhausted.
+        """
+        layout = tuple(
+            (
+                name,
+                (
+                    None
+                    if value is None
+                    else (
+                        tuple(value.shape),
+                        tuple(value.stride()),
+                        value.dtype,
+                        value.device,
+                        value.data_ptr() if name in zero_copy else None,
+                    )
+                ),
+            )
+            for name, value in tensors.items()
+        )
+        key = (key, layout)
+        if self.has_graph(key):
+            return True, self.replay(key, tensors)
+        if not self.can_capture(key):
+            return False, None
+        read_from, refresh = self.input_buffers(tensors, tuple(tensors), zero_copy)
+        result = self.capture_on_demand(
+            key, read_from, refresh, compute_fn, output_slot
+        )
+        return True, result
 
     def replay(self, key, named_args: dict) -> torch.Tensor | None:
         """Refresh the inputs this runner owns, replay, and return the output."""
