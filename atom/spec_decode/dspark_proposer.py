@@ -122,29 +122,6 @@ class DSparkProposer(Drafter):
             # This flavor's block sampler has no sampled entry point. Silent,
             # because "not ported yet" is not an operator error.
             return
-        if envs.ATOM_ENABLE_RELAXED_MTP:
-            # Refused here, at construction, rather than in `rejection_sample`:
-            # the sampler only sees `draft_probs` on a sampled unfiltered batch,
-            # so a check there fires per step inside every TP worker and only
-            # for some traffic -- an all-greedy batch would silently take the
-            # relaxed path instead, and a filtered one exact match. The server
-            # would boot, arm, serve prefills and die mid-stream.
-            #
-            # Raised rather than warned-and-fallen-back, unlike PP and PCP
-            # below. Those are capability gaps, where the shipped behaviour is
-            # a reasonable substitute. This is a contradictory REQUEST: relaxed
-            # top-N accepts tokens the target would not have drawn, and the
-            # ratio rule's whole claim is that the emitted stream is the
-            # target's distribution exactly. Falling back silently would hand
-            # the operator the opposite of one of the two things they asked
-            # for. `models/deepseek_v41/config.py` refuses the same flag the
-            # same way.
-            raise ValueError(
-                "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-                "mutually exclusive: relaxed top-N acceptance is approximate "
-                "by construction and the probability-ratio rule is exact, so "
-                "there is no defensible way to apply both. Turn one off."
-            )
         if self.config.pipeline_parallel_size > 1:
             # The draft's temperatures / greedy mask / seed ride the runner's
             # `sampling` publication group, and PP gives that group a ring (one

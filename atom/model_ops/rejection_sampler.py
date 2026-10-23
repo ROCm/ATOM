@@ -463,16 +463,16 @@ def rejection_sample(
         # acceptance is deliberately not distribution-preserving, while the
         # ratio rule's entire claim is that it is.
         #
-        # An assert, not a raise: the pair is refused at construction by
-        # `DSparkProposer._init_lossless_sampling`, so reaching here means that
-        # gate was bypassed. Re-checking on the verify path cost a per-step
+        # An assert, not a raise: the pair is refused when any drafter is
+        # constructed (`Drafter.__init__`), so reaching here means that gate
+        # was bypassed. Re-checking on the verify path cost a per-step
         # branch in every TP worker for a condition that cannot change after
         # startup -- both flags are read at import -- and it only fired on a
         # sampled unfiltered batch, so an all-greedy batch silently ran relaxed
         # instead of being refused.
         assert RELAXED_TOP_N <= 1, (
             "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
-            "mutually exclusive; this should have been refused at proposer "
+            "mutually exclusive; this should have been refused at drafter "
             "construction"
         )
     if target_token_ids is not None:
