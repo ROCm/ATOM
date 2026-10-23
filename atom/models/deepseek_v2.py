@@ -108,6 +108,7 @@ from atom.model_ops.linear import (
     use_fp4_non_shuffle_triton_gemm,
     use_mxfp4_preshuffle_triton_gemm,
     use_triton_gemm,
+    uses_mxfp4_n32k4_scale,
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.sparse_indexer_chunk import (
@@ -2844,7 +2845,17 @@ class DeepseekV2MLAAttention(nn.Module):
                 hidden_states, hidden_states_scale = hidden_states
 
         if self.q_lora_rank is not None:
+            q_uses_n32k4 = False
+            if self.quant_dtype == dtypes.fp4x2:
+                q_uses_n32k4 = uses_mxfp4_n32k4_scale(self.q_b_proj)
+                if self.is_v32 and self.indexer is not None and not self.skip_topk:
+                    q_uses_n32k4 = q_uses_n32k4 or uses_mxfp4_n32k4_scale(
+                        self.indexer.wq_b
+                    )
             if self.fuse_qknorm_quant and use_triton_gemm():
+                q_scale_shuffle_padding = not (
+                    q_uses_n32k4 and hidden_states.shape[0] < MXFP4_QUANT_BLOCK_SIZE
+                )
                 q_c, q_c_scale, kv_c_normed, k_pe = (
                     _fuse_qkv_a_proj_reduce_rmsnorm_quant(
                         hidden_states,
@@ -2860,7 +2871,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         dtype_quant=self.quant_dtype,
                         hidden_states_quant_scale=hidden_states_scale,
                         shuffle=True,
-                        scale_shuffle_padding=True,
+                        scale_shuffle_padding=q_scale_shuffle_padding,
                         group_size=128,
                         output_unquantized_inp1=False,
                         transpose_scale=True,
@@ -2880,7 +2891,9 @@ class DeepseekV2MLAAttention(nn.Module):
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
                     q_shuffle = False
                     q_scale_shuffle_padding = False
-                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
+                    if self.quant_dtype == dtypes.fp4x2 and (
+                        not use_triton_gemm() or q_uses_n32k4
+                    ):
                         q_shuffle, q_scale_shuffle_padding = (
                             _mxfp4_activation_quant_layout(q_c.shape[0])
                         )
