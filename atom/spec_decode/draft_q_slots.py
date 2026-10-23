@@ -58,34 +58,35 @@ class DraftQSlots:
     def verify_bases(self, req_ids, out) -> None:
         """Write each request's first q row into ``out``, or -1 if it has none.
 
-        Must run before `claim_bases` for the same batch: a claim can expire a
-        request of this very batch, and its verify still has to read the slot
-        its drafts came from. That read is ordered before the propose that
-        rewrites the slot because both run on the one compute stream, verify
-        first.
+        Must run before `claim_bases` for the same batch, which may hand the
+        slot of a request outside the batch to a new one. Both run on the host
+        before the forward; the verify's read is ordered before the propose
+        that rewrites a slot because both run on the one compute stream.
         """
         rows = self.rows_per_slot
-        slots = self._slot_of
-        for i, req_id in enumerate(req_ids):
-            slot = slots.get(req_id)
-            out[i] = -1 if slot is None else slot * rows
+        get = self._slot_of.get
+        out[: len(req_ids)] = [
+            -1 if slot is None else slot * rows for slot in map(get, req_ids)
+        ]
 
     def claim_bases(self, req_ids, out) -> None:
         """Give every request a slot to draft into and write its first row.
 
         A request that already owns a slot keeps it and becomes the most
-        recently drafted. Slots handed out within one call are distinct: each
-        claim makes its request the freshest entry, and with ``num_slots`` at
-        least the batch size an older entry is always there to expire first.
+        recently drafted. The batch's own entries are taken out of the map
+        before anything is claimed, so a new request can only expire a request
+        outside this batch: every member keeps its slot, and the slots handed
+        out are distinct. That always leaves enough to claim from, since the
+        free list plus the entries left in the map hold ``num_slots`` minus the
+        members' own slots, and ``num_slots`` is at least the batch size.
         """
         rows = self.rows_per_slot
         slots = self._slot_of
-        for i, req_id in enumerate(req_ids):
-            slot = slots.pop(req_id, None)
-            if slot is None:
-                slot = self._claim()
-            slots[req_id] = slot
-            out[i] = slot * rows
+        owned = [slots.pop(req_id, None) for req_id in req_ids]
+        claimed = [self._claim() if slot is None else slot for slot in owned]
+        # Re-inserted last, in batch order: the freshest entries.
+        slots.update(zip(req_ids, claimed))
+        out[: len(req_ids)] = [slot * rows for slot in claimed]
 
     def _claim(self) -> int:
         if self._free:

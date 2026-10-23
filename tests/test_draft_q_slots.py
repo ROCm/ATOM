@@ -77,17 +77,25 @@ def test_slots_claimed_in_one_batch_are_distinct_under_pressure():
     assert slots.evictions > 0
 
 
+def test_a_claim_never_expires_a_member_of_its_own_batch():
+    """LRU [b, x], free list empty, batch [a, b]: a takes x's slot and b keeps
+    its own -- one expiry, not a chain where a evicts b and b then evicts x."""
+    slots = DraftQSlots(2, T)
+    b, x = bases(slots, ["b", "x"], claim=True)
+    assert bases(slots, ["a", "b"], claim=True) == [x, b]
+    assert slots.evictions == 1
+    assert bases(slots, ["x"], claim=False) == [-1]
+
+
 def test_a_verify_computed_before_the_claims_of_its_own_batch_is_unaffected():
     """The order `stage_draft_sampling_host` uses: verify bases first, then
-    claims. Here every claim expires a request of the same batch -- c takes
-    a's slot, a then takes b's, b takes x's -- yet each verify was already
-    pointed at the rows its own drafts came from, and runs before the propose
-    that overwrites them (both on the one compute stream)."""
+    claims. The new request takes the slot of one outside the batch; the
+    batch's own requests keep the rows their drafts came from."""
     slots = DraftQSlots(3, T)
     a, b, x = bases(slots, ["a", "b", "x"], claim=True)
     assert bases(slots, ["c", "a", "b"], claim=False) == [-1, a, b]
-    assert bases(slots, ["c", "a", "b"], claim=True) == [a, b, x]
-    assert slots.evictions == 3
+    assert bases(slots, ["c", "a", "b"], claim=True) == [x, a, b]
+    assert slots.evictions == 1
 
 
 def test_more_live_requests_than_slots_never_alias():
