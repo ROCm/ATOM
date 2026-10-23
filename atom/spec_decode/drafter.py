@@ -388,6 +388,11 @@ class Drafter(abc.ABC):
         publication, which is what carries them to the device."""
         return
 
+    def kv_budget_reserve_bytes(self) -> int:
+        """Device scratch this drafter allocates per step outside the profiled
+        forward, for the KV budget to hold back."""
+        return 0
+
     @property
     def draft_kv_duplicates_propose(self) -> bool:
         """Is `compute_draft_kv` the pass propose's first draft step redoes?

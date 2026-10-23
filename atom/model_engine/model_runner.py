@@ -1852,6 +1852,12 @@ class ModelRunner:
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
         extra_reserve = self._kv_budget_extra_reserve(total)
+        # Scratch a drafter allocates per step on a path the profiling forward
+        # does not take (lossless speculative sampling's sampled draft and
+        # ratio verify), so the peak above never saw it.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            extra_reserve += drafter.kv_budget_reserve_bytes()
         available_for_kv_budget -= extra_reserve
         # GPU buffers the KV connector allocates after the KV cache is sized.
         connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)

@@ -9,7 +9,11 @@ from torch.profiler import record_function
 
 from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import get_pcp_world_size
-from atom.model_ops.dspark_markov_sample import dspark_markov_sample_unsupported
+from atom.model_ops.dspark_markov_sample import (
+    dspark_markov_sample_scratch_bytes,
+    dspark_markov_sample_unsupported,
+)
+from atom.model_ops.rejection_sampler import ratio_verify_scratch_bytes
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
@@ -244,6 +248,22 @@ class DSparkProposer(Drafter):
     def draft_probs(self) -> torch.Tensor | None:
         """``[slots * T, V]`` fp32 q, or None when the greedy pair is running."""
         return self._q_store
+
+    def kv_budget_reserve_bytes(self) -> int:
+        """Per-step scratch the sampled draft and the ratio verify allocate.
+
+        Neither runs in the profiling forward (warmup is an all-greedy prefill),
+        so the allocator's peak never sees them. Both are bounded by the batch
+        and vocab tiling; see the two ops for the shapes.
+        """
+        if self.draft_sampling is None:
+            return 0
+        max_bs = self.config.max_num_seqs
+        vocab = int(self.model.vocab_size)
+        rank = self.model.markov_head.markov_w1.weight.shape[1]
+        return dspark_markov_sample_scratch_bytes(
+            max_bs, vocab, rank
+        ) + ratio_verify_scratch_bytes(max_bs, self.draft_tokens_per_seq, vocab)
 
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool

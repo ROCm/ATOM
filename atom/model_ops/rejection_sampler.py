@@ -87,6 +87,18 @@ _RATIO_RESIDUAL_KEY = 2 << 32
 _RATIO_BLOCK_V = 4096
 
 
+def ratio_verify_scratch_bytes(
+    max_bs: int, num_spec_steps: int, vocab_size: int
+) -> int:
+    """Device bytes one ratio verify allocates at ``max_bs`` requests of
+    ``num_spec_steps`` drafts each, outside the profiled forward."""
+    tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
+    rows = max_bs * num_spec_steps
+    return rows * (tiles * 4 * 4 + 3 * 4) + max_bs * (  # per-tile stats, per-row stats
+        tiles * 4 * 4 + 4
+    )  # residual partials, rejecting row
+
+
 @triton.jit
 def _ratio_stats_kernel(
     logits_ptr,  # [num_tokens, V] raw target logits

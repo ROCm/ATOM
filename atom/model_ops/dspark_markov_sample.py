@@ -817,6 +817,25 @@ def dspark_markov_sample_unsupported(
     return None
 
 
+def dspark_markov_sample_scratch_bytes(
+    max_rows: int, vocab_size: int, rank: int
+) -> int:
+    """Device bytes one `dspark_markov_sample` call allocates at ``max_rows``.
+
+    The op runs once per block position and its scratch is freed between
+    calls, so this is also the peak a whole block adds.
+    """
+    gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
+    sample_tiles = triton.cdiv(vocab_size, _SAMPLE_BLOCK_V)
+    per_row = (
+        4 * gemv_tiles * 4  # part_max, part_sum, part_amax_val, part_amax_idx
+        + 3 * 4  # row_max, row_inv_z, row_argmax
+        + sample_tiles * (4 + 4)  # part_key, part_idx
+        + rank * 2  # markov_embed (bf16/fp16)
+    )
+    return max_rows * per_row
+
+
 @torch_compile_guard(
     gen_fake=_dspark_markov_sample_fake, mutates_args=["out", "q_store"]
 )
