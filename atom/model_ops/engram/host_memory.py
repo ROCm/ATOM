@@ -22,6 +22,7 @@ during a capture is skipped, with a warning, rather than breaking it.
 """
 
 import ctypes
+import functools
 import logging
 import os
 import sys
@@ -417,16 +418,91 @@ def _copy(allocator, sources, leases):
             pool.shutdown()
 
 
+@functools.cache
+def _hip_runtime():
+    """The HIP runtime torch already loaded (e.g. a wheel's libamdhip64.so.7)."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                if "libamdhip64" in line:
+                    return ctypes.CDLL(line.split()[-1])
+    except OSError:
+        pass
+    return None
+
+
+def _clear_last_error() -> None:
+    """Reset HIP's last error after a refused registration.
+
+    `cudaHostRegister` reports the refusal through its return code but also
+    leaves it as the runtime's last error, and torch raises that at its next
+    kernel-launch check -- so the host-path fallback would die there ("part or
+    all of the requested memory range is already mapped").
+    """
+    hip = _hip_runtime()
+    if hip is not None:
+        hip.hipGetLastError()
+
+
+class _PageRuns:
+    """Page-locked runs of this process, reference-counted.
+
+    `cudaHostRegister` refuses any range that overlaps one already registered,
+    and a table widens each range to page boundaries. Ranges stored back to
+    back want the page they share: a layer's scales sit right before its
+    values in the checkpoint shard, and a rank that holds every hash head (one
+    DP-attention rank per GPU) registers both whole. A run is registered once
+    and released with its last user.
+    """
+
+    def __init__(self):
+        self._runs: dict[int, list[int]] = {}  # base -> [end, users]
+
+    def acquire(self, rt, lo: int, hi: int) -> list[int] | None:
+        """Reference the runs covering `[lo, hi)`, registering the uncovered
+        gaps; their bases, or None (holding nothing) if a registration is
+        refused."""
+        held: list[int] = []
+        cursor = lo
+        overlapping = sorted(b for b, (e, _) in self._runs.items() if b < hi and e > lo)
+        for base in overlapping + [None]:
+            gap_end = hi if base is None else base
+            if cursor < gap_end:
+                if int(rt.cudaHostRegister(cursor, gap_end - cursor, 0)) != 0:
+                    _clear_last_error()
+                    self.release(rt, held)
+                    return None
+                self._runs[cursor] = [gap_end, 1]
+                held.append(cursor)
+            if base is None:
+                break
+            self._runs[base][1] += 1
+            held.append(base)
+            cursor = max(cursor, self._runs[base][0])
+        return held
+
+    def release(self, rt, bases) -> None:
+        for base in bases:
+            run = self._runs[base]
+            run[1] -= 1
+            if run[1] == 0:
+                rt.cudaHostUnregister(base)
+                del self._runs[base]
+
+
+_PAGE_RUNS = _PageRuns()
+
+
 def _register(sources, leases):
     """Register the mapping in place; the range is widened to page boundaries,
     which registration requires (the extra bytes are neighbouring rows the
     kernel never addresses)."""
     rt = torch.cuda.cudart()
 
-    def unregister(base):
+    def unregister(base, *, registry, runs):
         if torch.cuda.is_initialized():
             torch.cuda.synchronize()
-        rt.cudaHostUnregister(base)
+        registry.release(rt, runs)
 
     out = []
     for src in sources:
@@ -434,10 +510,12 @@ def _register(sources, leases):
         nbytes = src.numel() * src.element_size()
         lo = base - (base % _PAGE)
         size = -(-(base + nbytes - lo) // _PAGE) * _PAGE
-        if int(rt.cudaHostRegister(lo, size, 0)) != 0:
+        runs = _PAGE_RUNS.acquire(rt, lo, lo + size)
+        if runs is None:
             logger.info("engram: page-lock registration of %d bytes refused", size)
             return None
-        lease = _Lease(lo, size, unregister, keep=src)
+        release = functools.partial(unregister, registry=_PAGE_RUNS, runs=runs)
+        lease = _Lease(lo, size, release, keep=src)
         leases.append(lease)
         view = _owning_bytes(lease, base - lo, nbytes)
         out.append(view.view(src.dtype).view(src.shape))
