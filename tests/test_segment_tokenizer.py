@@ -221,7 +221,7 @@ def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
     assert not _segments(seg)
 
 
-def _tokenizer_with(added, pre=None):
+def _tokenizer_with(added, pre=None, dropout=None):
     rng = random.Random(8)
     backend = Tokenizer(models.BPE(unk_token="[UNK]"))
     backend.pre_tokenizer = pre or pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -233,6 +233,8 @@ def _tokenizer_with(added, pre=None):
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         ),
     )
+    if dropout is not None:
+        backend.model.dropout = dropout
     for tok in added:
         if tok.special:
             backend.add_special_tokens([tok])
@@ -267,6 +269,18 @@ def test_offset_sensitive_pre_tokenizers_are_refused():
     ):
         tok = _tokenizer_with([AddedToken("<|User|>", special=True)], pre=pre)
         assert SegmentTokenizer.maybe_create(tok, 10**6) is None, pre
+
+
+def test_bpe_dropout_is_refused(monkeypatch):
+    """Dropout samples merges on every call, so sharing one segment's ids
+    across occurrences changes the encoder even when the startup probes
+    happen to agree; the description alone has to refuse it."""
+    monkeypatch.setattr(seg_mod.AddedTokenSplitter, "_probes_match", lambda self: True)
+    added = [AddedToken("<|User|>", special=True)]
+    assert SegmentTokenizer.maybe_create(_tokenizer_with(added), 10**6) is not None
+    for dropout in (0.5, 0.01):
+        tok = _tokenizer_with(added, dropout=dropout)
+        assert SegmentTokenizer.maybe_create(tok, 10**6) is None, dropout
 
 
 def test_a_result_finished_after_the_cache_turned_off_is_not_returned(tok, monkeypatch):

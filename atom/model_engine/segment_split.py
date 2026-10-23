@@ -7,7 +7,8 @@ ones from the raw text, then normalized ones from what is left, each pass
 leftmost-longest. The text between two extracted tokens is then normalized,
 pre-tokenized and encoded on its own, so encoding it alone gives the same ids
 -- unless a token strips its neighbours' whitespace, the normalizer or
-pre-tokenizer treats the start of its input specially, or the two passes can
+pre-tokenizer treats the start of its input specially, the model samples
+(BPE dropout), or the two passes can
 disagree about where a token is. `AddedTokenSplitter.segments_exact` and
 `prefix_cuts_stable` decide those cases from the tokenizer's own description,
 and a few placements are encoded both ways as a backstop.
@@ -40,6 +41,13 @@ def _offset_sensitive(pre_tokenizer) -> bool:
     if kind == "ByteLevel":
         return bool(pre_tokenizer.get("add_prefix_space"))
     return False
+
+
+def _deterministic(model) -> bool:
+    """Whether the model encodes a given text the same way every time. BPE
+    with dropout samples merges per call, so a segment's ids must not be
+    shared between occurrences or requests."""
+    return not (isinstance(model, dict) and model.get("dropout"))
 
 
 def _normalizer_is_identity(description: dict) -> bool:
@@ -122,6 +130,8 @@ class AddedTokenSplitter:
             return False
         # A normalizer runs per segment too, and a normalized added token is
         # matched after it runs; only the identity is accepted.
+        if not _deterministic(description.get("model")):
+            return False
         if not _normalizer_is_identity(description):
             return False
         if _offset_sensitive(description.get("pre_tokenizer")):
