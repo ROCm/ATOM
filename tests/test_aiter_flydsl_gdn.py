@@ -289,6 +289,44 @@ def test_qwen_backend_binds_zero_copy_vk_state(
         assert result.v_cache is raw
 
 
+def test_qwen_mono_binds_vk_state_without_enabling_standalone_decode(monkeypatch):
+    from types import SimpleNamespace
+
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadataBuilder
+    from atom.model_ops.attentions.qwen4_exp_attn import Qwen4ExpMetadataBuilder
+    from atom.models.qwen4_exp_mono.cache import MonoCacheBuilder
+    from atom.utils import envs
+
+    raw = torch.zeros(4, 48, 128, 128, device="cuda", dtype=torch.float32)
+    monkeypatch.setattr(
+        GDNAttentionMetadataBuilder,
+        "build_kv_cache_tensor",
+        lambda self, module: SimpleNamespace(v_cache=raw),
+    )
+    monkeypatch.setattr(envs, "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", False)
+    monkeypatch.setattr(envs, "ATOM_MONO_ENABLE", True)
+    monkeypatch.setattr(fly, "backend", lambda stage: "auto")
+    monkeypatch.setattr(fly, "ops", lambda: object())
+    monkeypatch.setattr(fly, "decode_device_supported", lambda device: False)
+    attention = SimpleNamespace(
+        allow_aiter_flydsl=True,
+        dt_bias=torch.zeros(48, device="cuda", dtype=torch.bfloat16),
+        tp_size=1,
+        num_k_heads=16,
+        num_v_heads=48,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    builder = object.__new__(Qwen4ExpMetadataBuilder)
+    builder.replayssm = False
+    result = MonoCacheBuilder(builder).build_kv_cache_tensor(
+        SimpleNamespace(base_linear_attention=None, impl=attention)
+    )
+    assert not attention.gdn_flydsl_policy.decode
+    assert result.v_cache.data_ptr() == raw.data_ptr()
+    assert result.v_cache.stride()[-2:] == (1, 128)
+
+
 @requires_gfx942
 def test_align_flydsl_decode_accepts_strided_and_padded_indices():
     q, k, v, a, b, log, bias = inputs(4)
