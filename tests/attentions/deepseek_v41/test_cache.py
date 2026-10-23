@@ -232,6 +232,38 @@ def test_lmcache_mp_aliases_the_checkpoint_image_in_state_copies_order(
     assert builder.get_kv_transfer_tensors() is None
 
 
+def test_pd_transfer_publishes_the_state_slot(small_config):
+    """Mooncake P/D: PAGE units plus the whole STATE slot, slot-indexed.
+
+    The connector writes `src_slot * unit` to `dst_slot * unit`, and sends the
+    consumer's slot only when `slot_regions` is non-empty. Encoder bounded
+    replay keeps no checkpoint, so the spec may be None. `lmcache_mp` gets no
+    slot region: it moves STATE through checkpoint copies.
+    """
+    from atom.model_ops.attentions.deepseek_v41.backend import (
+        DeepseekV41MetadataBuilder,
+    )
+
+    geo = replace(geometry(small_config), window_size=32)
+    cache = PagedAttentionCache(geo, 8, 4, "cpu")
+    builder = DeepseekV41MetadataBuilder.__new__(DeepseekV41MetadataBuilder)
+    builder.model_runner = SimpleNamespace(
+        config=SimpleNamespace(
+            kv_transfer_config={"kv_connector": "mooncake", "kv_role": "kv_consumer"},
+            tensor_parallel_size=2,
+        ),
+        state_runtime=SimpleNamespace(checkpoint_spec=None),
+    )
+    builder.cache = cache
+    transfer = builder.get_kv_transfer_tensors()
+    assert not transfer.swa_block_regions and transfer.staging_region is None
+    (region,) = transfer.slot_regions
+    assert transfer.num_slots == 4
+    assert region.unit_bytes == geo.state_bytes and not region.reverse_indexed
+    for slot in range(4):
+        assert region.unit_addr(slot) == cache.state_bytes[slot].data_ptr()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("ratio", [1, 2])

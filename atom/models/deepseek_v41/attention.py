@@ -364,11 +364,15 @@ class Attention(nn.Module):
             self.indexer.score(*projected, cache, step)
         return joins
 
-    def forward(self, hidden, hidden_scale, cache, step, rope, queries=None):
+    def forward(
+        self, hidden, hidden_scale, cache, step, rope, queries=None, *, hidden_fp8=None
+    ):
         """``queries``: bounded replay's `QueryRows`, the rows of ``step`` this
         layer is asked outputs for; KV is still every row's."""
         compressed = self._fork_compress(hidden, cache, step, rope)
-        q_lora, kv_pre = self.project_qkv(hidden, hidden_scale)
+        q_lora, kv_pre = self.project_qkv(
+            hidden if hidden_fp8 is None else hidden_fp8, hidden_scale
+        )
         qr, qr_scale, kv_normed = self.qk_norm(q_lora, kv_pre)
         selecting = self._fork_select(
             hidden, qr, qr_scale, cache, step, rope, compressed=compressed

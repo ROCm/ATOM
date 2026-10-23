@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Any, ClassVar, NamedTuple
 
@@ -152,6 +152,9 @@ support_model_arch_dict = {
 # metadata builder before they are bound. Architectures not listed here route
 # mono decode inside their own model class instead.
 mono_decode_installers = {
+    "DeepseekV4ForCausalLM": (
+        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
+    ),
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
@@ -1083,6 +1086,9 @@ class ModelRunner:
         close = getattr(connector, "close", None) if connector is not None else None
         if callable(close):
             close()
+        execution = getattr(self, "_mono_execution", None)
+        if execution is not None:
+            execution.shutdown()
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
@@ -1763,6 +1769,14 @@ class ModelRunner:
         if not hasattr(hf_config, "head_dim") or hf_config.head_dim is None:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
 
+        # Mono's lossless production-weight repack is persistent and does not
+        # depend on cache addresses.  Allocate it before measuring the KV
+        # budget so the pool planner accounts for those real resident bytes,
+        # rather than filling the budget with KV first and adding Mono on top.
+        execution = getattr(self, "_mono_execution", None)
+        if execution is not None:
+            execution.prepare_weights()
+
         free, total = torch.cuda.mem_get_info()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -2105,6 +2119,9 @@ class ModelRunner:
         return pool
 
     def allocate_kv_cache(self, num_kvcache_blocks):
+        execution = getattr(self, "_mono_execution", None)
+        if execution is not None:
+            execution.cache_rebinding()
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         config = self.config
@@ -2242,6 +2259,9 @@ class ModelRunner:
                     f"actual={actual_kv_bytes / (1 << 30):.3f}GB, "
                     f"diff={diff_pct:.1%}"
                 )
+
+        if execution is not None:
+            execution.cache_bound()  # outside KV allocation accounting
 
         # Skip on single-rank: a world_size==1 barrier is a no-op but still
         # forces lazy NCCL communicator creation (CUDA-allocs its buffers),
@@ -3024,12 +3044,22 @@ class ModelRunner:
         # short-circuits only on prefill. The padded step is the one it is for.
         forward_mode.assert_shape_contract(input_ids, forward_context.attn_metadata)
 
+        graph_key = (
+            context.running_bs,
+            forward_mode.max_seqlen_q,
+        )
+        use_cudagraph = forward_mode.use_cudagraph
+        integration = getattr(self, "_mono_execution", None)
+        if integration is not None:
+            input_ids, positions, graph_key, use_cudagraph = integration.prepare_step(
+                input_ids, positions, forward_context, batch
+            )
         # Profiler label. Kind (prefix) distinguishes real/dummy and
         # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
         # `build_run_label`.
         label = build_run_label(
             is_prefill=is_prefill,
-            use_cudagraph=forward_mode.use_cudagraph,
+            use_cudagraph=use_cudagraph,
             is_dummy=context.is_dummy_run,
             tbo_on=forward_context.ubatch_slices is not None,
             scheduled_bs=bs,
@@ -3056,7 +3086,7 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
-        if not forward_mode.use_cudagraph:
+        if not use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
@@ -3179,7 +3209,6 @@ class ModelRunner:
             # decode[bs=128 tok=128 d=128] / decode[... p=2 d=126 spec=3] /
             # dummy_decode[...] — see build_run_label.
             with record_function(label):
-                running_bs = context.running_bs
                 running_tokens = forward_mode.running_tokens
                 scheduled_tokens = context.scheduled_tokens
 
@@ -3210,10 +3239,14 @@ class ModelRunner:
                         )
                     ]
                     logits = self.model.compute_logits(hidden_states)
+                    if integration is not None:
+                        integration.finish_step()
                     return logits, hidden_states
 
-                graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
-                self.graphs[graph_key].replay()
+                if integration is not None:
+                    integration.replay(self.graphs[graph_key])
+                else:
+                    self.graphs[graph_key].replay()
                 hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
@@ -3222,6 +3255,8 @@ class ModelRunner:
                 else:
                     logits = self.model.compute_logits(hidden_states)
 
+        if integration is not None:
+            integration.finish_step()
         return logits, hidden_states
 
     def flush_pp_send(self) -> bool:
@@ -3459,7 +3494,13 @@ class ModelRunner:
             needs_independent_noise,
         ) = self.prepare_model(batch)
         self._mark_staging_h2d_enqueued()
-        logits, hidden_states = self.run_model(input_ids, batch)
+        try:
+            logits, hidden_states = self.run_model(input_ids, batch)
+        except BaseException:
+            execution = getattr(self, "_mono_execution", None)
+            if execution is not None:
+                execution.abort_step()
+            raise
 
         pp_group = get_pp_group()
         pp_non_last = pp_group.world_size > 1 and not pp_group.is_last_rank
@@ -3951,6 +3992,9 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        integration = getattr(self, "_mono_execution", None)
+        if integration is not None:
+            integration.before_capture()
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
         # NCCL sets up peer connections on a group's FIRST collective -- doing
         # that inside a capture hangs. warmup_model() does not cover it: its
@@ -4074,8 +4118,14 @@ class ModelRunner:
         # [full_q_len] (single-graph, classic per-bs capture); DSpark confidence
         # scheduling expands to the smaller q-buckets a decode step may replay.
         q_buckets = self._dspark_capture_q_buckets(full_q_len)
-        if q_buckets != [full_q_len]:
-            logger.info("DSpark CUDA-graph query buckets: %s", q_buckets)
+        declared_q_buckets = list(q_buckets)
+        capture_widths = self.capture_sizes
+        if integration is not None:
+            q_buckets, capture_widths = integration.capture_ladder(
+                q_buckets, piecewise=_piecewise
+            )
+        if declared_q_buckets != [full_q_len]:
+            logger.info("DSpark CUDA-graph query buckets: %s", declared_q_buckets)
         elif hasattr(self, "drafter") and self.drafter.uses_confidence_schedule:
             # resolve_q_buckets always folds full_q in, so a spec naming only
             # full_q (or nothing, or nothing valid) collapses to [full_q] and
@@ -4133,12 +4183,15 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
+        with (
+            pause_gc(),
+            graph_capture() as capture_ctx,
+            self.capture_profiler as prof,
+            ExitStack() as capture_scope,
+        ):
             for max_q_len in q_buckets:
                 capture_range = (
-                    tqdm.tqdm(self.capture_sizes)
-                    if self.rank == 0
-                    else self.capture_sizes
+                    tqdm.tqdm(capture_widths) if self.rank == 0 else capture_widths
                 )
                 for bs in capture_range:
                     if self.rank == 0:
@@ -4207,6 +4260,14 @@ class ModelRunner:
                         in_hipgraph=True,
                     )
 
+                    if integration is not None:
+                        capture_scope.enter_context(
+                            integration.capture(
+                                input_ids[:num_tokens],
+                                positions[:num_tokens],
+                                get_forward_context(),
+                            )
+                        )
                     # Warmup
                     model_positions = (
                         self._mrope_positions_view(num_tokens)
@@ -4244,6 +4305,7 @@ class ModelRunner:
                             torch.cuda.synchronize()
                             prof.step()
                             self._capture_trace_tag = None
+                        capture_scope.close()
                         continue
 
                     # Capture
@@ -4286,6 +4348,7 @@ class ModelRunner:
                     if self.logits_in_graph and ubatch_slices is None:
                         self.graph_logits[(bs, max_q_len)] = graph_logits
                     torch.cuda.synchronize()
+                    capture_scope.close()
                     # After the sync: the warmup forward's kernels must have
                     # completed before the window closes, or they spill into the
                     # next bs's file.

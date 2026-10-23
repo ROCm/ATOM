@@ -87,7 +87,7 @@ from atom.model_ops.attentions.pool_layout.v4_pool_fields import (
 from atom.model_ops.communication_op import (
     tensor_model_parallel_all_reduce,
 )
-from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.embed_head import ParallelLMHead
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
 from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.linear import (
@@ -4402,6 +4402,23 @@ class Block(nn.Module):
             res_preshuffle=hc_state.res_preshuffle,
         )
 
+    def aux_hidden_state(self, output: HCState) -> torch.Tensor | None:
+        """Settle the V4 residual for the drafter's existing target aux hook."""
+        residual = output.residual
+        if residual is None:
+            return None
+        if output.res_preshuffle:
+            residual = aiter.mhc_res_unshuffle(residual)
+        if (
+            output.x_prev is not None
+            and output.post_mix is not None
+            and output.comb_mix is not None
+        ):
+            residual = self.hc_post(
+                output.x_prev, residual, output.post_mix, output.comb_mix
+            )
+        return residual.mean(dim=1)
+
     def forward(
         self,
         hc_state: HCState,
@@ -4662,7 +4679,9 @@ class DeepseekV4Model(nn.Module):
         # VocabParallelEmbedding shards along vocab dim. At TP=1 weight shape
         # equals nn.Embedding's [vocab_size, dim] so dummy state_dicts load
         # directly. At TP>1 each rank holds vocab_size/tp rows.
-        self.embed = VocabParallelEmbedding(
+        from atom.models.deepseek_v4.mono.embedding import V4VocabParallelEmbedding
+
+        self.embed = V4VocabParallelEmbedding(
             args.vocab_size,
             args.dim,
             prefix="embed",

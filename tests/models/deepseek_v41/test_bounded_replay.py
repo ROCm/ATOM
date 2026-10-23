@@ -632,3 +632,119 @@ def test_decoder_stages_run_each_layer_under_its_counts():
     assert all(sizes == (1, 128) for i, sizes in log if i < 39)
     assert log[-1] == (39, (1, 1))
     assert forward.dp_metadata.get_sizes_across_dp() == [16384, 500]
+
+
+@cuda
+@pytest.mark.parametrize("fuse_quant", [False, True])
+@pytest.mark.parametrize("has_tail", [False, True])
+def test_runtime_replay_gathers_attention_inputs_under_dp(
+    monkeypatch, fuse_quant, has_tail
+):
+    """Both a real tail and a DP placeholder keep the quantization paired with
+    its BF16 rows and mHC seam while joining the agreed decoder stages."""
+    from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
+    from atom.models.deepseek_v41 import runtime
+    from atom.utils import forward_context
+
+    cache = _cache()
+    step = _forward_step(cache, [6, 4], [0, 0], [False, has_tail])
+    plan = build_replay_plan(step, 128)
+    sizes = ((1, 0), (int(has_tail), 1), (4 if has_tail else 1, 40), (1, 40))
+    forward = _stage_forward([10, 40], 0, sizes, _report([6, 4], [False, has_tail]))
+    mask = torch.arange(10, device="cuda")[None] % 2 == 0
+    metadata = forward.attn_metadata = SimpleNamespace(
+        cache=cache, step=step, queries=None, image_mask=mask, engram_embeddings=None
+    )
+    monkeypatch.setattr(forward_context, "_forward_context", forward)
+    hidden = torch.arange(10 * 512, device="cuda").reshape(1, 10, 512).bfloat16()
+    quant = (torch.arange(hidden.numel(), device="cuda") % 239).to(torch.uint8)
+    quant = quant.reshape(hidden.shape).view(torch.float8_e4m3fn)
+    scale = (torch.arange(160, device="cuda") % 64 + 96).to(torch.uint8)
+    scale = scale.reshape(1, 10, 16).view(torch.float8_e8m0fnu)
+    normed = (hidden, quant, scale) if fuse_quant else hidden
+    state = SinglePassHCState.from_embeddings(hidden, 4)
+    combination = torch.arange(10 * 4 * 4, device="cuda").reshape(1, 10, 4, 4).float()
+    seam = (state.residual, state.pre_mix, state.pre_mix + 1, combination)
+    taken = plan.tail_rows if has_tail else torch.zeros(1, device="cuda").long()
+    expected_hidden = hidden.index_select(1, taken.long())
+    calls = []
+
+    class Attention(torch.nn.Module):
+        def _compress_batch(self, actual, *args):
+            assert actual is hidden  # compression still sees every BF16 row
+            calls.append("compress")
+
+        def forward(self, actual, hidden_scale, *args, hidden_fp8=None):
+            assert metadata.step.requests
+            calls.append("attention")
+            return actual
+
+    layer = runtime.RuntimeBlock.__new__(runtime.RuntimeBlock)
+    torch.nn.Module.__init__(layer)
+    layer.layer_name, layer.attn = "replay_test", Attention()
+    layer.prepare_attention = lambda *args: (normed, *seam)
+    forward.no_compile_layers = {layer.layer_name: (layer, None)}
+
+    def attention_forward(actual, *args):
+        sources = normed if fuse_quant else (normed,)
+        outputs = actual if fuse_quant else (actual,)
+        for source, output in zip(sources, outputs, strict=True):
+            assert output.dtype == source.dtype
+            torch.testing.assert_close(
+                output.view(torch.uint8),
+                source.view(torch.uint8).index_select(1, taken.long()),
+                rtol=0,
+                atol=0,
+            )
+        return runtime.RuntimeBlock.attention_forward(layer, actual, *args)
+
+    def ffn_forward(output, *actual_seam):
+        for source, actual in zip(seam, actual_seam, strict=True):
+            torch.testing.assert_close(actual, source.index_select(1, taken.long()))
+        torch.testing.assert_close(
+            output, expected_hidden if has_tail else torch.zeros_like(expected_hidden)
+        )
+        assert forward.dp_metadata.get_sizes_across_dp() == [taken.numel(), 40]
+        assert torch.equal(metadata.image_mask, mask.index_select(1, taken.long()))
+        calls.append("ffn")
+        return SinglePassHCState.from_embeddings(output, 4)
+
+    layer.attention_forward, layer.ffn_forward = attention_forward, ffn_forward
+    model = runtime.DeepseekV41RuntimeModel.__new__(runtime.DeepseekV41RuntimeModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=512)
+    model.layers = torch.nn.ModuleList([layer])
+    model.decoder_start, model.last_layer = 0, 1
+    model.decoder_specs, model.late_aux_layers = (), ()
+    model._rope = lambda _: None
+
+    def late_layers(state):
+        assert forward.dp_metadata.get_sizes_across_dp() == [taken.numel(), 40]
+        calls.append("late")
+        return state
+
+    def last_layer(index, state, queries=None):
+        assert forward.dp_metadata.get_sizes_across_dp() == [1, 40]
+        assert metadata.queries is queries
+        calls.append("last")
+        output = state.collapse()
+        if queries is not None:
+            output = output.index_select(1, queries.rows.long())
+        return SinglePassHCState.from_embeddings(output, 4)
+
+    model._late_layers, model._layer = late_layers, last_layer
+    actual = model._replayed(state, step.width, plan)
+    expected = torch.zeros_like(hidden.squeeze(0))
+    if has_tail:
+        expected[9] = hidden[0, 9]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert calls == [
+        "compress",
+        *(["attention"] if has_tail else []),
+        "ffn",
+        "late",
+        "last",
+    ]
+    assert forward.dp_metadata.get_sizes_across_dp() == [10, 40]
+    assert metadata.step is step and metadata.queries is None
+    assert metadata.image_mask is mask

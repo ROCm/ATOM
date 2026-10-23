@@ -437,15 +437,21 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
         and its scales). Each plane is published whole as one region, in that
         order -- the order `StateCopies` cuts a checkpoint
         image into, which `build_native_state_mp_layout` aliases unit by unit.
-        Nothing else is published: no SLOT and no P/D staging, since the only
-        transport admitted (`validate_runtime_config`) is the native-state MP
-        path, which moves STATE through `execute_paged_state_copies`.
+
+        For P/D (`slot_regions`): the request's whole STATE slot as one
+        slot-indexed region. A slot is contiguous and holds every
+        layer's window ring -- the decoder's bounded-replay tail and the DSpark
+        context layers included -- plus the compressor rings and the cursor, so
+        it is all a consumer needs to decode and draft from the prompt's end.
         """
         runner = self.model_runner
         if not getattr(runner.config, "kv_transfer_config", None):
             return None
         from atom.kv_transfer.disaggregation.page_region import page_region
-        from atom.kv_transfer.disaggregation.types import KVTransferTensors
+        from atom.kv_transfer.disaggregation.types import (
+            KVTransferRegion,
+            KVTransferTensors,
+        )
 
         if self.cache is None:
             raise RuntimeError(
@@ -458,21 +464,49 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             for name, plane in zip(names, owned)
         ]
         pages = [page_region(plane, semantic_role=role) for role, plane in planes]
+        # None under encoder SWA bounded replay, which keeps no checkpoint
+        # (`state_transfer`); P/D needs none -- it moves the live STATE slot.
         spec = runner.state_runtime.checkpoint_spec
         published = [page.region.unit_bytes for page in pages]
-        if (
-            published != [size for _, size in self.cache.unit_regions()]
-            or sum(published) != spec.page_unit_bytes
+        if published != [size for _, size in self.cache.unit_regions()] or (
+            spec is not None and sum(published) != spec.page_unit_bytes
         ):
             raise RuntimeError(
-                "DeepSeek-V4.1 transfer regions do not match the checkpoint's "
-                f"PAGE unit: regions={published}, unit={spec.page_unit_bytes}"
+                "DeepSeek-V4.1 transfer regions do not match the PAGE unit: "
+                f"regions={published}, cache={self.cache.unit_regions()}, "
+                f"checkpoint={None if spec is None else spec.page_unit_bytes}"
             )
         # No cache dimension is split across TP: every rank holds the same PAGE
         # and STATE bytes, as DeepSeek-V4's compressed cache does.
         tp_size = int(getattr(runner.config, "tensor_parallel_size", 1) or 1)
+        # The STATE slot travels as one slot-indexed region the connector
+        # writes straight across (`src_slot * unit` to `dst_slot * unit`). The
+        # consumer posts the write only once its device ran the in-flight step
+        # of the slot's previous tenant (`MooncakeConnector._post_write_requests`).
+        from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+        state = self.cache.state_bytes  # [slots, state_bytes] uint8 view
+        slot_unit = int(state.shape[1])
+        p_d = (
+            KVConnectorFactory.connector_name(runner.config.kv_transfer_config)
+            == "mooncake"
+        )
         return KVTransferTensors(
             pages=pages,
+            # `lmcache_mp` moves STATE through `execute_paged_state_copies`.
+            slot_regions=(
+                [
+                    KVTransferRegion(
+                        state.data_ptr(),
+                        int(state.shape[0]) * slot_unit,
+                        slot_unit,
+                        semantic_role="dsv41.state_slot",
+                    )
+                ]
+                if p_d
+                else []
+            ),
+            num_slots=int(state.shape[0]),
             tp_replication_factor=tp_size,
             native_state_tp_replication_factor=tp_size,
             paged_state_checkpoint_spec=spec,

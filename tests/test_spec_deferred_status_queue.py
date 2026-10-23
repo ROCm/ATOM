@@ -179,13 +179,15 @@ def test_a_consumer_keeps_deferred_output():
         (Family.V4, True),
         (Family.MLA, True),
         (Family.MHA, True),
-        (Family.CSA2, True),
+        (Family.CSA2, False),
     ],
 )
 def test_only_recurrent_state_producers_give_up_deferred_output(family, expected):
     """A paged write lands at T0's own position, so the consumer repeating it
     changes nothing -- V4 and the other paged models stay on the path they
-    used before P/D handoff existed."""
+    used before P/D handoff existed. CSA2 (DeepSeek-V4.1) hands off a STATE
+    slot whose cursor, compressor rings and Engram history advance per token,
+    so like the recurrent families its producer emits T0 from the prefill."""
     processor = _processor_for(kv_config={"kv_role": "kv_producer"}, family=family)
     assert processor.is_deferred_out is expected
 
