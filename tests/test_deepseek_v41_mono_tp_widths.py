@@ -5,6 +5,7 @@ kernels write into it, and every build fits a CU's LDS."""
 
 import pytest
 
+pytest.importorskip("aiter")
 pytest.importorskip("flydsl")
 
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a

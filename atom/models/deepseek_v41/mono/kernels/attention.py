@@ -56,6 +56,7 @@ from atom.mono.device.ops import (
     ld_dev,
     ld_i32,
     mfma_bf16,
+    readlane,
     row_shr,
     rsrc,
     traced,
@@ -68,7 +69,10 @@ SPLITS, BK = aplan.SPLITS, aplan.BK  # a split is a 16-key tile
 # (``_kv_splits_heuristic`` and the reduce's D chunk follow T x heads)
 ORDER_ROWS = 6
 assert SPLITS * BK == ATTENTION_KEYS_MAX
-SCORE_INFLIGHT = 2  # a score wave's splits whose key loads are in flight together
+# a score split's 16 key rows in the wave's LDS: a row's 1 KB and 16 B of
+# padding (a lane's read-back of 16 rows at one column hits distinct banks)
+SCORE_LDS_ROW = HEAD_DIM // 2 + 4  # words
+SCORE_LDS_WORDS = BK * SCORE_LDS_ROW  # a wave's
 COLS = 32  # the pv task's columns: one FP8 quant group
 GROUPS = HEAD_DIM // COLS  # a head's column groups
 
@@ -134,6 +138,34 @@ def _row_ptr(pool, row, byte):
     return pool + fx.Int64(row) * ROW_BYTES + fx.Int64(byte)
 
 
+def _rows_to_lds(c, pool, slot, kv):
+    """A split's 16 key rows (row ``slot`` of lane k, k < 16) whole into this
+    wave's LDS ``kv``: one LDS DMA a row, 16 B a lane, read back in the MFMA's
+    layout (``_rows_from_lds``). A descriptor a row: the pool passes the 4 GiB
+    a buffer descriptor reaches, so no one view of it can be copied from."""
+    for r in range_constexpr(BK):
+        row = readlane(slot, r)
+        rocdl.buffer_load_to_lds(
+            rsrc(pool + fx.Int64(row) * ROW_BYTES),
+            fx.to_llvm_ptr(kv + r * SCORE_LDS_ROW),
+            c["lane"] * 16,
+            size_bytes=16,
+        )
+
+
+def _rows_from_lds(c, kv):
+    """The split's key operands back from LDS ``kv``: lane l row l % 16, bytes
+    (ch 32 + 8 (l // 16)) 2, a K chunk ch each (``_score_split``'s ``kws``)."""
+    lane = c["lane"]
+    at = kv + (lane % BK) * SCORE_LDS_ROW + 4 * (lane // 16)
+    return [
+        fx.Vector(
+            fx.ptr_load(at + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32))
+        )
+        for ch in range(HEAD_DIM // 32)
+    ]
+
+
 def _ld_row4(pool, row, byte):
     ptr = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16), _row_ptr(pool, row, byte)
@@ -196,8 +228,8 @@ def _ap(d, t, tile, s):
 @traced
 def stage_attn_score(c, task, per):
     """Score task ``task``, ``per`` a (token, head tile) (``score_tasks``): wave
-    w its splits (sg + per k) 8 + w, SCORE_INFLIGHT splits' key loads at a
-    time (q's once, first) issued before those splits' MFMAs."""
+    w its splits (sg + per k) 8 + w, each split's key rows through the wave's
+    LDS (``_rows_to_lds``), the next split's in flight under a split's MFMAs."""
     lane, wave, d = c["lane"], c["wave"], c["d"]
     a = c["args"]
     g = lane // 16
@@ -222,20 +254,16 @@ def stage_attn_score(c, task, per):
         )
         for ch in range(HEAD_DIM // 32)
     ]
-    # SCORE_INFLIGHT splits' keys in flight at a time: a split's are 64
-    # registers a lane, and TP2's two head tiles at 40+ rows give a wave four
-    # splits, whose loads together spilled (424 B of scratch a lane)
-    for b0 in range_constexpr(0, len(ss), SCORE_INFLIGHT):
-        batch = ss[b0 : b0 + SCORE_INFLIGHT]
-        kws = [
-            [
-                _ld_row4(a["pool"], slot, (ch * 32 + 8 * g) * 2)
-                for ch in range(HEAD_DIM // 32)
-            ]
-            for slot in slots[b0 : b0 + SCORE_INFLIGHT]
-        ]
-        for s, kw in zip(batch, kws):
-            _score_split(c, t, tile, s, qh, live, kv_len, kw, qws)
+    kv = c["att"]["score_kv"] + c["wave"] * SCORE_LDS_WORDS
+    _rows_to_lds(c, a["pool"], slots[0], kv)
+    for k in range_constexpr(len(ss)):
+        rocdl.s_waitcnt(vmcnt=0)
+        kws = _rows_from_lds(c, kv)
+        if const_expr(k + 1 < len(ss)):
+            # the read-back done before the next split's rows overwrite it
+            rocdl.s_waitcnt(lgkmcnt=0)
+            _rows_to_lds(c, a["pool"], slots[k + 1], kv)
+        _score_split(c, t, tile, ss[k], qh, live, kv_len, kws, qws)
 
 
 @traced

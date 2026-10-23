@@ -90,6 +90,14 @@ def build_run_label(
             else:
                 ctx_str = f"{ctx[:3].tolist()}...+{len(ctx) - 3}"
             label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
+            if is_prefill and not is_dummy:
+                # Attention work of the chunk: sum over seqs of new tokens x the
+                # mean context they attend (prior context + half the chunk).
+                n = getattr(batch, "num_scheduled_tokens", None)
+                if n is not None and len(n) == len(ctx):
+                    n = n.astype("float64")
+                    span = (n * (ctx - n / 2)).sum()
+                    label += f" nctx={span / 1e6:.1f}M"
     label += detailed_suffix
     if tbo_on:
         label += " tbo=1"

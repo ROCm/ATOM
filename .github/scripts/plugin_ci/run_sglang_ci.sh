@@ -93,10 +93,10 @@ ARG INSTALL_LM_EVAL=1
 LABEL com.rocm.atom.sglang_ref="${SGLANG_REF}"
 LABEL com.rocm.atom.aiter_artifact_id="${AITER_ARTIFACT_ID}"
 COPY aiter-whl/ /tmp/aiter-whl/
-# datasets (via lm-eval) asks for huggingface-hub>=1.31. Left unconstrained,
-# pip installs hub 2.x, and transformers 5.16.1 refuses to import. That pin
-# stays: Qwen3.8-Flash needs it. Keep hub on the 1.x line both accept.
-RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]" "huggingface-hub>=1.31.0,<2"; else echo "Skip lm-eval install"; fi
+# datasets 5.1 needs huggingface-hub>=1.31 and an unconstrained lm-eval
+# install pulls hub 2.x, which transformers 5.16.1 rejects. Pin datasets
+# 5.0 so the image's hub 1.5.0 pin (Qwen3.8-Flash) stays in place.
+RUN if [ "${INSTALL_LM_EVAL}" = "1" ]; then pip install -U "lm-eval[api]" "datasets==5.0.0"; else echo "Skip lm-eval install"; fi
 RUN pip install hf_transfer
 RUN pip install --upgrade "pybind11>=3.0.1"
 RUN echo "=== Aiter version BEFORE uninstall ===" && pip show amd-aiter || true && \

@@ -9,6 +9,14 @@ region an exchange (an all-reduce: a task pushes before it waits on its peers'
 pushes). ``check`` holds a ``trace.Record`` to that and to the regions'
 declarations: the stages that put each, the declared space (scope), and no
 mailbox access on an unnamed address.
+
+A kernel whose grid is split by role breaks the "each CTA walks every stage"
+premise: its roles are branches on the CTA id, so two stages of one program can
+run at once on disjoint CTAs and their source order orders nothing. A region
+handed between two such roles is declared ``concurrent``, which is a claim about
+the grid (the writer's and the poller's CTA sets do not meet) that the checker
+cannot see and the model's layout must make good -- the progress argument is
+then co-residency, not program order.
 """
 
 from dataclasses import dataclass
@@ -24,6 +32,10 @@ class RegionDecl:
     # cell (a token's last index tree level): every one runs before a poller
     writer: str | tuple[str, ...]
     exchange: bool = False  # polled by its writer stage too (an all-reduce)
+    # handed between two roles of a split grid: the poller's CTAs and the
+    # writer's do not meet, so program order does not order the two stages and
+    # the poll may name a writer that comes later
+    concurrent: bool = False
 
     @property
     def writers(self) -> tuple[str, ...]:
@@ -77,7 +89,7 @@ def check(record: Record, decls: list[RegionDecl]) -> None:
                     problems.append(
                         f"{a.region} polled by {a.stage}, its writer {w} never runs"
                     )
-                elif first[w] > first[a.stage]:
+                elif first[w] > first[a.stage] and not d.concurrent:
                     problems.append(
                         f"{a.region} polled by {a.stage}, which runs before its writer {w}"
                     )

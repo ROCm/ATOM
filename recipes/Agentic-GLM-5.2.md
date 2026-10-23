@@ -111,6 +111,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -166,6 +167,7 @@ export PYTHONHASHSEED=0
 export AITER_LOG_LEVEL=WARNING
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 export ATOM_MLA_PAGE_SIZE=1
 export ATOM_ONLINE_QUANT_STREAMING=0
 export ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB=2047
@@ -269,6 +271,11 @@ four; the case block resolves both the draft depth and its golden AL from
 `CONC`. These points run on the native GPU prefix cache alone -- LMCache CPU
 offload is only used from `C16` upwards.
 
+The default recipe keeps MTP5 on the production path. The scaled-FP4
+MonoKernel has measured model-level evidence for MTP4 C1/C2 only; set
+`ENABLE_MTP4_MONO=1` for that controlled A/B. C4 and above remain on the
+production path because the current multi-chunk native schedule is slower.
+
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 
@@ -278,11 +285,17 @@ export AITER_USE_FLYDSL_MOE_SORTING=1
 
 export TP=${TP:-4}
 export CONC=${CONC:-8}
+export ENABLE_MTP4_MONO=${ENABLE_MTP4_MONO:-0}
+ATOM_MONO_ENABLE=0
 
 # MTP_K and MTP_AL move together: the AL is the golden value for that depth.
 case "${CONC}" in
-  1)  CUDAGRAPH_CAPTURE_SIZES='[1,2]';                       MTP_K=5; MTP_AL=3.61 ;;
-  2)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4]';                     MTP_K=5; MTP_AL=3.61 ;;
+  1)
+    CUDAGRAPH_CAPTURE_SIZES='[1,2]'; MTP_K=5; MTP_AL=3.61
+    ;;
+  2)
+    CUDAGRAPH_CAPTURE_SIZES='[1,2,4]'; MTP_K=5; MTP_AL=3.61
+    ;;
   4)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8]';                   MTP_K=5; MTP_AL=3.61 ;;
   8)  CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16]';             MTP_K=5; MTP_AL=3.61 ;;
   10) CUDAGRAPH_CAPTURE_SIZES='[1,2,4,8,12,16,20]';          MTP_K=4; MTP_AL=3.33 ;;
@@ -292,6 +305,22 @@ case "${CONC}" in
     exit 2
     ;;
 esac
+
+if [[ "${ENABLE_MTP4_MONO}" == "1" ]]; then
+  if [[ "${CONC}" != "1" && "${CONC}" != "2" ]]; then
+    echo "ENABLE_MTP4_MONO=1 supports only C1/C2" >&2
+    exit 2
+  fi
+  MTP_K=4
+  # the golden AL for depth 4, per the table above. 3.61 is MTP5's, and
+  # pinning it on a 4-token draft forces more accepted tokens than the depth
+  # can produce -- which overstates the mono arm in the very A/B this flag is
+  # for. MTP_K and MTP_AL move together.
+  MTP_AL=3.33
+  ATOM_MONO_ENABLE=1
+fi
+
+export ATOM_MONO_ENABLE
 
 python -m atom.entrypoints.openai_server \
   --model "${MODEL_PATH}" \
@@ -333,12 +362,19 @@ decoding stays on: `C16`-`C40` use four draft tokens and `C48` uses three.
 > so the mxfp4 gate does not apply) and adds its own separate KV cost, on top
 > of the ~3.7% above — see `enable_query_replication` in
 > [Context Parallel Guide](../docs/context_parallel_guide.md#enable_query_replication-qrep)
-> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). **This exact
-> combination — MXFP4 weights + TP4/DCP4 + MTP + QREP — has not been run
-> end-to-end**; only GLM-5.2 FP8 tp8/dcp8 has. If `--gpu-memory-utilization
-> 0.95` runs tight at your concurrency, lower it or pass
-> `--dcp-config '{"enable_query_replication": false}'` to opt back out.
+> for that cost's typical size (~5% on DeepSeek-R1 tp8/dcp8). If
+> `--gpu-memory-utilization 0.95` runs tight at your concurrency, lower it or
+> pass `--dcp-config '{"enable_query_replication": false}'` to opt back out.
 > Compare MTP and non-MTP runs at the same concurrency and QREP setting.
+>
+> Sparse prefill uses two DCP optimizations: `ATOM_DCP_PREFILL_QREP=1` builds
+> the DCP group's query heads locally instead of all-gathering them, and the
+> non-persistent fp8 gqa64 MLA kernel (`ATOM_DCP_SPARSE_PREFILL_NONPS`, on by
+> default) needs no work metadata; it needs an aiter with ROCm/aiter#6132 and
+> `--max-num-batched-tokens` <= 32768. Together they cut prefill latency by ~20%
+> on MI355X TP4/DCP4 (64K prompt: 4.73 s to 3.74 s; 16K: 1.23 s to 1.00 s), measured
+> as the time to the first token of a unique prompt with `max_tokens=1`, mean of
+> 4 runs per setting; the per-flag breakdown is in ROCm/ATOM#2506.
 
 ```bash
 export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
@@ -346,6 +382,10 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 export PYTHONNOUSERSITE=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
+
+# DCP sparse prefill: local query heads (QREP); the non-persistent MLA kernel is on by default
+export ATOM_DCP_PREFILL_QREP=1
 
 # LMCache-related settings
 export PYTHONHASHSEED=0
@@ -423,6 +463,7 @@ export MODEL_PATH=${MODEL_PATH:-amd/GLM-5.2-MXFP4}
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
+export ATOM_MONO_ENABLE=0
 
 # LMCache-related settings
 export PYTHONHASHSEED=0

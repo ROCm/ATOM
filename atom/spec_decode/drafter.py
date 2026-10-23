@@ -213,7 +213,7 @@ class Drafter(abc.ABC):
         )
 
     @torch.inference_mode()
-    def warmup_draft_graphs(self, build_context, stream) -> None:
+    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
         """Run every declared pass once per captured size, paying its JIT here.
 
         aiter's flydsl hgemm builds a kernel per tile config, in-process, so a
@@ -268,6 +268,9 @@ class Drafter(abc.ABC):
                     num_tokens=local_tokens,
                 )
                 pool = pass_.warmup(bs, pool=pool, stream=stream)
+                if end_trace is not None:
+                    step = pass_.name.rsplit(".", 1)[-1].lstrip("_")
+                    end_trace(f"draft_{step}_bs_{bs}")
         runner.graph_pool = pool
         torch.cuda.synchronize()
         if runner.rank == 0:
@@ -406,6 +409,15 @@ class Drafter(abc.ABC):
             else:
                 module.register_forward_hook(hook)
         self._captures_aux = True
+        # A target that runs some layers on a subset of rows (V4.1 bounded
+        # replay) moves those layers' captures to their forward rows itself.
+        # The hooks above bind these buffers now, so the target gets the same
+        # tensors.
+        rows_hook = _descend_wrappers(
+            target_model, lambda m: getattr(m, "set_aux_hidden_state_rows", None)
+        )
+        if rows_hook is not None:
+            rows_hook(tuple(spec.layer_ids), tuple(self._aux_buffers))
         logger.info(
             f"{type(self).__name__} aux capture on target layers: {spec.layer_ids}"
         )
@@ -629,6 +641,9 @@ class Drafter(abc.ABC):
             parallel_config,
             running_tokens,
             unified=running_tokens_are_unified,
+        )
+        context.running_tokens_across_dp = tuple(
+            forward_context.dp_metadata.get_sizes_across_dp()
         )
 
     def prepare_inputs(self, scheduled_bs: int) -> torch.Tensor:

@@ -36,7 +36,7 @@ except ImportError:
 from aiter.dist.parallel_state import get_dp_group, get_tensor_model_parallel_rank
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
-    mla_decode_fwd as triton_shuffle_mla_decode_fwd,
+    mla_decode_fwd as triton_mla_decode_fwd,
 )
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla as triton_fused_qk_rope_cat_and_cache_mla,
@@ -52,6 +52,7 @@ from atom.config import (
     qrep_for_step,
 )
 from atom.distributed.dcp_utils import (
+    NONPS_MAX_Q_ROWS,
     dcp_persistent_supported,
     dcp_prefill_merge_bf16_ok,
     get_dcp_group,
@@ -59,6 +60,9 @@ from atom.distributed.dcp_utils import (
     get_dcp_world_size,
     mla_dcp_decode_is_persistent,
     mla_dcp_sparse_prefill_is_persistent,
+    mla_dcp_sparse_prefill_kv_splits,
+    mla_dcp_sparse_prefill_mode,
+    mla_dcp_sparse_prefill_uses_nonps,
 )
 from atom.distributed.pcp_utils import (
     get_pcp_world_size,
@@ -195,12 +199,9 @@ if fused_qk_rope_concat_and_cache_mla_seg is not None:
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
 
-# Shuffled-KV (block_size=64) Triton/Gluon MLA kernels, gated by
-# ATOM_USE_TRITON_MLA and ATOM_USE_TRITON_MLA_SHUFFLE_KV:. Write kernels mirror the aiter
-# concat_and_cache / fused_qk_rope_concat_and_cache_mla but store the cache in
-# the shuffled layout the shuffled decode kernel reads back.
-triton_shuffle_mla_decode_fwd = mark_trace(
-    triton_shuffle_mla_decode_fwd, prefix="mla_decode_shuffle", torch_compile=False
+# Paged Triton decode supports both interleaved and shuffled KV caches.
+triton_mla_decode_fwd = mark_trace(
+    triton_mla_decode_fwd, prefix="mla_decode_triton", torch_compile=False
 )
 triton_cat_and_cache_mla = mark_trace(
     triton_cat_and_cache_mla, prefix="kv_cache_shuffle", torch_compile=False
@@ -216,6 +217,33 @@ triton_fused_qk_rope_cat_and_cache_mla = mark_trace(
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+
+def check_kv_shuffled_supported(
+    atom_config,
+    *,
+    use_triton_mla: bool,
+    is_sparse_mla: bool,
+    dcp_world_size: int,
+    mla_page_size: int,
+) -> None:
+    unsupported = []
+    if not use_triton_mla and atom_config.speculative_config:
+        unsupported.append("speculative decoding without ATOM_USE_TRITON_MLA")
+    if is_sparse_mla:
+        unsupported.append("sparse MLA")
+    if dcp_world_size > 1:
+        unsupported.append("DCP>1")
+    if mla_page_size > 1:
+        unsupported.append("ATOM_MLA_PAGE_SIZE>1")
+    if atom_config.enable_tbo and (
+        atom_config.enable_prefix_caching or atom_config.enable_chunked_prefill
+    ):
+        unsupported.append("TBO with prefix caching or chunked prefill")
+    if unsupported:
+        raise ValueError(
+            "ATOM_MLA_KV_SHUFFLED does not support: " + ", ".join(unsupported)
+        )
 
 
 def mla_min_query_heads(kv_cache_dtype: str, block_width: int) -> int:
@@ -647,11 +675,14 @@ class MLAAttention(nn.Module):
         # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
         # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
         self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        self.kv_cache_block_size = atom_config.kv_cache_block_size
         # On the non-triton (aiter) path, ATOM_MLA_PAGE_SIZE selects the KV cache
         # layout: >1 uses the segmented (paged) seg kernels + padded q_out, while
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        # Shuffled KV cache; the decode kernel follows use_triton_mla.
+        self.kv_shuffled = bool(envs.ATOM_MLA_KV_SHUFFLED)
         self.use_flydsl_gather_kv_b_proj = bool(envs.ATOM_USE_FLYDSL_GATHER_KV_B_PROJ)
         # Resolved on the first gather, when the weights and cache exist; see
         # `_kv_b_proj_gather`. None = not asked yet.
@@ -692,7 +723,7 @@ class MLAAttention(nn.Module):
         self._ctx_kv_fusion_enabled = (
             envs.ATOM_DSPARK_FUSED_CTX_KV
             and not self.use_seg_mla
-            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and not self.kv_shuffled
             and rope is not None
             and getattr(rope, "rotary_dim", None) == self.qk_rope_head_dim
             and getattr(rope, "mrope_section", None) is None
@@ -704,6 +735,14 @@ class MLAAttention(nn.Module):
         # decode attention runs locally then combines via all-gather LSE +
         # reduce-scatter. Disabled (world_size==1) unless -dcp is set.
         self.dcp_world_size = get_dcp_world_size()
+        if self.kv_shuffled:
+            check_kv_shuffled_supported(
+                atom_config,
+                use_triton_mla=self.use_triton_mla,
+                is_sparse_mla=self.is_sparse_mla,
+                dcp_world_size=self.dcp_world_size,
+                mla_page_size=envs.ATOM_MLA_PAGE_SIZE,
+            )
         if self.dcp_world_size > 1:
             from atom.model_ops.dcp_ops import CPTritonContext
 
@@ -846,7 +885,7 @@ class MLAAttention(nn.Module):
             self.head_pad > 0
             and self.dcp_world_size <= 1
             and not self.use_seg_mla
-            and not (self.use_triton_mla and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV)
+            and not self.kv_shuffled
         )
 
     def _configure_dcp_decode_head_padding(self, dcp_world_size: int) -> None:
@@ -887,6 +926,7 @@ class MLAAttention(nn.Module):
         # can't silently borrow decode's answer if the two ever diverge.
         self.dcp_sparse_prefill_persistent = False
         self.dcp_sparse_prefill_num_heads = self.num_heads
+        self.dcp_sparse_prefill_nonps = False
         if dcp_world_size > 1 and self.is_sparse_mla:
             self.dcp_sparse_prefill_persistent = mla_dcp_sparse_prefill_is_persistent(
                 dcp_world_size,
@@ -902,6 +942,21 @@ class MLAAttention(nn.Module):
                 dcp_world_size,
                 self.min_query_heads,
                 persistent=self.dcp_sparse_prefill_persistent,
+            )
+            self.dcp_sparse_prefill_nonps = mla_dcp_sparse_prefill_uses_nonps(
+                dcp_world_size,
+                self.num_heads * dcp_world_size,
+                self.kv_cache_dtype.startswith("fp8"),
+                self.dcp_persistent_supported,
+                get_current_atom_config().max_num_batched_tokens,
+            )
+            (
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
+            ) = mla_dcp_sparse_prefill_mode(
+                self.dcp_sparse_prefill_nonps,
+                self.dcp_sparse_prefill_persistent,
+                self.dcp_sparse_prefill_num_heads,
             )
 
     def _pad_sparse_prefill_query_heads(self, q: torch.Tensor) -> torch.Tensor:
@@ -1585,7 +1640,7 @@ class MLAAttention(nn.Module):
         kv_out_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         weight = self.kv_b_proj.weight
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if self.kv_shuffled:
             # Shuffled KV: read the block_size-shuffled cache with block-granular
             # CSR indices built by the metadata builder. cu_seqlens_k stays the
             # token-granular context cumsum (output token positions).
@@ -2243,10 +2298,13 @@ class MLAAttention(nn.Module):
                 # -- rebuild it here, or run non-persistent.
                 #
                 # Read from the same predicate the gathered pad width came from
-                # rather than re-deriving the gate: gqa=64 is correct only in
-                # persistent mode, so running one way while the width was chosen
-                # for the other silently miscomputes. The assert keeps the two
-                # spellings honest if either side gains a condition.
+                # rather than re-deriving the gate: on the persistent kernel set
+                # gqa=64 is correct only in persistent mode, so running one way
+                # while the width was chosen for the other silently miscomputes.
+                # The non-persistent gqa64 kernel (dcp_sparse_prefill_nonps) is
+                # the exception, and runs at 64 non-persistent by design. The
+                # assert keeps the two spellings honest if either side gains a
+                # condition.
                 sparse_dcp_persistent = (
                     dcp_sparse and self.dcp_sparse_prefill_persistent
                 )
@@ -2255,10 +2313,17 @@ class MLAAttention(nn.Module):
                     and self.sparse_dcp_metadata_rebuild
                     and self.dcp_persistent_supported
                     and page_size <= 1
+                    and not self.dcp_sparse_prefill_nonps
                 ), (
                     "DCP sparse prefill would run in a different mode than the "
                     "one its gathered query width was padded for; update "
                     "mla_dcp_sparse_prefill_is_persistent alongside this gate."
+                )
+                nonps = dcp_sparse and self.dcp_sparse_prefill_nonps
+                assert not nonps or q.shape[0] <= NONPS_MAX_Q_ROWS, (
+                    f"non-persistent DCP sparse prefill got total_q={q.shape[0]} "
+                    f"q rows, more than the {NONPS_MAX_Q_ROWS} it takes; the "
+                    "max_num_batched_tokens gate should have kept it persistent."
                 )
                 if sparse_dcp_persistent and self.owns_sparse_indexer:
                     self._rebuild_sparse_dcp_persistent_metadata(
@@ -2288,7 +2353,9 @@ class MLAAttention(nn.Module):
                     kv_last_page_lens,
                     max_q_len,
                     page_size=page_size,
-                    num_kv_splits=max(2, 16 // max(1, self.dcp_world_size)),
+                    num_kv_splits=mla_dcp_sparse_prefill_kv_splits(
+                        nonps, self.dcp_world_size
+                    ),
                     sm_scale=self.scale,
                     q_scale=self._q_scale if is_fp8 else None,
                     kv_scale=self._k_scale if is_fp8 else None,
@@ -2382,8 +2449,8 @@ class MLAAttention(nn.Module):
 
     def _shuffled_kv_view(self, kv_cache: torch.Tensor):
         """View the flat ``[num_token_slots, 1, d]`` MLA cache as the
-        ``[num_blocks, num_kv_heads=1, block_size, d]`` shuffled layout the
-        block_size=64 Triton/Gluon MLA kernels read and write.
+        ``[num_blocks, num_kv_heads=1, block_size, d]`` shuffled (16x16-tiled)
+        layout, read by both the Triton/Gluon and the aiter MLA decode.
 
         This is a pure view: ``num_token_slots == num_blocks * block_size`` by
         construction (block_ratio == kv_cache_block_size), and the per-block
@@ -2514,55 +2581,52 @@ class MLAAttention(nn.Module):
 
         final_lse = None
 
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
-            # Shuffled block_size=64 Triton/Gluon MLA decode kernel.
-            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
-            triton_shuffle_mla_decode_fwd(
-                q,  # [num_tokens, num_query_heads, kv_lora_rank + qk_rope_head_dim]
-                kv_buffer,  # [num_blocks, 1, block_size, kv_lora_rank + qk_rope_head_dim]
+        if self.use_triton_mla:
+            if self.kv_shuffled:
+                kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            else:
+                # block_tables contains scheduler block IDs, while the plain
+                # cache is stored as token rows. Group rows into those blocks;
+                # the Triton kernel widens block offsets to int64 internally.
+                kv_buffer = kv_c_and_k_pe_cache.view(
+                    -1, self.kv_cache_block_size, 1, q.shape[-1]
+                )
+            triton_mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
                 attn_metadata.cu_seqlens_q,
-                attn_metadata.context_lens,  # seqused_k
-                int(attn_metadata.max_seqlen_k),  # max_seqlen_kv
-                attn_metadata.block_tables,  # [bs, max_num_blocks_per_seq] (logical)
+                attn_metadata.context_lens,
+                int(attn_metadata.max_seqlen_k),
+                attn_metadata.block_tables,
                 self.scale,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
-                True,  # causal
-                # q is bf16 (the shuffled fused write does not quantize q), so
-                # no q de-scale; kv carries its own per-tensor scale.
-                None,  # q_descale
-                self._k_scale,  # kv_descale
-                shuffled_kv_cache=True,
+                causal,
+                self._q_scale if q.element_size() == 1 else None,
+                self._k_scale,
+                shuffled_kv_cache=self.kv_shuffled,
             )
-        elif hasattr(attn_metadata, "triton_block_table"):
-            from aiter.ops.triton.attention.mla_decode import decode_attention_fwd
-
-            k_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-            v_buffer = k_buffer[..., : self.kv_lora_rank]
-            page_size = k_buffer.shape[1]
-
-            q_for_triton = (
-                q.to(torch.bfloat16)
-                if q.dtype.is_floating_point and q.element_size() == 1
-                else q
-            )
-
-            # Use pre-built dense block_table from prepare_decode()
-            decode_attention_fwd(
-                q_for_triton,
-                k_buffer,
-                v_buffer,
+        elif self.kv_shuffled:
+            kv_buffer = self._shuffled_kv_view(kv_c_and_k_pe_cache)
+            _, final_lse = mla_decode_fwd(
+                q,
+                kv_buffer,
                 o,
-                attn_metadata.triton_lse,
-                attn_metadata.triton_block_table,
-                attn_metadata.context_lens,
-                attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
-                self.scale,
-                page_size,
-                k_scale=self._k_scale,
-                v_scale=self._k_scale,
+                attn_metadata.cu_seqlens_q,
+                None,  # kv_shuffled takes seq_lens/page_table, not CSR
+                None,
+                None,
+                attn_metadata.max_seqlen_q,
+                page_size=kv_buffer.shape[2],
+                kv_layout="kv_shuffled",
+                seq_lens=attn_metadata.context_lens[:B],
+                page_table=attn_metadata.block_tables[:B],
+                sm_scale=self.scale,
+                causal=causal,
+                q_scale=self._q_scale if q.element_size() == 1 else None,
+                kv_scale=self._k_scale,
+                return_lse=return_lse,
             )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -2732,7 +2796,7 @@ class MLAAttention(nn.Module):
         branch so the physical cache layout matches exactly. `k_rope` must
         already be rotary-embedded.
         """
-        if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+        if self.kv_shuffled:
             shuffled_cache = self._shuffled_kv_view(kv_cache)
             triton_cat_and_cache_mla(
                 k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -2896,7 +2960,7 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                if envs.ATOM_USE_TRITON_MLA and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV:
+                if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_cat_and_cache_mla(
                         k_nope.view(-1, self.num_kv_heads, self.kv_lora_rank),
@@ -2934,9 +2998,9 @@ class MLAAttention(nn.Module):
                     )
 
             if attn_metadata.has_cached:
-                # Shuffled KV: the builder nulls mla_chunk_meta, so cached-prefix
-                # prefill always takes the single-pass gather (which is shuffle
-                # aware). The chunked path stays on the plain layout.
+                # Shuffled KV takes either path too: the builder gives the chunked
+                # path block-granular per-chunk CSR, and the single-pass path a
+                # full-context one.
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
                 if chunk_meta is not None:
                     output = self._forward_prefill_cached_chunked(
@@ -3035,11 +3099,7 @@ class MLAAttention(nn.Module):
                 q_out[:, : self.num_heads] if self._fused_q_head_pad else q_out
             )
             if kv_cache.numel() > 0:
-                if (
-                    envs.ATOM_USE_TRITON_MLA
-                    and envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV
-                    and self.dcp_world_size <= 1
-                ):
+                if self.kv_shuffled:
                     shuffled_cache = self._shuffled_kv_view(kv_cache)
                     triton_fused_qk_rope_cat_and_cache_mla(
                         q_nope,
