@@ -3374,13 +3374,17 @@ class ModelRunner:
             # keyed back onto this batch by req_id, since the scheduler reorders
             # between the two. Resolved before the verification sample below,
             # because it decides whether that sample is needed at all.
-            draft_probs, draft_probs_row_base = _lossless_verify_inputs(
-                getattr(self, "drafter", None),
-                batch.req_ids[:bs],
-                all_greedy=all_greedy,
-                top_ks=top_ks,
-                top_ps=top_ps,
-            )
+            # An all-greedy batch always verifies by exact match, so it never
+            # asks (and never touches the drafter or the batch's req_ids).
+            draft_probs = draft_probs_row_base = None
+            if not all_greedy:
+                draft_probs, draft_probs_row_base = _lossless_verify_inputs(
+                    getattr(self, "drafter", None),
+                    batch.req_ids[:bs],
+                    all_greedy=all_greedy,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                )
             target_token_ids = None
             if _needs_verification_sample(all_greedy, draft_probs):
                 target_token_ids = self.sampler.sample_verification_tokens(
