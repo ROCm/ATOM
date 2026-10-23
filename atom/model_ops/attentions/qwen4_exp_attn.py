@@ -31,6 +31,8 @@ import torch
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.model_ops.qwen4_exp.ops.qsa import (
+    qsa_cache_formats,
+    qsa_cache_row_layout,
     qsa_compressed_slots,
     qsa_draft_decode_metadata,
 )
@@ -51,6 +53,9 @@ PLE_STATE_SLOT_CLASS = STATE_SLOT_CLASS
 # order it was bound in: on a non-first PP stage the global layer numbers do
 # not start at zero, and that arithmetic would index past the pool.
 QSA_ROWS = "qsa"
+# MTP draft QSA layers that keep BF16 caches while the target's are quantized
+# (`ATOM_QSA_DRAFT_KV_BF16=1`): their own rows, their own `*_draft` fields.
+QSA_DRAFT_ROWS = "qsa_draft"
 
 
 @dataclass
@@ -120,8 +125,7 @@ class Qwen4ExpBackend(GDNAttentionBackend):
             )
         if len(set(config.hf_config.ple_layer_ids or [])) > 1:
             raise ValueError("Qwen backend currently allocates state for one PLE layer")
-        if config.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
-            raise ValueError("Qwen QSA requires BF16 KV cache")
+        qsa_cache_formats(config)
         ratio = int(config.hf_config.indexer_compress_ratio)
         if ratio <= 0 or config.kv_cache_block_size % ratio:
             raise ValueError(
@@ -210,16 +214,31 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     # ------------------------------------------------------------------ #
 
     def _module_kinds(self, module) -> tuple:
-        """A QSA layer takes a row of the QSA pool; everything else is the
-        hybrid's (the GDN state slots, handled by the parent)."""
+        """A QSA layer takes a row of the QSA pool (or of the BF16 draft rows,
+        when the draft keeps BF16 caches under quantized target caches);
+        everything else is the hybrid's (the GDN state slots, handled by the
+        parent)."""
         if getattr(module, "is_qsa_attention", False):
-            return (QSA_ROWS,)
+            return (getattr(module, "qsa_row_space", QSA_ROWS),)
         return super()._module_kinds(module)
 
     @property
     def _qsa_layers(self) -> int:
         """QSA layers this rank actually built, counted off the bind walk."""
         return self.row_counts().get(QSA_ROWS, 0)
+
+    def _qsa_row_spaces(self):
+        """`(row space, field-name suffix, (kv format, index format), rows)`."""
+        counts = self.row_counts()
+        spaces = [
+            (QSA_ROWS, "", qsa_cache_formats(self.model_runner.config)),
+            (QSA_DRAFT_ROWS, "_draft", ("bf16", "bf16")),
+        ]
+        return [
+            (space, suffix, formats, counts[space])
+            for space, suffix, formats in spaces
+            if counts.get(space, 0)
+        ]
 
     @property
     def _index_head_dim(self) -> int:
@@ -242,27 +261,64 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
     # ------------------------------------------------------------------ #
 
     def _qsa_fields(self) -> list[EntryField]:
-        """Single declaration used for sizing, allocation and transfer views."""
+        """Single declaration used for sizing, allocation and transfer views.
+
+        A quantized K/V or compressed-key cache adds its scale plane
+        (`*_scale`), paged like the rows it scales. BF16 draft rows under
+        quantized target rows get their own `*_draft` fields.
+        """
         hf = self.model_runner.config.hf_config
-        layers, block = self._qsa_layers, self.block_size
-        shape = (block, self.model_runner._get_num_kv_heads(), int(hf.head_dim))
-        fields = [
-            EntryField("k", layers, shape, torch.bfloat16),
-            EntryField("v", layers, shape, torch.bfloat16),
-            EntryField(
-                "index_raw", layers, (block, 1, self._index_head_dim), torch.bfloat16
-            ),
-            EntryField(
-                "index_compressed",
-                layers,
-                (block // self._compress_ratio, 1, self._index_head_dim),
-                torch.bfloat16,
-            ),
-        ]
-        if self.cache_rope_positions:
-            fields.append(
-                EntryField("rope_positions", layers, (block, 1, 3), torch.int64)
+        block = self.block_size
+        heads = self.model_runner._get_num_kv_heads()
+        rows = block // self._compress_ratio
+        fields = []
+        for _, sfx, (kv_format, index_format), layers in self._qsa_row_spaces():
+            kv_dim, kv_dtype, kv_scale, kv_scale_dtype = qsa_cache_row_layout(
+                kv_format, int(hf.head_dim)
             )
+            fields += [
+                EntryField(f"k{sfx}", layers, (block, heads, kv_dim), kv_dtype),
+                EntryField(f"v{sfx}", layers, (block, heads, kv_dim), kv_dtype),
+            ]
+            if kv_scale is not None:
+                for name in ("k_scale", "v_scale"):
+                    fields.append(
+                        EntryField(
+                            f"{name}{sfx}",
+                            layers,
+                            (block, heads, *kv_scale),
+                            kv_scale_dtype,
+                        )
+                    )
+            index_dim, index_dtype, index_scale, index_scale_dtype = (
+                qsa_cache_row_layout(index_format, self._index_head_dim)
+            )
+            fields += [
+                EntryField(
+                    f"index_raw{sfx}",
+                    layers,
+                    (block, 1, self._index_head_dim),
+                    torch.bfloat16,
+                ),
+                EntryField(
+                    f"index_compressed{sfx}", layers, (rows, 1, index_dim), index_dtype
+                ),
+            ]
+            if index_scale is not None:
+                fields.append(
+                    EntryField(
+                        f"index_compressed_scale{sfx}",
+                        layers,
+                        (rows, 1, *index_scale),
+                        index_scale_dtype,
+                    )
+                )
+            if self.cache_rope_positions:
+                fields.append(
+                    EntryField(
+                        f"rope_positions{sfx}", layers, (block, 1, 3), torch.int64
+                    )
+                )
         return fields
 
     def _page_bytes(self) -> int:
@@ -312,8 +368,9 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
         return {}
 
     def release_kv_pools(self) -> None:
-        for module in self.pool_rows.get(QSA_ROWS, {}):
-            module.bind_caches(None, None, None, None, None)
+        for space in (QSA_ROWS, QSA_DRAFT_ROWS):
+            for module in self.pool_rows.get(space, {}):
+                module.bind_caches(None, None, None, None, None)
         self.qsa_arena = None
         super().release_kv_pools()
 
@@ -405,15 +462,26 @@ class Qwen4ExpMetadataBuilder(GDNAttentionMetadataBuilder):
 
         from atom.config import KVCacheTensor
 
-        row = self.pool_rows[QSA_ROWS][module]
+        space = getattr(module, "qsa_row_space", QSA_ROWS)
+        sfx = "_draft" if space == QSA_DRAFT_ROWS else ""
+        row = self.pool_rows[space][module]
         arena = self.qsa_arena
-        key, value = arena.view("k")[row], arena.view("v")[row]
+        names = {field.name for field in arena.fields}
+
+        def optional(name):
+            name += sfx
+            return arena.view(name)[row] if name in names else None
+
+        key, value = optional("k"), optional("v")
         module.bind_caches(
             key,
             value,
-            arena.view("index_raw")[row],
-            arena.view("index_compressed")[row],
-            arena.view("rope_positions")[row] if self.cache_rope_positions else None,
+            optional("index_raw"),
+            optional("index_compressed"),
+            optional("rope_positions"),
+            k_scale_cache=optional("k_scale"),
+            v_scale_cache=optional("v_scale"),
+            compressed_key_scale=optional("index_compressed_scale"),
         )
         return KVCacheTensor(
             layer_num=module.layer_num,

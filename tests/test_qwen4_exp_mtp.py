@@ -113,7 +113,9 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
     monkeypatch.setattr(
         qsa_attention,
         "get_forward_context",
-        lambda: SimpleNamespace(context=SimpleNamespace(is_draft=is_draft)),
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(is_draft=is_draft, is_prefill=False)
+        ),
     )
     layers = [
         SimpleNamespace(
@@ -124,6 +126,7 @@ def test_qsa_rope_cache_matches_implicit_positions(monkeypatch, qsa_rope, is_dra
             compressed_key_cache=torch.zeros(
                 pages, block // ratio, 1, 128, device=device, dtype=torch.bfloat16
             ),
+            compressed_key_scale=None,
             rope_position_cache=(
                 torch.zeros(pages, block, 1, 3, device=device, dtype=torch.int64)
                 if cached
