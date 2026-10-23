@@ -388,14 +388,24 @@ def test_qwen4_exp_mtp_fp8_exclusion_keeps_draft_layer_name():
     )
 
 
-def test_qwen4_exp_mtp_draft_marks_forward_context(monkeypatch):
+@pytest.mark.parametrize("fixed_inputs", [False, True])
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_qwen4_exp_mtp_draft_marks_forward_context(
+    monkeypatch, fixed_inputs, multimodal
+):
     from contextlib import contextmanager
 
     import atom.plugin.rtpllm.models.qwen4_exp as qwen4_module
     from atom.utils import forward_context as forward_context_module
 
     runtime = object.__new__(_ATOMQwen4ExpMTPRuntime)
-    runtime._rtp_model_config = SimpleNamespace(hidden_size=2, hc_mult=1)
+    runtime._rtp_model_config = SimpleNamespace(
+        hidden_size=2,
+        hc_mult=1,
+        vocab_size=100,
+        mm_model_config=SimpleNamespace(is_multimodal=multimodal),
+    )
+    runtime._image_token_id = 42
     runtime._rtp_layer_maps = ({}, {}, {})
     runtime._cg_max_seq_len = 32
     runtime._get_model_device = lambda: torch.device("cpu")
@@ -410,6 +420,9 @@ def test_qwen4_exp_mtp_draft_marks_forward_context(monkeypatch):
 
     @contextmanager
     def bind(**kwargs):
+        assert kwargs["inputs"].attention_inputs_by_tag == {
+            "full": kwargs["inputs"].attention_inputs
+        }
         yield
 
     runtime._rtp_forward_context_cls = SimpleNamespace(bind=bind)
@@ -419,7 +432,10 @@ def test_qwen4_exp_mtp_draft_marks_forward_context(monkeypatch):
 
         def __call__(self, ids, positions, hc_input):
             assert context.is_draft
-            assert positions.tolist() == [4]
+            assert ids.tolist() == ([42] if multimodal else [1])
+            assert positions.tolist() == ([[9], [10], [11]] if multimodal else [4])
+            if multimodal:
+                assert context.positions.tolist() == [[8], [9], [10]]
             return hc_input
 
         def _head_input(self, hc):
@@ -427,11 +443,27 @@ def test_qwen4_exp_mtp_draft_marks_forward_context(monkeypatch):
 
     runtime.model = Draft()
     monkeypatch.setattr(qwen4_module, "PyModelOutputs", lambda mixed, hc: (mixed, hc))
-    inputs = SimpleNamespace(
-        input_ids=torch.tensor([1], dtype=torch.int32),
-        input_hiddens=torch.ones(1, 2),
-        attention_inputs=SimpleNamespace(is_cuda_graph=False),
-    )
+    fields = {
+        "input_ids": torch.tensor([999 if multimodal else 1], dtype=torch.int32),
+        "input_hiddens": torch.ones(1, 2),
+        "attention_inputs": SimpleNamespace(is_cuda_graph=False),
+        "combo_position_ids": (
+            torch.tensor([[8], [9], [10]], dtype=torch.int32) if multimodal else None
+        ),
+        "embedding_inputs": None,
+        "multimodal_inputs": None,
+        "bert_embedding_inputs": None,
+    }
+    if fixed_inputs:
+
+        class FixedInputs:
+            __slots__ = tuple(fields)
+
+        inputs = FixedInputs()
+        for name, value in fields.items():
+            setattr(inputs, name, value)
+    else:
+        inputs = SimpleNamespace(**fields)
     runtime.forward(inputs)
     assert context.is_draft
 
@@ -1486,8 +1518,9 @@ def test_qwen4_exp_ple_graph_uses_selected_forward_buffers(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("reserved_tail", [0, 1, 2, 3])
 def test_qwen4_exp_recovered_physical_table_respects_prewarmed_buffer_stride(
-    monkeypatch,
+    monkeypatch, reserved_tail
 ):
     device = torch.device("cuda")
     kernel = torch.tensor(
@@ -1495,6 +1528,14 @@ def test_qwen4_exp_recovered_physical_table_respects_prewarmed_buffer_stride(
         dtype=torch.int32,
         device=device,
     )
+    if reserved_tail:
+        kernel = torch.cat(
+            [
+                kernel,
+                torch.full((2, reserved_tail), 999, dtype=torch.int32, device=device),
+            ],
+            dim=1,
+        )
     # The graph buffer is larger than the active table, so its row stride
     # differs from the returned view's logical column count.
     buffer = torch.full((2, 5), -99, dtype=torch.int32, device=device)

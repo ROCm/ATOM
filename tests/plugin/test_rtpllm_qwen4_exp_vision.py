@@ -15,10 +15,44 @@ from rtp_llm.multimodal.multimodal_mixin_register import (
 
 from atom.plugin.rtpllm.models.qwen4_exp import _ATOMQwen4ExpRuntime
 from atom.plugin.rtpllm.models.qwen4_exp_vision import Qwen4ExpVisionMixin
+from atom.plugin.rtpllm.models.qwen4_exp_vision_impl import Qwen4ExpImageEmbedding
 
 
 def test_qwen4_exp_vision_mixin_registered():
     assert get_multimodal_mixin_cls("atom_qwen4_exp") is Qwen4ExpVisionMixin
+    assert get_multimodal_mixin_cls("atom_qwen4_exp_mtp") is Qwen4ExpVisionMixin
+
+
+def test_batched_vision_attention_is_isolated_per_image():
+    class MixingVision:
+        device = torch.device("cpu")
+        dtype = torch.float32
+        spatial_merge_size = 2
+
+        def __call__(self, pixels, grid):
+            assert grid.shape == (1, 3)
+            return pixels.mean().reshape(1, 1)
+
+    encoder = object.__new__(Qwen4ExpImageEmbedding)
+    encoder.visual = MixingVision()
+    grid = torch.tensor([[1, 2, 2]], dtype=torch.int32)
+    outputs = encoder.batched_embedding(
+        [(torch.ones(4, 1), grid), (torch.full((4, 1), 9.0), grid)],
+        [1, 1],
+    )
+    assert [embedding.item() for embedding, _ in outputs] == [1.0, 9.0]
+
+    # A single request may also carry multiple image grids.
+    outputs = encoder.batched_embedding(
+        [
+            (
+                torch.cat([torch.ones(4, 1), torch.full((4, 1), 9.0)]),
+                torch.cat([grid, grid]),
+            )
+        ],
+        [1],
+    )
+    assert [embedding.item() for embedding, _ in outputs] == [1.0, 9.0]
 
 
 @pytest.mark.parametrize("tp_size", [1, 2])
@@ -138,6 +172,7 @@ def test_vision_mtp_uses_candidate_cache_positions(monkeypatch, is_draft, is_gra
             is_target_verify=not is_draft,
             is_cuda_graph=is_graph,
             prefix_lengths_device=torch.tensor([16, 129], dtype=torch.int32),
+            input_lengths=torch.tensor([3, 3], dtype=torch.int32),
             sequence_lengths_plus_1_device=torch.tensor([17, 130], dtype=torch.int32),
             combo_position_ids=torch.tensor(
                 [16, 17, 18, 129, 130, 131], dtype=torch.int32
@@ -205,3 +240,25 @@ def test_vision_draft_initial_prefill_is_ragged_not_mtp_window(monkeypatch):
         SimpleNamespace(attention_inputs=attn), torch.device("cpu"), 5
     )
     assert actual.tolist() == [8, 9, 16, 17, 18]
+
+
+def test_vision_draft_ragged_prefill_with_fixed_total_uses_actual_lengths(monkeypatch):
+    runtime = object.__new__(_ATOMQwen4ExpRuntime)
+    runtime._rtp_model_config = SimpleNamespace(
+        mm_model_config=SimpleNamespace(is_multimodal=True),
+        is_mtp=True,
+        gen_num_per_cycle=2,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn = SimpleNamespace(
+        is_prefill=True,
+        is_cuda_graph=False,
+        is_target_verify=False,
+        input_lengths=torch.tensor([1, 5], dtype=torch.int32),
+        prefix_lengths=torch.tensor([8, 16], dtype=torch.int32),
+        prefix_lengths_device=torch.tensor([8, 16], dtype=torch.int32),
+    )
+    actual = runtime._extract_positions(
+        SimpleNamespace(attention_inputs=attn), torch.device("cpu"), 6
+    )
+    assert actual.tolist() == [8, 16, 17, 18, 19, 20]
