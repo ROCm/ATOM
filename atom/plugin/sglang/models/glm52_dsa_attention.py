@@ -35,6 +35,21 @@ def glm52_native_mla_attention_construction():
         deepseek_v2.Attention = previous
 
 
+def _pack_head_slice(tensor: torch.Tensor) -> torch.Tensor:
+    """Pack an 8-head slice whose token stride still covers the other heads.
+
+    A rope-pad view keeps ``stride(-2) > size(-1)`` and must stay a view: the
+    hd256 kernel reads that pitch. This only packs the slice whose row pitch
+    already equals the head dim.
+    """
+
+    if tensor.ndim < 3 or tensor.stride(-2) != tensor.shape[-1]:
+        return tensor
+    if tensor.stride(-3) == tensor.shape[-2] * tensor.stride(-2):
+        return tensor
+    return tensor.contiguous()
+
+
 class SGLangATOMGLM52MLAAttention(MLAAttention):
     """Use ATOM native ``MLAAttention`` under SGLang plugin runtime.
 
@@ -192,14 +207,20 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
         lses = []
         for start in range(0, n_heads, 8):
             head_slice = slice(start, start + 8)
-            # Keep the padded row stride. _drop_rope_pad leaves
-            # stride(-1) at the unpadded width on purpose; contiguous()
-            # packs that and the hd256 kernel reads off the end.
-            rope = None if k_rope is None else k_rope[:, head_slice]
+            # Keep a rope-pad pitch (stride(-2) wider than size(-1)): packing
+            # that view is what makes hd256 read off the allocation. A 16-head
+            # row sliced to 8 is the other way around — size(-1) already
+            # matches the row pitch, but the token stride still covers the
+            # unsliced heads. The group kernel treats that as packed and
+            # walks off the output.
+            q_piece = _pack_head_slice(q[:, head_slice])
+            k_piece = _pack_head_slice(k[:, head_slice])
+            v_piece = _pack_head_slice(v[:, head_slice])
+            rope = None if k_rope is None else _pack_head_slice(k_rope[:, head_slice])
             piece = super()._flash_attn_prefill(
-                q[:, head_slice],
-                k[:, head_slice],
-                v[:, head_slice],
+                q_piece,
+                k_piece,
+                v_piece,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
@@ -232,6 +253,7 @@ class SGLangATOMGLM52MLAAttention(MLAAttention):
     ) -> torch.Tensor:
         # Short MTP has no top-k selection. The dense KV table is the whole
         # context; the sparse index buffer is not filled on this path.
+        # q==1 stays on sparse MLA: that is the FP8 decode graph.
         short_dense = (
             self.is_sparse_mla
             and int(getattr(self, "dcp_world_size", 1) or 1) == 1

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import torch
@@ -18,8 +17,86 @@ from atom.plugin.sglang.models.glm52_dsa_attention import (
     SGLangATOMGLM52MLAAttention,
 )
 
-logger = logging.getLogger("atom.plugin.sglang.models.glm52_dsa")
-_indexer_run_logged = False
+
+def _in_cuda_graph_capture() -> bool:
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+    except ImportError:
+        return False
+    return bool(get_is_capture_mode())
+
+
+def _capture_attention_variant() -> str | None:
+    """SGLang's dual-graph label, when this forward is inside CUDA-graph capture."""
+
+    try:
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+        )
+    except ImportError:
+        return None
+    if not _in_cuda_graph_capture():
+        return None
+    return get_capture_attention_variant()
+
+
+def glm52_short_context_is_dense(forward_batch: Any, topk_tokens: int) -> bool:
+    """True when GLM should read the dense KV table instead of top-k indices.
+
+    Kimi does not set the opt-in flag, so its plugin indexer is unchanged.
+    Single-token decode stays on the indexer. A dense CUDA-graph variant of
+    verify or extend is dense; the sparse variant is not.
+    """
+
+    if forward_batch is None or int(topk_tokens) <= 0:
+        return False
+    from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+        sparse_attn_indexer_sglang_plugin_mode,
+    )
+
+    if not getattr(
+        sparse_attn_indexer_sglang_plugin_mode, "_glm52_skip_short_topk", False
+    ):
+        return False
+    mode = getattr(forward_batch, "forward_mode", None)
+    is_verify = bool(getattr(mode, "is_target_verify", lambda: False)())
+    is_decode = bool(getattr(mode, "is_decode_or_idle", lambda: False)())
+    # FP8 GSM8K is one query token. Replacing its indexer with a dense fill
+    # leaves sparse MLA empty and the score falls to chance.
+    if is_decode and not is_verify:
+        return False
+    variant = _capture_attention_variant()
+    if variant == "sparse":
+        return False
+    if variant == "dense":
+        return True
+    bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+    cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if cpu is None or bs <= 0:
+        return False
+    try:
+        seq_max = int(max(cpu[:bs]))
+    except Exception as exc:
+        if "capturing" not in str(exc):
+            raise
+        return False
+    if seq_max <= int(topk_tokens):
+        return True
+    from atom.plugin.sglang.glm52_dsa_bridge import GLM52_GRAPH_SEQ_LEN_CAPACITY
+
+    extend = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if extend is None:
+        return False
+    try:
+        extend_max = int(max(extend[:bs]))
+    except Exception as exc:
+        if "capturing" not in str(exc):
+            raise
+        return False
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    return seq_max == fill and 0 < extend_max < fill
 
 
 def short_verify_skips_indexer(
@@ -78,58 +155,65 @@ def _install_short_verify_indexer_skip(module: Any) -> None:
         is_prefill = bool(
             getattr(getattr(context, "context", None), "is_prefill", False)
         )
+        topk_tokens = int(getattr(indexer, "topk_tokens", 0) or 0)
+        # Multi-token verify inside index_topk has no selection to score.
+        # Single-token FP8 decode must still call the indexer: skipping it
+        # leaves sparse MLA empty. The clamp's host copy is illegal while
+        # the decode graph is capturing, so capture skips only that copy.
         if short_verify_skips_indexer(
             metadata,
             is_prefill=is_prefill,
             dcp_world_size=get_dcp_world_size(),
-            topk_tokens=int(getattr(indexer, "topk_tokens", 0) or 0),
+            topk_tokens=topk_tokens,
         ):
             return None
-        if metadata is not None and forward_batch is not None:
+        if (
+            not _in_cuda_graph_capture()
+            and metadata is not None
+            and forward_batch is not None
+        ):
             runtime = resolve_sglang_runtime(forward_batch)
-            clamp_published_indexer_context(
-                metadata, forward_batch, runtime.req_to_token_pool
-            )
-            mask_oob_indexer_pages(metadata, runtime.token_to_kv_pool)
-        global _indexer_run_logged
-        if not _indexer_run_logged:
-            _indexer_run_logged = True
-            context_lens = getattr(metadata, "context_lens", None)
-            block_tables = getattr(metadata, "block_tables", None)
-            slot_mapping = getattr(metadata, "slot_mapping", None)
-            claimed_max = (
-                int(context_lens.max().item())
-                if torch.is_tensor(context_lens) and int(context_lens.numel())
-                else -1
-            )
-            page_max = (
-                int(block_tables.max().item())
-                if torch.is_tensor(block_tables) and int(block_tables.numel())
-                else -1
-            )
-            slot_max = (
-                int(slot_mapping.max().item())
-                if torch.is_tensor(slot_mapping) and int(slot_mapping.numel())
-                else -1
-            )
-            mode = getattr(getattr(forward_batch, "forward_mode", None), "name", "?")
-            logger.warning(
-                "GLM indexer run mode=%s prefill=%s q=%s k=%s claimed_max=%s rows=%s "
-                "pages=%s page_max=%s slot_max=%s",
-                mode,
-                is_prefill,
-                int(getattr(metadata, "max_seqlen_q", -1) or -1),
-                int(getattr(metadata, "max_seqlen_k", -1) or -1),
-                claimed_max,
-                int(context_lens.numel()) if torch.is_tensor(context_lens) else 0,
-                tuple(block_tables.shape) if torch.is_tensor(block_tables) else None,
-                page_max,
-                slot_max,
-            )
+            try:
+                clamped = clamp_published_indexer_context(
+                    metadata, forward_batch, runtime.req_to_token_pool
+                )
+            except Exception as exc:
+                if "capturing" not in str(exc):
+                    raise
+                clamped = False
+            if clamped:
+                try:
+                    mask_oob_indexer_pages(metadata, runtime.token_to_kv_pool)
+                except Exception as exc:
+                    if "capturing" not in str(exc):
+                        raise
+            if short_verify_skips_indexer(
+                metadata,
+                is_prefill=is_prefill,
+                dcp_world_size=get_dcp_world_size(),
+                topk_tokens=topk_tokens,
+            ):
+                return None
+            if not is_prefill:
+                # top_k_per_row_decode uses seq - next_n + (row % next_n) + 1.
+                # A padded row shorter than next_n wraps that to a huge length.
+                next_n = int(getattr(metadata, "max_seqlen_q", 1) or 1)
+                context_lens = getattr(metadata, "context_lens", None)
+                if (
+                    next_n > 1
+                    and torch.is_tensor(context_lens)
+                    and int(context_lens.numel())
+                ):
+                    context_lens.clamp_(min=next_n)
         return original(*args, **kwargs)
 
     indexer.sparse_attn_indexer_impl = _sparse_attn_indexer
     indexer._atom_glm52_short_verify_skip = True
+    from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+        sparse_attn_indexer_sglang_plugin_mode,
+    )
+
+    sparse_attn_indexer_sglang_plugin_mode._glm52_skip_short_topk = True
 
 
 def setup_glm52_dsa_for_sglang(model: Any) -> None:

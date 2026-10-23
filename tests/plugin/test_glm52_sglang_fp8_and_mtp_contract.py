@@ -10,11 +10,16 @@ from atom.plugin.sglang.attention_backend.glm52_dsa_backend import (
 )
 from atom.plugin.sglang.glm52_dsa_bridge import (
     GLM52_GRAPH_SEQ_LEN_CAPACITY,
+    _cap_context_to_host_seq,
     _cap_context_to_written_tokens,
+    real_prefill_seq_lens,
     resolve_draft_decode_context_lens,
     resolve_target_verify_lens,
 )
-from atom.plugin.sglang.models.glm52_dsa import short_verify_skips_indexer
+from atom.plugin.sglang.models.glm52_dsa import (
+    glm52_short_context_is_dense,
+    short_verify_skips_indexer,
+)
 
 
 def test_fp8_decode_keeps_the_indexer():
@@ -157,6 +162,41 @@ def test_graph_fill_does_not_override_a_real_mtp_context():
     assert padded_lens.tolist() == [13, 2, 2, 2]
 
 
+def test_short_prefill_drops_the_graph_fill_seq_len():
+    fill = GLM52_GRAPH_SEQ_LEN_CAPACITY
+    batch = SimpleNamespace()
+    fixed = real_prefill_seq_lens(
+        np.array([fill, fill], dtype=np.int32),
+        np.array([6, 4], dtype=np.int32),
+        batch,
+    )
+    assert fixed.tolist() == [6, 4]
+    kept = real_prefill_seq_lens(
+        np.array([3000, 128], dtype=np.int32),
+        np.array([128, 128], dtype=np.int32),
+        batch,
+    )
+    assert kept.tolist() == [3000, 128]
+    capture = SimpleNamespace(_atom_glm52_keep_graph_fill=True)
+    held = real_prefill_seq_lens(
+        np.array([fill], dtype=np.int32),
+        np.array([6], dtype=np.int32),
+        capture,
+    )
+    assert held.tolist() == [fill]
+
+
+def test_host_seq_stops_a_graph_fill_the_token_row_still_looks_full():
+    # Replay can leave both the GPU context and a stale req_to_token row at
+    # the fill. The scheduler's CPU length is the one that was actually written.
+    capped = _cap_context_to_host_seq(
+        np.array([10240, 10240], dtype=np.int32),
+        np.array([6, 10240], dtype=np.int32),
+        query_len=4,
+    )
+    assert capped.tolist() == [10, 10240]
+
+
 def test_context_stops_at_the_written_req_to_token_prefix():
     pool = SimpleNamespace(
         req_to_token=torch.tensor(
@@ -189,3 +229,34 @@ def test_head_chunk_keeps_the_padded_flash_stride():
     assert chunk.stride(-2) == padded
     packed = chunk.contiguous()
     assert packed.stride(-2) == logical
+
+
+def test_short_glm_context_uses_dense_attention_kimi_does_not():
+    from atom.plugin.sglang.attention_backend.sparse_mla_indexer import (
+        sparse_attn_indexer_sglang_plugin_mode,
+    )
+
+    batch = SimpleNamespace(
+        batch_size=1,
+        seq_lens_cpu=torch.tensor([6], dtype=torch.int32),
+    )
+    assert not glm52_short_context_is_dense(batch, 2048)
+    sparse_attn_indexer_sglang_plugin_mode._glm52_skip_short_topk = True
+    try:
+        assert glm52_short_context_is_dense(batch, 2048)
+        decode = SimpleNamespace(
+            batch_size=1,
+            seq_lens_cpu=torch.tensor([6], dtype=torch.int32),
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: True,
+                is_target_verify=lambda: False,
+            ),
+        )
+        assert not glm52_short_context_is_dense(decode, 2048)
+        long = SimpleNamespace(
+            batch_size=1,
+            seq_lens_cpu=torch.tensor([4096], dtype=torch.int32),
+        )
+        assert not glm52_short_context_is_dense(long, 2048)
+    finally:
+        sparse_attn_indexer_sglang_plugin_mode._glm52_skip_short_topk = False

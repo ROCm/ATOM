@@ -461,6 +461,12 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                         include_v2=True
                     )
                 )
+                # GLM verify capture bakes max_seqlen_k. The V4 flag turns
+                # that replay on for every supported model; a 6-token prompt
+                # then faults inside the replayed kernel. Eager verify uses
+                # the live length. DeepSeek-V4 still follows the flag.
+                if _is_glm52_runner(model_runner) and is_target_verify:
+                    return False
                 if (
                     is_supported_model
                     and is_target_verify
@@ -469,14 +475,6 @@ def _patch_sglang_dsv4_spec_cuda_graph() -> None:
                     return False
                 if is_supported_model and is_draft_extend:
                     return False
-                if _is_glm52_runner(model_runner) and is_target_verify:
-                    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
-                    if seq_lens_cpu is None or len(seq_lens_cpu) == 0:
-                        return False
-                    max_seq_len = int(max(seq_lens_cpu))
-                    max_graph_seq_len = GLM52_GRAPH_SEQ_LEN_CAPACITY
-                    if max_seq_len > max_graph_seq_len:
-                        return False
             except Exception:  # noqa: S110
                 pass
             return original_can_run(self, forward_batch)

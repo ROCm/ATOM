@@ -132,6 +132,73 @@ def _drop_unconfirmed_graph_fill(lengths: np.ndarray, forward_batch) -> np.ndarr
     return out
 
 
+def _cap_context_to_host_seq(
+    context_lens: np.ndarray, host_lens: np.ndarray, query_len: int
+) -> np.ndarray:
+    """Do not let a graph-fill context outrun the scheduler's CPU seq len.
+
+    ``host_lens`` is the committed prefix. ``query_len`` is the tokens this
+    step adds (1 for decode, the draft width for verify). A CUDA-graph buffer
+    can still say 10240 after replay, and a stale ``req_to_token`` row can
+    look full, so the CPU length is the bound the indexer is allowed to walk.
+    """
+
+    context = np.asarray(context_lens, dtype=np.int32).copy()
+    host = np.asarray(host_lens, dtype=np.int32).reshape(-1)
+    n = min(int(context.size), int(host.size))
+    if n == 0:
+        return context
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    query_len = max(int(query_len), 1)
+    real = (host[:n] > 0) & (host[:n] < fill)
+    allow = host[:n] + np.int32(query_len)
+    shrink = real & (context[:n] > allow)
+    context[:n][shrink] = allow[shrink]
+    return context
+
+
+def real_prefill_seq_lens(
+    seq_lens: np.ndarray,
+    extend_lens: np.ndarray,
+    forward_batch,
+) -> np.ndarray:
+    """Replace a CUDA-graph seq-len fill with the extend that was written.
+
+    Capture stores ``GLM52_GRAPH_SEQ_LEN_CAPACITY`` in ``seq_lens``. A live
+    short prefill then publishes that fill as ``max_seqlen_k``, and the
+    indexer calls ``top_k_per_row_prefill`` on a row that only holds the
+    extend. A real context, including one longer than the fill, is kept.
+    Capture sets ``_atom_glm52_keep_graph_fill`` and is kept as well.
+    """
+
+    seq = np.asarray(seq_lens, dtype=np.int32).copy()
+    extend = np.asarray(extend_lens, dtype=np.int32).reshape(-1)
+    if seq.size == 0 or getattr(forward_batch, "_atom_glm52_keep_graph_fill", False):
+        return seq
+    fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
+    n = min(int(seq.size), int(extend.size))
+    if n == 0:
+        return seq
+    bogus = seq[:n] == fill
+    if not np.any(bogus):
+        return seq
+    prefix = get_extend_prefix_lens_cpu(forward_batch, n)
+    if prefix is not None:
+        prefix = np.asarray(prefix, dtype=np.int32).reshape(-1)[:n]
+        use_prefix = (
+            bogus
+            & (prefix >= 0)
+            & (prefix < fill)
+            & (extend[:n] > 0)
+            & (extend[:n] < fill)
+        )
+        seq[:n][use_prefix] = prefix[use_prefix] + extend[:n][use_prefix]
+        bogus = seq[:n] == fill
+    short = bogus & (extend[:n] > 0) & (extend[:n] < fill)
+    seq[:n][short] = extend[:n][short]
+    return seq
+
+
 def _cap_context_to_written_tokens(
     context_lens: np.ndarray,
     forward_batch,
@@ -192,7 +259,7 @@ def _cap_context_to_written_tokens(
     return capped.astype(np.int32)
 
 
-def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) -> None:
+def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) -> bool:
     """Shrink a published decode context that still carries the graph fill.
 
     Replay can hand the indexer the capture buffer after the host length was
@@ -202,11 +269,30 @@ def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) 
 
     context = getattr(metadata, "context_lens", None)
     if not torch.is_tensor(context) or int(context.numel()) == 0:
-        return
+        return True
     if getattr(forward_batch, "_atom_glm52_keep_graph_fill", False):
-        return
-    claimed = context.detach().to(dtype=torch.int32, device="cpu").reshape(-1).numpy()
-    capped = _cap_context_to_written_tokens(claimed, forward_batch, req_to_token_pool)
+        return True
+    try:
+        claimed = (
+            context.detach().to(dtype=torch.int32, device="cpu").reshape(-1).numpy()
+        )
+    except Exception as exc:
+        # HIP refuses a host copy while the capture stream is recording.
+        # AcceleratorError is not always a RuntimeError on this build.
+        if "capturing" not in str(exc):
+            raise
+        return False
+    query_len = int(getattr(metadata, "max_seqlen_q", 1) or 1)
+    capped = _cap_context_to_host_seq(
+        claimed, get_seq_lens_cpu(forward_batch, int(claimed.size)), query_len
+    )
+    if not np.array_equal(capped, claimed):
+        logger.warning(
+            "GLM host-capped indexer context from %s to %s",
+            int(claimed.max(initial=0)),
+            int(capped.max(initial=0)),
+        )
+    capped = _cap_context_to_written_tokens(capped, forward_batch, req_to_token_pool)
     fill = int(GLM52_GRAPH_SEQ_LEN_CAPACITY)
     if int(capped.max(initial=0)) >= fill and not getattr(
         clamp_published_indexer_context, "_logged_fill", False
@@ -219,7 +305,7 @@ def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) 
             int(capped.size),
         )
     if np.array_equal(capped, claimed):
-        return
+        return True
     context.copy_(
         torch.from_numpy(capped)
         .to(device=context.device, dtype=context.dtype)
@@ -227,6 +313,7 @@ def clamp_published_indexer_context(metadata, forward_batch, req_to_token_pool) 
     )
     if hasattr(metadata, "max_seqlen_k"):
         metadata.max_seqlen_k = int(max(int(capped.max(initial=1)), 1))
+    return True
 
 
 def mask_oob_indexer_pages(metadata, token_to_kv_pool) -> None:
@@ -1528,6 +1615,7 @@ def build_mtp_draft_extend_prefill_metadata(
     bs = int(forward_batch.batch_size)
     seq_lens = get_seq_lens_cpu(forward_batch, bs)
     extend_lens = get_extend_lens_cpu(forward_batch, positions, bs)
+    seq_lens = real_prefill_seq_lens(seq_lens, extend_lens, forward_batch)
     topk = get_index_topk(atom_config)
     page_size = validate_page_size(token_to_kv_pool, atom_config)
 
@@ -1662,6 +1750,7 @@ def build_prefill_metadata(
     bs = int(forward_batch.batch_size)
     seq_lens = get_seq_lens_cpu(forward_batch, bs)
     extend_lens = get_extend_lens_cpu(forward_batch, positions, bs)
+    seq_lens = real_prefill_seq_lens(seq_lens, extend_lens, forward_batch)
     topk = get_index_topk(atom_config)
     page_size = validate_page_size(token_to_kv_pool, atom_config)
 
