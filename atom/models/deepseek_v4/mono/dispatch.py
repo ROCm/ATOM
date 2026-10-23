@@ -97,8 +97,14 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
     # Preserve the loaded parameter and exact kernel, but use a read-only
     # schema so graph recording cannot invalidate the weight binding.
     from atom.models.deepseek_v4.mono.embedding import MonoEmbedding
+    from atom.models.deepseek_v4.mono.projection import MonoIndexerProjection
 
     model.model.embed = MonoEmbedding(model.model.embed)
+    for layer in model.model.layers:
+        if layer.attn.indexer is not None:
+            layer.attn.indexer.weights_proj = MonoIndexerProjection(
+                layer.attn.indexer.weights_proj
+            )
     if drafter is not None:
         drafter.model.share_with_target(model, set())
     metadata_builder._mono_session = session
