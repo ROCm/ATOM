@@ -227,12 +227,17 @@ def test_a_process_has_exactly_one_name():
 
     assert worker_process_name(cfg(), 3) == "TP3"
     assert worker_process_name(cfg(dp=4, dp_rank=2), 3) == "DP2TP3"
+    assert worker_process_name(cfg(pp=8, pp_rank=5), 0) == "PP5TP0"
+    assert worker_process_name(cfg(pp=2, dp=2, pp_rank=1, dp_rank=1), 0) == "DP1PP1TP0"
     # A worker can be built without a config; naming must not be what fails.
     assert worker_process_name(None, 3) == "TP3"
 
     # Control: dp ranks must not collide, which is what a rank-blind name does.
     names = {worker_process_name(cfg(dp=4, dp_rank=r), 0) for r in range(4)}
     assert len(names) == 4, f"dp ranks share a name: {names}"
+    # Nor pp stages: each runs one TP0 worker, so without the stage all match.
+    names = {worker_process_name(cfg(pp=8, pp_rank=r), 0) for r in range(8)}
+    assert len(names) == 8, f"pp stages share a name: {names}"
 
 
 def test_the_worker_rpc_returns_something():
