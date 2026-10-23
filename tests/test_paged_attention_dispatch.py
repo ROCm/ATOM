@@ -296,9 +296,18 @@ class _Layer:
             setattr(self, name, name)
 
 
-def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
+def _route(
+    monkeypatch,
+    max_qlen,
+    block_size=128,
+    unified=False,
+    force=False,
+    gluon_supported=True,
+    **kw,
+):
     from atom.model_ops import attention_mha as mha
 
+    monkeypatch.setattr(mha, "gluon_pa_decode_supported", lambda: gluon_supported)
     monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
     monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
     monkeypatch.setattr(
@@ -311,6 +320,27 @@ def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **
 
 class TestDecodeRouting:
     """Which backend _dispatch_decode picks, for the shapes that reach it."""
+
+    @pytest.mark.parametrize(
+        "max_qlen,kw",
+        [
+            (4, {}),  # within gluon, past ASM
+            (1, {"num_heads": 64}),  # past ASM
+            (1, {"use_triton_attn": True}),  # head_dim != 128
+            (1, {"sliding_window": 128}),
+        ],
+    )
+    def test_no_gluon_kernel_takes_unified(self, monkeypatch, max_qlen, kw):
+        """gfx1250: aiter's pa_decode_gluon asserts CDNA, so every shape that
+        would take it goes to unified instead."""
+        assert (
+            _route(monkeypatch, max_qlen, gluon_supported=False, **kw)
+            == "paged_attention_unified"
+        )
+
+    def test_no_gluon_kernel_keeps_asm(self, monkeypatch):
+        """Only the gluon choice moves; a shape within ASM's envelope keeps it."""
+        assert _route(monkeypatch, 1, gluon_supported=False) == "paged_attention_asm"
 
     def test_m3_dense_production_shape_stays_on_gluon(self, monkeypatch):
         """TP4, 3 draft tokens. The shape this change is measured on."""

@@ -3021,7 +3021,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for el, num in vars_used
             if el not in metadata_deps and el != "block_tables"
         ]
-        max_seqlen_k = context_lens.max()
+        max_seqlen_k = int(context_lens.max())
 
         # All persistent metadata publishes on the owner's compute stream.
         ctx = {

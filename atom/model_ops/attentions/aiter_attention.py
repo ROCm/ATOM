@@ -1206,7 +1206,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             if num_rejected is not None:
                 context_lens -= num_rejected
         positions = decode_positions(context_lens, max_seqlen_q)
-        max_seqlen_k = np.max(context_lens)
+        max_seqlen_k = int(np.max(context_lens))
 
         # Before the slots, not after: `slot_mapping` reads this packed table.
         self.prepare_block_tables(batch, running_bs)
@@ -1272,7 +1272,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             ctx.update(ctx_pa_ps)
 
         ctx["kv_indices"] = var["kv_indices"].gpu
-        max_seqlen_k = context_lens.max()
+        max_seqlen_k = int(context_lens.max())
         kv_indices_generate_triton(
             ctx["block_tables"],
             ctx["kv_indices"],
