@@ -192,5 +192,24 @@ def test_normalized_added_tokens_need_an_identity_normalizer():
     assert seg._encode_segments(prompt) == tok.encode(prompt)
 
 
+def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
+    """They would take an entry each but no token budget, so eviction would
+    never bound them."""
+    seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
+    real = seg._backend.encode_batch
+
+    def drop_whitespace(texts, **kw):
+        return [
+            MagicMock(ids=[]) if not t.strip() else e
+            for t, e in zip(texts, real(texts, **kw))
+        ]
+
+    monkeypatch.setattr(seg, "_backend", MagicMock(encode_batch=drop_whitespace))
+    seg._verified = seg_mod._VERIFY_FIRST
+    for n in range(1, 50):
+        seg._encode_segments("<|User|>" + " " * n + "<|Assistant|>")
+    assert len(seg._cache) == 0 and seg._cached_tokens == 0
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16

@@ -170,7 +170,9 @@ class SegmentTokenizer:
         out: list[int] = list(self._head)
         with self._lock:
             for key, ids in fresh.items():
-                if key not in self._cache:
+                # An empty encoding would cost a cache entry but no budget,
+                # so eviction would never bound how many accumulate.
+                if len(ids) and key not in self._cache:
                     self._cache[key] = ids
                     self._cached_tokens += len(ids)
             for part, key in zip(parts, keys):
