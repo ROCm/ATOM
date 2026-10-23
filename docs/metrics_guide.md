@@ -128,11 +128,14 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics: series count grows with requests.
+**Opt-in.** Set `ATOM_METRICS_PER_REQUEST_CONTEXT=1` before starting the service
+to record the two request context gauges; default `0` emits no samples. These are
+intentionally per-request metrics: series count grows with requests.
 Samples remain after request completion so even short requests can be scraped.
 Native multiprocess files retain them until the service's metrics directory is
-cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
-directory between long benchmark runs when this accumulated cardinality matters.
+cleaned; there is no automatic per-request expiry, and every `/metrics` render
+re-reads all of them. Use a fresh service/metrics directory between long
+benchmark runs when this accumulated cardinality matters.
 
 ### GPU forward timing
 
