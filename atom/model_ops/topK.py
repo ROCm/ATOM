@@ -39,8 +39,8 @@ def _mxfp8_shared_into_mxfp4(shared, routed) -> bool:
 
 def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
     quant_config,
-    shared_expert_prefix: Optional[str] = None,
-    routed_expert_prefix: Optional[str] = None,
+    shared_expert_prefix: str | None = None,
+    routed_expert_prefix: str | None = None,
 ) -> bool:
     config = get_current_atom_config()
     if quant_config is None:
