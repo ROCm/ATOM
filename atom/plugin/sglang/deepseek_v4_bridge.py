@@ -28,6 +28,7 @@ except Exception:  # noqa: BLE001
     ATOM_DEEPSEEK_V4_FP8_PACKED_DIM = 512
 _V4_FP8_SUPPORTED_GFX = ("gfx950", "gfx1250")
 _V4_FP8_DOWNGRADE_WARNED = False
+_V4_SPLIT_PLAN_HEADS_WARNED = False
 _V4_SWA_DEST_RATIOS = (DENSE_RATIO, CSA_RATIO, HCA_RATIO)
 
 logger = logging.getLogger(__name__)
@@ -1589,6 +1590,150 @@ def _build_block_tables(
     ).to(torch.int32)
 
 
+def _local_heads_on(module) -> int | None:
+    if module is None:
+        return None
+    direct = getattr(module, "n_local_heads", None)
+    if direct:
+        return int(direct)
+    layers = getattr(module, "layers", None)
+    if layers is None or len(layers) == 0:
+        return None
+    heads = getattr(getattr(layers[0], "attn", None), "n_local_heads", None)
+    if heads:
+        return int(heads)
+    return None
+
+
+def _resolve_v4_local_heads(model: Any = None) -> int | None:
+    """Heads per rank for the fp8 decode split plan.
+
+    Native attention stores this as ``num_attention_heads // tp``. The SGLang
+    bridge does not own that module, so read the same counts off the model or
+    the active ATOM config.
+    """
+    configs: list[Any] = []
+    if model is not None:
+        for module in (model, getattr(model, "model", None)):
+            heads = _local_heads_on(module)
+            if heads:
+                return heads
+            cfg = getattr(module, "atom_config", None)
+            if cfg is not None:
+                configs.append(cfg)
+    try:
+        from atom.config import get_current_atom_config
+
+        configs.append(get_current_atom_config())
+    except Exception:  # noqa: BLE001, S110 - config is optional for this fallback
+        pass
+    for cfg in configs:
+        hf = getattr(cfg, "hf_config", None)
+        heads = getattr(hf, "num_attention_heads", None)
+        if not heads:
+            continue
+        tp = int(getattr(cfg, "tensor_parallel_size", 1) or 1)
+        return max(1, int(heads) // max(tp, 1))
+    return None
+
+
+def _v4_split_table(proxy_pool, rows: int, device) -> torch.Tensor:
+    """Constant split table shared by every decode plan on this pool.
+
+    Capture and replay must read the same storage. Grow it only when a larger
+    batch shows up; a forward never allocates its own table.
+    """
+    from atom.model_ops.v4_kernels.paged_decode import v4_uniform_split_table
+
+    need = max(int(rows), int(getattr(proxy_pool, "num_slots", 1)))
+    table = getattr(proxy_pool, "_atom_v4_split_table", None)
+    want = device if isinstance(device, torch.device) else torch.device(device)
+    if (
+        table is not None
+        and table.shape[1] > need
+        and table.device.type == want.type
+    ):
+        return table
+    table = v4_uniform_split_table(need, device)
+    proxy_pool._atom_v4_split_table = table
+    return table
+
+
+def _attach_v4_decode_split_plans(
+    md,
+    *,
+    rows: int,
+    proxy_pool,
+    model: Any = None,
+    index_topk: int,
+    max_committed_hca: int,
+) -> None:
+    """Set ``split_plan_{swa,csa,hca}`` on generic SGLang metadata.
+
+    ``AttentionMetaData`` does not declare these fields. Native decode fills
+    them on ``AttentionMetaData_DSV4``; without the attributes,
+    ``_sparse_attention`` raises AttributeError on the fp8 decode path.
+    Non-fp8 matches ``_decode_split_plan`` and stores None.
+    """
+    global _V4_SPLIT_PLAN_HEADS_WARNED
+
+    rows = int(rows)
+    if not getattr(proxy_pool, "use_fp8_kv", False) or rows <= 0:
+        md.split_plan_swa = None
+        md.split_plan_csa = None
+        md.split_plan_hca = None
+        md._atom_v4_split_plan_spec = None
+        return
+
+    heads = _resolve_v4_local_heads(model)
+    if heads is None:
+        if not _V4_SPLIT_PLAN_HEADS_WARNED:
+            logger.warning(
+                "DeepSeek-V4 fp8 decode split plan skipped: local head count "
+                "is unknown; aiter will pick the split count"
+            )
+            _V4_SPLIT_PLAN_HEADS_WARNED = True
+        md.split_plan_swa = None
+        md.split_plan_csa = None
+        md.split_plan_hca = None
+        md._atom_v4_split_plan_spec = None
+        return
+
+    from atom.model_ops.v4_kernels.paged_decode import v4_decode_split_plan
+
+    win = int(proxy_pool.window_size)
+    topk = int(index_topk)
+    hca = int(max_committed_hca)
+    table = _v4_split_table(proxy_pool, rows, proxy_pool.device)
+    md._atom_v4_split_plan_spec = (table, heads, win, topk, hca)
+    md.split_plan_swa = v4_decode_split_plan(rows, heads, win, table)
+    md.split_plan_csa = v4_decode_split_plan(rows, heads, win + topk, table)
+    md.split_plan_hca = v4_decode_split_plan(rows, heads, win + hca, table)
+
+
+def _retarget_v4_decode_split_plans(md, rows: int) -> None:
+    """Rebuild split plans for a narrower CUDA-graph capture bucket.
+
+    The plan tensors stay views of the pool's constant table, so capture and
+    replay of one bucket keep the same storage.
+    """
+    spec = getattr(md, "_atom_v4_split_plan_spec", None)
+    if spec is None:
+        return
+    table, heads, win, topk, hca = spec
+    from atom.model_ops.v4_kernels.paged_decode import v4_decode_split_plan
+
+    rows = int(rows)
+    if rows <= 0:
+        md.split_plan_swa = None
+        md.split_plan_csa = None
+        md.split_plan_hca = None
+        return
+    md.split_plan_swa = v4_decode_split_plan(rows, heads, win, table)
+    md.split_plan_csa = v4_decode_split_plan(rows, heads, win + topk, table)
+    md.split_plan_hca = v4_decode_split_plan(rows, heads, win + hca, table)
+
+
 def build_atom_v4_decode_graph_metadata_from_sglang(
     forward_batch,
     positions: torch.Tensor,
@@ -1836,6 +1981,14 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         "cu_starts_gpu": seq_base,
         "cu_ends_gpu": visible_end,
     }
+    _attach_v4_decode_split_plans(
+        md,
+        rows=t_pad,
+        proxy_pool=proxy_pool,
+        model=model,
+        index_topk=index_topk,
+        max_committed_hca=max_blocks,
+    )
     return md
 
 
@@ -2275,6 +2428,13 @@ def build_atom_v4_attention_metadata_from_sglang(
         if proxy_pool.use_fp8_kv:
             _stage_decode_fp8_page_metadata(md, total, total)
         _publish_empty_kv_indptr(md, total)
+        _attach_v4_decode_split_plans(
+            md,
+            rows=total,
+            proxy_pool=proxy_pool,
+            index_topk=index_topk,
+            max_committed_hca=proxy_pool.num_blocks,
+        )
     else:
         _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device)
     _populate_indexer(md, batch_np, positions[:total], device)

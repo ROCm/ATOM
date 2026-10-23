@@ -48,10 +48,12 @@ from atom.model_ops.attentions.pool_layout.v4_pool_geometry import (
 from atom.plugin.sglang.deepseek_v4_bridge import (
     ATOM_DEEPSEEK_V4_BLOCK_SIZE,
     ATOMDeepSeekV4ProxyKVPool,
+    _attach_v4_decode_split_plans,
     _geometry_serves_ratio,
     _geometry_supports_shared_prefill_writer,
     _proxy_pool_geometry,
     _resolve_v4_pool_geometry,
+    _retarget_v4_decode_split_plans,
     _write_dense_only_prefill_indices,
 )
 
@@ -262,3 +264,76 @@ def test_dense_only_prefill_indices_write_swa_without_calling_shared_writer():
     assert int(prefix_swa[0]) == dense.index(1, 13)
     assert "_write_dense_only_prefill_indices" in SGLANG_BRIDGE
     assert "_geometry_supports_shared_prefill_writer" in SGLANG_BRIDGE
+
+
+def _split_plan_pool(*, fp8: bool, num_blocks: int = 7):
+    return SimpleNamespace(
+        use_fp8_kv=fp8,
+        window_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        num_slots=4,
+        num_blocks=num_blocks,
+        device=torch.device("cpu"),
+    )
+
+
+def test_decode_split_plans_are_absent_without_fp8_kv():
+    md = SimpleNamespace()
+    _attach_v4_decode_split_plans(
+        md,
+        rows=3,
+        proxy_pool=_split_plan_pool(fp8=False),
+        model=SimpleNamespace(n_local_heads=16),
+        index_topk=32,
+        max_committed_hca=7,
+    )
+    assert md.split_plan_swa is None
+    assert md.split_plan_csa is None
+    assert md.split_plan_hca is None
+    assert md._atom_v4_split_plan_spec is None
+
+
+def test_decode_split_plans_follow_native_kv_lengths(monkeypatch):
+    from atom.model_ops.v4_kernels import paged_decode
+
+    calls = []
+
+    def _fake_plan(rows, heads, kv_len, table):
+        calls.append((rows, heads, kv_len, table))
+        return 2, table[1]
+
+    monkeypatch.setattr(paged_decode, "v4_decode_split_plan", _fake_plan)
+    pool = _split_plan_pool(fp8=True, num_blocks=9)
+    md = SimpleNamespace()
+    _attach_v4_decode_split_plans(
+        md,
+        rows=3,
+        proxy_pool=pool,
+        model=SimpleNamespace(n_local_heads=16),
+        index_topk=32,
+        max_committed_hca=9,
+    )
+
+    win = ATOM_DEEPSEEK_V4_BLOCK_SIZE
+    assert [call[2] for call in calls] == [win, win + 32, win + 9]
+    assert all(call[0] == 3 and call[1] == 16 for call in calls)
+    table = calls[0][3]
+    assert all(call[3] is table for call in calls)
+    assert md.split_plan_swa == (2, table[1])
+    assert md.split_plan_csa[0] == 2
+    assert md.split_plan_hca[0] == 2
+
+    again = SimpleNamespace()
+    _attach_v4_decode_split_plans(
+        again,
+        rows=2,
+        proxy_pool=pool,
+        model=SimpleNamespace(n_local_heads=16),
+        index_topk=32,
+        max_committed_hca=9,
+    )
+    assert again._atom_v4_split_plan_spec[0] is table
+
+    _retarget_v4_decode_split_plans(md, 1)
+    assert calls[-1][0] == 1
+    assert calls[-3][0] == 1
+    assert md.split_plan_swa[1].data_ptr() == table[1].data_ptr()
