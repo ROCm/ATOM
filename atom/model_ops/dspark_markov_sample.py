@@ -592,6 +592,8 @@ def _dspark_markov_sample_stage1(
     q_ptr,
     part_max_ptr,
     part_sum_ptr,
+    part_amax_val_ptr,
+    part_amax_idx_ptr,
     num_rows,
     vocab_size,
     rank,
@@ -606,7 +608,8 @@ def _dspark_markov_sample_stage1(
     BLOCK_K: tl.constexpr,
 ):
     """One (V tile, row tile): bias GEMV, add base, scale by 1/T, write ``s``
-    into the row's q row and publish this tile's (max, sum exp(s - max)).
+    into the row's q row and publish this tile's (max, sum exp(s - max)), plus
+    the unscaled logits' (max, lowest id) a greedy row drafts from.
 
     ``s`` lands in q itself, which stage 3 then normalizes in place: the
     alternative is a second `[B, V]` scratch for no gain.
@@ -648,9 +651,20 @@ def _dspark_markov_sample_stage1(
     # Pre-clamped by the caller to SAMPLER_EPS, so a greedy row gets a
     # near-delta q rather than a division by zero; `greedy_mask` is what
     # actually makes it an argmax.
+    logits = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
+    # The greedy op's own (max, lowest id), taken before the division: a
+    # near-zero temperature can round distinct logits onto one value.
+    raw_max = tl.max(logits, axis=1)
+    raw_idx = tl.min(
+        tl.where(
+            (logits == raw_max[:, None]) & v_mask[None, :], offs_v[None, :], vocab_size
+        ),
+        axis=1,
+    )
+    tl.store(part_amax_val_ptr + tile * num_rows + offs_row, raw_max, mask=row_mask)
+    tl.store(part_amax_idx_ptr + tile * num_rows + offs_row, raw_idx, mask=row_mask)
     temperature = tl.load(temperatures_ptr + offs_row, mask=row_mask, other=1.0)
-    scaled = (base.to(tl.float32) + acc) / temperature[:, None]
-    scaled = tl.where(v_mask[None, :], scaled, float("-inf"))
+    scaled = logits / temperature[:, None]
     q_base = tl.load(q_row_base_ptr + offs_row, mask=row_mask, other=-1)
     q_row = (q_base + position).to(tl.int64) * vocab_size
     tl.store(
@@ -670,6 +684,7 @@ def _dspark_markov_sample_stage3(
     q_row_base_ptr,
     row_max_ptr,
     row_inv_z_ptr,
+    row_argmax_ptr,
     greedy_mask_ptr,
     seed_ptr,
     part_key_ptr,
@@ -683,8 +698,10 @@ def _dspark_markov_sample_stage3(
     """One (row, V tile): normalize ``s`` into q in place, then run the
     exponential race over this tile.
 
-    ``probs.div_(noise).argmax(-1)``, with ``noise = where(greedy_mask, 1.0,
-    exp_noise)`` -- the greedy rows fall out as a plain argmax.
+    ``probs.div_(noise).argmax(-1)``. A greedy row publishes the exact delta on
+    its logits' lowest-id argmax instead of ``softmax(s)``, which on a tie is
+    1/n per tied id: the id is the argmax, not a draw from that softmax, and
+    the accept rule must see the distribution the id actually came from.
 
     One row per program, deliberately: this stage only streams, so its live tile
     is ``[1, BLOCK_V]`` of fp32 rather than stage 1's MFMA accumulator. Tiling
@@ -698,13 +715,19 @@ def _dspark_markov_sample_stage3(
 
     q_base = tl.load(q_row_base_ptr + row)
     has_q = q_base >= 0
-    # A row with no destination loads -inf everywhere, so its probabilities are
-    # 0, its keys tie at 0 and it drafts the tile's first id. Nothing reads it.
+    # A sampled row with no destination loads -inf everywhere, so its
+    # probabilities are 0, its keys tie at 0 and it drafts the tile's first id.
+    # Nothing reads it.
     offs = (tl.where(has_q, q_base, 0) + position).to(tl.int64) * vocab_size + offs_v
     scaled = tl.load(q_ptr + offs, mask=v_mask & has_q, other=float("-inf"))
     row_max = tl.load(row_max_ptr + row)
     inv_z = tl.load(row_inv_z_ptr + row)
-    probs = tl.where(v_mask & has_q, tl.exp(scaled - row_max) * inv_z, 0.0)
+    greedy = tl.load(greedy_mask_ptr + row) != 0
+    if greedy:
+        argmax = tl.load(row_argmax_ptr + row)
+        probs = tl.where(v_mask & (offs_v == argmax), 1.0, 0.0)
+    else:
+        probs = tl.where(v_mask & has_q, tl.exp(scaled - row_max) * inv_z, 0.0)
     tl.store(q_ptr + offs, probs, mask=v_mask & has_q)
 
     # Philox, keyed on a device scalar every rank fills with the same SPMD step
@@ -716,7 +739,6 @@ def _dspark_markov_sample_stage3(
     # in (0, inf] and the key probs / E is always finite (u == 0 gives key 0,
     # which simply loses the race).
     exp_noise = -tl.log(u)
-    greedy = tl.load(greedy_mask_ptr + row) != 0
     denom = tl.where(greedy, 1.0, exp_noise)
     key = tl.where(v_mask, probs / denom, -1.0)
 
@@ -895,8 +917,13 @@ def dspark_markov_sample(
     f32 = {"dtype": torch.float32, "device": device}
     part_max = torch.empty((gemv_tiles, num_rows), **f32)
     part_sum = torch.empty((gemv_tiles, num_rows), **f32)
+    part_amax_val = torch.empty((gemv_tiles, num_rows), **f32)
+    part_amax_idx = torch.empty(
+        (gemv_tiles, num_rows), dtype=torch.int32, device=device
+    )
     row_max = torch.empty((num_rows,), **f32)
     row_inv_z = torch.empty((num_rows,), **f32)
+    row_argmax = torch.empty((num_rows,), dtype=torch.int32, device=device)
 
     _dspark_markov_sample_stage1[(gemv_tiles, row_tiles)](
         base_logits,
@@ -909,6 +936,8 @@ def dspark_markov_sample(
         q_store,
         part_max,
         part_sum,
+        part_amax_val,
+        part_amax_idx,
         num_rows,
         vocab_size,
         rank,
@@ -929,9 +958,13 @@ def dspark_markov_sample(
         part_sum,
         row_max,
         row_inv_z,
+        part_amax_val,
+        part_amax_idx,
+        row_argmax,
         num_rows,
         gemv_tiles,
         BLOCK_TILE=triton.next_power_of_2(gemv_tiles),
+        WITH_ARGMAX=True,
         num_warps=4,
         num_stages=1,
     )
@@ -944,6 +977,7 @@ def dspark_markov_sample(
         q_row_base,
         row_max,
         row_inv_z,
+        row_argmax,
         greedy_mask,
         seed,
         part_key,

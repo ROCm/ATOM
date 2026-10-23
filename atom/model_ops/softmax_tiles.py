@@ -37,12 +37,21 @@ def softmax_combine_kernel(
     part_sum_ptr,  # [num_tiles, num_rows] fp32
     row_max_ptr,  # [num_rows] fp32 out
     row_inv_z_ptr,  # [num_rows] fp32 out
+    part_amax_val_ptr,  # [num_tiles, num_rows] fp32, WITH_ARGMAX only
+    part_amax_idx_ptr,  # [num_tiles, num_rows] int32, WITH_ARGMAX only
+    row_argmax_ptr,  # [num_rows] int32 out, WITH_ARGMAX only
     num_rows,
     num_tiles,
     BLOCK_TILE: tl.constexpr,
+    WITH_ARGMAX: tl.constexpr,
 ):
     """One row: the online-softmax combine, global max and 1/Z from the
-    per-tile pairs, so V is never read a second time just to normalize."""
+    per-tile pairs, so V is never read a second time just to normalize.
+
+    ``WITH_ARGMAX`` also reduces per-tile ``(value, lowest id)`` pairs to the
+    row's lowest-id argmax, the pick ``torch.argmax`` and ``topk_select(...,
+    tie="low")`` make.
+    """
     row = tl.program_id(0)
     offs_tile = tl.arange(0, BLOCK_TILE)
     tile_mask = offs_tile < num_tiles
@@ -58,3 +67,20 @@ def softmax_combine_kernel(
     # 0 instead, so every probability of that row is 0.
     tl.store(row_max_ptr + row, global_max)
     tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
+    if WITH_ARGMAX:
+        vals = tl.load(
+            part_amax_val_ptr + offs_tile * num_rows + row,
+            mask=tile_mask,
+            other=float("-inf"),
+        )
+        idxs = tl.load(
+            part_amax_idx_ptr + offs_tile * num_rows + row,
+            mask=tile_mask,
+            other=2147483647,
+        )
+        best = tl.max(vals, axis=0)
+        cand = tl.where((vals == best) & tile_mask, idxs, 2147483647)
+        winner = tl.min(cand, axis=0)
+        # An all-NaN row matches nothing; answer id 0, as `torch.argmax` would
+        # not, but in range, so no consumer can index past the vocab.
+        tl.store(row_argmax_ptr + row, tl.where(winner == 2147483647, 0, winner))

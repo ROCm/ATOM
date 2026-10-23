@@ -592,22 +592,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Lossless speculative sampling: draw the DSpark draft block from
     # softmax(logits / T) and accept with the probability-ratio rule
-    # (`coin * q < p`) instead of proposing greedily and accepting only on exact
-    # equality with the target's own draw. Both halves or neither: a ratio
-    # kernel over a greedy delta q is an arithmetic no-op (sum_x min(p, q) =
-    # p(x*), which is what the exact-match kernel already computes), and a
-    # sampled draft under exact-match acceptance matches the target's draw
-    # strictly less often than a greedy one does.
+    # (`u * q < p`, residual relu(p - q) on rejection) instead of proposing
+    # greedily and accepting only on exact equality with the target's own draw.
+    # Both halves or neither: a ratio rule over a greedy delta q is exact match
+    # again, and a sampled draft under exact-match acceptance matches the
+    # target's draw less often than a greedy one does.
     #
-    # Defaults off, deliberately: it changes the emitted token distribution
-    # (both rules are target-exact, but they are not the same draw), and the
-    # house convention is that a behaviour-changing flag defaults off. A
-    # top-k/top-p batch is not refused -- the draft's q is unfiltered, so that
-    # step drops back to exact-match acceptance against the target's filtered
-    # draw, which is still lossless and only accepts less often. That drop is
-    # batch-wide (the accept kernel has one rule per launch and no exact-match
-    # branch to route a single row into), so such a batch also drafts greedily
-    # for that step and runs exactly the flag-off pair.
+    # Defaults off, deliberately: it changes the emitted token draw (both rules
+    # are target-exact, but they are not the same draw), and the house
+    # convention is that a behaviour-changing flag defaults off. A batch with
+    # top-k/top-p on any row keeps exact-match acceptance against the target's
+    # filtered draw and drafts greedily for that step, i.e. runs exactly the
+    # flag-off pair. Temperature-0 rows are matched exactly whatever they share
+    # a batch with: an all-greedy batch keeps the exact-match kernel, and the
+    # ratio kernel applies exact match (lowest-id argmax) to a greedy row of a
+    # mixed batch, so a greedy request's tokens do not depend on its batch.
     #
     # Costs what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid: q is a
     # full-vocab fp32 row per draft position and has to cross the step
@@ -615,14 +614,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 2 x max_num_seqs per-request row blocks -- 2 * max_num_seqs * T * V * 4
     # bytes, allocated before the KV cache is sized (1.25 GiB at max_num_seqs=64,
     # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The draft
-    # step also de-fuses, trading step latency for acceptance. Temperature-0 is unaffected: an all-greedy batch
-    # keeps the exact-match kernel, and a greedy row in a mixed batch draws a
-    # delta q that makes the ratio rule degenerate to exact match.
+    # step also de-fuses, trading step latency for acceptance.
     #
     # Only a draft model that declares `supports_lossless_draft` honours it;
-    # any other flavor silently keeps the greedy pair. Not implemented under PP
-    # or PCP, which warn and fall back. Read at drafter construction, so it must
-    # be set before the server starts.
+    # any other flavor silently keeps the greedy pair. Mutually exclusive with
+    # ATOM_ENABLE_RELAXED_MTP (refused at drafter construction). Not implemented
+    # under PP or PCP, which warn and fall back. Read at drafter construction,
+    # so it must be set before the server starts.
     "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
         os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
     ),

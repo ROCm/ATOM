@@ -4,6 +4,7 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
+from atom.model_ops.sampler import SAMPLER_EPS
 from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -58,7 +59,7 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 #
 # Nothing `[rows, V]` is materialized for p. Every (request, V tile) program
 # reduces its tile of each of the request's rows to the softmax statistics
-# (`softmax_tiles`); the accept walk then needs
+# (`softmax_tiles`) plus the row's raw-logit argmax; the accept walk then needs
 # p at one id per position, `exp(l(x) / T - max) / Z`, and only a rejecting row
 # is read across V again, by the residual race.
 #
@@ -66,6 +67,13 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 # with i.i.d. `E_v ~ Exp(1)` selects v with probability `r(v) / sum r`, so the
 # residual needs no normalizer, no prefix sum, and no agreement between two
 # reductions' rounding; tiles race in parallel and a cross-tile max decides.
+#
+# Greedy rows (temperature at or below SAMPLER_EPS) take exact match inside the
+# same launch: accept iff the draft is the target's lowest-id argmax, emit that
+# argmax on rejection. That is `rejection_greedy_sample_kernel`'s rule, so a
+# greedy request's tokens do not depend on whether sampled requests share its
+# batch. The ratio rule would not give that: on a bf16 logit tie p is 0.5/0.5,
+# not a delta.
 #
 # Randomness: Philox via `tl.rand`, keyed on a per-step SPMD counter, so every
 # TP rank draws the same uniforms. The key's high word names the purpose --
@@ -86,6 +94,8 @@ def _ratio_stats_kernel(
     temperatures_ptr,  # [batch_size] fp32, pre-clamped
     part_max_ptr,  # [n_tiles, num_tokens] fp32: max of logits / T
     part_sum_ptr,  # [n_tiles, num_tokens] fp32: sum exp(logits / T - max)
+    part_amax_val_ptr,  # [n_tiles, num_tokens] fp32: max raw logit
+    part_amax_idx_ptr,  # [n_tiles, num_tokens] int32: its lowest id
     num_tokens,
     vocab_size,
     logits_row_stride,
@@ -94,7 +104,9 @@ def _ratio_stats_kernel(
     """One (request, V tile), over each of the request's draft rows.
 
     Per request rather than per row so the temperature comes straight from the
-    request, with no row-to-request expansion.
+    request, with no row-to-request expansion. The raw argmax is taken before
+    the division: dividing by a near-zero temperature can round two distinct
+    logits onto one value and invent a tie the greedy rule would not see.
     """
     req_idx = tl.program_id(0)
     tile = tl.program_id(1)
@@ -112,10 +124,14 @@ def _ratio_stats_kernel(
             mask=vmask,
             other=float("-inf"),
         ).to(tl.float32)
+        raw_max = tl.max(x, axis=0)
+        raw_idx = tl.min(tl.where((x == raw_max) & vmask, offs, 2147483647), axis=0)
         scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
         part = tile * num_tokens + row
         tl.store(part_max_ptr + part, scaled_max)
         tl.store(part_sum_ptr + part, scaled_sum)
+        tl.store(part_amax_val_ptr + part, raw_max)
+        tl.store(part_amax_idx_ptr + part, raw_idx)
 
 
 @triton.jit(do_not_specialize=["num_spec_steps", "accept_seed"])
@@ -130,6 +146,7 @@ def _ratio_accept_kernel(
     temperatures_ptr,  # [batch_size] fp32, pre-clamped
     row_max_ptr,  # [num_tokens] fp32
     row_inv_z_ptr,  # [num_tokens] fp32
+    row_argmax_ptr,  # [num_tokens] int32, lowest id
     q_ptr,  # [num_q_rows, V] fp32, the q each draft token was drawn from
     q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
     bonus_token_ids_ptr,  # [batch_size]
@@ -137,11 +154,13 @@ def _ratio_accept_kernel(
     num_spec_steps,
     vocab_size,
     logits_row_stride,
+    greedy_temperature,
     accept_seed,
 ):
     """One request: walk its drafts until the first rejection.
 
-    Leaves the rejecting position's output to the residual kernels.
+    Leaves the rejecting position's output to the residual kernels for a
+    sampled request, and fills it with the target argmax for a greedy one.
     """
     req_idx = tl.program_id(0)
     if req_idx == 0:
@@ -151,6 +170,7 @@ def _ratio_accept_kernel(
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
     temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+    greedy = temp <= greedy_temperature
     # A negative base means this request has no live q (never drafted here, or
     # its slot expired). Its q reads as 0, so its first draft is rejected and
     # the residual is p itself: exact, at the cost of one step's speculation.
@@ -170,30 +190,36 @@ def _ratio_accept_kernel(
         else:
             row = start_idx + pos
             x = _draft_token(input_ids_ptr, target_logits_indices_ptr, row)
-            logit = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + x)
-            p = tl.exp(
-                logit.to(tl.float32) / temp - tl.load(row_max_ptr + row)
-            ) * tl.load(row_inv_z_ptr + row)
-            q = tl.load(
-                q_ptr + (q_base + pos).to(tl.int64) * vocab_size + x,
-                mask=has_q,
-                other=0.0,
-            )
-            u = tl.rand(accept_seed, row)
-            # x was drawn from q, so q(x) must be a positive probability;
-            # anything else is not the row x came from. `u * q < p` rather
-            # than `u < p / q`: no division, so a denormal q cannot become an
-            # infinite ratio.
-            accept = (q > 0.0) & (q <= 1.0) & (u * q < p)
+            target_argmax = tl.load(row_argmax_ptr + row)
+            if greedy:
+                accept = x == target_argmax
+            else:
+                logit = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + x)
+                p = tl.exp(
+                    logit.to(tl.float32) / temp - tl.load(row_max_ptr + row)
+                ) * tl.load(row_inv_z_ptr + row)
+                q = tl.load(
+                    q_ptr + (q_base + pos).to(tl.int64) * vocab_size + x,
+                    mask=has_q,
+                    other=0.0,
+                )
+                u = tl.rand(accept_seed, row)
+                # x was drawn from q, so q(x) must be a positive probability;
+                # anything else is not the row x came from. `u * q < p` rather
+                # than `u < p / q`: no division, so a denormal q cannot become
+                # an infinite ratio.
+                accept = (q > 0.0) & (q <= 1.0) & (u * q < p)
             if accept:
                 tl.store(out_row + pos, tl.cast(x, tl.int32))
             else:
                 rejected = True
                 reject_pos = pos
+                if greedy:
+                    tl.store(out_row + pos, tl.cast(target_argmax, tl.int32))
             last_checked += 1
 
     residual_row = -1
-    if rejected:
+    if rejected and not greedy:
         residual_row = start_idx + reject_pos
     tl.store(residual_row_ptr + req_idx, residual_row)
     _finish_request(
@@ -363,15 +389,20 @@ def _ratio_sample(
 
     row_max = torch.empty((num_tokens,), **f32)
     row_inv_z = torch.empty((num_tokens,), **f32)
+    row_argmax = torch.empty((num_tokens,), **i32)
     if num_tokens:
         part_max = torch.empty((n_tiles, num_tokens), **f32)
         part_sum = torch.empty((n_tiles, num_tokens), **f32)
+        part_amax_val = torch.empty((n_tiles, num_tokens), **f32)
+        part_amax_idx = torch.empty((n_tiles, num_tokens), **i32)
         _ratio_stats_kernel[(batch_size, n_tiles)](
             target_logits,
             cu_num_draft_tokens,
             temperatures,
             part_max,
             part_sum,
+            part_amax_val,
+            part_amax_idx,
             num_tokens,
             vocab_size,
             stride,
@@ -383,9 +414,13 @@ def _ratio_sample(
             part_sum,
             row_max,
             row_inv_z,
+            part_amax_val,
+            part_amax_idx,
+            row_argmax,
             num_tokens,
             n_tiles,
             BLOCK_TILE=triton.next_power_of_2(n_tiles),
+            WITH_ARGMAX=True,
             num_warps=4,
         )
     residual_row = torch.empty((batch_size,), **i32)
@@ -400,6 +435,7 @@ def _ratio_sample(
         temperatures,
         row_max,
         row_inv_z,
+        row_argmax,
         draft_probs,
         q_row_base,
         bonus_token_ids,
@@ -407,6 +443,7 @@ def _ratio_sample(
         num_spec_steps,
         vocab_size,
         stride,
+        SAMPLER_EPS,
         _RATIO_ACCEPT_KEY | ratio_step,
         num_warps=1,
     )

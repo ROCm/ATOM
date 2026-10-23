@@ -4,13 +4,13 @@
 * `dspark_markov_sample`: each row draws ``x ~ q = softmax((base + bias) / T)``
   and writes q into the persistent store at its own row block, nowhere else.
 * The probability-ratio verify (`rejection_sample` with ``draft_probs``): the
-  emitted tokens follow the target's p whatever q the drafts came from; a
-  request without q falls back to p.
+  emitted tokens follow the target's p whatever q the drafts came from; greedy
+  rows are exact match; a request without q falls back to p.
 
 Statistical checks use fixed seeds and tolerances several standard errors
 wide, so they are deterministic on a given platform and fail only on a real
 bias. The properties that hold for every coin (destination rows, residual
-support, rank-consistent draws) are asserted exactly.
+support, greedy outputs, rank-consistent draws) are asserted exactly.
 """
 
 import pytest
@@ -107,6 +107,28 @@ def test_at_temperature_zero_it_drafts_what_the_argmax_kernel_drafts(rows):
         expected = torch.zeros_like(q).scatter_(1, ids.view(-1, 1), 1.0)
         torch.testing.assert_close(q, expected, rtol=0, atol=0)
         drawn, ref = ids, ref_ids
+
+
+def test_a_greedy_row_on_a_tie_publishes_the_delta_its_id_came_from():
+    """softmax(s / EPS) on an exact tie is 1/2 per tied id, but the id is the
+    lowest of them, not a draw; the accept rule must see the delta."""
+    rows, vocab, rank, low, high = 2, 3000, 32, 40, 2900
+    base = torch.randn(rows, vocab, device=DEV).to(torch.bfloat16)
+    base[:, low] = 20.0
+    base[:, high] = 20.0
+    prev = torch.zeros(rows, dtype=torch.int64, device=DEV)
+    w = torch.zeros(vocab, rank, dtype=torch.bfloat16, device=DEV)
+    temps, greedy, seed = draft_args(rows, temperature=SAMPLER_EPS, greedy=True)
+    store = torch.full((rows, vocab), -1.0, device=DEV)
+    out = torch.empty(rows, dtype=torch.int64, device=DEV)
+    row_base = torch.arange(rows, dtype=torch.int32, device=DEV)
+    dspark_markov_sample(
+        base, prev, w, w, out, store, row_base, 0, temps, greedy, seed, 0
+    )
+    assert out.tolist() == [low, low]
+    expected = torch.zeros(rows, vocab, device=DEV)
+    expected[:, low] = 1.0
+    torch.testing.assert_close(store, expected, rtol=0, atol=0)
 
 
 def test_sampled_ids_follow_the_q_they_publish():
@@ -325,3 +347,67 @@ def test_the_same_key_gives_the_same_verdict():
     c = rejection_sample(**args, draft_probs=q_rows, ratio_step=41)
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     assert not torch.equal(a[0], c[0])
+
+
+def tied_logits(rows, vocab, low, high):
+    """bf16 logits whose max is an exact tie between ids ``low < high``."""
+    logits = torch.randn(rows, vocab, device=DEV).to(torch.bfloat16)
+    logits[:, low] = 30.0
+    logits[:, high] = 30.0
+    return logits
+
+
+@pytest.mark.parametrize("draft_first", ["tie-low", "tie-high", "other"])
+def test_a_greedy_row_is_exact_match_whatever_its_batch_mates(draft_first):
+    """On a bf16 tie the greedy row's p is 0.5/0.5, not a delta, so the ratio
+    rule would accept the high tie half the time. Exact match never does, and
+    must not care who else is in the batch."""
+    torch.manual_seed(41)
+    width, vocab, low, high = 3, 1024, 3, 700
+    first = {"tie-low": low, "tie-high": high, "other": 11}[draft_first]
+    greedy_drafts = torch.tensor([first, low, low], dtype=torch.int32, device=DEV)
+    greedy_logits = tied_logits(width, vocab, low, high)
+
+    # Reference: the flag-off kernel on the greedy request alone.
+    ref_out, ref_verdict = rejection_sample(
+        **verify_batch(
+            greedy_drafts,
+            width,
+            greedy_logits,
+            torch.full((1,), SAMPLER_EPS, device=DEV),
+        ),
+        draft_probs=None,
+    )
+    expected_accept = {"tie-low": 3, "tie-high": 0, "other": 0}[draft_first]
+    assert ref_verdict[0, 0].item() == expected_accept
+    if expected_accept == 0:
+        assert ref_out[0, 0].item() == low
+
+    # The same request among sampled ones, at several positions and keys.
+    sampled_n = 7
+    for slot in (0, 3, sampled_n):
+        for step in range(5):
+            others = torch.randint(0, vocab, (sampled_n * width,), device=DEV)
+            drafts = torch.cat(
+                (others[: slot * width], greedy_drafts, others[slot * width :])
+            ).to(torch.int32)
+            logits = torch.cat(
+                (
+                    torch.randn(slot * width, vocab, device=DEV).to(torch.bfloat16),
+                    greedy_logits,
+                    torch.randn((sampled_n - slot) * width, vocab, device=DEV).to(
+                        torch.bfloat16
+                    ),
+                )
+            )
+            temps = torch.ones(sampled_n + 1, device=DEV)
+            temps[slot] = SAMPLER_EPS
+            # q = p for the greedy row too, the case the ratio rule gets wrong.
+            q = torch.softmax(logits.float(), -1)
+            out, verdict = rejection_sample(
+                **verify_batch(drafts, width, logits, temps),
+                draft_probs=q,
+                ratio_step=100 + step,
+            )
+            assert torch.equal(out[slot, :width], ref_out[0, :width]), (slot, step)
+            assert torch.equal(verdict[:2, slot], ref_verdict[:2, 0]), (slot, step)
