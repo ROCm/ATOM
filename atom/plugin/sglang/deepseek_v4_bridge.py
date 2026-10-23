@@ -1683,6 +1683,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    # Generic AttentionMetaData has no fp4_decode_topk. None keeps indexer.topk.
+    md.fp4_decode_topk = None
 
     if total:
         if positions_numel > scheduled_bs:
@@ -1947,6 +1949,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.fp4_decode_topk = None
     # Target verify is extend-shaped for attention/compressor state, but the
     # indexer needs the fixed-shape decode scorer to be graph-safe.
     md.use_decode_indexer_for_verify_graph = True
@@ -2225,6 +2228,7 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.fp4_decode_topk = None
 
     if is_draft_extend:
         slot_arr = np.full(num_reqs, -1, dtype=np.int32)

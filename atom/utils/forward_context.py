@@ -663,10 +663,6 @@ class AttentionMetaData:
     # Every producer that rewrites block_tables must rewrite this too: a stale
     # one has the right length and the wrong rows.
     dcp_token_block_tables: torch.Tensor | None = None
-    # gfx950 FP4 decode top-k buffer. The V4 metadata subclass fills it;
-    # SGLang publishes the generic AttentionMetaData, so the attribute has
-    # to exist here. None keeps the token-shaped indexer.topk path.
-    fp4_decode_topk: torch.Tensor | None = None
 
     work_meta_data: torch.Tensor | None = None
     work_indptr: torch.Tensor | None = None
@@ -705,7 +701,6 @@ class AttentionMetaData:
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
         index_row_ends: torch.Tensor | None = None,
-        fp4_decode_topk: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
         work_indptr: torch.Tensor | None = None,
         work_info_set: torch.Tensor | None = None,
@@ -747,7 +742,6 @@ class AttentionMetaData:
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
         self.index_row_ends = index_row_ends
-        self.fp4_decode_topk = fp4_decode_topk
         self.work_meta_data = work_meta_data
         self.work_indptr = work_indptr
         self.work_info_set = work_info_set
