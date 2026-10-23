@@ -56,6 +56,7 @@ from atom.utils import (
 )
 from atom.utils.gc_utils import maybe_attach_gc_debug_callback, tune_gc
 from atom.utils.numa_utils import numa_bind_to_node
+from atom.utils.stall_watch import NO_STALL_WATCH, stall_watch
 
 logger = logging.getLogger("atom")
 
@@ -101,6 +102,7 @@ class AsyncIOProc:
 
     # Function names whose output goes to the KV channel instead of primary
     _KV_FUNC_NAMES = frozenset(["async_proc_aggregation"])
+    _stall = NO_STALL_WATCH
 
     def __init__(
         self,
@@ -139,6 +141,7 @@ class AsyncIOProc:
         # happens later, via the EngineCore's `freeze_gc_heap` RPC.
         tune_gc()
         maybe_attach_gc_debug_callback(name)
+        self._stall = stall_watch(name)
 
         # NUMA-local CPU/memory pinning (see atom.utils.numa_utils).
         # Auto-detects the GPU's local node by default; gated by
@@ -313,7 +316,9 @@ class AsyncIOProc:
     def busy_loop(self):
         """Main event loop: dequeue RPCs and dispatch to runners."""
         while True:
+            self._stall.disarm()
             func_name, args = self.get_func()
+            self._stall.arm()
             payload = (
                 args[0] if len(args) == 1 and isinstance(args[0], RpcPayload) else None
             )

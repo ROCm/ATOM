@@ -72,6 +72,7 @@ def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, in
         label="test",
         utility_queue=None,
         kv_transfer_enabled=False,
+        _stall=pp_engine_core.NO_STALL_WATCH,
         _is_rl_weights_offloaded=True,
         _is_idle_rl_weights_offloaded=lambda: True,
         _drain_kv_work_at_exit=lambda: None,

@@ -2930,6 +2930,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
     stage = SimpleNamespace(
         is_last=False,
         kv_transfer_enabled=True,
+        _stall=PPEngineCoreProc._stall,
         utility_queue=None,
         utility_handler=SimpleNamespace(
             process_queue=lambda *_: None, push_metrics=lambda **_: None

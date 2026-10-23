@@ -18,6 +18,7 @@ from atom.kv_transfer.disaggregation.types import (
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
 from atom.utils import envs
+from atom.utils.stall_watch import NO_STALL_WATCH, stall_watch
 
 logger = logging.getLogger("atom")
 
@@ -34,6 +35,8 @@ def pp_max_inflight(pp_size: int) -> int:
 
 
 class PPEngineCoreProc(EngineCore):
+    _stall = NO_STALL_WATCH
+
     def __init__(self, config, input_address, output_address):
         pc = config.parallel_config
         self.pp_rank = pc.pipeline_parallel_rank
@@ -42,6 +45,7 @@ class PPEngineCoreProc(EngineCore):
         self.is_last = self.pp_rank == self.pp_size - 1
         self.pp_max_inflight = pp_max_inflight(self.pp_size)
         super().__init__(config, input_address, output_address)
+        self._stall = stall_watch(EngineCore._process_name)
         self.pp_transport = PPStageTransport(
             self.pp_rank,
             self.pp_size,
@@ -82,6 +86,7 @@ class PPEngineCoreProc(EngineCore):
         next_metrics_push = 0.0
         try:
             while True:
+                self._stall.arm()
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
@@ -98,6 +103,7 @@ class PPEngineCoreProc(EngineCore):
                 elif self.has_pending_kv_work():
                     self._advance_idle_kv_transfer()
         finally:
+            self._stall.disarm()
             self._drain_kv_work_at_exit()
             try:
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
@@ -407,6 +413,7 @@ class PPEngineCoreProc(EngineCore):
         next_metrics_push = 0.0
         try:
             while True:
+                self._stall.arm()
                 self.utility_handler.process_queue(self.utility_queue, self)
                 now = time.monotonic()
                 if now >= next_metrics_push:
@@ -449,6 +456,7 @@ class PPEngineCoreProc(EngineCore):
                     elif batch.pp_completion_ack:
                         self.pp_transport.send_completion(batch.req_ids)
         finally:
+            self._stall.disarm()
             # One last report so the head's exit drain can still reach its
             # per-stage quorum for saves that landed after the final poll.
             try:

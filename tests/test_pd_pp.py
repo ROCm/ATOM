@@ -1402,6 +1402,7 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
     stage = SimpleNamespace(
         kv_transfer_enabled=True,
         is_last=True,
+        _stall=PPEngineCoreProc._stall,
         runner_mgr=MagicMock(),
         pp_transport=MagicMock(),
         scheduler=MagicMock(),
@@ -1428,6 +1429,7 @@ def _downstream_stage(**overrides):
     stage = SimpleNamespace(
         kv_transfer_enabled=False,
         is_last=True,
+        _stall=_pp_engine_core_cls()._stall,
         runner_mgr=MagicMock(),
         pp_transport=MagicMock(),
         scheduler=MagicMock(),

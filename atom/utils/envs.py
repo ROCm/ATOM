@@ -716,6 +716,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # After a gen-2 pass at least this many ms, once the startup heap is
     # frozen, freeze what survived it too, so later passes skip it. 0 = off.
     "ATOM_GC_REFREEZE_MS": lambda: _nonnegative_int_env("ATOM_GC_REFREEZE_MS", 0),
+    # Log every thread's stack once when one step of a PP EngineCore loop or
+    # one ModelRunner RPC runs this many seconds. 0 = off.
+    "ATOM_STALL_DUMP_S": lambda: _nonnegative_int_env("ATOM_STALL_DUMP_S", 0),
     # "t0,t1,t2" for gc.set_threshold(); empty keeps CPython's default.
     # Thresholds are per-interpreter, but this is one variable, read by every
     # process that serves -- and only the frontend was measured to reclaim
