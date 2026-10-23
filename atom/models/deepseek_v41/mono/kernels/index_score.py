@@ -327,6 +327,7 @@ def stage_ilist(c, t, j, raw, kind, level, bound_max, max_chunks):
                 publish(c["put"], c["irdy"], t, 1, tid == 0)
 
 
+@traced
 def _selected_rows(c, t, ident):
     """Column ``ident`` of token t as a selection holds it (a REINDEX layer's
     compacted column lifted back to the row it stands for) and as the
@@ -336,20 +337,18 @@ def _selected_rows(c, t, ident):
     (``stage_ilist``): inside the winners' branches each load was a round trip
     in series, and the attention's keys wait on none."""
     a = c["args"]
-    # FULL layers use history columns, not compacted candidate columns.
-    # Keep the speculative candidate load inside this token's row.
-    lift = (a["ilift"] != 0) & (ident >= 0)
-    cand_ident = fx.Int32(lift.select(ident, 0))
-    cand = fx.Int32(
-        bo.buffer_load(
-            rsrc(a["icand"]),
-            t * ip.TOPK_BLOCKS + cand_ident // TILE,
-            vec_width=1,
-            dtype=T.i32,
+    row = fx.Int32(ident)
+    # Only live REINDEX columns need a candidate lookup.
+    if (a["ilift"] != 0) & (ident >= 0):
+        cand = fx.Int32(
+            bo.buffer_load(
+                rsrc(a["icand"]),
+                t * ip.TOPK_BLOCKS + ident // TILE,
+                vec_width=1,
+                dtype=T.i32,
+            )
         )
-    )
-    lifted = cand * TILE + cand_ident % TILE
-    row = fx.Int32(lift.select(lifted, ident))
+        row = cand * TILE + ident % TILE
     toff = fx.Int32(
         bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
     )

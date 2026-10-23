@@ -76,6 +76,11 @@ def selected_rows_code():
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "_selected_rows"
     )
+    # Run the original Python control flow on CPU; @traced only lowers it to
+    # device IR. GPU tests exercise that lowering separately. Any additional
+    # decorator needs an explicit decision about its CPU test semantics.
+    assert [ast.unparse(node) for node in function.decorator_list] == ["traced"]
+    function.decorator_list = []
     return compile(ast.Module(body=[function], type_ignores=[]), str(SOURCE), "exec")
 
 
@@ -90,13 +95,16 @@ def _run(code, t, ident, lift):
     table = np.arange((1 << 20) // ROWS_PER_PAGE + TOKENS * 3, dtype=np.int32)
     table = (table * 7 + 11) % len(table)
     buffers = {"icand": candidates.ravel(), "kmeta": metadata.ravel(), "table": table}
+    candidate_loads = []
 
     def load(buffer, offset, **kwargs):
         offset = int(offset)
         if buffer == "icand":
+            assert lift and ident >= 0, "FULL and padding must not read candidates"
             assert (
                 t * ip.TOPK_BLOCKS <= offset < (t + 1) * ip.TOPK_BLOCKS
             ), f"candidate load {offset} escapes token {t}'s row"
+            candidate_loads.append(offset)
         assert 0 <= offset < len(buffers[buffer])
         return _i32(buffers[buffer][offset])
 
@@ -119,6 +127,7 @@ def _run(code, t, ident, lift):
         "main_off": MAIN_OFF,
     }
     actual = scope["_selected_rows"]({"args": args}, t, _i32(ident))
+    assert len(candidate_loads) == int(bool(lift) and ident >= 0)
     expected_row = ident
     if lift and ident >= 0:
         block, within = divmod(ident, ip.BLOCK_ROWS)
@@ -133,7 +142,7 @@ def _run(code, t, ident, lift):
 
 @pytest.mark.parametrize("t", [0, 1, TOKENS - 1])
 @pytest.mark.parametrize("ident", [-1, 0, 16383, 16384, 316436, (1 << 20) - 1])
-def test_full_history_rows_keep_candidate_loads_in_bounds(selected_rows_code, t, ident):
+def test_full_history_rows_do_not_read_candidates(selected_rows_code, t, ident):
     _run(selected_rows_code, t, ident, lift=0)
 
 
