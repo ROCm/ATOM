@@ -3350,17 +3350,24 @@ class ModelRunner:
             # then differ per rank and the emitted streams fork. Sync the
             # decision instead: the ids and the verdict.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
+                # Only the PCP group is synced here, so the ratio path's TP
+                # sync below must never be skipped by it: lossless sampling is
+                # refused under PCP (`DSparkProposer._init_lossless_sampling`).
+                assert draft_probs is None, "lossless sampling is not armed under PCP"
                 _g = get_pcp_group()
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
                 verdict = _g.broadcast(verdict, src=0)
             elif draft_probs is not None and get_tp_group().world_size > 1:
-                # The ratio rule decides on each rank from that rank's own p, q
-                # and coins. Exact match decided from a broadcast target draw,
-                # so its verdict agreed by construction; this one agrees only
-                # while p and q are bitwise equal across ranks, and one that is
-                # not leaves rank-local accept counts against rank 0's tokens.
-                # Take rank 0's decision with its tokens, in the one collective
-                # the tokens already needed.
+                # Insurance, at no extra collective. The ratio rule decides on
+                # each rank from that rank's p, q and coins, which are bitwise
+                # equal across TP ranks by construction: both sides read
+                # full-vocab logits replicated by the LM head's all-gather, and
+                # the coins and the draft's noise are Philox keyed on SPMD
+                # counters. That is the same assumption the draft ids already
+                # rest on -- they are drawn per rank and not broadcast, here or
+                # on the exact-match path -- so if it ever broke, the draft ids
+                # would diverge first. Taking rank 0's verdict with its tokens
+                # only keeps the accept decision from being the place it shows.
                 n = sampled_tokens.numel()
                 packed = get_tp_group().broadcast(
                     torch.cat((sampled_tokens.reshape(-1), verdict.reshape(-1))),
