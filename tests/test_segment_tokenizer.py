@@ -469,6 +469,23 @@ def test_a_fork_keeps_the_stored_prompt_it_left(tok):
     assert len(_stored(seg)) == 2
 
 
+def test_a_fork_whose_unshared_text_is_one_token_is_kept(tok):
+    """`cut_ids` counts every id up to each cut, so a gap holding one text
+    token plus its added token is 2 ids, not 1: a fork whose unshared tail
+    is a single-token message is not taken for a rewritten generation
+    prompt."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(29)
+    base = _long_conversation(rng, 4)
+    one = next(w for w in WORDS if len(tok.encode(w, add_special_tokens=False)) == 1)
+    first = base + "<|User|>" + one + "<|Assistant|>"
+    seg._encode_cached(first)
+    fork = base + "<|User|>" + _text(rng, 20) + "<|Assistant|>"
+    assert seg._encode_cached(fork) == tok.encode(fork)
+    assert len(_stored(seg)) == 2
+
+
 def test_a_divergence_with_no_new_added_token_stores_nothing(tok):
     """Edited inside the last message, before the stored prompt's last added
     token, with no added token after the edit: the new entry would be a part

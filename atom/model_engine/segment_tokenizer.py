@@ -53,8 +53,12 @@ _MIN_CACHED_CHARS = 100_000
 _PREFIX_KEY_CHARS = 16_384
 # Stored prompts per bucket. Agentic conversations share a long system prompt
 # and tool list, so a bucket holds every concurrent conversation of a
-# deployment; a lookup's cost per other conversation is comparing about that
-# shared start.
+# deployment. A lookup compares the prompt with every entry in its bucket, so
+# its cost grows linearly with the number of concurrent conversations, each
+# costing about a comparison of the shared start (on the API server thread):
+# with a ~100K-character shared start, ~0.8 ms at 32 entries and ~6 ms at
+# 256, more for non-ASCII text. Re-encoding such a prompt costs tens to
+# hundreds of ms.
 _PREFIX_BUCKET = 256
 # Characters compared per step when looking for where two prompts diverge.
 _COMPARE_CHUNK = 1 << 16
