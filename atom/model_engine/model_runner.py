@@ -1058,7 +1058,15 @@ class ModelRunner:
         """
         if not getattr(self.config, "enable_mixed_prefill_decode", False):
             return 0
-        return int(total_bytes * envs.ATOM_MIXED_KV_RESERVE_FRACTION)
+        fraction = envs.ATOM_MIXED_KV_RESERVE_FRACTION
+        # A negative fraction would grow the KV cache past the budget, and a
+        # non-finite one fails inside int() with nothing naming the variable.
+        if not (math.isfinite(fraction) and 0 <= fraction < 1):
+            raise ValueError(
+                f"ATOM_MIXED_KV_RESERVE_FRACTION must be a fraction of device "
+                f"memory in [0, 1), got {fraction!r}"
+            )
+        return int(total_bytes * fraction)
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.

@@ -38,6 +38,14 @@ def test_the_fraction_is_overridable(monkeypatch, fraction, expected):
     assert ModelRunner._kv_budget_extra_reserve(_runner(True), _TOTAL) == expected
 
 
+@pytest.mark.parametrize("fraction", ["-1", "-0.01", "1", "1.5", "nan", "inf"])
+def test_a_fraction_outside_zero_to_one_is_refused(monkeypatch, fraction):
+    """Negative would grow the KV cache past the budget; >= 1 leaves none."""
+    monkeypatch.setenv("ATOM_MIXED_KV_RESERVE_FRACTION", fraction)
+    with pytest.raises(ValueError, match="ATOM_MIXED_KV_RESERVE_FRACTION"):
+        ModelRunner._kv_budget_extra_reserve(_runner(True), _TOTAL)
+
+
 def test_disagg_adds_its_reserve_to_the_mixed_one(monkeypatch):
     """The override composes with the base reserve instead of replacing it."""
     monkeypatch.delenv("ATOM_MIXED_KV_RESERVE_FRACTION", raising=False)

@@ -1117,7 +1117,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # + DSpark actually uses: activation peaks 1.5x the profile, ~8 GiB of
     # allocator fragmentation, and ~4 GiB of runtime growth outside the
     # allocator. 5% (14.4 GiB on a 288 GiB device) is what CI validated as
-    # --gpu-memory-utilization 0.85; the KV cache peaked at 7% used. 0 disables.
+    # --gpu-memory-utilization 0.85; the KV cache peaked at 7% used. 0 disables;
+    # anything outside [0, 1), or non-finite, is refused at startup.
     "ATOM_MIXED_KV_RESERVE_FRACTION": lambda: float(
         os.getenv("ATOM_MIXED_KV_RESERVE_FRACTION", "0.05")
     ),
