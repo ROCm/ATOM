@@ -232,7 +232,7 @@ class EngineCore:
         self._send_ready_signal()
         logger.info(f"{self.label}: EngineCore fully initialized and ready")
 
-    def _init_prefill_delayer(self, config: Config, cpu_group=None):
+    def _init_prefill_delayer(self, config: Config):
         if (
             not envs.ATOM_ENABLE_PREFILL_DELAYER
             or config.enable_rapidserve
@@ -244,7 +244,6 @@ class EngineCore:
         self.scheduler.set_prefill_delayer(
             PrefillDelayer(
                 dp_size=config.parallel_config.data_parallel_size,
-                cpu_group=cpu_group,
                 max_num_batched_tokens=config.max_num_batched_tokens,
                 target_fill=envs.ATOM_PREFILL_DELAYER_TARGET_FILL,
                 ttft_max_ticks=envs.ATOM_PREFILL_DELAYER_TTFT_MAX_TICKS,
@@ -254,7 +253,6 @@ class EngineCore:
                 token_usage_low_watermark=envs.ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK,
                 max_queue_ms=envs.ATOM_PREFILL_DELAYER_MAX_QUEUE_MS,
                 prefill_decode_interval=envs.ATOM_PREFILL_DECODE_INTERVAL,
-                exchange_prefill_costs=self.scheduler.cost_balance,
             )
         )
 
@@ -847,7 +845,30 @@ class DPEngineCoreProc(EngineCore):
         self.engines_running = True
         self._shutting_down = False
 
-        self._init_prefill_delayer(config, self.dp_group)
+        self._init_prefill_delayer(config)
+        self._init_dp_schedule_sync(config)
+
+    def _init_dp_schedule_sync(self, config: Config):
+        """Give the scheduler its one cross-DP collective per tick, carrying
+        whichever of the PrefillDelayer's counts and the DP prefill cost
+        balancing costs is on — no collective when neither is. RapidServe's
+        own schedulers use neither."""
+        scheduler = self.scheduler
+        if scheduler is None or config.enable_rapidserve:
+            return
+        delayer = scheduler.prefill_delayer
+        if delayer is None and not scheduler.cost_balance:
+            return
+        from atom.model_engine.dp_schedule_sync import DPScheduleSync
+
+        scheduler.set_dp_sync(
+            DPScheduleSync(
+                self.dp_group,
+                config.parallel_config.data_parallel_size,
+                decision_slots=0 if delayer is None else delayer.DECISION_SLOTS,
+                prefill_costs=scheduler.cost_balance,
+            )
+        )
 
     def _init_data_parallel(self, config: Config):
         dp_rank = config.parallel_config.data_parallel_rank
@@ -867,10 +888,10 @@ class DPEngineCoreProc(EngineCore):
 
         self.dp_rank = dp_rank
         self.dp_group = config.parallel_config.stateless_init_dp_group()
-        # NOTE: PrefillDelayer attachment lives in __init__ (after
-        # super().__init__ creates self.scheduler) — not here. This
-        # function runs during super().__init__, before self.scheduler
-        # exists.
+        # NOTE: PrefillDelayer and DP schedule sync attachment live in
+        # __init__ (after super().__init__ creates self.scheduler) — not
+        # here. This function runs during super().__init__, before
+        # self.scheduler exists.
 
     def exit(self):
         super().exit()
@@ -916,7 +937,7 @@ class DPEngineCoreProc(EngineCore):
                     self.engines_running = False
                     if self.has_pending_kv_work():
                         # Local RPCs only. Anything that reaches schedule()
-                        # would run the delayer's cross-DP all_reduce off
+                        # would run the DP schedule sync's all_reduce off
                         # lockstep, so the idle drain must stay off that path.
                         self._advance_idle_kv_transfer()
                     continue
