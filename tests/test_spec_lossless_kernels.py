@@ -330,6 +330,24 @@ def test_a_residual_draw_never_lands_on_an_id_without_residual_mass():
     assert ((p - q)[replaced] > 0).all()
 
 
+def test_a_residual_without_mass_falls_back_to_p():
+    """p == q, and the draft is an id with no mass in either: it is rejected
+    (q(x) = 0 is not the row x came from), relu(p - q) is 0 everywhere, and
+    the replacement must still follow p rather than land on a fixed id."""
+    torch.manual_seed(29)
+    n = 30000
+    p = sparse(VOCAB, P)
+    drafts = torch.full((n,), 7, dtype=torch.int32, device=DEV)
+    out, (accepted, _, _) = rejection_sample(
+        **verify_batch(drafts, 1, p.log().expand(n, -1), torch.ones(n, device=DEV)),
+        draft_probs=p.expand(n, -1).contiguous(),
+        ratio_step=8,
+    )
+    assert (accepted == 0).all()
+    freq = torch.bincount(out[:, 0].long(), minlength=VOCAB).float() / n
+    torch.testing.assert_close(freq, p, rtol=0, atol=0.01)
+
+
 def test_a_request_without_q_rejects_and_draws_from_p():
     torch.manual_seed(23)
     n = 30000

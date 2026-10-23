@@ -94,9 +94,9 @@ def ratio_verify_scratch_bytes(
     ``num_spec_steps`` drafts each, outside the profiled forward."""
     tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
     rows = max_bs * num_spec_steps
-    return rows * (tiles * 4 * 4 + 3 * 4) + max_bs * (  # per-tile stats, per-row stats
-        tiles * 4 * 4 + 4
-    )  # residual partials, rejecting row
+    stats = rows * (tiles * 4 * 4 + 3 * 4)  # per-tile and per-row statistics
+    residual = max_bs * (tiles * 2 * 4 + 4)  # race partials, rejecting row
+    return stats + residual
 
 
 @triton.jit
@@ -259,21 +259,16 @@ def _ratio_residual_race_kernel(
     q_row_base_ptr,  # [batch_size] int32
     part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
     part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
-    part_pkey_ptr,  # [n_tiles, batch_size] fp32: best key racing p itself
-    part_pidx_ptr,  # [n_tiles, batch_size] int32
     batch_size,
     vocab_size,
     logits_row_stride,
     residual_seed,
     BLOCK_V: tl.constexpr,
 ):
-    """One (request, V tile) of the residual race, for rejecting requests.
-
-    Races ``relu(p - q) / E`` and, as a fallback, ``p / E`` with the same
-    noise. The fallback decides only when the residual has no mass at all
-    (p == q on every id, which the accept rule should have made unreachable);
-    drawing from p then is a valid answer, where a fixed id would not be.
-    """
+    """One (request, V tile) of the residual race ``relu(p - q) / E``, for
+    rejecting requests; every other program returns at once. Launched for
+    every request because which ones rejected is only known on the device,
+    and finding out on the host would stall the verify on a readback."""
     req_idx = tl.program_id(0)
     tile = tl.program_id(1)
     row = tl.load(residual_row_ptr + req_idx)
@@ -308,37 +303,42 @@ def _ratio_residual_race_kernel(
         # zero-mass id keys exactly 0.
         e = -tl.log(u)
         key = tl.where(vmask, residual / e, -1.0)
-        pkey = tl.where(vmask, p / e, -1.0)
         best = tl.max(key, axis=0)
-        pbest = tl.max(pkey, axis=0)
         part = tile * batch_size + req_idx
         tl.store(part_key_ptr + part, best)
         tl.store(
             part_idx_ptr + part,
             tl.min(tl.where((key == best) & vmask, offs, 2147483647), axis=0),
         )
-        tl.store(part_pkey_ptr + part, pbest)
-        tl.store(
-            part_pidx_ptr + part,
-            tl.min(tl.where((pkey == pbest) & vmask, offs, 2147483647), axis=0),
-        )
 
 
-@triton.jit(do_not_specialize=["num_spec_steps"])
+@triton.jit(do_not_specialize=["num_spec_steps", "residual_seed"])
 def _ratio_residual_pick_kernel(
     output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
     residual_row_ptr,  # [batch_size] int32
     cu_num_draft_tokens_ptr,  # [batch_size]
     part_key_ptr,
     part_idx_ptr,
-    part_pkey_ptr,
-    part_pidx_ptr,
+    logits_ptr,  # [num_tokens, V] raw target logits, for the fallback only
+    temperatures_ptr,  # [batch_size] fp32
+    row_max_ptr,  # [num_tokens] fp32
+    row_inv_z_ptr,  # [num_tokens] fp32
     batch_size,
     n_tiles,
     num_spec_steps,
+    vocab_size,
+    logits_row_stride,
+    residual_seed,
     BLOCK_TILE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
 ):
-    """One request: the race's winner across tiles, lowest id among ties."""
+    """One request: the race's winner across tiles, lowest id among ties.
+
+    If the residual had no mass anywhere (p == q on every id, which the
+    accept rule should make unreachable), every key is 0 and there is no
+    winner; draw from p itself instead, racing ``p / E`` with the same noise
+    in this one program. Only that case pays for a second vocab pass.
+    """
     req_idx = tl.program_id(0)
     row = tl.load(residual_row_ptr + req_idx)
     if row >= 0:
@@ -354,17 +354,32 @@ def _ratio_residual_pick_kernel(
         idxs = tl.load(
             part_idx_ptr + offs * batch_size + req_idx, mask=tmask, other=2147483647
         )
-        pkeys = tl.load(
-            part_pkey_ptr + offs * batch_size + req_idx, mask=tmask, other=-1.0
-        )
-        pidxs = tl.load(
-            part_pidx_ptr + offs * batch_size + req_idx, mask=tmask, other=2147483647
-        )
         best = tl.max(keys, axis=0)
-        winner = tl.min(tl.where((keys == best) & tmask, idxs, 2147483647), axis=0)
-        pbest = tl.max(pkeys, axis=0)
-        pwinner = tl.min(tl.where((pkeys == pbest) & tmask, pidxs, 2147483647), axis=0)
-        token = tl.where(best > 0.0, winner, pwinner)
+        token = tl.min(tl.where((keys == best) & tmask, idxs, 2147483647), axis=0)
+        if best <= 0.0:
+            temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+            row_max = tl.load(row_max_ptr + row)
+            inv_z = tl.load(row_inv_z_ptr + row)
+            pbest = -1.0
+            token = 2147483647
+            for v_start in range(0, vocab_size, BLOCK_V):
+                v = v_start + tl.arange(0, BLOCK_V)
+                vmask = v < vocab_size
+                x = tl.load(
+                    logits_ptr + row.to(tl.int64) * logits_row_stride + v,
+                    mask=vmask,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                p = tl.where(vmask, tl.exp(x / temp - row_max) * inv_z, 0.0)
+                u = tl.rand(residual_seed, row.to(tl.int64) * vocab_size + v)
+                key = tl.where(vmask, p / -tl.log(u), -1.0)
+                tile_best = tl.max(key, axis=0)
+                tile_idx = tl.min(
+                    tl.where((key == tile_best) & vmask, v, 2147483647), axis=0
+                )
+                # Strictly better only: an equal key keeps the lower id.
+                token = tl.where(tile_best > pbest, tile_idx, token)
+                pbest = tl.maximum(pbest, tile_best)
         # Every comparison above is false on NaN; stay inside the vocab.
         token = tl.where(token == 2147483647, 0, token)
         tl.store(
@@ -461,8 +476,6 @@ def _ratio_sample(
     )
     part_key = torch.empty((n_tiles, batch_size), **f32)
     part_idx = torch.empty((n_tiles, batch_size), **i32)
-    part_pkey = torch.empty((n_tiles, batch_size), **f32)
-    part_pidx = torch.empty((n_tiles, batch_size), **i32)
     _ratio_residual_race_kernel[(batch_size, n_tiles)](
         residual_row,
         cu_num_draft_tokens,
@@ -474,8 +487,6 @@ def _ratio_sample(
         q_row_base,
         part_key,
         part_idx,
-        part_pkey,
-        part_pidx,
         batch_size,
         vocab_size,
         stride,
@@ -489,12 +500,18 @@ def _ratio_sample(
         cu_num_draft_tokens,
         part_key,
         part_idx,
-        part_pkey,
-        part_pidx,
+        target_logits,
+        temperatures,
+        row_max,
+        row_inv_z,
         batch_size,
         n_tiles,
         num_spec_steps,
+        vocab_size,
+        stride,
+        _RATIO_RESIDUAL_KEY | ratio_step,
         BLOCK_TILE=triton.next_power_of_2(n_tiles),
+        BLOCK_V=_RATIO_BLOCK_V,
         num_warps=1,
     )
 
