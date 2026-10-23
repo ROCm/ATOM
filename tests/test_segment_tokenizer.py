@@ -290,5 +290,52 @@ def test_a_check_finishing_after_the_cache_turned_off_does_not_count(tok, monkey
     assert seg._verified == seg_mod._VERIFY_FIRST - 1 and not seg.enabled
 
 
+def _long_conversation(rng, turns):
+    """Long enough that its first `_PREFIX_KEY_CHARS` hold no new turn."""
+    prompt = "<|begin|>" + _text(rng, 3000)
+    for t in range(turns):
+        prompt += ("<|User|>" if t % 2 == 0 else "<|Assistant|>") + _text(rng, 40)
+    return prompt
+
+
+def test_a_later_turn_reuses_the_earlier_prompt_exactly(tok):
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(11)
+    prompt = _long_conversation(rng, 4)
+    for turn in range(6):
+        # The generation prompt ends a turn; the next one replaces it, so a
+        # later prompt diverges from the stored one just before its end.
+        ask = prompt + "<|Assistant|>"
+        assert seg._encode_segments(ask) == tok.encode(ask)
+        prompt += "<|Assistant|>" + _text(rng, 15) + "<|User|>" + _text(rng, 25)
+    assert seg._prefix_hits >= 5
+    # One stored prefix per conversation: each turn replaced the one before.
+    assert len(seg._prefixes) == 1
+
+
+def test_divergence_mid_prefix_reuses_up_to_the_last_shared_added_token(tok):
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(12)
+    base = _long_conversation(rng, 6)
+    seg._encode_segments(base)
+    edited = base[: len(base) - 30] + "rewritten tail<|User|>" + _text(rng, 20)
+    hits = seg._prefix_hits
+    assert seg._encode_segments(edited) == tok.encode(edited)
+    assert seg._prefix_hits == hits + 1
+
+
+def test_prefix_fast_path_is_off_when_an_added_token_contains_another():
+    tok = _tokenizer_with(
+        [
+            AddedToken("<|User|>", special=True),
+            AddedToken("<|User|>x", special=True),
+        ]
+    )
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    assert seg is not None and not seg._prefix_ok
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16

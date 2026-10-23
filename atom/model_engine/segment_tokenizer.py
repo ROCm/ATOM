@@ -24,6 +24,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from typing import NamedTuple
 
 import numpy as np
 
@@ -34,6 +35,23 @@ _VERIFY_FIRST = 4
 # Prompts shorter than this (characters) are encoded whole: splitting, hashing
 # and joining cost more than they save there.
 _MIN_CACHED_CHARS = 100_000
+# Leading characters that index a conversation's stored prefix: long enough
+# to take in its first messages, so conversations sharing only a system prompt
+# land in the same bucket rarely, and the check below settles it anyway.
+_PREFIX_KEY_CHARS = 16_384
+# Stored prefixes per bucket (forks of one conversation, look-alike starts).
+_PREFIX_BUCKET = 8
+
+
+class _Prefix(NamedTuple):
+    """A prompt cut after its last added token, the ids of exactly that, and
+    where each added token in it ends -- the points a later prompt that
+    diverges from it can still reuse it up to."""
+
+    text: str
+    ids: np.ndarray  # int32, without the BOS/EOS `encode` wraps a prompt in
+    cut_chars: np.ndarray  # int64, ascending; the last is len(text)
+    cut_ids: np.ndarray  # int64, ids before each cut
 
 
 def _alternation(tokens):
@@ -113,6 +131,18 @@ class SegmentTokenizer:
         )
         if not self.enabled:
             logger.info("segment tokenizer: off (added tokens are not plain splits)")
+        # A stored prefix ends right after an added token. Reusing it assumes
+        # no added token in the full prompt starts before that cut and ends
+        # after it, which holds when none contains another.
+        tokens = list(self._added)
+        self._prefix_ok = not any(
+            a != b and a in b for a in tokens for b in tokens if len(b) > len(a)
+        )
+        self._prefixes: OrderedDict[int, _Prefix] = OrderedDict()
+        self._prefix_buckets: dict[int, list[int]] = {}
+        self._prefix_tokens = 0
+        self._next_prefix = 0
+        self._prefix_hits = 0
 
     @classmethod
     def maybe_create(cls, tokenizer, max_cached_tokens: int):
@@ -218,9 +248,97 @@ class SegmentTokenizer:
         out.extend(self._tail)
         return out
 
+    def _find_prefix(self, prompt: str):
+        """`(entry, k)`: the stored prefix sharing the most with `prompt`, and
+        its last cut `k` that `prompt` agrees with up to; or None."""
+        if not self._prefix_ok or len(prompt) <= _PREFIX_KEY_CHARS:
+            return None
+        bucket = hash(prompt[:_PREFIX_KEY_CHARS])
+        with self._lock:
+            entries = [
+                self._prefixes[pid]
+                for pid in self._prefix_buckets.get(bucket, ())
+                if pid in self._prefixes
+            ]
+        best = None
+        for entry in entries:
+            cuts = entry.cut_chars
+            if prompt.startswith(entry.text):
+                k = len(cuts) - 1
+            else:
+                # Agreement up to a cut is monotone in the cut: bisect for the
+                # last cut both prompts share.
+                lo, hi = -1, len(cuts) - 1
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    c = int(cuts[mid])
+                    if c <= len(prompt) and prompt[:c] == entry.text[:c]:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                k = lo
+            if k >= 0 and (best is None or cuts[k] > best[0].cut_chars[best[1]]):
+                best = (entry, k)
+        return best
+
+    def _store_prefix(self, prompt: str, ids, cut_chars, cut_ids, base) -> None:
+        """Remember `prompt` up to its last cut, replacing the prefix it
+        extends."""
+        if not self._prefix_ok or not cut_chars or cut_chars[-1] <= _PREFIX_KEY_CHARS:
+            return None
+        cut = cut_chars[-1]
+        bucket = hash(prompt[:_PREFIX_KEY_CHARS])
+        with self._lock:
+            if base is not None:
+                for pid in list(self._prefix_buckets.get(bucket, ())):
+                    if self._prefixes.get(pid) is base:
+                        self._drop_prefix(pid, bucket)
+            # After the drop, which removes an emptied bucket.
+            pids = self._prefix_buckets.setdefault(bucket, [])
+            pid = self._next_prefix
+            self._next_prefix += 1
+            entry = _Prefix(
+                prompt[:cut],
+                ids,
+                np.asarray(cut_chars, dtype=np.int64),
+                np.asarray(cut_ids, dtype=np.int64),
+            )
+            self._prefixes[pid] = entry
+            self._prefix_tokens += len(ids)
+            pids.append(pid)
+            if len(pids) > _PREFIX_BUCKET:
+                self._drop_prefix(pids[0], bucket)
+            while self._prefix_tokens > self._max_tokens and self._prefixes:
+                old_pid = next(iter(self._prefixes))
+                old = self._prefixes[old_pid]
+                self._drop_prefix(old_pid, hash(old.text[:_PREFIX_KEY_CHARS]))
+        return entry
+
+    def _drop_prefix(self, pid: int, bucket: int) -> None:
+        entry = self._prefixes.pop(pid, None)
+        if entry is not None:
+            self._prefix_tokens -= len(entry.ids)
+        pids = self._prefix_buckets.get(bucket)
+        if pids is not None and pid in pids:
+            pids.remove(pid)
+            if not pids:
+                del self._prefix_buckets[bucket]
+
     def _encode_segments(self, prompt: str) -> list[int]:
         t0 = time.perf_counter()
-        parts = self._parts(prompt)
+        # A conversation's earlier turn, cut after its last added token: its
+        # ids are reused whole, and only the rest -- including the text after
+        # that cut -- is split and looked up below.
+        found_prefix = self._find_prefix(prompt)
+        base = None if found_prefix is None else found_prefix[0]
+        if base is None:
+            start, cut_chars, cut_ids = 0, [], []
+        else:
+            k = found_prefix[1]
+            start = int(base.cut_chars[k])
+            cut_chars = base.cut_chars[: k + 1].tolist()
+            cut_ids = base.cut_ids[: k + 1].tolist()
+        parts = self._parts(prompt[start:])
         keys: list[bytes | None] = []
         missing: dict[bytes, str] = {}
         # This request's own references to the ids it found cached: another
@@ -248,6 +366,8 @@ class SegmentTokenizer:
                 k: np.asarray(e.ids, dtype=np.int32) for k, e in zip(missing, encodings)
             }
         out: list[int] = list(self._head)
+        if base is not None:
+            out.extend(base.ids[: cut_ids[-1]].tolist())
         with self._lock:
             for key, ids in fresh.items():
                 # An empty encoding would cost a cache entry but no budget,
@@ -255,9 +375,13 @@ class SegmentTokenizer:
                 if len(ids) and key not in self._cache:
                     self._cache[key] = ids
                     self._cached_tokens += len(ids)
+            chars = start
             for part, key in zip(parts, keys):
+                chars += len(part)
                 if key is None:
                     out.append(self._added[part])
+                    cut_chars.append(chars)
+                    cut_ids.append(len(out) - len(self._head))
                     continue
                 ids = found.get(key)
                 if ids is None:
@@ -268,7 +392,21 @@ class SegmentTokenizer:
             while self._cached_tokens > self._max_tokens and self._cache:
                 _, old = self._cache.popitem(last=False)
                 self._cached_tokens -= len(old)
+        if cut_chars:
+            self._store_prefix(
+                prompt,
+                np.asarray(
+                    out[len(self._head) : len(self._head) + cut_ids[-1]],
+                    dtype=np.int32,
+                ),
+                cut_chars,
+                cut_ids,
+                base,
+            )
         out.extend(self._tail)
+        if base is not None:
+            with self._lock:
+                self._prefix_hits += 1
         fresh_tokens = sum(len(v) for v in fresh.values())
         with self._lock:
             st = self._stats
@@ -279,10 +417,11 @@ class SegmentTokenizer:
             if st[3] % 500 == 0:
                 logger.info(
                     "segment tokenizer: %d prompts, %.1f%% of tokens reused, "
-                    "%.1f ms per prompt, %d tokens cached",
+                    "%.1f ms per prompt, %d tokens cached, %d prefix hits",
                     st[3],
                     100 * st[0] / max(1, st[0] + st[1]),
                     1e3 * st[2] / st[3],
                     self._cached_tokens,
+                    self._prefix_hits,
                 )
         return out
