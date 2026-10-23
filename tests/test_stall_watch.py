@@ -77,4 +77,37 @@ def test_a_step_that_finishes_in_time_logs_nothing(caplog):
         time.sleep(0.03)
         watch.disarm()
     time.sleep(0.3)
-    assert _stall_headers(caplog) == []
+    assert caplog.records == []
+
+
+def test_an_overrunning_step_reports_where_its_thread_spent_the_time(caplog):
+    caplog.set_level(logging.WARNING, logger="atom")
+    watch = sw.StallWatch("PP6TP0", 0.1, poll_s=0.02)
+    release = threading.Event()
+
+    def compile_a_kernel():
+        release.wait()
+
+    def step():
+        watch.arm()
+        compile_a_kernel()
+        watch.disarm()
+
+    loop = threading.Thread(target=step, name="MainThread-of-the-test")
+    loop.start()
+    try:
+        assert _wait_for(lambda: _stall_headers(caplog))
+        time.sleep(0.2)
+    finally:
+        release.set()
+        loop.join()
+
+    def summary():
+        return [
+            r.getMessage() for r in caplog.records if "step ended" in r.getMessage()
+        ]
+
+    assert _wait_for(lambda: summary())
+    assert len(summary()) == 1 and "PP6TP0" in summary()[0]
+    top = next(r.getMessage() for r in caplog.records if "samples=" in r.getMessage())
+    assert "test_stall_watch.py:compile_a_kernel<test_stall_watch.py:step" in top
