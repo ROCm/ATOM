@@ -376,9 +376,10 @@ class DSparkProposer(Drafter):
         ``(None, None)`` keeps exact-match verification; anything else selects
         the probability-ratio rule in `rejection_sampler.rejection_sample`.
 
-        * An all-greedy batch keeps the exact-match kernel, so the flag is a
-          bit-for-bit no-op there. A greedy row inside a mixed batch is matched
-          exactly by the ratio kernel itself.
+        * An all-greedy batch keeps the exact-match kernel, so its accept rule
+          is the flag-off one (its draft still runs the sampled block, in
+          greedy mode). A greedy row inside a mixed batch is matched exactly
+          by the ratio kernel itself.
         * A batch with top-k or top-p on any row keeps exact match: p in the
           ratio path is a plain temperature softmax, and exact match against
           the target's own filtered draw is lossless. The draft side pairs with
