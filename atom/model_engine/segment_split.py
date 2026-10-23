@@ -122,6 +122,12 @@ class AddedTokenSplitter:
         """Whether encoding the pieces of `parts` separately is exact."""
         if not self.added or not self.wrapped:
             return False
+        # With special tokens split like text, `parts` would still extract
+        # them as single ids; the probes need not hit a special one.
+        if getattr(self.tokenizer, "split_special_tokens", False) or getattr(
+            self.backend, "encode_special_tokens", False
+        ):
+            return False
         if any(t.lstrip or t.rstrip or t.single_word for t in self._decoder):
             return False
         try:

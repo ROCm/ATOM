@@ -283,6 +283,24 @@ def test_bpe_dropout_is_refused(monkeypatch):
         assert SegmentTokenizer.maybe_create(tok, 10**6) is None, dropout
 
 
+def test_split_special_tokens_is_refused(monkeypatch):
+    """In this mode the plain encoder spells special tokens out as text, while
+    `parts` extracts them. The startup probes need not pick a special token
+    (e.g. added order `aa`, `<x>`, `longword`), so they are stubbed to agree
+    and only the mode check can refuse."""
+    monkeypatch.setattr(seg_mod.AddedTokenSplitter, "_probes_match", lambda self: True)
+    added = [
+        AddedToken("aa", special=False),
+        AddedToken("<x>", special=True),
+        AddedToken("longword", special=False),
+    ]
+    assert SegmentTokenizer.maybe_create(_tokenizer_with(added), 10**6) is not None
+    tok = _tokenizer_with(added)
+    tok.split_special_tokens = True
+    assert tok.encode("q <x> q") != _tokenizer_with(added).encode("q <x> q")
+    assert SegmentTokenizer.maybe_create(tok, 10**6) is None
+
+
 def test_a_result_finished_after_the_cache_turned_off_is_not_returned(tok, monkeypatch):
     """Another request turning the cache off while this one encodes: this
     one's unchecked ids must not be returned."""
