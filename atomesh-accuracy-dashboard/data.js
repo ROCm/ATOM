@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792602556618,
+  "lastUpdate": 1792774370659,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -4377,6 +4377,51 @@ window.BENCHMARK_DATA = {
             "value": 0.8908,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39633475846 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202610211502 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.1706 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9a0a5202bc28e9fd092b39199f6698e459d1d77d",
+          "message": "refactor: one graph mechanism per region, settled DP step shapes, cheaper V4.1 decode prep (#2688)\n\n* Revert \"feat(dsv4): enable Mono decode by default (#2586)\"\n\nThis reverts commit 2c772a5441f6efa012d53ee2e47d55646ab56f83.\n\n* refactor: one graph mechanism per region, settled DP step shapes, cheaper V4.1 decode prep\n\nGraph regions\n- TokenGraph (token buckets) and ReqGraph (request buckets) in\n  atom/utils/region_graph.py are the runner's two graph mechanisms; decode,\n  the V4.1 prefill decoder (DecoderGraph) and the DSpark draft record and\n  replay through them. Bucket lookups live on the graphs (TokenGraph.bucket,\n  __contains__), not in the forward context.\n- Prefill graph recording is one pass (_record_prefill_graphs); capture\n  boilerplate is shared (_build_capture); dummy prefill and decode share\n  dummy_execution.\n\nDP step shape\n- ForwardMode.decide runs the step's single DP exchange and settles the\n  running tokens per DP rank into a runner-owned numpy buffer in place.\n  DPMetadata holds only that table; gather_running_tokens is the one\n  all-reduce path (skipped at dp=1). set_forward_context takes the table as a\n  required argument; num_tokens names become scheduled/running tokens.\n\nV4.1 decode preparation (64k ISL, conc 4, TP4: prepare_decode 310 -> 176 us,\ndecode step median 3105 -> 2919 us, mean GPU idle per step 169 -> 34 us)\n- Step indptrs are filled by their first reader (PagedAttentionCache.indptrs)\n  and dropped by begin_forward, like unit tiles: a mono step fills none, a\n  graphed forward records the fill.\n- The FP4 score stage's walk plan is laid out on the device in the mono\n  step-meta launch (step_meta._walk_plan); index_plan.fill_walk_plan stays as\n  its host reference, checked against it on random steps. WalkPlanner and the\n  installers' metadata_builder argument are gone.\n- prepare_batch_step finds group members by name instead of scanning every\n  member twice; CompressPlan drops cu_compress_cpu / compress_plan_cpu, which\n  nothing read.\n- The previous step's speculative status is taken after the input ids are\n  staged, published and their fill launched: that wait is the step's one CPU\n  block on the GPU, and only the attention metadata after it reads the status.\n\nCleanup\n- Patch-style branches, duplicate plumbing and dead code removed across the\n  runner, attention builders (shared Fp4LaunchStorages, V4/MLA indexer rows),\n  MoE, plugins and tests; docs updated to match.\n\nValidation: V4.1-Flash TP4 GSM8K 3-shot 0.9242 (CI baseline 0.9224); unit\ntests in the affected areas pass apart from the known environment failures.\n\n* fix: mark region graph live sets ClassVar; skip decoder graph tests without triton\n\n* fix: keep the logits workspace and V4 transfer-region tests importable without aiter\n\n* chore: drop the indexer package's copy of the logits workspace",
+          "timestamp": "2026-10-23T16:27:37Z",
+          "url": "https://github.com/ROCm/ATOM/commit/9a0a5202bc28e9fd092b39199f6698e459d1d77d"
+        },
+        "date": 1792774370003,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9477,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39985830465 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202610231620 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9431 | fewshot: 3 | Model: deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9545,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39985830465 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610231620 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 65.97,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/39985830465 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202610231620 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9545 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.98,
+            "unit": "tok/fwd"
           }
         ]
       }
