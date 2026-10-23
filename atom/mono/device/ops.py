@@ -369,8 +369,53 @@ def rows_to_lds(tid, src, rows, row_words, dst, dst_row):
     )  # fmt: skip
 
 
+_HAS_BF16_MFMA_K32: bool | None = None
+
+
+def _has_bf16_mfma_k32() -> bool:
+    """gfx950's 16x16x32 bf16 MFMA. gfx942 stops at 16x16x16."""
+    global _HAS_BF16_MFMA_K32
+    if _HAS_BF16_MFMA_K32 is None:
+        try:
+            from aiter.jit.utils.chip_info import get_gfx
+
+            _HAS_BF16_MFMA_K32 = not str(get_gfx()).startswith("gfx942")
+        except (ImportError, RuntimeError):
+            _HAS_BF16_MFMA_K32 = True
+    return _HAS_BF16_MFMA_K32
+
+
+def _bf16_k16_half(v8, half: int):
+    """4 bf16 of an 8-bf16 16x16x32 operand, as the i16x4 the K=16 MFMA reads.
+
+    Half 0 is K[0:16], half 1 is K[16:32]. The bits stay bf16; the K=16
+    intrinsic types its operands as 16-bit integers.
+    """
+    words = v8.bitcast(fx.Int32)
+    return fx.Vector.from_elements(
+        [words[half * 2], words[half * 2 + 1]], fx.Int32
+    ).bitcast(fx.Int16)
+
+
 def mfma_bf16(a, b, c):
-    return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+    """16x16x32 bf16 into the 4-wide fp32 fragment.
+
+    CDNA4 issues ``v_mfma_f32_16x16x32_bf16`` (8 bf16 an operand). CDNA3 has
+    only ``v_mfma_f32_16x16x16_bf16``, so the same operand is two K=16
+    fragments accumulated in order. The fragment layout matches aiter's
+    gfx942 split of a v8bf16 K-step.
+    """
+    if _has_bf16_mfma_k32():
+        return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+    acc = c
+    for half in (0, 1):
+        acc = fx.Vector(
+            rocdl.mfma_f32_16x16x16bf16_1k(
+                T.vec(4, T.f32),
+                [_bf16_k16_half(a, half), _bf16_k16_half(b, half), acc],
+            )
+        )
+    return acc
 
 
 def row_sum(red, r, t, waves=None):

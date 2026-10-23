@@ -97,7 +97,9 @@ def _swizzle_mxfp4(
     passed explicitly. ``act_quant`` is keyword-only and has no default on
     purpose: a default would silently pick a width for a caller that forgot.
     """
-    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
+    # Callers gate on Mxfp4MoEMethod.use_triton, which auto-enables Triton MoE
+    # on gfx94x even when ATOM_USE_TRITON_MOE is unset. Do not re-check the raw
+    # env here -- that rejected the MI308 default path after weight load.
 
     # Transposing for expected layout of aiter triton kernels
     w1_triton_layout = w1.transpose(-2, -1)

@@ -15,6 +15,10 @@ FP8_MAX = tl.constexpr(torch.finfo(FP8_DTYPE).max)
 FP8_TL_DTYPE = tl.constexpr(
     tl.float8e4b8 if FP8_DTYPE is torch.float8_e4m3fnuz else tl.float8e4nv
 )
+# OCP E4M3 (checkpoint / aiter group32 GEMM). Independent of platform FNUZ.
+FP8_OCP_DTYPE = torch.float8_e4m3fn
+FP8_OCP_MAX = tl.constexpr(torch.finfo(FP8_OCP_DTYPE).max)
+FP8_OCP_TL_DTYPE = tl.constexpr(tl.float8e4nv)
 
 
 @triton.jit
@@ -34,6 +38,25 @@ def quantize_fp8_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
     code = ceil_pow2_code(amax * (1.0 / FP8_MAX))
     scale = (code << 23).to(tl.float32, bitcast=True)
     q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_MAX), FP8_MAX).to(FP8_TL_DTYPE)
+    if DEQUANT:
+        tl.store(Y + offsets, q.to(tl.float32) * scale[:, None], offsets < SIZE)
+    else:
+        tl.store(Y + offsets, q, offsets < SIZE)
+        tl.store(S + groups, code.to(tl.uint8), groups < SIZE // 32)
+
+
+@triton.jit
+def quantize_fp8_ocp_kernel(X, Y, S, SIZE, DEQUANT: tl.constexpr):
+    """Same as quantize_fp8_kernel but writes OCP e4m3fn (aiter group32)."""
+    groups = tl.program_id(0) * 32 + tl.arange(0, 32)
+    offsets = groups[:, None] * 32 + tl.arange(0, 32)[None, :]
+    x = tl.load(X + offsets, offsets < SIZE, other=0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), 1), 1e-4)
+    code = ceil_pow2_code(amax * (1.0 / FP8_OCP_MAX))
+    scale = (code << 23).to(tl.float32, bitcast=True)
+    q = tl.minimum(tl.maximum(x / scale[:, None], -FP8_OCP_MAX), FP8_OCP_MAX).to(
+        FP8_OCP_TL_DTYPE
+    )
     if DEQUANT:
         tl.store(Y + offsets, q.to(tl.float32) * scale[:, None], offsets < SIZE)
     else:

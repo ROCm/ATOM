@@ -693,13 +693,17 @@ class LinearBase(nn.Module):
         )
         self.native_a8_group_rows = None
         source_block = layer_quant_config.weight_block_size
-        native_fp8 = params_dtype == torch.float8_e4m3fn and source_block in (
+        # Checkpoint FP8 is float8_e4m3fn; aiter maps dtypes.fp8 to
+        # float8_e4m3fnuz on gfx942 (MI308) and float8_e4m3fn on gfx950.
+        # Native 32x32 / 1x32 scale geometry is identical for both encodings.
+        _native_fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        native_fp8 = params_dtype in _native_fp8_dtypes and source_block in (
             (1, 32),
             (32, 32),
         )
         native_w4a8 = (
             params_dtype == torch.float4_e2m1fn_x2
-            and layer_quant_config.activation_dtype == torch.float8_e4m3fn
+            and layer_quant_config.activation_dtype in _native_fp8_dtypes
             and source_block == (1, 32)
         )
         # A weight that online quant is about to overwrite is not a native
