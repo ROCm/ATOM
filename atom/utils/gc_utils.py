@@ -169,16 +169,58 @@ def unfreeze_gc_heap() -> None:
     gc.unfreeze()
 
 
-def maybe_attach_gc_debug_callback(context: str) -> None:
-    """Under ``ATOM_GC_DEBUG``, log every collection.
+def _attach_gc_timing(context: str, interval_s: float) -> None:
+    """Log, every `interval_s`, how many collections each generation ran here,
+    their total and their longest pause.
 
-    Deliberately expensive: it counts the tracked set on each pass, which cost
-    ~90s of extra startup on a V4-Flash tp1. It is also the only way to see
-    these pauses -- a stall in the EngineCore idles the workers, and an idle
-    worker emits no trace event at all.
+    Cheap enough to leave on under load, unlike `ATOM_GC_DEBUG`: two clock
+    reads per pass and no heap walk. Reported from the callback itself, so an
+    idle process says nothing rather than needing a timer thread.
+    """
+    state = {"t0": 0.0, "since": time.perf_counter()}
+    n, total, longest = [0, 0, 0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+
+    def _time(phase: str, info: dict) -> None:
+        now = time.perf_counter()
+        if phase == "start":
+            state["t0"] = now
+            return
+        gen = info.get("generation")
+        if gen not in (0, 1, 2):
+            return
+        dt = now - state["t0"]
+        n[gen] += 1
+        total[gen] += dt
+        longest[gen] = max(longest[gen], dt)
+        if now - state["since"] < interval_s:
+            return
+        logger.info(
+            "[gc-timing] ctx=%s s=%.1f n=%s ms=%s max_ms=%s",
+            context,
+            now - state["since"],
+            "/".join(map(str, n)),
+            "/".join(f"{x * 1e3:.1f}" for x in total),
+            "/".join(f"{x * 1e3:.1f}" for x in longest),
+        )
+        state["since"] = now
+        n[:], total[:], longest[:] = [0, 0, 0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+
+    gc.callbacks.append(_time)
+
+
+def maybe_attach_gc_debug_callback(context: str) -> None:
+    """Under ``ATOM_GC_DEBUG``, log every collection; under
+    ``ATOM_GC_TIMING_S``, a per-generation summary every that many seconds.
+
+    The first is deliberately expensive: it counts the tracked set on each
+    pass, which cost ~90s of extra startup on a V4-Flash tp1. Both are the only
+    way to see these pauses -- a stall in the EngineCore idles the workers, and
+    an idle worker emits no trace event at all.
     """
     from atom.utils import envs
 
+    if envs.ATOM_GC_TIMING_S > 0:
+        _attach_gc_timing(context, envs.ATOM_GC_TIMING_S)
     if not envs.ATOM_GC_DEBUG:
         return
 

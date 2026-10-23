@@ -617,3 +617,51 @@ def test_the_free_counters_ride_along():
     assert all("collected" in s for s in census["stats"])
     assert set(census["generations"]) == {"0", "1", "2"}
     assert len(census["thresholds"]) == 3
+
+
+def test_gc_timing_is_off_unless_asked(monkeypatch):
+    from atom.utils.gc_utils import maybe_attach_gc_debug_callback
+
+    monkeypatch.delenv("ATOM_GC_TIMING_S", raising=False)
+    monkeypatch.delenv("ATOM_GC_DEBUG", raising=False)
+    before = list(gc.callbacks)
+    maybe_attach_gc_debug_callback("test")
+    assert gc.callbacks == before
+
+
+def test_gc_timing_reports_each_generation_once_per_interval(monkeypatch):
+    """One line per interval, per generation count / total / longest -- the
+    shape that tells a frequent cheap pass from a rare one that stalls."""
+    from atom.utils import gc_utils
+
+    clock = [100.0]
+    lines = []
+    monkeypatch.setattr(gc_utils.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(gc_utils.logger, "info", lambda msg, *a: lines.append(msg % a))
+    monkeypatch.setenv("ATOM_GC_TIMING_S", "30")
+    monkeypatch.delenv("ATOM_GC_DEBUG", raising=False)
+    gc.disable()  # only the passes driven below may reach the callback
+    gc_utils.maybe_attach_gc_debug_callback("EngineCore_test")
+    callback = gc.callbacks[-1]
+    try:
+
+        def collect(gen, ms):
+            callback("start", {"generation": gen})
+            clock[0] += ms / 1e3
+            callback("stop", {"generation": gen, "collected": 0})
+
+        collect(0, 1)
+        collect(0, 3)
+        collect(2, 200)
+        assert lines == []
+        clock[0] += 30
+        collect(1, 5)
+        collect(0, 1)
+    finally:
+        gc.callbacks.remove(callback)
+
+    expected = (
+        "[gc-timing] ctx=EngineCore_test s=30.2 n=2/1/1 ms=4.0/5.0/200.0 "
+        "max_ms=3.0/5.0/200.0"
+    )
+    assert lines == [expected]
