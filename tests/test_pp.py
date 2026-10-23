@@ -703,6 +703,48 @@ def test_middle_chunk_output_discarded():
     assert seq.num_tokens == initial_num_tokens
 
 
+def test_mixed_batch_keeps_the_decode_token_under_pp():
+    """A mixed batch's decode rows are not middle chunks.
+
+    `is_final_chunk` is padded with False for the decode rows that trail the
+    prefill rows; the advance-on-schedule loop read those as middle chunks and
+    dropped every decode row's sampled token on every mixed step.
+    """
+    import numpy as np
+
+    cfg = _pp_config(max_num_batched_tokens=100, enable_mixed_prefill_decode=True)
+    sched = Scheduler(cfg)
+
+    def output(batch):
+        n = len(batch.req_ids)
+        return ScheduledBatchOutput(
+            req_ids=list(batch.req_ids),
+            token_ids=[(42,)] * n,
+            num_rejected=np.zeros(n, dtype=np.int32),
+            num_bonus=np.zeros(n, dtype=np.int32),
+            draft_token_ids=None,
+            is_deferred_out=False,
+        )
+
+    decoding = _make_seq(32, block_size=cfg.kv_cache_block_size)
+    sched.add(decoding)
+    batch1, seqs1 = sched.schedule()
+    sched.postprocess(list(seqs1.values()), output(batch1), batch=batch1)
+
+    prefilling = _make_seq(300, block_size=cfg.kv_cache_block_size)
+    sched.add(prefilling)
+    batch2, seqs2 = sched.schedule()
+    assert batch2.is_mixed
+    assert batch2.req_ids == [prefilling.id, decoding.id]
+    assert batch2.is_final_chunk == [False, False]  # middle chunk + decode pad
+
+    decode_tokens = decoding.num_tokens
+    prompt_tokens = prefilling.num_tokens
+    sched.postprocess(list(seqs2.values()), output(batch2), batch=batch2)
+    assert decoding.num_tokens == decode_tokens + 1
+    assert prefilling.num_tokens == prompt_tokens  # the middle chunk's is dropped
+
+
 @pytest.mark.parametrize(
     "num_new,budget,block_size,expected",
     [

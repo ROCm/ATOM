@@ -439,12 +439,17 @@ def test_decode_scores_the_cache_the_fused_writer_wrote(on_gfx950):
     _assert_agrees(logits, want, visible, topk=512)
 
 
-def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypatch):
+@pytest.mark.parametrize("right_sized", [False, True], ids=["model_max", "batch"])
+def test_v4_decode_scorer_takes_ragged_requests_and_padding(
+    on_gfx950, monkeypatch, right_sized
+):
     """`Indexer._score_topk_decode_fp4_flydsl` at a ragged MTP step: requests
     of 4, 1 and 3 rows (each row of a c-row request one token behind the
     next), an empty padding request and two padding rows, read off the step's
     metadata alone. Every real row picks the cache's top-k within its own
-    bound; a padding row picks nothing."""
+    bound; a padding row picks nothing -- whether the logits plane is the
+    model's whole width or the builder's bound on this batch."""
+    from atom.model_ops.attentions.deepseek_v4_attn import decode_logits_width
     from atom.models import deepseek_v4
 
     batch, next_n, ctx_len, topk = 3, 4, 768, 512
@@ -473,10 +478,16 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
     )
     indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
     indexer.kv_cache, indexer.kv_scale = kv_cache, kv_scale
-    indexer._max_model_len_idx, indexer._weights_scale = ctx_len, WEIGHTS_SCALE
+    # A model max far past the cache, as in serving (262144 columns there).
+    indexer._max_model_len_idx, indexer._weights_scale = 1 << 16, WEIGHTS_SCALE
+    indexer_meta = (
+        {"decode_logits_width": decode_logits_width(np.array([ctx_len] * batch))}
+        if right_sized
+        else {}
+    )
     padded_table = torch.cat([table, table[:1]])  # the padding request's row
     got = indexer._score_topk_decode_fp4_flydsl(
-        q_fp4[rows], q_scale[rows], padded_table, weights[rows], topk
+        q_fp4[rows], q_scale[rows], padded_table, weights[rows], indexer_meta, topk
     )
 
     want = _oracle(
@@ -489,6 +500,40 @@ def test_v4_decode_scorer_takes_ragged_requests_and_padding(on_gfx950, monkeypat
         best = set(want[r, :end].topk(min(topk, end)).indices.tolist())
         assert len(chosen & best) / len(best) > 0.99, r
     assert (got[len(picks) :] == -1).all()
+
+
+@pytest.mark.parametrize(
+    "longest, width",
+    [(0, 1024), (1, 1024), (1024, 1024), (1025, 2048), (2300, 4096), (65536, 65536)],
+)
+def test_decode_logits_width_bounds_the_longest_sequence(longest, width):
+    """Every row of a sequence sees at most its committed count, so the longest
+    one bounds the plane; the power-of-two rounding keeps an eager decode step
+    to a few sizes for the caching allocator."""
+    attn = _import_or_skip("atom.model_ops.attentions.deepseek_v4_attn")
+    counts = np.array([1, longest // 2, longest], dtype=np.int32)
+    assert attn.decode_logits_width(counts) == width
+    assert attn.decode_logits_width(np.array([], dtype=np.int32)) == 1024
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_decode_logits_width_is_static_only_under_capture(monkeypatch, capturing):
+    """A captured graph replays its width against any later context, so capture
+    takes the model max; an eager step takes the builder's bound, clamped to
+    that max, and the max when the builder gave none."""
+    deepseek_v4 = _import_or_skip("atom.models.deepseek_v4")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    indexer = deepseek_v4.Indexer.__new__(deepseek_v4.Indexer)
+    indexer._max_model_len_idx = 1 << 16
+    eager = {
+        4096: 4096,
+        1 << 20: 1 << 16,
+    }
+    for width, want in eager.items():
+        got = indexer._decode_logits_width({"decode_logits_width": width})
+        assert got == (1 << 16 if capturing else want)
+    assert indexer._decode_logits_width({}) == 1 << 16
+    assert indexer._decode_logits_width(None) == 1 << 16
 
 
 def test_dcp_decode_scores_each_query_token_over_its_own_local_window(on_gfx950):
@@ -925,6 +970,7 @@ def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
             qs,
             padded_table[:running_bs],
             weights,
+            metadata.indexer_meta,
             512,
             out=out_buf if into else None,
         )
