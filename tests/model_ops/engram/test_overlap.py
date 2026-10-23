@@ -149,7 +149,7 @@ def test_snapshot_stages_all_cursor_prefixes_without_mutating_history(
         assert torch.all(out[count:] == -1)
 
 
-def make_staging(mapping, group=None):
+def make_staging(mapping, group=None, staging_cls=EngramStaging):
     config = mapping.config
     device = torch.device("cuda", torch.cuda.current_device())
     size = 1 if group is None else group.world_size
@@ -206,7 +206,7 @@ def make_staging(mapping, group=None):
             32, config.num_hash_heads, dtype=torch.int64, device=device
         ),
     )
-    return EngramStaging(uva), backing
+    return staging_cls(uva), backing
 
 
 MAX_BS = 8

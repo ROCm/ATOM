@@ -174,3 +174,64 @@ def test_the_dspark_block_starts_after_the_tbo_block_in_both_widths(monkeypatch)
         assert r.max_seqlen_q_across_dp == 9, f"tbo_on={tbo_on}"
         alone = _sync(monkeypatch, peers=[], **_base(tbo_on=tbo_on, max_seqlen_q=3))
         assert alone.max_seqlen_q_across_dp == 3, f"tbo_on={tbo_on}"
+
+
+# ── stage rows (DeepSeek-V4.1 decoder bounded replay) ─────────────────────
+
+
+def test_stage_rows_ride_the_same_collective(monkeypatch):
+    """A replaying prefill rank beside a decoding peer: the table comes back
+    in DP order, and the step still issues one all_gather."""
+    calls = []
+
+    def peer(local):
+        calls.append(1)
+        out = local.clone()
+        out[2] = 0  # the peer decodes
+        out[-4:] = torch.tensor([0, 1, 40, 40], dtype=torch.int32)
+        return out
+
+    sync = _sync(
+        monkeypatch,
+        peers=[peer],
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 128, 1)),
+    )
+    assert sync.dp_stage_rows == ((1, 0), (1, 1), (128, 40), (1, 40))
+    assert len(calls) == 1
+
+
+def test_no_replaying_rank_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, dp_stage_row=(0, 1, 500, 500)),
+    )
+    assert sync.dp_stage_rows is None
+
+
+def test_a_decode_only_group_carries_no_table(monkeypatch):
+    sync = _sync(
+        monkeypatch, peers=[_with(0, 10)], **_base(dp_stage_row=(1, 0, 10, 10))
+    )
+    assert sync.dp_stage_rows is None
+
+
+def test_stage_rows_follow_the_dspark_row(monkeypatch):
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, max_seqlen_q=6, dp_stage_row=(1, 1, 128, 1)),
+    )
+    assert sync.max_seqlen_q_across_dp == 6
+    assert sync.dp_stage_rows[2] == (128, 128)
+
+
+def test_a_stage_row_is_as_long_as_the_model_makes_it(monkeypatch):
+    """The shared sync knows nothing of a model's stages: it carries whatever
+    row the model reports and only reads its leading applies flag."""
+    sync = _sync(
+        monkeypatch,
+        peers=[_with(2, 1)],
+        **_base(is_prefill=True, dp_stage_row=(1, 1, 7, 6, 5)),
+    )
+    assert sync.dp_stage_rows == ((1, 1), (1, 1), (7, 7), (6, 6), (5, 5))

@@ -279,9 +279,9 @@ RUN if [ "${ATOM_BASE_IMAGE}" = "rocm10-base" ]; then \
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
 # rocm10-base flavor is excluded.
-ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
-ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
-ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
 RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
         echo "========== [base] Pin Triton ${TRITON_PIN_VERSION} (index ${TRITON_INDEX_URL}) =========="; \
         pip install --index-url "${TRITON_INDEX_URL}" --force-reinstall --no-deps \
@@ -854,9 +854,9 @@ print('component imports ok: mori, atom (aiter needs a GPU: runtime-only; amdsmi
 # installs Triton from the ROCm 10 SDK channel (ROCM_TRITON_VERSION) and
 # force-reinstalling a rocm7.2.0 wheel there would break the stack, so the
 # rocm10-base flavor is excluded.
-ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
-ARG TRITON_PIN_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
-ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release_0914/rocm-7.2.0/simple/"
+ARG TRITON_PIN_VERSION="3.8.0+amd.rocm7.2.0.git7cb7b059"
+ARG TRITON_KERNELS_PIN_VERSION="1.0.0+amd.rocm7.2.0.git7cb7b059"
 RUN if [ "${ATOM_BASE_IMAGE}" != "rocm10-base" ] && [ -n "${TRITON_PIN_VERSION}" ]; then \
         cur="$("${VENV_PYTHON}" -c 'import importlib.metadata as m; print(m.version("triton"))' 2>/dev/null || echo none)"; \
         if [ "${cur}" != "${TRITON_PIN_VERSION}" ]; then \

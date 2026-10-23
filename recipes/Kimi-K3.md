@@ -31,12 +31,94 @@ python -m atom.entrypoints.openai_server \
   --gpu-memory-utilization 0.93 \
   --block-size 128 \
   --no-enable_prefix_caching \
+  --cudagraph-mode FULL \
   --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*self_attn.[qkv]_conv1d*", "*block_sparse_moe.experts*", "*block_sparse_moe.routed_expert_*", "*vision_tower*", "*mm_projector*"]}'
 ```
 
 Kimi full-attention layers use true MLA with a compressed latent KV cache. Aiter MLA is selected by default; `ATOM_USE_TRITON_MLA=1` selects the Triton MLA implementation when that configuration has been validated.
 
 Prefix caching remains disabled because the KDA recurrent state is maintained per request and cannot be reconstructed from the paged MLA cache alone. `-tp 8` is required for the model to fit. Use `gpu-memory-utilization 0.93` so the CUDA-graph pool fits alongside the KDA per-request state cache.
+
+### Mono decode
+
+Two fused kernels replace the KDA layers of a speculative verify step: K1, the
+attention seam through the KDA recurrence, and K2, `o_proj` plus the latent
+MoE. The MLA layers keep the production paged path.
+
+`ATOM_MONO_ENABLE` defaults to `1`, so a qualifying deployment gets mono
+without being asked. It needs TP8, DSpark, FP8 KV, DCP1, a FULL cudagraph and
+`ATOM_ENABLE_REPLAYSSM=0`. The launch above supplies TP8 and FP8 KV and takes
+DCP1 and the FULL cudagraph by default; **DSpark and `ATOM_ENABLE_REPLAYSSM`
+it does not**, and without both mono stays off:
+
+- FULL cudagraph **is** the CLI default (`cudagraph_mode: str = "FULL"`,
+  `atom/model_engine/arg_utils.py:145`, passed through at :768), so a launch
+  from the CLI arms mono without passing `--cudagraph-mode` at all. The
+  `None -> PIECEWISE` default at `atom/config.py:2393` applies only to a
+  config that never went through `arg_utils` -- i.e. plugin mode -- and K3
+  mono refuses PIECEWISE, logging `Kimi-K3 mono decode off: piecewise
+  cudagraph`. The examples below still pass the flag explicitly, because it
+  costs nothing and makes the requirement visible in the command.
+- **DSpark is not in the launch above.** Mono replaces the KDA layers of a
+  speculative *verify* step, so a server with no drafter has no such step to
+  replace and says `Kimi-K3 mono decode off: no speculative decoding`. The
+  draft model is a separate checkpoint and a local directory, not a repo id.
+- `ATOM_ENABLE_REPLAYSSM` defaults ON whenever spec decode is used, and K1
+  resumes a request from a per-token snapshot slot that ReplaySSM does not
+  keep live.
+- **Five projections must stay out of the online quant.** The kernels read
+  them as plain BF16 (`kimi_k3/mono/weights.py`, five `_plain_bf16` call
+  sites): `self_attn.in_proj`, `self_attn.f_b_proj`, `self_attn.o_proj`, and
+  the shared experts' `gate_up_proj` and `down_proj`. The baseline
+  `exclude_layer` list above covers none of them, and
+  `*block_sparse_moe.experts*` does **not** match `shared_experts`. Miss any
+  one and mono refuses the whole model -- the server answers correctly on the
+  production path and says so once, e.g. `mono decode off: layer 1 shared
+  gate_up_proj is torch.float8_e4m3fn`.
+
+```bash
+export ATOM_ENABLE_REPLAYSSM=0
+export DRAFT_MODEL_PATH=/path/to/Kimi-K3-DSpark   # a directory, not a repo id
+```
+
+Add these to the launch command:
+
+```
+  --method dspark \
+  --draft-model "${DRAFT_MODEL_PATH}" \
+  --num-speculative-tokens 7 \
+```
+
+Seven is what the row cap wants: a step is served only at 8 rows or fewer, and
+bs=1 with seven speculative tokens is exactly 8 (see below).
+
+Add these to the launch's `exclude_layer` list:
+
+```
+"*self_attn.in_proj*", "*self_attn.f_b_proj*", "*self_attn.o_proj*", "*shared_experts*"
+```
+
+The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
+`Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
+it before concluding anything about a run.
+
+**A step is served only if it is at most 8 rows** (batch x query length).
+bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the same
+width is 16, which every step declines back to the production path -- the
+server still answers, just without mono.
+
+The cap is a constant (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), not a
+switch. 16 rows is correct -- the kernels stride over their columns rather
+than assuming one pass covers them -- and measurably faster (-13.4 % target
+forward against stock). It stays at 8 because no task-level accuracy run
+exists at any width and K2's latent MoE carries a real, unsettled precision
+cost, so raising it is a decision to make on accuracy evidence rather than on
+speed.
+
+For a performance A/B, keep the launch command and the workload identical and
+change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin
+`--spec-decode-acceptance-length` on both arms, or the two runs do different
+amounts of work and the comparison means nothing.
 
 ---
 

@@ -51,7 +51,7 @@ def _runner(seen):
     runner.tokenID_processor = types.SimpleNamespace(
         is_deferred_out=False,
         prev_batch=None,
-        default_num_rejected_tokens=torch.zeros(64, dtype=torch.int32),
+        zero_spec_counts=torch.zeros(128, dtype=torch.int32),
         prepare_sampled_ids=lambda *a, **k: ({}, {}),
     )
     return runner
