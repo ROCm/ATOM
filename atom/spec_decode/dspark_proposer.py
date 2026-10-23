@@ -105,9 +105,12 @@ class DSparkProposer(Drafter):
         self._q_store = None
         self._q_slots = None
         self._draft_sample_step = 0
-        # How many sequences the last `stage_draft_sampling_host` covered, so
-        # `propose` can check it is drafting that same batch.
-        self._staged_draft_bs = -1
+        # Generations of `stage_draft_sampling_host` and of `propose`: every
+        # propose must consume a staging of its own, or the captured head would
+        # write q through a previous step's row bases into slots that may
+        # belong to other requests by now.
+        self._staging_gen = 0
+        self._drafted_gen = 0
         # Leading entries of the draft row base that may still name a slot.
         self._draft_row_base_hi = 0
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
@@ -307,7 +310,7 @@ class DSparkProposer(Drafter):
         counts[index["draft_temperatures"]] = bs or None
         counts[index["draft_greedy_mask"]] = bs or None
         counts[index["verify_q_row_base"]] = bs or None
-        self._staged_draft_bs = bs
+        self._staging_gen += 1
         req_ids = batch.req_ids[:bs]
         # Verify bases before claims: a claim may expire a request of this same
         # batch, whose verify must still read the slot its drafts came from.
@@ -352,6 +355,16 @@ class DSparkProposer(Drafter):
             # The predicate `Sampler` tests, so a row cannot be greedy to the
             # target and stochastic to the draft.
             mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
+
+    def _consume_staging(self) -> None:
+        """Claim this step's staging for the propose about to run, or refuse."""
+        if self.draft_sampling is None:
+            return
+        assert self._staging_gen != self._drafted_gen, (
+            "propose without a fresh stage_draft_sampling_host: the q row bases "
+            "are the previous step's"
+        )
+        self._drafted_gen = self._staging_gen
 
     def lossless_verify_inputs(self, bs: int, *, all_greedy: bool, has_filter: bool):
         """The verify step's ``(draft_probs, q_row_base)``, or ``(None, None)``.
@@ -989,19 +1002,13 @@ class DSparkProposer(Drafter):
             running_bs, next_token_ids, target_positions, last_token_indices
         )
 
-        # This step's temperatures / greedy mask / Philox key are already in the
-        # buffers the captured block head baked the addresses of, carried by
-        # `prepare_sample`'s `sampling` H2D, so there is nothing to launch here.
-        # The one thing that would break silently is the two sizing themselves
-        # by different batches, so say it out loud.
-        assert (
-            self.draft_sampling is None
-            or scheduled_bs == 0
-            or self._staged_draft_bs == scheduled_bs
-        ), (
-            f"draft sampling staged for {self._staged_draft_bs} sequences but "
-            f"the block is drafting {scheduled_bs}"
-        )
+        # This step's temperatures / greedy mask / Philox key / q row bases are
+        # already in the buffers the captured block head baked the addresses
+        # of, carried by `prepare_sample`'s `sampling` H2D, so there is nothing
+        # to launch here -- provided that staging happened for this propose. A
+        # propose reached without it (one that skipped `prepare_sample`) would
+        # draft through the previous step's row bases, so refuse it.
+        self._consume_staging()
 
         if self._with_draft:
             return self._propose_with_draft(

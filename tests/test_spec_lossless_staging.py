@@ -274,6 +274,19 @@ def test_the_philox_key_advances_once_per_step(monkeypatch):
     assert keys == [0, 1, 2]
 
 
+def test_a_propose_needs_a_staging_of_its_own(monkeypatch):
+    """Same batch size twice in a row is not enough: each propose must consume
+    a staging of its own, or it would draft through stale row bases."""
+    prop = proposer(monkeypatch)
+    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
+        prop._consume_staging()
+    for _ in range(2):
+        stage(prop, batch(["a", "b"]))
+        prop._consume_staging()
+        with pytest.raises(AssertionError):
+            prop._consume_staging()
+
+
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
