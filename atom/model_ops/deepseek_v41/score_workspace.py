@@ -18,12 +18,12 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from atom.model_ops.indexer import LogitsWorkspace
-from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 from atom.model_ops.sparse_indexer_chunk import (
+    LogitsWorkspace,
     logits_rows,
     plane_rows,
 )
+from atom.model_ops.sparse_indexer_chunk import flat_view as _view
 
 # A packed row starts on a 256-byte boundary, which the row-group scorer's
 # stores need to run at speed, and on a whole candidate block, so its block

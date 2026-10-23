@@ -62,11 +62,11 @@ from atom.model_ops.indexer import (
     DcpSplit,
     Fp4LaunchStorages,
     IndexRows,
-    LogitsWorkspace,
     concat_rows,
     fp4_rows,
     fp8_rows,
 )
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.sparse_indexer_fp4 import (
     fp4_index_scale_rows,
     sparse_indexer_fp4_enabled,

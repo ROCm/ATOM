@@ -195,7 +195,6 @@ def mla_builder_cls():
             DcpSplit=noop,
             Fp4LaunchStorages=noop,
             IndexRows=object,
-            LogitsWorkspace=object,
             concat_rows=noop,
             fp4_rows=noop,
             fp8_rows=noop,

@@ -122,11 +122,11 @@ from atom.model_ops.indexer import (
     ConcatKeys,
     Fp4LaunchStorages,
     IndexRows,
-    LogitsWorkspace,
     concat_rows,
     fp4_rows,
     fp8_rows,
 )
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 from atom.model_ops.v4_kernels import (
     build_v4_paged_decode_indptr,
     fp4_indexer_enabled,

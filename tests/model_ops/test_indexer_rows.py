@@ -18,7 +18,7 @@ rows_module = pytest.importorskip(
 from atom.distributed.pcp_utils import pcp_owned_rows_by_request
 from atom.model_ops import sparse_indexer_chunk as chunk
 from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-from atom.model_ops.indexer import LogitsWorkspace
+from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
 
 
 def _covers(bands, first, end):

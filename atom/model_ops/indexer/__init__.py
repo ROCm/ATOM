@@ -22,7 +22,6 @@ from .rows import (
     fp8_rows,
 )
 from .score import score_topk
-from .workspace import LogitsWorkspace
 
 __all__ = [
     "NATURAL",
@@ -32,7 +31,6 @@ __all__ = [
     "Fp4LaunchStorages",
     "IndexCache",
     "IndexRows",
-    "LogitsWorkspace",
     "concat_rows",
     "fold_query_scale",
     "fp4_rows",

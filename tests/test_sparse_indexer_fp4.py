@@ -798,12 +798,8 @@ def _fp4_decode_scorer(monkeypatch, rows, width, seed, max_bs=None):
     `max_bs` sequences, block-table rows past the real ones zero (as
     `prepare_decode` publishes them out to `running_bs`)."""
     from atom.model_ops.fp4_mqa_ragged_metadata import Fp4MqaRaggedMetadata
-    from atom.model_ops.indexer import (
-        IndexCache,
-        LogitsWorkspace,
-        fp4_rows,
-        score_topk,
-    )
+    from atom.model_ops.indexer import IndexCache, fp4_rows, score_topk
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
     from atom.utils import forward_context
 
     table, kv, ks, q, qs, weights, _ = _written_cache_and_queries(

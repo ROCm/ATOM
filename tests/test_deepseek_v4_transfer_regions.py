@@ -175,10 +175,13 @@ def _stub_v4_runtime_imports():
     # The indexer's scorer needs aiter's kernels; the builder only names them.
     indexer = types.ModuleType("atom.model_ops.indexer")
     indexer.NATURAL, indexer.PRESHUFFLE = "natural", "preshuffle"
-    for name in ("ConcatKeys", "IndexRows", "LogitsWorkspace"):
+    for name in ("ConcatKeys", "IndexRows"):
         setattr(indexer, name, type(name, (), {}))
     for name in ("Fp4LaunchStorages", "concat_rows", "fp4_rows", "fp8_rows"):
         setattr(indexer, name, lambda *args, **kwargs: None)
+    # Its sequences are aiter's FP4 MQA plan; the builder only names the type.
+    ragged = types.ModuleType("atom.model_ops.fp4_mqa_ragged_metadata")
+    ragged.Fp4MqaRaggedMetadata = type("Fp4MqaRaggedMetadata", (), {})
 
     replacements = {
         "aiter": aiter,
@@ -189,6 +192,7 @@ def _stub_v4_runtime_imports():
         "aiter.dist.parallel_state": parallel_state,
         "atom.distributed.pcp_utils": pcp_utils,
         "atom.model_ops.attentions.backends": backends,
+        "atom.model_ops.fp4_mqa_ragged_metadata": ragged,
         "atom.model_ops.indexer": indexer,
         "atom.model_ops.v4_kernels": kernels,
     }
