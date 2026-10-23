@@ -30,6 +30,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.ops.topk import top_k_per_row_prefill
 
 from atom.model_ops.qwen4_exp.ops import qsa_flydsl_layout
+from atom.utils import envs
 
 
 def _prev_pow2(n: int) -> int:
@@ -922,6 +923,127 @@ def _qsa_paged_mqa_logits_mfma_kernel(
     )
 
 
+@triton.jit
+def _qsa_paged_mqa_logits_stacked_kernel(
+    q_ptr,
+    k_cache_ptr,
+    page_table_ptr,
+    token_to_request_ptr,
+    query_positions_ptr,
+    context_lens_ptr,
+    visible_groups_ptr,
+    row_starts_ptr,
+    logits_ptr,
+    stride_q_token,
+    stride_q_head,
+    stride_cache_page,
+    stride_cache_token,
+    stride_table_request,
+    stride_logits_token,
+    num_tokens,
+    num_columns,
+    num_cache_pages,
+    num_requests,
+    score_divisor,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    BMT: tl.constexpr,
+    BN: tl.constexpr,
+) -> None:
+    """`_qsa_paged_mqa_logits_mfma_kernel` with the heads stacked into M.
+
+    A program's BMT query rows times NUM_HEADS heads form one M = BMT * heads
+    operand, so a key tile is read once and meets every head of every row in
+    a single dot; the per-head ReLU is applied before the heads are summed
+    back out of M. BMT = 4 with 4 heads is one MFMA tile and, in decode, one
+    request's verification rows -- each request's keys are read once rather
+    than once per row.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    rows = pid_m * BMT + tl.arange(0, BMT)
+    rvalid = rows < num_tokens
+    request = tl.load(token_to_request_ptr + rows, mask=rvalid, other=-1)
+    request_ok = rvalid & (request >= 0) & (request < num_requests)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+    position = tl.load(query_positions_ptr + rows, mask=rvalid, other=-1)
+    context = tl.load(context_lens_ptr + safe_request, mask=request_ok, other=0)
+    visible = tl.maximum(
+        0,
+        tl.minimum((position + 1) // COMPRESS_RATIO, context // COMPRESS_RATIO),
+    )
+    visible = tl.where(request_ok, visible, 0)
+    if pid_n == 0:
+        tl.store(visible_groups_ptr + rows, visible, mask=rvalid)
+        if row_starts_ptr is not None:
+            tl.store(row_starts_ptr + rows, 0, mask=rvalid)
+    # A program walks column tiles pid_n, pid_n + G, ... below the block's
+    # widest visible count, G = the grid's second dimension.
+    num_tiles = tl.cdiv(tl.minimum(tl.max(visible, axis=0), num_columns), BN)
+    if pid_n >= num_tiles:
+        return
+
+    M: tl.constexpr = BMT * NUM_HEADS
+    stacked = tl.arange(0, M)
+    stacked_row = pid_m * BMT + stacked // NUM_HEADS
+    q_base = (
+        q_ptr
+        + stacked_row.to(tl.int64) * stride_q_token
+        + (stacked % NUM_HEADS) * stride_q_head
+    )
+    dims = tl.arange(0, HEAD_DIM)
+    q_all = tl.load(
+        q_base[:, None] + dims[None, :],
+        mask=(stacked_row < num_tokens)[:, None],
+        other=0.0,
+    )
+
+    active = visible > 0
+    req_lo = tl.min(tl.where(active, safe_request, num_requests), axis=0)
+    req_hi = tl.max(tl.where(active, safe_request, -1), axis=0)
+    for tile in range(pid_n, num_tiles, tl.num_programs(1)):
+        columns = tile * BN + tl.arange(0, BN)
+        logical_page = columns // PAGE_SIZE
+        page_offset = columns % PAGE_SIZE
+        page_ok = logical_page < PAGE_TABLE_WIDTH
+        safe_page = tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1)
+        score = tl.zeros((BMT, BN), dtype=tl.float32)
+        for req in range(req_lo, req_hi + 1):
+            physical = tl.load(
+                page_table_ptr + req.to(tl.int64) * stride_table_request + safe_page,
+                mask=page_ok,
+                other=-1,
+            )
+            key_ok = page_ok & (physical >= 0) & (physical < num_cache_pages)
+            keys_t = tl.load(
+                k_cache_ptr
+                + tl.maximum(physical, 0).to(tl.int64)[None, :] * stride_cache_page
+                + page_offset[None, :] * stride_cache_token
+                + dims[:, None],
+                mask=key_ok[None, :],
+                other=0.0,
+            )
+            s = tl.dot(q_all, keys_t)
+            s = tl.sum(tl.reshape(tl.maximum(s, 0.0), (BMT, NUM_HEADS, BN)), axis=1)
+            score = tl.where((safe_request == req)[:, None], s, score)
+        score = score / score_divisor
+        tl.store(
+            logits_ptr
+            + rows[:, None].to(tl.int64) * stride_logits_token
+            + columns[None, :],
+            tl.where(columns[None, :] < visible[:, None], score, -float("inf")),
+            mask=rvalid[:, None] & (columns < num_columns)[None, :],
+        )
+
+
+# (BMT, BN, num_warps, column programs) of the stacked decode scorer. Measured
+# at 36 rows over 9 requests (MTP 3 verify) with L2 flushed between calls.
+_STACKED_DECODE_TILE = (4, 32, 2, 256)
+
+
 # Cap on the FP32 logits buffer; scoring is chunked over query rows to respect
 # it, because `columns` grows with the paged-cache capacity.
 DEFAULT_LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -1007,8 +1129,63 @@ def qsa_paged_mqa_logits(
             row_starts.zero_()
         return logits, visible_groups
 
-    # Decode-sized batches keep the CUDA-core kernel: one row per request
-    # leaves the MFMA M dimension mostly empty and cuts the grid 16x.
+    contiguous = (
+        q.stride(2) == 1
+        and compressed_k_cache.stride(3) == 1
+        and page_table.stride(1) == 1
+    )
+    heads, head_dim = q.shape[1], q.shape[2]
+    bmt, bn, warps, column_programs = _STACKED_DECODE_TILE
+    # Decode-sized batches stack each row's heads into the MFMA M dimension,
+    # so a few rows per request still fill it and a request's keys are read
+    # once rather than once per row.
+    if (
+        q.shape[0] <= 256
+        and envs.ATOM_QSA_STACKED_DECODE_SCORER
+        and contiguous
+        and heads & (heads - 1) == 0
+        and bmt * heads >= 16
+        and head_dim & (head_dim - 1) == 0
+        and head_dim >= 16
+    ):
+        _qsa_paged_mqa_logits_stacked_kernel[
+            (
+                triton.cdiv(q.shape[0], bmt),
+                min(triton.cdiv(columns, bn), column_programs),
+            )
+        ](
+            q,
+            compressed_k_cache,
+            page_table,
+            token_to_request,
+            query_positions,
+            context_lens,
+            visible_groups,
+            row_starts,
+            logits,
+            q.stride(0),
+            q.stride(1),
+            compressed_k_cache.stride(0),
+            compressed_k_cache.stride(1),
+            page_table.stride(0),
+            logits.stride(0),
+            q.shape[0],
+            columns,
+            compressed_k_cache.shape[0],
+            page_table.shape[0],
+            float(divisor),
+            PAGE_SIZE=compressed_k_cache.shape[1],
+            PAGE_TABLE_WIDTH=_table_width_bucket(page_table.shape[1]),
+            NUM_HEADS=heads,
+            HEAD_DIM=head_dim,
+            COMPRESS_RATIO=compress_ratio,
+            BMT=bmt,
+            BN=bn,
+            num_warps=warps,
+        )
+        return logits, visible_groups
+    # Otherwise decode-sized batches keep the CUDA-core kernel: one row per
+    # request leaves the MFMA M dimension mostly empty and cuts the grid 16x.
     if (
         q.shape[0] > 256
         and q.stride(2) == 1

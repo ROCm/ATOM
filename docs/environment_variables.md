@@ -130,6 +130,12 @@ cannot affect a server that does not use the feature.
 | **ATOM_DCP_SPARSE_PREFILL_NONPS** | bool | 1 (true) | DSA models under DCP: run sparse prefill attention on the non-persistent fp8 gqa64 MLA kernel, which needs no work metadata. Applies with fp8 q/KV, 64 gathered heads (tp4/dcp4, tp8/dcp8), gfx950, `ATOM_MLA_PAGE_SIZE=1` and `--max-num-batched-tokens` <= 32768 (each prefill token is one kernel row; a larger step budget logs a warning and keeps the default kernel). Needs an aiter that ships the kernel (ROCm/aiter#6132); with an older aiter set `0`, or the first sparse prefill past `index_topk` raises. |
 | **ATOM_SPARSE_INDEXER_LOGITS_BUDGET_MB** | int | 2048 | Sparse (DSA) indexer dense fp32 logits budget, in MiB. Prefill scores query rows in chunks within it. It also sizes the decode logits workspace (`max_model_len` wide, allocated once and counted in the KV budget) and so how many bands a decode step is scored in: lowering it saves memory but adds launches. `0` keeps only aiter's hard 2 GiB buffer-descriptor cap. |
 
+### Qwen3.8-Flash-Next (QSA)
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_QSA_STACKED_DECODE_SCORER** | bool | 1 (true) | Score decode-sized QSA index calls (at most 256 query rows: the target's MTP verify and the draft) with the MFMA kernel that stacks every row's index heads into the M dimension, so each key tile is read once per 4 rows instead of once per row. Needs power-of-two index heads (at least 4) and head dim; other shapes keep the CUDA-core scorer. Set `0` to force the CUDA-core scorer. |
+
 ### GLM-5.3
 
 | Variable | Type | Default | Description |
