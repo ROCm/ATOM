@@ -1111,6 +1111,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # steps the pure-prefill profile does not cover, e.g. mixed + DSpark on
     # DeepSeek-V4-Pro. Off: the runner's `forward` is not wrapped at all.
     "ATOM_PROBE_MEM": lambda: os.getenv("ATOM_PROBE_MEM", "0") == "1",
+    # Fraction of device memory held back from the KV cache when mixed
+    # prefill+decode is on (default 5%). The KV budget comes from one profiled
+    # pure-prefill step, which on DeepSeek-V4-Pro tp8 missed ~16 GiB that mixed
+    # + DSpark actually uses: activation peaks 1.5x the profile, ~8 GiB of
+    # allocator fragmentation, and ~4 GiB of runtime growth outside the
+    # allocator. 5% (14.4 GiB on a 288 GiB device) is what CI validated as
+    # --gpu-memory-utilization 0.85; the KV cache peaked at 7% used. 0 disables.
+    "ATOM_MIXED_KV_RESERVE_FRACTION": lambda: float(
+        os.getenv("ATOM_MIXED_KV_RESERVE_FRACTION", "0.05")
+    ),
     # Per-segment output magnitude for a mixed batch's two halves. A segment
     # that is wrong usually shows it here -- zeros, NaN, or a norm an order off
     # the other half -- and that says WHICH half to read. Registered rather than

@@ -1043,9 +1043,22 @@ class ModelRunner:
 
     def _kv_budget_extra_reserve(self, total_bytes: int) -> int:
         """Extra GPU bytes to hold back from the KV cache budget beyond the
-        base overhead. Base runner reserves nothing; override point for
-        setups that share the GPU with another process."""
-        return 0
+        base overhead. Override point for setups that share the GPU with
+        another process; overrides add to this, not replace it.
+
+        Mixed prefill+decode holds back ATOM_MIXED_KV_RESERVE_FRACTION of the
+        device (5%). The budget is sized from one profiled pure-prefill step
+        that runs before the KV cache exists, so it cannot exercise a mixed
+        step's decode rows; on DeepSeek-V4-Pro tp8 with DSpark, the real steps
+        needed ~16 GiB more than it planned (activation peaks 1.5x the
+        profile, ~8 GiB of allocator fragmentation, ~4 GiB of growth outside
+        the allocator). Without it c=1024 OOMed and c=512 stalled with the
+        device at ~0 GiB free; at 5% both ran clean, at no-mixed throughput,
+        with the KV cache at 7% used.
+        """
+        if not getattr(self.config, "enable_mixed_prefill_decode", False):
+            return 0
+        return int(total_bytes * envs.ATOM_MIXED_KV_RESERVE_FRACTION)
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.
@@ -2083,6 +2096,7 @@ class ModelRunner:
             f"non_torch={non_torch / (1 << 30):.2f}GB, "
             f"cudagraph_est={cudagraph_overhead / (1 << 30):.2f}GB, "
             f"safety={safety_margin / (1 << 30):.2f}GB, "
+            f"extra_reserve={extra_reserve / (1 << 30):.2f}GB, "
             f"available_for_kv={available_for_kv / (1 << 30):.2f}GB, "
             f"block_bytes={block_bytes}, "
             f"num_kvcache_blocks={num_kvcache_blocks}"
@@ -4758,7 +4772,7 @@ class RapidServeModelRunner(ModelRunner):
         # Two processes share the GPU in disagg mode; reserve extra headroom so
         # NCCL/system allocs (e.g. the 512MB NCCL barrier buffer) don't OOM.
         safety_margin = int(total_bytes * 0.02)
-        return 4 * safety_margin
+        return super()._kv_budget_extra_reserve(total_bytes) + 4 * safety_margin
 
     def get_num_blocks(self) -> dict[str, object]:
         # Decode in disagg mode owns no GPU memory — kvcache is imported from
