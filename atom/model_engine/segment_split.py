@@ -128,10 +128,10 @@ class AddedTokenSplitter:
             description = json.loads(self.backend.to_str())
         except (ValueError, AttributeError):
             return False
-        # A normalizer runs per segment too, and a normalized added token is
-        # matched after it runs; only the identity is accepted.
         if not _deterministic(description.get("model")):
             return False
+        # A normalizer runs per segment too, and a normalized added token is
+        # matched after it runs; only the identity is accepted.
         if not _normalizer_is_identity(description):
             return False
         if _offset_sensitive(description.get("pre_tokenizer")):
