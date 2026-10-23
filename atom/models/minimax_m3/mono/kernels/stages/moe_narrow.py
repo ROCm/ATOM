@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """K4 stages: the per-(token, slot) MoE (S <= 4)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
@@ -18,19 +19,12 @@ from atom.models.minimax_m3.mono.layout import (
     shared_after_routing,
 )
 from atom.mono.device.mx import FP4, mfma_scaled
-from atom.mono.device.ops import (
-    bf2_f32,
-    bf16_pair,
-    bf16_round,
-    fp8_pack4,
-    row_sum,
-    traced,
-)
+from atom.mono.device.ops import bf2_f32, bf16_pair, bf16_round, fp8_pack4, row_sum
 from atom.mono.plan.execution import THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
 
 
-@traced
+@flyc.jit
 def moe_narrow_defs(k4ctx):
     """The functions of the per-(token, slot) MoE (S <= 4)."""
     BASE = k4ctx["BASE"]
@@ -240,8 +234,8 @@ def moe_narrow_defs(k4ctx):
         # each poll) cost S = 1 / 4 1.75 / 6 us, though the arithmetic is tiny
         for k in range_constexpr(tokens):
             if tid < MID8_WORDS // 2:  # 8 elements a lane, 4 lanes a 32-block
-                w = fx.Vector(
-                    fx.ptr_load(xs + (k * MID16_WORDS + tid * 4), result_type=v4f)
+                w = fx.ptr_load(
+                    xs + (k * MID16_WORDS + tid * 4), result_type=v4f
                 ).bitcast(fx.Int32)
                 f = [v for j in range(4) for v in bf2_f32(w[j])]
                 sc, inv = mx8_scale(f, (1, 2))

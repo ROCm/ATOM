@@ -3,18 +3,19 @@
 """Layer-kernel stage: the FFN all-reduce of a down task's partial rows (the
 sparse layers' MoE and the dense layers' MLP)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from atom.models.minimax_m3.mono.config import HIDDEN, MAX_TOKENS
 from atom.models.minimax_m3.mono.layout import DN_ROWS
-from atom.mono.device.ops import bf2_f32, rsrc, traced
+from atom.mono.device.ops import bf2_f32, rsrc
 from atom.mono.device.ranks import sum_partials
 from atom.mono.device.sync import preg
 
 
-@traced
+@flyc.jit
 def ffn_reduce_defs(k4ctx):
     """The FFN all-reduce of a down task's rows."""
     AG_RS = k4ctx["AG_RS"]

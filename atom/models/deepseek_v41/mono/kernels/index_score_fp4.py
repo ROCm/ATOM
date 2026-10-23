@@ -27,9 +27,9 @@ arithmetic, step for step (relu as x + |x| against half the weight, the
 lane's heads in one fma chain, then the swaps): its logits bit for bit.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
@@ -39,12 +39,12 @@ from atom.models.deepseek_v41.mono import index_plan as ip
 from atom.mono.device.mx import FP4, mfma_scaled
 from atom.mono.device.ops import (
     CM_DEV,
+    buffer_ptr,
     butterfly,
     global_load,
     ld_i32,
     permlane_swap,
     rsrc,
-    traced,
 )
 from atom.mono.plan.execution import BLOCKS, THREADS, WAVES
 from atom.mono.plan.trace import enter_stage
@@ -85,11 +85,8 @@ def _vop(asm, *args):
 
 
 def _sload4(addr):
-    """Four words at a wave-uniform address, a scalar load (the constant
-    address space): the scalar cache's round trip, not the vector memory's."""
-    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<4>"), as_ir_value(addr)).result
-    v = fx.Vector(llvm.LoadOp(T.vec(4, T.i32), ptr, alignment=16).result)
-    return [fx.Int32(v[k]) for k in range(4)]
+    """Four words at a wave-uniform address, through the scalar cache."""
+    return list(rocdl.s_buffer_load(buffer_ptr(addr), 0, count=4))
 
 
 # the kernel arguments this stage reads (of K2a's many: reading them all at
@@ -125,12 +122,12 @@ def _swap_add(off, x, y):
 def _lds_barrier():
     """A barrier for an LDS hand-off only: ``gpu.barrier`` would also wait on
     the walk's first reads, issued ahead of it to overlap it."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
 
 
-@traced
+@flyc.jit
 def _stage_rows(c, lead, span, first_keys=None):
     """The piece's rows into LDS, read once a CTA (every wave reading its own
     copy put the CTA's waves on the same lines at once): thread u <
@@ -195,18 +192,16 @@ def _rows(c, rows):
     out = []
     for r in range_constexpr(rows):
         row = lds + r * ROW_WORDS
-        bound = fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r)))
+        bound = fx.ptr_load(lds + (BOUNDS_AT + r))
         q = [
-            fx.Vector(fx.ptr_load(row + ((mi * 16 + l) * 16 + g * 4), result_type=v4))
+            fx.ptr_load(row + ((mi * 16 + l) * 16 + g * 4), result_type=v4)
             for mi in range(M_TILES)
         ]
-        qs = fx.Int32(fx.ptr_load(row + (Q_WORDS + g * 16 + l)))
+        qs = fx.ptr_load(row + (Q_WORDS + g * 16 + l))
         w = []
         for mi in range_constexpr(M_TILES):
-            w4 = fx.Vector(
-                fx.ptr_load(
-                    row + (Q_WORDS + QS_WORDS + mi * 16 + g * 4), result_type=v4
-                )
+            w4 = fx.ptr_load(
+                row + (Q_WORDS + QS_WORDS + mi * 16 + g * 4), result_type=v4
             ).bitcast(fx.Float32)
             w.append([w4[e] * fx.Float32(0.5) for e in range(4)])
         out.append((bound, q, qs, w))
@@ -233,11 +228,9 @@ def _keys(c, page, nt):
     l, g = lane % 16, lane // 16
     # 64-bit addresses: a pool past 4 GiB is out of a buffer offset's reach
     page = fx.Int64(page)
-    kvs = fx.Int32(
-        global_load(a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4))
-    )
+    kvs = global_load(a["pscale"] + page * PAGE_SCALES + fx.Int64(g * 8 + (l % 2) * 4))
     base = a["plane"] + page * PAGE_BYTES + fx.Int64(g * 32 + (l % 2) * 16)
-    kv = [fx.Vector(global_load(base + t * 128, 4, nt)) for t in range(4)]
+    kv = [global_load(base + t * 128, 4, nt) for t in range(4)]
     return kv, kvs
 
 
@@ -251,7 +244,7 @@ def _first_keys(c, pages, nt):
     return init + pages[DEPTH:]
 
 
-@traced
+@flyc.jit
 def _step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
     """Step st's logits of every row (and block maxima on a candidate
     producer); ``after_mfmas`` once its keys are read."""
@@ -282,7 +275,7 @@ def _step(c, lead, rows, outs, kv, kvs, st, after_mfmas):
             for mi in range_constexpr(M_TILES):
                 for e in range_constexpr(4):
                     x = fx.Float32(accs[r][mi][e])
-                    t = x + fx.Float32(fmath.absf(x))
+                    t = x + fmath.absf(x)
                     total = (
                         _vop("v_mul_f32 $0, $1, $2", t, w[mi][e])
                         if total is None
@@ -309,7 +302,7 @@ def _swap_max(off, x, y):
     return fx.max(a.bitcast(fx.Float32), b.bitcast(fx.Float32))
 
 
-@traced
+@flyc.jit
 def _block_maxima(c, lead, rows, totals, key, st):
     """Each row's best visible logit of each 8-key block of step st (NaN
     ignored, capped at the largest finite, a row's newest block +inf), on a
@@ -322,8 +315,8 @@ def _block_maxima(c, lead, rows, totals, key, st):
     l, g = lane % 16, lane // 16
     vals = []
     for r in range_constexpr(len(rows)):
-        best = fx.Float32(fx.isnan(totals[r]).select(fx.Float32(NEG), totals[r]))
-        vals.append(fx.Float32((key < rows[r][0]).select(best, fx.Float32(NEG))))
+        best = fx.isnan(totals[r]).select(fx.Float32(NEG), totals[r])
+        vals.append((key < rows[r][0]).select(best, fx.Float32(NEG)))
     if const_expr(len(rows) == ip.WALK_ROWS):
         h01, h23, h45 = (_swap_max(32, vals[i], vals[i + 1]) for i in (0, 2, 4))
         # quarter q (lanes 16 q ..) of packed[k] holds row quarter_rows[k][q]
@@ -342,7 +335,7 @@ def _block_maxima(c, lead, rows, totals, key, st):
             row = here.select(fx.Int32(quarter_rows[k][q]), row)
             bound = here.select(rows[quarter_rows[k][q]][0], bound)
         blocks = ip.blocks(bound)
-        best = fx.Float32((blk == blocks - 1).select(fx.Float32(float("inf")), best))
+        best = (blk == blocks - 1).select(fx.Float32(float("inf")), best)
         # a row twice in `packed[k]` is stored from its first quarter only
         first = None
         for q in range_constexpr(4):
@@ -355,7 +348,7 @@ def _block_maxima(c, lead, rows, totals, key, st):
             )  # fmt: skip
 
 
-@traced
+@flyc.jit
 def _walk(c, lead, trow, count, step_of, init, rows_n):
     """This wave's ``count`` steps ``step_of(k)`` of the piece's first
     ``rows_n`` rows, off the keys ``init`` holds in flight: DEPTH buffers,
@@ -404,7 +397,7 @@ def _walk(c, lead, trow, count, step_of, init, rows_n):
             )  # fmt: skip
 
 
-@traced
+@flyc.jit
 def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
     """Chunks [ch0, ch1) of the ``span`` tokens from ``lead`` (a piece), each
     wave holding ``rows`` (a build constant: WALK_ROWS, or 1 for a REINDEX
@@ -443,7 +436,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
         init = _stage_rows(c, lead, span, lambda: _first_keys(c, pages, nt))
         _lds_barrier()
     lds = c["sel_lds"]["keys"]
-    bounds = [fx.Int32(fx.ptr_load(lds + (BOUNDS_AT + r))) for r in range(ip.WALK_ROWS)]
+    bounds = [fx.ptr_load(lds + (BOUNDS_AT + r)) for r in range(ip.WALK_ROWS)]
     # steps up to the rows' last scored chunk, from the bounds in LDS: the
     # first reads went out before them, on the chunks alone
     top = ip.score_chunks(bounds[0])
@@ -464,7 +457,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
                 c["put"](c["isf"], (lead + r) * max_chunks + ch0 + m, 1)
 
 
-@traced
+@flyc.jit
 def run_scores4(c, s, bid, max_chunks):
     """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
     the step's host plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for

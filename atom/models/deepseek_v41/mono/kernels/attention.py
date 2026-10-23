@@ -37,6 +37,7 @@ rn(acc alpha_kv) / max(l_final, 1e-30), bf16 -> ``att["out"]`` LDS [16][32],
 which the same task's inverse-RoPE quant reads.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -59,7 +60,7 @@ from atom.mono.device.ops import (
     readlane,
     row_shr,
     rsrc,
-    traced,
+    wave_max,
     xshfl,
 )
 from atom.mono.plan.execution import BLOCKS
@@ -159,9 +160,7 @@ def _rows_from_lds(c, kv):
     lane = c["lane"]
     at = kv + (lane % BK) * SCORE_LDS_ROW + 4 * (lane // 16)
     return [
-        fx.Vector(
-            fx.ptr_load(at + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32))
-        )
+        fx.ptr_load(at + ch * 16, result_type=fx.Vector.make_type(4, fx.Int32))
         for ch in range(HEAD_DIM // 32)
     ]
 
@@ -170,7 +169,7 @@ def _ld_row4(pool, row, byte):
     ptr = fx.inttoptr(
         fx.PointerType.get(T.i32, fx.AddressSpace.Global, 16), _row_ptr(pool, row, byte)
     )
-    return fx.Vector(fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32)))
+    return fx.ptr_load(ptr, result_type=fx.Vector.make_type(4, fx.Int32))
 
 
 def _keys(a, t):
@@ -179,11 +178,11 @@ def _keys(a, t):
     first window position and its slot's row base (word 2 of its metadata, the
     block table offset, is the indexer's: ``index_score._selected_rows``)."""
     first, count, base = [ld_i32(a["kmeta"], t * KMETA + i) for i in (0, 1, 3)]
-    n_sel = ip.selected(fx.Int32(ld_dev(a["sbound"], t)))
+    n_sel = ip.selected(ld_dev(a["sbound"], t))
     return aplan.kv_len(n_sel, count), (n_sel, first, base)
 
 
-@traced
+@flyc.jit
 def await_selection(c, t):
     """A layer that selects: its token t's selection is written this launch. A
     build without the indexer (``index_bound_max`` 0: the DSpark draft) has no
@@ -202,11 +201,11 @@ def _key_row(a, t, meta, key):
     key = fx.max(key, 0)
     picked = key < n_sel
     # a layer without a selection passes a dummy ``sel``: its row is never used
-    selected = fx.Int32(
-        picked.select(ld_dev(a["sel"], t * a["topk"] + fx.min(key, a["topk"] - 1)), 0)
+    selected = picked.select(
+        ld_dev(a["sel"], t * a["topk"] + fx.min(key, a["topk"] - 1)), 0
     )
     window = base + a["ring_off"] + (first + key - n_sel) % a["ring_slots"]
-    return fx.Int32(picked.select(selected, window))
+    return picked.select(selected, window)
 
 
 def only_live(cond, live):
@@ -225,7 +224,7 @@ def _ap(d, t, tile, s):
     return ((t * d.head_tiles.count + tile) * SPLITS + s) * 64
 
 
-@traced
+@flyc.jit
 def stage_attn_score(c, task, per):
     """Score task ``task``, ``per`` a (token, head tile) (``score_tasks``): wave
     w its splits (sg + per k) 8 + w, each split's key rows through the wave's
@@ -266,7 +265,7 @@ def stage_attn_score(c, task, per):
         _score_split(c, t, tile, ss[k], qh, live, kv_len, kws, qws)
 
 
-@traced
+@flyc.jit
 def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
     """Split s of token t, head tile ``tile``, on this wave from its key and q
     operands: the scores' max, sum and bf16 probabilities -> AM / AL / AP."""
@@ -278,16 +277,12 @@ def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
         ok = key < kv_len
         sc = fx.Vector.filled(4, 0.0, fx.Float32)
         for ch in range_constexpr(HEAD_DIM // 32):
-            kw = fx.Vector.from_elements(
-                [ok.select(kws[ch][e], fx.Int32(0)) for e in range(4)], fx.Int32
-            )
+            kw = ok.select(kws[ch], 0)
             qw = qws[ch]
             sc = mfma_bf16(kw.bitcast(fx.BFloat16), qw.bitcast(fx.BFloat16), sc)
         scale = fx.Int32(a["qk_scale"]).bitcast(fx.Float32)
         sv = [
-            fx.Float32(
-                (s * BK + 4 * g + i < kv_len).select(sc[i] * scale, fx.Float32(NEG))
-            )
+            (s * BK + 4 * g + i < kv_len).select(sc[i] * scale, fx.Float32(NEG))
             for i in range(4)
         ]
         m = butterfly(
@@ -307,18 +302,18 @@ def _score_split(c, t, tile, s, qh, live, kv_len, kws, qws):
 def _l_tree(l, alpha, lane):
     """The reduce's sum of l x alpha over lanes = splits (read at lane 63)."""
     x = l * alpha
-    v = fx.Float32(fmath.fma(l, alpha, row_shr(x, lane, 8)))
+    v = fmath.fma(l, alpha, row_shr(x, lane, 8))
     for k in (4, 2, 1):
         v = row_shr(v, lane, k) + v
     row = lane // 16
     b15 = lane_gather(v.bitcast(fx.Int32), fx.max(row * 16 - 1, 0)).bitcast(fx.Float32)
-    v = fx.Float32((row % 2 == 1).select(b15 + v, v))
+    v = (row % 2 == 1).select(b15 + v, v)
     b31 = lane_gather(v.bitcast(fx.Int32), 31).bitcast(fx.Float32)
-    v = fx.Float32((row >= 2).select(b31 + v, v))
+    v = (row >= 2).select(b31 + v, v)
     return lane_gather(v.bitcast(fx.Int32), 63).bitcast(fx.Float32)
 
 
-@traced
+@flyc.jit
 def _stat_specs(c, t, tile, last, lane, wave):
     """Lane = split (``attention_plan.polled_split``), wave w: (m, l) of the tile's heads 2 w,
     2 w + 1."""
@@ -330,16 +325,16 @@ def _stat_specs(c, t, tile, last, lane, wave):
     ]
 
 
-@traced
+@flyc.jit
 def _pv_stats(got, act, lane, wave, att):
     """``_stat_specs``' words -> per head m_max, alpha [split][head] and l_comb
     in LDS."""
     live = lane < act
     for k in range_constexpr(2):
         h = 2 * wave + k
-        m = fx.Float32(live.select(got[k][0].bitcast(fx.Float32), fx.Float32(NEG)))
-        l = fx.Float32(live.select(got[2 + k][0].bitcast(fx.Float32), fx.Float32(0.0)))
-        m_max = butterfly(m, (32, 16, 8, 4, 2, 1), fx.max)
+        m = live.select(got[k][0].bitcast(fx.Float32), fx.Float32(NEG))
+        l = live.select(got[2 + k][0].bitcast(fx.Float32), fx.Float32(0.0))
+        m_max = wave_max(m)
         alpha = hw_exp2(m - m_max)
         l_comb = _l_tree(l, alpha, lane)
         fx.ptr_store(alpha, att["alpha"] + (lane * HEAD_TILE + h))
@@ -348,7 +343,7 @@ def _pv_stats(got, act, lane, wave, att):
             fx.ptr_store(l_comb, att["stat"] + (HEAD_TILE + h))
 
 
-@traced
+@flyc.jit
 def stage_attn_pv(c, task, groups):
     """Token t, ``groups`` column groups of 32 (from 32 ``groups`` g0) of every
     head of a tile -> ``att["out"]`` [group][head][column] (f32 of bf16),
@@ -409,7 +404,7 @@ def stage_attn_pv(c, task, groups):
         tiles = nxt
 
 
-@traced
+@flyc.jit
 def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
     """``stage_attn_pv``'s group i: each split's PV MFMAs on its key tile
     ``tiles``, their alpha-weighted tree, the combine (with thread (head,
@@ -422,19 +417,17 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
     accs = []
     for r in range_constexpr(8):
         sp = splits[r]
-        pb = fx.Vector.from_elements([pws[r][0], pws[r][1]], fx.Int32).bitcast(fx.Int16)
+        pb = fx.Vector.from_elements(pws[r], fx.Int32).bitcast(fx.Int16)
         ok = sp * BK + lane // 4 < kv_len
         # this wave's LDS tile: [key][32 columns], this lane's quarter row
         fx.ptr_store(
-            fx.Vector.from_elements(
-                [ok.select(tiles[r][e], fx.Int32(0)) for e in range(4)], fx.Int32
-            ),
+            ok.select(tiles[r], 0),
             kt + (lane // 4 * (COLS // 2) + lane % 4 * 4),
         )
         for tt in range_constexpr(2):
             col = tt * 16 + head
             half = [
-                fx.Int32(fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2)))
+                fx.ptr_load(kt + ((4 * g + i4) * (COLS // 2) + col // 2))
                 >> (col % 2 * 16)
                 & 0xFFFF
                 for i4 in range(4)
@@ -449,14 +442,12 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
                 )
             )
             live = sp < act
-            accs.append(
-                [fx.Float32(live.select(acc[j], fx.Float32(0.0))) for j in range(4)]
-            )
+            accs.append([live.select(acc[j], fx.Float32(0.0)) for j in range(4)])
     for k in range_constexpr(8):
         tt, j = k // 4, k % 4
         av = [accs[2 * r + tt][j] for r in range(8)]
         pr = [
-            fx.Float32(fmath.fma(av[2 * m], al[2 * m], av[2 * m + 1] * al[2 * m + 1]))
+            fmath.fma(av[2 * m], al[2 * m], av[2 * m + 1] * al[2 * m + 1])
             for m in range(4)
         ]
         node = (pr[0] + pr[1]) + (pr[2] + pr[3])
@@ -475,9 +466,9 @@ def _pv_group(c, kv_len, act, splits, tiles, pws, al, sink, i):
     log2e = fx.Float32(LOG2E)
     m_final = fx.max(m_max, sink * log2e)
     alpha_kv = hw_exp2(m_max - m_final)
-    alpha_sink = hw_exp2(fx.Float32(fmath.fma(sink, log2e, -m_final)))
-    l_final = fx.Float32(fmath.fma(l_comb, alpha_kv, alpha_sink))
+    alpha_sink = hw_exp2(fmath.fma(sink, log2e, -m_final))
+    l_final = fmath.fma(l_comb, alpha_kv, alpha_sink)
     o = (tot * alpha_kv) / fx.max(l_final, fx.Float32(1e-30))
-    o = fx.Float32((l_final > fx.Float32(0.0)).select(o, fx.Float32(0.0)))
+    o = (l_final > fx.Float32(0.0)).select(o, fx.Float32(0.0))
     fx.ptr_store(bf16_round(o), att["out"] + ((i * HEAD_TILE + h) * COLS + col))
     gpu.barrier()

@@ -56,7 +56,7 @@ from atom.models.deepseek_v41.mono.kernels.moe_shape import (
 )
 from atom.models.deepseek_v41.mono.kernels.token_par import own_count
 from atom.models.deepseek_v41.mono.sources import SOURCES
-from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc, traced
+from atom.mono.device.ops import CM_DEV, kernel_symbol, launcher, rsrc
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp_begin, stamp_flush
 from atom.mono.device.sync import preg, publish
@@ -151,7 +151,7 @@ def scratch_bytes(key: LayerPostBuild) -> int:
     return max(o + n for o, n in scratch_layout(key).values())
 
 
-@traced
+@flyc.jit
 def publish_x(ca, cb, t):
     """Token t's ``normed`` row, written at device scope by this CTA's norm, is
     readable by every CTA: the stores drained, then its flag."""
@@ -162,7 +162,7 @@ def publish_x(ca, cb, t):
 _XG_QUADS = HIDDEN // 4
 
 
-@traced
+@flyc.jit
 def publish_x_tok_par(ca, cb, t):
     """Token t of this rank's (its row ``rank n + t``): the flag here, as
     ``publish_x``, then the row pushed to every other rank's XG."""
@@ -189,7 +189,7 @@ def publish_x_tok_par(ca, cb, t):
                     cb["put_words"](dst, tg * (HIDDEN // 2) + 2 * q, [w[0], w[1]])
 
 
-@traced
+@flyc.jit
 def gather_x(cb, t):
     """Token t, another rank's: its row from XG -> ``normed`` here (device
     scope), then its flag (the router's wait)."""
@@ -200,7 +200,7 @@ def gather_x(cb, t):
         if q < _XG_QUADS:
             (w,) = cb["poll"]([(own, t * (HIDDEN // 2) + 2 * q, 2)])
             bo.buffer_store(
-                fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                fx.Vector.from_elements(w, fx.Int32),
                 rsrc(cb["args"]["x"]),
                 t * (HIDDEN // 2) + 2 * q,
                 cache_modifier=CM_DEV,

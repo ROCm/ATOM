@@ -3,6 +3,7 @@
 """K4 stages: the narrow MoE's up / gate / down tasks (the FFN all-reduce:
 ``ffn_reduce``)."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.act import swiglu_mul_batch
@@ -33,10 +34,10 @@ from atom.models.minimax_m3.mono.layout import (
     XSC_ROW,
 )
 from atom.mono.device.mx import FP4, fp4_tile_load, mfma_scaled, scale_index
-from atom.mono.device.ops import CM_NT, bf16_round, row_sum, rsrc, traced, uniform
+from atom.mono.device.ops import CM_NT, bf16_round, row_sum, rsrc, uniform
 
 
-@traced
+@flyc.jit
 def moe_common_defs(k4ctx):
     """The functions of the narrow MoE's up / gate / down tasks."""
     CPT = k4ctx["CPT"]

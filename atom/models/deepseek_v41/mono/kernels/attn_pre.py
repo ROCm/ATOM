@@ -40,7 +40,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr import math as fmath
+from flydsl.expr.math import fma
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.deepseek_v41.mono import index_plan as ip
@@ -96,7 +96,6 @@ from atom.mono.device.ops import (
     ld_i32,
     row_sum,
     rsrc,
-    traced,
 )
 from atom.mono.device.ranks import peer_bases
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
@@ -220,10 +219,6 @@ def scratch_bytes(tokens: int) -> int:
     return sum(n for _, n in scratch_layout(tokens).values())
 
 
-def fma(a, b, c):
-    return fx.Float32(fmath.fma(a, b, c))
-
-
 def sigmoid(z):
     """Triton's ``tl.sigmoid``: 1 / (1 + exp2(-z log2(e)))."""
     return fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(z * fx.Float32(-LOG2E)))
@@ -305,7 +300,7 @@ def pend_value(c, t, col, cc):
 
 
 # ---------------------------------------------------------------- slice
-@traced
+@flyc.jit
 def slice_input(c, task, idx):
     """Thread ``idx``'s pair of the layer input (token idx / 16, columns
     32 task + 2 (idx % 16) ..) and the drafter's tap."""
@@ -411,7 +406,7 @@ def slice_prefetch(c, task):
     return fns, rows
 
 
-@traced
+@flyc.jit
 def stage_slice(c, task, pre=None):
     """R_new, the layer input and the partial projections of hidden columns
     32 task .. +32, all four streams, every token. ``pre``: its weights and
@@ -451,7 +446,7 @@ def stage_slice(c, task, pre=None):
         slice_mix(c, task, t0, n)
 
 
-@traced
+@flyc.jit
 def slice_mix(c, task, t0, n):
     """The mix projection partials of tokens t0 .. t0 + n (``stage_slice``)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
@@ -500,7 +495,7 @@ def _col_sum(v):
     return butterfly(v, (4, 8))
 
 
-@traced
+@flyc.jit
 def stage_gate(c, t):
     """Token t's 160 slices, in slice order, -> post / comb / next pre."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
@@ -560,7 +555,7 @@ def stage_gate(c, t):
 
 
 # ---------------------------------------------------------------- norm
-@traced
+@flyc.jit
 def stage_norm(c, t):
     """The seam's RMSNorm (rstd = rsq(fma(sum, 1/H, eps)), bf16((x rstd) w); 256
     threads, 3 chunks of 8 at 8 t + 2048 c), then ATOM's quantize_fp8 of the bf16
@@ -682,40 +677,26 @@ def _fp8_step_mfma(c, k, xl, xsl, st, ops, acc, live=None, rows=None):
     col = fx.min(lane % 16, s - 1)
     if const_expr(live is not None):
         st = fx.min(st, (k + 127) // 128 - 1)
-        lo = [live.select(lo[d], fx.Int32(0)) for d in range(4)]
+        lo = live.select(lo, 0)
     past = (2 * st + 1) * 64 >= k
     if const_expr(live is not None):
         past = past | ~live
-    av = fx.Vector.from_elements(
-        [lo[d] for d in range(4)] + [past.select(fx.Int32(0), hi[d]) for d in range(4)],
-        fx.Int32,
-    )
+    hi = past.select(0, hi)
     grp = st * 4 + j
-    xlo = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xlo = fx.ptr_load(
+        xl + (col * x_row + st * 32 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
-    xhi = fx.Vector(
-        fx.ptr_load(
-            xl + (col * x_row + st * 32 + 16 + j * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
+    xhi = fx.ptr_load(
+        xl + (col * x_row + st * 32 + 16 + j * 4),
+        result_type=fx.Vector.make_type(4, fx.Int32),
     )
     if const_expr(k % 64 != 0):
         over = 4 * st + j // 2 >= kg
-        av = fx.Vector.from_elements(
-            [over.select(fx.Int32(0), av[d]) for d in range(4)]
-            + [av[4 + d] for d in range(4)],
-            fx.Int32,
-        )
-        xlo = [over.select(fx.Int32(0), xlo[d]) for d in range(4)]
-    xv = fx.Vector.from_elements(
-        [xlo[d] for d in range(4)]
-        + [past.select(fx.Int32(0), xhi[d]) for d in range(4)],
-        fx.Int32,
-    )
+        lo = over.select(0, lo)
+        xlo = over.select(0, xlo)
+    av = lo.shuffle(hi, list(range(8)))
+    xv = xlo.shuffle(past.select(0, xhi), list(range(8)))
     sb = fx.ptr_load(xsl + (col * s_row + fx.min(grp, kg - 1)))
     unit = grp >= kg
     if const_expr(live is not None):
@@ -792,14 +773,11 @@ def gemv_fp8_mfmas(c, k, xl, xsl, red, ops, split=None, tiled=False, rows=None):
     for i, (st, live) in enumerate(_gemv_steps(c, k, split, tiled)):
         acc = _fp8_step_mfma(c, k, xl, xsl, st, ops[i], acc, live, rows)
     if const_expr(split is not None and not tiled):
-        acc = fx.Vector.from_elements(
-            [(wave < split).select(acc[e], fx.Float32(0.0)) for e in range(4)],
-            fx.Float32,
-        )
+        acc = (wave < split).select(acc, 0.0)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
 
 
-@traced
+@flyc.jit
 def poll_copy(c, idx, width, spans, live=None):
     """Mailbox spans [(region, pair_of, n, dst, row)] into LDS: element u (pair
     ``pair_of(u)``) to dst + u, or ``lds_at(u, row)`` for a span of rows
@@ -829,7 +807,7 @@ def poll_copy(c, idx, width, spans, live=None):
                 _poll_store_batches(c, chunks[b0 : b0 + POLL_MAX])
 
 
-@traced
+@flyc.jit
 def _poll_store_batches(c, chunks):
     """``poll_copy``'s chunks [(region, pair_of, n, (dst, row), u)], POLL_MAX a
     round trip, each batch stored before the next is polled."""
@@ -842,7 +820,7 @@ def _poll_store_batches(c, chunks):
                 fx.ptr_store(v[0], dst + at)
 
 
-@traced
+@flyc.jit
 def load_x8(c, words_mb, codes_mb, words, groups, xl, xsl, t0=0, n=None):
     """Tokens t0 .. t0 + n's MXFP8 rows (every token's by default) from the
     mailbox into LDS rows 0 .. (codes as i32). ``n`` traced (a tile a CTA picks
@@ -862,7 +840,7 @@ def load_x8(c, words_mb, codes_mb, words, groups, xl, xsl, t0=0, n=None):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_wqkv(c, task, ops, t0, n):
     """Rows 16 task .. of wqkv_a (weights ``ops``) against tokens t0 .. t0 + n,
     their x in LDS (``load_x8``)."""
@@ -878,7 +856,7 @@ def stage_wqkv(c, task, ops, t0, n):
 
 
 # ---------------------------------------------------------------- q / kv norms
-@traced
+@flyc.jit
 def stage_qkv(c, t):
     """Token t: q_norm -> MXFP8 (the Triton dual norm, 4 warps x 8 columns) and
     kv_norm -> GPT-J RoPE of the tail -> bf16 -> group-32 FP8 QAT -> the ring.
@@ -987,7 +965,7 @@ def stage_qkv(c, t):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def normed_row_from(c, nbg, t, n):
     """Token t, when another rank owns it: its normed row from NBG -> ``normed``
     (``stage_norm``'s store)."""
@@ -999,13 +977,13 @@ def normed_row_from(c, nbg, t, n):
             if q < HIDDEN // 4:
                 (w,) = c["poll"]([(nbg, t * (HIDDEN // 2) + 2 * q, 2)])
                 bo.buffer_store(
-                    fx.Vector.from_elements([w[0], w[1]], fx.Int32),
+                    fx.Vector.from_elements(w, fx.Int32),
                     rsrc(a["normed"]),
                     t * (HIDDEN // 2) + 2 * q,
                 )
 
 
-@traced
+@flyc.jit
 def ring_row_from(c, kg, t, n):
     """Token t, when another rank owns it: its window row from KG -> the ring
     row (``stage_qkv``'s store)."""
@@ -1025,7 +1003,7 @@ def ring_row_from(c, kg, t, n):
 
 
 # ---------------------------------------------------------------- wq_b
-@traced
+@flyc.jit
 def rope_pair(c, t0, n, dim0):
     """This thread's (cos, sin) for its token of the tile from ``t0`` (``n``
     rows, the index clamped into them) at pair dim0 // 2 of a head's rotated
@@ -1038,14 +1016,14 @@ def rope_pair(c, t0, n, dim0):
     return ld_bf(a["cos"], pos * HALF + jj), ld_bf(a["sin"], pos * HALF + jj)
 
 
-@traced
+@flyc.jit
 def wqb_rope(c, task, t0, n):
     """``rope_pair`` for row task 16 + 2 (tid % 8) of wq_b."""
     d = (task * ROWS + 2 * (c["tid"] % (ROWS // 2))) % HEAD_DIM
     return rope_pair(c, t0, n, d - (HEAD_DIM - ROPE))
 
 
-@traced
+@flyc.jit
 def stage_wqb(c, task, ops, t0, n, rope):
     """Rows 16 task .. +16 of the rank's heads x 512: FP8 GEMV -> bf16 -> the
     GPT-J RoPE of a head's last 64 dims (the Triton seam: bf16 products are exact,
@@ -1066,22 +1044,22 @@ def stage_wqb(c, task, ops, t0, n, rope):
         d = r0 % HEAD_DIM
         live = d >= HEAD_DIM - ROPE
         cs, sn = rope
-        e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
-        e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
+        e0 = live.select(v0 * cs - v1 * sn, v0)
+        e1 = live.select(v0 * sn + v1 * cs, v1)
         out = t * c["d"].heads * HEAD_DIM + r0
         bo.buffer_store(e0.to(fx.BFloat16), rsrc(a["q_out"]), out)
         bo.buffer_store(e1.to(fx.BFloat16), rsrc(a["q_out"]), out + 1)
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def iq_rope(c, task, t0, n):
     """``rope_pair`` for row task 16 + 2 (tid % 8) of the index query."""
     d = (task * ROWS + 2 * (c["tid"] % (ROWS // 2))) % ip.DIM
     return rope_pair(c, t0, n, d - (ip.DIM - IDX_ROPE))
 
 
-@traced
+@flyc.jit
 def stage_iq(c, task, ops, t0, n, rope):
     """Rows 16 task .. of the indexer's wq_b [4096, 1280]: FP8 GEMV of the q
     latent -> bf16 -> the GPT-J RoPE of a head's dims 64..127 -> IQ; the token
@@ -1101,8 +1079,8 @@ def stage_iq(c, task, ops, t0, n, rope):
         live = d >= ip.DIM - IDX_ROPE
         cs, sn = rope
         # bf16 x bf16 products are exact: the original's contraction cannot show
-        e0 = fx.Float32(live.select(v0 * cs - v1 * sn, v0))
-        e1 = fx.Float32(live.select(v0 * sn + v1 * cs, v1))
+        e0 = live.select(v0 * cs - v1 * sn, v0)
+        e1 = live.select(v0 * sn + v1 * cs, v1)
         c["put_bf"](c["iq"], t * IDX_ROWS + r0, [e0, e1])
     gpu.barrier()
 

@@ -146,13 +146,18 @@ from atom.mono.plan.tiles import (
     atom_mxfp4_scale_pair,
 )
 from atom.mono.device.ops import (
+    bf16_pair,
+    bf16_round,
+    bf2_f32,
     bpermute_i32,
     div_rn,
     f8_word,
     fp8_pack4,
+    load_ptr64,
     mem_realtime,
     read_lane_i32,
     spin_pause,
+    wave_max,
     wave_umax_dpp,
     write_lane_i32,
 )
@@ -608,10 +613,8 @@ def build_glm5_monokernel(
             pos0 = fx.Int32(0)
         else:
             pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
-        r_peers = _rsrc(peers)
         # One wave sends to one peer, so retain only that wave's destination.
-        pv = fx.Vector(bo.buffer_load(r_peers, fx.min(wave, W - 1) * 2, vec_width=2, dtype=T.i32))
-        peer_dst = (fx.Int64(_uniform(pv[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv[0])))
+        peer_dst = load_ptr64(peers, fx.min(wave, W - 1))
 
         # ------------------------------------------------------------ helpers
         def ld_f32(r, i):
@@ -679,13 +682,6 @@ def build_glm5_monokernel(
         def lds_st(ptr, i, v):
             fx.ptr_store(v, ptr + i)
 
-        def bf16_pair(a, b):
-            """Two f32 -> one f32-typed word holding (bf16(a), bf16(b))."""
-            return fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Float32)[0]
-
-        def bf16_round(a):
-            return fx.Float32(fx.Float32(a).to(fx.BFloat16))
-
         def index_arg(i):
             """Load one uniform pointer from the compact indexer parameter table.
 
@@ -693,8 +689,7 @@ def build_glm5_monokernel(
             timeline argument, keeping the no-indexer kernel ABI identical to the
             original layer.  The indices argument similarly carries index_cache.
             """
-            pv = fx.Vector(bo.buffer_load(_rsrc(timeline_buf), i * 2, vec_width=2, dtype=T.i32))
-            return (fx.Int64(_uniform(pv[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv[0])))
+            return load_ptr64(timeline_buf, i)
 
         # ---- tagged-pair mailboxes
         # TileRT lineage: payload + launch epoch is the progress protocol for
@@ -712,8 +707,7 @@ def build_glm5_monokernel(
                 return sym
             if const_expr(CP_RANKS < W):
                 peer = (rank // CP_RANKS) * CP_RANKS + peer
-            words = fx.Vector(bo.buffer_load(r_peers, peer * 2, vec_width=2, dtype=T.i32))
-            return (fx.Int64(_uniform(words[1])) << 32) | fx.Int64(fx.Uint32(_uniform(words[0])))
+            return load_ptr64(peers, peer)
 
         def cp_buffer(name, address):
             return address + fx.Int64(SY[name]) + fx.Int64(peer_slot) * SY[name + "_stride"]
@@ -738,10 +732,6 @@ def build_glm5_monokernel(
             for j in range_constexpr(len(vs) // 2):
                 words += [bf16_pair(vs[2 * j], vs[2 * j + 1]).bitcast(fx.Int32), tag]
             bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), _rsrc(base_addr), i, cache_modifier=cm)
-
-        def bf2_f32(w):
-            """Packed bf16 pair word -> (f32 low, f32 high)."""
-            return (w << 16).bitcast(fx.Float32), (w & fx.Int32(-65536)).bitcast(fx.Float32)
 
         def _qptr(addr):
             return fx.inttoptr(fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8), fx.Int64(addr))
@@ -833,11 +823,6 @@ def build_glm5_monokernel(
         def wave_sum(v):
             for sh in range_constexpr(6):
                 v = _xred(v, 32 >> sh, lambda a, b: a + b)
-            return v
-
-        def wave_max(v):
-            for sh in range_constexpr(6):
-                v = _xred(v, 32 >> sh, fx.max)
             return v
 
         def block_sums(vs):
@@ -1005,12 +990,12 @@ def build_glm5_monokernel(
         def lds_mxfp8(chunk_word):
             """One scaled-MFMA B operand from a row-major 128-value MXFP8 tile."""
             words = [
-                fx.Vector(fx.ptr_load(xs + chunk_word + 16 * half + 4 * (lane // 16), result_type=v4f)).bitcast(
+                fx.ptr_load(xs + chunk_word + 16 * half + 4 * (lane // 16), result_type=v4f).bitcast(
                     fx.Int32
                 )
                 for half in range(2)
             ]
-            return fx.Vector.from_elements([words[half][e] for half in range(2) for e in range(4)], fx.Int32)
+            return words[0].shuffle(words[1], list(range(8)))
 
         def unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln=None):
             ln = lane if ln is None else ln
@@ -1043,17 +1028,17 @@ def build_glm5_monokernel(
                         a = _mxfp4_to_bf16x8(raw[sp], scales[sp])
                         if const_expr(fmt == "mxfp4"):
                             wh, ws = sp // 2, sp % 2
-                            bv = fx.Vector(fx.ptr_load(xs + (bw + wh * 16), result_type=v4f)).bitcast(fx.Int32)
+                            bv = fx.ptr_load(xs + (bw + wh * 16), result_type=v4f).bitcast(fx.Int32)
                             b = _fp8_to_bf16x8(bv[ws * 2], bv[ws * 2 + 1])
                         else:
                             b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
                         c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
                 if const_expr(fmt == "f8f8"):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
-                    a = fx.Vector.from_elements([wv[h][e] for h in range(2) for e in range(4)], fx.Int32)
+                    a = wv[0].shuffle(wv[1], list(range(8)))
                     bv = [
-                        fx.Vector(fx.ptr_load(xs + (bw + h * 16), result_type=v4f)).bitcast(fx.Int32) for h in range(2)
+                        fx.ptr_load(xs + (bw + h * 16), result_type=v4f).bitcast(fx.Int32) for h in range(2)
                     ]
-                    b = fx.Vector.from_elements([bv[h][e] for h in range(2) for e in range(4)], fx.Int32)
+                    b = bv[0].shuffle(bv[1], list(range(8)))
                     one = fx.Int32(127)
                     c = fx.Vector(
                         rocdl.mfma_scale_f32_16x16x128_f8f6f4(T.vec(4, T.f32), [a, b, c, 0, 0, 0, one, 0, one])
@@ -1070,7 +1055,7 @@ def build_glm5_monokernel(
                     halves64 = 2 if fmt == "ptpc" else 1
                     for half64 in range_constexpr(halves64):
                         a = wv[half64].bitcast(fx.Int64)
-                        b = fx.Vector(fx.ptr_load(xs + (bw + half64 * 16), result_type=v4f)).bitcast(fx.Int64)
+                        b = fx.ptr_load(xs + (bw + half64 * 16), result_type=v4f).bitcast(fx.Int64)
                         for half32 in range_constexpr(2):
                             c = fx.Vector(
                                 rocdl.mfma_f32_16x16x32_fp8_fp8(T.vec(4, T.f32), [a[half32], b[half32], c, 0, 0, 0])
@@ -3348,12 +3333,8 @@ def build_glm5_monokernel(
                 def u_ug8(cc, e, live=None):  # expert e's weights (loads return 0 unless live)
                     nw = None if live is None else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
                     ns = None if live is None else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
-                    r_wug = bo.create_buffer_resource_from_addr(
-                        w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES), num_records_bytes=nw
-                    )
-                    r_sug = bo.create_buffer_resource_from_addr(
-                        s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES), num_records_bytes=ns
-                    )
+                    r_wug = _rsrc(w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES), nw)
+                    r_sug = _rsrc(s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES), ns)
                     unit = wave * (UG8_CPW // 2) + cc
                     kc = unit * 2
                     if const_expr(expert_mxfp4):
@@ -3568,13 +3549,13 @@ def build_glm5_monokernel(
                         rw = _rsrc(w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES))
                         rs = _rsrc(s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES))
                     else:
-                        rw = bo.create_buffer_resource_from_addr(
+                        rw = _rsrc(
                             w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
-                            num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
+                            live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
                         )
-                        rs = bo.create_buffer_resource_from_addr(
+                        rs = _rsrc(
                             s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
-                            num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
+                            live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
                         )
                     sn = n_sel() if sample is None else fx.Int32(sample)
                     units = []
@@ -3916,13 +3897,13 @@ def build_glm5_monokernel(
                 s_q = q // (DN_SLOTS * DN_NKC)
                 slot_q = (q // DN_NKC) % DN_SLOTS + DN_SLOT0
                 e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
-                wb = bo.create_buffer_resource_from_addr(
+                wb = _rsrc(
                     w_dn + fx.Int64(e) * fx.Int64(DN_W_BYTES),
-                    num_records_bytes=(None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_W_BYTES), fx.Int32(0))),
+                    None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_W_BYTES), fx.Int32(0)),
                 )
-                sb = bo.create_buffer_resource_from_addr(
+                sb = _rsrc(
                     s_dn + fx.Int64(e) * fx.Int64(DN_S_BYTES),
-                    num_records_bytes=(None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_S_BYTES), fx.Int32(0))),
+                    None if DN_NU % DN_WPR == 0 else live.select(fx.Int32(DN_S_BYTES), fx.Int32(0)),
                 )
                 got = (s_q, slot_q, wb, sb)
                 dn_experts[group] = got

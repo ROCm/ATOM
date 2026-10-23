@@ -51,7 +51,6 @@ from atom.mono.device.ops import (
     permlane_swap,
     readlane,
     rsrc,
-    traced,
     uniform,
     unlikely,
 )
@@ -115,7 +114,7 @@ def step_rows(seq_lens, tokens: int, q_len, heads: IndexHeads) -> StepRows:
     return StepRows(seq, n_blks, [nb > LONG_FROM_BLOCKS for nb in req_blks])
 
 
-@traced
+@flyc.jit
 def emit_index_scores(
     slot, lane, wave, red, mb_put, iscore, q_frag, tokens, q_len, init_blocks,
     local_blocks, scale, index_cache, block_table, seq_lens, bt_width,
@@ -229,7 +228,7 @@ def emit_index_scores(
                         )
             out.append(
                 [
-                    fx.Vector.from_elements([d[2 * s], d[2 * s + 1]], fx.Int32)
+                    fx.Vector.from_elements(d[2 * s : 2 * s + 2], fx.Int32)
                     for s in range(HEAD_DIM // 32)
                 ]
             )

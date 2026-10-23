@@ -11,10 +11,11 @@ narrow the field to the entries that can still be among the top k, and only
 those are counted against each other.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr
 
-from atom.mono.device.ops import butterfly, traced
+from atom.mono.device.ops import butterfly
 from atom.mono.plan.execution import WAVES
 
 KEY_LEAST = -(2**31)  # the 32-bit key of a dead entry: below every live one
@@ -29,7 +30,7 @@ def put_key(keys, e, key, idx, live):
     return (fx.Int64(key) << 32) | fx.Int64(idx)
 
 
-@traced
+@flyc.jit
 def count_beaten(keys, mines, m):
     """For each of up to two 64-bit sort keys ``mines``, how many of the first
     m entries of ``keys`` beat it. Entries up to m rounded up to BATCH must
@@ -43,9 +44,7 @@ def count_beaten(keys, mines, m):
     for j0 in range(0, m, BATCH):
         j0 = fx.Int32(j0)
         pairs = [
-            fx.Vector(fx.ptr_load(keys + (2 * j0 + 4 * q), result_type=v4i)).bitcast(
-                fx.Int64
-            )
+            fx.ptr_load(keys + (2 * j0 + 4 * q), result_type=v4i).bitcast(fx.Int64)
             for q in range(BATCH // 2)
         ]
         for q in range_constexpr(BATCH // 2):
@@ -56,7 +55,7 @@ def count_beaten(keys, mines, m):
     return [(packed >> (16 * i)) & 0xFFFF for i in range(len(mines))]
 
 
-@traced
+@flyc.jit
 def group_floor(keys32, k, red, lane, wave):
     """A lower bound of the k-th largest of the CTA's 32-bit keys (each
     thread's ``keys32``, dead ones ``KEY_LEAST``): k disjoint groups -- the
@@ -85,7 +84,7 @@ def group_floor(keys32, k, red, lane, wave):
     return fx.ptr_load(red + WAVES * k)
 
 
-@traced
+@flyc.jit
 def compact(cand, counter, cap, entries, floor):
     """The entries of ``entries`` ((key32, id, live) a thread) that can be in
     the top k -- live, key at least ``floor`` (ties kept: a superset) -- to

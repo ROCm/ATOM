@@ -26,6 +26,7 @@ heads, as the original does.
             order and the weight rn(w x weights_scale)
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -45,7 +46,7 @@ from atom.mono.device.ops import (
     lane_gather,
     row_shr,
     rsrc,
-    traced,
+    wave_max,
 )
 from atom.mono.plan.execution import WAVES
 
@@ -69,16 +70,16 @@ def _wv_reduce(v, lane):
     for k in (8, 4, 2):
         v = row_shr(v, lane, k) + v
     moved = lane_gather(v.bitcast(fx.Int32), fx.max(lane - 1, 0)).bitcast(fx.Float32)
-    v = fx.Float32((lane >= 1).select(moved + v, v))  # wave_shr:1
+    v = (lane >= 1).select(moved + v, v)  # wave_shr:1
     row = lane // 16
     b15 = lane_gather(v.bitcast(fx.Int32), fx.max(row * 16 - 1, 0)).bitcast(fx.Float32)
-    v = fx.Float32((row % 2 == 1).select(b15 + v, v))
+    v = (row % 2 == 1).select(b15 + v, v)
     b31 = lane_gather(v.bitcast(fx.Int32), 31).bitcast(fx.Float32)
-    v = fx.Float32((row >= 2).select(b31 + v, v))
+    v = (row >= 2).select(b31 + v, v)
     return lane_gather(v.bitcast(fx.Int32), 63).bitcast(fx.Float32)
 
 
-@traced
+@flyc.jit
 def stage_iw(c, task, hidden, nbl, load_group):
     """Row ``task`` of weights_proj; wave w its tokens w, w + WAVES, ..., a group
     of WAVES tokens' normed rows at a time in LDS ``nbl`` (bf16 pairs,
@@ -118,11 +119,9 @@ def stage_iw(c, task, hidden, nbl, load_group):
             k = ks[i] + lane * 8
             live = k < hidden
             kk = fx.min(k, hidden - 8)
-            xv = fx.Vector(
-                fx.ptr_load(
-                    nbl + ((tl * hidden + kk) // 2),
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xv = fx.ptr_load(
+                nbl + ((tl * hidden + kk) // 2),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             wv = wvs[i]
             ax = [bf_lo(xv[j]) for j in range(4)]
@@ -132,9 +131,9 @@ def stage_iw(c, task, hidden, nbl, load_group):
             accx = ax[0] * bx[0]
             accy = ay[0] * by[0]
             for j in range_constexpr(1, 4):
-                accx = fx.Float32(fmath.fma(ax[j], bx[j], accx))
-                accy = fx.Float32(fmath.fma(ay[j], by[j], accy))
-            total = fx.Float32(live.select(total + (accx + accy), total))
+                accx = fmath.fma(ax[j], bx[j], accx)
+                accy = fmath.fma(ay[j], by[j], accy)
+            total = live.select(total + (accx + accy), total)
         w = _wv_reduce(total, lane)
         if (lane == 0) & (wave < n):
             if const_expr(c["tok_par"]):
@@ -155,7 +154,7 @@ def poll_query(c, t, h, lane):
     return c["poll"]([q, w])
 
 
-@traced
+@flyc.jit
 def stage_iquant(c, task):
     """Token task // 32, head task % 32: a wave, 2 dims a lane (wave 0)."""
     lane, wave = c["lane"], c["wave"]
@@ -165,11 +164,7 @@ def stage_iquant(c, task):
     if wave == 0:
         got = poll_query(c, t, h, lane)
         x0, x1 = bf2_f32(got[0][0])
-        amax = butterfly(
-            fx.max(fx.max(abs(x0), abs(x1)), fx.Float32(AMAX_SEED)),
-            (1, 2, 4, 8, 16, 32),
-            fx.max,
-        )
+        amax = wave_max(fx.max(fx.max(abs(x0), abs(x1)), fx.Float32(AMAX_SEED)))
         scale = amax * fx.Float32(1.0 / FP8_MAX)
         inv = fx.Float32(1.0) / scale
         q = fp8_pack4(
@@ -204,12 +199,12 @@ def _e2m1(x):
         (2.5, 5, False), (3.5, 6, True), (5.0, 7, False),
     ):  # fmt: skip
         past = (m >= fx.Float32(edge)) if inclusive else (m > fx.Float32(edge))
-        code = fx.Int32(past.select(fx.Int32(value), code))
+        code = past.select(fx.Int32(value), code)
     sign = (x.bitcast(fx.Int32) >> 31) & 1
     return code | (sign << 3)
 
 
-@traced
+@flyc.jit
 def stage_iquant_fp4(c, task):
     """``stage_iquant`` on the FP4 plane: token task // 32, head task % 32, a
     wave (wave 0), 2 dims a lane and a 32-dim group 16 lanes. ``quantize_fp4``
@@ -227,9 +222,7 @@ def stage_iquant_fp4(c, task):
         bits = (fx.max(amax, fx.Float32(FP4_MIN_AMAX)) * fx.Float32(1.0 / 6.0)).bitcast(
             fx.Int32
         )
-        code = (bits >> 23) + fx.Int32(
-            ((bits & 0x7FFFFF) != 0).select(fx.Int32(1), fx.Int32(0))
-        )
+        code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).select(fx.Int32(1), fx.Int32(0))
         inv = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
         row = t * ip.HEADS + h
         byte = _e2m1(x0 * inv) | (_e2m1(x1 * inv) << 4)

@@ -8,19 +8,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc, traced
+from atom.mono.device.ops import CM_DEV, CM_SYS, bf16_pair, memrealtime, rsrc
 from atom.mono.plan.layout import DIAG_WORDS
 from atom.mono.plan.trace import Space, note
 
 POLL_MAX = 12  # mailbox specs polled per batch (bounds live registers)
 
 
-@traced
+@flyc.jit
 def _spin(load_all, pending):
     """Re-issue ``load_all`` until ``pending`` clears; a side-effecting op in the
     loop keeps the loads from being hoisted."""
@@ -35,7 +36,7 @@ def _spin(load_all, pending):
 DIAG_TICKS = 10 * 100_000_000
 
 
-@traced
+@flyc.jit
 def _spin_bounded(load_all, pending, diag, region_id, index, tag):
     """``_spin`` giving up after DIAG_TICKS: the CTA's record in ``diag`` names the
     wait (the runner raises with it after the step), and the kernel runs on."""
@@ -61,9 +62,7 @@ def _spin_bounded(load_all, pending, diag, region_id, index, tag):
             record = [1, region_id, index, tag, v[1], bid, at, 0]
             for h in range_constexpr(2):  # 16 B a store
                 bo.buffer_store(
-                    fx.Vector.from_elements(
-                        [fx.Int32(w) for w in record[4 * h : 4 * h + 4]], fx.Int32
-                    ),
+                    fx.Vector.from_elements(record[4 * h : 4 * h + 4], fx.Int32),
                     rsrc(diag),
                     bid * DIAG_WORDS + 4 * h,
                     cache_modifier=CM_SYS,
@@ -209,7 +208,7 @@ class Mailbox:
         return outs
 
 
-@traced
+@flyc.jit
 def publish(put, a, i, v, who):
     """This CTA's plain stores made readable by every CTA, then (thread ``who``)
     the mailbox pair (``a``, i) := v. The stores are drained first: a flag may

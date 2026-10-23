@@ -13,12 +13,13 @@ group g = lane / 16), and the token rows are read at the same K. The K order
 inside a chunk is a permutation both operands share, so the dot is unchanged.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from atom.mono.device.ops import CM_DEV, CM_NT, mfma_bf16, rsrc, traced
+from atom.mono.device.ops import CM_DEV, CM_NT, mfma_bf16, rsrc
 from atom.mono.plan.execution import THREADS, WAVES
 
 ROWS = 16
@@ -115,16 +116,12 @@ def mfmas(lane, wave, xl, xrow, k, s, ops, acc=None):
         live = ch < n
         kk = fx.min(ch, n - 1) * KCH + g * 8
         for q in range_constexpr(4):
-            xb = fx.Vector(
-                fx.ptr_load(
-                    xl + (t * xrow + kk + 32 * q) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xb = fx.ptr_load(
+                xl + (t * xrow + kk + 32 * q) // 2,
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
             if const_live(per, n):
-                xb = fx.Vector.from_elements(
-                    [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
-                )
+                xb = live.select(xb, 0)
             acc = mfma_bf16(
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )
@@ -136,7 +133,7 @@ def const_live(per, n):
     return per * WAVES != n
 
 
-@traced
+@flyc.jit
 def rows_to_lds(tid, src, k, s, xl, xrow, cm=0, ldk=None, k0=0):
     """Columns k0 .. k0 + k of token rows 0 .. s - 1 of the bf16 [s, ldk] at
     ``src`` -> LDS (``xrow`` a row), 16 B a lane."""

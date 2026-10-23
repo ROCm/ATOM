@@ -97,7 +97,6 @@ from atom.mono.device.mx import (
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
-    _hw_f32,
     ballot,
     bf16_round,
     bf_hi,
@@ -106,6 +105,7 @@ from atom.mono.device.ops import (
     fp8_pack4,
     fresh,
     hw_exp2,
+    hw_log2,
     hw_rcp,
     kernel_symbol,
     lane_gather,
@@ -115,7 +115,7 @@ from atom.mono.device.ops import (
     popcount,
     row_sum,
     rsrc,
-    traced,
+    wave_max,
 )
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
@@ -211,7 +211,7 @@ def region_pair(src, t, s, col):
 
 
 # ---------------------------------------------------------------- xq
-@traced
+@flyc.jit
 def stage_xq(c, t):
     """Token t, a group of 32 a thread."""
     tid = c["tid"]
@@ -281,7 +281,7 @@ def router_weights(c, task):
     )
 
 
-@traced
+@flyc.jit
 def stage_router(c, task, wvs):
     """Router task (token group, row tile, K part): K part ``part`` of rows
     16 ``tile`` .. of the bf16 gate weight [experts, 5120] times the group's
@@ -323,14 +323,14 @@ def stage_router(c, task, wvs):
 # ---------------------------------------------------------------- route
 def _score(x):
     """sqrt(log2(1 + exp2(x log2e)) ln2), x itself past 20 (topk_gating)."""
-    sp = fx.Float32((x > fx.Float32(20.0)).select(
-        x, _hw_f32("llvm.amdgcn.log.f32", fx.Float32(1.0) + hw_exp2(x * fx.Float32(LOG2E)))
+    sp = (x > fx.Float32(20.0)).select(
+        x, hw_log2(fx.Float32(1.0) + hw_exp2(x * fx.Float32(LOG2E)))
         * fx.Float32(LN2),
-    ))  # fmt: skip
-    return fx.Float32(fmath.sqrt(sp))
+    )  # fmt: skip
+    return fmath.sqrt(sp)
 
 
-@traced
+@flyc.jit
 def stage_route(c, t):
     """aiter topk_gating_kernel_opt for token t on wave 0."""
     lane, wave = c["lane"], c["wave"]
@@ -361,7 +361,7 @@ def stage_route(c, t):
             e = lane + 64 * i
             sc = _score(logits[i])
             # aiter's NaN guards: a NaN score weighs 0 and never wins
-            orig.append(fx.Float32(fx.isnan(sc).select(fx.Float32(0.0), sc)))
+            orig.append(fx.isnan(sc).select(fx.Float32(0.0), sc))
             vals.append(fx.max(sc + bias[i], fx.Float32(float("-inf"))))
             idxs.append(fx.Int32(e))
         for p, q in c["rs"].sort_net:
@@ -381,16 +381,14 @@ def stage_route(c, t):
                     at.select(idxs[i], ci),
                     at.select(orig[i], co),
                 )
-            best = butterfly(cv, (32, 16, 8, 4, 2, 1), fx.max)
+            best = wave_max(cv)
             ball = ballot(cv == best)
-            win = fx.Int32(
-                (ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball)))
-            )
-            win_id = fx.Int32(rocdl.readlane(T.i32, ci.ir_value(), win.ir_value()))
+            win = (ball == fx.Int64(0)).select(fx.Int32(0), fx.Int32(fmath.cttz(ball)))
+            win_id = fx.Int32(rocdl.readlane(T.i32, ci, win))
             won = (cursor < ept) & (ci == win_id)
-            mine_o = fx.Float32(won.select(co, fx.Float32(0.0)))
+            mine_o = won.select(co, fx.Float32(0.0))
             w = fx.Int32(rocdl.readlane(
-                T.i32, mine_o.bitcast(fx.Int32).ir_value(), (win_id & 63).ir_value()
+                T.i32, mine_o.bitcast(fx.Int32), win_id & 63
             )).bitcast(fx.Float32)  # fmt: skip
             cursor = cursor + won.select(1, 0)
             total = total + w
@@ -405,7 +403,7 @@ def stage_route(c, t):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def load_route(c, tab):
     """Every token's (ids, weights) into LDS ``tab``, then the union U of the ids
     (ascending): tab[2 S topk ..] = |U|, the experts of U, each (t, k)'s slot in
@@ -533,11 +531,11 @@ def _silu_mul(g, u):
     x * rcp(1 + exp(-x)) (ocml exp)."""
     g = bf16_round(fx.min(g, fx.Float32(LIMIT)))
     u = fx.max(fx.min(u, fx.Float32(LIMIT)), fx.Float32(-LIMIT))
-    act = g * hw_rcp(fx.Float32(1.0) + fx.Float32(fmath.exp(-g)))
+    act = g * hw_rcp(fx.Float32(1.0) + fmath.exp(-g))
     return act * u
 
 
-@traced
+@flyc.jit
 def stage_shared(c, task, gops, t0, n):
     """Gate rows 16 task .. (weights ``gops``), up rows 576 + 16 task .. against
     tokens t0 .. t0 + n (their x in LDS; ``n`` traced: a tile a CTA picks at run
@@ -568,7 +566,7 @@ def stage_shared(c, task, gops, t0, n):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def smid_quant(c, task, t0, n):
     """Odd shared task ``task``: its 16 columns (LDS ``pair``) and the even
     task's (SMID) are a quantize_fp8 group of 32 (amax floored 1e-4, the ceil
@@ -597,7 +595,7 @@ def smid_quant(c, task, t0, n):
 
 
 # ---------------------------------------------------------------- routed ug
-@traced
+@flyc.jit
 def gemv_fp4_pair(c, w, ws, e, n_rows, k, rg0, ks, xl, xsl, scale_cols, col):
     """Tiles rg0 and rg0 + 1 (16 rows each, one 32-row scale block) of expert
     e's (16, 16)-preshuffled MXFP4 weight [n_rows, k] times 16 MXFP8 rows in
@@ -765,9 +763,7 @@ def fp4_tile_weights(c, w, e, n_rows, k, rg, st0, blk, k_real=None):
             at = lane * 4
         v = fp4_tile_load(rsrc(w), base, rg, k, st0 + i, at)
         if const_expr(past):
-            v = fx.Vector.from_elements(
-                [real.select(v[q], fx.Int32(0)) for q in range(4)], fx.Int32
-            )
+            v = real.select(v, 0)
         out.append(v)
     return out
 
@@ -818,7 +814,7 @@ def st_dev(v, region, i):
     bo.buffer_store(v, rsrc(region.value), i, cache_modifier=CM_DEV)
 
 
-@traced
+@flyc.jit
 def take_ug_task(c):
     """This CTA's next ug task past the first round, from the launch's queue
     (``ugq``, a word a tag, counting from 0): the CTAs that ran a shared,
@@ -834,7 +830,7 @@ def take_ug_task(c):
     return fx.ptr_load(c["tab"] + c["rs"].queue0)
 
 
-@traced
+@flyc.jit
 def stage_ug(c, task):
     """One token tile: slot task // ug_parts of U (``RouteShape.ug_parts``), the
     ``ug_groups`` FP4 groups of intermediate columns from 32 ug_groups (task %
@@ -895,7 +891,7 @@ def ug_tile_task(c, task):
     return rs.union_expert(tab, s, u), task % ug_parts * rs.ug_groups, first, count
 
 
-@traced
+@flyc.jit
 def stage_ug_tile(c, task, total):
     """Past one token tile: ug task ``task`` of ``total`` (a pick tile of its
     slot), then the next task from the queue (``take_ug_task``). No next task's
@@ -914,7 +910,7 @@ def stage_ug_tile(c, task, total):
     return nxt
 
 
-@traced
+@flyc.jit
 def ug_pass(c, e, part0, first, count, col):
     """An ug task's GEMV and epilogue for the slot's picks first .. first +
     min(count, 16) (column lane % 16's x in LDS row ``col``)."""
@@ -932,7 +928,7 @@ def ug_pass(c, e, part0, first, count, col):
     for t in range_constexpr(2):
         slot = ug_red_slot(rs, p, wave % 2, ks, t)
         fx.ptr_store(
-            fx.Vector.from_elements([acc[4 * t + q] for q in range(4)], fx.Float32),
+            acc.shuffle(acc, list(range(4 * t, 4 * t + 4))),
             red + (slot * 64 + lane) * 4,
         )
     gpu.barrier()
@@ -944,7 +940,7 @@ def ug_pass(c, e, part0, first, count, col):
         ug_epilogue(c, part0, pas + tid, first, count)
 
 
-@traced
+@flyc.jit
 def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live):
     """MXFP8 rows ``token_of(j)``, j < ``live`` (<= TILE; traced or int), of
     scratch ``words_mb`` / ``codes_mb`` into LDS rows j of ``xl`` / ``xsl``:
@@ -985,7 +981,7 @@ def gather_x8r(c, first, count):
     load_x8_rows(c, "x8r", "x8rs", c["x8rl"], c["x8rsl"], token, fx.min(count, TILE))
 
 
-@traced
+@flyc.jit
 def ug_epilogue(c, part0, idx, first, count):
     """Thread ``idx``'s value of an ug task: silu x up of its (group, pick j,
     column), the group's MXFP8 scale, its byte of MID (the pick's row, ``first``
@@ -1033,7 +1029,7 @@ def ug_epilogue(c, part0, idx, first, count):
 
 
 # ---------------------------------------------------------------- down
-@traced
+@flyc.jit
 def stage_down(c, tasks):
     """Rows 16 task .. of the hidden output for each of ``tasks`` (a CTA's one or
     two, run together: a second pass would double the CTA's time): routed
@@ -1092,7 +1088,7 @@ def stage_down(c, tasks):
             down_combine(c, tasks[j], j, t0, nn)
 
 
-@traced
+@flyc.jit
 def take_down_rank(c):
     """This CTA's arrival rank at the down stage (DQ, a word a tag): which
     CTAs take the extra tiles. A tile's result is the same whichever CTA
@@ -1217,7 +1213,7 @@ def _down_ug_flag(c, ucs, f, per_slot):
     )
 
 
-@traced
+@flyc.jit
 def down_shared(c, tasks):
     """Each of ``tasks``' rows of the shared expert's down projection
     (its MXFP8 intermediate, ``load_smid_tile``) for every
@@ -1240,7 +1236,7 @@ def down_shared(c, tasks):
             gpu.barrier()
 
 
-@traced
+@flyc.jit
 def down_combine(c, task, j, t0, n):
     """Down task ``task`` (the CTA's j-th) for tokens t0 .. t0 + n: the routed
     contributions summed in bf16 in each token's top-k order, plus the shared expert's
@@ -1285,7 +1281,7 @@ def down_combine(c, task, j, t0, n):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def down_mfma(c, j, task, sl, mid, first, count, av, live):
     """Down task ``task`` (the CTA's j-th) on a slot of U: the routed MFMA of its
     picks first .. first + min(count, 16) (their B operands ``mid``:
@@ -1325,7 +1321,7 @@ def contrib_load(c, j, i):
 # ---------------------------------------------------------------- loaders
 
 
-@traced
+@flyc.jit
 def load_smid_tile(c, t0, n, groups):
     """The shared expert's MXFP8 intermediate of tokens t0 .. t0 + n (SMQ /
     SMC, ``smid_quant``) into LDS ``sxl`` / ``sxsl`` rows 0 .., by every
@@ -1342,7 +1338,7 @@ def load_smid_tile(c, t0, n, groups):
 
 
 # ---------------------------------------------------------------- reduce
-@traced
+@flyc.jit
 def stage_reduce(c, task):
     """Columns 128 task ..: the TP ranks' partials in rank order 0 .. TP - 1, in
     fp32 -> bf16 -> ``out``."""
@@ -1351,7 +1347,7 @@ def stage_reduce(c, task):
         reduce_pair(c, task, pas + tid)
 
 
-@traced
+@flyc.jit
 def reduce_pair(c, task, idx):
     """Thread ``idx``'s column pair of token idx / 64."""
     s, tp = c["S"], c["d"].tp
@@ -1439,7 +1435,7 @@ def moe_context(s, rs, lds, mb, bases, layout, scratch, args, rank, sym):
     return c
 
 
-@traced
+@flyc.jit
 def run_moe(c, key, bid, tls, tl0, before_ug=None):
     """K2b's stages, in order; ``timeline`` stamps from point ``tl0`` + 1.
     ``before_ug()``: a caller's stage between shared and ug, stamped there (the
@@ -1555,7 +1551,7 @@ def run_moe(c, key, bid, tls, tl0, before_ug=None):
     stamp(timeline, tls, tid, tl0 + shift + 7)
 
 
-@traced
+@flyc.jit
 def gather_rows(c, t):
     """Token t, when another rank owns it: its row here (``gather_x``)."""
     if t // own_count(c["S"], c["d"].tp) != c["rank"]:

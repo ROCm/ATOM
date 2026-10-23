@@ -46,14 +46,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda import (
     stage_mix,
     stage_slice,
 )
-from atom.mono.device.ops import (
-    CM_NT,
-    bf16_round,
-    mfma_bf16,
-    row_sum,
-    rsrc,
-    traced,
-)
+from atom.mono.device.ops import CM_NT, bf16_round, mfma_bf16, row_sum, rsrc
 from atom.mono.device.ranks import peer_bases, sum_partials
 from atom.mono.device.stamps import stamp, stamp_begin, stamp_flush
 from atom.mono.device.sync import Mailbox, preg, sreg
@@ -156,7 +149,7 @@ def o_loads(c, rg):
     return out
 
 
-@traced
+@flyc.jit
 def load_core(c):
     """The core rows (S x 1536 bf16) -> LDS, rows padded."""
     s, tid = c["S"], c["tid"]
@@ -174,7 +167,7 @@ def load_core(c):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_o(c, rg, ops):
     """Rows 16 rg ..: GEMV -> bf16 partials -> every rank's AR region, this
     rank's slot (thread: token, row pair; a put a peer)."""
@@ -188,15 +181,11 @@ def stage_o(c, rg, ops):
         live = ch < OKCH
         k = fx.min(ch, OKCH - 1) * 128 + g * 8
         for q in range_constexpr(4):
-            xb = fx.Vector(
-                fx.ptr_load(
-                    c["xl"] + (t * row + k + 32 * q) // 2,
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+            xb = fx.ptr_load(
+                c["xl"] + (t * row + k + 32 * q) // 2,
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
-            xb = fx.Vector.from_elements(
-                [live.select(xb[d], fx.Int32(0)) for d in range(4)], fx.Int32
-            )
+            xb = live.select(xb, 0)
             acc = mfma_bf16(
                 ops[i][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
             )
@@ -213,7 +202,7 @@ def stage_o(c, rg, ops):
     gpu.barrier()
 
 
-@traced
+@flyc.jit
 def stage_reduce(c, task):
     """Columns 128 task ..: the 8 ranks' partials, rank order, -> bf16 delta in
     LDS (thread: token, column pair).

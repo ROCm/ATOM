@@ -4,6 +4,7 @@
 the partitions' merge and per-token FP8 quantization; o_proj and the attention
 all-reduce."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E
@@ -38,7 +39,6 @@ from atom.mono.device.ops import (
     row_sum,
     rows_to_lds,
     rsrc,
-    traced,
     uniform,
     wave_max,
     xshfl,
@@ -49,7 +49,7 @@ from atom.mono.plan.arith import pick
 from atom.mono.plan.execution import WAVES
 
 
-@traced
+@flyc.jit
 def split_defs(k4ctx):
     """The functions of the split-K sparse attention (one 256-key partition x 16 heads a
     task)."""
@@ -194,9 +194,7 @@ def split_defs(k4ctx):
             for j in range_constexpr(PPW):
                 c = fx.Vector.filled(4, 0.0, fx.Float32)
                 for s in range_constexpr(HEAD_DIM // 32):
-                    qw = fx.Vector(
-                        fx.ptr_load(q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i)
-                    )
+                    qw = fx.ptr_load(q8 + (l16 * 32 + 8 * s + 2 * g4), result_type=v2i)
                     c = mfma_fp8(
                         qw.bitcast(fx.Int64)[0], kw[j * (HEAD_DIM // 32) + s], c
                     )
@@ -259,12 +257,9 @@ def split_defs(k4ctx):
             gpu.barrier()
             stamp(14)
             # PV over this wave's 32 keys: A = P (heads), B = V (dims)
-            pw = fx.Vector(
-                fx.ptr_load(
-                    p8
-                    + (l16 * (SPLIT_KEYS // 4) + (wave * (PPW * PAGE16) + 8 * g4) // 4),
-                    result_type=v2i,
-                )
+            pw = fx.ptr_load(
+                p8 + (l16 * (SPLIT_KEYS // 4) + (wave * (PPW * PAGE16) + 8 * g4) // 4),
+                result_type=v2i,
             ).bitcast(fx.Int64)[0]
             # keys past the context carry P = 0, but a NaN V byte would still poison
             nv = n_ctx - (key0 + 8 * g4)
@@ -310,7 +305,7 @@ def split_defs(k4ctx):
     return {"stage_split": stage_split}
 
 
-@traced
+@flyc.jit
 def merge_defs(k4ctx):
     """The functions of the partitions' merge and per-token FP8 quantization."""
     G = k4ctx["G"]
@@ -405,7 +400,7 @@ def merge_defs(k4ctx):
     return {"merge_token": merge_token, "stage_merge": stage_merge}
 
 
-@traced
+@flyc.jit
 def o_defs(k4ctx):
     """The functions of o_proj and the attention all-reduce."""
     AG_RS = k4ctx["AG_RS"]
@@ -493,16 +488,14 @@ def o_defs(k4ctx):
             # holds k 16 (l / 16) .. + 16 of each 64-k half -- the chunks' packing
             for p in range_constexpr(O_CPW // 2):
                 xb = [
-                    fx.Vector(
-                        fx.ptr_load(
-                            xs
-                            + (
-                                col_tok * O_ROW
-                                + ((wave % 4) * O_CPW + 2 * p + h) * 16
-                                + g4 * 4
-                            ),
-                            result_type=v4f,
-                        )
+                    fx.ptr_load(
+                        xs
+                        + (
+                            col_tok * O_ROW
+                            + ((wave % 4) * O_CPW + 2 * p + h) * 16
+                            + g4 * 4
+                        ),
+                        result_type=v4f,
                     ).bitcast(fx.Int32)
                     for h in range(2)
                 ]
