@@ -174,6 +174,8 @@ NVFP4_DTYPE = _qs.NVFP4_DTYPE
 QuarkParser = _qs.QuarkParser
 QuarkOnlineParser = _qs.QuarkOnlineParser
 ModelOptParser = _qs.ModelOptParser
+Mxfp8Parser = _qs.Mxfp8Parser
+NVFP4_DIVISOR_GLOBAL_SCALE_METHOD = _qs.NVFP4_DIVISOR_GLOBAL_SCALE_METHOD
 GenericParser = _qs.GenericParser
 get_quant_parser = _qs.get_quant_parser
 will_online_requant = _qs.will_online_requant
@@ -463,6 +465,95 @@ class TestModelOptParser:
                     "exclude_modules": ["lm_head"],
                 }
             )
+
+
+# =========================================================================
+# Tests — Mxfp8Parser
+# =========================================================================
+
+
+class TestMxfp8Parser:
+    @staticmethod
+    def _m31_config():
+        """Trimmed MiniMax-M3.1 config: MXFP8 linears, NVFP4 routed experts."""
+        return {
+            "quant_method": "mxfp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [1, 32],
+            "group_size": 16,
+            "moe_quant_algo": "NVFP4",
+            "moe_quant_format": "nvfp4-pack-quantized",
+            "ignored_layers": [
+                "lm_head",
+                "model.embed_tokens",
+                "language_model.model.layers.3.block_sparse_moe.gate",
+            ],
+        }
+
+    def test_registered(self):
+        assert isinstance(get_quant_parser("mxfp8"), Mxfp8Parser)
+
+    def test_plain_mxfp8_matches_generic(self):
+        config = self._m31_config()
+        del config["moe_quant_algo"], config["moe_quant_format"]
+        assert Mxfp8Parser().parse(config) == GenericParser().parse(config)
+
+    def test_nvfp4_experts_and_mxfp8_rest(self):
+        qcfg = QuantizationConfig(
+            FakeHFConfig(torch_dtype=BF16, quantization_config=self._m31_config()),
+            online_quant_config={
+                "global_quant_config": "ptpc_fp8",
+                "layer_quant_config": {"*.experts": "mxfp8"},
+            },
+        )
+        qcfg.remap_layer_name(
+            FakeHFConfig(model_type="minimax_m3_vl"),
+            packed_modules_mapping={
+                ".gate_proj": (".gate_up_proj", 0),
+                ".up_proj": (".gate_up_proj", 1),
+            },
+            quant_exclude_name_mapping={"language_model.model.": "model."},
+        )
+
+        experts = qcfg.get_layer_quant_config(
+            "model.layers.3.block_sparse_moe.experts", check_children=True
+        )
+        assert experts.quant_dtype == NVFP4_DTYPE
+        assert experts.quant_type == QuantType.per_1x32
+        assert experts.quant_method == NVFP4_DIVISOR_GLOBAL_SCALE_METHOD
+        for name in (
+            "model.layers.3.block_sparse_moe.shared_experts.gate_up_proj",
+            "model.layers.3.self_attn.qkv_proj",
+            "model.layers.0.mlp.down_proj",
+        ):
+            spec = qcfg.get_layer_quant_config(name)
+            assert (spec.quant_type, spec.quant_dtype) == (QuantType.per_1x32, FP8)
+        online = qcfg.get_layer_quant_config(
+            "model.layers.3.block_sparse_moe.experts", use_online_quant=True
+        )
+        assert (online.quant_type, online.quant_dtype) == (QuantType.per_1x32, FP8)
+        validate_nvfp4_online_target(
+            qcfg, "model.layers.3.block_sparse_moe.experts", allow_mxfp8=True
+        )
+        # Linear layers have no NVFP4 -> MXFP8 path yet.
+        with pytest.raises(ValueError, match="converted to MXFP4 online"):
+            validate_nvfp4_online_target(
+                qcfg, "model.layers.3.block_sparse_moe.experts"
+            )
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        [
+            ("moe_quant_algo", "MXFP4", "moe_quant_algo"),
+            ("moe_quant_format", "nvfp4-float-quantized", "moe_quant_format"),
+            ("group_size", 32, "group_size=16"),
+        ],
+    )
+    def test_rejects_unknown_moe_formats(self, field, value, match):
+        config = self._m31_config()
+        config[field] = value
+        with pytest.raises(ValueError, match=match):
+            Mxfp8Parser().parse(config)
 
 
 # =========================================================================

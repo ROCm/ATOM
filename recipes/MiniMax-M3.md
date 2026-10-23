@@ -274,17 +274,19 @@ same name and shape) with three model changes: lightning-indexer sparse attentio
 speculative-decoding draft is a separate **DSpark** block drafter shipped in the
 checkpoint's `dspark/` sub-directory.
 
-This recipe runs the AMD Quark MXFP4 export
-[amd/MiniMax-M3.1-Flash-Quark-MXFP4](https://huggingface.co/amd/MiniMax-M3.1-Flash-Quark-MXFP4),
-which ships the routed experts as MXFP4.
+ATOM runs both checkpoints, which differ only in the routed experts: the release checkpoint
+[MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) stores them
+as NVFP4 and ATOM converts them to MXFP4 at load; the AMD Quark MXFP4 export
+[amd/MiniMax-M3.1-Flash-Quark-MXFP4](https://huggingface.co/amd/MiniMax-M3.1-Flash-Quark-MXFP4)
+ships them as MXFP4.
 
-| Weights | Quark MXFP4 export | At runtime (recipe below) |
-|---|---|---|
-| Routed experts (57 layers × 128) | MXFP4 (E2M1, E8M0 scale per 32) | as shipped |
-| Shared expert | MXFP8 (FP8 E4M3, E8M0 scale per 32) | re-quantized to MXFP4 and fused into the MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`) |
-| Attention q/k/v/o, indexer, dense MLP (layers 0–2) | MXFP8 (Quark `per_block`, `block_size [1, 32]`) | per-token / per-channel FP8 (`ptpc_fp8` online quant), as for MiniMax-M3 |
-| Vision tower, projector | BF16 | as shipped |
-| DSpark draft (`dspark/`) | MXFP8 linears, BF16 rest | as shipped |
+| Weights | Release checkpoint | Quark MXFP4 export | At runtime (recipes below) |
+|---|---|---|---|
+| Routed experts (57 layers × 128) | NVFP4 (compressed-tensors: E2M1, FP8 scale per 16, FP32 global scale) | MXFP4 (E2M1, E8M0 scale per 32) | MXFP4: converted at load (`"layer_quant_config": {"*.experts": "mxfp4"}`) / as shipped |
+| Shared expert | MXFP8 (FP8 E4M3, E8M0 scale per 32) | MXFP8 | release: its own MXFP8 MLP; Quark: re-quantized to MXFP4 and fused into the MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`) |
+| Attention q/k/v/o, indexer, dense MLP (layers 0–2) | MXFP8 | MXFP8 (Quark `per_block`, `block_size [1, 32]`) | per-token / per-channel FP8 (`ptpc_fp8` online quant), as for MiniMax-M3 |
+| Vision tower, projector | BF16 | BF16 | as shipped |
+| DSpark draft (`dspark/`) | MXFP8 linears, BF16 rest | MXFP8 linears, BF16 rest | as shipped |
 
 ### What runs
 
@@ -297,7 +299,10 @@ which ships the routed experts as MXFP4.
   load, re-quantizes it MXFP8 → MXFP4 and writes it into the fused slot, so the MoE runs as the
   tuned 129-expert / top-5 MXFP4 kernel (no `no tuned FlyDSL config` warning in the log).
   Without it the shared expert runs as its own MXFP8 MLP next to a 128-expert / top-4 MoE.
-  The fusion needs MXFP4 routed experts in the checkpoint.
+  The fusion needs MXFP4 routed experts in the checkpoint, so it applies to the Quark MXFP4
+  export only; on the release checkpoint (NVFP4 experts converted at load) the switch has no
+  effect and the shared expert stays a separate MXFP8 MLP (the log shows `no tuned FlyDSL
+  config` for the 128-expert / top-4 MoE).
 - **DSpark, CUDA-graph captured.** See [DSpark Speculative Decoding](#dspark-speculative-decoding-minimax-m31)
   below. Expect `Draft passes warmed at [1, ..., 128] ... ['DSparkProposer._block_backbone (captured)']`.
 - **Image input.** With the checkpoint's `vision_config`, ATOM runs the vision tower natively
@@ -316,8 +321,41 @@ docker pull rocm/atom-dev:minimax-m31-flash
 
 ### Launching Server
 
-Quark MXFP4 export, with DSpark. The online-quantization config re-quantizes the attention and
-dense-MLP linears to PTPC FP8; the experts are already MXFP4, so the whole MoE block is left out:
+Release checkpoint, with DSpark. The online-quantization config converts the routed experts to
+MXFP4 and re-quantizes the attention and dense-MLP linears to PTPC FP8; the router gate and the
+shared expert are left out, so the shared expert runs in MXFP8 as shipped:
+
+```bash
+model_path=${model_path:-MiniMaxAI/MiniMax-M3.1-Flash}   # includes dspark/
+run_name=${run_name:-m31-flash-release-dspark}
+export AITER_LOG_LEVEL=WARNING
+export ATOM_FORCE_ATTN_TRITON=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --served-model-name minimax-m3.1 \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}' \
+  --gpu-memory-utilization 0.9 \
+  --block-size 128 \
+  --max-model-len 131072 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*.experts": "mxfp4"}, "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe.gate", "*shared_experts*"]}' \
+  --no-enable_prefix_caching \
+  --method dspark \
+  --draft-model "$model_path/dspark" \
+  --num-speculative-tokens 7 2>&1 | tee "${run_name}-server.log"
+```
+
+Quark MXFP4 export, with DSpark. Identical except for the checkpoint and the online-quantization
+config: the experts are already MXFP4, so the whole MoE block is left out:
 
 ```bash
 model_path=${model_path:-amd/MiniMax-M3.1-Flash-Quark-MXFP4}   # includes dspark/
@@ -363,11 +401,13 @@ Without speculative decoding, drop the last three flags. Notes:
 
 ### Accuracy Test
 
-Day-0 accuracy with the launch command above (PTPC FP8 attention, fused shared expert, DSpark
-with 7 drafts, FP8 KV and index cache, thinking on), lm-eval through the chat endpoint:
+Day-0 accuracy with the two launch commands above (PTPC FP8 attention, DSpark with 7 drafts,
+FP8 KV and index cache, thinking on; shared expert fused on the Quark export, separate MXFP8 MLP
+on the release checkpoint), lm-eval through the chat endpoint:
 
 | Checkpoint | GSM8K flexible / strict | AIME 2026 mean@16 | AIME 2025 mean@16 | MMMU-Pro standard / vision |
 |---|---:|---:|---:|---:|
+| Release (experts converted to MXFP4) | 0.958 / 0.917 | 0.927 | 0.906 | 0.802 / 0.690 |
 | Quark MXFP4 export | 0.955 / 0.914 | 0.919 | 0.915 | 0.791 / 0.682 |
 
 - GSM8K: 5-shot, multi-turn few-shot, temperature 0, `reasoning_effort=max`, up to 16,384 new

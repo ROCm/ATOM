@@ -542,6 +542,93 @@ def test_nvfp4_moe_loads_split_expert_scalars_and_blocks_forward():
         method.apply(layer, None)
 
 
+def test_nvfp4_moe_inverts_compressed_tensors_global_scales():
+    """compressed-tensors stores 448 * 6 / amax; scale_2 holds its reciprocal."""
+    spec = LayerQuantConfig(
+        quant_type=QuantType.per_1x32,
+        quant_dtype=NVFP4_DTYPE,
+        is_dynamic=True,
+        quant_method=quant_spec.NVFP4_DIVISOR_GLOBAL_SCALE_METHOD,
+    )
+    layer = object.__new__(FusedMoE)
+    nn.Module.__init__(layer)
+    layer.has_bias = False
+    layer.quant_config = SimpleNamespace(online_quant=False)
+    layer.prefix = "model.layers.3.block_sparse_moe.experts"
+    layer.layer_name = layer.prefix
+    layer.layer_quant_config = spec
+    layer.moe_parallel_config = SimpleNamespace(
+        tp_size=1, tp_rank=0, ep_size=1, ep_rank=0, dp_rank=0, use_ep=False
+    )
+    layer.expert_map = None
+    layer.local_num_experts = 2
+    method = Nvfp4MoEMethod(spec, SimpleNamespace())
+    layer.quant_method = method
+    method.create_weights(
+        layer,
+        num_experts=2,
+        hidden_size=64,
+        intermediate_size_per_partition=32,
+        params_dtype=dtypes.fp4x2,
+        weight_loader=layer.weight_loader,
+    )
+    for shard_id, value in (("w1", 4.0), ("w3", 8.0)):
+        layer.weight_loader(
+            layer.w13_weight_scale_2,
+            torch.tensor(value),
+            "weight_scale_2",
+            shard_id,
+            1,
+        )
+    layer.weight_loader(
+        layer.w2_weight_scale_2, torch.tensor(2.0), "weight_scale_2", "w2", 1
+    )
+    assert layer.w13_weight_scale_2[1].tolist() == [0.25, 0.125]
+    assert layer.w2_weight_scale_2[1].item() == 0.5
+
+
+def test_minimax_m3_maps_compressed_tensors_nvfp4_expert_names():
+    weights_mapping = minimax_m3.MiniMaxM3SparseForConditionalGeneration.weights_mapping
+    prefixes = sorted(
+        make_minimax_m3_expert_params_mapping(1),
+        key=lambda entry: len(entry[1]),
+        reverse=True,
+    )
+
+    def to_param(checkpoint_name):
+        for part, replacement in weights_mapping.items():
+            checkpoint_name = checkpoint_name.replace(part, replacement)
+        param_part, checkpoint_part, expert_id, shard_id = next(
+            entry for entry in prefixes if entry[1] in checkpoint_name
+        )
+        return (
+            checkpoint_name.replace(checkpoint_part, param_part),
+            expert_id,
+            shard_id,
+        )
+
+    base = "language_model.model.layers.3.block_sparse_moe."
+    assert to_param(base + "experts.0.w1.weight_packed") == (
+        base + "experts.w13_weight",
+        0,
+        "w1",
+    )
+    assert to_param(base + "experts.0.w3.weight_scale") == (
+        base + "experts.w13_weight_scale",
+        0,
+        "w3",
+    )
+    assert to_param(base + "experts.0.w2.weight_global_scale") == (
+        base + "experts.w2_weight_scale_2",
+        0,
+        "w2",
+    )
+    # No parameter carries it, so the loader drops it.
+    assert to_param(base + "experts.0.w1.input_global_scale")[0] == (
+        base + "experts.w13_input_global_scale"
+    )
+
+
 def test_nvfp4_moe_streaming_counts_split_global_scales(monkeypatch):
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "1")
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING", "1")
