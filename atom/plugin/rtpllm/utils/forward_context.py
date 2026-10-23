@@ -107,9 +107,12 @@ if triton is not None:
         # too-narrow table must be distinguishable from graph padding even
         # though both still use block 0 as the safe fallback address.
         first_page = tl.load(block_table + row * table_stride_row, live, 0)
+        # RTP may pad a Graph row with either block 0 or -1. Only positive
+        # first-page IDs identify live requests in this block-table contract.
+        real = first_page > 0
         invalid = (
             live
-            & (first_page > 0)
+            & real
             & ((read_col >= table_cols) | (write_col + query_len - 1 >= table_cols))
         )
         for token in tl.static_range(query_len):
@@ -121,7 +124,7 @@ if triton is not None:
                 live & (column < table_cols) & (length >= 2),
                 -1,
             )
-            invalid |= live & (first_page > 0) & (slot < 0)
+            invalid |= live & real & (slot < 0)
             # RTP reserves and zeroes state block 0 for Graph padding. The
             # recurrent consumer cannot safely dereference a negative slot.
             tl.store(write_slots + row * query_len + token, tl.maximum(slot, 0), live)
@@ -132,10 +135,11 @@ if triton is not None:
             live & (read_col < table_cols) & (length >= 2),
             -1,
         )
-        invalid |= live & (first_page > 0) & (previous < 0)
+        invalid |= live & real & (previous < 0)
         invalid_count = tl.sum(invalid.to(tl.int32), 0)
-        if invalid_count > 0:
-            tl.atomic_add(invalid_live_rows, invalid_count)
+        # Each tile owns one flag, overwritten on every Graph replay. This
+        # avoids both an atomic update and a separate counter-reset kernel.
+        tl.store(invalid_live_rows + tl.program_id(0), invalid_count)
         for token in tl.static_range(query_len):
             tl.store(
                 read_slots + row * query_len + token, tl.maximum(previous, 0), live

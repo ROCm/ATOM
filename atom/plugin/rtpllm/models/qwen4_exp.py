@@ -185,10 +185,10 @@ class _ATOMQwen4ExpRuntime(_ATOMQwen35MoeRuntime):
             mtp_buffers[name] = torch.empty(max_tokens, device=device, dtype=dtype)
         add_qsa_buffers(mtp_buffers, max_tokens)
         if is_target:
-            # Replays accumulate invalid *real* rows on device without a
-            # host sync; graph padding (reserved block 0) is not counted.
-            mtp_buffers["target_invalid_live_rows"] = torch.zeros(
-                (), device=device, dtype=torch.int32
+            # One flag per index-kernel tile; each replay overwrites it.
+            # Graph padding (reserved block 0) is not counted.
+            mtp_buffers["target_invalid_live_rows"] = torch.empty(
+                ((max_batch + 127) // 128,), device=device, dtype=torch.int32
             )
             mtp_buffers["target_read_slots_i32"] = torch.empty(
                 (max_batch, mtp_tokens_per_request), device=device, dtype=torch.int32
