@@ -24,7 +24,9 @@ from atom.models.qwen3_5.mono.layout import TL_POINTS, layout, shape_dims
 from atom.models.qwen3_5.mono.op import Qwen35MonoKernel, Qwen35Variant
 from atom.models.qwen3_5.mono.runner import (
     Qwen35MonoDecodeRunner,
+    bf16_gemm_refusal,
     check_inputs,
+    check_splits,
     raise_on_given_up_waits,
 )
 from atom.models.qwen3_5.mono.weights import LayerWeights, rope_tables
@@ -90,12 +92,14 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             raise MonoUnsupported(
                 f"MTP layer experts {w13.dtype}: the draft runs mono with the FP8 checkpoint"
             )
-        # its post-attention norm folds the all-reduce, as the target's layers' do
-        from atom.models.qwen3_5.model import allreduce_norm_fusion_enabled
-
-        if not allreduce_norm_fusion_enabled():
+        # ATOM builds the MTP layer without the all-reduce + RMSNorm fusion (Qwen3_5MTP), and the kernel
+        # follows that: its input norm quantizes as the unfused norm kernel does (the launch's layer 0),
+        # and an all-reduce summing the ranks in order and rounding once to bf16, then the add + norm
+        # on the f32 sum, is what the kernel's exchange and residual compute. A fused MTP layer's
+        # input norm would quantize as the fused one does instead
+        if getattr(layer, "fuse_allreduce_norm", True):
             raise MonoUnsupported(
-                "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
+                "the MTP layer folds its all-reduce into its norms; the kernel follows the unfused layer"
             )
         self.cfg = Q35Config(
             tp=self.tp,
@@ -103,12 +107,16 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
             weights="fp8",
             qk_fusion=envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION,
         )
+        why = bf16_gemm_refusal(self.cfg)
+        if why is not None:
+            raise MonoUnsupported(why)
         self.full = [True]
         self.layers = [(LayerWeights(self.cfg, True), self._pack(0, layer))]
         self.layer_nums = [layer.self_attn.attn.layer_num]
-        # positions < max_model_len, and the drafted tokens past it
+        # positions < max_model_len, and the draft's past it: its step 0 runs the verify's k + 1 rows
+        # one position on, each later step one more, up to 2k past the last kept token
         rope = rope_tables(
-            layer.self_attn.rotary_emb, self.cfg, self.max_len, spare=self.T - 1
+            layer.self_attn.rotary_emb, self.cfg, self.max_len, spare=2 * (self.T - 1)
         )
         if rope is None:
             raise MonoUnsupported(
@@ -181,6 +189,8 @@ class Qwen35MonoDraftRunner(Qwen35MonoDecodeRunner):
         T = self.step_t(S)
         pos = (positions[0] if positions.dim() == 2 else positions)[:S].to(torch.int32)
         slots = md.slot_mapping[:S].to(torch.int32)
+        # step 0 reuses the verify's metadata, whose context_lens a graph may have padded
+        check_splits(md, S // T)
         bt = md.block_tables[: S // T]
         ctx = md.context_lens[: S // T].to(torch.int32)
         if T > 1:

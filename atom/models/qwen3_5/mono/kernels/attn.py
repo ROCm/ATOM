@@ -17,13 +17,15 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.config import FP8_MAX
-from atom.models.qwen3_5.mono.kernels.common import fp8_word, sigmoid, sigmoid_precise
+from atom.models.qwen3_5.mono.kernels.common import sigmoid, sigmoid_precise
 from atom.models.qwen3_5.mono.kernels.ops import ld_f32, lds_ld, lds_st
 from atom.models.qwen3_5.mono.layout import BS, PROJ_TILE
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_round,
+    block_max,
     exp,
+    fp8_pack4,
     rcp,
     read_lane_i32,
     rsq,
@@ -136,23 +138,12 @@ def attn_stages(ctx):
     r_cos, r_sin, r_gq, r_gk = rsrc(rope_cos), rsrc(rope_sin), rsrc(g_qn1), rsrc(g_kn1)
     HALF = ROPE // 2
 
-    def block_max(v):
-        w = wave_max(v)
-        if lane == 0:
-            lds_st(red, wave, w)
-        gpu.barrier()
-        t = lds_ld(red, 0)
-        for i in range_constexpr(1, WAVES):
-            t = fx.max(t, lds_ld(red, i))
-        gpu.barrier()
-        return t
-
     def kv_quant(x, live):
         """Per-token FP8 E4M3 over the head as the original path writes it -> (FP8 value as f32, scale,
         the FP8 word). aiter's ``reshape_and_cache``: the scale ``amax / 448`` (stored as is: 0 for an
         all-zero head), x times ``1 / max(scale, 1e-12)``; ATOM's fused q / k norm + RoPE + cache kernel
         (QKF): ``amax / 448`` (1 for an all-zero head), x divided by it."""
-        amax = block_max(live.select(fmath.absf(x), fx.Float32(0.0)))
+        amax = block_max(live.select(fmath.absf(x), fx.Float32(0.0)), lane, wave, red)
         sc = amax / FP8_MAX
         if const_expr(QKF):
             sc = (sc == 0.0).select(fx.Float32(1.0), sc)
@@ -338,7 +329,7 @@ def attn_stages(ctx):
         lds_st(
             xs,
             XQ8 + (tid // (HD // 4)) * SQ8 + tid % (HD // 4),
-            fp8_word(
+            fp8_pack4(
                 *[qv[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
             ).bitcast(fx.Float32),
         )
@@ -359,7 +350,7 @@ def attn_stages(ctx):
             d4 = (tid % (HD // 4)) * 4
             base = (s0 + i_) * (2 * HD + 2) + kv_ * HD + d4
             got = poll([(mb("kvnew"), base, 2), (mb("kvnew"), base + 2, 2)])
-            w = fp8_word(
+            w = fp8_pack4(
                 *[got[i][e].bitcast(fx.Float32) for i in range(2) for e in range(2)]
             )
             lds_st(
@@ -447,7 +438,7 @@ def attn_stages(ctx):
             m = m_new
             f8i = 448.0 * rcp(vmax + 1.0e-8)
             pq = [(vss[j] * f8i) * ps_[j] for j in range(4)]
-            lds_st(xs, XPP + wave * SPP + lane, fp8_word(*pq).bitcast(fx.Float32))
+            lds_st(xs, XPP + wave * SPP + lane, fp8_pack4(*pq).bitcast(fx.Float32))
             pscale = vmax * (1.0 / 448.0)
             if lane == 0:
                 lds_st(xs, XA + wave, alpha)

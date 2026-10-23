@@ -20,6 +20,7 @@ from atom.mono.device.ops import (
     bf2_f32,
     bf16_pair,
     exp,
+    fp8_pack4,
     rcp,
     read_lane_i32,
     rsq,
@@ -159,12 +160,6 @@ def quant_rule_q4(amax):
     return sc, lambda x: _clamp8(x * inv)
 
 
-def fp8_word(q0, q1, q2, q3):
-    """Four f32 values (already scaled) as four E4M3FN bytes, K order."""
-    lo = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False))
-    return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q2, q3, lo, True))
-
-
 def quant_floor(a0, a1):
     """``quant_rule_q1`` of a 128-block held as 2 f32 per lane of a wave -> (q0, q1, scale)."""
     sc, q = quant_rule_q1(wave_max(fx.max(fmath.absf(a0), fmath.absf(a1))))
@@ -244,7 +239,7 @@ def common_defs(ctx):
         lds_st(
             xs,
             (s * n + k) // 4,
-            fp8_word(q(v4[0]), q(v4[1]), q(v4[2]), q(v4[3])).bitcast(fx.Float32),
+            fp8_pack4(q(v4[0]), q(v4[1]), q(v4[2]), q(v4[3])).bitcast(fx.Float32),
         )
         if lane % 32 == 0:
             lds_st(misc, MOE_MISC + s * XQ_BLOCKS + k // 128, sc)
@@ -359,7 +354,7 @@ def common_defs(ctx):
                 for o in (1, 2, 4, 8, 16):
                     amax = fx.max(amax, xshfl(amax, o))
                 sc, q = fp8_rule(amax)
-                lds_st(xs, w, fp8_word(*[q(x) for x in a]).bitcast(fx.Float32))
+                lds_st(xs, w, fp8_pack4(*[q(x) for x in a]).bitcast(fx.Float32))
                 if lane % 32 == 0:
                     lds_st(misc, MOE_MISC + w // 32, sc)
 
@@ -381,7 +376,7 @@ def common_defs(ctx):
                 for o in (1, 2, 4, 8, 16):
                     amax = fx.max(amax, xshfl(amax, o))
                 sc, q = fp8_rule(amax)
-                lds_st(xs, w, fp8_word(q(a0), q(a1), q(a2), q(a3)).bitcast(fx.Float32))
+                lds_st(xs, w, fp8_pack4(q(a0), q(a1), q(a2), q(a3)).bitcast(fx.Float32))
                 if lane % 32 == 0:
                     lds_st(misc, MOE_MISC + w // 32, sc)
 

@@ -13,7 +13,7 @@ The configuration is checked once (``config_refusal``). A step is then routed on
 pure decode of up to ``MAX_TOKENS`` rows: a token a request, or an MTP verify of whole requests;
 a draft step only when it runs one of the two shapes the MTP propose loop uses. Every per-step
 input read is TP-uniform: the kernel waits on every peer rank, so ranks that disagreed would wait
-on each other for ever.
+on each other for ever (a per-rank flag such as ``is_dummy_run`` must never gate this).
 """
 
 import functools
@@ -106,6 +106,13 @@ def baseline_switches() -> list[tuple[str, bool]]:
         ("ATOM_USE_MODEL_SENSITIVE_RMSNORM=1", envs.ATOM_USE_MODEL_SENSITIVE_RMSNORM),
         # the UT-transform replay (``auto`` takes it only past 11 verify tokens, beyond MTP-3)
         ("ATOM_REPLAYSSM_ROUTE=ut", envs.ATOM_REPLAYSSM_ROUTE == "ut"),
+        # the fused q / k norm + RoPE + cache kernel serves a step only up to this many rows; past it
+        # the original path norms, rounds, rotates and quantizes K in separate kernels
+        (
+            f"ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS < {MAX_TOKENS} with the QK fusion",
+            envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+            and envs.ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS < MAX_TOKENS,
+        ),
     ]
 
 
@@ -222,10 +229,9 @@ def step_supported(input_ids, T: int, replay: bool) -> bool:
         return False
     fwd = get_forward_context()
     c = fwd.context
-    # is_dummy_run is a per-rank flag: TP-uniform here only because DP > 1 is refused (with DP, an
-    # idle replica's dummy step would leave its ranks on the original path while a peer waits in
-    # the kernel's exchange). Lifting the DP refusal needs this gate removed and dummy steps run.
-    if c is None or c.is_prefill or c.is_dummy_run or getattr(c, "is_draft", False):
+    # no per-rank flag such as is_dummy_run gates this (see the module docstring); a dummy decode
+    # (DP's idle-rank step, DP > 1 being refused) is routed like any other
+    if c is None or c.is_prefill or getattr(c, "is_draft", False):
         return False
     if getattr(fwd, "ubatch_slices", None) is not None:
         return False

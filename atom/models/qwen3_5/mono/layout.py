@@ -91,6 +91,59 @@ BF16_GEMM_RULES = {
 }
 
 
+def bf16_gemms(cfg) -> list[tuple[str, int, int, str | None]]:
+    """Baseline ATOM's BF16 GEMMs on the decode path the kernel reproduces, as (name, N, K, its
+    ``BF16_GEMM_RULES`` entry or None: the kernel sums those in one fp32 pass) for a ``Q35Config``
+    rank: the router and the GDN b | a projection in both checkpoints, the MXFP4 checkpoint's BF16
+    projections and shared expert."""
+    gemms = [
+        ("router", cfg.n_experts + 1, cfg.hidden, "router"),
+        ("in_proj_ba", 2 * cfg.hv, cfg.hidden, None),
+    ]
+    if cfg.weights == "mxfp4":
+        sh = cfg.shared_inter // cfg.tp
+        gemms += [
+            ("in_proj_qkvz", cfg.conv_dim + cfg.value_dim, cfg.hidden, None),
+            (
+                "qkv_proj",
+                cfg.local_heads * 2 * cfg.head_dim + 2 * cfg.head_dim,
+                cfg.hidden,
+                None,
+            ),
+            ("out_proj", cfg.hidden, cfg.value_dim, "out"),
+            ("o_proj", cfg.hidden, cfg.local_heads * cfg.head_dim, "out"),
+            ("shared gate_up", 2 * sh, cfg.hidden, "shared_ug"),
+            ("shared down", cfg.hidden, sh, None),
+        ]
+    return gemms
+
+
+def aiter_bf16_rule(pick: dict | None) -> tuple:
+    """The partial-sum rounding (a ``BF16_GEMM_RULES`` value) of an aiter tuned_gemm config ``pick``
+    (``get_GEMM_A16W16_config``; None: untuned, torch). A FlyDSL pick whose name does not read as one
+    of those is ``("unknown", name)``, which matches no rule."""
+    pick = pick or {}
+    name = pick.get("kernelName") or ""
+    if pick.get("libtype") == "flydsl":
+        params = name.split("_")
+        try:
+            tile = next(p for p in params if p.startswith("t") and "x" in p)
+            ks = next(p for p in params if p.startswith("ks"))
+            waves = next(p for p in params if p.startswith("w") and "x" in p)
+            k_waves = int(waves[1:].split("x")[2])
+            split_k = 1 if ks == "ks1" else int(pick["splitK"])
+        except (StopIteration, IndexError, KeyError, ValueError):
+            return ("unknown", name)
+        if split_k > 1 and k_waves == 1:
+            return ("splitk", split_k)
+        if split_k == 1 and k_waves == 2 and tile.split("x")[2] == "256":
+            return ("halves",)
+        if split_k == 1 and k_waves == 1:
+            return ("single",)
+        return ("unknown", name)
+    return ("single",)
+
+
 # Past XIN_MIN rows the FP8 checkpoint's input norm + FP8 quant runs once a layer (stage ``xin``, a task per row)
 # instead of in every projection task (each restaged every row: the cost grew with the rows)
 XIN_MIN = 4

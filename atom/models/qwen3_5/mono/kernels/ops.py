@@ -6,20 +6,15 @@ from __future__ import annotations
 
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
+
+from atom.mono.device.ops import _hardware_f32
 
 ROW_TILE = 32
 
 SCALE_BM = 128
 FP8_MAX = 448.0
-
-
-def _hardware_f32(name, value):
-    return fx.Float32(
-        llvm.call_intrinsic(T.f32, name, [fx.Float32(value).ir_value()], [], [])
-    )
 
 
 def sqrt(value):

@@ -28,8 +28,12 @@ from aiter.dist.parallel_state import get_tp_group
 from atom.models.qwen3_5.mono.config import MAX_TOKENS, Q35Config, is_full_attention
 from atom.models.qwen3_5.mono.dispatch import final_norm
 from atom.models.qwen3_5.mono.layout import (
+    BF16_GEMM_RULES,
     TL_POINTS,
+    aiter_bf16_rule,
+    bf16_gemms,
     layout,
+    pa_splits,
     router_rows,
     shape_dims,
 )
@@ -94,6 +98,30 @@ def baseline_refusal(experts, rows: int = 16) -> str | None:
     return None
 
 
+def bf16_gemm_refusal(cfg, rows: int = MAX_TOKENS) -> str | None:
+    """Why one of the original path's BF16 GEMMs (``layout.bf16_gemms``) rounds its partial sums
+    otherwise than the kernel does at some decode M up to ``rows``, or None. Asked of the installed
+    aiter's tuned picks (``tgemm.mm``), so a re-tune, an aiter update or ``AITER_CONFIG_GEMM_BF16``
+    cannot change the original path's rounding under the kernel."""
+    try:
+        from aiter.tuned_gemm import get_GEMM_A16W16_config
+    except ImportError as e:
+        return f"cannot tell the original path's BF16 GEMMs: {e}"
+    for name, n, k, rule in bf16_gemms(cfg):
+        for m in range(1, rows + 1):
+            pick = get_GEMM_A16W16_config(
+                m, n, k, False, "torch.bfloat16", "torch.bfloat16", False, False
+            )
+            got = aiter_bf16_rule(pick)
+            want = BF16_GEMM_RULES[rule][m] if rule else ("single",)
+            if got != want:
+                return (
+                    f"the original path's {name} GEMM ({m} x {n} x {k}) rounds as {got}, the kernel"
+                    f" as {want}"
+                )
+    return None
+
+
 def _need(i, name, t, shape, dtype=None, shuffled=None, nbytes=None):
     """Layer ``i``'s tensor ``name`` as the kernel reads it -- its shape (or byte size), dtype and,
     for a weight the kernel reads in place, whether ATOM holds it shuffled -- or MonoUnsupported.
@@ -130,6 +158,19 @@ def check_inputs(built, kvd, x, ins) -> None:
         except StepInputError as e:
             raise StepInputError(f"layer {i}: {e}") from None
     built["pools_checked"] = kvd
+
+
+def check_splits(md, requests: int) -> None:
+    """The original decode attention splits each sequence by the count of its metadata's
+    ``context_lens`` (ATOM's ``dense_decode_splits``), and each split is a rounding point: a step
+    whose metadata counts other than its ``requests`` rows (a graph's padded batch around an eager
+    draft) would split differently, so it raises ``StepInputError``."""
+    seqs = md.context_lens.shape[0]
+    if pa_splits(seqs) != pa_splits(requests):
+        raise StepInputError(
+            f"the original attention splits {seqs} sequences {pa_splits(seqs)} ways, the kernel's"
+            f" {requests} {pa_splits(requests)}"
+        )
 
 
 def language_model(causal_lm):
@@ -208,6 +249,9 @@ class Qwen35MonoDecodeRunner:
             raise MonoUnsupported(
                 "the original path's all-reduce + RMSNorm fusion is off; the kernel reproduces it"
             )
+        why = bf16_gemm_refusal(self.cfg)
+        if why is not None:
+            raise MonoUnsupported(why)
         n = len(self.lm.layers)
         self.full = [is_full_attention(i) for i in range(n)]
         for i, layer in enumerate(self.lm.layers):
@@ -557,14 +601,16 @@ class Qwen35MonoDecodeRunner:
         if sm.numel() < S:
             # GDN's verify-graph capture metadata slices the per-token slot buffer to the sequence
             # count (gdn_attn.build_for_cudagraph_capture); the buffer itself holds every token's slot
-            assert (
+            if not (
                 sm.is_contiguous()
                 and sm.untyped_storage().nbytes()
                 >= (sm.storage_offset() + S) * sm.element_size()
-            )
+            ):
+                raise StepInputError(f"slot_mapping holds {sm.numel()} of {S} rows")
             sm = sm.as_strided((S,), (1,))
         slots = sm[:S].to(torch.int32)
         T = self.T
+        check_splits(md, S // T)
         ctx = md.context_lens[: S // T].to(torch.int32)
         if T == 1:
             gdn = (

@@ -12,7 +12,6 @@ from flydsl.expr.typing import T
 
 from atom.models.qwen3_5.mono.kernels.common import (
     div_rn,
-    fp8_word,
     quant_rule_q3,
     sigmoid,
     sigmoid_fast,
@@ -27,7 +26,16 @@ from atom.models.qwen3_5.mono.kernels.ops import (
     sqrt,
 )
 from atom.models.qwen3_5.mono.layout import PROJ_GROUPS, PROJ_TILE
-from atom.mono.device.ops import bf16_round, exp, rsq, rsrc, traced, uniform, xshfl
+from atom.mono.device.ops import (
+    bf16_round,
+    exp,
+    fp8_pack4,
+    rsq,
+    rsrc,
+    traced,
+    uniform,
+    xshfl,
+)
 from atom.mono.plan.execution import WAVES
 
 # recurrence thread mapping over ATOM's K-major state [K][V]: lane % 8 takes 16 consecutive k, lane // 8
@@ -446,7 +454,7 @@ def gdn_stages(ctx):
                 put(
                     mb("gq"),
                     (s * VALUE_DIM + h * V_DIM) // 4 + tid,
-                    fp8_word(q(g4[0]), q(g4[1]), q(g4[2]), q(g4[3])),
+                    fp8_pack4(q(g4[0]), q(g4[1]), q(g4[2]), q(g4[3])),
                 )
                 if tid == 0:
                     put(mb("gqs"), s * (VALUE_DIM // 128) + h * (V_DIM // 128), sc)

@@ -188,43 +188,84 @@ def test_mixer_output_mailboxes_follow_the_out_proj_input(weights, full):
     assert sizes["a"] >= tokens * dims["hidden"] * 8
 
 
-# the BF16 GEMMs whose baseline partial-sum rounding the kernel takes: TP 4 per-rank (N, K)
-_BF16_GEMMS = {"out": (4096, 2048), "shared_ug": (512, 4096), "router": (513, 4096)}
+@pytest.mark.parametrize(
+    "pick, rule",
+    [
+        (None, ("single",)),
+        ({"libtype": "hipblaslt", "kernelName": "Cijk_x"}, ("single",)),
+        (
+            {
+                "libtype": "flydsl",
+                "kernelName": "hgemm_t16x16x256_ks1_w1x1x2",
+                "splitK": 0,
+            },
+            ("halves",),
+        ),
+        (
+            {
+                "libtype": "flydsl",
+                "kernelName": "hgemm_t16x64x128_ks4_w1x1x1",
+                "splitK": 4,
+            },
+            ("splitk", 4),
+        ),
+        (
+            {
+                "libtype": "flydsl",
+                "kernelName": "hgemm_t16x64x128_ks1_w1x1x1",
+                "splitK": 0,
+            },
+            ("single",),
+        ),
+        # a pick the kernel has no rule for never matches one
+        (
+            {
+                "libtype": "flydsl",
+                "kernelName": "hgemm_t16x16x128_ks1_w1x1x2",
+                "splitK": 0,
+            },
+            ("unknown", "hgemm_t16x16x128_ks1_w1x1x2"),
+        ),
+        # nor does a name it cannot read
+        ({"libtype": "flydsl", "kernelName": "hgemm_new"}, ("unknown", "hgemm_new")),
+    ],
+)
+def test_an_aiter_pick_reads_as_its_partial_sum_rounding(pick, rule):
+    assert layout.aiter_bf16_rule(pick) == rule
 
 
-def _rule_of_aiter_pick(cfg: dict) -> tuple:
-    """The partial-sum rounding of an aiter tuned_gemm pick (see ``layout.BF16_GEMM_RULES``)."""
-    name = cfg.get("kernelName") or ""
-    if cfg.get("libtype") == "flydsl":
-        params = name.split("_")
-        tile = next(p for p in params if p.startswith("t") and "x" in p)
-        ks = next(p for p in params if p.startswith("ks"))
-        waves = next(p for p in params if p.startswith("w") and "x" in p)
-        k_waves = int(waves[1:].split("x")[2])
-        split_k = 1 if ks == "ks1" else int(cfg["splitK"])
-        assert (split_k == 1) or (k_waves == 1), name
-        if split_k > 1:
-            return ("splitk", split_k)
-        if k_waves == 2 and tile.split("x")[2] == "256":
-            return ("halves",)
-        assert k_waves == 1, name
-    return ("single",)
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+def test_every_bf16_gemm_the_kernel_follows_is_asked_of_aiter(weights):
+    """Every BF16 GEMM on the decode path the kernel reproduces, at its TP 4 shard shape: a rule of
+    ``BF16_GEMM_RULES`` or one fp32 sum."""
+    got = {
+        name: (n, k, rule)
+        for name, n, k, rule in layout.bf16_gemms(Q35Config(weights=weights))
+    }
+    want = {"router": (513, 4096, "router"), "in_proj_ba": (32, 4096, None)}
+    if weights == "mxfp4":
+        want |= {
+            "in_proj_qkvz": (5120, 4096, None),
+            "qkv_proj": (4608, 4096, None),
+            "out_proj": (4096, 2048, "out"),
+            "o_proj": (4096, 2048, "out"),
+            "shared gate_up": (512, 4096, "shared_ug"),
+            "shared down": (4096, 256, None),
+        }
+    assert got == want
 
 
-@pytest.mark.parametrize("name", sorted(_BF16_GEMMS))
-def test_bf16_gemm_rules_match_aiters_tuned_picks(name):
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+def test_bf16_gemm_rules_match_aiters_tuned_picks(weights):
     """A re-tune of aiter's BF16 GEMM configs can change which partial sums baseline ATOM rounds: the
-    pinned table must follow the installed aiter (needs its gfx950 tuned configs, so a GPU).
-    """
-    tg = pytest.importorskip("aiter.tuned_gemm")
+    runner refuses then (``bf16_gemm_refusal``), and the installed aiter must agree with the table
+    (needs its gfx950 tuned configs, so a GPU)."""
+    pytest.importorskip("aiter.tuned_gemm")
     if not torch.cuda.is_available():
         pytest.skip("aiter's tuned config lookup reads the GPU's CU count")
-    N, K = _BF16_GEMMS[name]
-    for M in range(1, 17):
-        cfg = tg.get_GEMM_A16W16_config(
-            M, N, K, False, "torch.bfloat16", "torch.bfloat16", False, False
-        )
-        assert layout.BF16_GEMM_RULES[name][M] == _rule_of_aiter_pick(cfg), (M, cfg)
+    from atom.models.qwen3_5.mono.runner import bf16_gemm_refusal
+
+    assert bf16_gemm_refusal(Q35Config(weights=weights)) is None
 
 
 def test_every_launch_width_has_its_bf16_gemm_rule():

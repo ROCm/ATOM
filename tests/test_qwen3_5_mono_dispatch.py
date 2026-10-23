@@ -210,7 +210,9 @@ def test_more_than_one_mtp_layer_is_refused(native):
     assert dispatch.config_refusal(_atom_config(hf_config=hf)) is None
 
 
-@pytest.mark.parametrize("setting", [n for n, _ in dispatch.baseline_switches()])
+@pytest.mark.parametrize(
+    "setting", [n for n, _ in dispatch.baseline_switches() if "=" in n]
+)
 def test_a_switch_that_changes_the_original_decode_is_refused(
     native, monkeypatch, setting
 ):
@@ -218,6 +220,24 @@ def test_a_switch_that_changes_the_original_decode_is_refused(
     assert dispatch.config_refusal(_atom_config()) is None
     monkeypatch.setenv(name, value)
     assert dispatch.config_refusal(_atom_config()) == setting
+
+
+@pytest.mark.parametrize(
+    "fusion, max_tokens, refused",
+    [("1", "8", True), ("1", "16", False), ("0", "8", False)],
+)
+def test_the_qk_fusion_must_serve_every_launch_width(
+    native, monkeypatch, fusion, max_tokens, refused
+):
+    """Past ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS rows the original attention leaves its fused
+    q / k norm + RoPE + cache kernel, which the kernel follows under the QK fusion."""
+    monkeypatch.setenv("ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION", fusion)
+    monkeypatch.setenv("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS", max_tokens)
+    reason = dispatch.config_refusal(_atom_config())
+    if refused:
+        assert reason.startswith("ATOM_QK_NORM_ROPE_CACHE_FUSION_MAX_TOKENS <")
+    else:
+        assert reason is None
 
 
 def test_replayssm_without_a_drafter_is_refused(native, monkeypatch):
@@ -298,12 +318,18 @@ def test_plain_decode_step_is_routed(monkeypatch, rows):
     assert dispatch.step_supported(_ids(rows), 1, False)
 
 
+def test_a_dummy_decode_is_routed_like_any_other(monkeypatch):
+    """is_dummy_run is a per-rank flag: a rank that kept the original path on it would leave its
+    peers waiting in the kernel's exchange."""
+    _context(monkeypatch, dummy=True, num_decodes=4)
+    assert dispatch.step_supported(_ids(4), 1, False)
+
+
 @pytest.mark.parametrize(
     "rows, kwargs",
     [
         (17, {}),
         (4, {"prefill": True}),
-        (4, {"dummy": True}),
         (4, {"draft": True}),
         (4, {"ubatch": object()}),
         (4, {"num_prefills": 1}),
