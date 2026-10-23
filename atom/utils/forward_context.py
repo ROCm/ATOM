@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from atom.config import Config, CUDAGraphMode, KVCacheTensor, ParallelConfig
+from atom.distributed.ulysses_sp import sp_tokens_across_ranks
 
 
 class AttnState(Enum):
@@ -1209,7 +1210,9 @@ def set_forward_context(
     # unconditionally, because the capture loop reuses one Context across
     # buckets and a set-only write would leave the last table behind.
     context.running_tokens_across_dp = (
-        None if num_tokens_across_dp is None else tuple(num_tokens_across_dp.tolist())
+        sp_tokens_across_ranks(num_tokens)
+        if num_tokens_across_dp is None
+        else tuple(num_tokens_across_dp.tolist())
     )
 
     _forward_context = ForwardContext(

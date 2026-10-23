@@ -109,6 +109,9 @@ class BlockPool:
         self._cached: OrderedDict[int, None] = OrderedDict()
         self._free: set[int] = set(range(num_blocks))
         self._used: set[int] = set()
+        # The highest block id ever handed out for FRESH content (`allocate`). Blocks above it were
+        # never written by any request, so their KV is still what the pool was built with.
+        self._max_allocated = -1
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
         # Reusable content this pool destroyed, split by what destroyed it.
@@ -331,6 +334,7 @@ class BlockPool:
         block.reset()
         self._take_named(block_id)
         self._used.add(block_id)
+        self._max_allocated = max(self._max_allocated, block_id)
         return block
 
     def claim(self, block_id: int) -> Block:
@@ -377,6 +381,14 @@ class BlockPool:
         if len(self._vacant) > 2 * self.num_blocks + 2:
             self._vacant = [b for b in self._free if self.blocks[b].hash == -1]
             heapify(self._vacant)
+
+    def used_free_blocks(self) -> list[int]:
+        """Free blocks that may hold the bytes of an earlier request: the free ids at or below the
+        highest id ever handed out for fresh content, ascending. A block above it was never written.
+        After a gemm_fusion device error verdict every one of these is wiped (zeros are what a fresh
+        pool holds), whichever request wrote it and however long ago it was freed."""
+        top = self._max_allocated
+        return sorted(b for b in self._free if b <= top)
 
     def _trim_protected(self) -> None:
         # Bound protection so new prefixes can compete for cache space.

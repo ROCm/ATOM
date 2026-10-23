@@ -41,6 +41,16 @@ from atom.distributed.pp_comm import (
     recv_intermediate_tensors,
 )
 from atom.distributed.simulated_tp import apply_simulated_tp, reject_simulated_tp
+from atom.distributed.ulysses_sp import (
+    get_sp_world_size,
+    set_sp_world_size,
+    sp_gather_tokens,
+    sp_graph_capture,
+    sp_is_enabled,
+    sp_local_slice,
+    sp_pad_len,
+    sp_split_tokens,
+)
 from atom.kv_transfer.disaggregation import (
     KVConnectorFactory,
     KVConnectorOutput,
@@ -689,11 +699,10 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
-        # world_size: the logical TP width, i.e. how many shards each weight is
-        # cut into -- what the KV-head math below divides by.
-        # tp_world_size: how many of those shards have a process.
-        # They differ only under simulated TP.
-        self.world_size = config.tensor_parallel_size
+        # KV caches follow the attention head shards. SP needs a hidden-state
+        # gather before the LM head, so this also disables logits_in_graph.
+        # tp_world_size counts actual TP worker processes.
+        self.world_size = config.tensor_parallel_size * config.sequence_parallel_size
         self.tp_world_size = config.tp_world_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.tp_world_size}"
@@ -783,6 +792,16 @@ class ModelRunner:
         )
 
         self._build_and_load_model(model_class)
+        if config.gemm_fusion.enabled:
+            # Call-site install (model.py is @support_torch_compile and untouched):
+            # swap eligible M3 attention forwards BEFORE any wrap/compile/trace.
+            from atom.model_ops.gemm_fusion.model_adapters import install_m3_sites
+
+            n_fused_layers = install_m3_sites(self.model)
+            logger.info(
+                "gemm_fusion: installed fused QKV+attention on %d layers",
+                n_fused_layers,
+            )
 
         # Optional debug instrumentation; no-op when env vars unset.
         # See atom/utils/debug_helper/.
@@ -944,6 +963,8 @@ class ModelRunner:
         return 0
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
+        # Attention layers, KV pools and metadata need the SP head count.
+        set_sp_world_size(config.sequence_parallel_size)
         # Calculate local device rank considering DP, PP and PCP.
         # On a single node the physical GPU index equals the global distributed
         # rank in the DPxPPxPCPxTP layout: each EngineCore (one per (dp,pp)
@@ -1038,6 +1059,21 @@ class ModelRunner:
                 ),
             )
             apply_simulated_tp(config)
+        # GEMM fusion: no-op unless config.gemm_fusion.profile is set. Needs the
+        # SP group, so it runs after distributed init and before model build.
+        if config.gemm_fusion.enabled:
+            from atom.distributed.ulysses_sp import get_sp_group
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.init_gemm_fusion(
+                config,
+                get_sp_group(),
+                # a rank that publishes KV checks for a device error in the SAME step, before the
+                # announcement (everyone else checks every `check_period` steps)
+                kv_publisher=kv_config_has_producer(
+                    getattr(config, "kv_transfer_config", None)
+                ),
+            )
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -1086,6 +1122,10 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.shutdown()  # before the dist env its windows live on
         # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
         #    Must happen while ops module is still alive for CustomAllreduce cleanup.
         destroy_dist_env()
@@ -1281,7 +1321,9 @@ class ModelRunner:
         if not self.config.enable_dp_attention:
             max_tokens //= get_dp_group().world_size
         pcp_size = self.config.prefill_context_parallel_size
-        if pcp_size > 1:
+        # Ulysses SP reuses the PCP rank dimension and shards the sequence itself, so the warmup
+        # forward must not also be divided by the PCP size.
+        if pcp_size > 1 and not sp_is_enabled():
             max_tokens = max(1, max_tokens // pcp_size)
         return max_tokens
 
@@ -1388,6 +1430,13 @@ class ModelRunner:
                 dtype=hidden_type,
             ),
         }
+        if sp_is_enabled():
+            # Each graph captures a fixed address for this rank's token shard.
+            self.forward_vars["sp_input_ids"] = torch.empty(
+                sp_pad_len(self.max_num_batched_tokens) // get_sp_world_size(),
+                dtype=self.tokenID_processor.input_ids.gpu.dtype,
+                device=self.device,
+            )
         if self.use_mrope:
             self.forward_vars["mrope_positions"] = CpuGpuBuffer(
                 3,
@@ -1596,6 +1645,23 @@ class ModelRunner:
         except BaseException:
             self.h2d_owner.fail()
             raise
+
+    def sp_local_tokens(self, num_tokens: int) -> int:
+        """Rows of the model input this rank owns for a step of `num_tokens`."""
+        if not sp_is_enabled():
+            return num_tokens
+        return sp_pad_len(num_tokens) // get_sp_world_size()
+
+    def sp_graph_input_ids(self, num_tokens: int) -> torch.Tensor:
+        """Stage this rank's padded token shard at the graph's fixed address."""
+        local = self.sp_local_tokens(num_tokens)
+        buf = self.forward_vars["sp_input_ids"][:local]
+        src = self.forward_vars["input_ids"].gpu[:num_tokens]
+        shard = src[sp_local_slice(num_tokens)]
+        buf[: shard.numel()].copy_(shard)
+        # Pad the local buffer: the global buffer may end at num_tokens.
+        buf[shard.numel() :].zero_()
+        return buf
 
     def _get_num_kv_heads(self):
         """Return the per-rank number of KV heads."""
@@ -2213,6 +2279,10 @@ class ModelRunner:
             transfer_tensors,
             num_blocks=num_kvcache_blocks,
         )
+        if config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.bind_kv_cache(kv_cache_data)
 
         # Cross-validate: compare estimated vs actual KV cache allocation.
         # `actual_kv_bytes` includes BOTH the unified pool tensors (counted by
@@ -2592,7 +2662,7 @@ class ModelRunner:
             attn_metadata=attn_metadata,
             atom_config=self.config,
             context=context,
-            num_tokens=scheduled_tokens,
+            num_tokens=running_tokens if sp_is_enabled() else scheduled_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             spec_decode_metadata=spec_decode_metadata,
             ubatch_slices=ubatch_slices,
@@ -3056,12 +3126,22 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        if sp_is_enabled() and getattr(batch, "multimodal_data", None):
+            raise ValueError(
+                "Ulysses SP does not support multimodal embedding merging."
+            )
+
         if not forward_mode.use_cudagraph:
             # prefill, or decode forced eager (enforce_eager / DP peer
             # prefill / bs above the largest captured graph).
             with record_function(label):
                 if not is_prefill and forward_mode.running_tokens_are_unified:
                     input_ids, positions = self._padded_decode_inputs(forward_mode)
+                # Pad decode globally before SP shards the input; attention
+                # retains global positions to identify real sequence rows.
+                sp_total_tokens = input_ids.shape[0]
+                input_ids = sp_split_tokens(input_ids)
+
                 # The multimodal runtime owns request leases and span scatter.
                 inputs_embeds = None
                 if (
@@ -3159,6 +3239,7 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
                     # Middle chunk: no logits, but drafter needs hidden states.
                     hidden_states = model_output
                     logits = None
@@ -3167,6 +3248,8 @@ class ModelRunner:
                         model_output = self._restore_pcp_balanced_output(
                             model_output, _pcp_bal_groups, _pcp_size
                         )
+                    # Restore global token order before selecting scheduled rows.
+                    model_output = sp_gather_tokens(model_output, sp_total_tokens)
                     # PP carries the full run between stages. Only the last
                     # stage returns scheduled rows to sampling/draft consumers.
                     hidden_states = (
@@ -3193,7 +3276,10 @@ class ModelRunner:
                     forward_context.batch_descriptor = BatchDescriptor(
                         num_tokens=running_tokens
                     )
+                    if sp_is_enabled():
+                        _ids = self.sp_graph_input_ids(running_tokens)
                     model_output = self.model(_ids, _pos)
+                    model_output = sp_gather_tokens(model_output, running_tokens)
                     forward_context.cudagraph_runtime_mode = CUDAGraphMode.NONE
                     forward_context.batch_descriptor = None
                     # model_output is always a plain Tensor; drafter aux capture
@@ -3213,8 +3299,17 @@ class ModelRunner:
                     return logits, hidden_states
 
                 graph_key = (running_bs, forward_context.attn_metadata.max_seqlen_q)
+                if sp_is_enabled():
+                    self.sp_graph_input_ids(running_tokens)
+                self._gemm_fusion_check_launch_gate()  # a replay runs no Python: check here
                 self.graphs[graph_key].replay()
-                hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
+                if sp_is_enabled():
+                    local = self.sp_local_tokens(running_tokens)
+                    hidden_states = sp_gather_tokens(
+                        self.forward_vars["outputs"][:local], running_tokens
+                    )[:scheduled_tokens]
+                else:
+                    hidden_states = self.forward_vars["outputs"][:scheduled_tokens]
                 # Drafter aux buffers (if any) refresh on replay: their in-place
                 # copy ops were captured into the graph.
                 if self.logits_in_graph:
@@ -3441,6 +3536,7 @@ class ModelRunner:
     @torch.inference_mode()
     @with_eplb_forward_monitor
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        self._gemm_fusion_check_launch_gate()
         # Make this forward's staging buffers safe to overwrite before
         # prepare_inputs writes them: rotate to a free slot if there is a ring,
         # otherwise wait out the previous forward's copies.
@@ -3508,13 +3604,20 @@ class ModelRunner:
             reset_forward_context()
             # Mark this slot's GPU work (attention consumed its metadata) done.
             self._record_forward_vars_event()
-            self._record_kv_cache_ready(batch)
-            return ScheduledBatchOutput(
-                req_ids=list(batch.req_ids),
-                token_ids=[],
-                num_rejected=None,
-                num_bonus=None,
-                draft_token_ids=None,
+            # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
+            # ready. A step with a device error verdict must not publish its KV.
+            aborted = self._gemm_fusion_check_step(batch)
+            if aborted is None:
+                self._record_kv_cache_ready(batch)
+            return self._apply_gemm_fusion_verdict(
+                ScheduledBatchOutput(
+                    req_ids=list(batch.req_ids),
+                    token_ids=[],
+                    num_rejected=None,
+                    num_bonus=None,
+                    draft_token_ids=None,
+                ),
+                aborted,
             )
 
         fwd_output = self.postprocess(
@@ -3530,7 +3633,89 @@ class ModelRunner:
 
         reset_forward_context()
         self._record_forward_vars_event()
-        self._record_kv_cache_ready(batch)
+        # C-S1: verify the step BEFORE telling a transfer connector this prefill's KV is
+        # ready. A step with a device error verdict must not publish its KV.
+        aborted = self._gemm_fusion_check_step(batch)
+        if aborted is None:
+            self._record_kv_cache_ready(batch)
+        return self._apply_gemm_fusion_verdict(fwd_output, aborted)
+
+    def scrub_kv_blocks(self, block_ids) -> int:
+        """Return the given scheduler blocks to the zeros of a fresh KV pool (every layer; K, V,
+        scales and the indexer cache), on THIS rank. An RPC target: the engine core calls it on every
+        rank after a gemm_fusion device error verdict, with the blocks the aborted requests held and
+        that were actually freed, before the next step can allocate them.
+
+        Why: the fused path writes into the KV while the error word is set, in a sticky NaN mode, so
+        the failed steps leave NaN in those blocks. The stock paged path reads unwritten slots of a
+        LATER sequence and masks them by multiplying with 0; NaN * 0 = NaN, so a recycled block
+        poisons it, while finite stale bytes are harmless. Returns how many blocks were zeroed.
+        Skipped with a KV transfer connector (a peer may be reading KV in flight; a PD producer never
+        publishes the KV of a failed step)."""
+        ids = list(block_ids)
+        if not ids:
+            return 0
+        if getattr(self.config, "kv_transfer_config", None):
+            logger.warning(
+                "gemm_fusion: not zeroing %d KV block(s) after a device error verdict "
+                "(a KV transfer connector is configured)",
+                len(ids),
+            )
+            return 0
+        if not self.attn_metadata_builder.zero_kv_entries(ids):
+            logger.warning(
+                "gemm_fusion: %s has no per-block KV zeroing; %d block(s) of aborted requests "
+                "may still hold NaN",
+                type(self.attn_metadata_builder).__name__,
+                len(ids),
+            )
+            return 0
+        torch.cuda.synchronize()
+        logger.warning(
+            "gemm_fusion: zeroed %d KV block(s) after a device error verdict (ids %d..%d)",
+            len(ids),
+            min(ids),
+            max(ids),
+        )
+        return len(ids)
+
+    def _gemm_fusion_check_launch_gate(self) -> None:
+        """Refuse a forward / graph replay while GEMM fusion's collective reset is running (a replayed
+        graph runs no Python, so aiter's own launch check cannot see it). One bool read; no-op unless
+        gemm_fusion is ON."""
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.check_launch_gate()
+
+    def _gemm_fusion_check_step(self, batch) -> list[int] | None:
+        """Periodic device error check of GEMM fusion, outside capture.
+
+        Runs on every rank at the end of every step (after postprocess), exactly once per forward.
+        Returns None normally. When some rank's error word was set it has run the collective reset
+        and returns the ids of the requests that ran a step not yet proven clean (possibly empty):
+        the caller must not publish this step's KV and must hand the ids to the scheduler
+        (``_apply_gemm_fusion_verdict``). A dummy batch contributes no ids. No-op unless
+        gemm_fusion is ON.
+        """
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            ids = () if getattr(batch, "is_dummy_run", False) else tuple(batch.req_ids)
+            return gemm_fusion.check_step(ids)
+        return None
+
+    def _apply_gemm_fusion_verdict(self, fwd_output, aborted):
+        """Attach a device error verdict to this step's output.
+
+        The scheduler aborts ``aborted`` and drops the prefix cache. The deferred-output state is
+        dropped too, so the next step starts like the first one after startup (no previous batch, no
+        queued token copy), which the scheduler already tolerates. Unverified on a GPU.
+        """
+        if aborted is None:
+            return fwd_output
+        self.tokenID_processor.clean()
+        fwd_output.aborted_req_ids = list(aborted)
         return fwd_output
 
     @staticmethod
@@ -4133,7 +4318,28 @@ class ModelRunner:
                 self.h2d_owner.fail()
                 raise
 
-        with pause_gc(), graph_capture() as capture_ctx, self.capture_profiler as prof:
+        if self.config.gemm_fusion.enabled:
+            # Resolve (and agree on) every bucket on every rank before capture
+            # so no collective is introduced during capture or replay.
+            from atom.distributed.ulysses_sp import sp_pad_len
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.before_graph_capture(
+                sorted(
+                    {
+                        (sp_pad_len(bs * q_len), bs * q_len)
+                        for q_len in q_buckets
+                        for bs in self.capture_sizes
+                    }
+                ),
+            )
+
+        with (
+            pause_gc(),
+            graph_capture() as capture_ctx,
+            sp_graph_capture(capture_ctx),
+            self.capture_profiler as prof,
+        ):
             for max_q_len in q_buckets:
                 capture_range = (
                     tqdm.tqdm(self.capture_sizes)
@@ -4213,10 +4419,19 @@ class ModelRunner:
                         if self.use_mrope
                         else positions[:num_tokens]
                     )
-                    model_output = self.model(input_ids[:num_tokens], model_positions)
-                    outputs[:num_tokens] = model_output
+                    # Ulysses runs the model on this rank's token chunk while
+                    # positions stay whole, so the graph is captured at the
+                    # local width and writes that many output rows.
+                    local_tokens = self.sp_local_tokens(num_tokens)
+                    model_ids = (
+                        self.sp_graph_input_ids(num_tokens)
+                        if sp_is_enabled()
+                        else input_ids[:num_tokens]
+                    )
+                    model_output = self.model(model_ids, model_positions)
+                    outputs[:local_tokens] = model_output
                     if self.logits_in_graph:
-                        self.model.compute_logits(outputs[:num_tokens])
+                        self.model.compute_logits(outputs[:local_tokens])
 
                     if _piecewise:
                         # PIECEWISE: no manual whole-forward graph; the compiled
@@ -4224,7 +4439,7 @@ class ModelRunner:
                         fc = get_forward_context()
                         fc.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
                         fc.batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
-                        self.model(input_ids[:num_tokens], model_positions)
+                        self.model(model_ids, model_positions)
                         fc.cudagraph_runtime_mode = CUDAGraphMode.NONE
                         fc.batch_descriptor = None
                         self._piecewise_captured_tokens.add(num_tokens)
@@ -4272,13 +4487,11 @@ class ModelRunner:
                             with torch.cuda.graph(
                                 graph, self.graph_pool, stream=capture_ctx.stream
                             ):
-                                model_output = self.model(
-                                    input_ids[:num_tokens], model_positions
-                                )
-                                outputs[:num_tokens] = model_output
+                                model_output = self.model(model_ids, model_positions)
+                                outputs[:local_tokens] = model_output
                                 if self.logits_in_graph:
                                     graph_logits = self.model.compute_logits(
-                                        outputs[:num_tokens]
+                                        outputs[:local_tokens]
                                     )
                     if self.graph_pool is None:
                         self.graph_pool = graph.pool()
@@ -4314,6 +4527,10 @@ class ModelRunner:
                     capture_ctx.stream,
                     end_draft_trace if prof is not None else None,
                 )
+        if self.config.gemm_fusion.enabled:
+            from atom.model_ops import gemm_fusion
+
+            gemm_fusion.after_graph_capture()
         self.capture_sizes.sort()
         self.capture_sizes_np = np.asarray(self.capture_sizes, dtype=np.int32)
 
@@ -4564,6 +4781,7 @@ class RapidServeModelRunner(ModelRunner):
         # GPU; postprocess (sampling + async CPU copy) stays on the default
         # stream. The stream pool is created by DecodeEngineCore via
         # create_decode_stream_pool().
+        self._gemm_fusion_check_launch_gate()
         stream = self._decode_streams[batch.cu_stream_fraction]
         self._done_event.record()
         stream.wait_event(self._done_event)
@@ -4597,7 +4815,10 @@ class RapidServeModelRunner(ModelRunner):
 
         self._record_forward_vars_event()
         reset_forward_context()
-        return fwd_output
+        # C-S1: a step with a device error verdict must not return output as valid
+        return self._apply_gemm_fusion_verdict(
+            fwd_output, self._gemm_fusion_check_step(batch)
+        )
 
     # ------------------------------------------------------------------
     # Disagg IPC helpers (TP-aware)
@@ -4919,6 +5140,7 @@ class RapidServeModelRunner(ModelRunner):
         the decode process can append them before the first decode step,
         matching the num_tokens state that non-disagg postprocess would produce.
         """
+        self._gemm_fusion_check_launch_gate()
         prefill_streams = getattr(self, "_prefill_streams", None)
         if prefill_streams is not None:
             stream = self._prefill_streams[batch.cu_stream_fraction]
@@ -4943,6 +5165,16 @@ class RapidServeModelRunner(ModelRunner):
             self._record_forward_vars_event()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
+        # C-S1: verify the step before announcing this prefill's KV as ready for transfer. This
+        # path returns plain token ids to a standalone PrefillScheduler, so there is no output
+        # object to carry abort ids: an error verdict (the collective reset has run) is fatal.
+        if self._gemm_fusion_check_step(batch) is not None:
+            from atom.model_ops.gemm_fusion import GemmFusionDeviceError
+
+            raise GemmFusionDeviceError(
+                "gemm_fusion device error word set during a prefill that publishes KV; "
+                "plans re-initialised, the prefill instance must be treated as failed"
+            )
         self._record_kv_cache_ready(batch)
         reset_forward_context()
         return sampled_cpu

@@ -13,6 +13,7 @@ from atom.config import (
     DCPConfig,
     DSparkConfig,
     EPLBConfig,
+    GemmFusionConfig,
     ParallelConfig,
     SpeculativeConfig,
 )
@@ -122,6 +123,7 @@ class EngineArgs:
     decode_context_parallel_size: int = 1
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
+    sequence_parallel_size: int = 1
     data_parallel_size: int = 1
     data_parallel_size_local: int | None = None
     data_parallel_rank: int = 0
@@ -179,6 +181,8 @@ class EngineArgs:
     online_quant_config: dict | None = None
     hf_overrides: dict | None = None
     dspark_config: dict | None = None
+    gemm_fusion_profile: str | None = None
+    gemm_fusion_check_period: int | None = None
 
     eplb_enable: bool = False
     eplb_config: dict | None = None
@@ -225,6 +229,15 @@ class EngineArgs:
             default=1,
             help="Prefill context parallel size. Independent dimension "
             "(world = tp x pcp); splits the sequence during prefill.",
+        )
+        parser.add_argument(
+            "--sequence-parallel-size",
+            "-sp",
+            type=int,
+            default=1,
+            help="Ulysses sequence parallel size. Shards tokens across the "
+            "group and trades sequence for heads around attention via "
+            "all-to-all. Requires --tensor-parallel-size 1.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -717,6 +730,26 @@ class EngineArgs:
             ),
         )
         parser.add_argument(
+            "--gemm-fusion-profile",
+            type=str,
+            default=None,
+            help=(
+                "Name of an aiter GEMM-fusion profile (aiter/configs/gemm_fusion/"
+                "<name>.json). Unset/empty (default) disables GEMM fusion."
+            ),
+        )
+        parser.add_argument(
+            "--gemm-fusion-check-period",
+            type=int,
+            default=None,
+            help=(
+                "Steps between device error checks of GEMM fusion (default 14: the "
+                "requests of at most 16 steps are aborted on an error; 1 = check "
+                "every step synchronously). Ignored without --gemm-fusion-profile; "
+                "KV-publishing P/D ranks always check every step."
+            ),
+        )
+        parser.add_argument(
             "--dspark-config",
             type=json.loads,
             default=None,
@@ -893,6 +926,12 @@ class EngineArgs:
         # --dspark-config (JSON dict) → DSparkConfig object, passed through as
         # Config.dspark (no env vars).
         kwargs["dspark"] = DSparkConfig.from_dict(kwargs.pop("dspark_config", None))
+        # --gemm-fusion-profile (name) -> Config.gemm_fusion; empty = OFF.
+        gemm_fusion_kwargs = {"profile": kwargs.pop("gemm_fusion_profile", None) or ""}
+        check_period = kwargs.pop("gemm_fusion_check_period", None)
+        if check_period is not None:
+            gemm_fusion_kwargs["check_period"] = check_period
+        kwargs["gemm_fusion"] = GemmFusionConfig(**gemm_fusion_kwargs)
         # --eplb-config (JSON dict) → EPLBConfig object (--eplb-enable
         # is the master switch, --eplb-config only tunes it).
         kwargs["eplb_config"] = EPLBConfig.from_dict(kwargs.pop("eplb_config"))
