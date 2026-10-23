@@ -743,6 +743,30 @@ def test_qwen4_exp_mtp_verify_keeps_per_candidate_state(draft_steps):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("input_length", [3, 2])
+def test_qwen4_exp_mtp_verify_device_input_lengths(input_length):
+    inputs = SimpleNamespace(
+        is_target_verify=True,
+        input_lengths=torch.tensor([input_length], device="cuda", dtype=torch.int32),
+        kv_cache_kernel_block_id_device=torch.tensor(
+            [[5, 6, 7, 8]], device="cuda", dtype=torch.int32
+        ),
+        sequence_lengths_plus_1_device=torch.tensor(
+            [17], device="cuda", dtype=torch.int32
+        ),
+    )
+    if input_length == 3:
+        RTPQwen4ExpContext._build_gdn_metadata(
+            inputs, seq_size_per_block=16, num_tokens=3
+        )
+    else:
+        with pytest.raises(ValueError, match="state block is invalid"):
+            RTPQwen4ExpContext._build_gdn_metadata(
+                inputs, seq_size_per_block=16, num_tokens=3
+            )
+
+
 def test_non_qwen4_exp_context_rejects_mtp_target_verify():
     inputs = SimpleNamespace(
         is_target_verify=True,
@@ -817,6 +841,118 @@ def test_qwen4_exp_mtp_graph_counts_invalid_real_rows_not_padding():
     )
     assert counter.item() == 1
     assert writes.cpu().tolist() == [[6, 0, 0], [0, 0, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_qwen4_exp_mtp_graph_overwrites_each_tile_error_flag():
+    device = torch.device("cuda")
+    table = torch.tensor([[5, 6, 7, 8]] * 129, device=device, dtype=torch.int32)
+    table[128, 3] = -1
+    lengths = torch.full((129,), 17, device=device, dtype=torch.int32)
+    reads = torch.empty((129, 3), device=device, dtype=torch.int32)
+    writes = torch.empty_like(reads)
+    flags = torch.full((2,), 9, device=device, dtype=torch.int32)
+
+    def launch():
+        _target_verify_state_slots_graph_kernel[(2,)](
+            table, lengths, reads, writes, flags, 129, *table.stride(), 4, 16, 3, 128
+        )
+
+    launch()
+    assert flags.cpu().tolist() == [0, 1]
+    table[128, 3] = 8
+    launch()
+    assert flags.cpu().tolist() == [0, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("table_width, expected_invalid", [(4, False), (2, True)])
+def test_qwen4_exp_mtp_graph_metadata_checks_invalid_live_rows(
+    monkeypatch, table_width, expected_invalid
+):
+    device = torch.device("cuda")
+    table = torch.arange(5, 5 + table_width, device=device, dtype=torch.int32)[None, :]
+    buffers = {
+        "query_start_loc": torch.tensor([0, 3], device=device, dtype=torch.int32),
+        "target_read_slots_i32": torch.empty((1, 3), device=device, dtype=torch.int32),
+        "target_write_slots_i32": torch.empty((1, 3), device=device, dtype=torch.int32),
+        "target_invalid_live_rows": torch.full(
+            (1,), 17, device=device, dtype=torch.int32
+        ),
+        "target_sequence_masks": torch.ones(1, device=device, dtype=torch.bool),
+        "target_accepted_tokens": torch.ones(1, device=device, dtype=torch.int32),
+    }
+    inputs = SimpleNamespace(
+        is_target_verify=True,
+        input_lengths=torch.tensor([3], dtype=torch.int32),
+        kv_cache_kernel_block_id_device=table,
+        sequence_lengths_plus_1_device=torch.tensor(
+            [17], device=device, dtype=torch.int32
+        ),
+    )
+    checked = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        torch,
+        "_assert_async",
+        lambda condition, message: checked.append((bool(condition.item()), message)),
+    )
+    RTPQwen4ExpContext._build_gdn_metadata(
+        inputs, seq_size_per_block=16, num_tokens=3, cg_bufs=buffers
+    )
+    assert buffers["target_invalid_live_rows"].item() == int(expected_invalid)
+    assert checked == [
+        (
+            not expected_invalid,
+            "Qwen4Exp MTP target-verify state block is invalid",
+        )
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("device_lengths", [False, True])
+def test_qwen4_exp_mtp_target_metadata_captures_and_resets_counter(device_lengths):
+    device = torch.device("cuda")
+    table = torch.tensor([[5, 6, 7, 8]], device=device, dtype=torch.int32)
+    lengths = torch.tensor([17], device=device, dtype=torch.int32)
+    buffers = {
+        "query_start_loc": torch.tensor([0, 3], device=device, dtype=torch.int32),
+        "target_read_slots_i32": torch.empty((1, 3), device=device, dtype=torch.int32),
+        "target_write_slots_i32": torch.empty((1, 3), device=device, dtype=torch.int32),
+        "target_invalid_live_rows": torch.zeros(1, device=device, dtype=torch.int32),
+        "target_sequence_masks": torch.ones(1, device=device, dtype=torch.bool),
+        "target_accepted_tokens": torch.ones(1, device=device, dtype=torch.int32),
+    }
+    inputs = SimpleNamespace(
+        is_target_verify=True,
+        input_lengths=torch.tensor(
+            [3], device=device if device_lengths else "cpu", dtype=torch.int32
+        ),
+        kv_cache_kernel_block_id_device=table,
+        sequence_lengths_plus_1_device=lengths,
+    )
+    _target_verify_state_slots_graph_kernel[(1,)](
+        table,
+        lengths,
+        buffers["target_read_slots_i32"],
+        buffers["target_write_slots_i32"],
+        buffers["target_invalid_live_rows"],
+        1,
+        *table.stride(),
+        4,
+        16,
+        3,
+        128,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        RTPQwen4ExpContext._build_gdn_metadata(
+            inputs, seq_size_per_block=16, num_tokens=3, cg_bufs=buffers
+        )
+    buffers["target_invalid_live_rows"].fill_(9)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert buffers["target_invalid_live_rows"].item() == 0
 
 
 def test_qwen4_exp_graph_marks_both_cache_tags(monkeypatch):
