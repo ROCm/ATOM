@@ -57,8 +57,8 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
 # draw the replacement from the residual `relu(p - q)` (normalized). p is the
 # target's `softmax(logits / T)`, q the distribution the draft drew x from.
 #
-# Nothing `[rows, V]` is materialized for p. Every (request, V tile) program
-# reduces its tile of each of the request's rows to the softmax statistics
+# Nothing `[rows, V]` is materialized for p. Every (draft row, V tile) program
+# reduces its tile of the row to the softmax statistics
 # (`softmax_tiles`) plus the row's raw-logit argmax; the accept walk then needs
 # p at one id per position, `exp(l(x) / T - max) / Z`, and only a rejecting row
 # is read across V again, by the residual race.
@@ -100,6 +100,21 @@ def ratio_verify_scratch_bytes(
 
 
 @triton.jit
+def _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps):
+    """The request a draft row belongs to: the first ``r`` with
+    ``cu_num_draft_tokens[r] > row`` (a binary search, so requests with no
+    drafts are skipped). ``search_steps`` >= ceil(log2(batch_size)) + 1."""
+    lo = 0
+    hi = batch_size - 1
+    for _ in range(search_steps):
+        mid = (lo + hi) // 2
+        right = tl.load(cu_num_draft_tokens_ptr + mid) <= row
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(right, hi, mid)
+    return lo
+
+
+@triton.jit(do_not_specialize=["search_steps"])
 def _ratio_stats_kernel(
     logits_ptr,  # [num_tokens, V] raw target logits
     cu_num_draft_tokens_ptr,  # [batch_size]
@@ -111,39 +126,37 @@ def _ratio_stats_kernel(
     num_tokens,
     vocab_size,
     logits_row_stride,
+    batch_size,
+    search_steps,
     BLOCK_V: tl.constexpr,
 ):
-    """One (request, V tile), over each of the request's draft rows.
+    """One (draft row, V tile): softmax statistics plus the raw argmax.
 
-    Per request rather than per row so the temperature comes straight from the
-    request, with no row-to-request expansion. The raw argmax is taken before
-    the division: dividing by a near-zero temperature can round two distinct
-    logits onto one value and invent a tie the greedy rule would not see.
+    One row per program, so a small batch still fills the device; the row's
+    temperature is its request's, found in-kernel. The raw argmax is taken
+    before the division: dividing by a near-zero temperature can round two
+    distinct logits onto one value and invent a tie the greedy rule would
+    not see.
     """
-    req_idx = tl.program_id(0)
+    row = tl.program_id(0)
     tile = tl.program_id(1)
-    if req_idx == 0:
-        start_idx = 0
-    else:
-        start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
-    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    req_idx = _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps)
     temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
     offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
     vmask = offs < vocab_size
-    for row in range(start_idx, end_idx):
-        x = tl.load(
-            logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
-            mask=vmask,
-            other=float("-inf"),
-        ).to(tl.float32)
-        raw_max = tl.max(x, axis=0)
-        raw_idx = tl.min(tl.where((x == raw_max) & vmask, offs, 2147483647), axis=0)
-        scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
-        part = tile * num_tokens + row
-        tl.store(part_max_ptr + part, scaled_max)
-        tl.store(part_sum_ptr + part, scaled_sum)
-        tl.store(part_amax_val_ptr + part, raw_max)
-        tl.store(part_amax_idx_ptr + part, raw_idx)
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+        mask=vmask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    raw_max = tl.max(x, axis=0)
+    raw_idx = tl.min(tl.where((x == raw_max) & vmask, offs, 2147483647), axis=0)
+    scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
+    part = tile * num_tokens + row
+    tl.store(part_max_ptr + part, scaled_max)
+    tl.store(part_sum_ptr + part, scaled_sum)
+    tl.store(part_amax_val_ptr + part, raw_max)
+    tl.store(part_amax_idx_ptr + part, raw_idx)
 
 
 @triton.jit(do_not_specialize=["num_spec_steps", "accept_seed"])
@@ -422,7 +435,7 @@ def _ratio_sample(
         part_sum = torch.empty((n_tiles, num_tokens), **f32)
         part_amax_val = torch.empty((n_tiles, num_tokens), **f32)
         part_amax_idx = torch.empty((n_tiles, num_tokens), **i32)
-        _ratio_stats_kernel[(batch_size, n_tiles)](
+        _ratio_stats_kernel[(num_tokens, n_tiles)](
             target_logits,
             cu_num_draft_tokens,
             temperatures,
@@ -433,6 +446,8 @@ def _ratio_sample(
             num_tokens,
             vocab_size,
             stride,
+            batch_size,
+            batch_size.bit_length() + 1,
             BLOCK_V=_RATIO_BLOCK_V,
             num_warps=8,
         )

@@ -15,6 +15,8 @@ support, greedy outputs, rank-consistent draws) are asserted exactly.
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 pytest.importorskip("aiter", reason="the samplers are AITER/Triton ops")
 if not torch.cuda.is_available():
@@ -27,6 +29,7 @@ from atom.model_ops.dspark_markov_sample import (
 )
 from atom.model_ops.rejection_sampler import (
     _RATIO_BLOCK_V,
+    _request_of_row,
     rejection_sample,
 )
 from atom.model_ops.sampler import SAMPLER_EPS
@@ -295,6 +298,25 @@ def draw(dist, n):
 VOCAB = 2 * _RATIO_BLOCK_V + 1000
 P = {5: 0.5, _RATIO_BLOCK_V + 7: 0.3, VOCAB - 1: 0.2}
 Q = {5: 0.2, _RATIO_BLOCK_V + 7: 0.1, VOCAB - 2: 0.7}
+
+
+@triton.jit
+def _rows_to_requests(cu_ptr, out_ptr, batch_size, steps):
+    row = tl.program_id(0)
+    tl.store(out_ptr + row, _request_of_row(cu_ptr, row, batch_size, steps))
+
+
+@pytest.mark.parametrize(
+    "widths", [[3], [2, 0, 3, 1, 0, 4], [1] * 37, [0, 5, 0], [7, 7, 7, 7, 7]]
+)
+def test_each_draft_row_finds_its_request(widths):
+    """The stats kernel's row -> request lookup, against searchsorted."""
+    cu = torch.tensor(widths, device=DEV).cumsum(0).to(torch.int32)
+    rows = int(cu[-1])
+    out = torch.empty(rows, dtype=torch.int32, device=DEV)
+    _rows_to_requests[(rows,)](cu, out, len(widths), len(widths).bit_length() + 1)
+    expected = torch.searchsorted(cu, torch.arange(rows, device=DEV), right=True)
+    assert torch.equal(out.long(), expected)
 
 
 def test_the_emitted_token_follows_p_across_vocab_tiles():
