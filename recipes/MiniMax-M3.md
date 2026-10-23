@@ -1,7 +1,8 @@
 # MiniMax-M3 / MiniMax-M3.1 MXFP4/MXFP8 Usage Guide
 
-[MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) and [MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) are supported by the native ATOM OpenAI-compatible server path, as is the AMD Quark MXFP4 export of
-MiniMax-M3.1-Flash with its DSpark draft ([MiniMax-M3.1-Flash](#minimax-m31-flash-quark-mxfp4-on-4xmi355-gpus)).
+[MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) and [MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) are supported by the native ATOM OpenAI-compatible server path, as is MiniMax-M3.1-Flash with its DSpark
+draft, text and image input, from either the release checkpoint or the AMD Quark MXFP4 export
+([MiniMax-M3.1-Flash](#minimax-m31-flash-on-4xmi355-gpus)).
 
 ## Preparing Environment
 
@@ -265,7 +266,7 @@ Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
 | 32 | 320 | 125.69 | 609.24 | 5304.23 | 12.60 | 23.81 | 2355.93 | 21132.49 |
 | 64 | 640 | 198.58 | 966.20 | 10476.78 | 19.97 | 40.44 | 2973.94 | 26857.80 |
 
-## MiniMax-M3.1-Flash (Quark MXFP4) on 4xMI355 GPUs
+## MiniMax-M3.1-Flash on 4xMI355 GPUs
 
 MiniMax-M3.1-Flash keeps the MiniMax-M3 backbone (every M3 tensor exists in M3.1 with the
 same name and shape) with three model changes: lightning-indexer sparse attention in
@@ -273,15 +274,19 @@ same name and shape) with three model changes: lightning-indexer sparse attentio
 speculative-decoding draft is a separate **DSpark** block drafter shipped in the
 checkpoint's `dspark/` sub-directory.
 
-ATOM runs the AMD Quark MXFP4 export of MiniMax-M3.1-Flash, which needs no conversion at
-load:
+ATOM runs both checkpoints, which differ only in the routed experts: the release checkpoint
+[MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) stores them
+as NVFP4 and ATOM converts them to MXFP4 at load; the AMD Quark MXFP4 export
+[amd/MiniMax-M3.1-Flash-Quark-MXFP4](https://huggingface.co/amd/MiniMax-M3.1-Flash-Quark-MXFP4)
+ships them as MXFP4.
 
-| Weights | Quark MXFP4 export | At runtime (recipe below) |
-|---|---|---|
-| Routed experts (57 layers × 128) | MXFP4 (E2M1, E8M0 scale per 32) | MXFP4, as shipped |
-| Shared expert | MXFP8 (FP8 E4M3, E8M0 scale per 32) | re-quantized to MXFP4 and fused into the MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`) |
-| Attention q/k/v/o, indexer, dense MLP (layers 0–2) | MXFP8 (Quark `per_block`, `block_size [1, 32]`) | per-token / per-channel FP8 (`ptpc_fp8` online quant), as for MiniMax-M3 |
-| DSpark draft (`dspark/`) | MXFP8 linears, BF16 rest | as shipped |
+| Weights | Release checkpoint | Quark MXFP4 export | At runtime (recipes below) |
+|---|---|---|---|
+| Routed experts (57 layers × 128) | NVFP4 (compressed-tensors: E2M1, FP8 scale per 16, FP32 global scale) | MXFP4 (E2M1, E8M0 scale per 32) | MXFP4: converted at load (`"layer_quant_config": {"*.experts": "mxfp4"}`) / as shipped |
+| Shared expert | MXFP8 (FP8 E4M3, E8M0 scale per 32) | MXFP8 | release: its own MXFP8 MLP; Quark: re-quantized to MXFP4 and fused into the MoE (`ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1`) |
+| Attention q/k/v/o, indexer, dense MLP (layers 0–2) | MXFP8 | MXFP8 (Quark `per_block`, `block_size [1, 32]`) | per-token / per-channel FP8 (`ptpc_fp8` online quant), as for MiniMax-M3 |
+| Vision tower, projector | BF16 | BF16 | as shipped |
+| DSpark draft (`dspark/`) | MXFP8 linears, BF16 rest | MXFP8 linears, BF16 rest | as shipped |
 
 ### What runs
 
@@ -294,21 +299,66 @@ load:
   load, re-quantizes it MXFP8 → MXFP4 and writes it into the fused slot, so the MoE runs as the
   tuned 129-expert / top-5 MXFP4 kernel (no `no tuned FlyDSL config` warning in the log).
   Without it the shared expert runs as its own MXFP8 MLP next to a 128-expert / top-4 MoE.
+  The fusion needs MXFP4 routed experts in the checkpoint, so it applies to the Quark MXFP4
+  export only; on the release checkpoint (NVFP4 experts converted at load) the switch has no
+  effect and the shared expert stays a separate MXFP8 MLP (the log shows `no tuned FlyDSL
+  config` for the 128-expert / top-4 MoE).
 - **DSpark, CUDA-graph captured.** See [DSpark Speculative Decoding](#dspark-speculative-decoding-minimax-m31)
   below. Expect `Draft passes warmed at [1, ..., 128] ... ['DSparkProposer._block_backbone (captured)']`.
+- **Image input.** With the checkpoint's `vision_config`, ATOM runs the vision tower natively
+  and scatters the image embeddings over the image tokens; send images as `image_url` content
+  parts to `/v1/chat/completions`. Text-only requests take the same path.
 - **Mono decode is not used.** The MiniMax-M3 mono kernels assume dense layers 0–2; the log
   reads `MiniMax-M3 mono decode off: DSpark speculative decoding` (with DSpark) or
   `... off: layers 0..2 must be dense full-attention layers` (without).
 
-**Environment.** Measured in `rocm/atom-dev:nightly_202610181506` on 4xMI355X with ATOM
-branch `yuhua/m3.1-flash` (ROCm/ATOM `main` `daa4f1bb` + the M3.1 commits) on `PYTHONPATH`.
+**Environment.** Measured on 4xMI355X in `rocm/atom-dev:minimax-m31-flash`
+(`rocm/atom-dev:nightly_202610181506` with these MiniMax-M3.1 changes):
+
+```bash
+docker pull rocm/atom-dev:minimax-m31-flash
+```
 
 ### Launching Server
 
-With DSpark:
+Release checkpoint, with DSpark. The online-quantization config converts the routed experts to
+MXFP4 and re-quantizes the attention and dense-MLP linears to PTPC FP8; the router gate and the
+shared expert are left out, so the shared expert runs in MXFP8 as shipped:
 
 ```bash
-model_path=${model_path:-amd/MiniMax-M3.1-Flash-MXFP4}   # set to the Quark MXFP4 export (includes dspark/)
+model_path=${model_path:-MiniMaxAI/MiniMax-M3.1-Flash}   # includes dspark/
+run_name=${run_name:-m31-flash-release-dspark}
+export AITER_LOG_LEVEL=WARNING
+export ATOM_FORCE_ATTN_TRITON=1
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --served-model-name minimax-m3.1 \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}' \
+  --gpu-memory-utilization 0.9 \
+  --block-size 128 \
+  --max-model-len 131072 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 \
+  --kv_cache_dtype fp8 \
+  --index-cache-dtype fp8 \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config": {"*.experts": "mxfp4"}, "exclude_layer": ["lm_head", "model.embed_tokens", "vision_tower", "multi_modal_projector", "patch_merge_mlp", "*block_sparse_moe.gate", "*shared_experts*"]}' \
+  --no-enable_prefix_caching \
+  --method dspark \
+  --draft-model "$model_path/dspark" \
+  --num-speculative-tokens 7 2>&1 | tee "${run_name}-server.log"
+```
+
+Quark MXFP4 export, with DSpark. Identical except for the checkpoint and the online-quantization
+config: the experts are already MXFP4, so the whole MoE block is left out:
+
+```bash
+model_path=${model_path:-amd/MiniMax-M3.1-Flash-Quark-MXFP4}   # includes dspark/
 run_name=${run_name:-m31-flash-mxfp4-dspark}
 export AITER_LOG_LEVEL=WARNING
 export ATOM_FORCE_ATTN_TRITON=1
@@ -317,9 +367,11 @@ export ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
+  --served-model-name minimax-m3.1 \
   --tensor-parallel-size 4 \
   --server-port 8000 \
   --trust-remote-code \
+  --default-chat-template-kwargs '{"thinking_mode": "enabled"}' \
   --gpu-memory-utilization 0.9 \
   --block-size 128 \
   --max-model-len 131072 \
@@ -336,6 +388,8 @@ python -m atom.entrypoints.openai_server \
 
 Without speculative decoding, drop the last three flags. Notes:
 
+- `--default-chat-template-kwargs '{"thinking_mode": "enabled"}'` turns thinking on; the
+  accuracy below is measured with it.
 - `--block-size 128` is required with DSpark: the draft's KV pool shares the target's pages.
 - Set `--max-model-len` explicitly; the model's default is 1M tokens.
 - `--hf-overrides '{"use_index_cache": true, ...}'` (index-cache sharing, used for MiniMax-M3
@@ -347,21 +401,39 @@ Without speculative decoding, drop the last three flags. Notes:
 
 ### Accuracy Test
 
-GSM8K 5-shot through the chat endpoint, exactly as for MiniMax-M3 above, plus
-`--log_samples` so that the generations can be re-scored:
+Day-0 accuracy with the two launch commands above (PTPC FP8 attention, DSpark with 7 drafts,
+FP8 KV and index cache, thinking on; shared expert fused on the Quark export, separate MXFP8 MLP
+on the release checkpoint), lm-eval through the chat endpoint:
+
+| Checkpoint | GSM8K flexible / strict | AIME 2026 mean@16 | AIME 2025 mean@16 | MMMU-Pro standard / vision |
+|---|---:|---:|---:|---:|
+| Release (experts converted to MXFP4) | 0.958 / 0.917 | 0.927 | 0.906 | 0.802 / 0.690 |
+| Quark MXFP4 export | 0.955 / 0.914 | 0.919 | 0.915 | 0.791 / 0.682 |
+
+- GSM8K: 5-shot, multi-turn few-shot, temperature 0, `reasoning_effort=max`, up to 16,384 new
+  tokens, no stop strings (command below).
+- AIME 2025 / 2026: 0-shot, mean over 16 seeds, temperature 1.0, top-p 0.95, up to 98,304 new
+  tokens, answer taken from the last `\boxed{}`.
+- MMMU-Pro: standard (10 options) and vision subsets, temperature 1.0, top-p 0.95, up to 65,536
+  new tokens, strict letter match.
 
 ```bash
 lm_eval \
   --model local-chat-completions \
-  --model_args "model=$model_path,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=32,max_gen_toks=16384" \
+  --model_args "model=minimax-m3.1,base_url=http://127.0.0.1:8000/v1/chat/completions,tokenizer=$model_path,tokenized_requests=False,num_concurrent=16,max_gen_toks=16384" \
   --tasks gsm8k \
   --num_fewshot 5 \
-  --batch_size 65 \
   --apply_chat_template \
   --fewshot_as_multiturn \
+  --gen_kwargs "temperature=0,reasoning_effort=max,max_gen_toks=16384,until=<|no_stop_string|>" \
   --log_samples \
   --output_path "./gsm8k-${run_name}" 2>&1 | tee "${run_name}-gsm8k.log"
 ```
+
+#### Switch ablation (GSM8K, Quark MXFP4 export)
+
+Measured earlier without `--served-model-name` and `--default-chat-template-kwargs`, with
+lm-eval's default generation settings (`model=$model_path`, `--batch_size 65`, no `--gen_kwargs`).
 
 MiniMax-M3.1 usually states its final answer as `\boxed{\$70{,}000}` or `**Answer: 12 years**`
 instead of M3's `#### 70000`, which lm-eval's regex extractors partly misread (hence the lower
@@ -389,17 +461,7 @@ DSpark accepted tokens distribution on GSM8K (accepted drafts per verify step, P
 `{0: 14.51%, 1: 14.06%, 2: 12.76%, 3: 10.38%, 4: 8.54%, 5: 7.16%, 6: 6.36%, 7: 26.24%}`
 
 All four configurations agree within 6 questions (0.9591–0.9621, about one standard error);
-DSpark on or off moves the score by one question. GSM8K does not separate the two speed switches,
-but harder reasoning did on the earlier MiniMax-M3.1-preview2 checkpoint (same architecture and
-formats), so treat them as a speed / accuracy trade-off:
-
-- FSE alone, Quark MXFP4, FP8 KV, no DSpark: AIME26 avg@16 0.8125 (780/960, 2 runs) with it,
-  0.8302 (1594/1920, 4 runs) without.
-- PTPC attention + FSE (with mono decode and DSpark) was reported about 5.5 points below native
-  MXFP8 attention with an independent shared expert on AIME25 (0.758 vs 0.813, 3 runs each).
-
-Neither has been re-measured on MiniMax-M3.1-Flash. For an accuracy-first deployment drop
-`--online_quant_config` and `ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4`.
+DSpark on or off moves the score by one question.
 
 ### DSpark Speculative Decoding (MiniMax-M3.1)
 
