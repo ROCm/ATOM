@@ -69,8 +69,11 @@ class DraftQSlots:
             -1 if slot is None else slot * rows for slot in map(get, req_ids)
         ]
 
-    def claim_bases(self, req_ids, out) -> None:
+    def claim_bases(self, req_ids, out, skip=None) -> None:
         """Give every request a slot to draft into and write its first row.
+
+        ``skip`` (optional, one bool per request) marks requests whose q is
+        never read; they claim nothing and get -1.
 
         A request that already owns a slot keeps it and becomes the most
         recently drafted. The batch's own entries are taken out of the map
@@ -82,11 +85,19 @@ class DraftQSlots:
         """
         rows = self.rows_per_slot
         slots = self._slot_of
+        if skip is not None:
+            keep = [i for i, s in enumerate(skip) if not s]
+            out[: len(req_ids)] = [-1] * len(req_ids)
+            req_ids = [req_ids[i] for i in keep]
         owned = [slots.pop(req_id, None) for req_id in req_ids]
         claimed = [self._claim() if slot is None else slot for slot in owned]
         # Re-inserted last, in batch order: the freshest entries.
         slots.update(zip(req_ids, claimed))
-        out[: len(req_ids)] = [slot * rows for slot in claimed]
+        if skip is None:
+            out[: len(req_ids)] = [slot * rows for slot in claimed]
+        else:
+            for i, slot in zip(keep, claimed):
+                out[i] = slot * rows
 
     def _claim(self) -> int:
         if self._free:

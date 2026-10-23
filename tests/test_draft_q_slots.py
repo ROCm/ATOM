@@ -113,6 +113,14 @@ def test_more_live_requests_than_slots_never_alias():
             assert base == owner.get(req_id, -1)
 
 
+def test_skipped_requests_claim_nothing():
+    slots = DraftQSlots(4, T)
+    out = [None] * 3
+    slots.claim_bases(["a", "g", "b"], out, [False, True, False])
+    assert out[1] == -1 and out[0] >= 0 and out[2] >= 0 and out[0] != out[2]
+    assert "g" not in slots and len(slots) == 2
+
+
 def test_sizes_must_be_positive():
     with pytest.raises(ValueError):
         DraftQSlots(0, T)

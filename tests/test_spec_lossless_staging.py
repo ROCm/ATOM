@@ -195,6 +195,18 @@ def test_an_align_only_propose_writes_no_q_and_keeps_other_slots(monkeypatch):
     assert verify(prop)[0] == d
 
 
+def test_a_greedy_request_claims_no_slot_and_writes_no_q(monkeypatch):
+    """Its verify is exact match and never reads q; a sampled request beside
+    it, filtered batch or not, still gets the rows its q is read from."""
+    prop = proposer(monkeypatch)
+    for has_filter in (False, True):
+        stage(prop, batch(["g", "s"], [0.0, 1.0]), has_filter=has_filter)
+        assert dest(prop)[0] == -1 and dest(prop)[1] >= 0
+        assert "g" not in prop._q_slots and "s" in prop._q_slots
+    stage(prop, batch(["g", "s"], [0.0, 1.0]))
+    assert verify(prop)[0] == -1 and verify(prop)[1] == dest(prop)[1]
+
+
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):
     """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
     previous batch's slot would write its q into a live request's rows."""
