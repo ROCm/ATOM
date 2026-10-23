@@ -432,6 +432,8 @@ def hc_rows(
     has_inject: bool,
     block_out: torch.Tensor | None = None,
     raw: torch.Tensor | None = None,
+    *,
+    output_tile: int = 16,
 ):
     """Deferred combine + full mix, one program set per token.
 
@@ -472,7 +474,7 @@ def hc_rows(
     raw_out = (
         torch.empty((m, hc), dtype=h.dtype, device=h.device) if has_inject else None
     )
-    bh = 16
+    bh = output_tile
     _hc_mix_kernel[(triton.cdiv(hidden, bh), m)](
         part,
         normed,
