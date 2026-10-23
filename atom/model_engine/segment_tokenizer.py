@@ -36,6 +36,29 @@ _VERIFY_FIRST = 4
 _MIN_CACHED_CHARS = 100_000
 
 
+def _alternation(tokens):
+    """A capturing leftmost-longest pattern for `tokens`, or None."""
+    tokens = sorted(tokens, key=len, reverse=True)
+    if not tokens:
+        return None
+    return re.compile("(" + "|".join(re.escape(t) for t in tokens) + ")")
+
+
+def _offset_sensitive(pre_tokenizer) -> bool:
+    """Whether a pre-tokenizer treats the start of the input specially, so a
+    segment encoded alone differs from the same text inside the prompt."""
+    if not isinstance(pre_tokenizer, dict):
+        return False
+    kind = pre_tokenizer.get("type")
+    if kind == "Sequence":
+        return any(_offset_sensitive(p) for p in pre_tokenizer.get("pretokenizers", []))
+    if kind == "Metaspace":
+        return pre_tokenizer.get("prepend_scheme", "always") != "never"
+    if kind == "ByteLevel":
+        return bool(pre_tokenizer.get("add_prefix_space"))
+    return False
+
+
 def _normalizer_is_identity(backend) -> bool:
     """True when the fast tokenizer has no normalizer, or an empty sequence."""
     try:
@@ -55,18 +78,20 @@ class SegmentTokenizer:
         self._tokenizer = tokenizer
         self._backend = tokenizer._tokenizer
         self._max_tokens = max_cached_tokens
-        self._lock = threading.Lock()
         self._cache: OrderedDict[bytes, np.ndarray] = OrderedDict()
         self._cached_tokens = 0
         self._verified = 0
         # Tokens served from the cache vs freshly encoded, and time spent.
         self._stats = [0, 0, 0.0, 0]
         self._added = dict(tokenizer.get_added_vocab())
-        self._split = re.compile(
-            "("
-            + "|".join(re.escape(t) for t in sorted(self._added, key=len, reverse=True))
-            + ")"
-        )
+        # The backend extracts non-normalized added tokens from the raw text
+        # first, then normalized ones from what is left; each pass takes the
+        # leftmost-longest match. Two patterns reproduce that order.
+        decoder = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+        normalized = {t.content for t in decoder.values() if t.normalized}
+        self._split_raw = _alternation(t for t in self._added if t not in normalized)
+        self._split_normalized = _alternation(t for t in self._added if t in normalized)
+        self._lock = threading.Lock()
         # What `encode` wraps a prompt in (BOS/EOS), found on a probe.
         probe = "a"
         full = tokenizer.encode(probe)
@@ -79,9 +104,13 @@ class SegmentTokenizer:
             ),
             None,
         )
-        self.enabled = start is not None and self._segments_are_independent()
         if start is not None:
             self._head, self._tail = full[:start], full[start + len(bare) :]
+        self.enabled = (
+            start is not None
+            and self._segments_are_independent()
+            and self._probes_match()
+        )
         if not self.enabled:
             logger.info("segment tokenizer: off (added tokens are not plain splits)")
 
@@ -118,29 +147,80 @@ class SegmentTokenizer:
         decoder = getattr(self._tokenizer, "added_tokens_decoder", {}) or {}
         if any(t.lstrip or t.rstrip or t.single_word for t in decoder.values()):
             return False
-        if any(t.normalized for t in decoder.values()):
-            return _normalizer_is_identity(self._backend)
+        # A normalizer runs per segment too and may treat its start specially
+        # (e.g. `Prepend`), so only the identity is accepted.
+        if not _normalizer_is_identity(self._backend):
+            return False
+        try:
+            pre = json.loads(self._backend.to_str()).get("pre_tokenizer")
+        except (ValueError, AttributeError):
+            return False
+        return not _offset_sensitive(pre)
+
+    def _probes_match(self) -> bool:
+        """Encode a few added-token placements both ways once, at startup."""
+        added = list(self._added)
+        picks = {added[0], added[-1], min(added, key=len), max(added, key=len)}
+        for tok in picks:
+            for probe in (f"a{tok}a b", f"{tok} x\n{tok}", f" y {tok}\t1 2"):
+                if self._join(probe) != self._tokenizer.encode(probe):
+                    return False
         return True
 
     def encode(self, prompt: str) -> list[int]:
         if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
             return self._tokenizer.encode(prompt)
+        # Decided before encoding: a request either checks its own result or
+        # was admitted once enough others had.
+        with self._lock:
+            verify = self._verified < _VERIFY_FIRST
         ids = self._encode_segments(prompt)
-        if self._verified < _VERIFY_FIRST:
+        if verify:
             ref = self._tokenizer.encode(prompt)
-            if ids != ref:
-                self.enabled = False
-                logger.warning(
-                    "segment tokenizer: result differs from the plain encoder; "
-                    "turning the cache off"
-                )
-                return ref
-            self._verified += 1
-        return ids
+            with self._lock:
+                if ids != ref:
+                    if self.enabled:
+                        logger.warning(
+                            "segment tokenizer: result differs from the plain "
+                            "encoder; turning the cache off"
+                        )
+                    self.enabled = False
+                elif self.enabled:
+                    self._verified += 1
+            return ref
+        with self._lock:
+            enabled = self.enabled
+        # Turned off while this request encoded: its ids are unchecked.
+        return ids if enabled else self._tokenizer.encode(prompt)
+
+    def _parts(self, prompt: str) -> list[str]:
+        parts = [prompt]
+        for pattern in (self._split_raw, self._split_normalized):
+            if pattern is None:
+                continue
+            nxt = []
+            for part in parts:
+                if part in self._added:
+                    nxt.append(part)
+                else:
+                    nxt.extend(p for p in pattern.split(part) if p)
+            parts = nxt
+        return parts
+
+    def _join(self, prompt: str) -> list[int]:
+        """Segment-wise encoding without the cache (startup probe)."""
+        out = list(self._head)
+        for part in self._parts(prompt):
+            if part in self._added:
+                out.append(self._added[part])
+            else:
+                out.extend(self._backend.encode(part, add_special_tokens=False).ids)
+        out.extend(self._tail)
+        return out
 
     def _encode_segments(self, prompt: str) -> list[int]:
         t0 = time.perf_counter()
-        parts = [p for p in self._split.split(prompt) if p]
+        parts = self._parts(prompt)
         keys: list[bytes | None] = []
         missing: dict[bytes, str] = {}
         # This request's own references to the ids it found cached: another

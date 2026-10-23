@@ -211,5 +211,84 @@ def test_segments_that_encode_to_nothing_are_not_cached(tok, monkeypatch):
     assert len(seg._cache) == 0 and seg._cached_tokens == 0
 
 
+def _tokenizer_with(added, pre=None):
+    rng = random.Random(8)
+    backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+    backend.pre_tokenizer = pre or pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.train_from_iterator(
+        [_text(rng, 40) + " x" for _ in range(50)],
+        trainers.BpeTrainer(
+            vocab_size=280,
+            special_tokens=["[UNK]"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        ),
+    )
+    for tok in added:
+        if tok.special:
+            backend.add_special_tokens([tok])
+        else:
+            backend.add_tokens([tok])
+    return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def test_cross_pass_overlap_follows_the_backends_extraction_order():
+    """Non-normalized added tokens are extracted before normalized ones, so
+    `x<|User|>` becomes `x` + `<|User|>` rather than the longer token."""
+    tok = _tokenizer_with(
+        [
+            AddedToken("<|User|>", special=True, normalized=False),
+            AddedToken("x<|User|>", normalized=True),
+        ]
+    )
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    assert seg is not None
+    seg._verified = seg_mod._VERIFY_FIRST  # past the window: unchecked
+    prompt = "alpha x<|User|>beta" * 3
+    assert seg._encode_segments(prompt) == tok.encode(prompt)
+
+
+def test_offset_sensitive_pre_tokenizers_are_refused():
+    for pre in (
+        pre_tokenizers.Metaspace(prepend_scheme="first"),
+        pre_tokenizers.Sequence(
+            [pre_tokenizers.Digits(), pre_tokenizers.Metaspace(prepend_scheme="first")]
+        ),
+        pre_tokenizers.ByteLevel(add_prefix_space=True),
+    ):
+        tok = _tokenizer_with([AddedToken("<|User|>", special=True)], pre=pre)
+        assert SegmentTokenizer.maybe_create(tok, 10**6) is None, pre
+
+
+def test_a_result_finished_after_the_cache_turned_off_is_not_returned(tok, monkeypatch):
+    """Another request turning the cache off while this one encodes: this
+    one's unchecked ids must not be returned."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    seg._verified = seg_mod._VERIFY_FIRST
+    prompt = _conversation(random.Random(9), 4)
+
+    def wrong_and_meanwhile_disabled(p):
+        seg.enabled = False
+        return [0]
+
+    monkeypatch.setattr(seg, "_encode_segments", wrong_and_meanwhile_disabled)
+    assert seg.encode(prompt) == tok.encode(prompt)
+
+
+def test_a_check_finishing_after_the_cache_turned_off_does_not_count(tok, monkeypatch):
+    seg = SegmentTokenizer.maybe_create(tok, 10**6)
+    seg._verified = seg_mod._VERIFY_FIRST - 1
+    prompt = _conversation(random.Random(10), 4)
+    real = seg._encode_segments
+
+    def disabled_meanwhile(p):
+        ids = real(p)
+        seg.enabled = False
+        return ids
+
+    monkeypatch.setattr(seg, "_encode_segments", disabled_meanwhile)
+    assert seg.encode(prompt) == tok.encode(prompt)
+    assert seg._verified == seg_mod._VERIFY_FIRST - 1 and not seg.enabled
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16
