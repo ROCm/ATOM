@@ -522,6 +522,25 @@ def test_ensure_flydsl_policy_binds_qwen4_impls_once(monkeypatch):
     assert len(calls) == 1
 
 
+def test_gfx950_keeps_flydsl_prefill_off(monkeypatch):
+    from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
+
+    cfg, impl = _qwen4_flydsl_atom_config()
+    monkeypatch.setattr(attention_gdn, "get_current_atom_config", lambda: cfg)
+    monkeypatch.setattr(
+        "atom.model_ops.fla_ops.gdn_flydsl.select_policy",
+        lambda **kwargs: GDNFlyDSLPolicy(prefill=True, decode=False),
+    )
+    monkeypatch.setattr(
+        attention_gdn, "_flydsl_prefill_supported", lambda device: False
+    )
+    state = torch.zeros(2, 24, 128, 128)
+    policy = attention_gdn._ensure_flydsl_policy(state)
+    assert policy.prefill is False
+    assert policy.decode is False
+    assert impl.gdn_flydsl_policy is policy
+
+
 def test_kv_cache_uses_zero_copy_kv_view_when_flydsl_decode(monkeypatch):
     from atom.model_ops.fla_ops.gdn_flydsl import GDNFlyDSLPolicy
 
