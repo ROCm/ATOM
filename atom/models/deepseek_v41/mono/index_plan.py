@@ -160,6 +160,18 @@ def selected(bound, k=TOPK):
     return winners(bound, k)
 
 
+def candidate_offset(t, ident):
+    """Candidate address inside token t's row, including FULL and padding.
+
+    A live REINDEX column is in [0, TOPK_BLOCKS * BLOCK_ROWS), so its block
+    slot is unchanged. FULL history rows and negative padding may lie outside
+    that range: clamp the speculative address, not the selected row. The
+    caller discards the candidate value for FULL and padding.
+    """
+    slot = imin(imax(ident, 0) // BLOCK_ROWS, TOPK_BLOCKS - 1)
+    return i32(t * TOPK_BLOCKS + slot)
+
+
 def blocks(bound):
     """Candidate blocks a candidate-producing layer ranks: the blocks holding
     visible rows, the newest pinned."""
