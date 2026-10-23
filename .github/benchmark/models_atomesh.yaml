@@ -1705,6 +1705,55 @@ models:
             decode:
               ATOM_PD_EARLY_T0: "1"
 
+        # Test only. The c88-gctime cell with fewer prefill batches in flight
+        # across the eight stages, so a request's last chunk queues behind
+        # fewer others on its way through.
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-if12
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_PD_TIMING_SAMPLE: "4"
+              ATOM_KV_POLL_FRESH_WAIT_MS: "5"
+              ATOM_FAST_TOKENIZER_SPLIT: "1"
+              ATOM_GC_TIMING_S: "30"
+            prefill:
+              <<: *kimi_k3_pp8_stagestream_prefill_env
+              ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
+              ATOM_PD_PROMPT_IDS_B64: "1"
+              ATOM_PP_MAX_INFLIGHT: "12"
+            decode:
+              ATOM_PD_EARLY_T0: "1"
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8_c56
+          name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88-if10
+          concurrency: [88]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 176
+          env:
+            common:
+              <<: *kimi_k3_pp8_ondemand_env
+              AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
+              ATOM_PD_TIMING_SAMPLE: "4"
+              ATOM_KV_POLL_FRESH_WAIT_MS: "5"
+              ATOM_FAST_TOKENIZER_SPLIT: "1"
+              ATOM_GC_TIMING_S: "30"
+            prefill:
+              <<: *kimi_k3_pp8_stagestream_prefill_env
+              ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
+              ATOM_PD_PROMPT_IDS_B64: "1"
+              ATOM_PP_MAX_INFLIGHT: "10"
+            decode:
+              ATOM_PD_EARLY_T0: "1"
+
         # Test only. The c88-noreqctx cell, run on a commit where the OpenAI
         # server also stops queueing finished sequences nothing reads.
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
