@@ -158,6 +158,11 @@ mono_decode_installers = {
     "KimiK3ForConditionalGeneration": (
         "atom.models.kimi_k3.mono.dispatch.install_mono_decode"
     ),
+    "Qwen3_5MoeForConditionalGeneration": (
+        "atom.models.qwen3_5.mono.dispatch.install_mono_decode"
+    ),
+    # the text-only architecture of the same checkpoints
+    "Qwen3_5MoeForCausalLM": ("atom.models.qwen3_5.mono.dispatch.install_mono_decode"),
 }
 
 

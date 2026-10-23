@@ -93,7 +93,8 @@ Key entry points:
   hand-offs without a GPU with `FLYDSL_RUNTIME_ENABLE_CACHE=0 ARCH=gfx950
   python -m atom.models.<model>.mono.contract`; GLM-5.2's `contract.py` is the
   per-step input check only, and Kimi-K3 ships neither it nor a `check.py`
-  yet)
+  yet; Qwen3.5-MoE, wrapped through `mono_decode_installers` too, runs one launch
+  a decoder layer, the MTP draft's layer on the same kernel)
 - Diffusion: `atom/diffusion/` — framework at the top level (`pipeline.py`,
   `attention.py`, `ulysses.py`), engine in `engine/`, server in `entrypoints/`,
   and one package per model in `models/<family>/`. Extras: `pip install -e ".[diffusion]"`
