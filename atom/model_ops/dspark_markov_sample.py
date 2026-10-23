@@ -53,6 +53,8 @@ import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
+
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
 # [BLOCK_ROW, BLOCK_V] fp32 (64x128 -> 16 VGPR/lane at 8 warps) and one pipeline
 # stage stages [BLOCK_ROW, BLOCK_K] + [BLOCK_K, BLOCK_V] bf16 = 24KB of the 64KB
@@ -649,43 +651,9 @@ def _dspark_markov_sample_stage1(
         mask=row_mask[:, None] & v_mask[None, :],
     )
 
-    tile_max = tl.max(scaled, axis=1)
-    # A fully masked lane is -inf, and `exp(-inf - -inf)` is NaN, so the sum is
-    # masked rather than relying on the exponential to zero it.
-    expd = tl.where(v_mask[None, :], tl.exp(scaled - tile_max[:, None]), 0.0)
-    tile_sum = tl.sum(expd, axis=1)
+    tile_max, tile_sum = tile_max_sumexp(scaled, v_mask[None, :])
     tl.store(part_max_ptr + tile * num_rows + offs_row, tile_max, mask=row_mask)
     tl.store(part_sum_ptr + tile * num_rows + offs_row, tile_sum, mask=row_mask)
-
-
-@triton.jit
-def _dspark_markov_sample_stage2(
-    part_max_ptr,
-    part_sum_ptr,
-    row_max_ptr,
-    row_inv_z_ptr,
-    num_rows,
-    num_tiles,
-    BLOCK_TILE: tl.constexpr,
-):
-    """One row: the online-softmax combine. Global max and 1/Z from the
-    per-tile pairs, so V is never read a second time just to normalize."""
-    row = tl.program_id(0)
-    offs_tile = tl.arange(0, BLOCK_TILE)
-    tile_mask = offs_tile < num_tiles
-    maxes = tl.load(
-        part_max_ptr + offs_tile * num_rows + row, mask=tile_mask, other=float("-inf")
-    )
-    sums = tl.load(part_sum_ptr + offs_tile * num_rows + row, mask=tile_mask, other=0.0)
-    global_max = tl.max(maxes, axis=0)
-    rescaled = tl.where(tile_mask, sums * tl.exp(maxes - global_max), 0.0)
-    z = tl.sum(rescaled, axis=0)
-    # An all--inf row (the fp8-KV warmup forward drafts before the pool is
-    # written) leaves Z at 0, and 1/0 would make every probability inf. Answer 0
-    # instead; the cross-tile reduce resolves the all-tie to id 0, as
-    # `torch.argmax` does.
-    tl.store(row_max_ptr + row, global_max)
-    tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
 
 
 @triton.jit
@@ -920,7 +888,7 @@ def dspark_markov_sample(
         num_warps=8 if block_row >= 32 else 4,
         num_stages=2,
     )
-    _dspark_markov_sample_stage2[(num_rows,)](
+    softmax_combine_kernel[(num_rows,)](
         part_max,
         part_sum,
         row_max,

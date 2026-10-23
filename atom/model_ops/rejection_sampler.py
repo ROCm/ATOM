@@ -4,6 +4,7 @@ import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
+from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
 
@@ -92,37 +93,9 @@ def _softmax_temp_partial_kernel(
         mask=vmask,
         other=-float("inf"),
     ).to(tl.float32)
-    x = x / temp
-    tile_max = tl.max(x, axis=0)
-    # A fully masked tile is -inf, and exp(-inf - -inf) is NaN, so mask the sum
-    # rather than letting the exponential zero it.
-    tile_sum = tl.sum(tl.where(vmask, tl.exp(x - tile_max), 0.0), axis=0)
+    tile_max, tile_sum = tile_max_sumexp(x / temp, vmask)
     tl.store(part_max_ptr + tile * num_rows + row, tile_max)
     tl.store(part_sum_ptr + tile * num_rows + row, tile_sum)
-
-
-@triton.jit
-def _softmax_temp_combine_kernel(
-    part_max_ptr,
-    part_sum_ptr,
-    row_max_ptr,
-    row_inv_z_ptr,
-    num_rows,
-    n_tiles,
-    BLOCK_TILES: tl.constexpr,
-):
-    """One row: global max and 1/Z from the per-tile pairs."""
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_TILES)
-    mask = offs < n_tiles
-    maxes = tl.load(
-        part_max_ptr + offs * num_rows + row, mask=mask, other=-float("inf")
-    )
-    sums = tl.load(part_sum_ptr + offs * num_rows + row, mask=mask, other=0.0)
-    global_max = tl.max(maxes, axis=0)
-    z = tl.sum(tl.where(mask, sums * tl.exp(maxes - global_max), 0.0), axis=0)
-    tl.store(row_max_ptr + row, global_max)
-    tl.store(row_inv_z_ptr + row, tl.where(z > 0.0, 1.0 / z, 0.0))
 
 
 @triton.jit
@@ -213,14 +186,14 @@ def _ratio_target_probs(
         BLOCK_V=_RATIO_BLOCK_V,
         num_warps=8,
     )
-    _softmax_temp_combine_kernel[(rows,)](
+    softmax_combine_kernel[(rows,)](
         part_max,
         part_sum,
         row_max,
         row_inv_z,
         rows,
         n_tiles,
-        BLOCK_TILES=triton.next_power_of_2(n_tiles),
+        BLOCK_TILE=triton.next_power_of_2(n_tiles),
         num_warps=4,
     )
     _softmax_temp_store_kernel[(rows, n_tiles)](
