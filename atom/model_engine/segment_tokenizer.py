@@ -2,9 +2,9 @@
 """Prompt tokenization that reuses the previous turn's work.
 
 An agentic conversation resends its whole history every turn, so each request
-re-tokenizes hundreds of thousands of tokens it tokenized a moment ago; for
-DeepSeek-V4.1 that is ~0.24 s at 115K tokens and ~1.6 s at 656K, on the TTFT
-path. A chat template separates messages with added (special) tokens, and a
+re-tokenizes the whole context it tokenized a moment ago, on the TTFT path, at
+a cost that grows with the context rather than with the new messages. A chat
+template separates messages with added (special) tokens, and a
 fast tokenizer splits on added tokens before anything else, so the text
 between two of them tokenizes the same alone as in the whole prompt. This
 encodes those segments independently -- the new ones in one parallel batch --
@@ -30,9 +30,8 @@ logger = logging.getLogger("atom")
 
 # Prompts checked against the plain encoder before the cache is trusted.
 _VERIFY_FIRST = 4
-# Prompts shorter than this (characters, ~25K tokens) are encoded whole:
-# splitting, hashing and joining cost more than they save there (DeepSeek-V4.1
-# AgentX, ISL < 32K: +18 ms TTFT p50 through the cache).
+# Prompts shorter than this (characters) are encoded whole: splitting, hashing
+# and joining cost more than they save there.
 _MIN_CACHED_CHARS = 100_000
 
 
