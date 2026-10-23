@@ -338,7 +338,8 @@ def _selected_rows(c, t, ident):
     a = c["args"]
     # FULL layers use history columns, not compacted candidate columns.
     # Keep the speculative candidate load inside this token's row.
-    cand_ident = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(ident, 0))
+    lift = (a["ilift"] != 0) & (ident >= 0)
+    cand_ident = fx.Int32(lift.select(ident, 0))
     cand = fx.Int32(
         bo.buffer_load(
             rsrc(a["icand"]),
@@ -347,8 +348,8 @@ def _selected_rows(c, t, ident):
             dtype=T.i32,
         )
     )
-    lifted = cand * TILE + fx.max(ident, 0) % TILE
-    row = fx.Int32(((a["ilift"] != 0) & (ident >= 0)).select(lifted, ident))
+    lifted = cand * TILE + cand_ident % TILE
+    row = fx.Int32(lift.select(lifted, ident))
     toff = fx.Int32(
         bo.buffer_load(rsrc(a["kmeta"]), t * KMETA + 2, vec_width=1, dtype=T.i32)
     )

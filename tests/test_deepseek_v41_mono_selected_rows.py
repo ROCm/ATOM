@@ -4,11 +4,18 @@
 Execute its source with NumPy scalars and bounds-checked buffer loads so this
 regression runs without FlyDSL or a GPU. Checking only the returned row misses
 the bug: FULL discarded an out-of-bounds candidate load's result.
+
+This is a bounds regression, not a FlyDSL emulator: new global dependencies
+require an explicit harness update, and division/remainder must stay in the
+nonnegative domain where NumPy and GPU integer arithmetic agree.
 """
 
 import ast
+import builtins
+import dis
+import operator
 from pathlib import Path
-from types import SimpleNamespace
+from types import CodeType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -27,12 +34,38 @@ MAIN_OFF = 7
 
 
 class _Scalar(np.ndarray):
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        values = [np.asarray(value) for value in inputs]
+        if ufunc in (np.floor_divide, np.remainder):
+            assert np.all(values[0] >= 0) and np.all(values[1] > 0), (
+                "selected_rows CPU harness requires a nonnegative dividend and "
+                "positive divisor; NumPy and GPU signed division/remainder differ"
+            )
+        return np.asarray(getattr(ufunc, method)(*values, **kwargs)).view(_Scalar)
+
     def select(self, yes, no):
         return np.where(self, yes, no).view(_Scalar)
 
 
 def _i32(value):
     return np.asarray(value, dtype=np.int32).view(_Scalar)
+
+
+def _global_names(code):
+    for instruction in dis.get_instructions(code):
+        if instruction.opname == "LOAD_GLOBAL":
+            yield instruction.argval
+    for constant in code.co_consts:
+        if isinstance(constant, CodeType):
+            yield from _global_names(constant)
+
+
+def _check_globals(code, scope):
+    missing = set(_global_names(code)) - scope.keys() - vars(builtins).keys()
+    assert not missing, (
+        "_selected_rows acquired global dependencies missing from its CPU "
+        f"harness: {sorted(missing)}; update the harness before running this regression"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +109,7 @@ def _run(code, t, ident, lift):
         "TILE": ip.BLOCK_ROWS,
         "KMETA": KMETA,
     }
+    _check_globals(code, scope)
     exec(code, scope)  # noqa: S102 - the function under test, from this repository.
     args = {
         **{name: name for name in buffers},
@@ -110,3 +144,16 @@ def test_reindex_lifts_candidates_and_preserves_padding(
     selected_rows_code, t, ident, lift
 ):
     _run(selected_rows_code, t, ident, lift)
+
+
+@pytest.mark.parametrize("operation", [operator.floordiv, operator.mod])
+@pytest.mark.parametrize("left,right", [(-1, 8), (1, -8), (1, 0)])
+def test_scalar_rejects_unsupported_division_domain(operation, left, right):
+    with pytest.raises(AssertionError, match="NumPy and GPU signed"):
+        operation(_i32(left), _i32(right))
+
+
+def test_harness_reports_new_global_dependencies():
+    code = compile("def probe(): return added_dependency", "<probe>", "exec")
+    with pytest.raises(AssertionError, match="missing.*CPU harness:.*added_dependency"):
+        _check_globals(code, {})
