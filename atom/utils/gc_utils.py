@@ -264,6 +264,41 @@ def log_gc_heap_census(
     )
 
 
+def _attach_gc_refreeze(context: str, slow_ms: int) -> None:
+    """After a gen-2 pass at least `slow_ms` long, freeze what survived it.
+
+    For a process whose long-lived heap keeps growing after startup: a
+    prefill worker's LMCache CPU cache holds ~7 tracked objects per cached
+    chunk and fills for hours, and every full pass rescans all of it. Frozen
+    objects are still freed by reference counting when evicted. What is given
+    up is a reference cycle among them that dies later, which no pass will
+    reclaim -- hence the reclaimed count on every line.
+    """
+    started = [0.0]
+
+    def _refreeze(phase: str, info: dict) -> None:
+        if info.get("generation") != 2:
+            return
+        if phase == "start":
+            started[0] = time.perf_counter()
+            return
+        ms = (time.perf_counter() - started[0]) * 1e3
+        if not _heap_frozen or ms < slow_ms:
+            return
+        before = gc.get_freeze_count()
+        gc.freeze()
+        logger.info(
+            "[gc] %s: refroze %d objects after a %.0f ms gen-2 pass "
+            "that reclaimed %s",
+            context,
+            gc.get_freeze_count() - before,
+            ms,
+            info.get("collected", "?"),
+        )
+
+    gc.callbacks.append(_refreeze)
+
+
 def _attach_gc_timing(context: str, interval_s: float, census_ms: int = 0) -> None:
     """Log, every `interval_s`, how many collections each generation ran here,
     their total and their longest pause; with `census_ms`, also a census of
@@ -327,6 +362,9 @@ def maybe_attach_gc_debug_callback(context: str) -> None:
 
     if envs.ATOM_GC_TIMING_S > 0:
         _attach_gc_timing(context, envs.ATOM_GC_TIMING_S, envs.ATOM_GC_CENSUS_SLOW_MS)
+    # After the timing callback, so a census sees the generation it reports.
+    if envs.ATOM_GC_REFREEZE_MS > 0:
+        _attach_gc_refreeze(context, envs.ATOM_GC_REFREEZE_MS)
     if not envs.ATOM_GC_DEBUG:
         return
 

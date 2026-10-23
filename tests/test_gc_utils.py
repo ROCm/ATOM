@@ -736,3 +736,62 @@ def test_a_census_waits_for_the_freeze_a_slow_pass_and_its_gap(monkeypatch):
 
     assert [ms for _, ms in calls] == pytest.approx([200.0, 300.0])
     assert {ctx for ctx, _ in calls} == {"PP0TP0"}
+
+
+def test_a_slow_full_pass_after_the_freeze_freezes_its_survivors(monkeypatch):
+    """The next full pass then skips them; refcounting still frees them."""
+    import weakref
+
+    from atom.utils import gc_utils
+
+    lines = []
+    monkeypatch.setattr(gc_utils.logger, "info", lambda msg, *a: lines.append(msg % a))
+    gc_utils._attach_gc_refreeze("PP1TP0", slow_ms=0)
+    callback = gc.callbacks[-1]
+    base = gc.get_freeze_count()
+    try:
+        gc_utils._heap_frozen = False
+        gc.collect()  # the startup freeze's own pass
+        assert lines == []
+        assert gc.get_freeze_count() == base
+
+        gc_utils._heap_frozen = True
+        survivors = [_Cycle() for _ in range(100)]
+        gc.collect()
+    finally:
+        gc.callbacks.remove(callback)
+
+    (line,) = lines
+    assert line.startswith("[gc] PP1TP0: refroze ")
+    assert gc.get_freeze_count() - base >= 100
+    assert len(gc.get_objects(2)) == 0
+
+    probe = weakref.ref(survivors[0])
+    del survivors
+    assert probe() is not None  # a frozen cycle is not reclaimed ...
+    gc.unfreeze()
+    gc.collect()
+    assert probe() is None  # ... until it is handed back
+
+
+def test_a_fast_full_pass_leaves_the_heap_alone(monkeypatch):
+    from atom.utils import gc_utils
+
+    clock = [0.0]
+    monkeypatch.setattr(gc_utils.time, "perf_counter", lambda: clock[0])
+    gc.disable()
+    gc_utils._attach_gc_refreeze("PP1TP0", slow_ms=100)
+    callback = gc.callbacks[-1]
+    base = gc.get_freeze_count()
+    try:
+        gc_utils._heap_frozen = True
+        callback("start", {"generation": 2})
+        clock[0] += 0.099
+        callback("stop", {"generation": 2, "collected": 0})
+        callback("start", {"generation": 1})
+        clock[0] += 0.5
+        callback("stop", {"generation": 1, "collected": 0})
+    finally:
+        gc.callbacks.remove(callback)
+
+    assert gc.get_freeze_count() == base
