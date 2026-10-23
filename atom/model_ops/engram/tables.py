@@ -7,12 +7,15 @@ this module on a machine with no Triton.
 """
 
 import ctypes
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
 
 from atom.utils import envs
+
+logger = logging.getLogger("atom")
 
 # Threads copying a shard into page-locked memory; one thread falls well short
 # of what the node can copy out of the checkpoint's page cache.
@@ -227,26 +230,34 @@ class HostEmbeddingTable:
 
     def _copy_into_pinned(self, allocator, row_start: int, row_end: int) -> bool:
         """Copy the shard's rows (and scales) into page-locked memory of exactly
-        their size, on `_COPY_THREADS` threads; all-or-nothing."""
+        their size, on `_COPY_THREADS` threads; all-or-nothing.
+
+        False, with everything taken freed, on any failure -- no memory, no
+        thread to copy on -- so the TP group can fall back as one.
+        """
         regions = [self._tensor]
         if self._scale is not None:
             regions.append(self._scale)
         taken, copies = [], []
-        for tensor in regions:
-            src = tensor[row_start:row_end]
-            nbytes = src.numel() * src.element_size()
-            ptr = allocator.alloc(nbytes)
-            if ptr is None:
-                for done in taken:
-                    allocator.free(done)
-                return False
-            taken.append(ptr)
-            dst = torch.frombuffer(
-                (ctypes.c_char * max(nbytes, 1)).from_address(ptr),
-                dtype=torch.uint8,
-            )[:nbytes]
-            _parallel_copy(dst, src.reshape(-1).view(torch.uint8))
-            copies.append(dst.view(tensor.dtype).view(src.shape))
+        try:
+            for tensor in regions:
+                src = tensor[row_start:row_end]
+                nbytes = src.numel() * src.element_size()
+                ptr = allocator.alloc(nbytes)
+                if ptr is None:
+                    raise MemoryError(f"no page-locked memory for {nbytes} bytes")
+                taken.append(ptr)
+                dst = torch.frombuffer(
+                    (ctypes.c_char * max(nbytes, 1)).from_address(ptr),
+                    dtype=torch.uint8,
+                )[:nbytes]
+                _parallel_copy(dst, src.reshape(-1).view(torch.uint8))
+                copies.append(dst.view(tensor.dtype).view(src.shape))
+        except Exception:
+            logger.warning("engram: copying the UVA shard failed", exc_info=True)
+            for ptr in taken:
+                allocator.free(ptr)
+            return False
         self._copies = tuple(copies)
         self._pinned = tuple(taken)
         self._allocator = allocator

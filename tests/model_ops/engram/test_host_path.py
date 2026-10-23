@@ -597,6 +597,16 @@ def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
     rt.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_host_allocator(monkeypatch):
+    """Keep every test off the real `hipHostMalloc`: the registration tests
+    script `cudaHostRegister`, and the copy tests install `FakeHostAllocator`
+    themselves."""
+    from atom.model_ops.engram import tables as tables_mod
+
+    monkeypatch.setattr(tables_mod, "_host_allocator", lambda: None)
+
+
 class FakeCudart:
     """Page-lock accounting, and a scripted refusal.
 
@@ -717,6 +727,24 @@ def test_refused_scale_copy_frees_the_values_it_took(monkeypatch):
     table = scaled_table()
     assert table.enable_uva(0, 4) is False
     assert allocator.live == {} and table._uva is None
+
+
+def test_a_copy_that_fails_frees_what_it_took(monkeypatch):
+    """No thread to copy on (or any copy error): every allocation goes back
+    and the table reports no shard, so the group can fall back."""
+    from atom.model_ops.engram import tables as tables_mod
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(tables_mod, "_host_allocator", lambda: allocator)
+
+    def no_thread(dst, src):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(tables_mod, "_parallel_copy", no_thread)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is False
+    assert allocator.live == {} and table._uva is None
+    table.disable_uva()
 
 
 def test_without_a_host_allocator_the_mapping_is_registered_in_place(monkeypatch):
