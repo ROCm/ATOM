@@ -1461,14 +1461,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.quant_method = quant_config.quant_method or ""
         self.static_input_scales = not quant_config.is_dynamic
         self.fp8_activations = moe.mxfp4_fp8_activations
-        self.is_guinterleave = envs.ATOM_MOE_GU_ITLV or self.fp8_activations
+        gfx = get_gfx()
+        self.is_gfx1250 = gfx == "gfx1250"
+        # aiter's gfx1250 fused_moe rejects the separated gate/up layout for every
+        # G1U1 MoE, so on gfx1250 GU interleave is required, not opt-in.
+        self.is_guinterleave = (
+            envs.ATOM_MOE_GU_ITLV or self.fp8_activations or self.is_gfx1250
+        )
         self.pad_align = 256
         self.block_quant = (
             self.quant_type == QuantType.per_1x128
             or self.quant_type == QuantType.per_1x32
         )
-        gfx = get_gfx()
-        self.is_gfx1250 = gfx == "gfx1250"
         self.act_quant = MoEActivationQuant.from_model_config(moe.a_quant_dtype)
         ep_moe = self.moe.use_ep
         if envs.is_set("ATOM_USE_TRITON_MOE"):
