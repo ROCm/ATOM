@@ -219,10 +219,12 @@ def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):
 
 
 def test_a_filtered_batch_drafts_greedily(monkeypatch):
+    """Only the mask changes: the delta q comes from the greedy draw itself,
+    so the temperatures stay the requests' own (clamped) ones."""
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"], [0.7, 1.3]), has_filter=True)
-    assert prop._draft_temps_buf.np[:2].tolist() == [np.float32(SAMPLER_EPS)] * 2
     assert prop._draft_greedy_buf.np[:2].tolist() == [1, 1]
+    np.testing.assert_allclose(prop._draft_temps_buf.np[:2], [0.7, 1.3], rtol=1e-6)
 
 
 def test_an_unfiltered_batch_keeps_each_rows_temperature_and_greedy_predicate(

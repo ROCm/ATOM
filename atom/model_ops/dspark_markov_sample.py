@@ -648,9 +648,9 @@ def _dspark_markov_sample_stage1(
         mask=row_mask[:, None] & v_mask[None, :],
         other=0.0,
     )
-    # Pre-clamped by the caller to SAMPLER_EPS, so a greedy row gets a
-    # near-delta q rather than a division by zero; `greedy_mask` is what
-    # actually makes it an argmax.
+    # Pre-clamped by the caller to SAMPLER_EPS, so no row divides by zero. A
+    # greedy row's scores are only scratch: stage 3 publishes the exact delta
+    # on its argmax instead.
     logits = tl.where(v_mask[None, :], base.to(tl.float32) + acc, float("-inf"))
     # The greedy op's own (max, lowest id), taken before the division: a
     # near-zero temperature can round distinct logits onto one value.

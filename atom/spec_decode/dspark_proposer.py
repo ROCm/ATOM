@@ -321,20 +321,17 @@ class DSparkProposer(Drafter):
         counts[index["draft_q_row_base"]] = hi or None
         if not bs:
             return
+        # The clamp `prepare_sample` applies to the target's copy, so the two
+        # divide by the same number row for row and no row divides by zero.
+        np.maximum(batch.temperatures, SAMPLER_EPS, out=temps.np[:bs])
         if has_filter:
-            # Clamp the draft's own temperature as well as setting the mask:
-            # the mask alone makes the draw an argmax but leaves the published
-            # q a full `softmax(logits/T)`. Clamped, q is a near-delta on the
-            # drafted id, sound under either accept rule -- which matters
-            # because this batch's drafts meet the next step's filters.
-            # `rejection_sampler` reads the target's own temperatures, which
-            # are untouched here.
-            temps.np[:bs] = SAMPLER_EPS
+            # Draft the whole batch greedily. A greedy row's draw is its
+            # logits' argmax and the q it publishes is the exact delta on that
+            # id (stage 3 of `dspark_markov_sample`), which is sound under
+            # either accept rule -- this batch's drafts may meet an unfiltered
+            # verify next step. The temperature plays no part in either.
             mask.np[:bs] = 1
         else:
-            # The clamp `prepare_sample` applies to the target's copy, so the
-            # two divide by the same number row for row.
-            np.maximum(batch.temperatures, SAMPLER_EPS, out=temps.np[:bs])
             # The predicate `Sampler` tests, so a row cannot be greedy to the
             # target and stochastic to the draft.
             mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
