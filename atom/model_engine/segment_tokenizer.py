@@ -18,6 +18,7 @@ any mismatch turns the cache off for good and falls back.
 """
 
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -33,6 +34,17 @@ _VERIFY_FIRST = 4
 # Prompts shorter than this (characters) are encoded whole: splitting, hashing
 # and joining cost more than they save there.
 _MIN_CACHED_CHARS = 100_000
+
+
+def _normalizer_is_identity(backend) -> bool:
+    """True when the fast tokenizer has no normalizer, or an empty sequence."""
+    try:
+        normalizer = json.loads(backend.to_str()).get("normalizer")
+    except (ValueError, AttributeError):
+        return False
+    return normalizer is None or (
+        normalizer.get("type") == "Sequence" and not normalizer.get("normalizers")
+    )
 
 
 class SegmentTokenizer:
@@ -94,10 +106,21 @@ class SegmentTokenizer:
         return seg if seg.enabled and seg._added else None
 
     def _segments_are_independent(self) -> bool:
+        """Whether splitting the raw prompt at added-token spellings is what
+        the fast tokenizer does itself.
+
+        An added token that strips whitespace or matches single words depends
+        on its neighbours. A normalized added token is matched after the
+        normalizer runs, so its raw spelling may not be where the tokenizer
+        splits (NFC folds `a` + U+0301 into one character); those are only
+        safe when there is no normalizer.
+        """
         decoder = getattr(self._tokenizer, "added_tokens_decoder", {}) or {}
-        return all(
-            not (t.lstrip or t.rstrip or t.single_word) for t in decoder.values()
-        )
+        if any(t.lstrip or t.rstrip or t.single_word for t in decoder.values()):
+            return False
+        if any(t.normalized for t in decoder.values()):
+            return _normalizer_is_identity(self._backend)
+        return True
 
     def encode(self, prompt: str) -> list[int]:
         if not self.enabled or len(prompt) < _MIN_CACHED_CHARS:
@@ -120,6 +143,9 @@ class SegmentTokenizer:
         parts = [p for p in self._split.split(prompt) if p]
         keys: list[bytes | None] = []
         missing: dict[bytes, str] = {}
+        # This request's own references to the ids it found cached: another
+        # request may evict them while this one encodes its missing segments.
+        found: dict[bytes, np.ndarray] = {}
         with self._lock:
             for part in parts:
                 if part in self._added:
@@ -127,8 +153,11 @@ class SegmentTokenizer:
                     continue
                 key = hashlib.blake2b(part.encode(), digest_size=16).digest()
                 keys.append(key)
-                if key not in self._cache:
+                ids = self._cache.get(key)
+                if ids is None:
                     missing[key] = part
+                else:
+                    found[key] = ids
         # Encoded outside the lock: one batch, parallel inside the tokenizer.
         fresh = {}
         if missing:
@@ -148,9 +177,9 @@ class SegmentTokenizer:
                 if key is None:
                     out.append(self._added[part])
                     continue
-                ids = fresh.get(key)
+                ids = found.get(key)
                 if ids is None:
-                    ids = self._cache[key]
+                    ids = fresh[key]
                 if key in self._cache:
                     self._cache.move_to_end(key)
                 out.extend(ids.tolist())

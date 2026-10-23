@@ -140,5 +140,57 @@ def test_short_prompts_are_encoded_whole(tok, monkeypatch):
     assert seg._stats[3] == 0 and seg._cached_tokens == 0
 
 
+def test_eviction_by_another_request_mid_encode_is_harmless(tok, monkeypatch):
+    """Another request can evict this one's cached segments while it encodes
+    its new ones outside the lock."""
+    seg = SegmentTokenizer.maybe_create(tok, 1_000_000)
+    rng = random.Random(6)
+    prompt = _conversation(rng, 6)
+    assert seg.encode(prompt) == tok.encode(prompt)
+    longer = prompt + "<|User|>" + _text(rng, 30)
+    real = seg._backend.encode_batch
+
+    def evict_then_encode(texts, **kw):
+        with seg._lock:
+            seg._cache.clear()
+            seg._cached_tokens = 0
+        return real(texts, **kw)
+
+    monkeypatch.setattr(seg, "_backend", MagicMock(encode_batch=evict_then_encode))
+    seg._verified = seg_mod._VERIFY_FIRST  # unchecked, as in steady state
+    assert seg._encode_segments(longer) == tok.encode(longer)
+
+
+def _normalized_tokenizer(normalizer):
+    rng = random.Random(7)
+    backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+    if normalizer is not None:
+        backend.normalizer = normalizer
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.train_from_iterator(
+        [_text(rng, 40) for _ in range(50)],
+        trainers.BpeTrainer(vocab_size=280, special_tokens=["[UNK]"]),
+    )
+    backend.add_special_tokens([AddedToken("<|User|>", special=True)])
+    backend.add_tokens([AddedToken("\u0301", normalized=True)])
+    return transformers.PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+def test_normalized_added_tokens_need_an_identity_normalizer():
+    from tokenizers import normalizers
+
+    assert (
+        SegmentTokenizer.maybe_create(_normalized_tokenizer(normalizers.NFC()), 10**6)
+        is None
+    )
+    seg = SegmentTokenizer.maybe_create(_normalized_tokenizer(None), 10**6)
+    assert seg is not None
+    # Past the verification window, a combining accent is still exact.
+    tok = seg._tokenizer
+    seg._verified = seg_mod._VERIFY_FIRST
+    prompt = "<|User|>a\u0301 caf\u0301e" * 3
+    assert seg._encode_segments(prompt) == tok.encode(prompt)
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16
