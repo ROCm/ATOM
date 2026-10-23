@@ -411,3 +411,22 @@ def test_a_greedy_row_is_exact_match_whatever_its_batch_mates(draft_first):
             )
             assert torch.equal(out[slot, :width], ref_out[0, :width]), (slot, step)
             assert torch.equal(verdict[:2, slot], ref_verdict[:2, 0]), (slot, step)
+
+
+def test_the_target_law_holds_at_the_real_vocab():
+    torch.manual_seed(53)
+    vocab, n = 163840, 6000
+    support_p = {7: 0.4, 81920: 0.35, vocab - 1: 0.25}
+    support_q = {7: 0.6, 81920: 0.1, vocab - 3: 0.3}
+    p, q = sparse(vocab, support_p), sparse(vocab, support_q)
+    drafts = draw(q, n)
+    logits = p.log().to(torch.bfloat16).expand(n, -1)
+    out, _ = rejection_sample(
+        **verify_batch(drafts, 1, logits, torch.ones(n, device=DEV)),
+        draft_probs=q.expand(1, -1).contiguous(),
+        draft_probs_row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
+        ratio_step=3,
+    )
+    p_bf16 = torch.softmax(p.log().to(torch.bfloat16).float(), -1)
+    freq = torch.bincount(out[:, 0].long(), minlength=vocab).float() / n
+    torch.testing.assert_close(freq, p_bf16, rtol=0, atol=0.025)

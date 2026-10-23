@@ -20,14 +20,16 @@ def tile_max_sumexp(x, mask):
     """``(max, sum exp(x - max))`` of one ``[BLOCK]`` or ``[ROWS, BLOCK]`` tile
     along its last axis. Masked lanes must already hold -inf.
 
-    A fully masked lane is -inf, and ``exp(-inf - -inf)`` is NaN, so the sum is
-    masked rather than relying on the exponential to zero it.
+    A tile that is -inf throughout (masked lanes, or a vocab range the logits
+    themselves mask) has max -inf, and ``exp(-inf - -inf)`` is NaN; subtracting
+    0 instead makes its sum the 0 it is, and its max stays -inf.
     """
     tile_max = tl.max(x, axis=-1)
+    shift = tl.where(tile_max == float("-inf"), 0.0, tile_max)
     if len(x.shape) == 1:
-        expd = tl.where(mask, tl.exp(x - tile_max), 0.0)
+        expd = tl.where(mask, tl.exp(x - shift), 0.0)
     else:
-        expd = tl.where(mask, tl.exp(x - tile_max[:, None]), 0.0)
+        expd = tl.where(mask, tl.exp(x - shift[:, None]), 0.0)
     return tile_max, tl.sum(expd, axis=-1)
 
 
@@ -60,7 +62,11 @@ def softmax_combine_kernel(
     )
     sums = tl.load(part_sum_ptr + offs_tile * num_rows + row, mask=tile_mask, other=0.0)
     global_max = tl.max(maxes, axis=0)
-    rescaled = tl.where(tile_mask, sums * tl.exp(maxes - global_max), 0.0)
+    # An all--inf tile contributes nothing, and must not contribute the NaN
+    # `exp(-inf - -inf)` would give when the whole row is -inf.
+    rescaled = tl.where(
+        tile_mask & (maxes > float("-inf")), sums * tl.exp(maxes - global_max), 0.0
+    )
     z = tl.sum(rescaled, axis=0)
     # An all--inf row (the fp8-KV warmup forward drafts before the pool is
     # written) leaves Z at 0, and 1/0 would make every probability inf. Answer
