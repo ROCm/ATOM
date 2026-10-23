@@ -11,6 +11,14 @@ encodes those segments independently -- the new ones in one parallel batch --
 and keeps each segment's ids in an LRU keyed by its content, so a turn costs
 roughly its new messages (DeepSeek Recipe's "special-token segmentation").
 
+On top of that, each prompt is kept cut after its last added token, with its
+ids and where each added token in it ends. The next turn of the conversation
+(found by its first characters) reuses those ids up to the last added token
+both prompts share -- the generation prompt of a turn is rewritten once it is
+answered, so the shared part usually ends a little before the stored one --
+and only the rest goes through the segment cache. Cutting at an added token
+keeps this exact as well; it is off when one added token contains another.
+
 Exactness is checked twice: statically (no added token strips neighbouring
 whitespace or matches single words, either of which would make a segment
 depend on its neighbours) and against the plain encoder on the first prompts;
@@ -21,6 +29,7 @@ import hashlib
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -52,6 +61,11 @@ class _Prefix(NamedTuple):
     ids: np.ndarray  # int32, without the BOS/EOS `encode` wraps a prompt in
     cut_chars: np.ndarray  # int64, ascending; the last is len(text)
     cut_ids: np.ndarray  # int64, ids before each cut
+
+    @property
+    def cost(self) -> int:
+        """Budget units (one per int32 token id): the ids and the text."""
+        return len(self.ids) + sys.getsizeof(self.text) // 4
 
 
 def _alternation(tokens):
@@ -281,11 +295,13 @@ class SegmentTokenizer:
                 best = (entry, k)
         return best
 
-    def _store_prefix(self, prompt: str, ids, cut_chars, cut_ids, base) -> None:
-        """Remember `prompt` up to its last cut, replacing the prefix it
-        extends."""
+    def _store_prefix(self, prompt: str, ids, cut_chars, cut_ids, base):
+        """Remember `prompt` up to its last cut. `base`, when given, is the
+        stored prefix this prompt extends whole, which it replaces; a prompt
+        that only shares part of one (another conversation with the same
+        start, a fork) is kept beside it."""
         if not self._prefix_ok or not cut_chars or cut_chars[-1] <= _PREFIX_KEY_CHARS:
-            return None
+            return
         cut = cut_chars[-1]
         bucket = hash(prompt[:_PREFIX_KEY_CHARS])
         with self._lock:
@@ -304,7 +320,7 @@ class SegmentTokenizer:
                 np.asarray(cut_ids, dtype=np.int64),
             )
             self._prefixes[pid] = entry
-            self._prefix_tokens += len(ids)
+            self._prefix_tokens += entry.cost
             pids.append(pid)
             if len(pids) > _PREFIX_BUCKET:
                 self._drop_prefix(pids[0], bucket)
@@ -312,12 +328,11 @@ class SegmentTokenizer:
                 old_pid = next(iter(self._prefixes))
                 old = self._prefixes[old_pid]
                 self._drop_prefix(old_pid, hash(old.text[:_PREFIX_KEY_CHARS]))
-        return entry
 
     def _drop_prefix(self, pid: int, bucket: int) -> None:
         entry = self._prefixes.pop(pid, None)
         if entry is not None:
-            self._prefix_tokens -= len(entry.ids)
+            self._prefix_tokens -= entry.cost
         pids = self._prefix_buckets.get(bucket)
         if pids is not None and pid in pids:
             pids.remove(pid)
@@ -335,6 +350,8 @@ class SegmentTokenizer:
             start, cut_chars, cut_ids = 0, [], []
         else:
             k = found_prefix[1]
+            # Extending it whole retires it; sharing only part leaves it be.
+            extends = k == len(base.cut_chars) - 1
             start = int(base.cut_chars[k])
             cut_chars = base.cut_chars[: k + 1].tolist()
             cut_ids = base.cut_ids[: k + 1].tolist()
@@ -401,7 +418,7 @@ class SegmentTokenizer:
                 ),
                 cut_chars,
                 cut_ids,
-                base,
+                base if base is not None and extends else None,
             )
         out.extend(self._tail)
         if base is not None:

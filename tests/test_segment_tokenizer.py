@@ -337,5 +337,63 @@ def test_prefix_fast_path_is_off_when_an_added_token_contains_another():
     assert seg is not None and not seg._prefix_ok
 
 
+def test_conversations_sharing_a_start_are_kept_apart_and_exact(tok):
+    """Two conversations with the same first characters share a bucket; each
+    still reuses only what it shares and stays exact."""
+    seg = SegmentTokenizer.maybe_create(tok, 10**7)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(14)
+    common = _long_conversation(rng, 2)
+    a = common + "<|User|>" + _text(rng, 30)
+    b = common + "<|User|>" + _text(rng, 30)
+    for _ in range(3):
+        for p in (a, b):
+            ask = p + "<|Assistant|>"
+            assert seg._encode_segments(ask) == tok.encode(ask)
+        a += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
+        b += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 20)
+    assert len(seg._prefix_buckets) == 1
+    assert len(seg._prefixes) == 2
+
+
+def test_stored_prefixes_stay_within_the_budget(tok):
+    seg = SegmentTokenizer.maybe_create(tok, 20_000)
+    seg._verified = seg_mod._VERIFY_FIRST
+    rng = random.Random(15)
+    for _ in range(12):
+        p = _long_conversation(rng, 4) + "<|Assistant|>"
+        assert seg._encode_segments(p) == tok.encode(p)
+        assert seg._prefix_tokens <= 20_000
+        assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
+
+
+def test_concurrent_turns_stay_exact(tok):
+    """Threads advancing conversations that share a start: lookups, stores
+    and evictions interleave."""
+    import threading
+
+    seg = SegmentTokenizer.maybe_create(tok, 60_000)
+    seg._verified = seg_mod._VERIFY_FIRST
+    common = _long_conversation(random.Random(16), 2)
+    errors = []
+
+    def worker(i):
+        rng = random.Random(100 + i)
+        p = common + "<|User|>" + _text(rng, 20)
+        for _ in range(8):
+            ask = p + "<|Assistant|>"
+            if seg._encode_segments(ask) != tok.encode(ask):
+                errors.append(i)
+            p += "<|Assistant|>" + _text(rng, 10) + "<|User|>" + _text(rng, 15)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not errors
+    assert seg._prefix_tokens == sum(e.cost for e in seg._prefixes.values())
+
+
 def test_verification_window_is_bounded():
     assert 0 < seg_mod._VERIFY_FIRST <= 16
