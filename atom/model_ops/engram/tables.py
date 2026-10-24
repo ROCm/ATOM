@@ -6,72 +6,10 @@ registered shard lives in `device.uva`, so that the prefetch runtime can import
 this module on a machine with no Triton.
 """
 
-import ctypes
-import logging
-from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 import torch
 
-from atom.utils import envs
-
-logger = logging.getLogger("atom")
-
-# Threads copying a shard into page-locked memory; one thread falls well short
-# of what the node can copy out of the checkpoint's page cache.
-_COPY_THREADS = 16
-
-
-class _HipHostAllocator:
-    """`hipHostMalloc`/`hipHostFree` through ctypes.
-
-    Not torch's pinned allocator: that one rounds every block up to a power of
-    two, which for a large table shard wastes a large share of page-locked
-    memory. ctypes also drops the GIL for the call.
-    """
-
-    def __init__(self, lib):
-        self._malloc, self._free = lib.hipHostMalloc, lib.hipHostFree
-        self._malloc.argtypes = [
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_size_t,
-            ctypes.c_uint,
-        ]
-        self._free.argtypes = [ctypes.c_void_p]
-
-    def alloc(self, nbytes: int) -> int | None:
-        ptr = ctypes.c_void_p()
-        if self._malloc(ctypes.byref(ptr), max(nbytes, 1), 0) != 0 or not ptr.value:
-            return None
-        return ptr.value
-
-    def free(self, ptr: int) -> None:
-        self._free(ptr)
-
-
-def _parallel_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """`dst.copy_(src)` for flat byte tensors, in chunks on `_COPY_THREADS`
-    threads (each `copy_` releases the GIL)."""
-    nbytes = src.numel()
-    step = max(1, -(-nbytes // (_COPY_THREADS * 4)))
-
-    def copy_chunk(start: int) -> None:
-        dst[start : start + step].copy_(src[start : start + step])
-
-    with ThreadPoolExecutor(_COPY_THREADS) as pool:
-        list(pool.map(copy_chunk, range(0, nbytes, step)))
-
-
-def _host_allocator():
-    """The page-locked allocator `enable_uva` copies a shard into, or None to
-    register the checkpoint mapping in place instead (`ATOM_ENGRAM_UVA_COPY=0`,
-    or no HIP runtime to call)."""
-    if not envs.ATOM_ENGRAM_UVA_COPY or not torch.version.hip:
-        return None
-    try:
-        return _HipHostAllocator(ctypes.CDLL("libamdhip64.so"))
-    except OSError:
-        return None
+from atom.model_ops.engram import host_memory
 
 
 class HostEmbeddingTable:
@@ -101,14 +39,10 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
-        # The registered row range, and the page-aligned base of each
-        # registration made for it.
+        # The page-locked row range and its rows (values, then scales), as
+        # `host_memory.pin_rows` returned them; the tensors own the memory.
         self._uva: tuple[int, int] | None = None
-        self._pinned: tuple[int, ...] = ()
-        # Set when the range was copied into page-locked memory rather than
-        # registered in place: the copies, as the kernel addresses them.
-        self._copies: tuple[torch.Tensor, ...] = ()
-        self._allocator = None
+        self._shard: tuple[torch.Tensor, ...] = ()
         if scale is not None:
             # gather() does `scale.to(float32)`; that decodes 2**(code-127) only
             # for a float8 E8M0 dtype. A raw uint8 exponent-code table would be
@@ -180,21 +114,12 @@ class HostEmbeddingTable:
     # table. Registering the whole table on every rank is what a TP=4 job cannot
     # afford: 4 x 203 GB of unswappable pages.
 
-    _PAGE = 4096
-
     def enable_uva(self, row_start: int = 0, row_end: int | None = None) -> bool:
-        """Page-lock rows `[row_start, row_end)` so a device kernel can read them.
+        """Page-lock rows `[row_start, row_end)` so a device kernel can read
+        them (`host_memory.pin_rows`); all-or-nothing.
 
-        By default the rows are copied into freshly page-locked memory
-        (`_copy_into_pinned`). Registering the checkpoint mapping in place
-        instead copies every page on its write fault (the mapping is private)
-        on one thread while holding the HIP runtime lock, which also stalls
-        the rest of startup. The memory is the same either way; the registered
-        pages are anonymous copies too.
-
-        In place, the range is widened to page boundaries, which registration
-        requires; the extra bytes are neighbouring rows this rank never
-        addresses.
+        A table holds one range: enabling a different one while a range is
+        held raises -- `disable_uva()` first.
         """
         row_end = self.num_rows if row_end is None else row_end
         if not 0 <= row_start <= row_end <= self.num_rows:
@@ -202,87 +127,30 @@ class HostEmbeddingTable:
                 f"engram shard rows [{row_start}, {row_end}) outside "
                 f"[0, {self.num_rows})"
             )
-        if self._uva == (row_start, row_end):
-            return True
-        allocator = _host_allocator()
-        if allocator is not None:
-            return self._copy_into_pinned(allocator, row_start, row_end)
-        rt = torch.cuda.cudart()
-        regions = [(self._tensor, self.head_dim)]
+        if self._uva is not None:
+            if self._uva == (row_start, row_end):
+                return True
+            raise RuntimeError(
+                f"engram table already page-locks rows {list(self._uva)}; "
+                f"disable_uva() before enabling [{row_start}, {row_end})"
+            )
+        sources = [self._tensor[row_start:row_end]]
         if self._scale is not None:
-            regions.append((self._scale, self._scale.shape[1]))
-        pinned = []
-        for tensor, width in regions:
-            item = tensor.element_size()
-            base = tensor.data_ptr() + row_start * width * item
-            nbytes = (row_end - row_start) * width * item
-            lo = base - (base % self._PAGE)
-            size = -(-(base + nbytes - lo) // self._PAGE) * self._PAGE
-            if int(rt.cudaHostRegister(lo, size, 0)) != 0:
-                # This object is about to report that it holds neither region.
-                for done in pinned:
-                    rt.cudaHostUnregister(done)
-                return False
-            pinned.append(lo)
-        self._pinned = tuple(pinned)
-        self._uva = (row_start, row_end)
-        return True
-
-    def _copy_into_pinned(self, allocator, row_start: int, row_end: int) -> bool:
-        """Copy the shard's rows (and scales) into page-locked memory of exactly
-        their size, on `_COPY_THREADS` threads; all-or-nothing.
-
-        False, with everything taken freed, on any failure -- no memory, no
-        thread to copy on -- so the TP group can fall back as one.
-        """
-        regions = [self._tensor]
-        if self._scale is not None:
-            regions.append(self._scale)
-        taken, copies = [], []
-        try:
-            for tensor in regions:
-                src = tensor[row_start:row_end]
-                nbytes = src.numel() * src.element_size()
-                ptr = allocator.alloc(nbytes)
-                if ptr is None:
-                    raise MemoryError(f"no page-locked memory for {nbytes} bytes")
-                taken.append(ptr)
-                dst = torch.frombuffer(
-                    (ctypes.c_char * max(nbytes, 1)).from_address(ptr),
-                    dtype=torch.uint8,
-                )[:nbytes]
-                _parallel_copy(dst, src.reshape(-1).view(torch.uint8))
-                copies.append(dst.view(tensor.dtype).view(src.shape))
-        except Exception:
-            logger.warning("engram: copying the UVA shard failed", exc_info=True)
-            for ptr in taken:
-                allocator.free(ptr)
+            sources.append(self._scale[row_start:row_end])
+        shard = host_memory.pin_rows(sources)
+        if shard is None:
             return False
-        self._copies = tuple(copies)
-        self._pinned = tuple(taken)
-        self._allocator = allocator
+        self._shard = shard
         self._uva = (row_start, row_end)
         return True
 
     def disable_uva(self) -> None:
-        """Release this table's page-locked range, if it holds one.
+        """Drop this table's page-locked range, if it holds one.
 
-        What comes back is what went in, rather than the same offsets derived a
-        second time -- two copies of that arithmetic would have to agree.
+        The memory goes when the last tensor over it does: at once unless a
+        caller still holds one from `registered_shard`, then with that tensor.
         """
-        if self._uva is None:
-            return
-        if self._copies:
-            self._copies = ()
-            for ptr in self._pinned:
-                self._allocator.free(ptr)
-            self._pinned = ()
-            self._uva = None
-            return
-        rt = torch.cuda.cudart()
-        for base in self._pinned:
-            rt.cudaHostUnregister(base)
-        self._pinned = ()
+        self._shard = ()
         self._uva = None
 
     def registered_shard(self):
@@ -296,18 +164,8 @@ class HostEmbeddingTable:
         if self._uva is None:
             raise RuntimeError("engram UVA lookup needs enable_uva() first")
         row_start, row_end = self._uva
-        if self._copies:
-            weight = self._copies[0]
-            scales = (
-                weight if self._scale is None else self._copies[1].view(torch.uint8)
-            )
-            return weight, scales, row_start, row_end
-        weight = self._tensor[row_start:row_end]
-        scales = (
-            weight
-            if self._scale is None
-            else self._scale[row_start:row_end].view(torch.uint8)
-        )
+        weight = self._shard[0]
+        scales = weight if self._scale is None else self._shard[1].view(torch.uint8)
         return weight, scales, row_start, row_end
 
     @staticmethod
