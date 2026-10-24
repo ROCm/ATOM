@@ -291,6 +291,17 @@ def load_model(
     def _fuse_shared_expert(
         shared_expert_prefix: str, routed_expert_prefix: str
     ) -> bool:
+        # The model decided fusion when it was built. A shared expert it built
+        # as its own module owns these weights: remapped into the fused slot,
+        # which then does not exist, they would be dropped and the module left
+        # uninitialized (the Qwen3.5 MTP drafter under DP + mori, whose quant
+        # config resolves the draft prefixes differently here).
+        try:
+            standalone = model.get_submodule(shared_expert_prefix)
+        except AttributeError:
+            standalone = None
+        if standalone is not None and any(True for _ in standalone.parameters()):
+            return False
         model_quant_config = getattr(
             getattr(model, "atom_config", None), "quant_config", None
         )
