@@ -3146,6 +3146,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 running_bs,
                 max_seqlen_q,
                 context_lens,
+                split_bs=self._ubatch_split_bs,
             )
 
         return attn_metadata, positions
@@ -3156,21 +3157,26 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         bs: int,
         max_seqlen_q: int,
         context_lens: np.ndarray,
+        *,
+        split_bs: int | None = None,
     ):
         """Split the full-batch data into per-ubatch buffers for TBO decode.
 
-        Each ubatch holds the scheduled requests its micro-batch runs
-        (`decode_ubatch_request_ranges`), padded to half the padded batch,
-        which always covers them.
+        One per micro-batch the step runs (`decode_ubatch_request_ranges` of
+        ``split_bs``, the step's `_ubatch_split_bs`; None: the scheduled
+        requests): a replayed TBO graph's halves of the bucket, or an eager
+        split's halves of the scheduled requests. Each is padded to its half
+        of the padded batch, which covers either.
         """
         self._check_metadata_writable("ub0_mla_metadata", "ub1_mla_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        half = bs // N
 
-        ub_ranges = decode_ubatch_request_ranges(scheduled_bs, N)
+        ub_ranges = decode_ubatch_request_ranges(split_bs or scheduled_bs, N)
         self._tbo_ubatch_request_ranges = ub_ranges
-        running_bs_list = [half, bs - half]
+        running_bs_list = [
+            end - start for start, end in decode_ubatch_request_ranges(bs, N)
+        ]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(
             zip(ub_ranges, running_bs_list)

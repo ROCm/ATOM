@@ -155,6 +155,12 @@ class ForwardMode:
     # The DP group replays request graphs as one this step: a decode's whole
     # forward (`use_cudagraph`), a prefill's decoder (`DecoderGraph`).
     req_graphs: bool = False
+    # The decode batch this step's TBO micro-batches are cut from
+    # (`decode_ubatch_request_ranges`), and so the one every backend lays its
+    # per-ubatch metadata out for: the padded bucket when the step replays a
+    # TBO graph, which recorded that split; the scheduled requests on an eager
+    # TBO split. None when the step does not split a decode.
+    ubatch_split_bs: int | None = None
 
     @classmethod
     def decide(
@@ -172,8 +178,13 @@ class ForwardMode:
         max_seqlen_q: int,
         running_tokens_per_dp_rank: np.ndarray,
         graph_shapes: Container[tuple[int, int]] | None = None,
+        tbo_decode_graphs: bool = False,
     ) -> "ForwardMode":
         """Run the step's DP collective and settle its shape from the result.
+
+        ``tbo_decode_graphs``: every decode bucket that splits
+        (`decode_bucket_splits`) was recorded as a TBO graph, so a decode the
+        group splits replays like any other.
 
         ``running_tokens_per_dp_rank`` is the caller's [dp_size] buffer, which
         every step settles in place from the group's scheduled tokens.
@@ -184,6 +195,7 @@ class ForwardMode:
         agrees on it.
         """
         # Lazy: `atom.utils.tbo`'s package init reaches back into this module.
+        from atom.utils.tbo.ubatch_splitting import decode_bucket_splits
         from atom.utils.tbo.ubatching import sync_dp_metadata
 
         is_prefill = batch.total_tokens_num_prefill > 0
@@ -255,10 +267,12 @@ class ForwardMode:
         # and every decode it runs has no draft. That holds on every rank, its DP dummy included, and
         # `running_bs` is the group's, so the lookup is DP-agreed: the group
         # replays or runs eagerly as one.
-        # A decode the group splits into TBO microbatches has no recording
-        # yet, and `tbo_collective_active` is the group's: it runs eagerly as
-        # one.
-        graphable = not (enforce_eager or step_needs_eager or tbo_collective_active)
+        # A step the group splits into TBO microbatches has no recording of its
+        # own, and `tbo_collective_active` is the group's: it runs eagerly as
+        # one -- unless it is a decode and the buckets were recorded split
+        # (`tbo_decode_graphs`), where the bucket's recording is the split.
+        tbo_eager = tbo_collective_active and (is_prefill or not tbo_decode_graphs)
+        graphable = not (enforce_eager or step_needs_eager or tbo_eager)
         # A recording holds every rank's rows in its collectives, so the group
         # replays request graphs as one, on a step every rank runs alike: all
         # decoding (`unified`) or all prefilling.
@@ -271,6 +285,15 @@ class ForwardMode:
         if replayable and not shape_captured:
             _warn_uncaptured_decode_shape(running_bs, max_seqlen_q)
         use_cudagraph = replayable and shape_captured
+        # A replayed bucket that splits was recorded split at the bucket, on
+        # every rank alike, whatever each rank scheduled into it; an eager
+        # split cuts this rank's scheduled requests.
+        if use_cudagraph and tbo_decode_graphs and decode_bucket_splits(running_bs):
+            ubatch_split_bs = running_bs
+        elif tbo_collective_active and not is_prefill:
+            ubatch_split_bs = scheduled_bs
+        else:
+            ubatch_split_bs = None
 
         running_tokens, decode_recorded = cls._running_tokens(
             is_prefill=is_prefill,
@@ -306,6 +329,7 @@ class ForwardMode:
             sync=sync,
             token_graph=bool(token_graph) or (decode_recorded and graphable),
             req_graphs=req_graphs,
+            ubatch_split_bs=ubatch_split_bs,
         )
 
     @staticmethod

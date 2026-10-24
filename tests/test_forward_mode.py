@@ -569,3 +569,58 @@ def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
         own, running = _bucket(100, True, sync)
         assert own == 0
         assert running == sync.scheduled_tokens_per_dp_rank.tolist()
+
+
+# --------------------------------------------------------------------------- #
+# TBO decode: which batch a split step's micro-batches are cut from.          #
+# --------------------------------------------------------------------------- #
+
+SPLIT = (True, True, 2, 3)  # this rank can split, and it is worth splitting
+
+
+def test_without_tbo_recordings_a_split_decode_runs_eagerly_on_its_requests():
+    mode = _decide(_batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT)
+    assert mode.tbo_collective_active and not mode.use_cudagraph
+    assert mode.ubatch_split_bs == 5
+
+
+def test_a_split_decode_replays_its_bucket_recorded_split():
+    """The bucket's recording cut its micro-batches at the bucket, so the step
+    lays them out there, not at the 5 requests it scheduled."""
+    mode = _decide(
+        _batch(seqs=5, q=1), tbo_on=True, local_tbo=SPLIT, tbo_decode_graphs=True
+    )
+    assert mode.use_cudagraph and mode.running_bs == 8
+    assert mode.ubatch_split_bs == 8
+
+
+def test_a_replayed_bucket_that_splits_is_split_whatever_this_rank_decided():
+    """Every rank replays the group's bucket; a rank whose own batch could not
+    split runs the same split recording as its peers."""
+    mode = _decide(_batch(seqs=3, q=1), tbo_on=True, tbo_decode_graphs=True)
+    assert not mode.tbo_collective_active and mode.use_cudagraph
+    assert mode.running_bs == 4 and mode.ubatch_split_bs == 4
+
+
+def test_a_bucket_too_small_to_split_replays_whole():
+    mode = _decide(_batch(seqs=2, q=1), tbo_on=True, tbo_decode_graphs=True)
+    assert mode.use_cudagraph and mode.ubatch_split_bs is None
+
+
+def test_eager_or_prefill_tbo_does_not_replay_a_split_recording():
+    eager = _decide(
+        _batch(seqs=5, q=1),
+        tbo_on=True,
+        local_tbo=SPLIT,
+        tbo_decode_graphs=True,
+        enforce_eager=True,
+    )
+    assert not eager.use_cudagraph and eager.ubatch_split_bs == 5
+    prefill = _decide(
+        _batch(seqs=3, tokens=900, prefill_tokens=900),
+        tbo_on=True,
+        local_tbo=(True, True, 450, 450),
+        tbo_decode_graphs=True,
+    )
+    assert prefill.tbo_collective_active and not prefill.req_graphs
+    assert prefill.ubatch_split_bs is None

@@ -52,6 +52,17 @@ class UBatchSlice:
     token_slice: slice  # which tokens belong to this micro-batch (for prefill)
 
 
+def decode_bucket_splits(bs: int) -> bool:
+    """Whether a decode batch of ``bs`` requests is split into micro-batches.
+
+    One threshold for both places a decode split is decided: a rank's own
+    scheduled batch on an eager step (`_precompute_decode`) and a recorded
+    request bucket (`ModelRunner.capture_cudagraph`, which records a bucket
+    that splits as a TBO graph). The per-ubatch metadata of a smaller batch
+    is not prepared (`_prepare_ubatch_decode` callers)."""
+    return bs > 2
+
+
 def decode_ubatch_request_ranges(
     scheduled_bs: int, num_ubatches: int
 ) -> list[tuple[int, int]]:
@@ -60,10 +71,11 @@ def decode_ubatch_request_ranges(
 
     The one split a decode step's micro-batches are cut by
     (`maybe_create_ubatch_slices`) and the one every attention backend's
-    per-ubatch metadata must cover (`_prepare_ubatch_decode`). A backend that
-    splits anything else -- the padded running batch, a ubatch's padded
-    width -- hands a micro-batch's rows another request's context and KV
-    slots.
+    per-ubatch metadata must cover (`_prepare_ubatch_decode`). Which batch it
+    cuts is the step's (`ForwardMode.ubatch_split_bs`): the scheduled requests
+    on an eager step, the padded bucket a TBO graph recorded. A backend that
+    splits anything else hands a micro-batch's rows another request's context
+    and KV slots.
     """
     per_ubatch = scheduled_bs // num_ubatches
     return [

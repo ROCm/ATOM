@@ -164,8 +164,15 @@ request_bucket(running_bs, max_seqlen_q) == (running_bs, draft_num)
   the one it decodes: `0` for standard decode, `mtp_k` for MTP speculative
   decoding.
 
-A decode step the DP group splits into TBO microbatches has no graph yet and
-runs eagerly (`ForwardMode.decide`).
+Under TBO decode (`--enable-tbo all`), a bucket that splits
+(`decode_bucket_splits`: `running_bs > 2`) is recorded as a TBO graph: its two
+microbatches cut at the bucket (`decode_ubatch_request_ranges(running_bs)`),
+every DP rank recording the same split. A decode step that replays it lays
+each microbatch's attention metadata out for that split
+(`ForwardMode.ubatch_split_bs`), whatever each rank scheduled into the bucket.
+A split decode no recording serves -- off the ladder, under `--enforce-eager`,
+or under TR_HYBRID, whose token graphs have no split recording -- runs eagerly,
+its microbatches cut from the scheduled requests.
 
 ### Graph pool sharing
 

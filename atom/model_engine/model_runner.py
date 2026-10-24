@@ -107,6 +107,7 @@ from atom.utils.selector import attn_family, get_attn_backend, has_mla_indexer
 from atom.utils.tbo import (
     UBatchSlice,
     UBatchWrapper,
+    decode_bucket_splits,
     local_tbo_precompute,
     maybe_create_ubatch_slices,
 )
@@ -767,6 +768,10 @@ class ModelRunner:
         # Decode request buckets `capture_cudagraph` records; None until it
         # has (and whenever it never does).
         self.req_graph: ReqGraph | None = None
+        # Whether it recorded every bucket that splits (`decode_bucket_splits`)
+        # as a TBO graph, so a decode the DP group splits replays
+        # (`ForwardMode.decide`).
+        self.tbo_decode_graphs = False
 
         init_exit_handler(self)
         default_dtype = self.config.torch_dtype
@@ -2541,6 +2546,7 @@ class ModelRunner:
             running_bs=running_bs,
             running_tokens=running_tokens,
             max_seqlen_q=forward_mode.max_seqlen_q,
+            ubatch_split_bs=forward_mode.ubatch_split_bs,
         )
         self.attn_metadata_builder.prepare_model_inputs(input_ids, attn_metadata)
         context = Context(
@@ -2675,6 +2681,7 @@ class ModelRunner:
             max_seqlen_q=(batch.num_spec_step + 1 if shrunk_q is None else shrunk_q),
             running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
             graph_shapes=self._producer_graph_shapes(),
+            tbo_decode_graphs=self.tbo_decode_graphs,
         )
         # Stash the DP-wide prefill OR for the EPLB prefill gate; reused free by
         # on_forward_pass_end when the DP group == the migration (EP) group.
@@ -3899,13 +3906,17 @@ class ModelRunner:
             self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         # A decode step's whole forward per request bucket (`ReqGraph`), its
-        # logits too when `logits_in_graph`. A decode the group splits into TBO
-        # microbatches has none yet: it runs eagerly (`ForwardMode.decide`).
+        # logits too when `logits_in_graph`. Under TBO decode a bucket that
+        # splits (`decode_bucket_splits`) is recorded split, its micro-batches
+        # cut at the bucket, so a decode the group splits replays it
+        # (`ForwardMode.decide`). Token graphs have no such recording: under
+        # TR_HYBRID a split decode runs eagerly.
         self.req_graph = ReqGraph()
-        if self.config.enable_tbo_decode and self.rank == 0:
+        self.tbo_decode_graphs = self.config.enable_tbo_decode and not tr_hybrid
+        if self.config.enable_tbo_decode and tr_hybrid and self.rank == 0:
             logger.warning(
-                "TBO decode has no CUDA graph yet: a decode step split into "
-                "microbatches runs eagerly."
+                "TBO decode has no token graph: under TR_HYBRID a decode step "
+                "split into microbatches runs eagerly."
             )
         logits_in_graph = self.world_size == 1
 
@@ -4020,12 +4031,32 @@ class ModelRunner:
                         )
                         context.positions = mrope_positions
                     self.running_tokens_per_dp_rank.fill(running_tokens)
+                    # A bucket that splits is recorded split at the bucket
+                    # (`ForwardMode.ubatch_split_bs`). Every rank records the
+                    # same bucket, so each micro-batch's per-rank rows are its
+                    # own, repeated.
+                    ubatch_slices = ub_tokens_across_dp = ub_max_tokens = None
+                    if self.tbo_decode_graphs and decode_bucket_splits(bs):
+                        ubatch_slices = maybe_create_ubatch_slices(
+                            num_reqs=bs, scheduled_tokens=running_tokens
+                        )
+                        ub_max_tokens = tuple(
+                            s.token_slice.stop - s.token_slice.start
+                            for s in ubatch_slices
+                        )
+                        dp = len(self.running_tokens_per_dp_rank)
+                        ub_tokens_across_dp = tuple(
+                            (rows,) * dp for rows in ub_max_tokens
+                        )
                     set_forward_context(
                         attn_metadata=attn_metadata,
                         atom_config=self.config,
                         context=context,
                         running_tokens_per_dp_rank=self.running_tokens_per_dp_rank,
+                        ubatch_slices=ubatch_slices,
                         in_hipgraph=True,
+                        ub_max_tokens_across_dp=ub_max_tokens,
+                        ub_tokens_across_dp=ub_tokens_across_dp,
                     )
 
                     # Warmup
