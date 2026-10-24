@@ -2382,7 +2382,17 @@ class Scheduler:
             # Guard: PD decode consumer inherits hit from prefill node;
             # don't clobber with the local hit (always 0 on consumer).
             if not seq.prefix_cache_hit_tokens:
-                seq.prefix_cache_hit_tokens = seq.num_cached_tokens
+                # The gated HBM hit, not the chunk floor `allocate` may have
+                # lowered `num_cached_tokens` to. `[floor, hbm)` is refilled
+                # from CPU but was already resident; recording the floor makes
+                # that slice look like a CPU-tier load.
+                recorded = seq.num_cached_tokens
+                if (
+                    seq.offload_joint.boundary_tokens
+                    and seq.offload_joint.hbm_hit_tokens > recorded
+                ):
+                    recorded = seq.offload_joint.hbm_hit_tokens
+                seq.prefix_cache_hit_tokens = recorded
 
             self._lookup_detach_declined.discard(seq.id)
             self._notify_connector_after_prefill_alloc(seq)
@@ -2421,31 +2431,42 @@ class Scheduler:
 
             if seq.offload_joint.boundary_tokens:
                 # The KV leg was refused after the state leg was aimed at the
-                # joint boundary, so the state claims a prefix whose KV nobody
-                # will fetch. Disown it; `_decide_load_after_alloc` logs why.
-                logger.debug(
-                    "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
-                    "recomputing from %d",
-                    seq.id,
-                    seq.offload_joint.boundary_tokens,
-                    seq.num_cached_tokens,
-                )
-                # Privatise the claimed prefix (finding #2) so recompute-from-0
-                # cannot tear a shared decode. cancel_state_load does it when a
-                # CPU state load was pending; otherwise disown directly.
-                if seq.offload_joint.load_hash != -1:
-                    disowned = self.block_manager.cancel_state_load(seq)
+                # joint boundary. An unaligned joint resumes at the HBM hit
+                # when that hit is still recoverable; otherwise disown to 0.
+                # `_decide_load_after_alloc` logs why the leg was refused.
+                if self.block_manager.retreat_joint_to_hbm(seq):
+                    logger.debug(
+                        "[JOINT-RETREAT] seq %s: KV leg refused; resuming at %d",
+                        seq.id,
+                        seq.num_cached_tokens,
+                    )
                 else:
-                    disowned = self.block_manager.disown_claimed_prefix(seq)
-                if not disowned:
-                    self.block_manager.deallocate(seq)
-                    self.waiting.appendleft(seq)
-                    break
-                seq.num_cached_tokens = 0
-                # Partial reset by design: the KV/claim spans are left as-is,
-                # matching the pre-record code -- not a full `reset_joint`.
-                seq.offload_joint.boundary_tokens = 0
-                seq.offload_joint.boundary_hash = -1
+                    logger.debug(
+                        "[JOINT-DISOWN] seq %s: KV leg refused at boundary %d; "
+                        "recomputing from %d",
+                        seq.id,
+                        seq.offload_joint.boundary_tokens,
+                        seq.num_cached_tokens,
+                    )
+                    # Privatise the claimed prefix (finding #2) so
+                    # recompute-from-0 cannot tear a shared decode.
+                    # cancel_state_load does it when a CPU state load was
+                    # pending; otherwise disown directly.
+                    if seq.offload_joint.load_hash != -1:
+                        disowned = self.block_manager.cancel_state_load(seq)
+                    else:
+                        disowned = self.block_manager.disown_claimed_prefix(seq)
+                    if not disowned:
+                        self.block_manager.deallocate(seq)
+                        self.waiting.appendleft(seq)
+                        break
+                    seq.num_cached_tokens = 0
+                    # Partial reset by design: the KV/claim spans are left
+                    # as-is, matching the pre-record code -- not a full
+                    # `reset_joint`.
+                    seq.offload_joint.boundary_tokens = 0
+                    seq.offload_joint.boundary_hash = -1
+                    seq.offload_joint.hbm_hit_tokens = 0
 
             if seq.offload_joint.load_hash != -1:
                 # The kept state boundary is in LMCache, not HBM. It parks
@@ -2860,24 +2881,35 @@ class Scheduler:
         if not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
         if seq.offload_joint.load_hash != -1 or seq.offload_joint.boundary_tokens:
-            # The state never arrived, so the boundary is not this request's
-            # history. Disown it exactly as `BlockManager.allocate` does at
-            # admission, otherwise the resume runs with `num_cached_tokens > 0`
-            # over a group nobody filled -- `has_initial_state` reads that as
-            # "the recurrence continues". Before `offload_loaded_tokens` is set
-            # below, so that field records the disowned figure. Privatise the
+            # The state or the joint KV never arrived. An unaligned joint
+            # resumes at the HBM hit when that hit is still recoverable.
+            # Otherwise disown exactly as `BlockManager.allocate` does:
+            # `num_cached_tokens > 0` would tell `has_initial_state` the
+            # recurrence continues over a group nobody filled. Privatise the
             # claimed prefix (finding #2): the offload resume path reuses this
-            # exact block_table without re-allocating, so recompute-from-0 would
-            # otherwise tear a shared decode.
+            # block_table, so recompute-from-0 would tear a shared decode.
+            if self.block_manager.retreat_joint_to_hbm(seq):
+                seq.offload_loaded = False
+                seq.offload_loaded_tokens = seq.num_cached_tokens
+                seq.offload_load_start_tokens = None
+                if seq.offload_joint.load_hash != -1:
+                    # The hit's own state is a tier load. Stay parked for it;
+                    # this failure was the joint, not that load.
+                    seq.offload_load_failed = False
+                    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                    return False
+                # The HBM hit's blocks are already in the table. Mark the
+                # load failed so admission resumes that prefill instead of
+                # calling allocate on a non-empty block table.
+                seq.offload_load_failed = True
+                return True
             disowned = self.block_manager.disown_claimed_prefix(seq)
             seq.num_cached_tokens = 0
             seq.offload_joint.load_hash = -1
-            # A joint boundary that failed on either leg is not this request's
-            # history any more than a state-only one is, and leaving it set
-            # would let the connector clamp a later lookup to it. Partial reset
-            # by design: the KV/claim spans are left as-is, as before.
+            # Partial reset by design: the KV/claim spans are left as-is.
             seq.offload_joint.boundary_tokens = 0
             seq.offload_joint.boundary_hash = -1
+            seq.offload_joint.hbm_hit_tokens = 0
             if not disowned:
                 # Cannot back private copies; drop the whole table so the
                 # re-admission rebuilds a clean one via can_allocate/allocate

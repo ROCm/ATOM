@@ -799,15 +799,17 @@ class KimiK3OffloadScheduler(DenseOffloadScheduler, StateOffloadFace):
         joint = int(seq.offload_joint.boundary_tokens or 0)
         if joint <= hbm:
             return False, "per_req_cache_state_boundary", hbm, lmc, lmc - hbm, chunk
-        # Where the transfer starts -- NOT where the request may call itself
-        # cached. `allocate` claimed every matched block, not just resumable
-        # ones, so the KV below this is already resident; asking LMCache to
-        # resend it would land a second copy in HBM (`publish_loaded_prefix`
-        # keeps the canonical mapping, fresh blocks stay private). Floored to the
-        # chunk grid by `_joint_kv_boundary`, so aligned whenever `hbm` was.
+        # Where the transfer starts -- not where the request may call itself
+        # cached. After allocate, `claim_tokens` is at or above
+        # `num_cached_tokens` and on the chunk grid. Blocks strictly below
+        # `start` are the shared prefix; resending them would land a second
+        # copy (`publish_loaded_prefix` keeps the canonical mapping). An
+        # unaligned hit has already lowered `num_cached_tokens` to the chunk
+        # floor, and the partial chunk `[floor, hbm)` is private and sits at
+        # `start`, which is what this leg writes.
         start = max(hbm, int(seq.offload_joint.claim_tokens or 0))
-        # The KV leg moves whole chunks and the blocks below `start` are shared,
-        # so an unaligned start cannot be rounded down.
+        # Whole chunks only. Blocks below `start` are shared, so an unaligned
+        # start cannot be rounded down onto them.
         if start % chunk != 0:
             return False, "joint_unaligned_hbm_prefill", start, lmc, lmc - start, chunk
         # Transfer the chunk covering the boundary, claim only the boundary.
