@@ -3267,8 +3267,6 @@ class ModelRunner:
     ) -> ScheduledBatchOutput:
         spec_decode_metadata = get_forward_context().spec_decode_metadata
         bs = batch.total_seqs_num
-        # Set where the sampled ids were already broadcast with the verdict.
-        tokens_synced = False
         if spec_decode_metadata is None:
             # The LM head emitted one row per sequence the step FORWARDED,
             # which prefill pads to `running_bs` for the draft pass that
@@ -3350,41 +3348,16 @@ class ModelRunner:
             # then differ per rank and the emitted streams fork. Sync the
             # decision instead: the ids and the verdict.
             if get_pcp_world_size() > 1 and hasattr(self, "drafter"):
-                # Only the PCP group is synced here, so the ratio path's TP
-                # sync below must never be skipped by it: lossless sampling is
-                # refused under PCP (`DSparkProposer._init_lossless_sampling`).
-                assert draft_probs is None, "lossless sampling is not armed under PCP"
                 _g = get_pcp_group()
                 sampled_tokens = _g.broadcast(sampled_tokens.contiguous(), src=0)
                 verdict = _g.broadcast(verdict, src=0)
-            elif draft_probs is not None and get_tp_group().world_size > 1:
-                # Insurance, at no extra collective. The ratio rule decides on
-                # each rank from that rank's p, q and coins, which are bitwise
-                # equal across TP ranks by construction: both sides read
-                # full-vocab logits replicated by the LM head's all-gather, and
-                # the coins and the draft's noise are Philox keyed on SPMD
-                # counters. That is the same assumption the draft ids already
-                # rest on -- they are drawn per rank and not broadcast, here or
-                # on the exact-match path -- so if it ever broke, the draft ids
-                # would diverge first. Taking rank 0's verdict with its tokens
-                # only keeps the accept decision from being the place it shows.
-                n = sampled_tokens.numel()
-                packed = get_tp_group().broadcast(
-                    torch.cat((sampled_tokens.reshape(-1), verdict.reshape(-1))),
-                    src=0,
-                )
-                sampled_tokens = packed[:n].view(sampled_tokens.shape)
-                verdict = packed[n:].view(verdict.shape)
-                tokens_synced = True
             num_bonus_tokens, num_reject_tokens, anchors = verdict
             next_token_locs = num_bonus_tokens
             spec_counts = verdict[:2]
 
         # Drafter input must agree across TP ranks.
-        if (
-            not tokens_synced
-            and get_tp_group().world_size > 1
-            and (self.tokenID_processor.is_deferred_out or hasattr(self, "drafter"))
+        if get_tp_group().world_size > 1 and (
+            self.tokenID_processor.is_deferred_out or hasattr(self, "drafter")
         ):
             sampled_tokens = get_tp_group().broadcast(sampled_tokens, src=0)
 
