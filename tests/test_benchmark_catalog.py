@@ -456,12 +456,19 @@ def test_agentic_nightly_grid_and_shared_capture_recipe():
         assert "--enforce-eager" not in args
         assert "--max-num-seqs" not in args
         assert captures == list(range(1, 33)) + [48, 64, 96, 128, 160, 192, 224, 256]
+        layout = (
+            "dep"
+            if "--enable-expert-parallel" in args
+            else "dtp" if "--enable-dp-attention" in args else "tp"
+        )
         for conc in json.loads(config["concurrency"]):
-            assert (tp, conc) not in points
-            points.add((tp, conc))
-    assert points == {(2, c) for c in [1, 2, 4, 8, 16, 32, 64, 128]} | {
-        (4, c) for c in [1, 4, 8]
-    }
+            assert (tp, layout, conc) not in points
+            points.add((tp, layout, conc))
+    assert points == (
+        {(2, "tp", c) for c in [1, 2, 4, 8, 16, 32, 64, 128]}
+        | {(4, "tp", c) for c in [1, 4, 8]}
+        | {(2, "dtp", 128), (2, "dep", 128)}
+    )
 
 
 def test_agentic_nightly_subset_keeps_each_tp_grid():
