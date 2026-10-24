@@ -1858,7 +1858,7 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
             # This module's slot: the mamba pool holds one per
             # linear-attention layer, and its rows are those modules.
             gdn_idx = self.pool_rows[LINEAR_STATE_ROWS][module]
-            return KVCacheTensor(
+            cache = KVCacheTensor(
                 layer_num=module.layer_num,
                 k_cache=runner.mamba_k_cache[gdn_idx],
                 v_cache=runner.mamba_v_cache[gdn_idx],
@@ -1878,6 +1878,18 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
                 # of `kv_cache_data`), but no block-addressed mover may touch it.
                 per_request_state=True,
             )
+            # The AITER fused decode reads a V-major state: expose that storage
+            # as the logical KV view, zero-copy, as Qwen4Exp does for FlyDSL.
+            # ReplaySSM and the lossy decode keep their own state paths.
+            attention = module.impl
+            attention.gdn_fused_decode = (
+                getattr(attention, "gated_norm", None) is not None
+                and not self.replayssm
+                and not envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
+            )
+            if attention.gdn_fused_decode:
+                cache.v_cache = cache.v_cache.transpose(-1, -2)
+            return cache
         return super().build_kv_cache_tensor(module)
 
     def prepare_prefill(  # type: ignore[override]

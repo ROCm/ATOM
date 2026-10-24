@@ -970,6 +970,7 @@ def linear_attention_with_output_base_fake(
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
+    z: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(core_attn_out)
 
@@ -986,11 +987,14 @@ def linear_attention_with_output_base(
     a: torch.Tensor,
     core_attn_out: torch.Tensor,
     layer_name: str,
+    z: torch.Tensor | None = None,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     ret = torch.empty_like(core_attn_out)
-    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name)
+    # The output gate goes only to impls that apply the gated RMSNorm.
+    gate = {} if z is None else {"z": z}
+    ret = self.impl.forward(mixed_qkv, b, a, ret, layer_name, **gate)
     return ret
 
 
@@ -1100,8 +1104,9 @@ class LinearAttention(nn.Module):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        z: torch.Tensor | None = None,
     ):
         output = torch.ops.aiter.linear_attention_with_output_base(
-            mixed_qkv, b, a, core_attn_out, self.layer_name
+            mixed_qkv, b, a, core_attn_out, self.layer_name, z
         )
         return output
