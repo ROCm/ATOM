@@ -124,30 +124,56 @@ def _slot_routing(hidden_states, gating_output, topk, renormalize):
     return torch.ones_like(gating_output, dtype=torch.float32), ids
 
 
-def _slot_moe_unsupported(experts, enable_dp_attention: bool) -> str | None:
+def _slot_moe_unsupported(experts, atom_config) -> str | None:
     """Why ``experts`` cannot run the pre-expanded top-1 slots, or None.
 
-    Two FusedMoE paths cannot take ``[tokens * top_k]`` slot rows
+    These FusedMoE paths cannot take ``[tokens * top_k]`` slot rows
     with preselected expert ids:
     - the Triton TP path routes from ``router_logits`` and ignores
       ``custom_routing_function`` (moe.py ``Mxfp4MoEMethod.apply``), so it would
-      read the expert ids as logits and pick expert 0 for every slot;
+      read the expert ids as logits and pick expert 0 for every slot; the
+      Triton EP path clamps the SiLU gate at ``swiglu_limit`` (default 10);
     - with DP attention the MoE gathers rows across DP ranks against the
       forward context's token count, which the slots exceed ``top_k`` times
       (the gather/scatter path asserts; the all2all path is not validated with
-      expanded slots).
+      expanded slots);
+    - DP > 1 with EP selects the all2all dispatch/combine, which is sized for
+      one row per token;
+    - ``--moe-backend mega`` is sized for one row per token and does its own
+      weighted combine;
+    - ``--fake-eplb`` replaces the router logits (here the expert ids) with a
+      balance table.
     """
-    if getattr(experts.quant_method, "use_triton", False):
+    if getattr(experts.quant_method, "use_triton", False) or getattr(
+        experts.quant_method, "use_triton_ep", False
+    ):
         return (
             "Muse Spark routes preselected experts over top_k-expanded slots, "
-            "which the Triton TP MoE path does not support (it routes from "
-            "logits). Set ATOM_USE_TRITON_MOE=0, or run with expert parallel."
+            "which the Triton MoE paths do not support (TP routes from logits, "
+            "EP clamps the SiLU gate). Set ATOM_USE_TRITON_MOE=0."
         )
-    if enable_dp_attention and experts.dp_size > 1:
+    if atom_config.enable_dp_attention and experts.dp_size > 1:
         return (
             "Muse Spark does not support DP attention yet: its MoE runs "
             "top_k-expanded slots, and the DP MoE communication expects one row "
             "per token. Run without DP attention (TP or TP + EP)."
+        )
+    if experts.dp_size > 1 and experts.use_ep:
+        return (
+            "Muse Spark does not support DP with expert parallel yet: the "
+            "all2all MoE dispatch expects one row per token. Run TP + EP "
+            "without DP, or DP without expert parallel."
+        )
+    if atom_config.moe_backend == "mega":
+        return (
+            "Muse Spark does not support --moe-backend mega: it expects one row "
+            "per token and combines the experts itself. Use --moe-backend "
+            "standard."
+        )
+    if atom_config.fake_eplb:
+        return (
+            "Muse Spark does not support --fake-eplb: it replaces the "
+            "preselected expert ids with a balance table. Run without it."
         )
     return None
 
@@ -334,9 +360,7 @@ class MuseSparkMoE(nn.Module):
             custom_routing_function=_slot_routing,
             config=config,
         )
-        unsupported = _slot_moe_unsupported(
-            self.experts, atom_config.enable_dp_attention
-        )
+        unsupported = _slot_moe_unsupported(self.experts, atom_config)
         if unsupported:
             raise NotImplementedError(unsupported)
         self.post_expert_proj = ReplicatedLinear(
