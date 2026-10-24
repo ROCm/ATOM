@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -29,6 +30,163 @@ def test_mxfp4_method_selection(monkeypatch, backend_name):
     selected = moe_mod._make_mxfp4_moe_method(object(), object())
 
     assert selected is (mega_method if backend_name == "mega" else standard_method)
+
+
+def _raw_mega_layer():
+    experts = 2
+    return SimpleNamespace(
+        local_num_experts=experts,
+        w13_weight=SimpleNamespace(
+            data=torch.zeros((experts, 64, 64), dtype=torch.uint8)
+        ),
+        w13_weight_scale=SimpleNamespace(
+            data=torch.zeros((experts, 64, 5), dtype=torch.uint8)
+        ),
+        w2_weight=SimpleNamespace(
+            data=torch.zeros((experts, 32, 64), dtype=torch.uint8)
+        ),
+        w2_weight_scale=SimpleNamespace(
+            data=torch.zeros((experts, 32, 5), dtype=torch.uint8)
+        ),
+    )
+
+
+def test_mega_weight_build_keeps_the_ordinary_allocation_path(monkeypatch):
+    import aiter.ops.shuffle as shuffle_mod
+
+    import atom.model_ops.fused_moe.flydsl_mega_experts as mega
+
+    calls = []
+
+    def fake_shuffle(src, *_args, out=None, **_kwargs):
+        calls.append(out)
+        return src.clone()
+
+    monkeypatch.setattr(mega.envs, "ATOM_ENABLE_MOONEP", False)
+    monkeypatch.setattr(shuffle_mod, "shuffle_weight_a16w4", fake_shuffle)
+    monkeypatch.setattr(shuffle_mod, "shuffle_scale_a16w4", fake_shuffle)
+    layer = _raw_mega_layer()
+
+    mega.build_mega_weights(layer)
+
+    assert calls == [None, None, None, None]
+    assert not hasattr(layer, "_moonep_weight_pool")
+
+
+def _stub_ep_group(monkeypatch, ep):
+    # Stand-in module: aiter.dist does not import in every test environment.
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.dist.parallel_state",
+        SimpleNamespace(get_ep_group=lambda: ep),
+    )
+
+
+def test_moonep_weight_build_shuffles_directly_into_symmetric_home(monkeypatch):
+    import aiter.ops.shuffle as shuffle_mod
+
+    import atom.model_ops.fused_moe.flydsl_mega_experts as mega
+
+    class FakePool:
+        def __init__(self, *, experts_per_rank, prefetch_slots, parts, **_kwargs):
+            self.home = [
+                torch.empty((experts_per_rank, *shape), dtype=dtype)
+                for shape, dtype in parts
+            ]
+            self.prefetch_slots = prefetch_slots
+            self.finished = False
+
+        def finish_home(self):
+            self.finished = True
+
+    outputs = []
+
+    def fake_shuffle(src, *_args, out=None, **_kwargs):
+        assert out is not None
+        outputs.append(out)
+        out.zero_()
+        return out
+
+    manager = SimpleNamespace(rank=0, world_size=4)
+    ep = SimpleNamespace(device_communicator=SimpleNamespace(all2all_manager=manager))
+    monkeypatch.setattr(mega.envs, "ATOM_ENABLE_MOONEP", True)
+    monkeypatch.setattr(mega.envs, "MOONEP_PREFETCH_SLOTS", 3)
+    monkeypatch.setattr(
+        mega, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    _stub_ep_group(monkeypatch, ep)
+    fake_weights = ModuleType("aiter.ops.flydsl.kernels.moonep_weights")
+    fake_weights.MoonEPWeightPool = FakePool
+    monkeypatch.setitem(sys.modules, fake_weights.__name__, fake_weights)
+    monkeypatch.setattr(shuffle_mod, "shuffle_weight_a16w4", fake_shuffle)
+    monkeypatch.setattr(shuffle_mod, "shuffle_scale_a16w4", fake_shuffle)
+    layer = _raw_mega_layer()
+
+    mega.build_mega_weights(layer)
+
+    pool = layer._moonep_weight_pool
+    assert pool.finished
+    assert [tensor.data_ptr() for tensor in outputs] == [
+        tensor.data_ptr() for tensor in pool.home
+    ]
+    assert layer._mega_w1.data_ptr() == pool.home[0].data_ptr()
+    assert layer._mega_w1_scale.data_ptr() == pool.home[1].data_ptr()
+    assert layer._mega_w2.data_ptr() == pool.home[2].data_ptr()
+    assert layer._mega_w2_scale.data_ptr() == pool.home[3].data_ptr()
+
+
+def test_moonep_home_rows_take_the_real_padded_scale_shuffle(monkeypatch):
+    """Real aiter shuffles: the 5-column scales land 8 wide in the pool."""
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    import atom.model_ops.fused_moe.flydsl_mega_experts as mega
+
+    class FakePool:
+        def __init__(self, *, experts_per_rank, prefetch_slots, parts, **_kwargs):
+            self.home = [
+                torch.empty((experts_per_rank, *shape), dtype=dtype)
+                for shape, dtype in parts
+            ]
+
+        def finish_home(self):
+            pass
+
+    manager = SimpleNamespace(rank=0, world_size=4)
+    ep = SimpleNamespace(device_communicator=SimpleNamespace(all2all_manager=manager))
+    monkeypatch.setattr(mega.envs, "ATOM_ENABLE_MOONEP", True)
+    monkeypatch.setattr(mega.envs, "MOONEP_PREFETCH_SLOTS", 3)
+    monkeypatch.setattr(
+        mega, "get_current_atom_config", lambda: SimpleNamespace(eplb_enable=False)
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    _stub_ep_group(monkeypatch, ep)
+    fake_weights = ModuleType("aiter.ops.flydsl.kernels.moonep_weights")
+    fake_weights.MoonEPWeightPool = FakePool
+    monkeypatch.setitem(sys.modules, fake_weights.__name__, fake_weights)
+    layer = _raw_mega_layer()
+    gen = torch.Generator().manual_seed(0)
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        data = getattr(layer, name).data
+        data.copy_(torch.randint(0, 256, data.shape, generator=gen, dtype=torch.uint8))
+
+    mega.build_mega_weights(layer)
+
+    pool = layer._moonep_weight_pool
+    for index, name, shuffled, gate_up in (
+        (1, "w13", layer._mega_w1_scale, True),
+        (3, "w2", layer._mega_w2_scale, False),
+    ):
+        raw = getattr(layer, f"{name}_weight_scale").data
+        experts, rows, _ = raw.shape
+        assert pool.home[index].shape == (experts, rows, 8)
+        assert shuffled.data_ptr() == pool.home[index].data_ptr()
+        flat = raw.reshape(experts * rows, 5)
+        expected = shuffle_scale_a16w4(flat, experts, gate_up)
+        assert torch.equal(pool.home[index].reshape(expected.shape), expected)
+        # The 3 pad columns are E8M0 1.0, as if the raw scales had carried them.
+        padded = torch.nn.functional.pad(flat, (0, 3), value=0x7F)
+        assert torch.equal(shuffle_scale_a16w4(padded, experts, gate_up), expected)
 
 
 @pytest.mark.parametrize("fp8_activations", [False, True])
