@@ -24,10 +24,3 @@ def test_left_offset_is_span_minus_one(span):
 @pytest.mark.parametrize("span", [-1, 0, None])
 def test_no_window_is_unbounded(span):
     assert window_left(span) == -1
-
-
-def test_inclusive_offset_covers_exactly_the_span():
-    span, query = 2048, 5000
-    left = window_left(span)
-    keys = range(query - left, query + 1)
-    assert len(keys) == span

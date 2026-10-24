@@ -11,7 +11,7 @@ Architecture points that matter for serving:
 
 ## Preparing environment
 
-Muse Spark support is not in a release image yet. Use the nightly dev image and this branch:
+Muse Spark support is in ATOM main from #2641 on, and not in a release image yet. Use a nightly dev image built after that change:
 ```bash
 docker pull rocm/atom-dev:latest
 ```
@@ -31,6 +31,8 @@ python -m atom.entrypoints.openai_server \
 ```
 
 ### TP8, optionally with expert parallel
+
+We recommend TP8 with expert parallel. Under plain TP each layer all-reduces the per-slot expert outputs (`[tokens * top_k, 4096]`, about 4x the bytes of a usual MoE reduce); with EP the combine is local and only `[tokens, 4096]` is reduced (about 1/8 of that).
 
 ```bash
 python -m atom.entrypoints.openai_server \

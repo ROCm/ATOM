@@ -939,7 +939,7 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
             prefill_value = value[num_decode_tokens + num_extend_tokens :]
 
             left = window_left(self.sliding_window)
-            sliding_window = (left, 0, 0) if left >= 0 else (-1, -1, 0)
+            sliding_window = (left, 0, 0) if left >= 0 else (-1, 0, 0)
 
             aiter.flash_attn_varlen_func(
                 q=prefill_query,
