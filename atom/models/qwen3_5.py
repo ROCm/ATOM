@@ -287,7 +287,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         )
 
     def create_qkvzba_proj(self, quant_config, prefix):
-        if self.quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+        if _gdn_in_proj_is_bf16(self.atom_config):
+            # The exclude list names in_proj_qkvz / in_proj_ba, not the fused
+            # module, so a quantized checkpoint builds it unquantized here.
+            if self.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+                quant_config = None
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -564,8 +568,27 @@ _BF16_IN_PROJ_MAPPING = {
 }
 
 
+def _gdn_in_proj_is_bf16(atom_config: Config) -> bool:
+    """Whether in_proj_qkvz and in_proj_ba are bf16 in every linear-attention
+    layer, so they load into one in_proj_qkvzba GEMM: a bf16 checkpoint, or a
+    quantized one that excludes them (the Quark MXFP4 ones do)."""
+    quant_config = atom_config.quant_config
+    if quant_config.global_quant_config.quant_dtype == torch.bfloat16:
+        return True
+    # remap_layer_name has already renamed the excludes onto in_proj_qkvz and
+    # in_proj_ba. Key them by the name after ".layers." to match any prefix.
+    excluded = {name.split(".layers.")[-1] for name in quant_config.exclude_layers}
+    layer_types = get_qwen3_5_text_config(atom_config).layer_types
+    return all(
+        f"{i}.linear_attn.{proj}" in excluded
+        for i, kind in enumerate(layer_types)
+        if kind == "linear_attention"
+        for proj in ("in_proj_qkvz", "in_proj_ba")
+    )
+
+
 def _apply_bf16_in_proj_mapping(mapping: dict, atom_config: Config) -> dict:
-    if atom_config.quant_config.global_quant_config.quant_dtype != torch.bfloat16:
+    if not _gdn_in_proj_is_bf16(atom_config):
         return mapping
 
     mapping.pop("in_proj_qkvz", None)
