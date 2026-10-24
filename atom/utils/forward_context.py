@@ -339,20 +339,26 @@ class ForwardMode:
 
         One bucket for every prefilling rank, an idle rank's dummy prefill
         included: a recording's collectives are sized by its bucket, so ranks
-        replaying different ones hang the group.
+        replaying different ones hang the group. For the same reason a step on
+        which some rank decodes replays no bucket anywhere: the decoding rank
+        runs eagerly, and its MoE's variable-length gather is not the
+        collective a peer's recording replays. Without a prefill delayer
+        (`Scheduler.dummy_prefill`) a decoding rank stays on decode beside a
+        peer's prefill, so that step runs eagerly on every rank.
         """
         bucket = region_graph.TokenGraph.bucket
         running = running_tokens_per_dp_rank
         np.copyto(running, sync.scheduled_tokens_per_dp_rank)
-        group = bucket(running.max(), "prefill") if graphable else None
+        every_rank_prefills = all(sync.prefill_across_dp)
+        group = (
+            bucket(running.max(), "prefill")
+            if graphable and every_rank_prefills
+            else None
+        )
         if group is None:
             return 0
-        # Every rank's, whether or not it pads itself: a peer's replay
-        # dispatches its padded rows to this rank too.
-        for rank, prefill in enumerate(sync.prefill_across_dp):
-            if prefill:
-                running[rank] = group
-        return group if is_prefill else 0
+        running.fill(group)
+        return group
 
     @staticmethod
     def _running_tokens(
