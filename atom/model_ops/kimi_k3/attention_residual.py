@@ -10,6 +10,11 @@
 
 """Fused attention-residual operations for Kimi-K3.
 
+``apply_attn_res`` runs aiter's ``attn_res_gate`` (see ``_aiter_attn_res_impl``).
+The Triton kernel below is the same math and is no longer on that path; it is
+kept as the reference implementation the aiter kernel was ported from and
+validated against.
+
 The algorithm is flash-linear-attention's ``fused_attnres``
 (``fla/ops/attnres/fused.py``, MIT; read against fla 0.5.2), which is what the
 reference KDA model calls -- see ``fla/models/kda/modeling_kda.py:135``.
@@ -320,6 +325,49 @@ def _apply_attn_res_impl(
     return y, prefix_out
 
 
+def _aiter_attn_res_impl(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    score_weight: torch.Tensor,
+    eps: float,
+    add_hidden: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_eps: float = 1e-6,
+    add_hidden2: torch.Tensor | None = None,
+    quant_dtype: torch.dtype | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+):
+    """aiter's ``attn_res_gate`` behind ``_apply_attn_res_impl``'s signature.
+
+    What the four custom ops below launch. Same mix and same fusion arguments as
+    the Triton kernel above, but a separate implementation, so the two are not
+    expected to agree bit for bit -- the fused FP8 output quant in particular
+    lands a ulp apart on rounding ties. aiter's own surface is also wider than
+    what is forwarded here (it can fuse the block-banking concat as well); this
+    passes on only the combinations ATOM asks for. Its output pair nests the
+    quant scale inside the first element; unpack it so callers see the flat
+    returns they already handle.
+    """
+    from aiter.ops.triton.fusions.attn_res import attn_res_gate
+
+    y, prefix_out = attn_res_gate(
+        prefix_sum,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight=out_norm_weight,
+        output_rms_eps=out_eps,
+        out_quant_dtype=quant_dtype,
+    )
+    if quant_dtype is None:
+        return y, prefix_out
+    y, y_scale = y
+    return y, y_scale, prefix_out
+
+
 def _apply_attn_res_op(
     prefix_sum: torch.Tensor,
     block_residual: torch.Tensor,
@@ -328,7 +376,7 @@ def _apply_attn_res_op(
     out_norm_weight: torch.Tensor | None = None,
     out_eps: float = 1e-6,
 ) -> torch.Tensor:
-    mixed_output, _ = _apply_attn_res_impl(
+    mixed_output, _ = _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -368,7 +416,7 @@ def _apply_attn_res_add_op(
     out_eps: float = 1e-6,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _apply_attn_res_impl(
+    return _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -415,7 +463,7 @@ def _apply_attn_res_quant_op(
     out_eps: float,
     quant_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    y, y_scale, _ = _apply_attn_res_impl(
+    y, y_scale, _ = _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
@@ -463,7 +511,7 @@ def _apply_attn_res_add_quant_op(
     quant_dtype: torch.dtype,
     add_hidden2: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _apply_attn_res_impl(
+    return _aiter_attn_res_impl(
         prefix_sum,
         block_residual,
         score_weight,
