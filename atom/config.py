@@ -1162,7 +1162,9 @@ def _resolve_sequential_drafter_max_spec(
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
-def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
+def _normalize_draft_dspark_config(
+    hf_config: PretrainedConfig, *, dflash: bool = False
+) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
     DSpark checkpoints come in two shapes and name the same quantities
@@ -1174,13 +1176,27 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
       ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
       their DSpark fields at the config top level: ``target_layer_ids``,
       ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    - STANDALONE, SpecForge-trained (DFlash) drafts are also their own
+      checkpoint, but nest the same two fields under ``dflash_config`` and put
+      the trained block width at the top level as ``block_size``. SpecForge
+      builds these on a plain ``Qwen3Config``, so the backbone is GQA rather
+      than MLA -- which this function does not care about, but the log line
+      below does.
+
+    Both standalone shapes are read here; ``dflash_config`` is the fallback so
+    a checkpoint carrying both stays on its top-level values.
     """
-    target_layer_ids = getattr(hf_config, "target_layer_ids", None)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+
+    target_layer_ids = getattr(
+        hf_config, "target_layer_ids", None
+    ) or dflash_config.get("target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
-            "K3DSparkModel config is missing `target_layer_ids` (the target "
-            "decoder layers whose hidden states the draft consumes). Without "
-            "it the draft has no context input."
+            "Standalone DSpark draft config is missing `target_layer_ids` (the "
+            "target decoder layers whose hidden states the draft consumes), at "
+            "the top level and under `dflash_config`. Without it the draft has "
+            "no context input."
         )
     # 0-based target decoder-layer indices, matching ATOM's `layers[i]` aux-tap
     # convention: the reference indexes `hidden_states[layer_id + 1]`, i.e. the
@@ -1189,9 +1205,12 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     mask_token_id = getattr(hf_config, "mask_token_id", None)
     if mask_token_id is None:
+        mask_token_id = dflash_config.get("mask_token_id")
+    if mask_token_id is None:
         raise ValueError(
-            "K3DSparkModel config is missing `mask_token_id` (the noise token "
-            "the draft block is seeded with)."
+            "Standalone DSpark draft config is missing `mask_token_id` (the "
+            "noise token the draft block is seeded with), at the top level and "
+            "under `dflash_config`."
         )
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
@@ -1200,17 +1219,38 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
     hf_config.dspark_with_draft = True
 
-    # NOTE: no `dspark_block_size` here. Unlike V4-Pro-DSpark and the SpecForge
-    # SpecForge DFlash checkpoints, this config carries no block width: the draft is
-    # width-agnostic in its weights and the block is sized by
-    # --num-speculative-tokens (7 in the checkpoint's own serving recipe).
-    # DSparkProposer._resolve_mtp_k falls back to that.
+    # The trained block width, where the checkpoint records one. K3-DSpark does
+    # not: its draft is width-agnostic in its weights and the block is sized by
+    # --num-speculative-tokens (7 in that checkpoint's own serving recipe), so
+    # `dspark_block_size` stays unset and DSparkProposer._resolve_mtp_k falls
+    # back to the flag. SpecForge DFlash checkpoints DO record it, as a
+    # `block_size`. Recording it does not pin the verify horizon --
+    # `_resolve_mtp_k` still returns --num-speculative-tokens -- it
+    # only lets Config.__post_init__ warn when the horizon runs past the
+    # trained width.
+    #
+    # Read ONLY on the DFlash path. `block_size` is a loose generic HF key that
+    # another checkpoint may carry meaning something else entirely (a paging or
+    # windowing width), and this function also normalizes the MLA K3-DSpark
+    # shape, which must keep falling through to --num-speculative-tokens.
+    # `dflash` is the caller's assertion that this checkpoint's `block_size` is
+    # the SpecForge-trained verify width; nothing else promotes one.
+    if dflash:
+        block_size = dflash_config.get("block_size") or getattr(
+            hf_config, "block_size", None
+        )
+        if block_size:
+            hf_config.dspark_block_size = int(block_size)
 
+    # The backbone is the draft's own business, but say which one so a
+    # mis-detected flavor is visible in the log rather than only in acceptance.
+    backbone = "MLA" if getattr(hf_config, "kv_lora_rank", None) else "GQA"
     logger.info(
-        "Detected MLA DSpark drafter with a separate draft model "
+        f"Detected {backbone} DSpark drafter with a separate draft model "
         f"(markov_rank={hf_config.dspark_markov_rank}, "
         f"target_layers={hf_config.dspark_target_layer_ids}, "
-        f"mask_token_id={hf_config.dspark_noise_token_id})"
+        f"mask_token_id={hf_config.dspark_noise_token_id}, "
+        f"block_size={getattr(hf_config, 'dspark_block_size', None)})"
     )
 
 
@@ -1431,6 +1471,20 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
+        # SpecForge DFlash drafts, before the suffix test below: they are
+        # standalone DSpark checkpoints too, but their arch is `DSparkDraftModel`
+        # -- which ends in "DraftModel", not "DSparkModel", so the suffix test
+        # misses them -- and SpecForge stamps that same string on every DFlash
+        # draft regardless of target. So key on the nested `dflash_config` the
+        # backbone actually needs, and rename to an arch that identifies the
+        # model. The rename also resolves a collision: `DSparkDraftModel` is
+        # already the name of ATOM's draft base class in
+        # atom/models/dspark_draft.py, and `support_draft_model_arch_dict` is a
+        # bare dict index keyed on this string.
+        if arch == "DSparkDraftModel" and getattr(hf_config, "dflash_config", None):
+            hf_config.architectures = ["K3DFlashModel"]
+            _normalize_draft_dspark_config(hf_config, dflash=True)
+            return
         if arch.endswith("DSparkModel"):
             _normalize_draft_dspark_config(hf_config)
             return
@@ -2245,6 +2299,61 @@ class Config:
                     "decode and DCP is unverified. Use --enable-tbo (prefill "
                     "only), or drop DCP or speculative decode."
                 )
+                # A non-MLA draft owns a SIBLING KV pool with two axes, and DCP
+                # shards one of them. That is only safe where the draft stays
+                # OUT of the dcp group and runs at DCP1, so the head axis is
+                # never sharded at all -- which exactly one draft family in
+                # this tree does (the DFlash non-causal GQA block drafter,
+                # `needs_non_causal_kv`; the target stays at DCP8 while the
+                # draft reads a pool whose entry is `block_size * dcp_size`
+                # tokens wide, `spec_decode/draft_kv.py:46-57`). Note
+                # `verify_shared_kv_fwd` returns only `o` and never an LSE, so
+                # it could not merge partial softmaxes even if asked. MLA is
+                # immune by
+                # construction: its cache is one latent row per token,
+                # replicated across TP, so DCP's token shard is the only shard.
+                #
+                # Every OTHER such draft (Eagle3-llama, a plain GQA speculator)
+                # double-shards and produces garbage with NO error and NO fault
+                # -- the only symptom is lost acceptance length. Refuse it.
+                #
+                # KEY ON OWNERSHIP OF A POOL, NOT ON THE FAMILY NAME. An earlier
+                # version tested `attn_family(draft_hf) is not Family.MLA` and
+                # refused every working MTP + DCP config in the tree: for
+                # `--method mtp` the draft hf config IS the target's, and
+                # `attn_family` returns the target's family -- KIMI_MLA, V4 or
+                # CSA2 -- never `Family.MLA`, which `selector.py` only reaches
+                # after every earlier family test has already failed. That
+                # rejected e.g. `recipes/Agentic-GLM-5.2.md`'s documented
+                # `--method mtp --decode-context-parallel-size 4`.
+                #
+                # `DRAFT_OWNS_KV_POOL` is the mechanism itself rather than a
+                # proxy for it: a draft that owns a SIBLING pool is the one
+                # sharded on the head axis. Latent-KV drafts share the target's
+                # cache, own no pool, and are immune. Same helper
+                # `kv_transfer/offload/mp/deployment.py:182` already uses.
+                from atom.spec_decode.draft_kv import needs_non_causal_kv
+                from atom.utils.selector import attn_family, get_attn_backend
+
+                draft_hf = self.speculative_config.draft_model_hf_config
+                owns_sibling_pool = draft_hf is not None and bool(
+                    get_attn_backend(attn_family(draft_hf)).DRAFT_OWNS_KV_POOL
+                )
+                if owns_sibling_pool and not needs_non_causal_kv(draft_hf):
+                    # `raise`, not `assert`: `python -O` strips asserts, and a
+                    # stripped guard restores exactly the silent mis-shard this
+                    # exists to prevent.
+                    raise ValueError(
+                        "Decode context parallel (--decode-context-parallel-size "
+                        f"{self.decode_context_parallel_size}) with a non-MLA "
+                        "draft that owns its own KV pool is only supported for the "
+                        "DFlash block drafter, "
+                        "which stays out of the DCP group and runs at DCP1 so "
+                        "its head axis is never sharded. This draft "
+                        f"({(getattr(draft_hf, 'architectures', None) or ['?'])[0]}) "
+                        "would be sharded on BOTH the head and the token axis, "
+                        "which is unreconstructible. Disable DCP for this draft."
+                    )
         # DCP KV-cache interleave granularity S. S=1 (default) = token-level
         # round-robin (unchanged). S>1 = block-level interleave; must divide the
         # KV block so each physical block holds an integer number of S-groups

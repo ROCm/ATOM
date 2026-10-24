@@ -225,7 +225,11 @@ class DeepseekV41DSpark(DSparkDraftModel):
     def share_with_target(self, target_base, loaded=None):
         self.embed, self.head = target_base.embed, target_base.head
 
-    def target_aux_capture_spec(self, layer_ids, hidden_size):
+    def target_aux_capture_spec(self, layer_ids, hidden_size, target_model=None):
+        # `target_model` is accepted and ignored: this draft's feature is read
+        # off the tapped block's own input, so the hook needs nothing from the
+        # rest of the target. Declared anyway, because the call site hands it to
+        # every implementor -- a Kimi-K3 draft does need it.
         from atom.spec_decode.drafter import AuxCaptureSpec
 
         # Published taps (37, 38, 39) have no Engram. A block pre-hook at an

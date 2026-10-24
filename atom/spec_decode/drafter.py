@@ -132,6 +132,11 @@ support_draft_model_arch_dict = {
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
     "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
     "K3DSparkModel": "atom.models.kimi_k3_dspark.KimiK3DSpark",
+    # SpecForge's DFlash draft for the same target. The checkpoint's own arch
+    # string is `DSparkDraftModel` -- stamped on every DFlash draft regardless
+    # of target, and colliding with the base class in atom/models/dspark_draft.py
+    # -- so `SpeculativeConfig.hf_config_override` renames it to this.
+    "K3DFlashModel": "atom.models.kimi_k3_dflash.KimiK3DFlash",
 }
 
 
