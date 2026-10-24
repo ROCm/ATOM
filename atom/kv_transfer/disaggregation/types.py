@@ -534,8 +534,8 @@ class ConnectorMetadata:
             remote_host=kv_transfer_params.get("remote_host"),
             remote_port=kv_transfer_params.get("remote_port"),
             remote_handshake_port=kv_transfer_params.get("remote_handshake_port"),
-            remote_dp_size=kv_transfer_params.get("remote_dp_size", 1),
-            remote_dp_rank=kv_transfer_params.get("remote_dp_rank", 0),
+            remote_dp_size=int(kv_transfer_params.get("remote_dp_size") or 1),
+            remote_dp_rank=int(kv_transfer_params.get("remote_dp_rank") or 0),
             remote_pp_size=kv_transfer_params.get("remote_pp_size", 1),
             remote_tp_size=kv_transfer_params.get("remote_tp_size", 0),
             tp_size=(
