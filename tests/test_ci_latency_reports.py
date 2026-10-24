@@ -613,6 +613,7 @@ def test_mesh_setup_builds_once_and_passes_a_reusable_binary_path(tmp_path):
     recorded = [json.loads(line) for line in calls.read_text().splitlines()]
     assert len(recorded) == 1
     assert "--user" in recorded[0] and "--env-file" in recorded[0]
+    assert "nofile=65536:524288" in recorded[0]
     assert any(arg.startswith("ATOMESH_MESH_SOURCE_COMMIT=") for arg in recorded[0])
     assert f"{tmp_path / 'cache'}:/mesh-cache" in recorded[0]
     for overrides, expected in (
