@@ -14,6 +14,7 @@ from atom.models.deepseek_v4.mono.config import SCALE_BM
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
 from atom.models.deepseek_v4.mono.kernels.helpers import traced
+from atom.models.deepseek_v4.mono.kernels.moe_ug import publish_routes, routed_union
 from atom.models.deepseek_v4.mono.kernels.plan import (
     ROUTER_TILE,
     UG8,
@@ -116,6 +117,29 @@ def ffn_stages(ctx):
     use_fp8_block128 = ctx["use_fp8_block128"]
     use_mxfp4_weight = ctx["use_mxfp4_weight"]
     use_mxfp8_block32 = ctx["use_mxfp8_block32"]
+    # Validated V4-Pro TP8 q7 target only. Other widths,
+    # draft blocks and formats retain their existing producer/consumer path.
+    # These are Python build constants. A tuple avoids expanding a long
+    # short-circuit tree in FlyDSL's device-control-flow rewriter.
+    expert_union = all(
+        (
+            S == 7,
+            ctx["TOK"] == 7,
+            ctx["phase"] == "moe",
+            not ctx["DRAFT_BLOCK"],
+            ctx["npes"] == 8,
+            TOP_K == 6,
+            N_EXPERTS == 384,
+            HC == 4,
+            HIDDEN == 7168,
+            INTER == 384,
+            G == 256,
+            use_mxfp4_weight,
+            use_mxfp8_block32,
+            shared_bf16_block128,
+            routed_down_bf16,
+        )
+    )
     w_dn = ctx["w_dn"]
     w_r = ctx["w_r"]
     w_sdn = ctx["w_sdn"]
@@ -501,6 +525,8 @@ def ffn_stages(ctx):
                         m0,
                         m1,
                     )
+            if const_expr(expert_union):
+                return
             if (c == 0) & (tid < count if shared else tid == 0):
                 sn = tid + sample if shared else fx.Int32(sample)
                 sl = fx.Int32(0) if shared else slot
@@ -527,6 +553,23 @@ def ffn_stages(ctx):
             w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
             s_rg = (lane // 32) * (INTER // 16) + c // 2
             return live, uu, c, slot, has_sh, w_rg, w_ln, s_rg
+
+        if const_expr(expert_union):
+            ctx["swiglu"] = swiglu
+            publish_routes(ctx)
+            live, _u, c0, slot0, has_sh, wr0, wl0, sr0 = ug8_tile(u0)
+            if has_sh & live:
+                pre = shared_units(c0, wr0, wl0, sr0, has_sh & live)
+                stage_moe_input(list(range(S)), shared=True)
+                gpu.barrier()
+                reduce_rows(
+                    1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16)
+                )
+                gpu.barrier()
+                ug8_emit(c0, slot0, 0, True, True)
+            gpu.barrier()
+            routed_union(ctx)
+            return
 
         # a shared-expert tile serves every sample at once (B columns); routed work is items
         N_UG_ITEMS = S * N_UG_TASKS
