@@ -628,7 +628,7 @@ class RejectionSampler(nn.Module):
         # ---- probability-ratio path ----------------------------------------
         # [num_q_rows, vocab_size] fp32: the q each draft token was drawn from.
         # None selects exact-match acceptance. Never given for a top-k/top-p
-        # batch (`Drafter.lossless_verify_inputs`): p here is unfiltered.
+        # batch (`DSparkProposer.lossless_verify_inputs`): p here is unfiltered.
         draft_probs: torch.Tensor | None = None,
         # [batch_size] int32: first q row of each request. Negative means "no
         # live q"; see `_ratio_accept_kernel`.
@@ -669,7 +669,7 @@ class RejectionSampler(nn.Module):
 def rejection_sample(
     # the step's input ids; draft r is input_ids[target_logits_indices[r] + 1]
     input_ids: torch.Tensor,
-    # [num_tokens] -- the row of the step's logits each target_probs row is
+    # [num_tokens] -- the row of the step's logits each target_logits row is
     target_logits_indices: torch.Tensor,
     # # [batch_size]
     # num_draft_tokens: list[int],
@@ -680,8 +680,8 @@ def rejection_sample(
     # from; None keeps the exact-match acceptance below. Rows are reached
     # through `draft_probs_row_base`, not `start_idx`.
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # [num_tokens, vocab_size] raw target logits
+    target_logits: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # [batch_size] -- each request's last row, the one its bonus is sampled at
@@ -696,7 +696,7 @@ def rejection_sample(
     # callers keep meaning what they meant) ----------------------------------
     *,
     # [batch_size] fp32, pre-clamped to SAMPLER_EPS. The ratio rule compares
-    # against p = softmax(target_logits / T), and `target_probs` arrives raw.
+    # against p = softmax(target_logits / T).
     temperatures: torch.Tensor | None = None,
     # [batch_size] int32: this request's first row in `draft_probs`, or a
     # negative sentinel when it has no live q. None means the flat ragged
@@ -709,17 +709,17 @@ def rejection_sample(
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_logits.ndim == 2
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    vocab_size = target_logits.shape[-1]
+    device = target_logits.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
+    assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    assert target_logits.shape == (num_tokens, vocab_size)
     if draft_probs is not None:
         assert draft_probs.shape[-1] == vocab_size, (
             f"draft q covers {draft_probs.shape[-1]} ids but the target scored "
@@ -773,7 +773,7 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        _, target_argmax = topk_select(target_logits, 1, tie="low")
         target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
@@ -821,7 +821,7 @@ def rejection_sample(
             cu_num_draft_tokens,
             input_ids,
             target_logits_indices,
-            target_probs,
+            target_logits,
             temperatures,
             draft_probs,
             draft_probs_row_base,
@@ -836,7 +836,7 @@ def rejection_sample(
         # needs only token IDs. `topk_select`, not `.argmax`: the tie rule
         # above is what keeps the accept/reject pattern equal across TP ranks.
         if target_token_ids is None:
-            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            _, target_argmax = topk_select(target_logits, 1, tie="low")
             target_argmax = target_argmax.view(-1)
         else:
             target_argmax = target_token_ids
@@ -855,7 +855,7 @@ def rejection_sample(
     else:
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
-        probs = target_probs.softmax(dim=-1, dtype=torch.float32)
+        probs = target_logits.softmax(dim=-1, dtype=torch.float32)
         # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
         #
         # Among EQUAL probabilities the slot order is unspecified, here as it

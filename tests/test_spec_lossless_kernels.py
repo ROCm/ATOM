@@ -273,7 +273,7 @@ def verify_batch(drafts, width, logits, temperatures):
         "cu_num_draft_tokens": torch.arange(
             width, rows + 1, width, device=DEV, dtype=torch.int32
         ),
-        "target_probs": logits.contiguous(),
+        "target_logits": logits.contiguous(),
         "bonus_token_ids": torch.zeros(batch, device=DEV, dtype=torch.int32),
         "bonus_logits_indices": torch.arange(
             width, (width + 1) * batch, width + 1, device=DEV

@@ -47,7 +47,7 @@ def two_token_batch(probabilities, drafts, width):
     The accept rule is the only thing left varying between the two arms below,
     so both take this same batch and add their own `draft_probs`.
 
-    ``target_probs`` is raw LOGITS here -- `rejection_sample` builds
+    ``target_logits`` is raw LOGITS here -- `rejection_sample` builds
     `p = softmax(logits / T)` itself, because ATOM's unfiltered verify draw
     goes through a fused sampler that never forms probabilities to borrow.
     """
@@ -61,7 +61,7 @@ def two_token_batch(probabilities, drafts, width):
         "cu_num_draft_tokens": torch.arange(
             width, rows + 1, width, device="cuda", dtype=torch.int32
         ),
-        "target_probs": probabilities.log().expand(rows, -1).contiguous(),
+        "target_logits": probabilities.log().expand(rows, -1).contiguous(),
         "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
         "bonus_logits_indices": bonus_rows([width] * batch),
     }
