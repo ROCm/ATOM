@@ -12,9 +12,7 @@ import math
 import pytest
 import torch
 
-pytest.importorskip("aiter")
-
-from atom.models.muse_spark import (
+from atom.models.muse_spark_math import (
     muse_logits,
     muse_rms,
     muse_route,
@@ -96,3 +94,9 @@ def test_logits_are_scaled_then_softcapped():
     torch.testing.assert_close(out, expected)
     assert out.abs().max() <= 20.0
     assert math.isclose(out[0, 0].item(), 0.0)
+
+
+@pytest.mark.parametrize("cap", [None, 0.0])
+def test_logits_without_a_softcap_are_only_scaled(cap):
+    raw = torch.tensor([[0.0, 50.0, -1000.0]])
+    torch.testing.assert_close(muse_logits(raw, 0.25, cap), raw * 0.25)
