@@ -22,6 +22,7 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, check_e8m0, ptr_arg
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -34,6 +35,22 @@ OUTPUT = 1792
 TILE_N = 16
 THREADS = 256
 K_SPLIT = 8
+
+
+def _weighted_bf16(value, weight):
+    # The original gfx1250 stage fuses FP32 * BF16 into BF16 directly.
+    # An intermediate FP32 product can double-round a BF16 halfway case.
+    # The BF16 coefficient occupies weight's high 16 bits as an FP32 value.
+    bits = fx.Int32(
+        llvm.inline_asm(
+            T.i32,
+            [value.ir_value(), weight.ir_value()],
+            "v_fma_mixlo_bf16 $0, $1, $2, 0 op_sel:[0,1,0] op_sel_hi:[0,1,0]",
+            "=v,v,v",
+            has_side_effects=False,
+        )
+    )
+    return bf_lo(bits)
 
 
 def _kernel_name(rows, debug):
@@ -106,7 +123,7 @@ def _launcher(rows: int, debug: bool):
                 total = (pairs[0] + pairs[1]) + (pairs[2] + pairs[3])
                 rstd = hw_rsq(fx.fma(total, fx.Float32(1.0 / HIDDEN), fx.Float32(1e-20)))
                 for ch in range_constexpr(3):
-                    ys = [bf16_round((xs[ch][j] * rstd) * wts[ch][j]) for j in range(8)]
+                    ys = [_weighted_bf16(xs[ch][j] * rstd, wts[ch][j]) for j in range(8)]
                     amax = fx.Float32(0.0)
                     for j in range_constexpr(8):
                         amax = fx.max(amax, abs(ys[j]))

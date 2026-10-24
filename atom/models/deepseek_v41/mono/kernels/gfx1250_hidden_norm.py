@@ -16,27 +16,19 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, check_e8m0, ptr_arg
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from atom.models.deepseek_v41.mono.kernels.gfx1250_norm_wqkv import HIDDEN, _load_bf8
+from atom.models.deepseek_v41.mono.kernels.gfx1250_norm_wqkv import (
+    HIDDEN,
+    _load_bf8,
+    _weighted_bf16,
+)
 from atom.mono.device.mx import FP8_MAX, clamp_fp8, code_ceil, rcp_pow2
-from atom.mono.device.ops import bf_lo, fp8_pack4, hw_rsq
+from atom.mono.device.ops import fp8_pack4, hw_rsq
 
 THREADS = 256
-
-
-def _weighted_bf16(value, weight):
-    # The original gfx1250 stage fuses FP32 * BF16 into BF16 directly.
-    # An intermediate FP32 product can double-round a BF16 halfway case.
-    # The BF16 coefficient occupies weight's high 16 bits as an FP32 value.
-    bits = fx.Int32(llvm.inline_asm(
-        T.i32, [value.ir_value(), weight.ir_value()],
-        "v_fma_mixlo_bf16 $0, $1, $2, 0 op_sel:[0,1,0] op_sel_hi:[0,1,0]",
-        "=v,v,v", has_side_effects=False))
-    return bf_lo(bits)
 
 
 def _kernel_name(rows):
