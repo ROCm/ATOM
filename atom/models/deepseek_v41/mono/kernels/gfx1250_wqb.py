@@ -24,6 +24,10 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from atom.models.deepseek_v41.mono.kernels.gfx1250_gemv import (
+    grouped_lds_bytes,
+    grouped_wqb_device,
+)
 from atom.mono.device.ops import bf_hi, bf_lo, bf16_round
 
 Q_RANK = 1280
@@ -205,4 +209,70 @@ def wqb_rope_gfx1250(q, qs, weight, scale, cos, sin, out, *, debug=None):
     """
     args = _arguments(q, qs, weight, scale, cos, sin, out, debug)
     _run_compiled(_launcher(q.shape[0], out.shape[1], debug is not None), *args)
+    return out
+
+
+@lru_cache(maxsize=4)
+def _grouped_launcher(rows, heads):
+    @flyc.jit
+    def launch(
+        q: fx.Pointer,
+        qs: fx.Pointer,
+        weight: fx.Pointer,
+        scale: fx.Pointer,
+        cos: fx.Pointer,
+        sin: fx.Pointer,
+        out: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        @flyc.kernel(
+            name=f"atom_gfx1250_wqb_rope_r{rows}_h{heads}_n64_k8",
+            known_block_size=[THREADS, 1, 1],
+        )
+        def kernel(
+            q: fx.Pointer,
+            qs: fx.Pointer,
+            weight: fx.Pointer,
+            scale: fx.Pointer,
+            cos: fx.Pointer,
+            sin: fx.Pointer,
+            out: fx.Pointer,
+        ):
+            tid, bid = fx.Int32(fx.thread_idx.x), fx.Int32(fx.block_idx.x)
+            arena = fx.SharedAllocator(static=False)
+            arena.allocate(grouped_lds_bytes(rows, 4))
+            grouped_wqb_device(
+                q,
+                qs,
+                weight,
+                scale,
+                cos,
+                sin,
+                out,
+                fx.Int64(fx.ptrtoint(arena.base_ptr)),
+                tid,
+                bid,
+                rows,
+                heads * HEAD_DIM,
+            )
+
+        kernel(q, qs, weight, scale, cos, sin, out).launch(
+            grid=(heads * HEAD_DIM // 64, 1, 1), block=(THREADS, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def wqb_rope_grouped_gfx1250(q, qs, weight, scale, cos, sin, out):
+    """Four N16 tiles per CTA, with the original eight partials and rounding.
+
+    Each pair of wave32 groups computes one N16 tile. Independent original
+    K partials reduce in their original order; no reassociation is introduced.
+    This variant removes all masked WMMA steps for K1280 and reduces the
+    TP2 grid from 1024 to 256 CTAs. The original debug-capable API is retained.
+    The N64 grouping serves cooperative K1 scheduling; standalone callers
+    should retain the faster original N16 path unless measured otherwise.
+    """
+    args = _arguments(q, qs, weight, scale, cos, sin, out, None)
+    _run_compiled(_grouped_launcher(q.shape[0], out.shape[1]), *args[:7], args[-1])
     return out
