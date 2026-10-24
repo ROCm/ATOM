@@ -80,6 +80,7 @@ from atom.model_ops.base_attention import (
     PA_GLUON_MAX_QUERY_LEN,
     dense_decode_splits,
     gluon_decode_over_limit,
+    gluon_decode_supports_arch,
 )
 
 # aiter pa_decode_gluon.py:134-168 -- the arms `register_bases` is defined for,
@@ -155,6 +156,20 @@ class TestGluonEnvelope:
             assert not (seen_over and not over), f"qlen={qlen} came back under"
             seen_over |= over
         assert seen_over, "16 heads should leave the envelope within 12 positions"
+
+    @pytest.mark.parametrize(
+        "arch,supported",
+        [("gfx942", True), ("gfx950", True), ("gfx1250", False)],
+    )
+    def test_arch_support_matches_aiter(self, monkeypatch, arch, supported):
+        from aiter.jit.utils import chip_info
+
+        monkeypatch.setattr(chip_info, "get_gfx", lambda: arch)
+        gluon_decode_supports_arch.cache_clear()
+        try:
+            assert gluon_decode_supports_arch() is supported
+        finally:
+            gluon_decode_supports_arch.cache_clear()
 
 
 class TestEnvelopeConstants:
@@ -299,8 +314,10 @@ class _Layer:
 def _route(monkeypatch, max_qlen, block_size=128, unified=False, force=False, **kw):
     from atom.model_ops import attention_mha as mha
 
+    gluon_arch = kw.pop("gluon_arch", True)
     monkeypatch.setattr(mha.envs, "ATOM_USE_UNIFIED_ATTN", unified)
     monkeypatch.setattr(mha.envs, "ATOM_FORCE_ATTN_TRITON", force)
+    monkeypatch.setattr(mha, "gluon_decode_supports_arch", lambda: gluon_arch)
     monkeypatch.setattr(
         mha,
         "get_current_atom_config",
@@ -318,6 +335,9 @@ class TestDecodeRouting:
 
     def test_no_drafting_still_reaches_asm(self, monkeypatch):
         assert _route(monkeypatch, 1) == "paged_attention_asm"
+
+    def test_unsupported_gluon_arch_takes_unified(self, monkeypatch):
+        assert _route(monkeypatch, 1, gluon_arch=False) == "paged_attention_unified"
 
     def test_past_gluon_falls_back_to_unified(self, monkeypatch):
         assert _route(monkeypatch, 5) == "paged_attention_unified"
@@ -385,6 +405,35 @@ class TestDecodeRouting:
             _route(monkeypatch, 4, block_size=256, unified=True)
             == "paged_attention_persistent_asm"
         )
+
+
+def test_gfx1250_per_token_shuffled_decode_contract(monkeypatch):
+    from atom.model_ops import attention_mha as mha
+
+    monkeypatch.setattr(mha, "get_gfx", lambda: "gfx1250")
+    layer = SimpleNamespace(
+        use_flash_layout=False,
+        sinks=None,
+        alibi_slopes=None,
+        logits_soft_cap=None,
+    )
+    query = _torch.empty((4, 16, 128), dtype=_torch.bfloat16, device="meta")
+    key_cache = _torch.empty((32, 1, 8, 128, 16), dtype=_FP8, device="meta")
+    value_cache = _torch.empty((32, 1, 8, 128, 16), dtype=_FP8, device="meta")
+    k_scale = _torch.empty((32, 1, 128), dtype=_torch.float32, device="meta")
+    v_scale = _torch.empty_like(k_scale)
+    metadata = SimpleNamespace(
+        max_seqlen_q=1,
+        context_lens=_torch.empty((4,), dtype=_torch.int32, device="meta"),
+    )
+
+    assert mha.PagedAttentionImpl._can_use_per_token_shuffled_decode(
+        layer, query, key_cache, value_cache, k_scale, v_scale, metadata
+    )
+    metadata.max_seqlen_q = 2
+    assert not mha.PagedAttentionImpl._can_use_per_token_shuffled_decode(
+        layer, query, key_cache, value_cache, k_scale, v_scale, metadata
+    )
 
 
 class _FakePlan:

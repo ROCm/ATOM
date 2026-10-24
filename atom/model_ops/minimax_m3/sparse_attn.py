@@ -20,6 +20,7 @@ import torch
 # which couples to vLLM internals. ATOM imports triton directly everywhere else.
 import triton
 import triton.language as tl
+from aiter.jit.utils.chip_info import get_gfx
 
 from atom.model_ops.minimax_m3.index_topk import build_n_valid_column_per_row
 
@@ -243,6 +244,13 @@ def _sparse_pa_ran_on_asm(
         PA_ASM_MAX_QUERY_GROUP_SIZE,
         run_pa_fwd_asm,
     )
+
+    # gfx1250 ships BF16 sparse PA code objects, but not MiniMax's per-token
+    # FP8 GQA variants. The low-level launcher aborts the process rather than
+    # reporting an unsupported shape, so decline before applying the row
+    # profitability heuristic and use the shuffled-FP8 Triton path instead.
+    if get_gfx() == "gfx1250":
+        return False
 
     rows, group, head_dim = q.shape
     if (
@@ -1358,6 +1366,66 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+def _sparse_unified_per_row(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+    sm_scale: float,
+    output: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Run each sparse row as a length-one sequence through unified attention."""
+    if (k_scale is not None and k_scale.numel() > 1) or (
+        v_scale is not None and v_scale.numel() > 1
+    ):
+        from aiter.ops.triton.attention.pa_decode_shuffle import (
+            paged_attention_decode_shuffle_swa,
+        )
+
+        assert k_scale is not None and v_scale is not None
+        paged_attention_decode_shuffle_swa(
+            output,
+            q,
+            k_cache,
+            v_cache,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            k_scale,
+            v_scale,
+            sliding_window=-1,
+        )
+        return
+
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    rows = q.shape[0]
+    unified_attention(
+        q,
+        k_cache,
+        v_cache,
+        output,
+        cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device=q.device),
+        seqused_k=sparse_ctx,
+        max_seqlen_q=1,
+        max_seqlen_k=sparse_bt.shape[1] * ASM_PAGE_SIZE,
+        softmax_scale=sm_scale,
+        causal=True,
+        alibi_slopes=None,
+        window_size=(-1, -1),
+        block_table=sparse_bt,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+
+
 @torch.no_grad()
 def _sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1384,7 +1452,10 @@ def _sparse_pa_per_row(
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
-    from atom.model_ops.base_attention import run_pa_decode
+    from atom.model_ops.base_attention import (
+        gluon_decode_supports_arch,
+        run_pa_decode,
+    )
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
     # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1.
@@ -1411,6 +1482,27 @@ def _sparse_pa_per_row(
         v_scale,
         out_view,
     ):
+        return
+
+    if not gluon_decode_supports_arch():
+        if k_scale is not None and k_scale.numel() > 1:
+            pbs = k_scale.shape[-1]
+            fallback_k_scale = k_scale.view(nph16 * _hkv, 1, pbs)
+            fallback_v_scale = v_scale.view(nph16 * _hkv, 1, pbs)
+        else:
+            fallback_k_scale = k_scale
+            fallback_v_scale = v_scale
+        _sparse_unified_per_row(
+            q_view,
+            k_cache_view,
+            v_cache_view,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            out_view,
+            fallback_k_scale,
+            fallback_v_scale,
+        )
         return
 
     num_seqs = T * num_kv_heads

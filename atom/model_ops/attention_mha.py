@@ -18,6 +18,7 @@ from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     dense_decode_splits,
     gluon_decode_over_limit,
+    gluon_decode_supports_arch,
     run_pa_decode,
     run_pa_fwd_asm,
 )
@@ -193,6 +194,45 @@ class PagedAttentionImpl(nn.Module):
                 f"layer {self.layer_num} takes unified_attention for {phase}, "
                 "which cannot carry its per-token KV scales"
             )
+
+    def _can_use_per_token_shuffled_decode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: torch.Tensor | None,
+        v_scale: torch.Tensor | None,
+        attn_metadata,
+    ) -> bool:
+        """Whether the generic shuffled-FP8 decode contract is fully satisfied."""
+        if get_gfx() != "gfx1250" or self.use_flash_layout:
+            return False
+        if self.sinks is not None or self.alibi_slopes is not None:
+            return False
+        if self.logits_soft_cap not in (None, 0, 0.0):
+            return False
+        if (
+            k_scale is None
+            or v_scale is None
+            or k_scale.numel() <= 1
+            or v_scale.numel() <= 1
+        ):
+            return False
+        if q.ndim != 3 or k_cache.ndim != 5:
+            return False
+        if attn_metadata.max_seqlen_q != 1:
+            return False
+        if q.shape[0] != attn_metadata.context_lens.numel():
+            return False
+        if k_scale.ndim != 3 or v_scale.ndim != 3:
+            return False
+        return (
+            k_scale.shape == v_scale.shape
+            and k_scale.shape[:2] == k_cache.shape[:2]
+            and k_scale.shape[-1] == k_cache.shape[-2]
+            and k_cache.element_size() == 1
+            and v_cache.element_size() == 1
+        )
 
     def forward_impl(
         self,
@@ -463,16 +503,29 @@ class PagedAttentionImpl(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        aiter.reshape_and_cache_with_pertoken_quant(
-            k,
-            v,
-            k_cache,
-            v_cache,
-            k_scale,
-            v_scale,
-            attn_metadata.slot_mapping,
-            asm_layout=True,
-        )
+        if self.kv_cache_dtype == "fp8":
+            aiter.reshape_and_cache_with_pertoken_quant(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                attn_metadata.slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            aiter.reshape_and_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                kv_cache_dtype="auto",
+                k_scale=None,
+                v_scale=None,
+                asm_layout=True,
+            )
         return q, k, v
 
     def _gather_prefix_and_concat_kv(
@@ -585,6 +638,28 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
+        if self._can_use_per_token_shuffled_decode(
+            q, k_cache, v_cache, k_scale, v_scale, attn_metadata
+        ):
+            from aiter.ops.triton.attention.pa_decode_shuffle import (
+                paged_attention_decode_shuffle_swa,
+            )
+
+            o = torch.empty_like(q)
+            paged_attention_decode_shuffle_swa(
+                o,
+                q,
+                k_cache,
+                self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache),
+                attn_metadata.block_tables,
+                attn_metadata.context_lens,
+                self.scale,
+                k_scale,
+                v_scale,
+                self.sliding_window,
+            )
+            return o
+
         self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
@@ -1041,7 +1116,7 @@ class PagedAttentionImpl(nn.Module):
         # Clamped once here so both gates see the same value; the predicate
         # clamps internally too, and a sentinel would otherwise split them.
         max_qlen = max(1, int(max_qlen))
-        over_gluon = gluon_decode_over_limit(
+        over_gluon = not gluon_decode_supports_arch() or gluon_decode_over_limit(
             max_qlen, self.num_heads, self.num_kv_heads
         )
         over_asm = (
