@@ -1258,35 +1258,6 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # dispatch_backend within the same single-threaded layer forward.
         self._index_q: torch.Tensor | None = None
 
-    @staticmethod
-    def _to_page16_shuffle(k_cache, v_cache, k_scale, v_scale):
-        """Reinterpret the standard page-128 SHUFFLE KV/scale views as page-16
-        SHUFFLE for the MiniMax-M3 ASM/gluon kernels. Zero-copy (128 == 8*16):
-
-            K:     [N, nkv, hd//x, 128, x] -> [N*8, nkv, hd//x, 16, x]
-            V:     [N, nkv, 128//x, hd, x] -> [N*8, nkv, 16//x, hd, x]
-            scale: [N, nkv, 128]           -> [N*8, nkv, 16]   (fp8 only)
-
-        Scales are re-viewed only when present (fp8); bf16 passes them through
-        (None).
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import (
-            ASM_PAGE_SIZE,
-            PAGES_PER_SPARSE_BLOCK,
-        )
-
-        n_blocks, nkv = k_cache.shape[0], k_cache.shape[1]
-        x = k_cache.shape[-1]
-        head_dim = k_cache.shape[2] * x
-        num_phys16 = n_blocks * PAGES_PER_SPARSE_BLOCK
-
-        k16 = k_cache.view(num_phys16, nkv, head_dim // x, ASM_PAGE_SIZE, x)
-        v16 = v_cache.view(num_phys16, nkv, ASM_PAGE_SIZE // x, head_dim, x)
-        if k_scale is not None and v_scale is not None:
-            k_scale = k_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-            v_scale = v_scale.view(num_phys16, nkv, ASM_PAGE_SIZE)
-        return k16, v16, k_scale, v_scale
-
     @mark_trace(prefix="rope_cache", torch_compile=False)
     def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
         """MiniMax-M3 fused qk-norm + partial-NeoX-RoPE + page-16 SHUFFLE KV insert
@@ -1317,8 +1288,10 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
         # page-16 view is a pure zero-copy reinterpretation of the page-128 view.
         # We re-view here (at attention time) instead of at bind time so the binder
         # has no M3-specific KV/scale code.
+        from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
+
         layer = kv_cache_data[f"layer_{self.layer_num}"]
-        k_cache, v_cache, k_scale, v_scale = self._to_page16_shuffle(
+        k_cache, v_cache, k_scale, v_scale = to_page16_shuffle(
             layer.k_cache, layer.v_cache, layer.k_scale, layer.v_scale
         )
 

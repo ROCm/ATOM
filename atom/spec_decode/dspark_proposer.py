@@ -12,6 +12,7 @@ from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import envs
 from atom.utils.block_convert import kv_indices_generate_triton
+from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -434,14 +435,6 @@ class DSparkProposer(Drafter):
         # width; default to the full block (a static verify length == block).
         return num_spec or self.dspark_block_size
 
-    @property
-    def _draft_first_layer_num(self) -> int:
-        """The kv_cache_data key of the draft's first attention layer: the MLA
-        module on the K3 draft, the MHA `Attention` on MiniMax-M3.1's."""
-        attn = self.model.layers[0].self_attn
-        mla = getattr(attn, "mla_attn", None)
-        return (mla if mla is not None else attn.attn).layer_num
-
     def _bound_draft_k_cache(self, forward_context) -> "torch.Tensor | None":
         """The draft's own paged K cache, or None while the pool is unallocated.
 
@@ -452,7 +445,7 @@ class DSparkProposer(Drafter):
         fully bound. Gating on the flag would let the second one through
         describing whatever the previous real step left behind.
         """
-        layer_num = self._draft_first_layer_num
+        layer_num = self.model.first_attention_layer_num
         cache_data = forward_context.kv_cache_data or {}
         entry = cache_data.get(f"layer_{layer_num}")
         bound = getattr(entry, "k_cache", None) if entry is not None else None
@@ -486,7 +479,7 @@ class DSparkProposer(Drafter):
             # for `final` so the caller does not cache a warmup-time guess.
             return from_config, False
         if bound.dtype != from_config:
-            layer_num = self._draft_first_layer_num
+            layer_num = self.model.first_attention_layer_num
             logger.warning(
                 "DSpark draft layer_%d is bound to a %s KV cache, but "
                 "--kv_cache_dtype=%s implies %s. Using the bound tensor's dtype "
@@ -827,10 +820,6 @@ class DSparkProposer(Drafter):
                 self._blk_dtype_q = dtype_q
         attn_metadata.dtype_q = dtype_q
 
-        # How many leading rows are real requests; an MHA draft attends only
-        # those (see `block_attention_is_mla` below). Zero until the pool is
-        # bound and on a DP-alignment dummy.
-        attn_metadata.dspark_real_bs = 0
         if self._bound_draft_k_cache(forward_context) is None:
             # warmup_model() runs before allocate_kv_cache(), so there is no
             # paged state to describe. The block forward still runs on that
@@ -965,17 +954,18 @@ class DSparkProposer(Drafter):
         attn_metadata.kv_indptr = kv_indptr
         attn_metadata.kv_indices = self._blk_kv_indices
         attn_metadata.kv_last_page_lens = self._blk_last_page_lens[:running_bs]
-        attn_metadata.dspark_real_bs = scheduled_bs
-        if not getattr(self.model, "block_attention_is_mla", True):
-            # An MHA draft (MiniMax-M3.1) attends its block itself; there is no
-            # MLA decode to plan, only its per-row paged decode tables.
-            self._build_mha_block_rows(
+        if not self.model.block_attention_is_mla:
+            # A draft that attends its block another way (MiniMax-M3.1's per-row
+            # MHA decode) builds what it reads itself; there is no MLA decode
+            # to plan.
+            self.model.prepare_paged_block(
                 attn_metadata,
                 block_tables,
                 block_positions,
                 slots,
                 ctx_lens,
-                scheduled_bs=scheduled_bs,
+                block_table_state(self.runner.forward_vars["block_tables"]).lengths,
+                scheduled_bs,
             )
             return
 
@@ -1012,177 +1002,6 @@ class DSparkProposer(Drafter):
         attn_metadata.reduce_indptr = ps["reduce_indptr"]
         attn_metadata.reduce_final_map = ps["reduce_final_map"]
         attn_metadata.reduce_partial_map = ps["reduce_partial_map"]
-
-    @staticmethod
-    def _page16_table(
-        block_tables: torch.Tensor,  # [rb, W] page-128 ids
-        out: torch.Tensor,  # [rb, 8 * W]
-        sub_pages: torch.Tensor,  # [8] = arange(8)
-    ) -> torch.Tensor:
-        """Page-16 ids of a page-128 table: page p covers ``p * 8 + 0..7``.
-
-        Through ``copy_`` of an expanded view: an ``out=`` of the ``[rb, W, 1]``
-        product would be resized to that shape rather than broadcast over the
-        eight sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import PAGES_PER_SPARSE_BLOCK
-
-        rb, W = block_tables.shape
-        out3 = out.view(rb, W, PAGES_PER_SPARSE_BLOCK)
-        out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, PAGES_PER_SPARSE_BLOCK))
-        out3.mul_(PAGES_PER_SPARSE_BLOCK).add_(sub_pages)
-        return out
-
-    @staticmethod
-    def _window_rows(
-        bt16_flat: torch.Tensor,  # [(rb + 1) * P] request tables, then P of slack
-        ctx_eff: torch.Tensor,  # [rb] keys each request can read
-        positions: torch.Tensor,  # [rb * T] each row's own position
-        row_req: torch.Tensor,  # [rb * T] the request each row belongs to
-        window: int,  # 0: attend the whole context
-        real_rows: int,  # rows past this are padding
-        start16: torch.Tensor,  # [rb * T] int64 scratch
-        out_tables: torch.Tensor,  # [rb * T, P]
-        out_lens: torch.Tensor,  # [rb * T]
-    ) -> None:
-        """Each block row's page-16 table and length under the sliding window.
-
-        A row at position p attends the keys from ``p - window + 1`` on, as the
-        reference does (the whole block is inside that window). The per-row
-        decode starts a row at a page boundary, so the row starts at the page-16
-        holding that key and also reads up to 15 keys before it. Its table is
-        the P-wide window of its request's table from that page on, taken from
-        the flat buffer; its length ends it within its own request's columns,
-        so what that window runs into past them is never read.
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
-
-        P = out_tables.shape[1]
-        if window:
-            torch.sub(positions, window - 1, out=start16)
-            start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
-            # Pad rows repeat the last real anchor but read one page.
-            start16[real_rows:].zero_()
-        else:
-            start16.zero_()
-        torch.index_select(ctx_eff, 0, row_req, out=out_lens)
-        out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
-        start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
-        torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
-
-    def _build_mha_block_rows(
-        self,
-        attn_metadata,
-        block_tables: torch.Tensor,  # [running_bs, W] page ids (page-128)
-        block_positions: torch.Tensor,  # [running_bs, T]
-        slots: torch.Tensor,  # [running_bs, T] -- the block's KV write slots
-        ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
-        *,
-        scheduled_bs: int,
-    ) -> None:
-        """Per-row paged decode tables for an MHA draft's block (MiniMax-M3.1).
-
-        The block is attended as ``running_bs * T`` independent q_len=1 decode
-        rows -- non-causal by construction -- each over its request's
-        ``[context | block]`` through a page-16 block table, the layout the
-        target's sparse decode kernels read. Everything lands in buffers sized at
-        ``max_num_seqs`` and is only sliced, so a captured block replays against
-        this step's numbers.
-
-        Block positions can run past the pages the scheduler has allocated for
-        the request (it allocates through the verify window, the block reaches
-        up to T past the accepted anchor). A table column that was never
-        allocated reads as page 0, which is some other request's page -- under
-        prefix caching, a prefix every request shares. Such positions are
-        neither written (slot -1) nor read (the row's context is capped at what
-        is allocated): their draft rows simply miss a few of their own keys.
-        """
-        from atom.model_ops.minimax_m3.sparse_attn import PAGES_PER_SPARSE_BLOCK
-
-        T = self.draft_tokens_per_seq
-        running_bs = block_positions.shape[0]
-        block_size = self.runner.block_size
-        if self.dcp_world_size > 1:
-            raise NotImplementedError("MHA DSpark draft does not support DCP.")
-        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
-        if getattr(self, "_blk_bt16", None) is None or self._blk_bt16.shape[1] != P:
-            # First call is the warmup, ahead of any capture: these addresses
-            # are the ones every recording bakes in.
-            max_bs = self.config.max_num_seqs
-            dev = self.device
-            self._blk_alloc = torch.zeros(max_bs, dtype=torch.int32, device=dev)
-            self._blk_alloc_host = torch.zeros(
-                max_bs, dtype=torch.int32, pin_memory=True
-            )
-            # Recorded after each copy out of `_blk_alloc_host`; a fresh event
-            # has nothing to wait for.
-            self._blk_alloc_copied = torch.cuda.Event()
-            # One row of slack past the last request: `_window_rows` reads
-            # every row as a P-wide window of this buffer.
-            self._blk_bt16_flat = torch.zeros(
-                (max_bs + 1) * P, dtype=torch.int32, device=dev
-            )
-            self._blk_bt16 = self._blk_bt16_flat[: max_bs * P].view(max_bs, P)
-            self._blk_bt16_rows = torch.zeros(
-                max_bs * T, P, dtype=torch.int32, device=dev
-            )
-            self._blk_ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=dev)
-            self._blk_row_req = torch.arange(
-                max_bs, dtype=torch.int64, device=dev
-            ).repeat_interleave(T)
-            self._blk_page16 = torch.arange(
-                PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=dev
-            )
-            self._blk_start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=dev)
-            self._blk_ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=dev)
-
-        # Allocated tokens per request, from the host snapshot of the block
-        # tables this step was scheduled with. At least one page: the warmup
-        # batch and the pad tail address page 0 by convention.
-        from atom.utils.block_tables import block_table_state
-
-        lengths = block_table_state(self.runner.forward_vars["block_tables"]).lengths
-        # The host can run a step ahead of the device, so the previous step's
-        # copy must have read the pinned buffer before it is rewritten.
-        self._blk_alloc_copied.synchronize()
-        pages = self._blk_alloc_host.numpy()[:running_bs]
-        n = min(len(lengths), scheduled_bs)
-        pages[:n] = lengths[:n]
-        pages[n:] = 1
-        pages.clip(min=1, out=pages)
-        alloc = self._blk_alloc[:running_bs]
-        alloc.copy_(self._blk_alloc_host[:running_bs], non_blocking=True)
-        self._blk_alloc_copied.record()
-        alloc.mul_(block_size)
-
-        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
-        # The rows' own lengths; `ctx_lens` (attn_metadata.context_lens) stays
-        # the full anchor + 1 + T the eager fallback reads.
-        ctx_eff = self._blk_ctx_eff[:running_bs]
-        torch.minimum(ctx_lens, alloc, out=ctx_eff)
-
-        # Page-16 table: phys16 = page * 8 + sub-page (one kv head per rank).
-        bt16 = self._page16_table(
-            block_tables, self._blk_bt16[:running_bs], self._blk_page16
-        )
-        if running_bs > scheduled_bs:
-            # A pad row reads one page: page 0.
-            bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._blk_page16)
-
-        rows = running_bs * T
-        self._window_rows(
-            self._blk_bt16_flat,
-            ctx_eff,
-            block_positions.view(-1),
-            self._blk_row_req[:rows],
-            int(getattr(self.model, "sliding_window", 0) or 0),
-            scheduled_bs * T,
-            self._blk_start16[:rows],
-            self._blk_bt16_rows[:rows],
-            self._blk_ctx_rows[:rows],
-        )
-        attn_metadata.dspark_bt16_rows = self._blk_bt16_rows[:rows]
-        attn_metadata.dspark_ctx_rows = self._blk_ctx_rows[:rows]
 
     @property
     def _paged_pad_ctx_len(self) -> int:

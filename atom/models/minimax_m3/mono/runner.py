@@ -35,6 +35,7 @@ from aiter.dist.parallel_state import (
 import atom.model_ops.topK as topk_meta
 from atom.distributed.indexer_cp import indexer_cp_enabled
 from atom.model_ops.communication_op import tensor_model_parallel_all_reduce
+from atom.model_ops.minimax_m3.sparse_attn import to_page16_shuffle
 from atom.models.minimax_m3.mono.config import (
     HEAD_DIM,
     HIDDEN,
@@ -450,9 +451,8 @@ class MonoDecodeRunner:
         sparse_md = _sparse_metadata(fwd)
         block_table, seq_lens = rows
         stream = torch.cuda.current_stream()
-        impl = lw.attn_impl
         kv = fwd.kv_cache_data[f"layer_{lw.layer_id}"]
-        k16, v16, ks16, vs16 = impl._to_page16_shuffle(
+        k16, v16, ks16, vs16 = to_page16_shuffle(
             kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale
         )
         args = {

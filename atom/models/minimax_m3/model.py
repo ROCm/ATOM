@@ -204,6 +204,7 @@ class MiniMaxM3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        hidden_act: str | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -221,9 +222,10 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        if config.hidden_act != "swigluoai":
+        hidden_act = hidden_act or config.hidden_act
+        if hidden_act != "swigluoai":
             raise ValueError(
-                f"Unsupported MiniMax-M3 activation {config.hidden_act!r}; "
+                f"Unsupported MiniMax-M3 activation {hidden_act!r}; "
                 "expected 'swigluoai'."
             )
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)

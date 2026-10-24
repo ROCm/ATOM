@@ -2110,7 +2110,7 @@ def _paged_proposer(monkeypatch, *, max_model_len, block_size, bound_pool=True):
         kv_cache_dtype="auto",
     )
     p.dtype = torch.bfloat16
-    p.model = types.SimpleNamespace(window_size=None)
+    p.model = types.SimpleNamespace(window_size=None, block_attention_is_mla=True)
     n_cols = max_model_len // block_size
     block_tables = torch.zeros(p.config.max_num_seqs, n_cols, dtype=torch.int32)
     p.runner = types.SimpleNamespace(
@@ -2428,11 +2428,11 @@ def test_page16_table_expands_every_page_into_its_eight_sub_pages():
     page-128 block table: page p -> 8p .. 8p+7, in column order."""
     import torch
 
-    from atom.spec_decode.dspark_proposer import DSparkProposer
+    from atom.models.minimax_m3_dspark import _page16_table
 
     bt = torch.tensor([[0, 1, 0], [5, 7, 2]], dtype=torch.int32)
     out = torch.full((2, 24), -1, dtype=torch.int32)
-    DSparkProposer._page16_table(bt, out, torch.arange(8, dtype=torch.int32))
+    _page16_table(bt, out, torch.arange(8, dtype=torch.int32))
     expect = (bt.repeat_interleave(8, dim=1) * 8) + torch.arange(8).repeat(3)
     assert torch.equal(out, expect.to(torch.int32))
 
@@ -2445,7 +2445,7 @@ def test_window_rows_start_each_row_at_its_own_window(window):
     Pad rows repeat the last real anchor and read from their first page."""
     import torch
 
-    from atom.spec_decode.dspark_proposer import DSparkProposer
+    from atom.models.minimax_m3_dspark import _window_rows
 
     P, T, rb = 32, 3, 2
     bt16_flat = torch.arange((rb + 1) * P, dtype=torch.int32)
@@ -2455,7 +2455,7 @@ def test_window_rows_start_each_row_at_its_own_window(window):
     row_req = torch.arange(rb).repeat_interleave(T)
     tables = torch.empty(rb * T, P, dtype=torch.int32)
     lens = torch.empty(rb * T, dtype=torch.int32)
-    DSparkProposer._window_rows(
+    _window_rows(
         bt16_flat,
         ctx_eff,
         positions,

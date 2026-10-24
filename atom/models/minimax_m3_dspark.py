@@ -23,7 +23,7 @@ reference is NeMo AutoModel ``speculative/dspark/draft_minimax_m3.py``:
 KV lives in a sibling pool of its own (an MHA draft cannot share the target's
 latent pool the way K3's MLA draft does): ``draft_kv_builder`` resolves this
 config to the MHA backend, which owns a pool laid out like the target's and
-binds it onto each layer's ``Attention``. Both writes -- context rows and the
+binds it onto each layer's ``KVCacheBinding``. Both writes -- context rows and the
 block's own rows -- go through ``triton_fused_norm_rope_cache`` with an explicit
 slot mapping, the kernel the target's dense layers use for the same norm, RoPE
 and per-token fp8 cache format.
@@ -31,7 +31,7 @@ and per-token fp8 cache format.
 The block attention is ``B * T`` independent q_len=1 paged decode rows --
 non-causal by construction -- over each request's ``[context | block]``,
 through the per-row ASM / Gluon decode the target's sparse layers run and a
-page-16 table ``DSparkProposer`` builds outside the graph; the block's own K/V
+page-16 table ``prepare_paged_block`` builds outside the graph; the block's own K/V
 are written into the cache first, except at positions past the request's
 allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
 captured like the other drafts. The per-row decode takes one KV head per rank,
@@ -59,25 +59,28 @@ from aiter.rotary_embedding import get_rope
 from torch import nn
 
 from atom.config import QuantizationConfig
-from atom.model_ops.base_attention import Attention
 from atom.model_ops.layernorm import GemmaRMSNorm
 from atom.model_ops.linear import QKVParallelLinear, ReplicatedLinear, RowParallelLinear
+from atom.model_ops.minimax_m3.sparse_attn import (
+    ASM_PAGE_SIZE,
+    PAGES_PER_SPARSE_BLOCK,
+    sparse_pa_per_row,
+    to_page16_shuffle,
+)
 from atom.model_ops.triton_fused_qkv_norm_rope_cache import (
     triton_fused_norm_rope_cache,
 )
-from atom.models.dspark_draft import DSparkDraftModel
-from atom.models.kimi_k3_dspark import DSparkMarkovHead
+from atom.models.dspark_draft import (
+    DSparkConfidenceHead,
+    DSparkDraftModel,
+    DSparkMarkovHead,
+    linear_out,
+)
 from atom.models.minimax_m3.model import MiniMaxM3MLP
-from atom.quant_spec import LayerQuantConfig
 from atom.utils.forward_context import get_forward_context
 
 if TYPE_CHECKING:
     from atom.config import Config
-
-
-def _linear_out(output):
-    """ATOM quantized linears may return (tensor, scale); take the tensor."""
-    return output[0] if isinstance(output, tuple) else output
 
 
 def _draft_rope_theta(config) -> float:
@@ -97,31 +100,94 @@ def _draft_quant_config(config) -> QuantizationConfig:
     whatever the target is -- the M3.1 targets come as MXFP8 + NVFP4 experts,
     Quark MXFP4, or BF16 -- so the target's config, which ``_build_draft_model``
     copies onto the draft, cannot be trusted to describe these weights. The
-    checkpoint's own block parses here; a draft config without one is BF16.
+    checkpoint's own block goes through the registered parser here; a draft
+    config without one is BF16.
     """
-    qc = getattr(config, "quantization_config", None)
-    if not qc:
-        return QuantizationConfig()
-    method = str(qc.get("quant_method", "")).lower()
-    block = list(qc.get("weight_block_size") or [])
-    if method != "mxfp8" or block != [1, 32]:
+    draft_qc = QuantizationConfig(config)
+    spec = draft_qc.global_spec
+    if draft_qc.quant_method and (spec.quant_type, spec.quant_dtype) != (
+        QuantType.per_1x32,
+        dtypes.fp8,
+    ):
         raise ValueError(
             "MiniMax-M3 DSpark draft supports MXFP8 [1, 32] or BF16 weights, "
-            f"got quant_method={method!r} weight_block_size={block}."
+            f"got quant_method={draft_qc.quant_method!r} ({spec.quant_type}, "
+            f"{spec.quant_dtype})."
         )
-    draft_qc = QuantizationConfig()
-    draft_qc.quant_method = "mxfp8"
-    # Only remap_layer_name sets this, and nothing here needs a remap: one
-    # global spec covers every quantized draft linear.
-    draft_qc.packed_modules_mapping = {}
-    draft_qc.global_spec = LayerQuantConfig(
-        quant_type=QuantType.per_1x32,
-        quant_dtype=dtypes.fp8,
-        is_dynamic=True,
-        quant_method="mxfp8",
-        weight_block_size=(1, 32),
-    )
     return draft_qc
+
+
+def _page16_table(
+    block_tables: torch.Tensor,  # [rb, W] page-128 ids
+    out: torch.Tensor,  # [rb, 8 * W]
+    sub_pages: torch.Tensor,  # [8] = arange(8)
+) -> torch.Tensor:
+    """Page-16 ids of a page-128 table: page p covers ``p * 8 + 0..7``.
+
+    Through ``copy_`` of an expanded view: an ``out=`` of the ``[rb, W, 1]``
+    product would be resized to that shape rather than broadcast over the
+    eight sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
+    """
+    rb, W = block_tables.shape
+    out3 = out.view(rb, W, PAGES_PER_SPARSE_BLOCK)
+    out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, PAGES_PER_SPARSE_BLOCK))
+    out3.mul_(PAGES_PER_SPARSE_BLOCK).add_(sub_pages)
+    return out
+
+
+def _window_rows(
+    bt16_flat: torch.Tensor,  # [(rb + 1) * P] request tables, then P of slack
+    ctx_eff: torch.Tensor,  # [rb] keys each request can read
+    positions: torch.Tensor,  # [rb * T] each row's own position
+    row_req: torch.Tensor,  # [rb * T] the request each row belongs to
+    window: int,  # 0: attend the whole context
+    real_rows: int,  # rows past this are padding
+    start16: torch.Tensor,  # [rb * T] int64 scratch
+    out_tables: torch.Tensor,  # [rb * T, P]
+    out_lens: torch.Tensor,  # [rb * T]
+) -> None:
+    """Each block row's page-16 table and length under the sliding window.
+
+    A row at position p attends the keys from ``p - window + 1`` on, as the
+    reference does (the whole block is inside that window). The per-row
+    decode starts a row at a page boundary, so the row starts at the page-16
+    holding that key and also reads up to 15 keys before it. Its table is
+    the P-wide window of its request's table from that page on, taken from
+    the flat buffer; its length ends it within its own request's columns,
+    so what that window runs into past them is never read.
+    """
+    P = out_tables.shape[1]
+    if window:
+        torch.sub(positions, window - 1, out=start16)
+        start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
+        # Pad rows repeat the last real anchor but read one page.
+        start16[real_rows:].zero_()
+    else:
+        start16.zero_()
+    torch.index_select(ctx_eff, 0, row_req, out=out_lens)
+    out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
+    start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
+    torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
+
+
+class KVCacheBinding(nn.Module):
+    """What the draft KV pool binds one layer's cache onto, and nothing else.
+
+    ``DraftKvBuilder`` recognizes a non-MLA attention module by these
+    attributes and sets ``k_cache`` / ``v_cache`` (5-D SHUFFLE), the fp8
+    per-token scales and ``max_model_len`` on it; the layer then reads and
+    writes the cache itself.
+    """
+
+    base_attention = None
+    use_mla = False
+
+    def __init__(self, layer_num: int) -> None:
+        super().__init__()
+        self.layer_num = layer_num
+        self.max_model_len = 0
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.k_scale = self.v_scale = None
 
 
 class M3DSparkAttention(nn.Module):
@@ -158,8 +224,6 @@ class M3DSparkAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.kv_cache_dtype = atom_config.kv_cache_dtype
-        # 0 or absent: full attention over the context.
-        self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
 
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
@@ -193,23 +257,7 @@ class M3DSparkAttention(nn.Module):
             base=_draft_rope_theta(config),
             rope_scaling=None,
         )
-        # Never called: it is here to own this layer's KV binding. The MHA
-        # backend's draft pool walks the draft for `Attention` modules and binds
-        # k_cache / v_cache (5-D SHUFFLE) and the fp8 per-token scales onto it.
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            self.num_kv_heads,
-            kv_cache_dtype=self.kv_cache_dtype,
-            layer_num=layer_num,
-            use_mla=False,
-            rotary_emb=self.rotary_emb,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            per_layer_sliding_window=self.sliding_window or None,
-            prefix=f"{prefix}.attn",
-        )
+        self.kv = KVCacheBinding(layer_num)
 
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
@@ -221,14 +269,10 @@ class M3DSparkAttention(nn.Module):
         the same in both (page * 128 + off == (page * 8 + off // 16) * 16 +
         off % 16), only the view differs.
         """
-        attn = self.attn
-        if attn.k_cache.numel() == 0:
+        kv = self.kv
+        if kv.k_cache.numel() == 0:
             return None
-        from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
-
-        return SparseMHAPagedAttentionImpl._to_page16_shuffle(
-            attn.k_cache, attn.v_cache, attn.k_scale, attn.v_scale
-        )
+        return to_page16_shuffle(kv.k_cache, kv.v_cache, kv.k_scale, kv.v_scale)
 
     def _norm_rope_write(self, q, k, v, num_heads, positions, slot_mapping, cache):
         k_cache, v_cache, k_scale, v_scale = cache
@@ -265,7 +309,7 @@ class M3DSparkAttention(nn.Module):
         cache = self._bound_cache()
         if cache is None:
             return
-        qkv = _linear_out(self.qkv_proj(ctx_hidden))
+        qkv = linear_out(self.qkv_proj(ctx_hidden))
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         self._norm_rope_write(k, k, v, 0, positions, slot_mapping, cache)
 
@@ -277,14 +321,14 @@ class M3DSparkAttention(nn.Module):
         page another request owns (under prefix caching, a shared prefix) --
         then decode per row.
         """
-        qkv = _linear_out(self.qkv_proj(hidden_states))
+        qkv = linear_out(self.qkv_proj(hidden_states))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         cache = self._bound_cache()
         if cache is None:
             # warmup_model() runs before the pool exists; the pass only sizes
             # activations then, so shapes are all that must be right.
             out = q.new_zeros(q.shape[0], self.q_size)
-            return _linear_out(self.o_proj(out))
+            return linear_out(self.o_proj(out))
 
         md = get_forward_context().attn_metadata
         # The block's K/V go into the cache at the block's slots (positions
@@ -294,26 +338,24 @@ class M3DSparkAttention(nn.Module):
             q, k, v, self.num_heads, positions, md.slot_mapping, cache
         )
         out = self._block_attention_paged(q, md, cache)
-        return _linear_out(self.o_proj(out))
+        return linear_out(self.o_proj(out))
 
     def _block_attention_paged(self, q: torch.Tensor, md, cache) -> torch.Tensor:
         """``[context | block]`` attention as ``B * T`` q_len=1 paged decode rows.
 
         A length-1 query sees its whole context, so per-row decode is the
         non-causal block attention by construction. The rows read the request's
-        page-16 table and capped length that ``DSparkProposer`` built
+        page-16 table and capped length that ``prepare_paged_block`` built
         (``dspark_bt16_rows`` / ``dspark_ctx_rows``, sliding window applied
         there), through the same per-row ASM / Gluon decode the target's sparse
         layers run -- no host sync, fixed shapes, so the block can be captured.
         The context is read once per block position, one KV head per rank.
         """
-        from atom.model_ops.minimax_m3.sparse_attn import _sparse_pa_per_row
-
         k16, v16, ks16, vs16 = cache  # page-16 views, see _bound_cache
         rows = q.shape[0]
         q = q.view(rows, self.num_heads, self.head_dim)
         out = torch.empty_like(q)
-        _sparse_pa_per_row(
+        sparse_pa_per_row(
             q,
             k16,
             v16,
@@ -349,6 +391,11 @@ class M3DSparkDecoderLayer(nn.Module):
             quant_config=quant_config,
             reduce_results=True,
             prefix=f"{prefix}.mlp",
+            # The checkpoint says `swigluoai`, and the reference draft MLP is
+            # SwiGLU-OAI whatever the field says; transformers'
+            # MiniMaxM3VLTextConfig, which this config loads as, rewrites the
+            # field to its `silu` default.
+            hidden_act="swigluoai",
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -374,29 +421,11 @@ class M3DSparkDecoderLayer(nn.Module):
         return self.mlp(hidden_states), residual
 
 
-class DSparkConfidenceHead(nn.Module):
-    """``sigmoid(proj([h_k ; W1[x_{k-1}]]))``: the draft's per-position estimate
-    that position k survives verification, fed to the confidence scheduler.
-    ``h_k`` is the post-final-norm hidden the LM head reads (the reference's)."""
-
-    def __init__(self, hidden_size: int, markov_rank: int):
-        super().__init__()
-        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=True)
-
-    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor):
-        x = torch.cat([hidden.float(), markov_embed.float()], dim=-1)
-        return torch.sigmoid(
-            torch.nn.functional.linear(
-                x, self.proj.weight.float(), self.proj.bias.float()
-            )
-        ).squeeze(-1)
-
-
 class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
     Markov head + confidence head)."""
 
-    # The proposer plans MLA persistent decode metadata only for MLA drafts.
+    # Per-row MHA decode; its tables are built in `prepare_paged_block`.
     block_attention_is_mla = False
 
     weights_mapping: ClassVar[dict[str, str]] = {
@@ -413,13 +442,13 @@ class MiniMaxM3DSpark(DSparkDraftModel):
 
     def __init__(self, atom_config: "Config", layer_offset: int = 0) -> None:
         super().__init__()
+        if atom_config.decode_context_parallel_size > 1:
+            raise NotImplementedError(
+                "The MiniMax-M3.1 DSpark draft does not support DCP."
+            )
         config = atom_config.hf_config
         self.hf_config = config
         quant_config = _draft_quant_config(config)
-        # The checkpoint says `swigluoai`, and the reference draft MLP is
-        # SwiGLU-OAI whatever the field says; transformers' MiniMaxM3VLTextConfig,
-        # which this config loads as, rewrites the field to its `silu` default.
-        config.hidden_act = "swigluoai"
 
         self.hidden_size = config.hidden_size
         self.noise_token_id = int(config.dspark_noise_token_id)
@@ -451,10 +480,10 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
-        # Read by DSparkProposer: the window its per-row tables apply.
+        # 0 or absent: every block row attends the whole context.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
         self.confidence_head = (
-            DSparkConfidenceHead(self.hidden_size, self.markov_rank)
+            DSparkConfidenceHead(self.hidden_size, self.markov_rank, bias=True)
             if getattr(config, "enable_confidence_head", False)
             else None
         )
@@ -462,6 +491,16 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         # Bound by share_with_target(); the checkpoint ships neither.
         self.embed_tokens = None
         self.lm_head = None
+
+        # `prepare_paged_block`'s buffers, sized here and allocated on its
+        # first call.
+        self.max_num_seqs = atom_config.max_num_seqs
+        self.block_size = atom_config.kv_cache_block_size
+        self._bt16 = None
+
+    @property
+    def first_attention_layer_num(self) -> int:
+        return self.layers[0].self_attn.kv.layer_num
 
     # ---- weight-loading hooks ---------------------------------------------
 
@@ -486,11 +525,109 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         the last one through the target's final norm instead (the NeMo recipe's
         post-norm feature) dropped GSM8K acceptance from 51% to 39%.
         """
-        return self.hidden_norm(_linear_out(self.fc(aux_concat)))
+        return self.hidden_norm(linear_out(self.fc(aux_concat)))
 
     @property
     def context_layers(self):
         return self.layers
+
+    def _alloc_block_rows(self, P: int, T: int, device) -> None:
+        """The first call is the warmup, ahead of any capture: these addresses
+        are the ones every recording bakes in."""
+        max_bs = self.max_num_seqs
+        self._alloc = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        self._alloc_host = torch.zeros(max_bs, dtype=torch.int32, pin_memory=True)
+        # Recorded after each copy out of `_alloc_host`; a fresh event has
+        # nothing to wait for.
+        self._alloc_copied = torch.cuda.Event()
+        # One row of slack past the last request: `_window_rows` reads every
+        # row as a P-wide window of this buffer.
+        self._bt16_flat = torch.zeros(
+            (max_bs + 1) * P, dtype=torch.int32, device=device
+        )
+        self._bt16 = self._bt16_flat[: max_bs * P].view(max_bs, P)
+        self._bt16_rows = torch.zeros(max_bs * T, P, dtype=torch.int32, device=device)
+        self._ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=device)
+        self._row_req = torch.arange(
+            max_bs, dtype=torch.int64, device=device
+        ).repeat_interleave(T)
+        self._sub_pages = torch.arange(
+            PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=device
+        )
+        self._start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=device)
+        self._ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=device)
+
+    def prepare_paged_block(
+        self,
+        attn_metadata,
+        block_tables: torch.Tensor,  # [running_bs, W] page ids (page-128)
+        block_positions: torch.Tensor,  # [running_bs, T]
+        slots: torch.Tensor,  # [running_bs, T] -- the block's KV write slots
+        ctx_lens: torch.Tensor,  # [running_bs] anchor + 1 + T
+        allocated_pages,  # [>= scheduled_bs] host, pages each request holds
+        scheduled_bs: int,
+    ) -> None:
+        """Per-row paged decode tables for the block.
+
+        The block is attended as ``running_bs * T`` independent q_len=1 decode
+        rows -- non-causal by construction -- each over its request's
+        ``[context | block]`` through a page-16 block table, the layout the
+        target's sparse decode kernels read. Everything lands in buffers sized at
+        ``max_num_seqs`` and is only sliced, so a captured block replays against
+        this step's numbers.
+
+        Block positions can run past the pages the scheduler has allocated for
+        the request (it allocates through the verify window, the block reaches
+        up to T past the accepted anchor). A table column that was never
+        allocated reads as page 0, which is some other request's page -- under
+        prefix caching, a prefix every request shares. Such positions are
+        neither written (slot -1) nor read (the row's context is capped at what
+        is allocated): their draft rows simply miss a few of their own keys.
+        """
+        running_bs, T = block_positions.shape
+        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
+        if self._bt16 is None or self._bt16.shape[1] != P:
+            self._alloc_block_rows(P, T, block_tables.device)
+
+        # Allocated tokens per request. At least one page: the warmup batch and
+        # the pad tail address page 0 by convention. The host can run a step
+        # ahead of the device, so the previous step's copy must have read the
+        # pinned buffer before it is rewritten.
+        self._alloc_copied.synchronize()
+        pages = self._alloc_host.numpy()[:running_bs]
+        n = min(len(allocated_pages), scheduled_bs)
+        pages[:n] = allocated_pages[:n]
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
+        alloc = self._alloc[:running_bs]
+        alloc.copy_(self._alloc_host[:running_bs], non_blocking=True)
+        self._alloc_copied.record()
+        alloc.mul_(self.block_size)
+
+        slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
+        # The rows' own lengths; `ctx_lens` is left as the proposer built it.
+        ctx_eff = self._ctx_eff[:running_bs]
+        torch.minimum(ctx_lens, alloc, out=ctx_eff)
+
+        bt16 = _page16_table(block_tables, self._bt16[:running_bs], self._sub_pages)
+        if running_bs > scheduled_bs:
+            # A pad row reads one page: page 0.
+            bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._sub_pages)
+
+        rows = running_bs * T
+        _window_rows(
+            self._bt16_flat,
+            ctx_eff,
+            block_positions.view(-1),
+            self._row_req[:rows],
+            self.sliding_window,
+            scheduled_bs * T,
+            self._start16[:rows],
+            self._bt16_rows[:rows],
+            self._ctx_rows[:rows],
+        )
+        attn_metadata.dspark_bt16_rows = self._bt16_rows[:rows]
+        attn_metadata.dspark_ctx_rows = self._ctx_rows[:rows]
 
     def forward_spec(self, input_ids, positions, num_draft):
         return self.head_and_sample(
