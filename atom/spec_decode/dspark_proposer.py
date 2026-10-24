@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -388,6 +389,28 @@ class DSparkProposer(Drafter):
         if self.draft_sampling is None or all_greedy or has_filter:
             return None, None
         return self._q_store, self._verify_row_base_buf.gpu[:bs]
+
+    def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
+        """Warm (and capture) the block with every row aimed at no q row.
+
+        The warmup runs the captured block directly, not through `propose`, so
+        it drafts through whatever destination row bases are staged. At startup
+        those are -1, but a recapture after a rollout sleep/wake finds the last
+        served step's bases there, and the synthetic batch would overwrite the
+        q of requests that still own those slots.
+        """
+        self._clear_draft_destinations(stream)
+        super().warmup_draft_graphs(build_context, stream, end_trace)
+
+    def _clear_draft_destinations(self, stream=None) -> None:
+        """Point every draft row at no q row, on the host and the device."""
+        if self.draft_sampling is None:
+            return
+        dest = self._draft_row_base_buf
+        dest.np[:] = -1
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            dest.gpu.fill_(-1)
+        self._draft_row_base_hi = 0
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

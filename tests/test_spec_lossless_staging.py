@@ -287,6 +287,26 @@ def test_a_propose_needs_a_staging_of_its_own(monkeypatch):
             prop._consume_staging()
 
 
+def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
+    """A recapture after a rollout sleep/wake warms the block directly, not
+    through propose; whatever bases the last served step staged must not
+    reach it, or the synthetic batch overwrites live requests' q."""
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["a", "b", "c"]))
+    assert any(base >= 0 for base in dest(prop)[:3])
+    seen = {}
+
+    def base_warmup(self, build_context, stream, end_trace=None):
+        seen["np"] = self._draft_row_base_buf.np.tolist()
+        seen["gpu"] = self._draft_row_base_buf.gpu.tolist()
+
+    monkeypatch.setattr(dspark_proposer.Drafter, "warmup_draft_graphs", base_warmup)
+    prop.warmup_draft_graphs(None, None)
+    assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
+    # The slot map is untouched: those requests still own their q rows.
+    assert {"a", "b", "c"} <= set(prop._q_slots._slot_of)
+
+
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
