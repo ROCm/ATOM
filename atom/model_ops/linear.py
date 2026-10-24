@@ -91,6 +91,30 @@ else:
     gemm_afp4wfp4 = None
 
 
+# The preshuffled MXFP4 GEMMs walk K in 256-wide steps and none of them masks a
+# tail: at a K that is not a multiple of 256 the last step reads the padded scale
+# columns and the bytes past each row, i.e. uninitialized memory, and the result
+# is garbage at an M that depends on what happens to be there. The triton
+# preshuffle kernel asserts on this at call time; the ASM `gemm_a4w4` does not.
+# A model with such a layer must zero-pad K to this multiple (Kimi-K3's dense
+# MLP does), so `process_weights_after_loading` refuses it at load instead.
+MXFP4_PRESHUFFLE_K_ALIGN = 256
+
+
+def check_mxfp4_preshuffle_k(prefix: str, weight: torch.Tensor) -> None:
+    """Raise if a preshuffled MXFP4 (fp4x2) weight's K would leave a tail."""
+    k = weight.shape[-1] * 2  # fp4x2 packs two K elements per byte
+    if k % MXFP4_PRESHUFFLE_K_ALIGN:
+        raise RuntimeError(
+            f"{prefix}: MXFP4 weight has K={k}, which is not a multiple of "
+            f"{MXFP4_PRESHUFFLE_K_ALIGN}. The preshuffled MXFP4 GEMMs do not "
+            "handle a K tail and would read uninitialized memory. Zero-pad this "
+            "layer's K to a multiple of 256 (see KimiMLP in "
+            "atom/models/kimi_k3/model.py), or set "
+            "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1."
+        )
+
+
 if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
@@ -1276,6 +1300,13 @@ class LinearBase(nn.Module):
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
+        if (
+            self.quant_type.value == QuantType.per_1x32.value
+            and self.params_dtype == dtypes.fp4x2
+            and self.weight.dim() == 2
+            and not use_fp4_non_shuffle_triton_gemm()
+        ):
+            check_mxfp4_preshuffle_k(getattr(self, "prefix", ""), self.weight)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type.value == QuantType.per_1x32.value and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
