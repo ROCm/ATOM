@@ -121,7 +121,9 @@ def make_scheduler(
         enable_prefix_caching=True,
         hash_block_size=4,
         compute_hash=BlockManager.compute_hash,
+        anchor_grids=[],
     )
+    manager.align_checkpoint_anchor = manager.anchor_grids.append
     # BlockManager's own chain walk (seed, algorithm, token slices).
     manager._hash_block_tokens = lambda seq, index: BlockManager._hash_block_tokens(
         manager, seq, index
@@ -140,6 +142,8 @@ def make_scheduler(
     scheduler.bind_block_manager(manager)
     scheduler.bind_block_manager(manager)
     assert connections == [checkpoints.store.spec]
+    # Once, on the chunk grid images are stored on (the rebind is a no-op).
+    assert manager.anchor_grids == [8]
     scheduler._min_load_tokens = 0
     return scheduler, checkpoints, adapter
 
@@ -297,14 +301,32 @@ def test_save_frontier_rescans_only_when_frontier_or_checkpoints_change(
     assert scheduler._save_frontier(seq) == 8
     assert len(calls) == scanned  # moves the store, but none of our boundaries
 
-    checkpoint(scheduler, checkpoints, seq, 16)  # a newer checkpoint publishes
+    checkpoint(scheduler, checkpoints, seq, 16)  # a later rung does not skip 8
+    assert scheduler._save_frontier(seq) == 8
+    assert len(calls) == scanned
+
+    scheduler._save_tracker[str(seq.id)] = [seq, 8]
     assert scheduler._save_frontier(seq) == 16
     assert len(calls) > scanned
     rescanned = len(calls)
 
     checkpoints.store.unindex(scheduler._boundary_hash(seq, 16))  # ours drops
-    assert scheduler._save_frontier(seq) == 8
+    assert scheduler._save_frontier(seq) == 0
     assert len(calls) > rescanned
+
+
+def test_each_checkpoint_rung_is_stored_before_a_later_one(monkeypatch):
+    """A same-length prompt can only load the chunk below its end."""
+    scheduler, checkpoints, _ = make_scheduler(monkeypatch)
+    seq = sequence(computed=24)
+    checkpoint(scheduler, checkpoints, seq, 8)
+    checkpoint(scheduler, checkpoints, seq, 16)
+    scheduler.update_state_after_alloc(seq)
+    [first] = scheduler.build_connector_meta().requests
+    assert first.native_state.boundary_tokens == 8
+    terminal(scheduler, first.save_operation)
+    [second] = scheduler.build_connector_meta().requests
+    assert second.native_state.boundary_tokens == 16
 
 
 def test_default_min_save_tokens_skips_a_short_prompt(monkeypatch):

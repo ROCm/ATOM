@@ -406,6 +406,10 @@ class BlockManager:
                 f"snapping to {snapped or 'off (0)'}."
             )
             self.state_checkpoint_interval_tokens = snapped
+        # The grid the prompt-end anchor is floored to: the hash block, unless
+        # an offload tier keeps checkpoints only on a coarser one
+        # (`align_checkpoint_anchor`).
+        self.checkpoint_anchor_grid = self.hash_block_size
 
         # Every Pool.STATE class. A tuple of one today — the sliding window
         # used to be the second member, back when it was a content-addressed
@@ -1000,8 +1004,8 @@ class BlockManager:
             return self._no_joint("no_chunk_size")
         # Floored to the grid everything below compares against, so the
         # covering-chunk check becomes true by construction rather than by
-        # luck. (`get_num_new_matched_tokens` withholds one token on a
-        # full-prompt hit, which takes the lookup off the grid.)
+        # luck. (A layout that withholds the last token of a full-prompt hit
+        # takes the lookup off the grid; see `_withholds_last_prompt_token`.)
         lmc_tokens = (lmc_tokens // chunk) * chunk
         if lmc_tokens <= hbm_boundary * hbs:
             return self._no_joint("lmcache_within_hbm")
@@ -2249,6 +2253,25 @@ class BlockManager:
         seq.state_fork_src = -1
         return True
 
+    def align_checkpoint_anchor(self, tokens: int) -> None:
+        """Put the prompt-end anchor on a multiple of `tokens`.
+
+        For an offload tier that stores a checkpoint only on its own grid:
+        LMCache MP keeps a state image only at a chunk boundary, so an anchor
+        off that grid is kept in HBM and never reaches the tier, and the next
+        turn finds nothing there. The anchor is the resume point of nearly
+        every continuation (see `_record_checkpoint_end`), and the 8192 ladder
+        is too coarse to stand in for it. On the grid it costs HBM less than
+        one grid of reuse.
+        """
+        tokens = int(tokens)
+        if tokens <= 0 or tokens % self.hash_block_size:
+            raise ValueError(
+                f"checkpoint anchor grid {tokens} is not a positive multiple of "
+                f"the hash block size {self.hash_block_size}"
+            )
+        self.checkpoint_anchor_grid = tokens
+
     def checkpoint_limit(self, seq: Sequence) -> int:
         """Rightmost prompt position any state class may checkpoint at, 0 none.
 
@@ -2469,6 +2492,10 @@ class BlockManager:
         # than merely getting no better. Capping costs the continuation at most
         # one block of reuse — the same trade `room` above already takes.
         end = min(end, (self._n_hash_blocks(seq) - 1) * self.hash_block_size)
+        # Floored after the cap, which is a hash-block position: a tier grid
+        # (`align_checkpoint_anchor`) need not contain it. Moving left keeps
+        # both tests above.
+        end -= end % self.checkpoint_anchor_grid
         if end > 0:
             seq.checkpoint_end_pos = end
 

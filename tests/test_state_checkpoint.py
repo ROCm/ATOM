@@ -1489,7 +1489,7 @@ class TestPagedCopyCheckpoint:
         bm._joint_chunk_tokens = chunk
         return bm
 
-    def _prompt_with_a_rung_at(self, bm, blocks: int):
+    def _prompt_with_a_rung_at(self, bm, blocks: int, tokens=None):
         """Run PROMPT once and leave one READY checkpoint `blocks` blocks in.
 
         Placed explicitly rather than by the ladder because the position
@@ -1497,7 +1497,7 @@ class TestPagedCopyCheckpoint:
         checkpoint filed under the LAST block is one no scan can ever look up.
         An interior rung is what a resume actually lands on.
         """
-        seq = self._admitted(bm, PROMPT)
+        seq = self._admitted(bm, tokens or PROMPT)
         # Publish the prefix, which is what makes its blocks lookup-able and so
         # what a second request's walk can match against.
         bm.hash_blocks(seq, seq.num_prompt_tokens)
@@ -1565,6 +1565,39 @@ class TestPagedCopyCheckpoint:
         assert second.offload_joint.boundary_tokens == 8 * BLOCK
         # The KV leg has real work: the walk stopped well below the boundary.
         assert hbm_hit * BLOCK < second.offload_joint.kv_tokens
+
+    def test_a_chunk_aligned_prompt_resent_whole_reaches_its_last_rung(self):
+        """The KV leg's ceiling decides which rungs are in reach.
+
+        A prompt of whole chunks keeps its rungs at its end and one block
+        before it, and only the second is lookup-able. A ceiling withheld by
+        one token and floored lands a whole chunk below that rung, so nothing
+        forms and the tier copy is never read. Left whole, the covering chunk
+        is the prompt's last one and the boundary is the rung.
+        """
+        tokens = list(range(48))  # 12 blocks, 3 chunks
+        chunk = 4 * BLOCK
+        bm = self._joint_bm(chunk=chunk)
+        first, h = self._prompt_with_a_rung_at(bm, 11, tokens)
+        victim = first.block_table[0]
+        bm.deallocate(first)
+        self._break_the_kv_chain_at(bm, victim)
+        bm.paged_state_checkpoints.unindex(h)
+        self._with_tier(bm, h)
+        self._reset_joint_counters(bm)
+
+        withheld = stateful_seq(tokens)
+        withheld.offload_joint.kv_prefix_tokens = (len(tokens) - 1) // chunk * chunk
+        bm.can_allocate(withheld)
+        assert bm.joint_boundaries == 0
+        assert bm.joint_skips.get("no_rung_above_hbm") == 1, bm.joint_skips
+
+        whole = stateful_seq(tokens)
+        whole.offload_joint.kv_prefix_tokens = len(tokens)
+        bm.can_allocate(whole)
+        assert bm.joint_boundaries == 1, bm.joint_skips
+        assert whole.offload_joint.boundary_tokens == 11 * BLOCK
+        assert whole.offload_joint.kv_tokens == len(tokens)
 
     def test_the_split_says_which_tier_the_state_leg_came_from(self):
         """`state_tier` is the only counter here that cannot be non-zero with
@@ -2532,6 +2565,36 @@ class TestPromptEndAnchor:
                 cuts = set(forward_on_the_ladder(bm, seq))
                 keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
                 assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+
+    def test_an_aligned_anchor_is_the_hash_anchor_floored_to_the_tier_grid(self):
+        """LMCache MP stores a state image only at a chunk boundary, so an
+        anchor off that grid stays in HBM and the next turn finds nothing in
+        the tier. Aligned, it moves left by less than one grid and stays a
+        position the cut and the keep agree on. Swept for the same reason as
+        the test above."""
+        grid = 2 * BLOCK
+        for n in range(BLOCK, 80):
+            tokens = list(range(1000 * n, 1000 * n + n))
+            plain = make_block_manager(demand_config())
+            ref = stateful_seq(tokens)
+            plain.can_allocate(ref)
+
+            bm = make_block_manager(demand_config())
+            bm.align_checkpoint_anchor(grid)
+            seq = stateful_seq(tokens)
+            bm.allocate(seq, bm.can_allocate(seq))
+            anchor = seq.checkpoint_end_pos
+            assert anchor == ref.checkpoint_end_pos // grid * grid, n
+            cuts = set(forward_on_the_ladder(bm, seq))
+            keeps = {p for p in range(1, n + 1) if bm.checkpointers_at(seq, p)}
+            assert not cuts - keeps, (n, sorted(cuts), sorted(keeps))
+            if anchor:
+                assert anchor in keeps, n
+
+    def test_an_anchor_grid_off_the_hash_grid_is_refused(self):
+        bm = make_block_manager(demand_config())
+        with pytest.raises(ValueError):
+            bm.align_checkpoint_anchor(BLOCK + 2)
 
     def test_the_anchor_does_not_displace_the_grid_rung(self):
         """Both are cut for, because they serve different classes.

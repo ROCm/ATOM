@@ -1546,9 +1546,9 @@ class GDNStateMixin(PoolRowsMixin):
 
 # ``GDNAttentionMetadataBuilder`` is shared, so the model name is the gate.
 # Turning PAGE copies on for every subclass would aim the image at MHA
-# regions. Qwen4Exp inherits the builder and keeps its state on a QSA pool,
-# which this geometry does not address. The set is only the hybrids whose
-# full attention is ordinary MHA: Qwen3-Next and Qwen3.5.
+# regions. Qwen4Exp is not in this set: its builder opts in on its own and
+# aims the image at the QSA arena. The set is only the hybrids whose full
+# attention is ordinary MHA: Qwen3-Next and Qwen3.5.
 #
 # These are text-config ``model_type`` values. A Qwen3.5 wrapper may report
 # ``qwen3_5_moe``; ``get_hf_text_config`` peels that to ``qwen3_5_moe_text``
@@ -1634,8 +1634,9 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
     def state_transfer(self) -> StateTransfer:
         """PAGE image for Qwen GDN hybrids; fork for everyone else.
 
-        Qwen4Exp inherits this builder and stays on fork: its model type is
-        not in the set, and its QSA pool is not the MHA destination below.
+        A model type outside the MHA set, including one this method sees as
+        ``qwen4_exp``, stays on fork. Qwen4ExpMetadataBuilder overrides this
+        and points the image at its QSA arena.
         Pipeline parallelism and RapidServe stay on fork so sizing does not
         refuse to start.
         """

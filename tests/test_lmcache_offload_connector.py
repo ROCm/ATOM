@@ -5672,6 +5672,32 @@ def test_engine_id_defaults_to_replica_zero():
     assert offcfg.lmcache_engine_id(SimpleNamespace()) == "atom-offload-dp0"
 
 
+def _server_config(port: int, dp_rank: int = 0, **kw):
+    cfg = _dp_config(dp_rank, **kw)
+    cfg.port = port
+    return cfg
+
+
+def test_engine_id_is_distinct_per_server_on_one_host():
+    # One TP1 server per GPU: every one is DP rank 0, and the lookup socket
+    # sits under one host directory. Without the port, the eight schedulers
+    # would connect to whichever server bound the shared path last.
+    ids = [offcfg.lmcache_engine_id(_server_config(22010 + gpu)) for gpu in range(8)]
+    assert len(set(ids)) == 8
+
+
+def test_engine_id_with_port_still_pairs_one_replica_and_splits_replicas():
+    same = {
+        offcfg.lmcache_engine_id(
+            _server_config(22010, 3, pp_size=2, tp_size=4, pp_rank=pp)
+        )
+        for pp in range(2)
+    }
+    assert same == {"atom-offload-p22010-dp3"}
+    ids = [offcfg.lmcache_engine_id(_server_config(22010, rank)) for rank in range(8)]
+    assert len(set(ids)) == 8
+
+
 def test_replica_world_size_counts_pp_and_tp_but_not_dp():
     # Worker ids index the replica-local PP x TP grid. Folding DP in would push
     # every replica but the first past lookup_server_worker_ids=[0], leaving
@@ -5940,6 +5966,59 @@ def test_a_joint_load_clamps_the_kv_leg_to_the_covering_chunk():
     assert (ok, reason) == (True, "joint_state_and_kv")
     assert (hbm, lmc, need) == (512, 1024, 512)
     assert ls.lmcache_cached_tokens == 1024
+
+
+def test_a_hybrid_full_prompt_hit_keeps_its_last_chunk(monkeypatch):
+    """A chunk-aligned prompt resent whole, with HBM empty and the tier holding
+    all of it. Withholding the last token would floor the KV leg's ceiling to
+    512, under the 704 rung that prompt kept, and no joint boundary could form.
+    A hybrid claims the joint boundary instead, so the hit stays whole."""
+    monkeypatch.setattr(
+        offcfg,
+        "build_lmcache_config",
+        lambda _config=None: SimpleNamespace(chunk_size=256),
+    )
+    monkeypatch.setattr(offcfg, "build_lmcache_metadata", lambda *_args: object())
+    sched = QwenOffloadScheduler(
+        SimpleNamespace(
+            kv_transfer_config={"kv_role": "offload"},
+            kv_cache_block_size=64,
+            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+        )
+    )
+    sched._min_load_tokens = 0
+    sched._lookup_client = _LookupClient(hit=768)
+    hybrid = SimpleNamespace(
+        id=7,
+        num_prompt_tokens=768,
+        token_ids=list(range(768)),
+        num_cached_tokens=0,
+        has_per_req_cache=True,
+        offload_joint=OffloadJointRecord(),
+    )
+
+    assert sched.get_num_new_matched_tokens(hybrid) == (768, True)
+    ls = sched._load_specs["7"]
+    assert ls.lmcache_cached_tokens == 768
+
+    # `_joint_kv_boundary` puts the boundary on the 704 rung and aims the KV
+    # leg at the chunk covering it; the claim stops at the boundary.
+    hybrid.offload_joint = OffloadJointRecord(boundary_tokens=704, kv_tokens=768)
+    ok, reason, start, lmc, _, _ = sched._decide_load_after_alloc(hybrid, ls)
+    assert (ok, reason, start, lmc) == (True, "joint_state_and_kv", 0, 768)
+    assert sched._claim_after_load(hybrid, 0, 768) == 704
+
+    # A request without per-request state claims what it loads, so it still
+    # leaves a token to compute: 768 -> 767 -> 512.
+    dense = SimpleNamespace(
+        id=8,
+        num_prompt_tokens=768,
+        token_ids=list(range(768)),
+        num_cached_tokens=0,
+        has_per_req_cache=False,
+    )
+    assert sched.get_num_new_matched_tokens(dense) == (512, True)
 
 
 def test_the_kv_leg_starts_where_the_claim_ended_not_where_the_hit_did():
