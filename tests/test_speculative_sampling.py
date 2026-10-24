@@ -35,6 +35,41 @@ def bonus_rows(widths):
     return ends - 1
 
 
+def draw(probabilities, rows):
+    """`rows` ids drawn from the two-token distribution ``probabilities``."""
+    return (torch.rand(rows, device="cuda") >= probabilities[0]).to(torch.int32)
+
+
+def two_token_batch(probabilities, drafts, width):
+    """`rejection_sample` arguments for equal-width requests whose every
+    verification row scores ``probabilities``, drafting ``drafts``.
+
+    The accept rule is the only thing left varying between the two arms below,
+    so both take this same batch and add their own `draft_probs`.
+
+    ``target_logits`` is raw LOGITS here -- `rejection_sample` builds
+    `p = softmax(logits / T)` itself, because ATOM's unfiltered verify draw
+    goes through a fused sampler that never forms probabilities to borrow.
+    """
+    rows = drafts.numel()
+    batch = rows // width
+    ids, logits_rows = verify_stream(drafts.tolist(), [width] * batch)
+    return {
+        "input_ids": ids,
+        "target_logits_indices": logits_rows,
+        "num_spec_steps": width,
+        "cu_num_draft_tokens": torch.arange(
+            width, rows + 1, width, device="cuda", dtype=torch.int32
+        ),
+        "target_logits": probabilities.log().expand(rows, -1).contiguous(),
+        "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
+        "bonus_logits_indices": bonus_rows([width] * batch),
+        # The ratio path's q rows, flat: request b's start at b * width.
+        "draft_probs_row_base": torch.arange(batch, device="cuda", dtype=torch.int32)
+        * width,
+    }
+
+
 def test_verification_parameters_follow_ragged_request_rows(monkeypatch):
     observed = {}
 
@@ -191,3 +226,89 @@ def test_target_prefixes_cover_every_ragged_acceptance_length(stochastic):
     # The anchor is the row the last emitted token was sampled at.
     starts = [sum(w + 1 for w in widths[:i]) for i in range(len(widths))]
     assert anchors.tolist() == [s + a for s, a in zip(starts, accepts)]
+
+
+@gpu
+def test_ratio_acceptance_emits_the_target_law_from_a_draft_that_drew_another():
+    """q deliberately != p: the emitted token still carries the TARGET's law.
+
+    This is the losslessness claim, and it is only true of a draft token drawn
+    from the q the kernel is handed. Pinning the draft to one id instead
+    measures that id's conditional accept rate, `min(1, p0/q0) = 0.778`, and
+    the test then reads as a kernel failure for a reason that is in the
+    harness -- so the drafts are DRAWN from q, and armed below to say so.
+
+    Both halves are asserted because they fail separately: the marginal at
+    position 0 catches a residual that does not correct the accept bias, and
+    the law at position 1 among the rows that got there catches a chain whose
+    later positions are conditioned on the accept decision before them.
+    """
+    torch.manual_seed(4471)
+    n = 20000
+    p = torch.tensor([0.7, 0.3], device="cuda")
+    q = torch.tensor([0.9, 0.1], device="cuda")
+    drafts = draw(q, n * 2)
+    # Armed: a proposal that happened to be p would make the ratio rule accept
+    # everything and prove nothing about the residual.
+    torch.testing.assert_close(
+        torch.bincount(drafts.long(), minlength=2).float() / drafts.numel(),
+        q,
+        rtol=0,
+        atol=0.015,
+    )
+    output, (accepted, _, _) = rejection_sample(
+        **two_token_batch(p, drafts, 2),
+        draft_probs=q.expand(n * 2, -1).contiguous(),
+        temperatures=torch.ones(n, device="cuda"),
+    )
+    marginal = torch.bincount(output[:, 0].long(), minlength=2).float() / n
+    torch.testing.assert_close(marginal, p, rtol=0, atol=0.015)
+    # Position 1 exists for every request that got past position 0, whether it
+    # holds the accepted draft or the residual correction.
+    reached = output[accepted >= 1, 1].long()
+    assert (reached >= 0).all()
+    conditional = torch.bincount(reached, minlength=2).float() / reached.numel()
+    torch.testing.assert_close(conditional, p, rtol=0, atol=0.015)
+
+
+@gpu
+@pytest.mark.parametrize("q0", (0.9, 0.7, 0.3))
+def test_ratio_acceptance_accepts_at_least_as_often_as_exact_match(q0):
+    """The PR's motivation, made testable: same drafts, same target, two rules.
+
+    Exact match accepts a draft only when the target's own draw repeats it,
+    `sum_x q(x) p(x)`; the ratio rule accepts `sum_x min(p(x), q(x))`, which is
+    never smaller for any q. Both arms get the SAME sampled drafts, so this
+    compares the accept rules alone -- it does not compare against the greedy
+    proposal that ships today, which is a different and much stronger baseline.
+    """
+    torch.manual_seed(1783)
+    n = 30000
+    p = torch.tensor([0.7, 0.3], device="cuda")
+    q = torch.tensor([q0, 1 - q0], device="cuda")
+    drafts = draw(q, n * 2)
+    batch = two_token_batch(p, drafts, 2)
+    _, (ratio_accepted, _, _) = rejection_sample(
+        **batch,
+        draft_probs=q.expand(n * 2, -1).contiguous(),
+        temperatures=torch.ones(n, device="cuda"),
+    )
+    # The same drafts against the target's own draw, which is what the default
+    # path verifies by equality.
+    _, (exact_accepted, _, _) = rejection_sample(
+        **batch, draft_probs=None, target_token_ids=draw(p, n * 2)
+    )
+    ratio_rate = torch.minimum(p, q).sum().item()
+    exact_rate = (p * q).sum().item()
+    # Width 2 and both positions independent, so the mean accepted count is
+    # `a + a**2` for a per-position acceptance of `a`.
+    measured = torch.tensor(
+        [ratio_accepted.float().mean().item(), exact_accepted.float().mean().item()]
+    )
+    torch.testing.assert_close(
+        measured,
+        torch.tensor([ratio_rate + ratio_rate**2, exact_rate + exact_rate**2]),
+        rtol=0,
+        atol=0.025,
+    )
+    assert measured[0] >= measured[1]

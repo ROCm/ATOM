@@ -25,7 +25,7 @@ ATOM (AiTer Optimized Model) wraps AITER kernels with model-level abstractions f
 | `ParallelLMHead` | `embed_head.py` | `tgemm.mm` + `tensor_model_parallel_all_gather` | LM output head |
 | `RotaryEmbedding` | `rotary_embedding.py` | `aiter.rope_cached_positions_2c_fwd_inplace` | Rotary position embedding |
 | `Sampler` | `sampler.py` | `aiter.mixed_sample_outer_exponential`, `aiter.ops.triton.topk.topk`, `aiter.ops.triton.softmax.softmax` | Token sampling |
-| `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel` | Speculative decoding |
+| `RejectionSampler` | `rejection_sampler.py` | Triton `rejection_greedy_sample_kernel`, `_ratio_*` kernels | Speculative decoding |
 
 ## AITER integration overview
 
@@ -461,12 +461,13 @@ def forward(self, logits, temperatures) -> sampled_tokens:
 
 ### `RejectionSampler` (`rejection_sampler.py`)
 
-Implements rejection sampling for speculative decoding (MTP). Given draft token IDs and target model logits:
+Implements rejection sampling for speculative decoding (MTP, EAGLE, DSpark). Given the drafted token IDs, the target logits at each draft position and the bonus token sampled at each request's last row, it accepts each request's drafts until the first rejection and returns `(output_token_ids, verdict)`, where `verdict` is `[accepted, rejected, anchor row]` per request. One of three rules runs per launch:
 
-1. Computes `target_argmax = target_logits.argmax(dim=-1)`.
-2. Runs a Triton kernel `rejection_greedy_sample_kernel` that sequentially compares draft tokens against target argmax, accepting until first mismatch.
-3. On full acceptance, appends the bonus token.
-4. Returns `(output_token_ids, num_bonus_tokens)`.
+1. **Exact match** (default): a draft is accepted iff it equals the target's own token at that row — the lowest-id argmax for greedy requests (`topk_select(..., tie="low")`), the target's temperature/top-k/top-p draw (`Sampler.sample_verification_tokens`) otherwise. On mismatch the target's token is emitted. Kernel: `rejection_greedy_sample_kernel`.
+2. **Probability ratio** (`ATOM_SPEC_LOSSLESS_SAMPLING=1`, DSpark drafts sampled from `q`): accept iff `u * q(x) < p(x)` with `p = softmax(logits / T)`; on rejection draw from `relu(p - q)` by an exponential race over the vocab. `p` is never materialized: per-tile softmax statistics (`softmax_tiles.py`) give `p(x)` at the drafted id, and only a rejecting row is read across the vocab again. Greedy rows in the same batch take exact match. Kernels: `_ratio_stats_kernel`, `softmax_combine_kernel`, `_ratio_accept_kernel`, `_ratio_residual_race_kernel`, `_ratio_residual_pick_kernel`. The `q` rows come from `dspark_markov_sample` (`dspark_markov_sample.py`), which draws each draft position from `softmax((base + W1[x_{k-1}] W2^T) / T)` and writes that row into a persistent per-request store.
+3. **Synthetic** (`--spec-decode-acceptance-length` / `-rate`): forces a configured acceptance curve for benchmarking, ignoring the real comparison.
+
+All randomness is Philox keyed on SPMD step counters, so every TP rank draws the same coins.
 
 ## Fused kernel chains
 

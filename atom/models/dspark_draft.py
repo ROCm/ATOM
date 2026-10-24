@@ -25,14 +25,83 @@ half. The steps line up one for one and not one of them is the same computation
 -- which is why the seam is here, above the per-layer write, and not inside it.
 """
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from atom.model_ops.sampling_scratch import SamplingScratch
+
+
+@dataclass(frozen=True)
+class DraftSampling:
+    """Everything the block sampler needs to draw -- and publish -- a real q.
+
+    Bound once, at drafter init, and never rebound: the block head is
+    cudagraph-captured (``DSparkProposer._declare_draft_graphs``,
+    ``capture_epilogue=True``), so every address here is baked into the
+    recording. That is also why the per-step seed and row bases are device
+    tensors rather than python ints: their values are refreshed outside it.
+
+    The per-row tensors are sized at ``max_num_seqs``; the block runs at
+    ``running_bs <= max_num_seqs`` and slices.
+    """
+
+    #: [slots * T, V] fp32 -- q, the distribution each draft token was drawn
+    #: from, one block of T rows per live request. Read a step later by the
+    #: accept kernel, so it outlives the pass and cannot live in the graph's
+    #: private pool.
+    q_store: torch.Tensor
+    #: [max_bs] int32, the first ``q_store`` row each batch row writes; block
+    #: position k goes to row ``base + k``. Negative writes nothing.
+    q_row_base: torch.Tensor
+    #: [max_bs] fp32, pre-clamped away from 0 (``SAMPLER_EPS``).
+    temperatures: torch.Tensor
+    #: [max_bs] int32, nonzero where the draw is an argmax -- i.e. where the
+    #: temperature was at or below ``SAMPLER_EPS`` before the clamp, the same
+    #: predicate ``Sampler`` itself tests.
+    greedy_mask: torch.Tensor
+    #: [1] int32, the Philox key. Must hold the same value on every TP rank.
+    seed: torch.Tensor
+    #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),
+    #: so the draft step allocates nothing and the profiling run sees it.
+    scratch: "SamplingScratch"
 
 
 class DSparkDraftModel(nn.Module):
     """What a DSpark draft model must provide to ``DSparkProposer``."""
 
     supports_block_graph = True
+
+    #: Does this flavor's ``_sample_block`` branch on ``draft_sampling`` and
+    #: draw from, and publish, a real q? An explicit class flag
+    #: rather than a ``hasattr(head, "sample_next_q")`` probe:
+    #: ``DSparkMarkovHead`` is a name carried by two independent classes, so a
+    #: duck-typed probe would arm the other flavor the day its head grew one.
+    supports_lossless_draft = False
+
+    #: Set by ``bind_draft_sampling`` when lossless speculative sampling is on;
+    #: None keeps the greedy block sampler. A class default because every
+    #: flavor's ``_sample_block`` reads it.
+    draft_sampling: "DraftSampling | None" = None
+
+    def bind_draft_sampling(self, sampling: "DraftSampling | None") -> None:
+        """Hand this model the buffers its block sampler draws into.
+
+        Called once from ``DSparkProposer.__init__``, before any warmup or
+        capture, so the sampled branch is the one that gets JITed and recorded.
+        Switching it per step would not work: the branch is python, and a
+        captured graph holds whichever side was taken at capture.
+        """
+        if sampling is not None and not self.supports_lossless_draft:
+            raise ValueError(
+                f"{type(self).__name__} does not declare supports_lossless_draft; "
+                "binding draft sampling buffers to it would publish a q the "
+                "block sampler never draws from"
+            )
+        self.draft_sampling = sampling
 
     def prepare_block(self, metadata_builder, num_draft, scheduled_bs, running_bs):
         """Mask padded writes for models whose draft pass mutates private KV."""

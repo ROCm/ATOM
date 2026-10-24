@@ -626,6 +626,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DSPARK_FUSED_MARKOV_SAMPLE": lambda: (
         os.getenv("ATOM_DSPARK_FUSED_MARKOV_SAMPLE", "1") == "1"
     ),
+    # Lossless speculative sampling: draw the DSpark draft block from
+    # softmax(logits / T) and accept with the probability-ratio rule
+    # (`u * q < p`, residual relu(p - q) on rejection) instead of proposing
+    # greedily and accepting only on exact equality with the target's own draw.
+    # Both halves or neither: a ratio rule over a greedy delta q is exact match
+    # again, and a sampled draft under exact-match acceptance matches the
+    # target's draw less often than a greedy one does.
+    #
+    # Defaults off, deliberately: it changes the emitted token draw (both rules
+    # are target-exact, but they are not the same draw), and the house
+    # convention is that a behaviour-changing flag defaults off.
+    #
+    # What stays as with the flag off is the accept rule, not the draft path.
+    # A batch with top-k/top-p on any row keeps exact-match acceptance against
+    # the target's filtered draw, and an all-greedy batch keeps the exact-match
+    # kernel; a greedy row of a mixed batch is matched exactly (lowest-id
+    # argmax) inside the ratio kernel, so a greedy request's tokens do not
+    # depend on its batch. The draft, however, always runs the de-fused sampled
+    # block once the flag is on: greedy rows draft the same argmax ids as the
+    # fused greedy kernel (and publish no q), but at the sampled block's step
+    # latency, so greedy traffic pays that latency too.
+    #
+    # Costs what ATOM_DSPARK_FUSED_MARKOV_SAMPLE above exists to avoid: q is a
+    # full-vocab fp32 row per draft position and has to cross the step
+    # boundary, so the draft writes it into a persistent store of
+    # 2 x max_num_seqs per-request row blocks -- 2 * max_num_seqs * T * V * 4
+    # bytes, allocated before the KV cache is sized (1.25 GiB at max_num_seqs=64,
+    # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The two
+    # ops' per-step scratch is allocated once alongside it.
+    #
+    # Only a draft model that declares `supports_lossless_draft` honours it;
+    # any other flavor silently keeps the greedy pair. Mutually exclusive with
+    # ATOM_ENABLE_RELAXED_MTP (refused at drafter construction). Not used under
+    # PP or PCP, or on a P/D producer (which drafts for handoff and verifies
+    # nothing); those warn and keep the greedy pair. Read at drafter
+    # construction, so it must be set before the server starts.
+    "ATOM_SPEC_LOSSLESS_SAMPLING": lambda: (
+        os.getenv("ATOM_SPEC_LOSSLESS_SAMPLING", "0") == "1"
+    ),
     # Replicate the vocab embedding on every TP rank (full table per rank, purely
     # local lookup) instead of TP-sharding it — eliminates the post-embedding
     # all-reduce. Applies to BOTH the main/target model and the speculative draft

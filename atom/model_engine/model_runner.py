@@ -2652,6 +2652,22 @@ class ModelRunner:
         counts[group.indices["temperatures"]] = bs
         counts[group.indices["top_ks"]] = top_k_count
         counts[group.indices["top_ps"]] = top_p_count
+        # The draft's copy of the same facts, plus where its q goes, staged into
+        # the same publication so the upload stays a single batched H2D and is
+        # covered by this forward's staging window. A no-op on every drafter but
+        # a DSpark one with lossless sampling.
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None:
+            drafter.stage_draft_sampling_host(
+                batch,
+                bs,
+                group,
+                has_filter=bool(needs_topk or needs_topp),
+                # A dummy forward's and an align-only propose's drafts are
+                # dropped, so they must not claim q slots or write q.
+                drafts_verifiable=not batch.is_dummy_run
+                and not self._is_pure_middle_chunk(batch),
+            )
         if publication_group is None:
             group.publish(counts)
         temperatures = temp_buffer.gpu[:bs]
@@ -3250,8 +3266,22 @@ class ModelRunner:
 
             bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
             target_logits = torch.index_select(logits, 0, target_logits_indices)
+            # Lossless acceptance: compare against the q the draft actually drew
+            # from (`u * q < p`) instead of requiring the draft token to equal
+            # the target's own draw. Resolved before the verification sample
+            # below, because it decides whether that sample is needed at all.
+            # An all-greedy batch always verifies by exact match, so it never
+            # asks. `top_ks`/`top_ps` are None exactly when no row filters.
+            draft_probs = draft_probs_row_base = ratio_scratch = None
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and not all_greedy:
+                draft_probs, draft_probs_row_base, ratio_scratch = (
+                    drafter.lossless_verify_inputs(
+                        bs, has_filter=top_ks is not None or top_ps is not None
+                    )
+                )
             target_token_ids = None
-            if not all_greedy:
+            if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
                 target_token_ids = self.sampler.sample_verification_tokens(
                     target_logits,
                     spec_decode_metadata.cu_num_draft_tokens,
@@ -3274,6 +3304,10 @@ class ModelRunner:
                 target_logits,
                 bonus_token_ids,
                 target_token_ids=target_token_ids,
+                draft_probs=draft_probs,
+                draft_probs_row_base=draft_probs_row_base,
+                temperatures=temperatures,
+                ratio_scratch=ratio_scratch,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16

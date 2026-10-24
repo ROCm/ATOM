@@ -1,0 +1,245 @@
+"""Which rows of the persistent draft-q store belong to which request.
+
+Lossless speculative sampling verifies each draft token against the q it was
+drawn from, a step after the propose that drew it. The scheduler reorders the
+batch in between and may run prefill-only steps that propose for other
+requests, so q cannot live at a batch slot: each request owns a block of
+``rows_per_slot`` rows in the store for as long as it keeps drafting.
+
+Pure host bookkeeping, deliberately free of torch and aiter, so the policy is
+testable without a device. ``DSparkProposer`` owns a `DraftQStaging`, which
+owns the `DraftQSlots` and writes the row bases the draft head writes through
+and the accept kernel reads through.
+"""
+
+import logging
+
+import numpy as np
+
+logger = logging.getLogger("atom")
+
+
+class DraftQSlots:
+    """req_id -> persistent q slot, least-recently-drafted first.
+
+    Release is by expiry. A worker is handed batches, never departures, so a
+    finished, aborted or preempted request keeps its slot until the free list
+    runs out and it is the stalest entry. Expiry is safe whoever the victim is:
+    the victim drops out of the map, its next verify gets the -1 sentinel, and
+    the accept kernel rejects its first draft and draws that token from the
+    target alone. The output distribution is unchanged; the cost is one step of
+    speculation for one request.
+
+    The victim is usually a dead request, but nothing guarantees it. A request
+    waiting through a long prefill-first burst is not refreshed while more than
+    ``num_slots - live`` new ids claim slots, which a stream of prefill-only
+    (``max_tokens=1``) requests can do. ``evictions`` counts expiries of
+    entries that were drafted for, so a live-eviction rate shows up as a
+    number rather than as an unexplained acceptance dip.
+    """
+
+    def __init__(self, num_slots: int, rows_per_slot: int):
+        if num_slots <= 0 or rows_per_slot <= 0:
+            raise ValueError(
+                f"need positive slots and rows, got {num_slots} x {rows_per_slot}"
+            )
+        self.num_slots = num_slots
+        self.rows_per_slot = rows_per_slot
+        # A plain dict is insertion-ordered; `claim_bases` re-inserts, so the
+        # first key is always the least recently drafted request.
+        self._slot_of: dict = {}
+        self._free = list(range(num_slots - 1, -1, -1))
+        self.evictions = 0
+        self._next_eviction_log = 1
+
+    def __len__(self) -> int:
+        return len(self._slot_of)
+
+    def __contains__(self, req_id) -> bool:
+        return req_id in self._slot_of
+
+    def verify_bases(self, req_ids, out) -> None:
+        """Write each request's first q row into ``out``, or -1 if it has none.
+
+        Must run before `claim_bases` for the same batch, which may hand the
+        slot of a request outside the batch to a new one. Both run on the host
+        before the forward; the verify's read is ordered before the propose
+        that rewrites a slot because both run on the one compute stream.
+        """
+        rows = self.rows_per_slot
+        get = self._slot_of.get
+        out[: len(req_ids)] = [
+            -1 if slot is None else slot * rows for slot in map(get, req_ids)
+        ]
+
+    def claim_bases(self, req_ids, out, skip=None) -> None:
+        """Give every request a slot to draft into and write its first row.
+
+        ``skip`` (optional, one bool per request) marks requests whose q is
+        never read; they claim nothing and get -1.
+
+        A request that already owns a slot keeps it and becomes the most
+        recently drafted. The batch's own entries are taken out of the map
+        before anything is claimed, so a new request can only expire a request
+        outside this batch: every member keeps its slot, and the slots handed
+        out are distinct. That always leaves enough to claim from, since the
+        free list plus the entries left in the map hold ``num_slots`` minus the
+        members' own slots, and ``num_slots`` is at least the batch size.
+        """
+        rows = self.rows_per_slot
+        slots = self._slot_of
+        if skip is not None:
+            keep = [i for i, s in enumerate(skip) if not s]
+            out[: len(req_ids)] = [-1] * len(req_ids)
+            req_ids = [req_ids[i] for i in keep]
+        owned = [slots.pop(req_id, None) for req_id in req_ids]
+        claimed = [self._claim() if slot is None else slot for slot in owned]
+        # Re-inserted last, in batch order: the freshest entries.
+        slots.update(zip(req_ids, claimed))
+        if skip is None:
+            out[: len(req_ids)] = [slot * rows for slot in claimed]
+        else:
+            for i, slot in zip(keep, claimed):
+                out[i] = slot * rows
+
+    def _claim(self) -> int:
+        if self._free:
+            return self._free.pop()
+        self.evictions += 1
+        if self.evictions >= self._next_eviction_log:
+            # Powers of two: visible from the first one on, quiet under churn.
+            self._next_eviction_log *= 2
+            logger.info(
+                "draft q slots: %d expiries so far (%d slots); an expired "
+                "request that is still running rejects its next first draft",
+                self.evictions,
+                self.num_slots,
+            )
+        return self._slot_of.pop(next(iter(self._slot_of)))
+
+
+class DraftQStaging:
+    """The host half of a lossless draft step: what to stage, row by row.
+
+    Writes, into numpy views of the proposer's pinned staging buffers, the
+    inputs the captured draft head and the ratio verify read: per-row draft
+    temperature and greedy mask, the Philox step, each row's q destination
+    and each request's verify q row. `stage` returns how many leading rows of
+    each buffer to publish; the proposer turns those into its publication
+    counts. Free of torch and aiter, so the policy is testable on any host.
+    """
+
+    def __init__(
+        self,
+        slots: DraftQSlots,
+        *,
+        temperatures,
+        greedy_mask,
+        seed,
+        dest_row_base,
+        verify_row_base,
+        greedy_threshold: float,
+    ):
+        self.slots = slots
+        self._temps = temperatures
+        self._mask = greedy_mask
+        self._seed = seed
+        self._dest = dest_row_base
+        self._verify = verify_row_base
+        # `SAMPLER_EPS`: a row at or below it is greedy, as `Sampler` decides.
+        self._eps = greedy_threshold
+        self._step = 0
+        # Leading destination rows that may still name a slot.
+        self._dest_hi = 0
+        # Generations of `stage` and of the proposes consuming it.
+        self._staged = 0
+        self._consumed = 0
+
+    def stage(self, batch, bs: int, *, has_filter: bool, drafts_verifiable: bool):
+        """Stage one step and return ``{buffer: rows to publish or None}``.
+
+        ``has_filter``: some row carries top-k or top-p, so the verify keeps
+        exact match for the whole batch and the batch drafts greedily.
+
+        ``drafts_verifiable``: this step's propose emits drafts a later verify
+        may read. False for a dummy forward and an align-only middle chunk:
+        those claim no slot and write no q, so their ids (warmup's 0..n-1, the
+        DP dummy's -1) never enter the slot map.
+        """
+        # The Philox key. A plain SPMD counter, so every TP rank reaches the
+        # same number without exchanging it.
+        self._seed[0] = self._step
+        self._step = (self._step + 1) & 0x7FFFFFFF
+        self._staged += 1
+        req_ids = batch.req_ids[:bs]
+        # Verify bases before claims: a claim may hand a slot to a new request,
+        # and a request's verify must still read the slot its drafts came from.
+        if batch.is_dummy_run:
+            self._verify[:bs] = -1
+        else:
+            self.slots.verify_bases(req_ids, self._verify)
+        # Every row the block runs must name a destination, the pad rows up to
+        # `running_bs` included, and a pad row left holding a larger previous
+        # batch's base would write its q into a live request's slot. So clear
+        # back down to wherever the last claim reached.
+        hi = max(bs, self._dest_hi)
+        if drafts_verifiable and bs:
+            # Per request, rows whose q nobody reads claim no slot and write no
+            # q (the draft still emits the argmax for them):
+            # * a greedy request: its verify is exact match against the target
+            #   argmax. Its own temperature, not the batch's draft mode -- a
+            #   filtered batch drafts greedily, but its sampled requests' q is
+            #   read once the batch is unfiltered again;
+            # * a request still mid-prompt in a mixed prefill batch: its drafts
+            #   are dropped, like a whole align-only batch's.
+            skip = batch.temperatures[:bs] <= self._eps
+            final_chunk = getattr(batch, "is_final_chunk", None)
+            if final_chunk is not None:
+                skip |= ~np.asarray(final_chunk[:bs], dtype=bool)
+            self.slots.claim_bases(req_ids, self._dest, skip if skip.any() else None)
+            self._dest[bs:hi] = -1
+            self._dest_hi = bs
+        else:
+            self._dest[:hi] = -1
+            self._dest_hi = 0
+        counts = {
+            "seed": 1,
+            "temperatures": bs or None,
+            "greedy_mask": bs or None,
+            "verify_row_base": bs or None,
+            "dest_row_base": hi or None,
+        }
+        if not bs:
+            return counts
+        # The clamp `prepare_sample` applies to the target's copy, so the two
+        # divide by the same number row for row and no row divides by zero.
+        np.maximum(batch.temperatures[:bs], self._eps, out=self._temps[:bs])
+        if has_filter:
+            # Draft the whole batch greedily. A greedy row's draw is its
+            # logits' argmax and the q it publishes is the exact delta on that
+            # id (stage 3 of `dspark_markov_sample`), which is sound under
+            # either accept rule -- this batch's drafts may meet an unfiltered
+            # verify next step. The temperature plays no part in either.
+            self._mask[:bs] = 1
+        else:
+            # The predicate `Sampler` tests, so a row cannot be greedy to the
+            # target and stochastic to the draft.
+            self._mask[:bs] = batch.temperatures[:bs] <= self._eps
+        return counts
+
+    def consume(self) -> None:
+        """Claim the latest staging for the propose about to run, or refuse.
+
+        A propose that skipped `stage` would draft through the previous step's
+        destination rows, into slots other requests may own by now.
+        """
+        assert self._staged != self._consumed, (
+            "propose without a fresh stage_draft_sampling_host: the q row bases "
+            "are the previous step's"
+        )
+        self._consumed = self._staged
+
+    def clear_destinations(self) -> None:
+        """Point every host-side destination row at no q row."""
+        self._dest[:] = -1
+        self._dest_hi = 0

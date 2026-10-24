@@ -1,9 +1,14 @@
+from math import prod
+
 import torch
 import triton
 import triton.language as tl
 from aiter import topk_select
 from torch import nn
 
+from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.sampling_scratch import SamplingScratch, take
+from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
 
@@ -47,6 +52,510 @@ def _synthetic_generator(device: torch.device) -> torch.Generator:
         generator = torch.Generator(device=device)
         _SYNTHETIC_GENERATORS[device] = generator
     return generator
+
+
+# ---- probability-ratio verification ----------------------------------------
+#
+# Accept draft x at a position iff `u * q(x) < p(x)`, and on the first rejection
+# draw the replacement from the residual `relu(p - q)` (normalized). p is the
+# target's `softmax(logits / T)`, q the distribution the draft drew x from.
+#
+# Nothing `[rows, V]` is materialized for p. Every (draft row, V tile) program
+# reduces its tile of the row to the softmax statistics
+# (`softmax_tiles`) plus the row's raw-logit argmax; the accept walk then needs
+# p at one id per position, `exp(l(x) / T - max) / Z`, and only a rejecting row
+# is read across V again, by the residual race.
+#
+# Residual: an exponential race rather than a CDF walk. `argmax_v r(v) / E_v`
+# with i.i.d. `E_v ~ Exp(1)` selects v with probability `r(v) / sum r`, so the
+# residual needs no normalizer, no prefix sum, and no agreement between two
+# reductions' rounding; tiles race in parallel and a cross-tile max decides.
+#
+# Greedy rows (temperature at or below SAMPLER_EPS) take exact match inside the
+# same launch: accept iff the draft is the target's lowest-id argmax, emit that
+# argmax on rejection. That is `rejection_greedy_sample_kernel`'s rule, so a
+# greedy request's tokens do not depend on whether sampled requests share its
+# batch. The ratio rule would not give that: on a bf16 logit tie p is 0.5/0.5,
+# not a delta.
+#
+# Randomness: Philox via `tl.rand`, keyed on a per-step SPMD counter, so every
+# TP rank draws the same uniforms. The key's high word names the purpose --
+# 0 is the draft's noise (`dspark_markov_sample`), and the two below are the
+# accept coins and the residual race -- so no two consumers can ever share a
+# stream, whatever their step counters do. That holds for 64-bit offsets too:
+# `tl.rand` goes through `randint4x`, which always splits the offset into two
+# 32-bit Philox counters, so `philox` keeps the seed's high word as the second
+# key word (only a direct 64-bit-counter `philox` call would drop it). Pinned by
+# `test_the_key_purpose_word_separates_streams_at_any_offset_width`.
+_RATIO_ACCEPT_KEY = 1 << 32
+_RATIO_RESIDUAL_KEY = 2 << 32
+
+# Vocab tile every ratio kernel walks in.
+_RATIO_BLOCK_V = 4096
+
+
+def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
+    """fp32 and int32 shapes one ratio verify needs, in `_ratio_sample` order."""
+    tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
+    f32 = [
+        (num_tokens,),  # row_max
+        (num_tokens,),  # row_inv_z
+        (tiles, num_tokens),  # part_max
+        (tiles, num_tokens),  # part_sum
+        (tiles, num_tokens),  # part_amax_val
+        (tiles, batch_size),  # part_key
+    ]
+    i32 = [
+        (num_tokens,),  # row_argmax
+        (tiles, num_tokens),  # part_amax_idx
+        (batch_size,),  # residual_row
+        (tiles, batch_size),  # part_idx
+    ]
+    return f32, i32
+
+
+def ratio_verify_scratch(
+    max_bs: int, num_spec_steps: int, vocab_size: int, device
+) -> SamplingScratch:
+    """Scratch for any ratio verify of up to ``max_bs`` requests of
+    ``num_spec_steps`` drafts each, allocated once."""
+    f32, i32 = _ratio_scratch_shapes(max_bs * num_spec_steps, max_bs, vocab_size)
+    return SamplingScratch(sum(prod(x) for x in f32), sum(prod(x) for x in i32), device)
+
+
+@triton.jit
+def _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps):
+    """The request a draft row belongs to: the first ``r`` with
+    ``cu_num_draft_tokens[r] > row`` (a binary search, so requests with no
+    drafts are skipped). ``search_steps`` >= ceil(log2(batch_size)) + 1."""
+    lo = 0
+    hi = batch_size - 1
+    for _ in range(search_steps):
+        mid = (lo + hi) // 2
+        right = tl.load(cu_num_draft_tokens_ptr + mid) <= row
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(right, hi, mid)
+    return lo
+
+
+@triton.jit(do_not_specialize=["search_steps"])
+def _ratio_stats_kernel(
+    logits_ptr,  # [num_tokens, V] raw target logits
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    temperatures_ptr,  # [batch_size] fp32, pre-clamped
+    part_max_ptr,  # [n_tiles, num_tokens] fp32: max of logits / T
+    part_sum_ptr,  # [n_tiles, num_tokens] fp32: sum exp(logits / T - max)
+    part_amax_val_ptr,  # [n_tiles, num_tokens] fp32: max raw logit
+    part_amax_idx_ptr,  # [n_tiles, num_tokens] int32: its lowest id
+    num_tokens,
+    vocab_size,
+    logits_row_stride,
+    batch_size,
+    search_steps,
+    BLOCK_V: tl.constexpr,
+):
+    """One (draft row, V tile): softmax statistics plus the raw argmax.
+
+    One row per program, so a small batch still fills the device; the row's
+    temperature is its request's, found in-kernel. The raw argmax is taken
+    before the division: dividing by a near-zero temperature can round two
+    distinct logits onto one value and invent a tie the greedy rule would
+    not see.
+    """
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    req_idx = _request_of_row(cu_num_draft_tokens_ptr, row, batch_size, search_steps)
+    temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    vmask = offs < vocab_size
+    x = tl.load(
+        logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+        mask=vmask,
+        other=float("-inf"),
+    ).to(tl.float32)
+    raw_max = tl.max(x, axis=0)
+    raw_idx = tl.min(tl.where((x == raw_max) & vmask, offs, 2147483647), axis=0)
+    scaled_max, scaled_sum = tile_max_sumexp(x / temp, vmask)
+    part = tile * num_tokens + row
+    tl.store(part_max_ptr + part, scaled_max)
+    tl.store(part_sum_ptr + part, scaled_sum)
+    tl.store(part_amax_val_ptr + part, raw_max)
+    tl.store(part_amax_idx_ptr + part, raw_idx)
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "accept_seed"])
+def _ratio_accept_kernel(
+    output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
+    verdict_ptr,  # [3, batch_size]: accepted drafts, rejected, anchor row
+    residual_row_ptr,  # [batch_size] int32 out: the row to resample, or -1
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    input_ids_ptr,  # the step's input ids
+    target_logits_indices_ptr,  # [num_tokens]
+    logits_ptr,  # [num_tokens, V] raw target logits
+    temperatures_ptr,  # [batch_size] fp32, pre-clamped
+    row_max_ptr,  # [num_tokens] fp32
+    row_inv_z_ptr,  # [num_tokens] fp32
+    row_argmax_ptr,  # [num_tokens] int32, lowest id
+    q_ptr,  # [num_q_rows, V] fp32, the q each draft token was drawn from
+    q_row_base_ptr,  # [batch_size] int32, this request's first q row, or < 0
+    bonus_token_ids_ptr,  # [batch_size]
+    bonus_logits_indices_ptr,  # [batch_size]
+    num_spec_steps,
+    vocab_size,
+    logits_row_stride,
+    greedy_temperature,
+    accept_seed,
+):
+    """One request: walk its drafts until the first rejection.
+
+    Leaves the rejecting position's output to the residual kernels for a
+    sampled request, and fills it with the target argmax for a greedy one.
+    """
+    req_idx = tl.program_id(0)
+    if req_idx == 0:
+        start_idx = 0
+    else:
+        start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+    temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+    greedy = temp <= greedy_temperature
+    # A negative base means this request has no live q (never drafted here, or
+    # its slot expired). Its q reads as 0, so its first draft is rejected and
+    # the residual is p itself: exact, at the cost of one step's speculation.
+    # Not 0 for "none": row 0 is in range and holds a stranger's q > 0, against
+    # which `u * q < p` would accept.
+    q_base = tl.load(q_row_base_ptr + req_idx)
+    has_q = q_base >= 0
+    out_row = output_token_ids_ptr + req_idx * (num_spec_steps + 1)
+
+    INVALID_TOKEN: tl.constexpr = -1
+    rejected = False
+    reject_pos = -1
+    last_checked = -1
+    for pos in range(num_draft_tokens):
+        if rejected:
+            tl.store(out_row + pos, INVALID_TOKEN)
+        else:
+            row = start_idx + pos
+            x = _draft_token(input_ids_ptr, target_logits_indices_ptr, row)
+            target_argmax = tl.load(row_argmax_ptr + row)
+            if greedy:
+                accept = x == target_argmax
+            else:
+                logit = tl.load(logits_ptr + row.to(tl.int64) * logits_row_stride + x)
+                p = tl.exp(
+                    logit.to(tl.float32) / temp - tl.load(row_max_ptr + row)
+                ) * tl.load(row_inv_z_ptr + row)
+                q = tl.load(
+                    q_ptr + (q_base + pos).to(tl.int64) * vocab_size + x,
+                    mask=has_q,
+                    other=0.0,
+                )
+                u = tl.rand(accept_seed, row)
+                # x was drawn from q, so q(x) must be a positive probability;
+                # anything else is not the row x came from. `u * q < p` rather
+                # than `u < p / q`: no division, so a denormal q cannot become
+                # an infinite ratio.
+                accept = (q > 0.0) & (q <= 1.0) & (u * q < p)
+            if accept:
+                tl.store(out_row + pos, tl.cast(x, tl.int32))
+            else:
+                rejected = True
+                reject_pos = pos
+                if greedy:
+                    tl.store(out_row + pos, tl.cast(target_argmax, tl.int32))
+            last_checked += 1
+
+    residual_row = -1
+    if rejected and not greedy:
+        residual_row = start_idx + reject_pos
+    tl.store(residual_row_ptr + req_idx, residual_row)
+    _finish_request(
+        output_token_ids_ptr,
+        verdict_ptr,
+        bonus_token_ids_ptr,
+        bonus_logits_indices_ptr,
+        req_idx,
+        num_draft_tokens,
+        last_checked,
+        rejected,
+        num_spec_steps,
+    )
+
+
+@triton.jit(do_not_specialize=["residual_seed"])
+def _ratio_residual_race_kernel(
+    residual_row_ptr,  # [batch_size] int32, the rejecting row, or -1
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    logits_ptr,  # [num_tokens, V] raw target logits
+    temperatures_ptr,  # [batch_size] fp32
+    row_max_ptr,  # [num_tokens] fp32
+    row_inv_z_ptr,  # [num_tokens] fp32
+    q_ptr,  # [num_q_rows, V] fp32
+    q_row_base_ptr,  # [batch_size] int32
+    part_key_ptr,  # [n_tiles, batch_size] fp32: best residual key
+    part_idx_ptr,  # [n_tiles, batch_size] int32: its lowest id
+    batch_size,
+    vocab_size,
+    logits_row_stride,
+    residual_seed,
+    BLOCK_V: tl.constexpr,
+):
+    """One (request, V tile) of the residual race ``relu(p - q) / E``, for
+    rejecting requests; every other program returns at once. Launched for
+    every request because which ones rejected is only known on the device,
+    and finding out on the host would stall the verify on a readback."""
+    req_idx = tl.program_id(0)
+    tile = tl.program_id(1)
+    row = tl.load(residual_row_ptr + req_idx)
+    if row >= 0:
+        if req_idx == 0:
+            start_idx = 0
+        else:
+            start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+        temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+        q_base = tl.load(q_row_base_ptr + req_idx)
+        has_q = q_base >= 0
+        offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab_size
+        x = tl.load(
+            logits_ptr + row.to(tl.int64) * logits_row_stride + offs,
+            mask=vmask,
+            other=float("-inf"),
+        ).to(tl.float32)
+        p = tl.exp(x / temp - tl.load(row_max_ptr + row)) * tl.load(row_inv_z_ptr + row)
+        p = tl.where(vmask, p, 0.0)
+        q = tl.load(
+            q_ptr + (q_base + row - start_idx).to(tl.int64) * vocab_size + offs,
+            mask=vmask & has_q,
+            other=0.0,
+        )
+        # Anything that is not a probability (NaN, inf, negative) counts as 0,
+        # so the residual falls back toward p rather than inheriting garbage.
+        q = tl.where((q >= 0.0) & (q <= 1.0), q, 0.0)
+        residual = tl.maximum(p - q, 0.0)
+        u = tl.rand(residual_seed, row.to(tl.int64) * vocab_size + offs)
+        # u in [0, 1): E = -log(u) is in (0, inf], so a key is finite and a
+        # zero-mass id keys exactly 0.
+        e = -tl.log(u)
+        key = tl.where(vmask, residual / e, -1.0)
+        best = tl.max(key, axis=0)
+        part = tile * batch_size + req_idx
+        tl.store(part_key_ptr + part, best)
+        tl.store(
+            part_idx_ptr + part,
+            tl.min(tl.where((key == best) & vmask, offs, 2147483647), axis=0),
+        )
+
+
+@triton.jit(do_not_specialize=["num_spec_steps", "residual_seed"])
+def _ratio_residual_pick_kernel(
+    output_token_ids_ptr,  # [batch_size, num_spec_steps + 1]
+    residual_row_ptr,  # [batch_size] int32
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    part_key_ptr,
+    part_idx_ptr,
+    logits_ptr,  # [num_tokens, V] raw target logits, for the fallback only
+    temperatures_ptr,  # [batch_size] fp32
+    row_max_ptr,  # [num_tokens] fp32
+    row_inv_z_ptr,  # [num_tokens] fp32
+    batch_size,
+    n_tiles,
+    num_spec_steps,
+    vocab_size,
+    logits_row_stride,
+    residual_seed,
+    BLOCK_TILE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """One request: the race's winner across tiles, lowest id among ties.
+
+    If the residual had no mass anywhere (p == q on every id, which the
+    accept rule should make unreachable), every key is 0 and there is no
+    winner; draw from p itself instead, racing ``p / E`` with the same noise
+    in this one program. Only that case pays for a second vocab pass.
+    """
+    req_idx = tl.program_id(0)
+    row = tl.load(residual_row_ptr + req_idx)
+    if row >= 0:
+        if req_idx == 0:
+            start_idx = 0
+        else:
+            start_idx = tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
+        offs = tl.arange(0, BLOCK_TILE)
+        tmask = offs < n_tiles
+        keys = tl.load(
+            part_key_ptr + offs * batch_size + req_idx, mask=tmask, other=-1.0
+        )
+        idxs = tl.load(
+            part_idx_ptr + offs * batch_size + req_idx, mask=tmask, other=2147483647
+        )
+        best = tl.max(keys, axis=0)
+        token = tl.min(tl.where((keys == best) & tmask, idxs, 2147483647), axis=0)
+        if best <= 0.0:
+            temp = tl.load(temperatures_ptr + req_idx).to(tl.float32)
+            row_max = tl.load(row_max_ptr + row)
+            inv_z = tl.load(row_inv_z_ptr + row)
+            pbest = -1.0
+            token = 2147483647
+            for v_start in range(0, vocab_size, BLOCK_V):
+                v = v_start + tl.arange(0, BLOCK_V)
+                vmask = v < vocab_size
+                x = tl.load(
+                    logits_ptr + row.to(tl.int64) * logits_row_stride + v,
+                    mask=vmask,
+                    other=float("-inf"),
+                ).to(tl.float32)
+                p = tl.where(vmask, tl.exp(x / temp - row_max) * inv_z, 0.0)
+                u = tl.rand(residual_seed, row.to(tl.int64) * vocab_size + v)
+                key = tl.where(vmask, p / -tl.log(u), -1.0)
+                tile_best = tl.max(key, axis=0)
+                tile_idx = tl.min(
+                    tl.where((key == tile_best) & vmask, v, 2147483647), axis=0
+                )
+                # Strictly better only: an equal key keeps the lower id.
+                token = tl.where(tile_best > pbest, tile_idx, token)
+                pbest = tl.maximum(pbest, tile_best)
+        # Every comparison above is false on NaN; stay inside the vocab.
+        token = tl.where(token == 2147483647, 0, token)
+        tl.store(
+            output_token_ids_ptr + req_idx * (num_spec_steps + 1) + (row - start_idx),
+            token.to(tl.int32),
+        )
+
+
+def _ratio_sample(
+    output_token_ids: torch.Tensor,
+    verdict: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    input_ids: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    target_logits: torch.Tensor,  # [num_tokens, V] raw
+    temperatures: torch.Tensor,  # [batch_size] fp32, pre-clamped
+    draft_probs: torch.Tensor,  # [num_q_rows, V] fp32
+    q_row_base: torch.Tensor,  # [batch_size] int32
+    bonus_token_ids: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    num_spec_steps: int,
+    ratio_step: int,
+    scratch: SamplingScratch | None = None,
+) -> None:
+    """Launch the probability-ratio verify: stats, combine, accept, residual.
+
+    Its scratch comes out of ``scratch`` when given (the serving path) and is
+    allocated per call otherwise."""
+    num_tokens, vocab_size = target_logits.shape
+    batch_size = cu_num_draft_tokens.shape[0]
+    device = target_logits.device
+    n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
+    stride = target_logits.stride(0)
+    temperatures = temperatures.to(torch.float32).contiguous()
+    q_row_base = q_row_base.contiguous()
+
+    f32_shapes, i32_shapes = _ratio_scratch_shapes(num_tokens, batch_size, vocab_size)
+    (
+        (row_max, row_inv_z, part_max, part_sum, part_amax_val, part_key),
+        (row_argmax, part_amax_idx, residual_row, part_idx),
+    ) = take(
+        f32_shapes,
+        i32_shapes,
+        device,
+        None if scratch is None else scratch.f32,
+        None if scratch is None else scratch.i32,
+    )
+    if num_tokens:
+        _ratio_stats_kernel[(num_tokens, n_tiles)](
+            target_logits,
+            cu_num_draft_tokens,
+            temperatures,
+            part_max,
+            part_sum,
+            part_amax_val,
+            part_amax_idx,
+            num_tokens,
+            vocab_size,
+            stride,
+            batch_size,
+            batch_size.bit_length() + 1,
+            BLOCK_V=_RATIO_BLOCK_V,
+            num_warps=8,
+        )
+        softmax_combine_kernel[(num_tokens,)](
+            part_max,
+            part_sum,
+            row_max,
+            row_inv_z,
+            part_amax_val,
+            part_amax_idx,
+            row_argmax,
+            num_tokens,
+            n_tiles,
+            BLOCK_TILE=triton.next_power_of_2(n_tiles),
+            WITH_ARGMAX=True,
+            num_warps=4,
+        )
+    _ratio_accept_kernel[(batch_size,)](
+        output_token_ids,
+        verdict,
+        residual_row,
+        cu_num_draft_tokens,
+        input_ids,
+        target_logits_indices,
+        target_logits,
+        temperatures,
+        row_max,
+        row_inv_z,
+        row_argmax,
+        draft_probs,
+        q_row_base,
+        bonus_token_ids,
+        bonus_logits_indices,
+        num_spec_steps,
+        vocab_size,
+        stride,
+        SAMPLER_EPS,
+        _RATIO_ACCEPT_KEY | ratio_step,
+        num_warps=1,
+    )
+    _ratio_residual_race_kernel[(batch_size, n_tiles)](
+        residual_row,
+        cu_num_draft_tokens,
+        target_logits,
+        temperatures,
+        row_max,
+        row_inv_z,
+        draft_probs,
+        q_row_base,
+        part_key,
+        part_idx,
+        batch_size,
+        vocab_size,
+        stride,
+        _RATIO_RESIDUAL_KEY | ratio_step,
+        BLOCK_V=_RATIO_BLOCK_V,
+        num_warps=8,
+    )
+    _ratio_residual_pick_kernel[(batch_size,)](
+        output_token_ids,
+        residual_row,
+        cu_num_draft_tokens,
+        part_key,
+        part_idx,
+        target_logits,
+        temperatures,
+        row_max,
+        row_inv_z,
+        batch_size,
+        n_tiles,
+        num_spec_steps,
+        vocab_size,
+        stride,
+        _RATIO_RESIDUAL_KEY | ratio_step,
+        BLOCK_TILE=triton.next_power_of_2(n_tiles),
+        BLOCK_V=_RATIO_BLOCK_V,
+        num_warps=1,
+    )
 
 
 def acceptance_length_to_rates(length: float, n: int) -> list[float]:
@@ -111,6 +620,24 @@ class RejectionSampler(nn.Module):
         # lockstep across TP ranks (SPMD), so the forced accept/reject pattern is
         # identical on every rank while still varying step to step.
         self._synthetic_step = 0
+        # Same, for the probability-ratio path's draws. Advanced on every forward
+        # that takes that path, so no two steps replay a stream.
+        self._ratio_step = 0
+
+    @staticmethod
+    def needs_target_draw(all_greedy: bool, draft_probs) -> bool:
+        """Does this verify step have to draw the target's own tokens?
+
+        `Sampler.sample_verification_tokens` (plus, under TP, a broadcast of
+        its result) feeds the exact-match kernel and nothing else. The ratio
+        path reads `draft_probs` and the logits instead, so the draw is skipped
+        exactly when `draft_probs` is given -- not whenever the batch is
+        sampled: a sampled batch with no q (flag off, a filtered batch) still
+        verifies by exact match, and without the draw that kernel would fall
+        back to the target argmax, a different and lossy rule for a stochastic
+        request. An all-greedy batch never needed it.
+        """
+        return not all_greedy and draft_probs is None
 
     def forward(
         self,
@@ -121,6 +648,18 @@ class RejectionSampler(nn.Module):
         bonus_token_ids: torch.Tensor,
         *,
         target_token_ids: torch.Tensor | None = None,
+        # ---- probability-ratio path ----------------------------------------
+        # [num_q_rows, vocab_size] fp32: the q each draft token was drawn from.
+        # None selects exact-match acceptance. Never given for a top-k/top-p
+        # batch (`DSparkProposer.lossless_verify_inputs`): p here is unfiltered.
+        draft_probs: torch.Tensor | None = None,
+        # [batch_size] int32: first q row of each request. Negative means "no
+        # live q"; see `_ratio_accept_kernel`.
+        draft_probs_row_base: torch.Tensor | None = None,
+        # [batch_size] fp32, pre-clamped. Required with draft_probs.
+        temperatures: torch.Tensor | None = None,
+        # Preallocated device scratch for the ratio path; None allocates.
+        ratio_scratch: SamplingScratch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -133,33 +672,42 @@ class RejectionSampler(nn.Module):
             # metadata.num_draft_tokens_np,
             metadata.num_spec_steps,
             metadata.cu_num_draft_tokens,
-            None,
+            draft_probs,
             target_logits,
             bonus_token_ids,
             metadata.bonus_logits_indices,
             synthetic_acceptance_rates=self.synthetic_acceptance_rates,
             synthetic_step=self._synthetic_step,
             target_token_ids=target_token_ids,
+            temperatures=temperatures,
+            draft_probs_row_base=draft_probs_row_base,
+            ratio_step=self._ratio_step,
+            ratio_scratch=ratio_scratch,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
+        if draft_probs is not None and self.synthetic_acceptance_rates is None:
+            # The low key word; the high word is the draw's purpose.
+            self._ratio_step = (self._ratio_step + 1) & 0xFFFFFFFF
         return output_token_ids
 
 
 def rejection_sample(
     # the step's input ids; draft r is input_ids[target_logits_indices[r] + 1]
     input_ids: torch.Tensor,
-    # [num_tokens] -- the row of the step's logits each target_probs row is
+    # [num_tokens] -- the row of the step's logits each target_logits row is
     target_logits_indices: torch.Tensor,
     # # [batch_size]
     # num_draft_tokens: list[int],
     num_spec_steps: int,
     # [batch_size]
     cu_num_draft_tokens: torch.Tensor,
-    # [num_tokens, vocab_size]
+    # [num_q_rows, vocab_size] fp32, or None. The q each draft token was drawn
+    # from; None keeps the exact-match acceptance below. Rows are reached
+    # through `draft_probs_row_base`, not `start_idx`.
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_probs: torch.Tensor,
+    # [num_tokens, vocab_size] raw target logits
+    target_logits: torch.Tensor,
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     # [batch_size] -- each request's last row, the one its bonus is sampled at
@@ -170,21 +718,54 @@ def rejection_sample(
     # Per-step seed for the (rank-consistent) synthetic RNG; ignored otherwise.
     synthetic_step: int = 0,
     target_token_ids: torch.Tensor | None = None,
+    # ---- probability-ratio path (keyword-only, so the existing positional
+    # callers keep meaning what they meant) ----------------------------------
+    *,
+    # [batch_size] fp32, pre-clamped to SAMPLER_EPS. The ratio rule compares
+    # against p = softmax(target_logits / T).
+    temperatures: torch.Tensor | None = None,
+    # [batch_size] int32: this request's first row in `draft_probs`, or a
+    # negative sentinel when it has no live q. Required with draft_probs.
+    draft_probs_row_base: torch.Tensor | None = None,
+    # Per-step key for the (rank-consistent) accept coins and residual race,
+    # < 2**32.
+    ratio_step: int = 0,
+    # Preallocated device scratch for the ratio path; None allocates per call.
+    ratio_scratch: SamplingScratch | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
-    assert target_probs.ndim == 2
+    assert target_logits.ndim == 2
 
     batch_size = len(cu_num_draft_tokens)
     num_tokens = target_logits_indices.shape[0]
-    vocab_size = target_probs.shape[-1]
-    device = target_probs.device
+    vocab_size = target_logits.shape[-1]
+    device = target_logits.device
     assert input_ids.is_contiguous() and target_logits_indices.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
-    assert target_probs.is_contiguous()
+    assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_probs.shape == (num_tokens, vocab_size)
+    assert target_logits.shape == (num_tokens, vocab_size)
+    if draft_probs is not None:
+        assert draft_probs.shape[-1] == vocab_size, (
+            f"draft q covers {draft_probs.shape[-1]} ids but the target scored "
+            f"{vocab_size}; the ratio rule indexes both rows with the same id"
+        )
+        assert temperatures is not None, (
+            "the probability-ratio path needs the target temperatures: p is "
+            "softmax(target_logits / T), not softmax(target_logits)"
+        )
+        # The ratio branch below sits above the relaxed one, so the relaxed
+        # path would simply never run, and the two are not combinable: relaxed
+        # acceptance is deliberately not distribution-preserving. The pair is
+        # refused when any drafter is constructed (`Drafter.__init__`), so this
+        # only fires if that gate was bypassed.
+        assert RELAXED_TOP_N <= 1, (
+            "ATOM_SPEC_LOSSLESS_SAMPLING and ATOM_ENABLE_RELAXED_MTP are "
+            "mutually exclusive; this should have been refused at drafter "
+            "construction"
+        )
     if target_token_ids is not None:
         if target_token_ids.shape != target_logits_indices.shape:
             raise ValueError("Sampled target IDs must cover every verification row")
@@ -219,7 +800,7 @@ def rejection_sample(
         # target argmax as the correction token and stop (same output layout /
         # num_bonus_tokens semantics as the greedy path).
         cond_rates = _get_synthetic_cond_rates(synthetic_acceptance_rates, device)
-        _, target_argmax = topk_select(target_probs, 1, tie="low")
+        _, target_argmax = topk_select(target_logits, 1, tie="low")
         target_argmax = target_argmax.view(-1)
         # Rank-consistent uniforms: a dedicated device generator re-seeded from the
         # step counter draws the same Philox stream on every TP rank / GPU, so the
@@ -252,13 +833,36 @@ def rejection_sample(
             num_spec_steps,
             num_warps=1,
         )
+    elif draft_probs is not None:
+        # Probability-ratio path: accept with `u * q < p` against the q the
+        # draft actually drew from, instead of requiring equality with the
+        # target's own draw. Same output distribution, higher acceptance.
+        assert (
+            draft_probs_row_base is not None
+        ), "the probability-ratio path needs each request's first q row"
+        _ratio_sample(
+            output_token_ids,
+            verdict,
+            cu_num_draft_tokens,
+            input_ids,
+            target_logits_indices,
+            target_logits,
+            temperatures,
+            draft_probs,
+            draft_probs_row_base,
+            bonus_token_ids,
+            bonus_logits_indices,
+            num_spec_steps,
+            ratio_step,
+            ratio_scratch,
+        )
     elif target_token_ids is not None or RELAXED_TOP_N <= 1:
         # Match the actual target draw for stochastic requests; greedy requests
         # take the target argmax and must match it exactly. The prefix kernel
         # needs only token IDs. `topk_select`, not `.argmax`: the tie rule
         # above is what keeps the accept/reject pattern equal across TP ranks.
         if target_token_ids is None:
-            _, target_argmax = topk_select(target_probs, 1, tie="low")
+            _, target_argmax = topk_select(target_logits, 1, tie="low")
             target_argmax = target_argmax.view(-1)
         else:
             target_argmax = target_token_ids
@@ -277,7 +881,7 @@ def rejection_sample(
     else:
         # Relaxed acceptance path: accept if draft is among top-N
         # candidates with prob >= (top1_prob - delta)
-        probs = target_probs.softmax(dim=-1, dtype=torch.float32)
+        probs = target_logits.softmax(dim=-1, dtype=torch.float32)
         # `sorted` is what puts the top-1 in slot 0 for `top1_probs` below.
         #
         # Among EQUAL probabilities the slot order is unspecified, here as it

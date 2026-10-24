@@ -66,7 +66,10 @@ from atom.model_ops.attention_mla import (
     qrep_tp_override,
 )
 from atom.model_ops.base_attention import Attention
-from atom.model_ops.dspark_markov_sample import dspark_markov_argmax
+from atom.model_ops.dspark_markov_sample import (
+    dspark_markov_argmax,
+    dspark_markov_sample,
+)
 from atom.model_ops.layernorm import RMSNorm
 from atom.model_ops.linear import (
     ColumnParallelLinear,
@@ -164,6 +167,46 @@ class DSparkMarkovHead(nn.Module):
         # .float() would only materialize it twice for the same sum.
         out.copy_((base_logits + bias).argmax(dim=-1))
         return markov_embed
+
+    def sample_next_q(
+        self,
+        token_ids: torch.Tensor,  # [B]   x_{k-1}
+        base_logits: torch.Tensor,  # [B, V]
+        out: torch.Tensor,  # [B]   destination for x_k
+        q_store: torch.Tensor,  # [rows, V] fp32 persistent q
+        q_row_base: torch.Tensor,  # [B] int32, first q_store row per batch row
+        position: int,  # k: this position's row is q_row_base + k
+        temperatures: torch.Tensor,  # [B]
+        greedy_mask: torch.Tensor,  # [B] int32
+        seed: torch.Tensor,  # [1] int32, device
+        noise_offset: int,
+        scratch=None,  # SamplingScratch for the op's partials, or None
+    ) -> torch.Tensor:
+        """One sampled block position: draw ``x_k ~ softmax(biased / T)`` and
+        write that q out.
+
+        A separate entry point from ``sample_next`` rather than a flag on it:
+        the two have different outputs (this one publishes a ``[B, V]``
+        distribution the other exists not to materialize), so a caller that
+        takes the wrong one fails loudly rather than silently drafting under a
+        policy the accept rule does not match.
+        """
+        return dspark_markov_sample(
+            base_logits,
+            token_ids,
+            self.markov_w1.weight,
+            self.markov_w2.weight,
+            out,
+            q_store,
+            q_row_base,
+            position,
+            temperatures,
+            greedy_mask,
+            seed,
+            noise_offset,
+            None if scratch is None else scratch.f32,
+            None if scratch is None else scratch.i32,
+        )
 
 
 def _dspark_block_width(draft_config, atom_config) -> int:
@@ -601,6 +644,11 @@ class KimiK3DSpark(DSparkDraftModel):
     ``packed_modules_mapping``.
     """
 
+    # This flavor's markov head implements `sample_next_q` and `_sample_block`
+    # below branches on the binding, so `DSparkProposer` may arm lossless
+    # speculative sampling here.
+    supports_lossless_draft = True
+
     packed_modules_mapping: ClassVar[dict[str, tuple[str, int]]] = {
         "q_a_proj": ("fused_qkv_a_proj", 0),
         "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
@@ -792,6 +840,12 @@ class KimiK3DSpark(DSparkDraftModel):
         Only this loop is sequential, and it is T tiny rank-256 matmuls rather
         than T backbone passes -- which is the entire point of DSpark.
         """
+        # Lossless speculative sampling draws x_k from softmax(biased / T) and
+        # publishes that q for the accept rule. Branched here and not inside the
+        # loop: the block head is captured, so whichever side is taken at warmup
+        # is the one every replay runs.
+        if self.draft_sampling is not None:
+            return self._sample_block_lossless(base_logits, anchor_ids)
         bs, T, _ = base_logits.shape
         out_ids = anchor_ids.new_empty(bs, T + 1)
         out_ids[:, 0] = anchor_ids
@@ -800,5 +854,48 @@ class KimiK3DSpark(DSparkDraftModel):
             # The column is the op's destination, so no id is written twice.
             self.markov_head.sample_next(
                 out_ids[:, k], base_logits[:, k], out_ids[:, k + 1]
+            )
+        return out_ids[:, 1:]
+
+    def _sample_block_lossless(
+        self,
+        base_logits: torch.Tensor,  # [B, T, V]
+        anchor_ids: torch.Tensor,  # [B]
+    ) -> torch.Tensor:
+        """The sampled twin of `_sample_block`:
+
+            logits_k <- U_k + B(x_{k-1}, .)
+            q_k      <- softmax(logits_k / T)   -- written to q_store[base + k]
+            x_k      <- q_k                     -- drawn, not argmaxed
+
+        Each row writes its q straight into the persistent row block its
+        request owns, ``draft_sampling.q_row_base`` naming the block; the
+        accept kernel reads it back from there a step later.
+        """
+        sampling = self.draft_sampling
+        bs, num_draft, vocab = base_logits.shape
+        assert sampling.q_store.shape[1] == vocab, (
+            f"q store rows are {sampling.q_store.shape[1]} wide but the block "
+            f"scores {vocab} ids; the accept kernel indexes the two as one"
+        )
+        # The noise counter stride is the buffer's max batch, not this step's,
+        # so the uniform a (position, row, id) draws does not move with the
+        # batch, and no two positions of one block share a counter.
+        position_stride = sampling.q_row_base.shape[0] * vocab
+        out_ids = anchor_ids.new_empty(bs, num_draft + 1)
+        out_ids[:, 0] = anchor_ids
+        for k in range(num_draft):
+            self.markov_head.sample_next_q(
+                out_ids[:, k],
+                base_logits[:, k],
+                out_ids[:, k + 1],
+                sampling.q_store,
+                sampling.q_row_base[:bs],
+                k,
+                sampling.temperatures[:bs],
+                sampling.greedy_mask[:bs],
+                sampling.seed,
+                k * position_stride,
+                sampling.scratch,
             )
         return out_ids[:, 1:]
