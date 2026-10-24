@@ -194,6 +194,7 @@ Applies with `--enable-eplb`; the schedule itself is set by `--eplb-config`
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_EPLB_MAX_REBALANCES** | int | 0 (no limit) | Stop periodic rebalancing once this many rebalances have run, and serve with that expert placement for the rest of the process: balance on early traffic, then pay no further migrations. Only rebalances that run count; an interval the balancedness gate skips does not. The limit is checked after a rebalance's last migration chunk commits, on every rank in lockstep; after it, the manager also stops reducing the per-step has-prefill flag. Load recording continues (its buffers are fixed for CUDA graphs) but is no longer read. `0` or a negative value keeps rebalancing for the life of the process. Read when the EPLB manager is built, so set it before the server starts. |
+| **ATOM_EXPERT_TRACE_DIR** | str | unset | Diagnostic. Record per-step, per-layer token counts of each routed logical expert (before any EPLB remap; DP/CUDA-graph pad rows go to an extra last bin; drafter layers skipped) into this directory while a file named `ENABLE` exists in it. Each rank writes `rank<R>_part<N>_hist.npy` (`[steps, layers, experts+1]` uint16) and `_meta.npy` (`[steps, 5]`: time, is_dummy, prefill tokens, decode tokens, seqs) every 512 steps. Independent of `--enable-eplb`. |
 
 ## Fusion passes
 
