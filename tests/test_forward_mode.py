@@ -550,12 +550,13 @@ def test_one_rank_pads_its_prefill_to_the_smallest_bucket_that_holds_it():
     assert bucket(600) == (0, [600])
 
 
-def test_only_prefilling_ranks_pad_in_the_table():
-    # A prefill beside a peer decoding its own 6 rows.
+def test_a_prefill_beside_a_decoding_peer_runs_eagerly_on_every_rank():
+    """Without a prefill delayer a peer decodes beside the prefill. It runs
+    eagerly, and its variable-length gather is not the collective the
+    prefill's recording would replay, so neither rank replays."""
     sync = _graph_sync([300, 6], prefill=(1, 0))
-    assert _bucket(True, sync) == (384, [384, 6])
-    # A peer off the token graph still bounds its dispatch by the padded count.
-    assert _bucket(False, sync) == (0, [384, 6])
+    assert _bucket(True, sync) == (0, [300, 6])
+    assert _bucket(False, sync) == (0, [300, 6])
 
 
 def test_every_prefilling_rank_replays_the_groups_bucket():
