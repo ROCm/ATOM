@@ -2428,7 +2428,7 @@ def test_page16_table_expands_every_page_into_its_eight_sub_pages():
     page-128 block table: page p -> 8p .. 8p+7, in column order."""
     import torch
 
-    from atom.models.minimax_m3_dspark import _page16_table
+    from atom.models.minimax_m3.dspark import _page16_table
 
     bt = torch.tensor([[0, 1, 0], [5, 7, 2]], dtype=torch.int32)
     out = torch.full((2, 24), -1, dtype=torch.int32)
@@ -2445,7 +2445,7 @@ def test_window_rows_start_each_row_at_its_own_window(window):
     Pad rows repeat the last real anchor and read from their first page."""
     import torch
 
-    from atom.models.minimax_m3_dspark import _window_rows
+    from atom.models.minimax_m3.dspark import _window_rows
 
     P, T, rb = 32, 3, 2
     bt16_flat = torch.arange((rb + 1) * P, dtype=torch.int32)
@@ -2480,7 +2480,7 @@ def test_minimax_m31_dspark_refuses_tp_below_its_kv_heads(monkeypatch, tp):
     """The MiniMax-M3.1 draft decodes its block per row with one KV head per
     rank; with 4 KV heads it refuses TP < 4 at construction rather than
     failing on the first drafted block."""
-    import atom.models.minimax_m3_dspark as m3_dspark
+    import atom.models.minimax_m3.dspark as m3_dspark
 
     monkeypatch.setattr(m3_dspark, "get_tensor_model_parallel_world_size", lambda: tp)
     config = types.SimpleNamespace(num_attention_heads=64, num_key_value_heads=4)

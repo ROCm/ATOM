@@ -33,7 +33,7 @@ _MULTIMODAL_ARCH_TO_INPUT_BUILDER: dict[str, str] = {
     ),
     "KimiK3ForConditionalGeneration": "atom.models.kimi_k3_vl.build_kimi_k3_inputs",
     "MiniMaxM3SparseForConditionalGeneration": (
-        "atom.models.minimax_m3_vl.build_minimax_m3_inputs"
+        "atom.models.minimax_m3.image_processing.build_minimax_m3_inputs"
     ),
 }
 

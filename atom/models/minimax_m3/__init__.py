@@ -23,7 +23,6 @@ __all__ = [
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGenerationTextOnly",
-    "MiniMaxM3SparseForConditionalGenerationVL",
     "make_minimax_m3_expert_params_mapping",
 ]
 

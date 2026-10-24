@@ -41,11 +41,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
-from atom.models.minimax_m3_vl import (
-    build_vision_modules,
-    image_input_refusal,
-    image_token_id,
-)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -969,76 +964,6 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
-
-
-class MiniMaxM3SparseForConditionalGenerationVL(
-    MiniMaxM3SparseForConditionalGenerationTextOnly
-):
-    """MiniMax-M3.1 with its vision tower, for native ATOM serving.
-
-    Image embeddings are produced once per request by `ModelRunner` and
-    scattered over the `]<]image[>[` runs that `build_minimax_m3_inputs`
-    recorded as embedding spans. Where image input is refused
-    (`image_input_refusal`, e.g. a text-only export) this degrades to the
-    text-only model.
-    """
-
-    # Vision weights belong to this model, so nothing is skipped by default.
-    # `__init__` re-adds the skips where no tower is built.
-    skip_weight_prefixes: ClassVar[list[str]] = []
-    vision_weight_prefixes: ClassVar[tuple[str, ...]] = tuple(
-        MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes
-    )
-
-    def __init__(self, atom_config: Config, prefix: str = "") -> None:
-        super().__init__(atom_config, prefix=prefix)
-        hf_config = atom_config.hf_config
-        self.image_token_id = image_token_id(hf_config)
-        # The tower only runs where the token embeddings are produced, and
-        # only where image requests are accepted (`build_minimax_m3_inputs`).
-        why = image_input_refusal(atom_config)
-        self.has_vision_tower = why is None and get_pp_group().is_first_rank
-        if not self.has_vision_tower:
-            self.vision_tower = PPMissingLayer()
-            self.multi_modal_projector = PPMissingLayer()
-            self.patch_merge_mlp = PPMissingLayer()
-            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
-            return
-
-        (
-            self.vision_tower,
-            self.multi_modal_projector,
-            self.patch_merge_mlp,
-        ) = build_vision_modules(hf_config)
-        self.language_model.embed_before_model = True
-
-    def get_vision_embeddings(
-        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
-    ) -> torch.Tensor:
-        if not self.has_vision_tower:
-            raise RuntimeError(
-                "MiniMax-M3 image embeddings were requested on a rank without "
-                "a vision tower (image input refused, or a non-first PP rank)."
-            )
-        features = self.vision_tower(pixel_values, grid_thw.tolist())
-        return self.patch_merge_mlp(self.multi_modal_projector(features))
-
-    def merge_multimodal_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        inputs_embeds: torch.Tensor,
-        vision_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        mask = input_ids == self.image_token_id
-        num_placeholders = int(mask.sum())
-        if num_placeholders != vision_embeds.shape[0]:
-            raise ValueError(
-                f"MiniMax-M3 got {vision_embeds.shape[0]} image embeddings for "
-                f"{num_placeholders} image tokens; an image prefill without "
-                "embedding spans must not be chunked."
-            )
-        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
-        return inputs_embeds
 
 
 # The plugin entry points (vLLM/SGLang) bring their own vision stacks and keep

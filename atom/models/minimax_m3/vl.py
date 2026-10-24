@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native vision stack for MiniMax-M3.1 (``minimax_m3_vl``).
+"""Native vision stack for MiniMax-M3.1 (``minimax_m3_vl``) and the VL model.
 
 Pure PyTorch port of the reference CLIP-style tower with 3D RoPE, followed by
 the multi-modal projector and the 2x2 patch-merge MLP. Module and parameter
@@ -18,41 +18,23 @@ embeddings before the first collective).
 """
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import ClassVar
 
 import torch
 import torch.nn.functional as F
+from aiter import flash_attn_varlen_func
+from aiter.dist.parallel_state import get_pp_group
 from torch import nn
 
-from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
-if TYPE_CHECKING:
-    from atom.config import Config
-
-IMAGE_TOKEN = "]<]image[>["
-DEFAULT_IMAGE_TOKEN_ID = 200025
-
-
-def image_token_id(hf_config) -> int:
-    """The id of the ``]<]image[>[`` placeholder, as either key names it."""
-    return int(
-        getattr(hf_config, "image_token_index", None)
-        or getattr(hf_config, "image_token_id", None)
-        or DEFAULT_IMAGE_TOKEN_ID
-    )
-
-
-def image_input_refusal(atom_config: "Config") -> str | None:
-    """Why this deployment takes no image input, or None."""
-    if getattr(atom_config.hf_config, "vision_config", None) is None:
-        return "the checkpoint has no vision_config (a text-only export)"
-    mode = atom_config.compilation_config.cudagraph_mode
-    if not atom_config.enforce_eager and mode is not None and mode.uses_tr_hybrid():
-        # Image input needs the compiled model to always take inputs_embeds,
-        # embedded eagerly before it, and TR_HYBRID replays token graphs
-        # recorded on input_ids alone (`_run_capture_prefill`).
-        return f"--cudagraph-mode {mode.name} (image input needs FULL or eager)"
-    return None
+from atom.config import Config
+from atom.models.minimax_m3.image_processing import (
+    image_input_refusal,
+    image_token_id,
+)
+from atom.models.minimax_m3.model import (
+    MiniMaxM3SparseForConditionalGenerationTextOnly,
+)
+from atom.models.utils import PPMissingLayer
 
 
 def _compression(config) -> dict:
@@ -87,10 +69,6 @@ def _varlen_attention(
     max_seqlen: int,
 ) -> torch.Tensor:
     """Non-causal packed attention; a patch attends only within its segment."""
-    # Imported here, not at module scope: the API server imports this module
-    # for `build_minimax_m3_inputs`, and that stays importable without AITER.
-    from aiter import flash_attn_varlen_func
-
     out = flash_attn_varlen_func(
         q,
         k,
@@ -318,73 +296,71 @@ def build_vision_modules(hf_config) -> tuple[nn.Module, nn.Module, nn.Module]:
     return tower, projector, merger
 
 
-def _image_token_spans(input_ids: list[int], token_id: int) -> list[tuple]:
-    spans, start = [], None
-    for index, token in enumerate(input_ids + [None]):
-        if token == token_id and start is None:
-            start = index
-        elif token != token_id and start is not None:
-            spans.append((start, index - start))
-            start = None
-    return spans
+class MiniMaxM3SparseForConditionalGenerationVL(
+    MiniMaxM3SparseForConditionalGenerationTextOnly
+):
+    """MiniMax-M3.1 with its vision tower, for native ATOM serving.
 
-
-def build_minimax_m3_inputs(
-    atom_config: "Config",
-    processor: Any,
-    messages: list[dict],
-    images: list,
-    chat_template_kwargs: dict,
-    tools: Any = None,
-) -> tuple[list[int], dict]:
-    """Render the chat template, then let ``MiniMaxVLProcessor`` expand images.
-
-    The template emits one ``]<]image[>[`` per image; the processor wraps each
-    in start/end-of-image tokens and repeats it once per merged patch
-    (``t*h*w // 4``). Each run of image tokens becomes one embedding span, so
-    image prefills can be chunked and their embeddings cached per request.
+    Image embeddings are produced once per request by `ModelRunner` and
+    scattered over the `]<]image[>[` runs that `build_minimax_m3_inputs`
+    recorded as embedding spans. Where image input is refused
+    (`image_input_refusal`, e.g. a text-only export) this degrades to the
+    text-only model.
     """
-    why = image_input_refusal(atom_config)
-    if why is not None:
-        raise ValueError(f"This MiniMax-M3 deployment takes no image input: {why}")
-    token_id = image_token_id(atom_config.hf_config)
-    template_kwargs = dict(chat_template_kwargs)
-    template_kwargs.pop("tokenize", None)
-    template_kwargs.pop("add_generation_prompt", None)
-    if tools:
-        template_kwargs["tools"] = tools
-    # The checkpoint ships its template for the tokenizer only; the server's
-    # --chat-template, when given, is installed on the processor.
-    text = processor.apply_chat_template(
-        messages,
-        chat_template=processor.chat_template or processor.tokenizer.chat_template,
-        tokenize=False,
-        add_generation_prompt=True,
-        **template_kwargs,
+
+    # Vision weights belong to this model, so nothing is skipped by default.
+    # `__init__` re-adds the skips where no tower is built.
+    skip_weight_prefixes: ClassVar[list[str]] = []
+    vision_weight_prefixes: ClassVar[tuple[str, ...]] = tuple(
+        MiniMaxM3SparseForConditionalGenerationTextOnly.skip_weight_prefixes
     )
-    num_placeholders = text.count(IMAGE_TOKEN)
-    if num_placeholders != len(images):
-        raise ValueError(
-            f"Prompt has {num_placeholders} image placeholders but {len(images)} images"
-        )
-    # The rendered template already carries its own BOS.
-    processed = processor(
-        text=[text], images=images, add_special_tokens=False, return_tensors="pt"
-    )
-    input_ids = processed["input_ids"][0].tolist()
-    grid_thw = processed["image_grid_thw"]
-    spans = _image_token_spans(input_ids, token_id)
-    merge_length = processor.image_processor.merge_size**2
-    expected = [int(n) // merge_length for n in grid_thw.prod(-1).tolist()]
-    if [count for _, count in spans] != expected:
-        raise ValueError(
-            f"Image token runs {[c for _, c in spans]} disagree with the "
-            f"processed grids {expected}"
-        )
-    data = {
-        "pixel_values": processed["pixel_values"],
-        "image_grid_thw": grid_thw,
-        "embedding_spans": tuple(spans),
-    }
-    data["cache_seed"] = multimodal_cache_seed(data)
-    return input_ids, data
+
+    def __init__(self, atom_config: Config, prefix: str = "") -> None:
+        super().__init__(atom_config, prefix=prefix)
+        hf_config = atom_config.hf_config
+        self.image_token_id = image_token_id(hf_config)
+        # The tower only runs where the token embeddings are produced, and
+        # only where image requests are accepted (`build_minimax_m3_inputs`).
+        why = image_input_refusal(atom_config)
+        self.has_vision_tower = why is None and get_pp_group().is_first_rank
+        if not self.has_vision_tower:
+            self.vision_tower = PPMissingLayer()
+            self.multi_modal_projector = PPMissingLayer()
+            self.patch_merge_mlp = PPMissingLayer()
+            self.skip_weight_prefixes = list(self.vision_weight_prefixes)
+            return
+
+        (
+            self.vision_tower,
+            self.multi_modal_projector,
+            self.patch_merge_mlp,
+        ) = build_vision_modules(hf_config)
+        self.language_model.embed_before_model = True
+
+    def get_vision_embeddings(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.has_vision_tower:
+            raise RuntimeError(
+                "MiniMax-M3 image embeddings were requested on a rank without "
+                "a vision tower (image input refused, or a non-first PP rank)."
+            )
+        features = self.vision_tower(pixel_values, grid_thw.tolist())
+        return self.patch_merge_mlp(self.multi_modal_projector(features))
+
+    def merge_multimodal_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        vision_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = input_ids == self.image_token_id
+        num_placeholders = int(mask.sum())
+        if num_placeholders != vision_embeds.shape[0]:
+            raise ValueError(
+                f"MiniMax-M3 got {vision_embeds.shape[0]} image embeddings for "
+                f"{num_placeholders} image tokens; an image prefill without "
+                "embedding spans must not be chunked."
+            )
+        inputs_embeds[mask] = vision_embeds.to(inputs_embeds.dtype)
+        return inputs_embeds
