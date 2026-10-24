@@ -597,6 +597,16 @@ def test_staging_rejects_padding_that_truncates_or_exceeds_capacity():
     rt.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_host_allocator(monkeypatch):
+    """Keep every test off the real `hipHostMalloc`: the registration tests
+    script `cudaHostRegister`, and the copy tests install `FakeHostAllocator`
+    themselves."""
+    from atom.model_ops.engram import host_memory
+
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: None)
+
+
 class FakeCudart:
     """Page-lock accounting, and a scripted refusal.
 
@@ -664,6 +674,273 @@ def test_enabling_the_same_range_twice_registers_once(monkeypatch):
     assert table.enable_uva(0, 4) is True
     assert table.enable_uva(0, 4) is True
     assert cudart.calls == 2
+
+
+class FakeHostAllocator:
+    """Page-locked allocations backed by ctypes buffers kept alive here."""
+
+    def __init__(self, refuse_call=None):
+        self.refuse_call = refuse_call
+        self.live = {}
+        self.calls = 0
+
+    def alloc(self, nbytes):
+        import ctypes
+
+        self.calls += 1
+        if self.calls == self.refuse_call:
+            return None
+        buf = ctypes.create_string_buffer(nbytes)
+        self.live[ctypes.addressof(buf)] = buf
+        return ctypes.addressof(buf)
+
+    def free(self, ptr):
+        del self.live[ptr]
+
+
+def test_copied_shard_holds_exactly_the_rows_the_kernel_addresses(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    weight = torch.arange(6 * 8, dtype=torch.float32).reshape(6, 8)
+    scale = torch.full((6, 2), 2.0).to(torch.float8_e8m0fnu)
+    table = HostEmbeddingTable(weight, num_rows=6, head_dim=8, scale=scale)
+    assert table.enable_uva(2, 5) is True
+    got_w, got_s, start, end = table.registered_shard()
+    assert (start, end) == (2, 5)
+    assert torch.equal(got_w, weight[2:5])
+    assert torch.equal(got_s, scale[2:5].view(torch.uint8))
+    # Copies, not views of the checkpoint mapping.
+    assert got_w.data_ptr() != weight[2:5].data_ptr()
+    assert len(allocator.live) == 2
+    del got_w, got_s
+    table.disable_uva()
+    assert allocator.live == {} and table._uva is None
+    table.disable_uva()
+
+
+def test_a_held_shard_tensor_keeps_its_memory_until_dropped(monkeypatch):
+    """The tensors `registered_shard` hands out own the page-locked memory:
+    `disable_uva` cannot free memory a caller can still read."""
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    weight = table.registered_shard()[0]
+    table.disable_uva()
+    # The scales had no other holder; the values are still referenced.
+    assert list(allocator.live) == [weight.data_ptr()]
+    assert torch.equal(weight, torch.ones(4, 8))
+    del weight
+    assert allocator.live == {}
+
+
+def test_a_table_dropped_without_disable_frees_its_shard(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(allocator.live) == 2
+    del table
+    assert allocator.live == {}
+
+
+def test_a_held_registration_stays_registered_until_dropped(monkeypatch):
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    weight = table.registered_shard()[0]
+    table.disable_uva()
+    assert len(cudart.registered) == 1
+    del weight
+    assert cudart.registered == []
+
+
+def test_enabling_a_different_range_while_one_is_held_raises(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    with pytest.raises(RuntimeError, match="disable_uva"):
+        table.enable_uva(1, 3)
+    assert table.registered_shard()[2:] == (0, 4)
+    table.disable_uva()
+    assert table.enable_uva(1, 3) is True
+    assert table.registered_shard()[2:] == (1, 3)
+    assert allocator.calls == 4
+
+
+def test_a_release_during_graph_capture_is_skipped(monkeypatch):
+    """Freeing synchronizes the device, which a capture forbids."""
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    monkeypatch.setattr(host_memory, "_capturing", lambda: True)
+    table.disable_uva()
+    assert len(allocator.live) == 2
+
+
+def test_a_copy_leaves_an_anonymous_source_intact(monkeypatch):
+    """Dropping copied source pages is for checkpoint (file) mappings only: on
+    anonymous memory it would discard the table."""
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(host_memory, "_BYTES_PER_THREAD", 1 << 14)
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda pid: set(range(4)))
+    weight = torch.randn(4096, 64)
+    expected = weight.clone()
+    assert host_memory._source_dropper(weight) is None
+    table = HostEmbeddingTable(weight, num_rows=4096, head_dim=64)
+    assert table.enable_uva(0, 4096) is True
+    assert torch.equal(weight, expected)
+
+
+def test_a_copied_file_mapping_is_dropped_and_still_reads_back(monkeypatch, tmp_path):
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    data = np.random.default_rng(0).standard_normal((4096, 64)).astype(np.float32)
+    path = tmp_path / "table.bin"
+    data.tofile(path)
+    mapped = torch.from_numpy(np.memmap(path, np.float32, "c", shape=data.shape))
+    dropped = []
+    real = host_memory._source_dropper
+
+    def watched(src):
+        drop = real(src)
+        assert drop is not None  # a file mapping
+
+        def record(offset, nbytes):
+            dropped.append((offset, nbytes))
+            drop(offset, nbytes)
+
+        return record
+
+    monkeypatch.setattr(host_memory, "_source_dropper", watched)
+    # Small chunks, several threads: exercise the chunked copy and drops.
+    monkeypatch.setattr(host_memory, "_BYTES_PER_THREAD", 1 << 14)
+    monkeypatch.setattr(host_memory, "_CHUNK_BYTES", 1 << 14)
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda pid: set(range(4)))
+    table = HostEmbeddingTable(mapped, num_rows=4096, head_dim=64)
+    assert table.enable_uva(0, 4096) is True
+    assert len(dropped) > 2 and dropped[-1] == (0, data.nbytes)
+    assert torch.equal(table.registered_shard()[0], torch.from_numpy(data))
+    assert torch.equal(mapped, torch.from_numpy(data))  # faulted back in
+
+
+def test_the_allocator_disables_huge_pages_only_around_the_allocation():
+    """hipHostMalloc on huge pages compacts memory once the page cache has
+    fragmented it; the allocation runs with THP off and restores the
+    process's own setting."""
+    from types import SimpleNamespace
+
+    from atom.model_ops.engram import host_memory as hm
+
+    calls, state = [], {"thp_off": 0}
+
+    def prctl(op, arg, *rest):
+        calls.append((op, arg))
+        if op == hm._PR_GET_THP_DISABLE:
+            return state["thp_off"]
+        state["thp_off"] = arg
+        return 0
+
+    def malloc(ptr, nbytes, flags):
+        calls.append(("malloc", state["thp_off"]))
+        ptr._obj.value = 4096
+        return 0
+
+    # Plain functions: the allocator sets `argtypes` on them, as on ctypes'.
+    libc = SimpleNamespace(prctl=prctl)
+    hip = SimpleNamespace(hipHostMalloc=malloc, hipHostFree=lambda ptr: 0)
+    alloc = hm._HipHostAllocator(hip, libc)
+    assert alloc.alloc(1 << 20) == 4096
+    assert ("malloc", 1) in calls and state["thp_off"] == 0
+    state["thp_off"] = 1  # a process that disabled THP itself keeps it off
+    calls.clear()
+    alloc.alloc(1 << 20)
+    assert state["thp_off"] == 1 and (hm._PR_SET_THP_DISABLE, 0) not in calls
+
+
+def test_copy_threads_scale_with_size_and_respect_cpu_affinity(monkeypatch):
+    from atom.model_ops.engram import host_memory as hm
+
+    monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: set(range(64)))
+    assert hm.copy_threads(hm._BYTES_PER_THREAD - 1) == 1
+    assert hm.copy_threads(4 * hm._BYTES_PER_THREAD) == 4
+    assert hm.copy_threads(1 << 40) == hm._MAX_COPY_THREADS
+    monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: {0, 1, 2})
+    assert hm.copy_threads(1 << 40) == 3
+
+
+def test_a_threaded_copy_is_exact(monkeypatch):
+    from atom.model_ops.engram import host_memory as hm
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(hm, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(hm, "_BYTES_PER_THREAD", 1000)
+    monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: set(range(8)))
+    weight = torch.randn(64, 128)
+    table = HostEmbeddingTable(weight, num_rows=64, head_dim=128)
+    assert table.enable_uva(3, 61) is True
+    assert torch.equal(table.registered_shard()[0], weight[3:61])
+
+
+def test_refused_scale_copy_frees_the_values_it_took(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator(refuse_call=2)
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is False
+    assert allocator.live == {} and table._uva is None
+
+
+def test_a_copy_that_fails_frees_what_it_took(monkeypatch):
+    """No thread to copy on (or any copy error): every allocation goes back
+    and the table reports no shard, so the group can fall back."""
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+
+    def no_thread(dst, src, pool):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(host_memory, "_copy_into", no_thread)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is False
+    assert allocator.live == {} and table._uva is None
+    table.disable_uva()
+
+
+def test_without_a_host_allocator_the_mapping_is_registered_in_place(monkeypatch):
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: None)
+    table = scaled_table()
+    assert table.enable_uva(0, 4) is True
+    assert len(cudart.registered) == 2
+    weight, _, _, _ = table.registered_shard()
+    assert weight.data_ptr() == table._tensor.data_ptr()
 
 
 class FakeGroup:

@@ -1132,14 +1132,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
-    # gathering them on the host. The tables stay in host memory (page-locked in
-    # place, not copied to HBM); the GPU pulls only the rows a step names and
-    # dequantizes them there. On by default: the host gather gives the same rows
+    # gathering them on the host. Each rank's shard stays in host memory,
+    # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
+    # GPU pulls only the rows a step names and dequantizes them there. On by default: the host gather gives the same rows
     # but costs ~50 ms of CPU per decode step with the GPU idle behind it. Set
     # to 0 to fall back. Anything that would make it unsafe -- no CUDA, more TP
     # ranks than hash heads, a registration that will not fit -- falls back on
     # its own, so the switch is for taking the host path deliberately.
     "ATOM_ENGRAM_UVA": lambda: os.getenv("ATOM_ENGRAM_UVA", "1") == "1",
+    # How the UVA path page-locks a shard (`engram.host_memory`): 1 copies it
+    # into page-locked memory of exactly its size (hipHostMalloc on base pages,
+    # so a fragmented page cache costs no compaction), one thread per 128 MiB up to
+    # 16 and the CPUs this process may use, dropping the copied checkpoint
+    # pages from the process as it goes; 0 registers the checkpoint mapping in
+    # place (one thread, under the HIP runtime lock). Either way the shard is
+    # resident once. Copying needs the HIP runtime; elsewhere it registers in
+    # place regardless. `tools/engram/bench_uva_shard.py` measures both.
+    "ATOM_ENGRAM_UVA_COPY": lambda: os.getenv("ATOM_ENGRAM_UVA_COPY", "1") == "1",
     # Where the compressed-vocab table is cached between runs. The table is
     # reproducible from the tokenizer, so this only trades startup time for
     # disk; point it at shared storage to let several servers build it once.
