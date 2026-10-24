@@ -6,8 +6,86 @@ registered shard lives in `device.uva`, so that the prefetch runtime can import
 this module on a machine with no Triton.
 """
 
+import ctypes
+import functools
+
 import numpy as np
 import torch
+
+
+@functools.cache
+def _hip_runtime():
+    """The HIP runtime torch already loaded (e.g. a wheel's libamdhip64.so.7)."""
+    try:
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                if "libamdhip64" in line:
+                    return ctypes.CDLL(line.split()[-1])
+    except OSError:
+        pass
+    return None
+
+
+def _clear_last_error() -> None:
+    """Reset HIP's last error after a refused registration.
+
+    `cudaHostRegister` reports the refusal through its return code but also
+    leaves it as the runtime's last error, and torch raises that at its next
+    kernel-launch check -- so the host-path fallback would die there ("part or
+    all of the requested memory range is already mapped").
+    """
+    hip = _hip_runtime()
+    if hip is not None:
+        hip.hipGetLastError()
+
+
+class _PageRuns:
+    """Page-locked runs of this process, reference-counted.
+
+    `cudaHostRegister` refuses any range that overlaps one already registered,
+    and a table widens each range to page boundaries. Ranges stored back to
+    back want the page they share: a layer's scales sit right before its
+    values in the checkpoint shard, and a rank that holds every hash head (one
+    DP-attention rank per GPU) registers both whole. A run is registered once
+    and released with its last user.
+    """
+
+    def __init__(self):
+        self._runs: dict[int, list[int]] = {}  # base -> [end, users]
+
+    def acquire(self, rt, lo: int, hi: int) -> list[int] | None:
+        """Reference the runs covering `[lo, hi)`, registering the uncovered
+        gaps; their bases, or None (holding nothing) if a registration is
+        refused."""
+        held: list[int] = []
+        cursor = lo
+        overlapping = sorted(b for b, (e, _) in self._runs.items() if b < hi and e > lo)
+        for base in overlapping + [None]:
+            gap_end = hi if base is None else base
+            if cursor < gap_end:
+                if int(rt.cudaHostRegister(cursor, gap_end - cursor, 0)) != 0:
+                    _clear_last_error()
+                    self.release(rt, held)
+                    return None
+                self._runs[cursor] = [gap_end, 1]
+                held.append(cursor)
+            if base is None:
+                break
+            self._runs[base][1] += 1
+            held.append(base)
+            cursor = max(cursor, self._runs[base][0])
+        return held
+
+    def release(self, rt, bases) -> None:
+        for base in bases:
+            run = self._runs[base]
+            run[1] -= 1
+            if run[1] == 0:
+                rt.cudaHostUnregister(base)
+                del self._runs[base]
+
+
+_PAGE_RUNS = _PageRuns()
 
 
 class HostEmbeddingTable:
@@ -37,8 +115,8 @@ class HostEmbeddingTable:
         self.head_dim = head_dim
         self._scale = scale
         self.block_size = 0
-        # The registered row range, and the page-aligned base of each
-        # registration made for it.
+        # The registered row range, and the page-locked runs (see `_PageRuns`)
+        # this table holds a reference on for it.
         self._uva: tuple[int, int] | None = None
         self._pinned: tuple[int, ...] = ()
         if scale is not None:
@@ -141,13 +219,13 @@ class HostEmbeddingTable:
             base = tensor.data_ptr() + row_start * width * item
             nbytes = (row_end - row_start) * width * item
             lo = base - (base % self._PAGE)
-            size = -(-(base + nbytes - lo) // self._PAGE) * self._PAGE
-            if int(rt.cudaHostRegister(lo, size, 0)) != 0:
+            hi = -(-(base + nbytes) // self._PAGE) * self._PAGE
+            runs = _PAGE_RUNS.acquire(rt, lo, hi)
+            if runs is None:
                 # This object is about to report that it holds neither region.
-                for done in pinned:
-                    rt.cudaHostUnregister(done)
+                _PAGE_RUNS.release(rt, pinned)
                 return False
-            pinned.append(lo)
+            pinned.extend(runs)
         self._pinned = tuple(pinned)
         self._uva = (row_start, row_end)
         return True
@@ -160,9 +238,7 @@ class HostEmbeddingTable:
         """
         if self._uva is None:
             return
-        rt = torch.cuda.cudart()
-        for base in self._pinned:
-            rt.cudaHostUnregister(base)
+        _PAGE_RUNS.release(torch.cuda.cudart(), self._pinned)
         self._pinned = ()
         self._uva = None
 
