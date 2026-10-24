@@ -157,6 +157,45 @@ class GatedDeltaNet(nn.Module):
         value = rearrange(value, "l (h d) -> 1 l h d", d=self.head_v_dim)
         return query.contiguous(), key.contiguous(), value.contiguous()
 
+    def _spec_conv1d_update(
+        self,
+        mixed_qkv_spec,
+        conv_state,
+        conv_weights,
+        gdn_metadata,
+        num_accepted_tokens,
+        use_replayssm,
+    ):
+        """Update speculative convolution state using the native cache layout."""
+        spec_state_indices_tensor = gdn_metadata.spec_state_indices_tensor
+        return causal_conv1d_update(
+            mixed_qkv_spec,
+            conv_state,
+            conv_weights,
+            self.num_k_heads * self.head_k_dim // self.tp_size,
+            self.num_v_heads * self.head_v_dim // self.tp_size,
+            self.conv1d.bias,
+            self.activation,
+            conv_state_indices=spec_state_indices_tensor[:, 0][
+                : gdn_metadata.num_spec_decodes
+            ],
+            num_accepted_tokens=num_accepted_tokens,
+            query_start_loc=gdn_metadata.spec_query_start_loc,
+            # The verify window, which sizes the conv rollback window
+            # (state_len = kernel_width-1 + max_query_len-1) and hence the
+            # kernel's NP2_STATELEN tile. It used to be inferred from the
+            # slot table's last dim, which only coincided with the window
+            # because that table carried one column per draft; state that
+            # dependency explicitly so a narrower table cannot silently
+            # truncate the conv state.
+            max_query_len=(
+                gdn_metadata.replayssm_max_query_len
+                if use_replayssm
+                else spec_state_indices_tensor.size(-1)
+            ),
+            validate_data=False,
+        )
+
     def forward(
         self,
         mixed_qkv: torch.Tensor,
@@ -243,32 +282,13 @@ class GatedDeltaNet(nn.Module):
 
         # # 1.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            query_spec, key_spec, value_spec = causal_conv1d_update(
+            query_spec, key_spec, value_spec = self._spec_conv1d_update(
                 mixed_qkv_spec,
                 conv_state,
                 conv_weights,
-                self.num_k_heads * self.head_k_dim // self.tp_size,
-                self.num_v_heads * self.head_v_dim // self.tp_size,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0][
-                    : gdn_metadata.num_spec_decodes
-                ],
-                num_accepted_tokens=num_accepted_tokens,
-                query_start_loc=spec_query_start_loc,
-                # The verify window, which sizes the conv rollback window
-                # (state_len = kernel_width-1 + max_query_len-1) and hence the
-                # kernel's NP2_STATELEN tile. It used to be inferred from the
-                # slot table's last dim, which only coincided with the window
-                # because that table carried one column per draft; state that
-                # dependency explicitly so a narrower table cannot silently
-                # truncate the conv state.
-                max_query_len=(
-                    gdn_metadata.replayssm_max_query_len
-                    if use_replayssm
-                    else spec_state_indices_tensor.size(-1)
-                ),
-                validate_data=False,
+                gdn_metadata,
+                num_accepted_tokens,
+                use_replayssm,
             )
             num_tokens_spec = query_spec.shape[0]
             query_spec = query_spec.view(1, num_tokens_spec, -1, self.head_k_dim)
@@ -424,6 +444,7 @@ class GatedDeltaNet(nn.Module):
                             : gdn_metadata.num_spec_decodes + 1
                         ],
                         ssm_state_indices=spec_state_indices_tensor,
+                        ssm_state_indices_in=gdn_metadata.spec_state_indices_in_tensor,
                         num_accepted_tokens=num_accepted_tokens,
                         use_qk_l2norm_in_kernel=True,
                     )
