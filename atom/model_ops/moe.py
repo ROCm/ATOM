@@ -1627,7 +1627,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # ── B. General Triton MXFP4 MoE ───────────────────────────────────────
         if self.use_triton and not self.use_triton_decode:
-            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+            from atom.model_ops.fused_moe_triton import _mx_scale_kwidth, _swizzle_mxfp4
 
             atom_config = get_current_atom_config()
 
@@ -1684,6 +1684,53 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # Selects the consuming kernel, which fixes the scale kwidth.
                 act_quant=self.act_quant,
             )
+
+            # gfx1250 prefill runs the routed GEMM as a8w4 (see apply), whose
+            # kernel reads the scales at its own kwidth. Where that differs from
+            # the configured act_quant's (a16w4 is 8, a8w4 is 4 on gfx1250) the
+            # same scales are a different permutation at an identical shape, so
+            # prefill gets its own swizzle -- the weights themselves are only
+            # transposed views. Scales are 1/16 of the expert weight bytes.
+            # None means prefill keeps self.act_quant.
+            layer.a8w4_prefill_scales = None
+            if self.is_gfx1250:
+                if _mx_scale_kwidth(MoEActivationQuant.FP8) == _mx_scale_kwidth(
+                    self.act_quant
+                ):
+                    layer.a8w4_prefill_scales = (
+                        w13_scale,
+                        w13_swizzle_layout,
+                        w2_scale,
+                        w2_swizzle_layout,
+                    )
+                else:
+                    (
+                        _,
+                        w13_scale_a8w4,
+                        w13_swizzle_layout_a8w4,
+                        _,
+                        w2_scale_a8w4,
+                        w2_swizzle_layout_a8w4,
+                    ) = _swizzle_mxfp4(
+                        layer.w13_weight.view(torch.uint8),
+                        layer.w13_weight_scale,
+                        layer.w2_weight.view(torch.uint8),
+                        layer.w2_weight_scale,
+                        "mx4",
+                        self.intermediate_size * 2,  # N_1,
+                        self.hidden_size,  # K_1,
+                        self.hidden_size,  # N_2,
+                        self.intermediate_size,  # K_2,
+                        atom_config.tensor_parallel_size,
+                        act_quant=MoEActivationQuant.FP8,
+                    )
+                    layer.a8w4_prefill_scales = (
+                        w13_scale_a8w4,
+                        w13_swizzle_layout_a8w4,
+                        w2_scale_a8w4,
+                        w2_swizzle_layout_a8w4,
+                    )
+
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
@@ -1929,6 +1976,29 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                 # Both preps publish the same six names, so there is nothing to
                 # select here -- only which kernel consumes them.
+                #
+                # Prefill FP8 activation quant (a8w4: FP8 act x MXFP4 weight) on
+                # gfx1250: the routed GEMM is compute-bound in prefill, where
+                # activation-quantizing is a large win (~+60% throughput, ~-45%
+                # TTFT) with no measured accuracy loss; decode (small M,
+                # memory-bound) keeps a16w4. Only where weight prep built the
+                # a8w4 scale swizzle: a16w4's scales misread silently under a8w4.
+                runtime_act_quant = self.act_quant
+                a8w4_prefill_scales = getattr(layer, "a8w4_prefill_scales", None)
+                if (
+                    a8w4_prefill_scales is not None
+                    and not use_triton_gfx1250_silu
+                    and activation == ActivationType.Swiglu
+                    and get_forward_context().context.is_prefill
+                ):
+                    runtime_act_quant = MoEActivationQuant.FP8
+                    (
+                        w13_weight_scale,
+                        w13_swizzle_layout,
+                        w2_weight_scale,
+                        w2_swizzle_layout,
+                    ) = a8w4_prefill_scales
+
                 output = torch.empty_like(x)
                 _moe_result = triton_kernel_fused_experts(
                     output,
@@ -1952,7 +2022,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
                     expert_map=expert_map,
-                    act_quant=self.act_quant,
+                    act_quant=runtime_act_quant,
                     use_triton_gfx1250_silu=use_triton_gfx1250_silu,
                 )
 
@@ -2244,15 +2314,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
 
-        # The dense shared-expert GEMM only implements the SiLU activation
-        # path; SwiGLU models have no fused shared experts, so this assert
-        # documents the supported scope.
-        assert (
-            activation != ActivationType.Swiglu
-        ), "dense shared-expert GEMM only supports the SiLU activation path"
+        from atom.model_ops.swiglu_oai import swiglu_oai_split
+
+        # Two activation flavours are supported, matching the routed experts:
+        #   * SiLU (DeepSeek): silu(gate) * clamp(up), split [gate | up] layout.
+        #   * SwiGLU-OAI (MiniMax-M3 / gpt-oss): gate * sigmoid(alpha*gate) *
+        #     (up + beta) with optional clamp. MiniMax-M3 does not interleave
+        #     gate/up, so the dense GEMM output is split [gate | up] - exactly
+        #     what swiglu_oai_split consumes (mirrors MiniMaxM3MLP.forward and
+        #     the routed swiglu_add_residual=True / alpha path).
+        is_swiglu = activation == ActivationType.Swiglu
 
         M = x.shape[0]
         swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
+        swiglu_alpha = getattr(layer, "swiglu_alpha", 1.702)
+        swiglu_beta = getattr(layer, "swiglu_beta", 1.0)
 
         use_a4w4 = self.act_quant == MoEActivationQuant.FP4
         if use_a4w4:
@@ -2278,14 +2354,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if shared_w13_bias is not None:
                 gate_up = gate_up + shared_w13_bias[e]
             half_n = gate_up.shape[-1] // 2
-            intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
-            fused_clamp_act_mul(
-                gate_up,
-                out=intermediate,
-                swiglu_limit=swiglu_limit,
-                activation="silu",
-                dtype_quant=None,
-            )
+            if is_swiglu:
+                intermediate = swiglu_oai_split(
+                    gate_up,
+                    alpha=swiglu_alpha,
+                    beta=swiglu_beta,
+                    limit=swiglu_limit,
+                    out_dtype=x.dtype,
+                )
+            else:
+                intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
+                fused_clamp_act_mul(
+                    gate_up,
+                    out=intermediate,
+                    swiglu_limit=swiglu_limit,
+                    activation="silu",
+                    dtype_quant=None,
+                )
             out_e = _shared_expert_gemm(
                 intermediate,
                 layer.shared_w2_weight[e],

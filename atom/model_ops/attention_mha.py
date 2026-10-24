@@ -179,20 +179,31 @@ class PagedAttentionImpl(nn.Module):
             return False
         return q.shape[1] % k.shape[1] == 0
 
-    def _reject_per_token_scales_on_unified(self, k_scale, v_scale, phase: str):
-        """unified_attention carries one descale for the whole tensor.
+    def _unified_kv_descales(self, k_scale, v_scale, phase: str):
+        """The (k_descale, v_descale) pair a unified_attention call over the
+        paged cache must pass.
 
-        Feeding it a per-token cache is not an error downstream, just wrong
-        numbers, so it has to be refused here. Both phases route into unified on
-        the same conditions, so both check.
+        The SHUFFLE writers quantize fp8 KV PER TOKEN and fill k_scale/v_scale
+        as [num_blocks, num_kv_heads, block_size]; descaling that cache with
+        the per-tensor self.kv_scale (1.0 by default) inflates K/V by
+        fp8_max/amax (~400x). aiter carries per-token descales only for the
+        gfx1250 shuffled fp8 cache; anywhere else unified_attention takes one
+        descale for the whole tensor, so a per-token cache is refused here
+        rather than read with the wrong numbers. Both phases route into unified
+        on the same conditions, so both ask.
         """
-        if (k_scale is not None and k_scale.numel() > 1) or (
+        per_token = (k_scale is not None and k_scale.numel() > 1) or (
             v_scale is not None and v_scale.numel() > 1
-        ):
-            raise NotImplementedError(
-                f"layer {self.layer_num} takes unified_attention for {phase}, "
-                "which cannot carry its per-token KV scales"
-            )
+        )
+        if not per_token:
+            return self.kv_scale, self.kv_scale
+        if get_gfx() == "gfx1250" and not self.use_flash_layout:
+            return k_scale, v_scale
+        raise NotImplementedError(
+            f"layer {self.layer_num} takes unified_attention for {phase}, "
+            "which carries per-token KV scales only for the gfx1250 shuffled "
+            "KV cache"
+        )
 
     def forward_impl(
         self,
@@ -585,7 +596,7 @@ class PagedAttentionImpl(nn.Module):
         of the reasons for it.
         """
         attn_metadata = fwd_ctx.attn_metadata
-        self._reject_per_token_scales_on_unified(k_scale, v_scale, "decode")
+        k_descale, v_descale = self._unified_kv_descales(k_scale, v_scale, "decode")
 
         if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
             o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
@@ -611,8 +622,8 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
-            v_descale=self.kv_scale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             sinks=self.sinks,
             shuffled_kv_cache=not self.use_flash_layout,
         )
@@ -977,7 +988,9 @@ class PagedAttentionImpl(nn.Module):
         if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
             # Only this branch reads the quantized cache; the else below passes
             # raw bf16 K/V, where a per-token scale never reaches the kernel.
-            self._reject_per_token_scales_on_unified(k_scale, v_scale, "prefill")
+            k_descale, v_descale = self._unified_kv_descales(
+                k_scale, v_scale, "prefill"
+            )
             k_for_attn = k_cache
             v_for_attn = v_cache
             # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
@@ -990,6 +1003,7 @@ class PagedAttentionImpl(nn.Module):
             v_for_attn = v.unsqueeze(1)
             # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
             shuffled_kv_cache = False
+            k_descale = v_descale = self.kv_scale
 
         # Requests this step scheduled: the width prepare_prefill fills in
         # cu_seqlens_q and context_lens before padding the tail to running_bs.
@@ -1018,8 +1032,8 @@ class PagedAttentionImpl(nn.Module):
             block_table=attn_metadata.block_tables,
             softcap=0,
             q_descale=None,
-            k_descale=self.kv_scale,
-            v_descale=self.kv_scale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             sinks=self.sinks,
             shuffled_kv_cache=shuffled_kv_cache,
         )
