@@ -234,10 +234,51 @@ class _Qwen4ExpDecodeGraphBuffers:
 
 
 _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
-# Draft stays eager (Flash mRoPE) but must not write the buffers baked into
+# The draft must not write the buffers baked into
 # the target verify graph. A second set still keeps page tables and seq_lens
 # on device, so a draft step does not allocate or sync seq_lens back to host.
 _DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
+# Non-None marker returned to the draft runner's out-of-graph hook
+# before the first draft forward has populated _DRAFT_QSA.last_qsa.
+_DRAFT_GRAPH_METADATA_IN_GRAPH = object()
+
+
+def _is_draft_decode_batch(forward_batch: Any) -> bool:
+    """Draft-runner decode batch (EAGLE draft input)."""
+    spec = getattr(forward_batch, "spec_info", None)
+    return type(spec).__name__ == "EagleDraftInput"
+
+
+def stage_draft_graph_mrope(mrope_buffer: torch.Tensor, forward_batch: Any) -> None:
+    """Stage the live mRoPE rows into a draft graph runner's ``[3, N]`` buffer.
+
+    SGLang's EAGLE draft decode / draft-extend runners capture
+    ``forward_batch.mrope_positions`` from that buffer but refresh only the
+    1-D ``positions`` on replay, and the buffer is shared by name and shape
+    with other runners. The Flash drafter reads the 3-row positions
+    (``_lm_positions_for_runtime``), so copy SGLang's live rows in (they carry
+    multimodal offsets), or broadcast the 1-D positions when SGLang computed
+    none. Rows past the batch are zeroed, as SGLang zeroes padded ``positions``.
+    """
+    live = getattr(forward_batch, "mrope_positions", None)
+    if live is None:
+        live = forward_batch.positions.unsqueeze(0).expand(3, -1)
+    num_tokens = int(live.shape[-1])
+    mrope_buffer[:, :num_tokens].copy_(live)
+    mrope_buffer[:, num_tokens:].zero_()
+
+
+def advance_draft_decode_mrope(forward_batch: Any) -> None:
+    """Advance mRoPE in step with EAGLE ``draft_forward``'s ``positions.add_(1)``.
+
+    SGLang moves only the 1-D positions after each draft decode step, so the
+    3-row positions the Flash drafter reads would stay at step 0. The plugin's
+    ``draft_forward`` wrapper calls this on the caller's batch after every draft
+    decode forward; inside a draft decode graph capture the add is recorded.
+    """
+    mrope = getattr(forward_batch, "mrope_positions", None)
+    if mrope is not None:
+        mrope.add_(1)
 
 
 def _is_draft_forward() -> bool:
@@ -918,11 +959,14 @@ def _serving_context_len(atom_config: Any, indexer_budget: int) -> int:
 
 
 def _ensure_draft_qsa(device: torch.device, block_size: int, ctx_len: int) -> None:
-    """Allocate the draft page tables once, at serving capacity."""
+    """Allocate the draft page tables once, at serving and graph capacity."""
     args = _server_args()
     max_bs = 32
     if args is not None:
         max_bs = max(int(getattr(args, "max_running_requests", 32) or 32), 1)
+    # The draft decode graph captures up to the decode bucket, which exceeds
+    # the 32-row default when --max-running-requests is omitted.
+    max_bs = max(max_bs, _get_cuda_graph_max_bs())
     ctx = max(int(ctx_len), 1)
     tokens_per_req = _get_qsa_graph_max_tokens_per_req()
     pages = max(1, (ctx + block_size - 1) // block_size)
@@ -1601,6 +1645,12 @@ def prepare_qwen4_exp_decode_graph_metadata(
             return None
     if atom_config is None or not _is_qwen4_exp_config(atom_config):
         return None
+    # A Flash draft decode graph rebuilds its QSA metadata into
+    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
+    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
+    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
+    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
+        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
 
     tokens_per_req = _get_qsa_tokens_per_req(forward_batch)
     positions = getattr(forward_batch, "positions", None)
@@ -1653,7 +1703,12 @@ def qwen4_exp_metadata_from_forward_batch(
     that storage in place; there is no extra PLE copy.
     """
     bind_qsa_caches(model, forward_batch, atom_config)
-    if _is_capturing() and _DECODE_GRAPH.last_qsa is not None:
+    # Draft graphs build into _DRAFT_QSA inside the graph instead.
+    if (
+        _is_capturing()
+        and not _is_draft_forward()
+        and _DECODE_GRAPH.last_qsa is not None
+    ):
         ple = _DECODE_GRAPH.last_ple
         if ple is None:
             ple = _build_decode_graph_ple_metadata(
