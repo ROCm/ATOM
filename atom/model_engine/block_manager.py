@@ -1620,6 +1620,17 @@ class BlockManager:
             seq.offload_joint.boundary_hash = -1
         return True
 
+    def tier_resume_replays(self, seq: Sequence) -> bool:
+        """Whether a prefill resuming after an offload load replays below it.
+
+        A DeepSeek-V4 bounded replay records it per hit (`replays_hit`). Under
+        a `replay` state transfer (DeepSeek-V4.1 encoder bounded replay) no
+        state is ever restored, so every resume rebuilds it, the tier's as
+        well as the HBM's: the load brings PAGE KV alone, and the forward
+        replays the hash block below where it ends.
+        """
+        return bool(seq.replays_hit or self.state.transfer.replays)
+
     def replay_start(self, seq: Sequence, start: int, *, hit: bool) -> int:
         """Where a prefill resuming at `start` begins, early enough to rebuild
         what its forward reads below `start`: under a `replay` state transfer
