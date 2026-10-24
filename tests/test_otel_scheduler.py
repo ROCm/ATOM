@@ -384,10 +384,13 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         kv_transfer_config=None,
     )
     cls(config, "unused", "unused")
-    assert events == [
+    required_order = [
         "get_num_blocks",
         "allocate_kv_cache",
         "initialize",
         "freeze",
         "ready",
     ]
+    # Other runner discovery/warmup RPCs can change independently of tracing.
+    # Keep checking the ordering and uniqueness of the relevant startup steps.
+    assert [event for event in events if event in required_order] == required_order
