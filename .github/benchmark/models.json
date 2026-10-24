@@ -172,7 +172,7 @@
         {
           "label": "MTP3",
           "suffix": "-mtp3",
-          "extra_args": "--method mtp --num-speculative-tokens 3",
+          "extra_args": "--method mtp --num-speculative-tokens 3 --max-num-seqs 256 --max-num-batched-tokens 8192 --attn-prefill-chunk-size 8192 --cudagraph-capture-sizes '[1,2,3,4,5,6,7,8,16,32,48,64,128]'",
           "bench_args": "--use-chat-template",
           "conc_min": 1,
           "conc_max": 256
