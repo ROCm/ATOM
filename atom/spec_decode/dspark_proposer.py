@@ -329,15 +329,19 @@ class DSparkProposer(Drafter):
         # back down to wherever the last claim reached.
         hi = max(bs, self._draft_row_base_hi)
         if drafts_verifiable and bs:
-            # A greedy request's verify is exact match against the target
-            # argmax and never reads its q, so it claims no slot and its row
-            # writes no q (the draft still emits the argmax). Per request, not
-            # per batch: a filtered batch drafts greedily but its sampled
-            # requests' q is read once the batch is unfiltered again.
-            greedy = batch.temperatures[:bs] <= SAMPLER_EPS
-            self._q_slots.claim_bases(
-                req_ids, dest.np, greedy if greedy.any() else None
-            )
+            # Per request, rows whose q nobody reads claim no slot and write no
+            # q (the draft still emits the argmax for them):
+            # * a greedy request: its verify is exact match against the target
+            #   argmax. Its own temperature, not the batch's draft mode -- a
+            #   filtered batch drafts greedily, but its sampled requests' q is
+            #   read once the batch is unfiltered again;
+            # * a request still mid-prompt in a mixed prefill batch: its drafts
+            #   are dropped, like a whole align-only batch's.
+            skip = batch.temperatures[:bs] <= SAMPLER_EPS
+            final_chunk = getattr(batch, "is_final_chunk", None)
+            if final_chunk is not None:
+                skip |= ~np.asarray(final_chunk[:bs], dtype=bool)
+            self._q_slots.claim_bases(req_ids, dest.np, skip if skip.any() else None)
             dest.np[bs:hi] = -1
             self._draft_row_base_hi = bs
         else:

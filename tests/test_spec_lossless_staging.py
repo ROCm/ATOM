@@ -77,12 +77,13 @@ def group(prop):
     )
 
 
-def batch(req_ids, temperatures=None, *, dummy=False):
+def batch(req_ids, temperatures=None, *, dummy=False, final_chunk=None):
     temps = np.ones(len(req_ids), np.float32) if temperatures is None else temperatures
     return SimpleNamespace(
         req_ids=list(req_ids),
         temperatures=np.asarray(temps, np.float32),
         is_dummy_run=dummy,
+        is_final_chunk=final_chunk,
     )
 
 
@@ -230,6 +231,18 @@ def test_a_greedy_request_claims_no_slot_and_writes_no_q(monkeypatch):
         assert "g" not in prop._q_slots and "s" in prop._q_slots
     stage(prop, batch(["g", "s"], [0.0, 1.0]))
     assert verify(prop)[0] == -1 and verify(prop)[1] == dest(prop)[1]
+
+
+def test_a_request_still_mid_prompt_claims_no_slot(monkeypatch):
+    """In a prefill batch where some requests finish their prompt and others
+    do not, the unfinished ones' drafts are dropped, so they claim nothing."""
+    prop = proposer(monkeypatch)
+    stage(prop, batch(["done", "mid", "done2"], final_chunk=[True, False, True]))
+    assert dest(prop)[1] == -1 and dest(prop)[0] >= 0 and dest(prop)[2] >= 0
+    assert "mid" not in prop._q_slots
+    # Its final chunk later claims as usual.
+    stage(prop, batch(["mid"], final_chunk=[True]))
+    assert "mid" in prop._q_slots and dest(prop)[0] >= 0
 
 
 def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):
