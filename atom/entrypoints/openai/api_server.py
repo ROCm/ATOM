@@ -658,9 +658,14 @@ def _get_multimodal_processor():
             _get_engine_config(), tokenizer, custom_message_encoder
         )
         if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
             processor = AutoProcessor.from_pretrained(
-                model_name, trust_remote_code=True
+                _get_engine_config().model, trust_remote_code=True
             )
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 

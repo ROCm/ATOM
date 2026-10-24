@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -198,6 +199,7 @@ class MiniMaxM3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
+        hidden_act: str | None = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -215,9 +217,10 @@ class MiniMaxM3MLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
-        if config.hidden_act != "swigluoai":
+        hidden_act = hidden_act or config.hidden_act
+        if hidden_act != "swigluoai":
             raise ValueError(
-                f"Unsupported MiniMax-M3 activation {config.hidden_act!r}; "
+                f"Unsupported MiniMax-M3 activation {hidden_act!r}; "
                 "expected 'swigluoai'."
             )
         self.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
@@ -675,6 +678,21 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return hidden_states, residual, aux_hidden_state
         return hidden_states, residual
 
+    @staticmethod
+    def aux_hidden_state(output: tuple) -> torch.Tensor:
+        """This layer's output as a DSpark draft reads it: the residual stream
+        after the layer, ``hidden + residual``.
+
+        ``hidden`` is TP-partial -- o_proj and the FFN skip their all-reduce,
+        which the next layer's fused all-reduce RMSNorm performs -- so it is
+        reduced here first. That costs one all-reduce per tapped layer per
+        target forward, only when a DSpark drafter taps this layer.
+        """
+        hidden_states, residual = output[0], output[1]
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states + residual
+
 
 @token_graph
 @support_torch_compile
@@ -824,6 +842,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._mono = MonoDecode(self, atom_config)
+        # Set by a VL model with a vision tower: its compiled MiniMaxM3Model is
+        # captured once, so it must always see inputs_embeds -- a text-only
+        # capture would replay without them and drop the image embeddings.
+        self.embed_before_model = False
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -856,6 +878,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             input_ids, positions, intermediate_tensors, inputs_embeds
         ):
             return self._mono.forward(input_ids, positions)
+        if self.embed_before_model and inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -942,9 +966,8 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
         return self.language_model.get_expert_mapping()
 
 
-# Native full VL support will be wired after the MiniMax-M3 vision tower is
-# ported to ATOM.  Keep the architecture name available as a text-only fallback
-# so checkpoints with the VL arch can start loading during language bring-up.
+# The plugin entry points (vLLM/SGLang) bring their own vision stacks and keep
+# the text-only view; native ATOM serving selects the VL class directly.
 MiniMaxM3SparseForConditionalGeneration = (
     MiniMaxM3SparseForConditionalGenerationTextOnly
 )

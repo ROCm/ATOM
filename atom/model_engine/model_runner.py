@@ -143,7 +143,9 @@ support_model_arch_dict = {
     "Mistral3ForConditionalGeneration": "atom.models.mistral3.Mistral3TextOnly",
     "MistralForCausalLM": "atom.models.mistral3.Mistral3ForCausalLM",
     "MiniMaxM3SparseForCausalLM": "atom.models.minimax_m3.MiniMaxM3SparseForCausalLM",
-    "MiniMaxM3SparseForConditionalGeneration": "atom.models.minimax_m3.MiniMaxM3SparseForConditionalGeneration",
+    "MiniMaxM3SparseForConditionalGeneration": (
+        "atom.models.minimax_m3.vl.MiniMaxM3SparseForConditionalGenerationVL"
+    ),
     "Glm5NextForConditionalGeneration": (
         "atom.models.glm5_next.Glm5NextForConditionalGeneration"
     ),
@@ -3045,9 +3047,12 @@ class ModelRunner:
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
                 # The multimodal runtime owns request leases and span scatter.
+                # Only the first PP stage embeds tokens; later stages receive
+                # hidden states.
                 inputs_embeds = None
                 if (
                     is_prefill
+                    and get_pp_group().is_first_rank
                     and hasattr(self.model, "get_vision_embeddings")
                     and batch is not None
                     and hasattr(batch, "multimodal_data")

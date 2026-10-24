@@ -58,6 +58,7 @@ from atom.model_ops.fused_moe.mori_prepare_finalize import (
     MoriPrepareAndFinalize,
     resolve_mori_dispatch,
 )
+from atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4 import Mxfp8SharedIntoMxfp4
 from atom.model_ops.fused_moe.shared_expert_dispatch import remap_topk_to_dispatch
 from atom.model_ops.topK import (
     init_aiter_topK_meta_data,
@@ -78,6 +79,7 @@ from atom.quant_spec import (
     NVFP4_DTYPE,
     NVFP4_GROUP_SIZE,
     LayerQuantConfig,
+    fuses_mxfp8_shared_into_mxfp4,
     should_skip_online_quant,
     should_stream_online_quant,
     validate_nvfp4_global_scales,
@@ -3257,6 +3259,9 @@ class FusedMoE(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Set in __init__ for an MXFP8 shared expert fused into MXFP4 experts.
+    shared_mxfp8_into_mxfp4: Mxfp8SharedIntoMxfp4 | None = None
+
     def __init__(
         self,
         num_experts: int,  # Global number of experts
@@ -3349,6 +3354,19 @@ class FusedMoE(torch.nn.Module):
         )
         num_fused_shared_experts = (
             getattr(config, "n_shared_experts", 0) if fuse_shared_experts else 0
+        )
+
+        # An MXFP8 shared expert fused into MXFP4 routed experts is staged
+        # while loading and re-quantized into its slot afterwards.
+        stage_shared_mxfp8 = bool(
+            num_fused_shared_experts
+            and layer_quant_config is not None
+            and fuses_mxfp8_shared_into_mxfp4(
+                quant_config.get_layer_quant_config(
+                    shared_expert_prefix, check_children=True
+                ),
+                layer_quant_config,
+            )
         )
 
         eplb_enabled = self.use_ep and getattr(atom_config, "eplb_enable", False)
@@ -3590,6 +3608,13 @@ class FusedMoE(torch.nn.Module):
         )
         self._load_device = torch.empty(0).device if self._stream_online_quant else None
         self.quant_method.create_weights(layer=self, **self.moe_quant_params)
+        self.shared_mxfp8_into_mxfp4 = (
+            Mxfp8SharedIntoMxfp4(
+                self, quant_config, hidden_size, self.intermediate_size_per_partition
+            )
+            if stage_shared_mxfp8
+            else None
+        )
         compilation_config = atom_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -3676,6 +3701,8 @@ class FusedMoE(torch.nn.Module):
 
     def process_weights_after_loading(self):
         self._online_quant()
+        if self.shared_mxfp8_into_mxfp4 is not None:
+            self.shared_mxfp8_into_mxfp4.fuse(self)
         self._validate_moe_backend()
 
     def _validate_moe_backend(self) -> None:
@@ -4867,6 +4894,12 @@ class FusedMoE(torch.nn.Module):
 
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
+            return
+        # getattr: test doubles borrow this loader without subclassing FusedMoE.
+        shared_mxfp8 = getattr(self, "shared_mxfp8_into_mxfp4", None)
+        if shared_mxfp8 is not None and shared_mxfp8.load(
+            self, param, loaded_weight, shard_id, expert_id
+        ):
             return
         if is_nvfp4 and self._load_nvfp4_global_scale(
             param, loaded_weight, shard_id, expert_id

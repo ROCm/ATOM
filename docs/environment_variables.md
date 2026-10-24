@@ -117,6 +117,7 @@ cannot affect a server that does not use the feature.
 | **ATOM_ONLINE_QUANT_STREAMING** | bool | `false` | Opt in to quantizing eligible online-quant modules as soon as their checkpoint weights are complete, then release source storage to reduce load-time peak memory. Only active with a valid online quantization config. See the [streaming online quantization guide](./online_quantization_streaming_guide.md). |
 | **ATOM_ONLINE_QUANT_STREAMING_HOST_STAGING** | bool | `true` | Assemble streamed module weights in CPU storage before one H2D transfer. Keeps the checkpoint walk parallel; disabling it buffers loader calls and forces the checkpoint walk to one thread. |
 | **ATOM_ONLINE_QUANT_STREAMING_THREADS** | int | `4` | Tail workers for H2D, per-module quantization, and source release. More workers increase overlap and in-flight memory; `0` runs finalization inline. |
+| **ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4** | bool | 0 (false) | Fuse an MXFP8 shared expert into MXFP4 routed experts (the Quark MXFP4 export of MiniMax-M3.1), so the MoE runs as one fused MoE with the shared expert as one more expert (129 experts, top-5). The shared expert is staged in MXFP8 while loading and re-quantized to MXFP4 after it, so it carries MXFP4 rounding error. Not supported with EPLB under all2all EP, with an `--online_quant_config` that re-quantizes the MoE, or across a weight reload. Off keeps the shared expert a separate MXFP8 MLP. Part of the compile cache key. |
 
 ## Plugin mode
 
