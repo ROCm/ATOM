@@ -1782,12 +1782,6 @@ class ModelRunner:
         # Physical clamp: never exceed what's actually free on the GPU.
         # Subclasses may reserve extra headroom (override point).
         extra_reserve = self._kv_budget_extra_reserve(total)
-        # Scratch a drafter allocates per step on a path the profiling forward
-        # does not take (lossless speculative sampling's sampled draft and
-        # ratio verify), so the peak above never saw it.
-        drafter = getattr(self, "drafter", None)
-        if drafter is not None:
-            extra_reserve += drafter.kv_budget_reserve_bytes()
         available_for_kv_budget -= extra_reserve
         # GPU buffers the KV connector allocates after the KV cache is sized.
         connector_bytes = KVConnectorFactory.kv_budget_reserve_bytes(config)
@@ -3306,11 +3300,13 @@ class ModelRunner:
             # below, because it decides whether that sample is needed at all.
             # An all-greedy batch always verifies by exact match, so it never
             # asks. `top_ks`/`top_ps` are None exactly when no row filters.
-            draft_probs = draft_probs_row_base = None
+            draft_probs = draft_probs_row_base = ratio_scratch = None
             drafter = getattr(self, "drafter", None)
             if drafter is not None and not all_greedy:
-                draft_probs, draft_probs_row_base = drafter.lossless_verify_inputs(
-                    bs, has_filter=top_ks is not None or top_ps is not None
+                draft_probs, draft_probs_row_base, ratio_scratch = (
+                    drafter.lossless_verify_inputs(
+                        bs, has_filter=top_ks is not None or top_ps is not None
+                    )
                 )
             target_token_ids = None
             if RejectionSampler.needs_target_draw(all_greedy, draft_probs):
@@ -3339,6 +3335,7 @@ class ModelRunner:
                 draft_probs=draft_probs,
                 draft_probs_row_base=draft_probs_row_base,
                 temperatures=temperatures,
+                ratio_scratch=ratio_scratch,
             )
             # PCP ranks decode redundantly and are consistent only while their
             # kernels agree bit-for-bit -- they don't (hidden differs by ~1 bf16

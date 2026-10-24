@@ -141,8 +141,7 @@ def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
     assert prop.draft_sampling is None and prop._q_store is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.lossless_verify_inputs(2, has_filter=False) == (None, None)
-    assert prop.kv_budget_reserve_bytes() == 0
+    assert prop.lossless_verify_inputs(2, has_filter=False) == (None, None, None)
     # Staging is a no-op rather than an error.
     prop.stage_draft_sampling_host(
         batch(["a"]), 1, None, has_filter=False, drafts_verifiable=True
@@ -173,8 +172,12 @@ def test_a_head_the_fused_op_cannot_run_keeps_the_greedy_pair(monkeypatch):
     assert prop.draft_sampling is None and prop.model.bound is None
 
 
-def test_the_scratch_reserve_is_counted_when_armed(monkeypatch):
-    assert proposer(monkeypatch).kv_budget_reserve_bytes() > 0
+def test_the_ops_scratch_is_allocated_once_when_armed(monkeypatch):
+    """Next to the q store, before the KV cache is sized: the profiling run
+    sees it and no step allocates."""
+    prop = proposer(monkeypatch)
+    assert prop.draft_sampling.scratch is prop._draft_scratch
+    assert prop._draft_scratch.f32.numel() and prop._verify_scratch.f32.numel()
 
 
 # ---- staging ----------------------------------------------------------------
@@ -216,9 +219,10 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
 def test_only_an_unfiltered_batch_reaches_the_ratio_rule(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
-    q, base = prop.lossless_verify_inputs(2, has_filter=False)
+    q, base, scratch = prop.lossless_verify_inputs(2, has_filter=False)
     assert q is prop._q_store and base.shape == (2,)
-    assert prop.lossless_verify_inputs(2, has_filter=True) == (None, None)
+    assert scratch is prop._verify_scratch
+    assert prop.lossless_verify_inputs(2, has_filter=True) == (None, None, None)
 
 
 @pytest.mark.parametrize(

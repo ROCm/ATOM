@@ -11,10 +11,10 @@ from atom.distributed.dcp_utils import get_dcp_rank, get_dcp_world_size
 from atom.distributed.pcp_utils import get_pcp_world_size
 from atom.kv_transfer.disaggregation import kv_config_has_producer
 from atom.model_ops.dspark_markov_sample import (
-    dspark_markov_sample_scratch_bytes,
+    dspark_markov_sample_scratch,
     dspark_markov_sample_unsupported,
 )
-from atom.model_ops.rejection_sampler import ratio_verify_scratch_bytes
+from atom.model_ops.rejection_sampler import ratio_verify_scratch
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
@@ -182,6 +182,11 @@ class DSparkProposer(Drafter):
         self._q_store = torch.empty(
             (q_slots * t, vocab), dtype=torch.float32, device=self.device
         )
+        # The two ops' per-step partials, also allocated once and here, so the
+        # profiling run counts them and neither the draft nor the verify
+        # allocates. Sized by max_num_seqs, T and V alone.
+        self._draft_scratch = dspark_markov_sample_scratch(max_bs, vocab, self.device)
+        self._verify_scratch = ratio_verify_scratch(max_bs, t, vocab, self.device)
         # Everything the captured block head reads, plus the verify's row base,
         # as members of the runner's `sampling` publication: staged on the host
         # by `stage_draft_sampling_host` inside the forward's preparation window
@@ -241,37 +246,24 @@ class DSparkProposer(Drafter):
             temperatures=self._draft_temps_buf.gpu,
             greedy_mask=self._draft_greedy_buf.gpu,
             seed=self._draft_seed_buf.gpu,
+            scratch=self._draft_scratch,
         )
         self.model.bind_draft_sampling(self.draft_sampling)
         if self.runner.rank == 0:
             logger.info(
                 "Lossless speculative sampling armed: draft q store %d slots x "
-                "[%d, %d] fp32 (%.0f MiB)",
+                "[%d, %d] fp32 (%.0f MiB) + %.1f MiB scratch",
                 q_slots,
                 t,
                 vocab,
                 self._q_store.numel() * 4 / 2**20,
+                sum(
+                    buf.numel() * 4
+                    for scratch in (self._draft_scratch, self._verify_scratch)
+                    for buf in (scratch.f32, scratch.i32)
+                )
+                / 2**20,
             )
-
-    def kv_budget_reserve_bytes(self) -> int:
-        """Per-step scratch the sampled draft and the ratio verify allocate.
-
-        The ratio verify never runs in the profiling forward (a prefill
-        verifies nothing), so the allocator's peak never sees its scratch. The
-        sampled draft does run there -- warmup's propose takes the lossless
-        branch -- but at warmup's batch, ``min(warmup tokens // max_model_len,
-        max_num_seqs)`` sequences, not at ``max_num_seqs``; it is reserved at
-        full size here, which double-counts the part warmup measured. Both are
-        bounded by the batch and vocab tiling; see the two ops for the shapes.
-        """
-        if self.draft_sampling is None:
-            return 0
-        max_bs = self.config.max_num_seqs
-        vocab = int(self.model.vocab_size)
-        rank = self.model.markov_head.markov_w1.weight.shape[1]
-        return dspark_markov_sample_scratch_bytes(
-            max_bs, vocab, rank
-        ) + ratio_verify_scratch_bytes(max_bs, self.draft_tokens_per_seq, vocab)
 
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool
@@ -307,10 +299,10 @@ class DSparkProposer(Drafter):
         self._staging.consume()
 
     def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
-        """The verify step's ``(draft_probs, q_row_base)``, or ``(None, None)``.
+        """The verify step's ``(draft_probs, q_row_base, ratio_scratch)``.
 
-        ``(None, None)`` keeps exact-match verification; anything else selects
-        the probability-ratio rule in `rejection_sampler.rejection_sample`.
+        All None keeps exact-match verification; anything else selects the
+        probability-ratio rule in `rejection_sampler.rejection_sample`.
         Asked only for a batch that is not all greedy: an all-greedy batch
         keeps the exact-match kernel, so its accept rule is the flag-off one
         (its draft still runs the sampled block, in greedy mode). A greedy row
@@ -322,8 +314,8 @@ class DSparkProposer(Drafter):
         drafting such a batch greedily.
         """
         if self.draft_sampling is None or has_filter:
-            return None, None
-        return self._q_store, self._verify_row_base_buf.gpu[:bs]
+            return None, None, None
+        return self._q_store, self._verify_row_base_buf.gpu[:bs], self._verify_scratch
 
     def warmup_draft_graphs(self, build_context, stream, end_trace=None) -> None:
         """Warm (and capture) the block with every row aimed at no q row.

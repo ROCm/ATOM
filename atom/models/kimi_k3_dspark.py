@@ -180,6 +180,7 @@ class DSparkMarkovHead(nn.Module):
         greedy_mask: torch.Tensor,  # [B] int32
         seed: torch.Tensor,  # [1] int32, device
         noise_offset: int,
+        scratch=None,  # SamplingScratch for the op's partials, or None
     ) -> torch.Tensor:
         """One sampled block position: draw ``x_k ~ softmax(biased / T)`` and
         write that q out.
@@ -203,6 +204,8 @@ class DSparkMarkovHead(nn.Module):
             greedy_mask,
             seed,
             noise_offset,
+            None if scratch is None else scratch.f32,
+            None if scratch is None else scratch.i32,
         )
 
 
@@ -893,5 +896,6 @@ class KimiK3DSpark(DSparkDraftModel):
                 sampling.greedy_mask[:bs],
                 sampling.seed,
                 k * position_stride,
+                sampling.scratch,
             )
         return out_ids[:, 1:]

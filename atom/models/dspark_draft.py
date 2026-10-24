@@ -26,9 +26,13 @@ half. The steps line up one for one and not one of them is the same computation
 """
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from atom.model_ops.sampling_scratch import SamplingScratch
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,9 @@ class DraftSampling:
     greedy_mask: torch.Tensor
     #: [1] int32, the Philox key. Must hold the same value on every TP rank.
     seed: torch.Tensor
+    #: Preallocated partials for the sampled op (`dspark_markov_sample_scratch`),
+    #: so the draft step allocates nothing and the profiling run sees it.
+    scratch: "SamplingScratch"
 
 
 class DSparkDraftModel(nn.Module):

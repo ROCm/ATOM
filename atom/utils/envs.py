@@ -617,9 +617,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # boundary, so the draft writes it into a persistent store of
     # 2 x max_num_seqs per-request row blocks -- 2 * max_num_seqs * T * V * 4
     # bytes, allocated before the KV cache is sized (1.25 GiB at max_num_seqs=64,
-    # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The per-step
-    # scratch of the two ops is reserved from the KV budget too (about 2 MiB at
-    # 64, 13-16 MiB at 512, T=5..16).
+    # T=16; 3.1 GiB at 512, T=5; 10 GiB at 512, T=16, for V=163840). The two
+    # ops' per-step scratch is allocated once alongside it.
     #
     # Only a draft model that declares `supports_lossless_draft` honours it;
     # any other flavor silently keeps the greedy pair. Mutually exclusive with

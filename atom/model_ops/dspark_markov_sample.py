@@ -48,11 +48,14 @@ data-dependent *address* inside stage 1's W1 gather, never a data-dependent
 shape. See ``docs/environment_variables.md``.
 """
 
+from math import prod
+
 import torch
 import triton
 import triton.language as tl
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
+from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
 
 # Untuned, and chosen for headroom rather than peak: the stage-1 accumulator is
@@ -766,6 +769,8 @@ def _dspark_markov_sample_fake(
     greedy_mask: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
+    scratch_f32: torch.Tensor | None = None,
+    scratch_i32: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty(
         base_logits.shape[0],
@@ -820,23 +825,31 @@ def dspark_markov_sample_unsupported(
     return None
 
 
-def dspark_markov_sample_scratch_bytes(
-    max_rows: int, vocab_size: int, rank: int
-) -> int:
-    """Device bytes one `dspark_markov_sample` call allocates at ``max_rows``.
-
-    The op runs once per block position and its scratch is freed between
-    calls, so this is also the peak a whole block adds.
-    """
+def _sample_scratch_shapes(num_rows: int, vocab_size: int):
+    """fp32 and int32 shapes one `dspark_markov_sample` call needs, in order."""
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     sample_tiles = triton.cdiv(vocab_size, _SAMPLE_BLOCK_V)
-    per_row = (
-        4 * gemv_tiles * 4  # part_max, part_sum, part_amax_val, part_amax_idx
-        + 3 * 4  # row_max, row_inv_z, row_argmax
-        + sample_tiles * (4 + 4)  # part_key, part_idx
-        + rank * 2  # markov_embed (bf16/fp16)
-    )
-    return max_rows * per_row
+    f32 = [
+        (gemv_tiles, num_rows),  # part_max
+        (gemv_tiles, num_rows),  # part_sum
+        (gemv_tiles, num_rows),  # part_amax_val
+        (num_rows,),  # row_max
+        (num_rows,),  # row_inv_z
+        (sample_tiles, num_rows),  # part_key
+    ]
+    i32 = [
+        (gemv_tiles, num_rows),  # part_amax_idx
+        (num_rows,),  # row_argmax
+        (sample_tiles, num_rows),  # part_idx
+    ]
+    return f32, i32
+
+
+def dspark_markov_sample_scratch(max_rows: int, vocab_size: int, device):
+    """Scratch for any `dspark_markov_sample` call of up to ``max_rows`` rows,
+    allocated once. One call runs at a time, so a block's positions share it."""
+    f32, i32 = _sample_scratch_shapes(max_rows, vocab_size)
+    return SamplingScratch(sum(prod(x) for x in f32), sum(prod(x) for x in i32), device)
 
 
 @torch_compile_guard(
@@ -855,6 +868,8 @@ def dspark_markov_sample(
     greedy_mask: torch.Tensor,
     seed: torch.Tensor,
     noise_offset: int,
+    scratch_f32: torch.Tensor | None = None,
+    scratch_i32: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Draw ``x_k ~ softmax((base_logits + W1[prev_ids] @ W2^T) / T)`` and
     publish that distribution.
@@ -879,6 +894,9 @@ def dspark_markov_sample(
         noise_offset:         host int, the Philox counter base for this block
                               position. Static (position * max_B * V), so it
                               does not make the launch data-dependent.
+        scratch_f32, scratch_i32: flat buffers the call's partials are carved
+                              from (`dspark_markov_sample_scratch`); None
+                              allocates per call.
 
     Returns:
         ``[B, r]`` ``W1[prev_ids]``, for the same reason the greedy op returns it.
@@ -936,16 +954,11 @@ def dspark_markov_sample(
     # Stage 1's GEMV keeps the greedy op's narrow V tile (its accumulator is the
     # MFMA one); stage 3's is wide, because it only streams.
     gemv_tiles = triton.cdiv(vocab_size, _BLOCK_V)
-    f32 = {"dtype": torch.float32, "device": device}
-    part_max = torch.empty((gemv_tiles, num_rows), **f32)
-    part_sum = torch.empty((gemv_tiles, num_rows), **f32)
-    part_amax_val = torch.empty((gemv_tiles, num_rows), **f32)
-    part_amax_idx = torch.empty(
-        (gemv_tiles, num_rows), dtype=torch.int32, device=device
-    )
-    row_max = torch.empty((num_rows,), **f32)
-    row_inv_z = torch.empty((num_rows,), **f32)
-    row_argmax = torch.empty((num_rows,), dtype=torch.int32, device=device)
+    f32_shapes, i32_shapes = _sample_scratch_shapes(num_rows, vocab_size)
+    (
+        (part_max, part_sum, part_amax_val, row_max, row_inv_z, part_key),
+        (part_amax_idx, row_argmax, part_idx),
+    ) = take(f32_shapes, i32_shapes, device, scratch_f32, scratch_i32)
 
     _dspark_markov_sample_stage1[(gemv_tiles, row_tiles)](
         base_logits,
@@ -992,8 +1005,6 @@ def dspark_markov_sample(
     )
 
     sample_tiles = triton.cdiv(vocab_size, _SAMPLE_BLOCK_V)
-    part_key = torch.empty((sample_tiles, num_rows), **f32)
-    part_idx = torch.empty((sample_tiles, num_rows), dtype=torch.int32, device=device)
     _dspark_markov_sample_stage3[(num_rows, sample_tiles)](
         q_store,
         q_row_base,

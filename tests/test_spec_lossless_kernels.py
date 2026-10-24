@@ -29,10 +29,12 @@ from atom.model_ops.dspark_markov_sample import (
     dspark_markov_argmax,
     dspark_markov_sample,
     dspark_markov_sample_reference,
+    dspark_markov_sample_scratch,
 )
 from atom.model_ops.rejection_sampler import (
     _RATIO_BLOCK_V,
     _request_of_row,
+    ratio_verify_scratch,
     rejection_sample,
 )
 from atom.model_ops.sampler import SAMPLER_EPS
@@ -170,6 +172,38 @@ def test_a_sampled_row_without_a_destination_drafts_the_argmax():
     )
     assert torch.equal(out, ref)
     assert (store == -7.0).all()
+
+
+def test_the_preallocated_scratch_drafts_exactly_what_allocation_does():
+    rows, vocab, rank = 24, 3000, 64
+    base, prev, w1, w2 = tables(rows, vocab, rank)
+    temps, greedy, seed = draft_args(rows, temperature=0.9, step=5)
+    greedy[::3] = 1
+    scratch = dspark_markov_sample_scratch(64, vocab, DEV)  # sized above rows
+    results = []
+    for f32, i32 in ((None, None), (scratch.f32, scratch.i32)):
+        store = torch.zeros(rows, vocab, device=DEV)
+        out = torch.empty(rows, dtype=torch.int64, device=DEV)
+        row_base = torch.arange(rows, dtype=torch.int32, device=DEV)
+        dspark_markov_sample(
+            base,
+            prev,
+            w1,
+            w2,
+            out,
+            store,
+            row_base,
+            0,
+            temps,
+            greedy,
+            seed,
+            0,
+            f32,
+            i32,
+        )
+        results.append((out, store))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
 
 
 def test_sampled_ids_follow_the_q_they_publish():
@@ -452,6 +486,23 @@ def test_the_key_purpose_word_separates_streams_at_any_offset_width(wide):
     for i in range(3):
         for j in range(i + 1, 3):
             assert not torch.equal(streams[i], streams[j]), (i, j)
+
+
+def test_the_preallocated_scratch_verifies_exactly_what_allocation_does():
+    torch.manual_seed(43)
+    batch_n, width, vocab = 48, 5, 3000
+    logits = torch.randn(batch_n * width, vocab, device=DEV)
+    q_rows = torch.softmax(torch.randn(batch_n * width, vocab, device=DEV), -1)
+    drafts = torch.multinomial(q_rows, 1).view(-1).to(torch.int32)
+    temps = torch.ones(batch_n, device=DEV)
+    temps[::4] = SAMPLER_EPS
+    args = verify_batch(drafts, width, logits, temps)
+    plain = rejection_sample(**args, draft_probs=q_rows, ratio_step=11)
+    scratch = ratio_verify_scratch(64, width, vocab, DEV)  # sized above the batch
+    reused = rejection_sample(
+        **args, draft_probs=q_rows, ratio_step=11, ratio_scratch=scratch
+    )
+    assert torch.equal(plain[0], reused[0]) and torch.equal(plain[1], reused[1])
 
 
 def test_the_same_key_gives_the_same_verdict():

@@ -1,3 +1,5 @@
+from math import prod
+
 import torch
 import triton
 import triton.language as tl
@@ -5,6 +7,7 @@ from aiter import topk_select
 from torch import nn
 
 from atom.model_ops.sampler import SAMPLER_EPS
+from atom.model_ops.sampling_scratch import SamplingScratch, take
 from atom.model_ops.softmax_tiles import softmax_combine_kernel, tile_max_sumexp
 from atom.utils import envs
 from atom.utils.forward_context import SpecDecodeMetadata
@@ -91,16 +94,33 @@ _RATIO_RESIDUAL_KEY = 2 << 32
 _RATIO_BLOCK_V = 4096
 
 
-def ratio_verify_scratch_bytes(
-    max_bs: int, num_spec_steps: int, vocab_size: int
-) -> int:
-    """Device bytes one ratio verify allocates at ``max_bs`` requests of
-    ``num_spec_steps`` drafts each, outside the profiled forward."""
+def _ratio_scratch_shapes(num_tokens: int, batch_size: int, vocab_size: int):
+    """fp32 and int32 shapes one ratio verify needs, in `_ratio_sample` order."""
     tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
-    rows = max_bs * num_spec_steps
-    stats = rows * (tiles * 4 * 4 + 3 * 4)  # per-tile and per-row statistics
-    residual = max_bs * (tiles * 2 * 4 + 4)  # race partials, rejecting row
-    return stats + residual
+    f32 = [
+        (num_tokens,),  # row_max
+        (num_tokens,),  # row_inv_z
+        (tiles, num_tokens),  # part_max
+        (tiles, num_tokens),  # part_sum
+        (tiles, num_tokens),  # part_amax_val
+        (tiles, batch_size),  # part_key
+    ]
+    i32 = [
+        (num_tokens,),  # row_argmax
+        (tiles, num_tokens),  # part_amax_idx
+        (batch_size,),  # residual_row
+        (tiles, batch_size),  # part_idx
+    ]
+    return f32, i32
+
+
+def ratio_verify_scratch(
+    max_bs: int, num_spec_steps: int, vocab_size: int, device
+) -> SamplingScratch:
+    """Scratch for any ratio verify of up to ``max_bs`` requests of
+    ``num_spec_steps`` drafts each, allocated once."""
+    f32, i32 = _ratio_scratch_shapes(max_bs * num_spec_steps, max_bs, vocab_size)
+    return SamplingScratch(sum(prod(x) for x in f32), sum(prod(x) for x in i32), device)
 
 
 @triton.jit
@@ -419,26 +439,32 @@ def _ratio_sample(
     bonus_logits_indices: torch.Tensor,
     num_spec_steps: int,
     ratio_step: int,
+    scratch: SamplingScratch | None = None,
 ) -> None:
-    """Launch the probability-ratio verify: stats, combine, accept, residual."""
+    """Launch the probability-ratio verify: stats, combine, accept, residual.
+
+    Its scratch comes out of ``scratch`` when given (the serving path) and is
+    allocated per call otherwise."""
     num_tokens, vocab_size = target_logits.shape
     batch_size = cu_num_draft_tokens.shape[0]
     device = target_logits.device
     n_tiles = triton.cdiv(vocab_size, _RATIO_BLOCK_V)
-    f32 = {"dtype": torch.float32, "device": device}
-    i32 = {"dtype": torch.int32, "device": device}
     stride = target_logits.stride(0)
     temperatures = temperatures.to(torch.float32).contiguous()
     q_row_base = q_row_base.contiguous()
 
-    row_max = torch.empty((num_tokens,), **f32)
-    row_inv_z = torch.empty((num_tokens,), **f32)
-    row_argmax = torch.empty((num_tokens,), **i32)
+    f32_shapes, i32_shapes = _ratio_scratch_shapes(num_tokens, batch_size, vocab_size)
+    (
+        (row_max, row_inv_z, part_max, part_sum, part_amax_val, part_key),
+        (row_argmax, part_amax_idx, residual_row, part_idx),
+    ) = take(
+        f32_shapes,
+        i32_shapes,
+        device,
+        None if scratch is None else scratch.f32,
+        None if scratch is None else scratch.i32,
+    )
     if num_tokens:
-        part_max = torch.empty((n_tiles, num_tokens), **f32)
-        part_sum = torch.empty((n_tiles, num_tokens), **f32)
-        part_amax_val = torch.empty((n_tiles, num_tokens), **f32)
-        part_amax_idx = torch.empty((n_tiles, num_tokens), **i32)
         _ratio_stats_kernel[(num_tokens, n_tiles)](
             target_logits,
             cu_num_draft_tokens,
@@ -469,7 +495,6 @@ def _ratio_sample(
             WITH_ARGMAX=True,
             num_warps=4,
         )
-    residual_row = torch.empty((batch_size,), **i32)
     _ratio_accept_kernel[(batch_size,)](
         output_token_ids,
         verdict,
@@ -493,8 +518,6 @@ def _ratio_sample(
         _RATIO_ACCEPT_KEY | ratio_step,
         num_warps=1,
     )
-    part_key = torch.empty((n_tiles, batch_size), **f32)
-    part_idx = torch.empty((n_tiles, batch_size), **i32)
     _ratio_residual_race_kernel[(batch_size, n_tiles)](
         residual_row,
         cu_num_draft_tokens,
@@ -635,6 +658,8 @@ class RejectionSampler(nn.Module):
         draft_probs_row_base: torch.Tensor | None = None,
         # [batch_size] fp32, pre-clamped. Required with draft_probs.
         temperatures: torch.Tensor | None = None,
+        # Preallocated device scratch for the ratio path; None allocates.
+        ratio_scratch: SamplingScratch | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Ensure target_logits is contiguous. For greedy sampling, we can use
         # logits directly (argmax is the same for logits and probs), but we
@@ -657,6 +682,7 @@ class RejectionSampler(nn.Module):
             temperatures=temperatures,
             draft_probs_row_base=draft_probs_row_base,
             ratio_step=self._ratio_step,
+            ratio_scratch=ratio_scratch,
         )
         if self.synthetic_acceptance_rates is not None:
             self._synthetic_step += 1
@@ -704,6 +730,8 @@ def rejection_sample(
     # Per-step key for the (rank-consistent) accept coins and residual race,
     # < 2**32.
     ratio_step: int = 0,
+    # Preallocated device scratch for the ratio path; None allocates per call.
+    ratio_scratch: SamplingScratch | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input_ids.ndim == 1 and target_logits_indices.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -826,6 +854,7 @@ def rejection_sample(
             bonus_logits_indices,
             num_spec_steps,
             ratio_step,
+            ratio_scratch,
         )
     elif target_token_ids is not None or RELAXED_TOP_N <= 1:
         # Match the actual target draw for stochastic requests; greedy requests

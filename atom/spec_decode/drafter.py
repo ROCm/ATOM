@@ -374,14 +374,9 @@ class Drafter(abc.ABC):
         return
 
     def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
-        """``(draft_probs, q_row_base)`` for the ratio accept rule, or
-        ``(None, None)`` for exact match."""
-        return None, None
-
-    def kv_budget_reserve_bytes(self) -> int:
-        """Device scratch this drafter allocates per step outside the profiled
-        forward, for the KV budget to hold back."""
-        return 0
+        """``(draft_probs, q_row_base, ratio_scratch)`` for the ratio accept
+        rule, or all None for exact match."""
+        return None, None, None
 
     @property
     def draft_kv_duplicates_propose(self) -> bool:
