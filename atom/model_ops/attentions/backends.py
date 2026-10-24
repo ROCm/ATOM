@@ -342,6 +342,12 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
                 f"{type(self).__name__} does not implement PAGE-backed state copy"
             )
 
+    def clear_page_units(self, unit_ids: Sequence[int]) -> None:
+        """Zero PAGE units a state checkpoint gave back (`BlockPool.state_images`).
+
+        A no-op here; `GDNAttentionMetadataBuilder` overrides it for its MHA pool.
+        """
+
     def reserve_checkpoint_descriptors(self, descriptor_slots) -> None:
         """Allocate staging for out-of-band copy slots before serving.
 
@@ -1023,6 +1029,10 @@ class CommonAttentionBuilder(PoolRowsMixin, AttentionMetadataBuilder[T], Generic
         """
         # Run state maintenance on the compute stream before the forward.
         state_ops = batch.state_maintenance_ops
+        # Before the copies: a unit given back and reserved again in one pass
+        # is cleared, then stored into.
+        if state_ops.checkpoint_clears:
+            self.clear_page_units(state_ops.checkpoint_clears)
         if state_ops.relocations:
             self.relocate_state_slots(state_ops.relocations)
         if state_ops.checkpoint_stores or state_ops.checkpoint_restores:

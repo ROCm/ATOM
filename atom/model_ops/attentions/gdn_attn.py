@@ -907,8 +907,8 @@ class GDNStateMixin(PoolRowsMixin):
 
         Slot 0 into the pool's first units. Both are real addresses, which is
         the point: a warmup on scratch would compile a kernel and fill nothing.
-        The bytes it writes are read by nobody -- a KV block is written before
-        it is read, and this runs before any block has been handed out.
+        The units are cleared right after: decode reads KV rows no sequence
+        has written yet (`BlockPool.state_images`).
         """
         runtime = getattr(self.model_runner, "state_runtime", None)
         spec = None if runtime is None else runtime.checkpoint_spec
@@ -924,6 +924,7 @@ class GDNStateMixin(PoolRowsMixin):
             self._page_unit_bases([list(range(spec.units_per_checkpoint))]),
         )
         launch_copy_descriptor(staging.upload(0, plan.num_spans), plan)
+        self.clear_page_units(range(spec.units_per_checkpoint))
 
     def state_entry_views(self, slot: int) -> list[torch.Tensor]:
         """One contiguous slice per (cache, layer) — the slot's whole state.
@@ -1761,6 +1762,30 @@ class GDNAttentionMetadataBuilder(GDNStateMixin, AiterAttentionMetadataBuilder):
         )
 
         return mha_page_unit_stream_sizes(self._page_unit_regions(), units)
+
+    def clear_page_units(self, unit_ids: Sequence[int]) -> None:
+        """Zero every MHA row of these PAGE units (`BlockPool.state_images`).
+
+        The ids go up through a pinned buffer fenced on its previous upload: a
+        pageable copy here would wait out the forward still queued.
+        """
+        ids = np.fromiter(unit_ids, dtype=np.int64)
+        if not ids.size:
+            return
+        pools = list(self.kv_pools.values())
+        if getattr(self, "_clear_ids", None) is None:
+            entries = max(len(pool.region_tensors()[0][1]) for pool in pools)
+            self._clear_ids = CpuGpuBuffer(
+                entries, dtype=torch.int64, device=self.device
+            )
+            self._clear_ids_uploaded = torch.cuda.Event()
+        # Returns at once before the first record.
+        self._clear_ids_uploaded.synchronize()
+        self._clear_ids.np[: ids.size] = ids
+        device_ids = self._clear_ids.copy_to_gpu(ids.size)
+        self._clear_ids_uploaded.record()
+        for pool in pools:
+            pool.zero_entries(device_ids)
 
     def page_unit_views(self, unit_ids):
         """MHA views of one checkpoint image, for the in-process state tier.

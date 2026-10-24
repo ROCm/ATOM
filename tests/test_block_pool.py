@@ -376,3 +376,40 @@ class TestEvictionAccounting:
         assert stats["blocks_free_reusable"] == 1
         assert stats["blocks_free"] - stats["blocks_free_reusable"] == 2
         assert stats["blocks_indexed"] == 1
+
+
+class TestAPoolHoldingStateImages:
+    """Raw units hold PAGE checkpoint images, which are not KV.
+
+    Decode's paged attention reads every token slot of a tile and pads the
+    tile's block ids with 0, so block 0 stays out of circulation and every
+    unit given back is listed for the worker to clear.
+    """
+
+    def test_block_0_is_never_handed_out(self):
+        pool = BlockPool(num_blocks=4, state_images=True)
+        assert pool.num_free == 3
+        assert sorted(pool.pop() for _ in range(3)) == [1, 2, 3]
+        with pytest.raises(AssertionError, match="No free blocks"):
+            pool.pop()
+
+    def test_units_given_back_are_listed_once_and_drained(self):
+        pool = BlockPool(num_blocks=5, state_images=True)
+        units = pool.reserve_units(2, owner="image")
+        pool.release_units(units, owner="image")
+        assert pool.take_released_units() == tuple(units)
+        assert pool.take_released_units() == ()
+
+    def test_a_unit_given_back_twice_between_drains_is_listed_once(self):
+        pool = BlockPool(num_blocks=3, state_images=True)
+        for _ in range(2):
+            units = pool.reserve_units(2, owner="image")
+            pool.release_units(units, owner="image")
+        assert sorted(pool.take_released_units()) == [1, 2]
+
+    def test_a_kv_only_pool_keeps_block_0_and_lists_nothing(self):
+        pool = BlockPool(num_blocks=3)
+        assert pool.pop() == 0
+        units = pool.reserve_units(2, owner="image")
+        pool.release_units(units, owner="image")
+        assert pool.take_released_units() == ()

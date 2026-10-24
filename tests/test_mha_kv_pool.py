@@ -664,3 +664,21 @@ def test_reachable_without_a_gpu_build():
             )
             if imported.startswith("atom."):
                 frontier.append(imported)
+
+
+def test_zero_entries_clears_those_entries_in_every_field_and_layer():
+    """A checkpoint image spans every field and layer of its units; clearing
+    one has to reach all of them and nothing else."""
+    pool = MhaKvPool(
+        layers=3, block_size=16, num_kv_heads=1, head_dim=128, kv_dtype=torch.int8
+    )
+    pool.allocate(5, "cpu")
+    roles = [role for role, _ in pool.region_tensors()]
+    assert any(role.startswith("k_scale") for role in roles)
+    for _, tensor in pool.region_tensors():
+        tensor.view(torch.uint8).fill_(0x7F)
+    pool.zero_entries(torch.tensor([1, 3]))
+    for role, tensor in pool.region_tensors():
+        raw = tensor.view(torch.uint8).reshape(tensor.shape[0], -1)
+        assert raw[[1, 3]].eq(0).all(), role
+        assert raw[[0, 2, 4]].eq(0x7F).all(), role

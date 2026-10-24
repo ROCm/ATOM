@@ -74,6 +74,7 @@ class BlockPool:
         cache_policy: str = "lru",
         protected_ratio: float = 0.5,
         on_remap: Callable[[int], None] | None = None,
+        state_images: bool = False,
     ):
         cache_policy = cache_policy.strip().lower()
         if cache_policy not in {"lru", "slru"}:
@@ -105,9 +106,20 @@ class BlockPool:
         # free list (`claim`) or retired, so membership in the set — not
         # presence in a container — is what makes an id free. `pop` skips the
         # stale entries.
-        self._vacant: list[int] = list(range(num_blocks))
+        # `state_images`: raw units here hold PAGE state checkpoint images,
+        # which are not KV, yet decode's paged attention reads KV rows no
+        # sequence owns: a tile's padded block-table lanes come back as block
+        # 0, and a block's unwritten token slots are loaded too. They get zero
+        # probability, but an image byte read as fp8 is often NaN, and 0 * NaN
+        # wipes the output row. So block 0 is never handed out and stays zero,
+        # and every unit given back is cleared (`take_released_units`) before
+        # it can serve as KV.
+        self.state_images = state_images
+        self._released_units: list[int] = []
+        first = 1 if state_images else 0
+        self._vacant: list[int] = list(range(first, num_blocks))
         self._cached: OrderedDict[int, None] = OrderedDict()
-        self._free: set[int] = set(range(num_blocks))
+        self._free: set[int] = set(range(first, num_blocks))
         self._used: set[int] = set()
         # Raw PAGE units reserved by multi-unit objects such as state checkpoints.
         self._raw_unit_owner: dict[int, tuple[Hashable, int]] = {}
@@ -418,6 +430,20 @@ class BlockPool:
         for block_id in ids:
             del self._raw_unit_owner[block_id]
             self.free(block_id)
+        if self.state_images:
+            self._released_units.extend(ids)
+
+    def take_released_units(self) -> tuple[int, ...]:
+        """Units given back since the last call, for the worker to zero.
+
+        A release precedes the allocation that reuses a unit, and the batch
+        that allocation serves drains it, so no unit is read as KV before it
+        is cleared. Distinct ids, so the worker's id buffer of one slot per
+        block always fits.
+        """
+        ids = tuple(dict.fromkeys(self._released_units))
+        self._released_units = []
+        return ids
 
     def rekey_units(
         self,

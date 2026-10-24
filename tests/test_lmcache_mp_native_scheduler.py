@@ -672,6 +672,12 @@ def test_loads_are_not_limited_by_the_save_limit(monkeypatch):
     terminal(scheduler, request.save_operation)
 
 
+#: `engine_scheduler`'s KV pool, and what of it can be handed out: a pool that
+#: holds PAGE state images keeps block 0 back as the null block.
+ENGINE_POOL_BLOCKS = 40
+ENGINE_USABLE_BLOCKS = ENGINE_POOL_BLOCKS - 1
+
+
 def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
     adapter = adapter if adapter is not None else Adapter()
     monkeypatch.setenv("OFFLOAD_MIN_LOAD_TOKENS", "0")
@@ -681,7 +687,7 @@ def engine_scheduler(monkeypatch, *, adapter=None, **overrides):
         mp_scheduler, "_make_scheduler_adapter", lambda _config, **kwargs: adapter
     )
     config = MockConfig(
-        num_kvcache_blocks=40,
+        num_kvcache_blocks=ENGINE_POOL_BLOCKS,
         enable_prefix_caching=True,
         pool_entries={"state": 4},
         state_checkpoint_interval_tokens=0,
@@ -731,7 +737,7 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
     seq, request = start_engine_load(engine)
     block_table = list(seq.block_table)
     state_slot = seq.state_slot
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == ENGINE_USABLE_BLOCKS - 6 - 3
 
     batch, scheduled = engine.schedule()
     assert scheduled == {} and batch.connector_meta_output.requests == []
@@ -748,7 +754,7 @@ def test_engine_allocates_then_parks_and_wakes_at_exact_native_boundary(monkeypa
         KVConnectorOutput(finished_loading={request.load_operation})
     )
     # The three transfer units remain as an unpinned READY checkpoint.
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == ENGINE_USABLE_BLOCKS - 6 - 3
     assert engine.block_manager.paged_state_checkpoints.contains(
         request.native_state.prefix_hash
     )
@@ -777,7 +783,7 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert engine.deferred_free_blocks[seq.id] is seq
     assert list(seq.block_table) == block_table
     assert seq.state_slot == state_slot
-    assert engine.block_manager.kv.num_free == 31
+    assert engine.block_manager.kv.num_free == ENGINE_USABLE_BLOCKS - 6 - 3
 
     kwargs = {
         "finished_loading" if succeeded else "failed_loading": {request.load_operation}
@@ -786,7 +792,8 @@ def test_engine_aborted_load_keeps_page_units_and_slot_until_terminal(
     assert seq.id not in engine.deferred_free_blocks
     assert list(seq.block_table) == []
     assert seq.state_slot == -1
-    expected_free = 37 if succeeded else 40
+    # A finished load keeps its 3 units as a READY checkpoint.
+    expected_free = ENGINE_USABLE_BLOCKS - (3 if succeeded else 0)
     assert engine.block_manager.kv.num_free == expected_free
     assert (
         engine.block_manager.paged_state_checkpoints.contains(
@@ -865,7 +872,7 @@ def test_engine_releases_retired_request_when_unpinned_candidate_is_evicted(
     assert connector.has_pending_work()
     engine._update_from_kv_xfer_finished(KVConnectorOutput())
     assert seq.id not in engine.deferred_free_blocks
-    assert bm.kv.num_free == 40
+    assert bm.kv.num_free == ENGINE_USABLE_BLOCKS
     assert connector._retired_requests == {}
     assert connector._save_tracker == {}
     assert not connector.has_pending_work()
