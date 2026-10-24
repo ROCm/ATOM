@@ -23,9 +23,11 @@ Decode / TARGET_VERIFY graph contract:
 from __future__ import annotations
 
 import logging
+import os
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from atom.model_ops.attentions.qwen4_exp_attn import (
@@ -37,7 +39,7 @@ from atom.plugin.sglang.attention_backend.backend_resolver import (
     resolve_attn_backend,
     resolve_mamba_req_pool,
 )
-from atom.utils import CpuGpuBuffer
+from atom.utils import CpuGpuBuffer, envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger(__name__)
@@ -238,6 +240,17 @@ _DECODE_GRAPH = _Qwen4ExpDecodeGraphBuffers()
 # the target verify graph. A second set still keeps page tables and seq_lens
 # on device, so a draft step does not allocate or sync seq_lens back to host.
 _DRAFT_QSA = _Qwen4ExpDecodeGraphBuffers()
+# PROTOTYPE: non-None marker returned to the draft runner's out-of-graph hook
+# before the first draft forward has populated _DRAFT_QSA.last_qsa.
+_DRAFT_GRAPH_METADATA_IN_GRAPH = object()
+
+
+def _is_draft_decode_batch(forward_batch: Any) -> bool:
+    """PROTOTYPE: draft-runner decode batch (EAGLE draft input), graphs enabled."""
+    if os.environ.get("ATOM_SGLANG_QWEN4_DRAFT_CG", "0").lower() not in ("1", "true"):
+        return False
+    spec = getattr(forward_batch, "spec_info", None)
+    return type(spec).__name__ == "EagleDraftInput"
 
 
 def _is_draft_forward() -> bool:
@@ -1156,6 +1169,11 @@ def build_qsa_metadata(
 
     compressed = torch.empty_like(slot_mapping)
     _compressed_slots_native(slot_mapping, logical, compress_ratio, compressed)
+    host_lens = context_slots = None
+    if not packed_step and envs.ATOM_QSA_FLYDSL_ATTN and not _is_draft_forward():
+        host_lens, context_slots = _flydsl_prefill_layout(
+            forward_batch, live_bs, num_tokens, block_tables, block_size
+        )
     qsa = Qwen4ExpQSAMetadata(
         block_tables=block_tables,
         slot_mapping=slot_mapping,
@@ -1164,8 +1182,48 @@ def build_qsa_metadata(
         logical_positions=logical,
         seq_lens=seq_lens,
         max_seq_len=max(max_seq_len, 1),
+        host_lens=host_lens,
+        context_slots=context_slots,
     )
     return qsa
+
+
+def _flydsl_prefill_layout(
+    forward_batch: Any,
+    live_bs: int,
+    num_tokens: int,
+    block_tables: torch.Tensor,
+    block_size: int,
+) -> tuple[tuple | None, torch.Tensor | None]:
+    """Host lengths for FlyDSL QSA attention, plus context rows when prefixed.
+
+    Returns (None, None) unless the packed tokens are exactly the scheduled
+    extends, so padded or partial batches keep the native kernel.
+    """
+    extends = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    seqs = getattr(forward_batch, "seq_lens_cpu", None)
+    if extends is None or seqs is None:
+        return None, None
+    extends = tuple(int(n) for n in list(extends)[:live_bs])
+    seqs = tuple(int(n) for n in list(seqs)[:live_bs])
+    if (
+        len(extends) != live_bs
+        or len(seqs) != live_bs
+        or sum(extends) != num_tokens
+        or any(e < 0 or s < e for e, s in zip(extends, seqs))
+    ):
+        return None, None
+    if all(s == e for e, s in zip(extends, seqs)):
+        return (extends, seqs), None
+    lengths = np.asarray(seqs, dtype=np.int64)
+    requests = np.repeat(np.arange(live_bs, dtype=np.int64), lengths)
+    tokens = np.arange(len(requests), dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    host = torch.from_numpy(np.stack((requests, tokens))).pin_memory()
+    requests, tokens = host.to(block_tables.device, non_blocking=True)
+    pages = block_tables[requests, tokens // block_size].to(torch.int64)
+    return (extends, seqs), pages * block_size + tokens % block_size
 
 
 def _ple_state_pool_slots(forward_batch: Any, idx: torch.Tensor | None) -> int:
@@ -1592,6 +1650,12 @@ def prepare_qwen4_exp_decode_graph_metadata(
     is_verify = _is_target_verify(forward_batch)
     if not (mode.is_decode_or_idle() or is_verify):
         return None
+    # PROTOTYPE: a Flash draft decode graph rebuilds its QSA metadata into
+    # _DRAFT_QSA inside the graph (positions / out_cache_loc change per draft
+    # step). Do not fill the target's _DECODE_GRAPH buffers from the draft
+    # runner's out-of-graph hook: TARGET_VERIFY replays from them.
+    if mode.is_decode_or_idle() and _is_draft_decode_batch(forward_batch):
+        return _DRAFT_QSA.last_qsa or _DRAFT_GRAPH_METADATA_IN_GRAPH
     if atom_config is None:
         try:
             from atom.config import get_current_atom_config
@@ -1653,7 +1717,12 @@ def qwen4_exp_metadata_from_forward_batch(
     that storage in place; there is no extra PLE copy.
     """
     bind_qsa_caches(model, forward_batch, atom_config)
-    if _is_capturing() and _DECODE_GRAPH.last_qsa is not None:
+    # Draft graphs (PROTOTYPE) build into _DRAFT_QSA inside the graph instead.
+    if (
+        _is_capturing()
+        and not _is_draft_forward()
+        and _DECODE_GRAPH.last_qsa is not None
+    ):
         ple = _DECODE_GRAPH.last_ple
         if ple is None:
             ple = _build_decode_graph_ple_metadata(
