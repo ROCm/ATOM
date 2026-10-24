@@ -21,7 +21,7 @@ from atom.utils.block_convert import (
 )
 from atom.utils.block_tables import block_table_state
 from atom.utils.forward_context import AttentionMetaData, Context, get_forward_context
-from atom.utils.tbo import TokenSplitPrefillState
+from atom.utils.tbo import TokenSplitPrefillState, decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mha_kv_pool import MhaKvPool
@@ -1342,17 +1342,19 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_q: int,
         context_lens: np.ndarray,
     ):
-        """Compute per-ubatch forward_vars for CUDAGraph TBO.
+        """Compute per-ubatch forward_vars for TBO decode.
 
-        Splits the full-batch data into per-ubatch CpuGpuBuffers.
-        The split point is bs // 2 to match CUDAGraph's baked-in token slices.
+        Splits the full-batch data into per-ubatch CpuGpuBuffers. Each ubatch
+        holds the scheduled requests its micro-batch runs
+        (`decode_ubatch_request_ranges`), padded to half the padded batch,
+        which always covers them.
         """
         self._check_metadata_writable("ub0_mha_metadata", "ub1_mha_metadata")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
         half = bs // N
 
-        ub_ranges = [(0, half), (half, bs)]
+        ub_ranges = decode_ubatch_request_ranges(scheduled_bs, N)
         running_bs_list = [half, bs - half]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(

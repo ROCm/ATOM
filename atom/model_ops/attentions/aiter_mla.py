@@ -83,6 +83,7 @@ from atom.utils.forward_context import (
     Context,
     get_forward_context,
 )
+from atom.utils.tbo import decode_ubatch_request_ranges
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 from .mla_kv_pool import MlaKvPool
@@ -470,7 +471,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self.indexes_by_token_table = indexes_by_token_table(
             self.is_sparse, self.dcp_world_size, self.index_kpool
         )
-        self._tbo_full_running_bs = 0
+        # Each TBO decode ubatch's [start, end) requests in the full batch, set
+        # where its per-ubatch metadata is laid out (`_prepare_ubatch_decode`).
+        self._tbo_ubatch_request_ranges: list[tuple[int, int]] = []
         # e8m0 row-swizzle table for decompose_slots_triton. Compile the kernel
         # now: warmup never reaches a long DCP prefill.
         self._fp4_scale_row_lut = None
@@ -3154,19 +3157,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         max_seqlen_q: int,
         context_lens: np.ndarray,
     ):
-        """
-        Splits the full-batch data into per-ubatch .
+        """Split the full-batch data into per-ubatch buffers for TBO decode.
+
+        Each ubatch holds the scheduled requests its micro-batch runs
+        (`decode_ubatch_request_ranges`), padded to half the padded batch,
+        which always covers them.
         """
         self._check_metadata_writable("ub0_mla_metadata", "ub1_mla_metadata")
         var = self.model_runner.forward_vars
-        self._tbo_full_running_bs = bs
         N = self._NUM_TBO_UBATCHES
         half = bs // N
 
-        ub_ranges = [
-            (0, half),
-            (half, bs),
-        ]
+        ub_ranges = decode_ubatch_request_ranges(scheduled_bs, N)
+        self._tbo_ubatch_request_ranges = ub_ranges
         running_bs_list = [half, bs - half]
 
         for ub_idx, ((req_start, req_end), running_bs) in enumerate(
@@ -3337,7 +3340,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         self._check_metadata_writable("mla_csr")
         var = self.model_runner.forward_vars
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
-        self._tbo_full_running_bs = bs
+        self._tbo_ubatch_request_ranges = decode_ubatch_request_ranges(
+            bs, self._NUM_TBO_UBATCHES
+        )
         # Self-consistent minimal KV metadata for capture: give every sequence
         # exactly 1 page (kv_indptr = [0,1,...,bs]) pointing at block 0, with a
         # 1-token last page. The split-KV stage1 asm kernel computes per batch
@@ -3462,8 +3467,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var = self.model_runner.forward_vars
         p = f"ub{ubatch_idx}_"
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
-        requests_per_ubatch = self._tbo_full_running_bs // self._NUM_TBO_UBATCHES
-        request_start = ubatch_idx * requests_per_ubatch
+        request_start = self._tbo_ubatch_request_ranges[ubatch_idx][0]
         dcp_local_context_lens = None
         if self._publishes_dcp_local_lens:
             dcp_local_context_lens = var["dcp_local_context_lens"].gpu[

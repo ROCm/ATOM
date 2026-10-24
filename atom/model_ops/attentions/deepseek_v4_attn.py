@@ -146,6 +146,7 @@ from atom.utils.forward_context import (
     get_forward_context,
 )
 from atom.utils.h2d import h2d_producer
+from atom.utils.tbo import decode_ubatch_request_ranges
 
 logger = logging.getLogger("atom")
 
@@ -2534,33 +2535,21 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             self._check_ubatch_sources(f"ub{ub_idx}_")
         var = self.model_runner.forward_vars
         N = self._NUM_TBO_UBATCHES
-        enforce_eager = self.model_runner.enforce_eager
-        if enforce_eager:
-            split_total = scheduled_bs
-            half = scheduled_bs // N
-            padded_list = [half, scheduled_bs - half]
-            ub_ranges = [(0, half), (half, split_total)]
+        # The requests each micro-batch runs (`decode_ubatch_request_ranges`):
+        # not its padded width, which a DP peer's larger split can set.
+        ub_ranges = decode_ubatch_request_ranges(scheduled_bs, N)
+        if self.model_runner.enforce_eager:
+            padded_list = [end - start for start, end in ub_ranges]
         else:
             from atom.utils.tbo.ubatch_wrapper import UBatchWrapper
 
+            # Each ubatch padded to its DP-agreed width, which covers its
+            # requests; pad rows beyond them carry sentinels (filled below).
             ctx = get_forward_context()
             padded_list = [
                 UBatchWrapper._decode_ub_running_bs(ctx, i, N, running_bs)
                 for i in range(N)
             ]
-            # Real-request ranges partition scheduled_bs; each ubatch owns up to
-            # its padded capacity, the tail ubatch takes the remainder. Pad rows
-            # beyond the real reqs carry sentinels (filled below).
-            ub_ranges = []
-            req_start = 0
-            for i in range(N):
-                if i == N - 1:
-                    req_end = scheduled_bs
-                else:
-                    req_end = min(scheduled_bs, req_start + padded_list[i])
-                ub_ranges.append((req_start, req_end))
-                req_start = req_end
-            split_total = scheduled_bs
 
         metas: list = []
         token_offsets = np.zeros(scheduled_bs + 1, dtype=np.int32)

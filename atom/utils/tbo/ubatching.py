@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
+from atom.utils.tbo.ubatch_splitting import decode_ubatch_request_ranges
 
 
 def tbo_overlap_enabled() -> bool:
@@ -113,8 +114,8 @@ def _precompute_decode(batch) -> tuple[bool, bool, int, int]:
         return False, False, 0, 0
     scheduled_tokens = batch.total_tokens_num
     tokens_per_req = scheduled_tokens // scheduled_bs if scheduled_bs else 1
-    reqs_per_ub = scheduled_bs // 2
-    ub0 = reqs_per_ub * tokens_per_req
+    (ub0_start, ub0_end), _ = decode_ubatch_request_ranges(scheduled_bs, 2)
+    ub0 = (ub0_end - ub0_start) * tokens_per_req
     ub1 = scheduled_tokens - ub0
     return True, True, ub0, ub1
 

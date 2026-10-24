@@ -10,6 +10,7 @@ import torch
 
 from atom.utils import CpuGpuBuffer
 from atom.utils.h2d import PublicationError
+from atom.utils.tbo import decode_ubatch_request_ranges
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_H2D_GPU_TESTS") != "1", reason="set RUN_H2D_GPU_TESTS=1"
@@ -277,12 +278,22 @@ def test_decode_csr_tbo_delayed_slot_reuse(
                 )
             )
         if tbo:
-            for ub, lo in enumerate((0, 2)):
-                n = max(0, min(count - lo, 2))
+            # Each ubatch holds the scheduled requests its micro-batch runs,
+            # not half the padded batch: count=3 is ubatch 0 = [0, 1).
+            for ub, (lo, hi) in enumerate(decode_ubatch_request_ranges(count, 2)):
+                n = hi - lo
                 p = f"ub{ub}_"
-                expected_ub = [v - expected[lo] for v in expected[lo : lo + 3]]
+                expected_ub = [
+                    expected[lo + min(j, n)] - expected[lo] for j in range(3)
+                ]
                 saved.append(
                     (runner.forward_vars[p + "kv_indptr"].gpu[:3].clone(), expected_ub)
+                )
+                saved.append(
+                    (
+                        runner.forward_vars[p + "context_lens"].gpu[:n].clone(),
+                        runner.forward_vars["context_lens"].np[lo:hi].tolist(),
+                    )
                 )
                 saved.append(
                     (
@@ -647,10 +658,12 @@ def test_shared_maps_skip_h2d_per_slot_and_tbo_buffer(monkeypatch, kind, transpo
         start_decode(runner, builder, batch, 1)
         torch.cuda._sleep(2_000_000)
         builder.prepare_decode(batch, 4, 4, 1)
+        # 3 scheduled requests split [0, 1) / [1, 3), each padded to half of 4.
+        (lo0, hi0), (lo1, hi1) = decode_ubatch_request_ranges(3, 2)
         for name, selected, width in (
             ("block_tables", rows, 4),
-            ("ub0_block_tables", rows[:2], 2),
-            ("ub1_block_tables", rows[2:], 2),
+            ("ub0_block_tables", rows[lo0:hi0], 2),
+            ("ub1_block_tables", rows[lo1:hi1], 2),
         ):
             buf = runner.forward_vars[name]
             mapping = tuple(tuple(row) for row in selected)

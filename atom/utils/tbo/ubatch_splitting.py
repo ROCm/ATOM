@@ -52,6 +52,29 @@ class UBatchSlice:
     token_slice: slice  # which tokens belong to this micro-batch (for prefill)
 
 
+def decode_ubatch_request_ranges(
+    scheduled_bs: int, num_ubatches: int
+) -> list[tuple[int, int]]:
+    """The ``[start, end)`` requests of each decode micro-batch: an even split
+    of the scheduled requests, the last taking the remainder.
+
+    The one split a decode step's micro-batches are cut by
+    (`maybe_create_ubatch_slices`) and the one every attention backend's
+    per-ubatch metadata must cover (`_prepare_ubatch_decode`). A backend that
+    splits anything else -- the padded running batch, a ubatch's padded
+    width -- hands a micro-batch's rows another request's context and KV
+    slots.
+    """
+    per_ubatch = scheduled_bs // num_ubatches
+    return [
+        (
+            i * per_ubatch,
+            (i + 1) * per_ubatch if i < num_ubatches - 1 else scheduled_bs,
+        )
+        for i in range(num_ubatches)
+    ]
+
+
 def maybe_create_ubatch_slices(
     num_reqs: int,
     scheduled_tokens: int,
@@ -113,22 +136,14 @@ def maybe_create_ubatch_slices(
         )
 
     # Decode: uniform split by request count
-    slices = []
-    reqs_per_ub = num_reqs // num_ubatches
     tokens_per_req = scheduled_tokens // num_reqs if num_reqs > 0 else 1
-
-    for i in range(num_ubatches):
-        req_start = i * reqs_per_ub
-        req_end = (i + 1) * reqs_per_ub if i < num_ubatches - 1 else num_reqs
-        tok_start = req_start * tokens_per_req
-        tok_end = req_end * tokens_per_req
-        slices.append(
-            UBatchSlice(
-                request_slice=slice(req_start, req_end),
-                token_slice=slice(tok_start, tok_end),
-            )
+    return [
+        UBatchSlice(
+            request_slice=slice(req_start, req_end),
+            token_slice=slice(req_start * tokens_per_req, req_end * tokens_per_req),
         )
-    return slices
+        for req_start, req_end in decode_ubatch_request_ranges(num_reqs, num_ubatches)
+    ]
 
 
 def _split_prefill_balanced(
