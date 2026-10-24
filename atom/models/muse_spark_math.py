@@ -54,7 +54,7 @@ def post_expert_combine(
 
     ``y`` is ``[tokens, top_k, dim]`` complete expert outputs (zeros for a slot
     another rank owns), ``weight`` the effective norm weight. The scale is
-    applied and rounded in ``y``'s dtype before the norm, as the reference does.
+    applied and rounded in ``y``'s dtype before the norm (the reference uses fp32).
     """
     scaled = (weight.to(y.dtype) * y).float()
     inv = torch.rsqrt(scaled.pow(2).mean(-1, keepdim=True) + eps)
