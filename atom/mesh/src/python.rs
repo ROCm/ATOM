@@ -9,6 +9,7 @@ use crate::{
         parse_prefill_args_from, Backend, Cli, CliArgs, Commands,
     },
     config::RoutingMode,
+    core::runtime::build_runtime,
     routers::atom_standalone::AtomStandaloneRuntime,
     server::{self, ServerConfig},
     version,
@@ -76,7 +77,7 @@ pub fn launch_mesh(
 }
 
 fn startup_runtime(server_config: ServerConfig) -> PyResult<()> {
-    let tokio_runtime = tokio::runtime::Runtime::new()
+    let tokio_runtime = build_runtime()
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {e}")))?;
     tokio_runtime
         .block_on(async move { server::startup(server_config).await })
@@ -265,10 +266,35 @@ pub fn atomesh_runner(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "ext-proc"))]
-mod ext_proc_tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
+    #[test]
+    fn python_parser_preserves_prepare_pool_options() {
+        Python::attach(|py| {
+            let parsed = parse_from(
+                py,
+                vec![
+                    "--prepare-workers".into(),
+                    "2".into(),
+                    "--prepare-queue-capacity".into(),
+                    "6".into(),
+                    "--prepare-max-tokenize-bytes".into(),
+                    "8192".into(),
+                ],
+            )
+            .unwrap();
+            let object = parsed.bind(py).get_item("server_config").unwrap().unwrap();
+            let config: PyRef<'_, PyServerConfig> = object.extract().unwrap();
+            let router = &config.inner.as_ref().unwrap().router_config;
+            assert_eq!(router.resolved_prepare_workers(), 2);
+            assert_eq!(router.resolved_prepare_pool().unwrap().queue_capacity, 6);
+            assert_eq!(router.resolved_max_tokenize_bytes(), 8192);
+        });
+    }
+
+    #[cfg(feature = "ext-proc")]
     #[test]
     fn python_parser_preserves_ext_proc_server_configuration() {
         Python::attach(|py| {
@@ -286,6 +312,15 @@ mod ext_proc_tests {
             let ext_proc = &config.inner.as_ref().unwrap().router_config.ext_proc;
             assert!(ext_proc.enabled);
             assert_eq!(ext_proc.listen.port(), 9012);
+            assert_eq!(
+                config
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .router_config
+                    .resolved_prepare_workers(),
+                crate::core::runtime::default_prepare_workers()
+            );
         });
     }
 }

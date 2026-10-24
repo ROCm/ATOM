@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -8,8 +8,6 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error};
 
 use crate::{
     app_context::AppContext,
@@ -17,23 +15,16 @@ use crate::{
     core::{
         is_retryable_status,
         placement::{
-            planner::DefaultPlanner,
-            registry_adapters::{PolicyRegistryAdapter, WorkerRegistryAdapter},
+            registry_adapters::PolicyRegistryAdapter,
             traits::PdPlanner,
             types::{PlacementPlan, Protocol, RequestDescriptor},
         },
-        AttachedBody, RetryExecutor, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        ConnectionMode, RetryExecutor, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
         metrics::{metrics_labels, MeshMetrics},
-    },
-    protocols::{
-        chat::ChatCompletionRequest,
-        common::GenerationRequest,
-        completion::CompletionRequest,
-        generate::GenerateRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{
         comm::{
@@ -48,9 +39,8 @@ use crate::{
 
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
-    planner: Arc<dyn PdPlanner>,
+    policies: Arc<PolicyRegistryAdapter>,
     client: Client,
-    dp_aware: bool,
     retry_config: RetryConfig,
 }
 
@@ -59,7 +49,6 @@ impl std::fmt::Debug for Router {
         f.debug_struct("Router")
             .field("worker_registry", &self.worker_registry)
             .field("client", &self.client)
-            .field("dp_aware", &self.dp_aware)
             .field("retry_config", &self.retry_config)
             .finish()
     }
@@ -67,17 +56,108 @@ impl std::fmt::Debug for Router {
 
 impl Router {
     pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(ctx.worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone())),
-        ));
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
-            planner,
+            policies: Arc::new(PolicyRegistryAdapter::new(ctx.policy_registry.clone())),
             client: ctx.client.clone(),
-            dp_aware: ctx.router_config.dp_aware,
             retry_config: ctx.router_config.effective_retry_config(),
         })
+    }
+
+    async fn send_inference_once(
+        &self,
+        request: &super::ingress::HttpInferenceRequest,
+        descriptor: &RequestDescriptor<'_>,
+        planner: &dyn PdPlanner,
+        policy: Arc<dyn crate::policies::LoadBalancingPolicy>,
+    ) -> Response {
+        use super::comm::error::IngressError;
+        let metadata = &request.metadata;
+        let (worker, policy_name) = match planner.plan(descriptor).await {
+            Ok(PlacementPlan::Single {
+                worker,
+                policy_name,
+                ..
+            }) => (worker, policy_name),
+            Ok(_) => {
+                return IngressError::new(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "unsupported_api_topology",
+                    "regular proxy requires a regular HTTP worker",
+                )
+                .response(metadata.route)
+            }
+            Err(err) => return placement_err_to_response(err, metadata.model.as_deref()),
+        };
+        MeshMetrics::record_worker_selection(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            metadata.model.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            policy_name,
+        );
+        let load = WorkerLoadGuard::new(worker.clone(), Some(&request.headers));
+        let headers = match header_utils::inference_request_headers(
+            &request.headers,
+            metadata.route,
+            worker.api_key().as_deref(),
+        ) {
+            Ok(headers) => headers,
+            Err(err) => return err.response(metadata.route),
+        };
+        let mut builder = self
+            .client
+            .post(
+                worker.endpoint_url(
+                    request
+                        .uri
+                        .path_and_query()
+                        .map(|p| p.as_str())
+                        .unwrap_or(metadata.route),
+                ),
+            )
+            .headers(headers);
+        builder = match super::ingress::dp_ranked_body(
+            worker.as_ref(),
+            metadata.route,
+            request.dp_rank_body.as_ref(),
+            &request.body,
+        ) {
+            Ok(Some(body)) => builder
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(body),
+            Ok(None) => builder
+                .header(
+                    CONTENT_TYPE,
+                    request
+                        .headers
+                        .get(CONTENT_TYPE)
+                        .cloned()
+                        .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+                )
+                .body(request.body.clone()),
+            Err(err) => return err.response(metadata.route),
+        };
+        events::RequestSentEvent { url: worker.url() }.emit();
+        let upstream = builder.send().await;
+        events::RequestReceivedEvent {}.emit();
+        let response = match upstream {
+            Ok(response) => {
+                super::comm::proxy_body::ProxyBody::response(response, worker, policy, load)
+            }
+            Err(err) => {
+                worker.record_outcome(false);
+                policy.on_request_complete(worker.url(), false);
+                convert_reqwest_error(err)
+            }
+        };
+        if response.status().is_server_error() {
+            MeshMetrics::record_worker_error(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                error_type_from_status(response.status()),
+            );
+        }
+        response
     }
 
     fn select_first_worker(&self) -> Result<String, String> {
@@ -131,449 +211,155 @@ impl Router {
         }
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &'static str,
-        model_id: Option<&str>,
-    ) -> Response {
-        let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
-        let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let endpoint = route_to_endpoint(route);
-
-        let observation = crate::observability::request::RequestMetrics::new(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_REGULAR,
-            model,
-            route,
-            is_stream,
-        );
-
-        let response = RetryExecutor::execute_response_with_retry(
-            &self.retry_config,
-            // operation per attempt
-            |_: u32| async {
-                let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
-                    .await;
-
-                // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                MeshMetrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    res.status().as_u16(),
-                    extract_error_code_from_response(&res),
-                );
-
-                res
-            },
-            // should_retry predicate
-            |res, _attempt| is_retryable_status(res.status()),
-            // on_backoff hook
-            |delay, attempt| {
-                // Layer 3 worker metrics
-                MeshMetrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                MeshMetrics::record_worker_retry_backoff(attempt, delay);
-            },
-            // on_exhausted hook
-            || {
-                MeshMetrics::record_worker_retries_exhausted(
-                    metrics_labels::WORKER_REGULAR,
-                    endpoint,
-                );
-            },
-        )
-        .await;
-
-        observation.wrap_response(response)
-    }
-
-    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
-        &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &'static str,
-        model_id: Option<&str>,
-        is_stream: bool,
-        text: &str,
-    ) -> Response {
-        let descriptor = RequestDescriptor {
-            model_id,
-            protocol: Some(Protocol::Http),
-            text: Some(text),
-            tokens: None,
-            headers,
-            stream: is_stream,
-        };
-
-        let (worker, policy_name) = match self.planner.plan(&descriptor).await {
-            Ok(PlacementPlan::Single {
-                worker,
-                policy_name,
-                ..
-            }) => (worker, policy_name),
-            Ok(PlacementPlan::Pair { .. }) => {
-                error!(
-                    function = "Router::route_typed_request_once",
-                    "Planner returned Pair plan for regular HTTP router"
-                );
-                return error::internal_error(
-                    "unexpected_pair_plan",
-                    "Planner returned Pair plan for regular router",
-                );
-            }
-            Err(err) => {
-                return placement_err_to_response(err, model_id);
-            }
-        };
-
-        MeshMetrics::record_worker_selection(
-            metrics_labels::WORKER_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id.unwrap_or(UNKNOWN_MODEL_ID),
-            policy_name,
-        );
-
-        let load_guard = ["cache_aware", "manual", "dp_sticky"]
-            .contains(&policy_name)
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
-
-        // Note: Using borrowed reference avoids heap allocation
-        events::RequestSentEvent { url: worker.url() }.emit();
-
-        let response = self
-            .send_typed_request(
-                headers,
-                typed_req,
-                route,
-                worker.url(),
-                is_stream,
-                load_guard,
-            )
-            .await;
-
-        events::RequestReceivedEvent {}.emit();
-
-        let status = response.status();
-        worker.record_outcome(status.is_success());
-
-        // Record worker errors for server errors (5xx)
-        if status.is_server_error() {
-            MeshMetrics::record_worker_error(
-                metrics_labels::WORKER_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                error_type_from_status(status),
-            );
-        }
-
-        response
-    }
-
-    // Helper: return base worker URL (strips DP suffix when enabled)
-    fn worker_base_url(&self, worker_url: &str) -> String {
-        if self.dp_aware {
-            if let Ok((prefix, _)) = Self::extract_dp_rank(worker_url) {
-                return prefix.to_string();
-            }
-        }
-        worker_url.to_string()
-    }
-
-    // Generic simple routing for GET/POST without JSON body
+    // Resource IDs have no model/owner hint, so probe eligible backend origins.
     async fn route_simple_request(
         &self,
         headers: Option<&HeaderMap>,
         endpoint: &str,
         method: Method,
+        query: Option<&str>,
     ) -> Response {
-        // TODO: currently the sglang worker is using in-memory state management, so this implementation has to fan out to all workers.
-        // Eventually, we need to have router to manage the chat history with a proper database, will update this implementation accordingly.
         let workers = self.worker_registry.get_all();
         if workers.is_empty() {
             return error::service_unavailable("no_workers", "No available workers");
         }
+        let api = super::ingress::EndpointSpec::find("/v1/responses")
+            .expect("Responses endpoint is registered");
+        let mut origins = BTreeMap::new();
+        for worker in workers.into_iter().filter(|worker| {
+            matches!(worker.connection_mode(), ConnectionMode::Http)
+                && matches!(worker.worker_type(), WorkerType::Regular)
+                && api.supports(worker.as_ref())
+        }) {
+            // An unhealthy worker can still own the requested resource.
+            let key = worker.api_key().clone();
+            match origins.entry(worker.base_url().trim_end_matches('/').to_owned()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(key);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    if entry.get() != &key {
+                        return error::service_unavailable(
+                            "conflicting_backend_credentials",
+                            "Responses workers at the same backend URL must use the same credential",
+                        );
+                    }
+                }
+            }
+        }
+        if origins.is_empty() {
+            return error::not_implemented(
+                "unsupported_api",
+                "no configured HTTP backend supports Responses resource operations",
+            );
+        }
+        let headers = headers.cloned().unwrap_or_default();
 
-        let filtered_headers: Vec<_> = headers
-            .map(|hdrs| {
-                hdrs.iter()
-                    .filter(|(name, _)| header_utils::should_forward_request_header(name.as_str()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let futures: Vec<_> = workers
+        // Match inference: configured worker keys override client credentials;
+        // eligible backends without a worker key receive the client credentials.
+        // Validate every credential before sending any DELETE or cancel request.
+        let mut requests = Vec::with_capacity(origins.len());
+        for (base, key) in origins {
+            let headers = match header_utils::inference_request_headers(
+                &headers,
+                "/v1/responses",
+                key.as_deref(),
+            ) {
+                Ok(headers) => headers,
+                Err(err) => return error::create_error(err.status, err.code, err.message),
+            };
+            let url = match query {
+                Some(query) => format!("{base}/{endpoint}?{query}"),
+                None => format!("{base}/{endpoint}"),
+            };
+            requests.push(self.client.request(method.clone(), url).headers(headers));
+        }
+        let futures = requests
             .into_iter()
-            .map(|worker| {
-                let worker_url = worker.url();
-                let base = self.worker_base_url(worker_url);
-                let url = format!("{}/{}", base, endpoint);
-                let client = self.client.clone();
-                let method = method.clone();
-
-                let headers = filtered_headers.clone();
-
-                let api_key = worker.api_key().clone();
-
-                async move {
-                    let mut request_builder = match method {
-                        Method::GET => client.get(url),
-                        Method::POST => client.post(url),
-                        _ => {
-                            return Err(error::method_not_allowed(
-                                "unsupported_method",
-                                "Unsupported method for simple routing",
-                            ))
-                        }
-                    };
-
-                    if let Some(key) = api_key {
-                        let mut auth_header = String::with_capacity(7 + key.len());
-                        auth_header.push_str("Bearer ");
-                        auth_header.push_str(&key);
-                        request_builder = request_builder.header("Authorization", auth_header);
-                    }
-
-                    for (name, value) in headers {
-                        request_builder = request_builder.header(name.clone(), value.clone());
-                    }
-
-                    request_builder.send().await.map_err(convert_reqwest_error)
-                }
-            })
-            .collect();
-
-        // Now execute the collected futures concurrently
+            .enumerate()
+            .map(|(index, request)| async move {
+                // A transport failure means this backend could not answer; keep
+                // its internal URL out of the client-visible error.
+                let result = request.send().await.map_err(|_| {
+                    error::bad_gateway(
+                        "backend_unreachable",
+                        "a backend that may own this response could not be reached",
+                    )
+                });
+                (index, result)
+            });
         let mut stream = stream::iter(futures).buffer_unordered(32);
-        let mut last_response: Option<Response> = None;
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-                    let response_headers = header_utils::preserve_response_headers(res.headers());
-
-                    match res.bytes().await {
-                        Ok(body) => {
-                            let mut response = Response::new(Body::from(body));
-                            *response.status_mut() = status;
-                            *response.headers_mut() = response_headers;
-
-                            if status.is_success() {
-                                return response;
-                            }
-                            last_response = Some(response);
-                        }
-                        Err(e) => {
-                            last_response = Some(error::internal_error(
-                                "read_response_failed",
-                                format!("Failed to read response: {}", e),
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    last_response = Some(e);
-                }
-            }
-        }
-
-        last_response
-            .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
-    }
-
-    // Route a GET request with provided headers to a specific endpoint
-    async fn route_get_request(&self, headers: Option<&HeaderMap>, endpoint: &str) -> Response {
-        self.route_simple_request(headers, endpoint, Method::GET)
-            .await
-    }
-
-    // Route a POST request with empty body to a specific endpoint
-    async fn route_post_empty_request(
-        &self,
-        headers: Option<&HeaderMap>,
-        endpoint: &str,
-    ) -> Response {
-        self.route_simple_request(headers, endpoint, Method::POST)
-            .await
-    }
-
-    // TODO (rui): Better accommodate to the Worker abstraction
-    fn extract_dp_rank(worker_url: &str) -> Result<(&str, usize), String> {
-        let parts: Vec<&str> = worker_url.split('@').collect();
-        if parts.len() != 2 {
-            return Err(format!("invalid worker_url format: {}", worker_url));
-        }
-
-        // Parse the second part (dp_rank) into an integer
-        match parts[1].parse::<usize>() {
-            Ok(dp_rank) => Ok((parts[0], dp_rank)),
-            Err(_) => Err(format!(
-                "failed to parse dp_rank from worker_url: {}",
-                worker_url
-            )),
-        }
-    }
-
-    // Send typed request directly without conversion
-    async fn send_typed_request<T: serde::Serialize>(
-        &self,
-        headers: Option<&HeaderMap>,
-        typed_req: &T,
-        route: &'static str,
-        worker_url: &str,
-        is_stream: bool,
-        load_guard: Option<WorkerLoadGuard>,
-    ) -> Response {
-        // Get the worker once and reuse for API key and load tracking
-        let worker = self.worker_registry.get_by_url(worker_url);
-        let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
-
-        // Static key string to avoid per-request allocations
-        const DP_RANK_KEY: &str = "data_parallel_rank";
-
-        let mut request_builder = if self.dp_aware {
-            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
-                Ok(tup) => tup,
-                Err(e) => {
-                    error!("Failed to extract dp_rank: {}", e);
-                    return error::internal_error(
-                        "dp_rank_extraction_failed",
-                        format!("Failed to extract dp_rank: {}", e),
-                    );
-                }
-            };
-
-            let mut json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return error::bad_request(
-                        "serialization_failed",
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    );
-                }
-            };
-
-            if let Some(map) = json_val.as_object_mut() {
-                // Use static key string to avoid allocation
-                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
-                // Only serialize if debug logging is enabled to avoid CPU overhead
-                if tracing::enabled!(tracing::Level::DEBUG) {
-                    debug!(
-                        "Modified request body: {}",
-                        serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
-                    );
-                }
-            } else {
-                return error::bad_request(
-                    "dp_rank_insertion_failed",
-                    "Failed to insert the data_parallel_rank field into the request body",
-                );
-            }
-
-            self.client
-                .post(format!("{}{}", worker_url_prefix, route))
-                .json(&json_val)
-        } else {
-            self.client
-                .post(format!("{}{}", worker_url, route))
-                .json(typed_req) // Use json() directly with typed request
-        };
-
-        if let Some(key) = api_key {
-            // Pre-allocate string with capacity to avoid reallocation
-            let mut auth_header = String::with_capacity(7 + key.len());
-            auth_header.push_str("Bearer ");
-            auth_header.push_str(&key);
-            request_builder = request_builder.header("Authorization", auth_header);
-        }
-
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-        }
-
-        let res = match request_builder.send().await {
-            Ok(res) => res,
-            Err(e) => {
-                error!(
-                    "Failed to send typed request worker_url={} route={} error={}",
-                    worker_url, route, e
-                );
-
-                return convert_reqwest_error(e);
-            }
-        };
-
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        if !is_stream {
-            // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-
-            let response = match res.bytes().await {
-                Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
+        let mut best_error: Option<((u8, usize), Response)> = None;
+        while let Some((index, result)) = stream.next().await {
+            let response = match result {
+                Ok(upstream) => {
+                    let status = upstream.status();
+                    let headers = header_utils::preserve_response_headers(upstream.headers());
+                    // Stream retrieval events as they arrive.
+                    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
                     *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
+                    *response.headers_mut() = headers;
+                    if status.is_success() {
+                        return response;
+                    }
                     response
                 }
-                Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
-                    error::internal_error("read_response_body_failed", error_msg)
-                }
+                Err(response) => response,
             };
-
-            // load_guard dropped here automatically after response body is read
-            response
-        } else {
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
-            if let Some(guard) = load_guard {
-                response = AttachedBody::wrap_response(response, guard);
+            let status = response.status();
+            // A backend without these routes says nothing about the resource.
+            let route_unsupported =
+                status == StatusCode::METHOD_NOT_ALLOWED || status == StatusCode::NOT_IMPLEMENTED;
+            let priority = if route_unsupported {
+                4
+            } else if status.is_client_error() && status != StatusCode::NOT_FOUND {
+                0
+            } else if status.is_server_error() {
+                1
+            } else if status == StatusCode::NOT_FOUND {
+                3
+            } else {
+                2
+            };
+            // Preserve actionable client errors over failures at other backends.
+            // An unreachable or failing backend may own the resource, so its
+            // error outranks 404; ties follow URL order.
+            let rank = (priority, index);
+            if best_error
+                .as_ref()
+                .is_none_or(|(current, _)| rank < *current)
+            {
+                best_error = Some((rank, response));
             }
-            response
         }
+        best_error
+            .map(|(_, response)| response)
+            .unwrap_or_else(|| error::bad_gateway("no_worker_response", "No worker response"))
     }
+}
+
+const CONNECTION_FAILED_CODE: &str = "call_upstream_connection_failed";
+
+/// Mesh-local errors caused by configuration or the request itself; retrying
+/// another worker cannot change the outcome.
+const NON_RETRYABLE_ERROR_CODES: &[&str] = &[
+    "invalid_backend_credentials",
+    "worker_request_preparation_failed",
+    "invalid_request",
+];
+
+/// Decide whether an inference attempt should be retried on another worker.
+pub(super) fn should_retry_inference(route: &str, response: &Response) -> bool {
+    let code = extract_error_code_from_response(response);
+    if NON_RETRYABLE_ERROR_CODES.contains(&code) {
+        return false;
+    }
+    // A Responses submission that reached a backend may already have created
+    // stored work, so only fail over when the connection was never made.
+    if route == "/v1/responses" {
+        return code == CONNECTION_FAILED_CODE;
+    }
+    is_retryable_status(response.status())
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
@@ -584,8 +370,12 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
     let message = format!("{}. URL: {}", e, url);
 
     // TODO improve error status code
+    // Connection failures are also request errors; classify them first so
+    // callers can tell that nothing reached the backend.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
+    } else if e.is_connect() {
+        (StatusCode::INTERNAL_SERVER_ERROR, CONNECTION_FAILED_CODE)
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -613,11 +403,6 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
         )
     } else if e.is_timeout() {
         (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
-    } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
-        )
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -636,6 +421,69 @@ impl RouterTrait for Router {
         self
     }
 
+    async fn route_inference(
+        &self,
+        request: super::ingress::InferenceEnvelope,
+        app: &Arc<AppContext>,
+    ) -> Response {
+        use crate::core::placement::traits::PolicySource;
+        let route = request.metadata.route;
+        let routing = super::ingress::IngressRouting::new(app);
+        let placement = match request
+            .prepare_placement(app, &routing, self.policies.clone())
+            .await
+        {
+            Ok(placement) => placement,
+            Err(err) => return err.response(route),
+        };
+        let (metadata, tokens, planner) = (placement.metadata, placement.tokens, placement.planner);
+        let request = placement.request.into_http_request();
+        let descriptor = RequestDescriptor {
+            model_id: metadata.model.as_deref(),
+            protocol: Some(Protocol::Http),
+            text: Some(&metadata.text),
+            tokens: tokens.as_deref(),
+            headers: Some(&request.headers),
+            stream: metadata.stream,
+        };
+        let policy = self.policies.regular_policy(metadata.model.as_deref());
+        let observation = crate::observability::request::RequestMetrics::new(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metadata.model.as_deref().unwrap_or(UNKNOWN_MODEL_ID),
+            metadata.route,
+            metadata.stream,
+        );
+        let endpoint = route_to_endpoint(metadata.route);
+        let response = RetryExecutor::execute_response_with_retry(
+            &self.retry_config,
+            |_| async {
+                let response = self
+                    .send_inference_once(&request, &descriptor, &planner, policy.clone())
+                    .await;
+                MeshMetrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    response.status().as_u16(),
+                    extract_error_code_from_response(&response),
+                );
+                response
+            },
+            |response, _| should_retry_inference(metadata.route, response),
+            |delay, attempt| {
+                MeshMetrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                MeshMetrics::record_worker_retry_backoff(attempt, delay);
+            },
+            || {
+                MeshMetrics::record_worker_retries_exhausted(
+                    metrics_labels::WORKER_REGULAR,
+                    endpoint,
+                )
+            },
+        )
+        .await;
+        observation.wrap_response(response)
+    }
+
     async fn health_generate(&self, req: Request<Body>) -> Response {
         self.proxy_get_request(req, "health_generate").await
     }
@@ -652,59 +500,38 @@ impl RouterTrait for Router {
         self.proxy_get_request(req, "get_model_info").await
     }
 
-    async fn route_generate(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
-            .await
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
-    }
-
-    async fn route_responses(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ResponsesRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
-            .await
-    }
-
     async fn get_response(
         &self,
         headers: Option<&HeaderMap>,
         response_id: &str,
-        _params: &ResponsesGetParams,
+        query: Option<&str>,
     ) -> Response {
         let endpoint = format!("v1/responses/{}", response_id);
-        self.route_get_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::GET, query)
+            .await
     }
 
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{}/cancel", response_id);
-        self.route_post_empty_request(headers, &endpoint).await
+        self.route_simple_request(headers, &endpoint, Method::POST, None)
+            .await
+    }
+
+    async fn delete_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+        let endpoint = format!("v1/responses/{}", response_id);
+        self.route_simple_request(headers, &endpoint, Method::DELETE, None)
+            .await
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+        query: Option<&str>,
+    ) -> Response {
+        let endpoint = format!("v1/responses/{}/input_items", response_id);
+        self.route_simple_request(headers, &endpoint, Method::GET, query)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -717,6 +544,28 @@ mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
     use crate::policies::PolicyRegistry;
+
+    #[test]
+    fn retries_skip_configuration_errors_and_responses_only_fail_over_unsent() {
+        let mesh_error =
+            |status, code: &str| error::create_error(status, code.to_owned(), "message");
+        for &code in NON_RETRYABLE_ERROR_CODES {
+            let response = mesh_error(StatusCode::SERVICE_UNAVAILABLE, code);
+            assert!(
+                !should_retry_inference("/v1/chat/completions", &response),
+                "{code}"
+            );
+        }
+        let unsent = mesh_error(StatusCode::INTERNAL_SERVER_ERROR, CONNECTION_FAILED_CODE);
+        let backend_failure = mesh_error(StatusCode::BAD_GATEWAY, "call_upstream_status_error");
+        assert!(should_retry_inference("/v1/chat/completions", &unsent));
+        assert!(should_retry_inference(
+            "/v1/chat/completions",
+            &backend_failure
+        ));
+        assert!(should_retry_inference("/v1/responses", &unsent));
+        assert!(!should_retry_inference("/v1/responses", &backend_failure));
+    }
 
     fn create_test_regular_router() -> Router {
         use crate::core::WorkerType;
@@ -735,15 +584,9 @@ mod tests {
         worker_registry.register(Arc::new(worker1));
         worker_registry.register(Arc::new(worker2));
 
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
-        ));
-
         Router {
             worker_registry,
-            planner,
-            dp_aware: false,
+            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
             client: Client::new(),
             retry_config: RetryConfig::default(),
         }
@@ -808,84 +651,14 @@ mod tests {
         let policy_registry = Arc::new(PolicyRegistry::new(
             crate::config::types::PolicyConfig::RoundRobin,
         ));
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
-        ));
         let router = Router {
             worker_registry,
-            planner,
-            dp_aware: false,
+            policies: Arc::new(PolicyRegistryAdapter::new(policy_registry)),
             client: Client::new(),
             retry_config: RetryConfig::default(),
         };
         let result = router.select_first_worker();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_dp_rank_valid() {
-        let (url, rank) = Router::extract_dp_rank("http://worker:8000@2").unwrap();
-        assert_eq!(url, "http://worker:8000");
-        assert_eq!(rank, 2);
-    }
-
-    #[test]
-    fn test_extract_dp_rank_zero() {
-        let (url, rank) = Router::extract_dp_rank("http://worker:8000@0").unwrap();
-        assert_eq!(url, "http://worker:8000");
-        assert_eq!(rank, 0);
-    }
-
-    #[test]
-    fn test_extract_dp_rank_no_at() {
-        let result = Router::extract_dp_rank("http://worker:8000");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_dp_rank_invalid_number() {
-        let result = Router::extract_dp_rank("http://worker:8000@abc");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_extract_dp_rank_multiple_at() {
-        let result = Router::extract_dp_rank("http://worker@8000@2");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_worker_base_url() {
-        let router = create_test_regular_router();
-        assert_eq!(
-            router.worker_base_url("http://worker:8000"),
-            "http://worker:8000"
-        );
-    }
-
-    #[test]
-    fn test_worker_base_url_dp_aware() {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(
-            crate::config::types::PolicyConfig::RoundRobin,
-        ));
-        let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
-            Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
-        ));
-        let router = Router {
-            worker_registry,
-            planner,
-            dp_aware: true,
-            client: Client::new(),
-            retry_config: RetryConfig::default(),
-        };
-        // With dp_aware, should extract base URL before @
-        assert_eq!(
-            router.worker_base_url("http://worker:8000@2"),
-            "http://worker:8000"
-        );
     }
 
     #[test]

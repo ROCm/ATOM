@@ -8,29 +8,25 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderMap, HeaderValue, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
 
 #[cfg(test)]
+#[path = "../../tests/routing/http_pd_load_tests.rs"]
 mod load_tests;
 
 use memchr::memmem;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
-use crate::routers::prepare::inference::{InferenceMetadata, InferenceRequest};
+use crate::routers::prepare::inference::InferenceMetadata;
 
 use crate::{
     config::types::{AtomPdRankMappingPolicy, BackendType, RetryConfig},
     core::{
-        is_retryable_status,
         placement::{
             backend::{
                 atom::{AtomAdapter, AtomPrefillInfo},
@@ -50,9 +46,6 @@ use crate::{
         metrics::{metrics_labels, MeshMetrics},
     },
     policies::PolicyRegistry,
-    protocols::{
-        chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    },
     routers::{
         comm::{
             error, header_utils,
@@ -72,6 +65,7 @@ pub struct PDRouter {
     pub backend: BackendType,
     pub atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy,
     pub planner: Arc<dyn PdPlanner>,
+    policies: Arc<PolicyRegistryAdapter>,
     pub adapter: Arc<dyn BackendAdapter>,
     /// Set when backend == Atom. enrich_decode_kv is ATOM-specific and not on the trait.
     atom_adapter: Option<Arc<AtomAdapter>>,
@@ -284,28 +278,26 @@ impl Drop for PrefillTask {
 
 #[derive(Clone)]
 struct PDRequestContext<'a> {
-    route: &'static str,
+    route: &'a str,
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<&'a str>,
+    tokens: Option<&'a [u32]>,
     model_id: Option<&'a str>,
     headers: Option<Arc<HeaderMap>>,
 }
 
 impl<'a> PDRequestContext<'a> {
-    fn from_metadata(
-        metadata: &'a InferenceMetadata,
-        headers: Option<&HeaderMap>,
-        model: Option<&'a str>,
-    ) -> Self {
+    fn from_metadata(metadata: &'a InferenceMetadata, headers: Option<&HeaderMap>) -> Self {
         Self {
             route: metadata.route,
             batch_size: metadata.batch_size,
             is_stream: metadata.stream,
             return_logprob: metadata.return_logprob,
             request_text: Some(&metadata.text),
-            model_id: model.or_else(|| metadata.model.as_deref().filter(|model| !model.is_empty())),
+            tokens: None,
+            model_id: metadata.model.as_deref().filter(|model| !model.is_empty()),
             headers: headers.cloned().map(Arc::new),
         }
     }
@@ -404,9 +396,10 @@ impl PDRouter {
             }
         };
 
+        let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+            policies.clone(),
         ));
 
         Ok(PDRouter {
@@ -417,6 +410,7 @@ impl PDRouter {
             backend,
             atom_pd_rank_mapping_policy: ctx.router_config.atom_pd_rank_mapping_policy,
             planner,
+            policies,
             adapter,
             atom_adapter,
         })
@@ -473,9 +467,11 @@ impl PDRouter {
         headers: &HeaderMap,
         body: Value,
         metadata: &InferenceMetadata,
+        path: &str,
         placement: Arc<ReservedPair>,
     ) -> Response {
-        let context = PDRequestContext::from_metadata(metadata, Some(headers), None);
+        let mut context = PDRequestContext::from_metadata(metadata, Some(headers));
+        context.route = path;
         self.execute_reserved(Some(headers), body, context, placement)
             .await
     }
@@ -720,16 +716,13 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    async fn dispatch_pd<T: Serialize + Clone>(
+    async fn dispatch_pd(
         &self,
         headers: Option<&HeaderMap>,
-        original_request: &T,
+        request: Value,
         context: PDRequestContext<'_>,
+        planner: &dyn PdPlanner,
     ) -> Response {
-        let request = match serde_json::to_value(original_request) {
-            Ok(value) => value,
-            Err(error) => return Self::handle_serialization_error(error),
-        };
         let endpoint = route_to_endpoint(context.route);
         let observation = crate::observability::request::RequestMetrics::new(
             metrics_labels::ROUTER_HTTP,
@@ -744,7 +737,7 @@ impl PDRouter {
                 let request = request.clone();
                 let context = context.clone();
                 async move {
-                    let placement = match self.plan_pd_pair(&context).await {
+                    let placement = match self.plan_pd_pair(&context, planner).await {
                         Ok(pair) => pair,
                         Err(response) => return response,
                     };
@@ -752,7 +745,7 @@ impl PDRouter {
                         .await
                 }
             },
-            |response, _| is_retryable_status(response.status()),
+            |response, _| super::http_router::should_retry_inference(context.route, response),
             |delay, attempt| {
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
                 MeshMetrics::record_worker_retry(metrics_labels::WORKER_DECODE, endpoint);
@@ -776,17 +769,17 @@ impl PDRouter {
     async fn plan_pd_pair(
         &self,
         context: &PDRequestContext<'_>,
+        planner: &dyn PdPlanner,
     ) -> Result<Arc<ReservedPair>, Response> {
         let descriptor = RequestDescriptor {
             model_id: context.model_id,
             protocol: Some(Protocol::Http),
             text: context.request_text.as_deref(),
-            tokens: None,
+            tokens: context.tokens,
             headers: context.headers.as_deref(),
             stream: context.is_stream,
         };
-        let plan = self
-            .planner
+        let plan = planner
             .plan(&descriptor)
             .await
             .map_err(|error| placement_err_to_response(error, context.model_id))?;
@@ -1720,7 +1713,7 @@ impl PDRouter {
         &self,
         client: &Client,
         worker: &dyn Worker,
-        route: &'static str,
+        route: &str,
         json_request: Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
@@ -1741,28 +1734,19 @@ impl PDRouter {
             )
         })?;
 
+        // Resolve credentials for each PD worker with the same rules as regular ingress.
+        let headers = header_utils::inference_request_headers(
+            headers.unwrap_or(&HeaderMap::new()),
+            route,
+            worker.api_key().as_deref(),
+        )
+        .map_err(|error| error.response(route))?;
         let mut request = client
             .post(worker.endpoint_url(route))
+            .headers(headers)
             .json(&prepared_request);
         if connection_close {
             request = request.header("Connection", "close");
-        }
-        let api_key = worker.api_key();
-        if let Some(headers) = headers {
-            for (name, value) in headers.iter() {
-                // bearer_auth appends, so omit client credentials when the worker has its own.
-                if name == AUTHORIZATION && api_key.is_some() {
-                    continue;
-                }
-                if header_utils::should_forward_request_header(name.as_str()) {
-                    if let Ok(val) = value.to_str() {
-                        request = request.header(name, val);
-                    }
-                }
-            }
-        }
-        if let Some(key) = api_key {
-            request = request.bearer_auth(key);
         }
         Ok(request)
     }
@@ -1954,37 +1938,33 @@ impl RouterTrait for PDRouter {
             .await
     }
 
-    async fn route_generate(
+    async fn route_inference(
         &self,
-        headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        request: super::ingress::InferenceEnvelope,
+        app: &Arc<crate::app_context::AppContext>,
     ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
-    }
-
-    async fn route_chat(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
-    }
-
-    async fn route_completion(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &CompletionRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let metadata = body.metadata();
-        let context = PDRequestContext::from_metadata(&metadata, headers, model_id);
-        self.dispatch_pd(headers, body, context).await
+        let route = request.metadata.route;
+        let routing = super::ingress::IngressRouting::new(app);
+        let placement = match request
+            .prepare_placement(app, &routing, self.policies.clone())
+            .await
+        {
+            Ok(placement) => placement,
+            Err(err) => return err.response(route),
+        };
+        let metadata = &placement.metadata;
+        let (uri, headers, body) = match placement.request.into_pd_parts() {
+            Ok(parts) => parts,
+            Err(err) => return err.response(metadata.route),
+        };
+        let mut context = PDRequestContext::from_metadata(metadata, Some(&headers));
+        context.route = uri
+            .path_and_query()
+            .map(|v| v.as_str())
+            .unwrap_or(metadata.route);
+        context.tokens = placement.tokens.as_deref();
+        self.dispatch_pd(Some(&headers), body, context, &placement.planner)
+            .await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1999,6 +1979,8 @@ mod tests {
         placement::backend::sglang::SglangAdapter, BasicWorkerBuilder, DPAwareWorkerBuilder,
         WorkerType,
     };
+    use crate::protocols::chat::ChatCompletionRequest;
+    use crate::routers::prepare::inference::InferenceRequest;
 
     #[derive(Debug, Default)]
     struct CompletionPolicy(std::sync::Mutex<Vec<bool>>);
@@ -2067,7 +2049,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                socket.read(&mut request).await.unwrap();
+                assert!(socket.read(&mut request).await.unwrap() > 0);
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
@@ -2153,6 +2135,7 @@ mod tests {
                 is_stream: false,
                 return_logprob: false,
                 request_text: None,
+                tokens: None,
                 model_id: None,
                 headers: None,
             };
@@ -2204,25 +2187,23 @@ mod tests {
     #[cfg(feature = "ext-proc")]
     #[tokio::test]
     async fn http_retries_replan_but_reserved_execution_never_replans_or_counts_twice() {
-        use crate::core::placement::types::PlacementError;
+        use crate::core::prepare_pool::PreparePoolRuntime;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        struct CountingPlanner {
-            inner: Arc<dyn PdPlanner>,
-            calls: AtomicUsize,
-        }
-        #[async_trait::async_trait]
-        impl PdPlanner for CountingPlanner {
-            async fn plan(
-                &self,
-                request: &RequestDescriptor<'_>,
-            ) -> Result<PlacementPlan, PlacementError> {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                self.inner.plan(request).await
-            }
-        }
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _recorder = metrics::set_default_local_recorder(&recorder);
+        // Every plan reserves its pair once, so prefill selections count plans.
+        let plans = || -> u64 {
+            handle
+                .render()
+                .lines()
+                .filter(|line| {
+                    line.starts_with("mesh_worker_selection_total{")
+                        && line.contains("worker_type=\"prefill\"")
+                })
+                .map(|line| line.rsplit(' ').next().unwrap().parse::<u64>().unwrap())
+                .sum()
+        };
         let calls = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2239,7 +2220,29 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        let pool = PreparePoolRuntime::new(
+            crate::config::RouterConfig::default()
+                .resolved_prepare_pool()
+                .unwrap(),
+        )
+        .unwrap();
+        let config = crate::config::RouterConfig {
+            policy: crate::config::PolicyConfig::RoundRobin,
+            mode: crate::config::RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        };
+        let app_context = Arc::new(
+            crate::app_context::AppContext::from_config(config, 5, pool.handle())
+                .await
+                .unwrap(),
+        );
         let mut router = create_test_pd_router();
+        router.worker_registry = app_context.worker_registry.clone();
         router.retry_config.max_retries = 2;
         router.retry_config.initial_backoff_ms = 1;
         let prefill: Arc<dyn Worker> = Arc::new(
@@ -2256,19 +2259,24 @@ mod tests {
         );
         router.worker_registry.register(prefill.clone());
         router.worker_registry.register(decode.clone());
-        let planner = Arc::new(CountingPlanner {
-            inner: router.planner.clone(),
-            calls: AtomicUsize::new(0),
-        });
-        router.planner = planner.clone();
-        let request: CompletionRequest =
-            serde_json::from_value(json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"})).unwrap();
-        let response = router.route_completion(None, &request, None).await;
+        let body = json!({"model": UNKNOWN_MODEL_ID, "prompt": "test"});
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let request = super::super::ingress::InferenceEnvelope::parse(
+            "/v1/completions".parse().unwrap(),
+            headers,
+            serde_json::to_vec(&body).unwrap().into(),
+            &app_context,
+        )
+        .await
+        .unwrap();
+        let metadata = request.metadata.execution_metadata();
+        let response = router.route_inference(request, &app_context).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(plans(), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
         let pair = router
@@ -2282,20 +2290,15 @@ mod tests {
                 None,
             )
             .unwrap();
-        let metadata = request.metadata().execution_metadata();
         let response = router
-            .execute_placement(
-                &HeaderMap::new(),
-                serde_json::to_value(&request).unwrap(),
-                &metadata,
-                pair,
-            )
+            .execute_placement(&HeaderMap::new(), body, &metadata, metadata.route, pair)
             .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
-        assert_eq!(planner.calls.load(Ordering::SeqCst), 2);
+        // The manual reservation above is the only additional plan.
+        assert_eq!(plans(), 3);
         assert_eq!(calls.load(Ordering::SeqCst), 6);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
         let rendered = handle.render();
@@ -2313,9 +2316,10 @@ mod tests {
         let policy_registry =
             Arc::new(PolicyRegistry::new(crate::config::PolicyConfig::RoundRobin));
 
+        let policies = Arc::new(PolicyRegistryAdapter::new(policy_registry.clone()));
         let planner: Arc<dyn PdPlanner> = Arc::new(DefaultPlanner::new(
             Arc::new(WorkerRegistryAdapter::new(worker_registry.clone())),
-            Arc::new(PolicyRegistryAdapter::new(policy_registry.clone())),
+            policies.clone(),
         ));
         let adapter: Arc<dyn BackendAdapter> = Arc::new(SglangAdapter);
 
@@ -2327,6 +2331,7 @@ mod tests {
             backend: BackendType::Sglang,
             atom_pd_rank_mapping_policy: AtomPdRankMappingPolicy::None,
             planner,
+            policies,
             adapter,
             atom_adapter: None,
         }
@@ -2691,6 +2696,7 @@ mod tests {
             is_stream: false,
             return_logprob: false,
             request_text: None,
+            tokens: None,
             model_id: Some("m"),
             headers: Some(Arc::new(headers)),
         };

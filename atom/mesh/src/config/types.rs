@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
-use super::ConfigResult;
-use crate::core::ConnectionMode;
+use super::{ConfigError, ConfigResult};
+use crate::core::{prepare_pool::PoolConfig, runtime::default_prepare_workers, ConnectionMode};
 
 /// Backend runtime type for inference workers.
 /// Determines PD-disaggregation protocol (SGLang dual-dispatch+bootstrap vs vLLM Mooncake kv_transfer_params).
@@ -56,6 +58,8 @@ pub struct RouterConfig {
     #[cfg(feature = "ext-proc")]
     #[serde(default)]
     pub ext_proc: crate::ext_proc::ExtProcConfig,
+    #[serde(default)]
+    pub prepare_pool: PreparePoolConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub backend: BackendType,
@@ -105,6 +109,58 @@ pub struct RouterConfig {
     pub tool_call_parser: Option<String>,
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
+}
+
+/// Default `--prepare-queue-timeout-ms`.
+pub const DEFAULT_PREPARE_QUEUE_TIMEOUT_MS: u64 = 250;
+/// Default `--prepare-timeout-ms`.
+pub const DEFAULT_PREPARE_TIMEOUT_MS: u64 = 5000;
+/// Default `--prepare-max-tokenize-bytes`.
+pub const DEFAULT_MAX_TOKENIZE_BYTES: usize = 1024 * 1024;
+/// Waiting jobs per preparation thread when `--prepare-queue-capacity` is unset.
+pub const PREPARE_QUEUE_SLOTS_PER_WORKER: usize = 10;
+
+/// Shared CPU preparation limits for HTTP, PD and external processing.
+#[derive(Debug, Clone, clap::Args, Serialize, Deserialize, PartialEq, Eq)]
+#[command(next_help_heading = "Request Preparation")]
+#[serde(default)]
+pub struct PreparePoolConfig {
+    /// Preparation threads (default: half the available CPUs, at least 1).
+    /// Overrides --ext-proc-parser-concurrency.
+    #[arg(id = "prepare_workers", long = "prepare-workers")]
+    pub workers: Option<usize>,
+    /// Jobs waiting for a preparation thread (default: 10 per thread).
+    #[arg(id = "prepare_queue_capacity", long = "prepare-queue-capacity")]
+    pub queue_capacity: Option<usize>,
+    /// Queue wait limit.
+    #[arg(
+        id = "prepare_queue_timeout_ms",
+        long = "prepare-queue-timeout-ms",
+        default_value_t = DEFAULT_PREPARE_QUEUE_TIMEOUT_MS
+    )]
+    pub queue_timeout_ms: u64,
+    /// Deadline shared by parsing and tokenization.
+    #[arg(
+        id = "prepare_timeout_ms",
+        long = "prepare-timeout-ms",
+        default_value_t = DEFAULT_PREPARE_TIMEOUT_MS
+    )]
+    pub prepare_timeout_ms: u64,
+    /// Tokenization byte limit (default: 1 MiB); overrides --ext-proc-max-tokenize-bytes.
+    #[arg(id = "prepare_max_tokenize_bytes", long = "prepare-max-tokenize-bytes")]
+    pub max_tokenize_bytes: Option<usize>,
+}
+
+impl Default for PreparePoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: None,
+            queue_capacity: None,
+            queue_timeout_ms: DEFAULT_PREPARE_QUEUE_TIMEOUT_MS,
+            prepare_timeout_ms: DEFAULT_PREPARE_TIMEOUT_MS,
+            max_tokenize_bytes: None,
+        }
+    }
 }
 
 /// Tokenizer cache configuration
@@ -376,6 +432,7 @@ impl Default for RouterConfig {
         Self {
             #[cfg(feature = "ext-proc")]
             ext_proc: Default::default(),
+            prepare_pool: PreparePoolConfig::default(),
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -416,6 +473,58 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Preparation settings, with the legacy ext-proc options filling unset
+    /// values when the external-processing transport is enabled.
+    fn effective_prepare_pool(&self) -> PreparePoolConfig {
+        let config = self.prepare_pool.clone();
+        #[cfg(feature = "ext-proc")]
+        if self.ext_proc.enabled {
+            return PreparePoolConfig {
+                workers: config.workers.or(self.ext_proc.parser_concurrency),
+                max_tokenize_bytes: config
+                    .max_tokenize_bytes
+                    .or(self.ext_proc.max_tokenize_bytes),
+                ..config
+            };
+        }
+        config
+    }
+
+    pub fn resolved_prepare_pool(&self) -> ConfigResult<PoolConfig> {
+        let config = self.effective_prepare_pool();
+        let workers = config.workers.unwrap_or_else(default_prepare_workers);
+        let queue_capacity = match config.queue_capacity {
+            Some(capacity) => capacity,
+            None => workers
+                .checked_mul(PREPARE_QUEUE_SLOTS_PER_WORKER)
+                .ok_or_else(|| ConfigError::InvalidValue {
+                    field: "prepare_pool.queue_capacity".to_string(),
+                    value: format!("{PREPARE_QUEUE_SLOTS_PER_WORKER} * {workers}"),
+                    reason: "Automatic queue capacity exceeds the platform limit".to_string(),
+                })?,
+        };
+        let pool = PoolConfig {
+            workers,
+            queue_capacity,
+            queue_timeout: Duration::from_millis(config.queue_timeout_ms),
+            prepare_timeout: Duration::from_millis(config.prepare_timeout_ms),
+        };
+        pool.validate()?;
+        Ok(pool)
+    }
+
+    pub fn resolved_prepare_workers(&self) -> usize {
+        self.effective_prepare_pool()
+            .workers
+            .unwrap_or_else(default_prepare_workers)
+    }
+
+    pub fn resolved_max_tokenize_bytes(&self) -> usize {
+        self.effective_prepare_pool()
+            .max_tokenize_bytes
+            .unwrap_or(DEFAULT_MAX_TOKENIZE_BYTES)
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {
@@ -465,6 +574,88 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_pool_defaults_overrides_and_legacy_config_deserialization() {
+        let config = RouterConfig::default();
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        let pool = config.resolved_prepare_pool().unwrap();
+        assert_eq!(pool.queue_capacity, workers * 10);
+        assert_eq!(pool.queue_timeout, Duration::from_millis(250));
+        assert_eq!(pool.prepare_timeout, Duration::from_secs(5));
+        assert_eq!(config.prepare_pool.queue_capacity, None);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("prepare_pool");
+        let restored: RouterConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.prepare_pool, PreparePoolConfig::default());
+
+        // Removed options in saved configs are ignored.
+        let partial: PreparePoolConfig = serde_json::from_str(
+            r#"{"workers":2,"shutdown_grace_ms":3000,"parse_inline_max_bytes":1024,
+                "max_retained_input_bytes":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(partial.workers, Some(2));
+        assert_eq!(partial.queue_capacity, None);
+        let config = RouterConfig {
+            prepare_pool: partial,
+            ..Default::default()
+        };
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 20);
+
+        // An explicit queue capacity overrides the per-worker multiplier.
+        let prepare_pool = serde_json::from_str(r#"{"workers":2,"queue_capacity":6}"#).unwrap();
+        let config = RouterConfig {
+            prepare_pool,
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 6);
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[test]
+    fn prepare_pool_resolves_enabled_legacy_options_and_common_overrides() {
+        let mut config = RouterConfig::default();
+        config.ext_proc.enabled = true;
+        let workers = default_prepare_workers();
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        config.ext_proc.enabled = false;
+        config.ext_proc.parser_concurrency = Some(3);
+        config.ext_proc.max_tokenize_bytes = Some(4096);
+        // Merely compiling ext-proc must not change the ordinary HTTP limits.
+        assert_eq!(config.resolved_prepare_workers(), workers);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 1024 * 1024);
+        config.ext_proc.enabled = true;
+        assert_eq!(config.resolved_prepare_workers(), 3);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+        config.prepare_pool.workers = Some(1);
+        config.prepare_pool.max_tokenize_bytes = Some(8192);
+        assert_eq!(config.resolved_prepare_workers(), 1);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 10);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 8192);
+    }
+
+    #[cfg(feature = "ext-proc")]
+    #[test]
+    fn legacy_ext_proc_config_file_still_sets_preparation_limits() {
+        let mut legacy = serde_json::to_value(RouterConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("prepare_pool");
+        legacy["ext_proc"] = serde_json::json!({
+            "enabled": true,
+            "parser_concurrency": 3,
+            "max_tokenize_bytes": 4096,
+        });
+        let config: RouterConfig = serde_json::from_value(legacy).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.ext_proc.parser_concurrency, Some(3));
+        assert_eq!(config.resolved_prepare_workers(), 3);
+        assert_eq!(config.resolved_prepare_pool().unwrap().queue_capacity, 30);
+        assert_eq!(config.resolved_max_tokenize_bytes(), 4096);
+    }
 
     #[test]
     fn test_router_config_default() {

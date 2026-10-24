@@ -57,6 +57,18 @@ const fn level_to_str(level: Level) -> &'static str {
 }
 
 #[inline]
+const fn level_to_log_filter(level: Level) -> tracing_log::log::LevelFilter {
+    use tracing_log::log::LevelFilter;
+    match level {
+        Level::TRACE => LevelFilter::Trace,
+        Level::DEBUG => LevelFilter::Debug,
+        Level::INFO => LevelFilter::Info,
+        Level::WARN => LevelFilter::Warn,
+        Level::ERROR => LevelFilter::Error,
+    }
+}
+
+#[inline]
 fn build_filter_string(targets: &[String], level_filter: &str) -> String {
     // Exact capacity: sum of target lengths + "=" and level per target + commas between
     let capacity = targets.iter().map(String::len).sum::<usize>()
@@ -77,7 +89,16 @@ fn build_filter_string(targets: &[String], level_filter: &str) -> String {
 }
 
 pub fn init_logging(config: LoggingConfig) -> LogGuard {
-    let _ = LogTracer::init();
+    // Cap `log` records from dependencies at the configured level. LogTracer::init()
+    // sets the cap to TRACE, so every disabled `log::trace!` (tokenizers emits them
+    // per normalized character) pays for a tracing dispatch instead of a static check.
+    // RUST_LOG may enable more verbose targets, so it keeps the full range.
+    let log_filter = if std::env::var_os("RUST_LOG").is_some() {
+        tracing_log::log::LevelFilter::Trace
+    } else {
+        level_to_log_filter(config.level)
+    };
+    let _ = LogTracer::init_with_filter(log_filter);
 
     let level_filter = level_to_str(config.level);
 
