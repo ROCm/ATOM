@@ -1621,6 +1621,8 @@ class EPLBConfig:
     #   "naive"  -> greedy replicate + balanced_packing (spread thinly)
     #   "biased" -> fully replicate top-K hottest experts to all GPUs
     #               (K = num_redundant // num_gpus, per-node in multi-node)
+    #   "step_peak" -> replicate and pack against the per-step peak over the
+    #               window (flat placement only; fit on rank 0, broadcast)
     placement_policy: str = "naive"
 
     def __post_init__(self):
@@ -1653,7 +1655,8 @@ class EPLBConfig:
         assert self.placement_policy in {
             "naive",
             "biased",
-        }, "eplb.placement_policy must be one of {'naive','biased'}"
+            "step_peak",
+        }, "eplb.placement_policy must be one of {'naive','biased','step_peak'}"
 
     @classmethod
     def from_dict(cls, cfg: dict | None) -> "EPLBConfig":
