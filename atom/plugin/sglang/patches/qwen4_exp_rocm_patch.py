@@ -206,11 +206,23 @@ def bf16_config_avoiding_gfx950_hipblaslt(config, *, qwen4: bool, gfx: str):
     return config
 
 
+def _live_gfx() -> str:
+    """Arch of the GPU actually running, not AITER's ``GPU_ARCHS`` list.
+
+    ``get_gfx()`` returns the last entry of ``gfx942;gfx950``. On MI308 that
+    is gfx950, which would send this bypass down the gfx942 hipBLASLt path.
+    """
+    import torch
+
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return ""
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
 def _install_gfx950_bf16_hipblaslt_bypass() -> None:
     """Send Qwen4Exp gfx950 BF16 hipBLASLt GEMMs back to torch."""
     try:
         from aiter import tuned_gemm
-        from aiter.jit.utils.chip_info import get_gfx
     except Exception:  # noqa: BLE001 - aiter is optional until GEMM loads
         return
     if getattr(tuned_gemm, "_atom_qwen4_gfx950_hipblaslt_bypass", False):
@@ -220,7 +232,7 @@ def _install_gfx950_bf16_hipblaslt_bypass() -> None:
     def get_GEMM_A16W16_config(*args, **kwargs):
         config = original(*args, **kwargs)
         replaced = bf16_config_avoiding_gfx950_hipblaslt(
-            config, qwen4=_qwen4_exp_hip, gfx=get_gfx()
+            config, qwen4=_qwen4_exp_hip, gfx=_live_gfx()
         )
         if replaced is not config and not getattr(
             tuned_gemm, "_atom_qwen4_gfx950_hipblaslt_logged", False
