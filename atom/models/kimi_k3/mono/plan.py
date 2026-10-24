@@ -100,9 +100,11 @@ def _keep_hooked_layers(plans, inner):
 
     A hook on ``layers[lid]`` never fires on a mono step, and handing the layer
     back does NOT change that: ``_fallback`` reruns the layer's forward from
-    its submodules rather than calling the module. So this buys nothing for the
-    drafter's aux capture, which ``K3MonoDecodeRunner._write_aux`` now fills
-    directly instead.
+    its submodules rather than calling the module. So holding a layer back buys
+    nothing for the drafter's aux capture, which ``K3MonoDecodeRunner.
+    _write_aux`` fills directly instead; the drafter's own hooks (marked
+    ``is_aux_capture``) are therefore ignored here, and the layers they tap keep
+    their kernels.
 
     It is kept for the hooks mono does not know about -- ``RLHFModelRunner.
     _register_hidden_state_hooks`` installs one per captured layer -- where
@@ -113,19 +115,25 @@ def _keep_hooked_layers(plans, inner):
     hooked = {
         i
         for i, layer in enumerate(inner.layers)
-        if layer._forward_hooks or layer._forward_pre_hooks
+        if any(
+            not getattr(hook, "is_aux_capture", False)
+            for hook in (
+                *layer._forward_hooks.values(),
+                *layer._forward_pre_hooks.values(),
+            )
+        )
     }
     if not hooked:
         return plans
     kept = [
-        replace(p, kda=None, moe=None) if p.layer_id in hooked and p.mono else p
+        replace(p, kda=None, moe=None) if p.layer_id in hooked and p.moe else p
         for p in plans
     ]
-    dropped = sorted(hooked & {p.layer_id for p in plans if p.mono})
+    dropped = sorted(hooked & {p.layer_id for p in plans if p.moe})
     if dropped:
         logger.info(
-            "Kimi-K3 mono: layers %s keep the original modules, something hooks"
-            " them (the drafter's aux capture)",
+            "Kimi-K3 mono: layers %s keep the original modules, something other"
+            " than the drafter's aux capture hooks them",
             dropped,
         )
     if not any(p.mono for p in kept):

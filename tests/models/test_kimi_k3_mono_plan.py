@@ -137,11 +137,58 @@ def test_step_rows_refuses_a_ragged_batch():
     assert step_rows(_metadata(num_spec_decodes=3), 8) is None
 
 
-@pytest.mark.parametrize(("rows", "qlen"), [(1, 1), (8, 8), (8, 2), (4, 4), (6, 3)])
+def _spec_metadata(requests: int, qlen: int):
+    """A uniform spec verify of ``requests`` requests of ``qlen`` tokens."""
+    return _metadata(
+        num_spec_decodes=requests,
+        num_actual_tokens=requests * qlen,
+        spec_state_indices_tensor=torch.zeros(requests, qlen, dtype=torch.int32),
+        num_accepted_tokens=torch.ones(requests, dtype=torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("cap", "requests", "qlen", "served"),
+    [
+        (8, 1, 8, True),  # bs=1 x MTP7
+        (8, 2, 8, False),  # bs=2 x MTP7 declines at the default cap...
+        (16, 1, 8, True),
+        (16, 2, 8, True),  # ...and is served at 16, which is the bs=2 graph
+        (16, 1, 16, True),
+        (16, 3, 8, False),  # 24 rows: past either cap
+        (16, 2, 9, False),  # 18 rows
+    ],
+)
+def test_the_row_cap_decides_which_uniform_steps_are_served(
+    monkeypatch, cap, requests, qlen, served
+):
+    from atom.models.kimi_k3.mono import plan
+
+    monkeypatch.setattr(plan, "MAX_ROWS", cap)
+    rows = requests * qlen
+    got, why = plan.step_shape(_spec_metadata(requests, qlen), rows)
+    assert (got == qlen) is served
+    if not served:
+        assert got is None and f"{rows} rows > the {cap}-row buffers" in why
+
+
+@pytest.mark.parametrize(
+    ("rows", "qlen"),
+    [(1, 1), (8, 8), (8, 2), (4, 4), (6, 3), (16, 8), (16, 16), (16, 1), (12, 4)],
+)
 def test_width_key_round_trips(rows, qlen):
     from atom.models.kimi_k3.mono.plan import _width, width_key
 
     assert _width(width_key(rows, qlen)) == (rows, qlen)
+
+
+def test_width_keys_stay_distinct_up_to_the_widest_cap():
+    from atom.models.kimi_k3.mono.config import MAX_QLEN, ROW_CAPS
+    from atom.models.kimi_k3.mono.plan import width_key
+
+    rows = max(ROW_CAPS)
+    keys = {width_key(r, q) for r in range(1, rows + 1) for q in range(1, MAX_QLEN + 1)}
+    assert len(keys) == rows * MAX_QLEN
 
 
 def test_kda_head_count_is_the_model_s():
@@ -168,6 +215,47 @@ def test_a_hooked_layer_keeps_its_own_module():
     plans, inner = _plans_and_layers(4, (2,))
     kept = _keep_hooked_layers(plans, inner)
     assert [p.mono for p in kept] == [True, True, False, True]
+
+
+def _aux_hook(*args):
+    """A drafter aux-capture hook: ``Drafter._make_aux_hook`` marks its hooks."""
+
+
+_aux_hook.is_aux_capture = True
+
+
+def test_the_drafter_s_aux_hooks_do_not_hold_a_layer_back():
+    """``_write_aux`` fills the tap on a mono step, so the drafter's own hooks
+    (forward and pre-forward) must not cost a tapped layer its kernels."""
+    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
+
+    plans, inner = _plans_and_layers(4, ())
+    inner.layers[2].register_forward_hook(_aux_hook)
+    inner.layers[1].register_forward_pre_hook(_aux_hook)
+    assert _keep_hooked_layers(plans, inner) is plans
+
+
+def test_a_foreign_hook_beside_the_drafter_s_still_holds_the_layer_back():
+    from atom.models.kimi_k3.mono.plan import _keep_hooked_layers
+
+    plans, inner = _plans_and_layers(4, (2,))
+    inner.layers[2].register_forward_hook(_aux_hook)
+    inner.layers[0].register_forward_hook(_aux_hook)
+    kept = _keep_hooked_layers(plans, inner)
+    assert [p.mono for p in kept] == [True, True, False, True]
+
+
+def test_the_drafter_marks_the_hooks_mono_exempts():
+    """The mark is an attribute set in ``spec_decode/drafter.py`` and read in
+    ``plan._keep_hooked_layers``; pin that the two still agree."""
+    try:
+        from atom.spec_decode.drafter import Drafter
+    except ImportError as error:  # the drafter imports the loader and triton ops
+        pytest.skip(f"atom.spec_decode.drafter needs the GPU stack: {error}")
+
+    fake = SimpleNamespace(_aux_buffers=[torch.zeros(2, 2)])
+    hook = Drafter._make_aux_hook(fake, 0, lambda output, module: output)
+    assert getattr(hook, "is_aux_capture", False)
 
 
 def test_no_hooks_leaves_every_plan_alone():

@@ -397,26 +397,44 @@ class LayerPlan:
 
     @property
     def mono(self) -> bool:
+        """K1 and K2 both."""
         return self.kda is not None and self.moe is not None
 
+    @property
+    def ffn_only(self) -> bool:
+        """K2 alone: a full-attention layer whose attention stays on the
+        production path (``bind_model``'s ``mla_k2``)."""
+        return self.kda is None and self.moe is not None
 
-def bind_model(model, dims: Dims, rank: int) -> list[LayerPlan]:
+
+def bind_model(model, dims: Dims, rank: int, mla_k2: bool = False) -> list[LayerPlan]:
     """Every decoder layer, in order.
 
-    A layer takes the kernels only when it is a KDA layer with a MoE FFN and at
+    A layer takes K1 and K2 only when it is a KDA layer with a MoE FFN and at
     least one AttnRes block behind it: layer 0 has a dense MLP and no block, and
     the full-attention layers keep the original MLA path (and their paged KV
     cache) because the kernels have no attention of their own.
+
+    ``mla_k2`` gives those full-attention layers K2 alone -- ``o_proj`` and the
+    latent MoE are not KDA's, only the core they read is. K2 restarts the prefix
+    only on a layer that closes a block, which this path does not bank (a block
+    closes at ``layer_id % ATTN_RES_BLOCK == 0``; K3's full-attention layers are
+    3 mod 4), so a layer that would is refused rather than read wrong.
     """
     layers = model.layers
     plans = []
     for layer_id, layer in enumerate(layers):
         blocks, _ = layer_block(layer_id)
-        takes = (
-            bool(getattr(layer, "is_linear_attn", False))
-            and hasattr(layer, "block_sparse_moe")
-            and blocks >= 1
-        )
+        has_ffn = hasattr(layer, "block_sparse_moe") and blocks >= 1
+        takes = bool(getattr(layer, "is_linear_attn", False)) and has_ffn
+        if not takes and mla_k2 and has_ffn:
+            moe = bind_moe(layer, layer_id, dims, rank)
+            _need(
+                moe.write_idx < 0,
+                f"layer {layer_id}: a full-attention layer that closes a block",
+            )
+            plans.append(LayerPlan(layer_id, None, moe))
+            continue
         if not takes:
             plans.append(LayerPlan(layer_id, None, None))
             continue

@@ -102,18 +102,44 @@ The server log says which way it went -- `Kimi-K3 mono decode armed (TP8)`, or
 `Kimi-K3 mono decode off: <why>` naming the first condition that failed. Read
 it before concluding anything about a run.
 
-**A step is served only if it is at most 8 rows** (batch x query length).
-bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the same
-width is 16, which every step declines back to the production path -- the
-server still answers, just without mono.
+**A step is served only if it is at most 8 rows** (batch x query length), by
+default. bs=1 with seven speculative tokens is 8 rows and is served; bs=2 at the
+same width is 16, which every step declines back to the production path -- the
+server still answers, just without mono. The log names a declined row count once
+per distinct count (`Kimi-K3 mono decode declined a step: 16 rows > the 8-row
+buffers`), so the number of such lines is the number of distinct widths turned
+away, not the number of steps.
 
-The cap is a constant (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`), not a
-switch. 16 rows is correct -- the kernels stride over their columns rather
-than assuming one pass covers them -- and measurably faster (-13.4 % target
-forward against stock). It stays at 8 because no task-level accuracy run
-exists at any width and K2's latent MoE carries a real, unsettled precision
-cost, so raising it is a decision to make on accuracy evidence rather than on
-speed.
+The cap is `ATOM_MONO_K3_MAX_ROWS` (`atom/models/kimi_k3/mono/config.py:MAX_ROWS`),
+8 or 16, read once at import. 16 rows is correct -- the kernels stride over
+their columns rather than assuming one pass covers them -- and measurably faster
+(-13.4 % target forward against stock); with it the bs=2 CUDA graph runs mono
+too. It stays 8 by default so a deployment opts into the wider buffers
+(peer buffer 4.76 MB to 9.52 MB a rank) on purpose. K2's latent MoE still
+carries a documented MXFP4 precision cost (rel_L2 vs stock median 0.24); the
+task-level check is a paired GSM8K run (3-shot, 1319 questions, two concurrent
+requests, same configuration, no synthetic acceptance length): 16 rows scored
+0.9591 against 0.9439 at the 8-row cap (paired z = +2.4), so no regression.
+Anything other than 8 or 16 turns mono off with the reason in the log.
+
+Two more switches cover the rest of the decode steps:
+
+- `ATOM_MONO_K3_MLA_K2=1` (off by default) also runs K2 on the 24 full-attention
+  (MLA) layers. At bs=1 it cut the step ITL 16.5 to 14.8 ms; GSM8K paired against
+  the 8-row control was +0.0038 (z = +0.6).
+- `ATOM_SCHEDULER_MAX_RUNNING_SEQS=N` caps how many sequences the scheduler runs
+  at once without touching the engine's buffers. `--max-num-seqs 1` fails at
+  startup on a DSpark deployment (the block drafter's warmup needs two
+  sequences), so launch `--max-num-seqs 2 --cudagraph-capture-sizes "[1,2]"` with
+  `ATOM_SCHEDULER_MAX_RUNNING_SEQS=1`. Other requests queue, so their TTFT rises
+  (mean 0.9 s to 1.7 s on the agentic trace).
+
+Agentic trace, TP8, DSpark k=7, acceptance length pinned 3.84, official client
+3600 s each, p90 interactivity (tok/s/user): native vLLM (no mono, one request at
+a time) 177.4; ATOM default concurrency with `ATOM_MONO_K3_MAX_ROWS=16` 165.5 (+
+`ATOM_MONO_K3_MLA_K2=1`: 177.1); with the one-request cap 204.9 (+ MLA K2: 216.6).
+At two-request concurrency (C2) `ATOM_MONO_K3_MAX_ROWS=16` gives 137.4 against
+vLLM's 130.1.
 
 For a performance A/B, keep the launch command and the workload identical and
 change only `ATOM_MONO_ENABLE` between `0` and `1`. Pin
