@@ -19,6 +19,7 @@ from atom.model_config.qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
 )
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
+from atom.model_ops.fla_ops import gdn_fused_decode
 from atom.model_ops.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from atom.model_ops.layernorm import fused_ar_gemma_per_group_supported
 from atom.model_ops.linear import (
@@ -239,6 +240,22 @@ def load_fused_expert_weights(
 
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # With the AITER fused decode, the attention op applies the gated
+        # RMSNorm. Not for a norm that also quantizes (FP8 out_proj), is
+        # grouped or gates first.
+        self.fuse_gated_norm = (
+            gdn_fused_decode.available()
+            and not self.norm.use_fused_fp8_quant
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+        )
+        if self.fuse_gated_norm:
+            # Not a submodule: the norm already belongs to this layer, and a
+            # second registration would give the loader a never-loaded copy.
+            object.__setattr__(self.attn.impl, "gated_norm", self.norm)
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -359,12 +376,16 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
-        core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
+        if self.fuse_gated_norm:  # the op also applies the gated RMSNorm
+            core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out, z=z)
+            core_attn_out, maybe_scale = core_attn_out.view(num_tokens, -1), None
+        else:
+            core_attn_out = self.attn(mixed_qkv, b, a, core_attn_out)
+            core_attn_out, maybe_scale = self.norm(core_attn_out, z)
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        core_attn_out, maybe_scale = self.norm(core_attn_out, z)
         output = self.out_proj(core_attn_out, x_scale=maybe_scale)
         return output
 
