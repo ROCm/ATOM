@@ -10,10 +10,12 @@ namespace, and the adapters both connector halves open to the server.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 from dataclasses import replace
 from typing import Any
+from urllib.parse import urlsplit
 
 from atom.kv_transfer.offload import config as offcfg
 from atom.utils import envs
@@ -122,16 +124,42 @@ def _validate_mp_config(config: Any) -> tuple[int, int]:
     # descriptors per (model_name, world_size) (all replicas publish the same
     # one), and _mp_session_id scopes request sessions and their locks per
     # replica.
-    if dp_size_local != dp_size:
+    #
+    # Across hosts the server cannot be shared: it moves KV through GPU IPC,
+    # which reaches only its own host's devices. A loopback server address
+    # therefore means one server per host, each serving that host's replicas,
+    # which is the multi-node layout this connector supports. A prefix is then
+    # reusable only on the host that stored it; DP session affinity routes a
+    # session's later turns back to its owner rank, and so to that host.
+    if dp_size_local != dp_size and not _server_is_host_local(config):
         raise NotImplementedError(
-            "lmcache_mp supports DP and DP-attention only within one host; "
-            "multi-node DP requires one LMCache server per host and local "
-            "server routing "
+            "lmcache_mp supports multi-node DP only with one LMCache server per "
+            "host: set lmcache.mp.host to a loopback address and start a server "
+            "on every host "
             f"(data_parallel_size={dp_size}, local={dp_size_local})"
         )
 
     _transfer_mode(config)
     return tp_size, pp_size
+
+
+def _server_is_host_local(config: Any) -> bool:
+    """Whether every rank reaches the LMCache server at a loopback address."""
+
+    try:
+        urls = _server_urls(config)
+    except (TypeError, ValueError, NotImplementedError):
+        return False
+    for url in urls:
+        host = urlsplit(url).hostname or ""
+        if host == "localhost":
+            continue
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return False
+        except ValueError:
+            return False
+    return True
 
 
 def _config_has_fully_replicated_tp_pages(config: Any) -> bool:
