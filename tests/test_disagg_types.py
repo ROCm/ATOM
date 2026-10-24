@@ -58,13 +58,13 @@ def test_block_assignment_pickle_roundtrip():
 def test_prefill_done_pickle_roundtrip():
     from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
 
-    original = PrefillDone(seq_id=7, num_tokens_computed=128, sampled_token_id=16)
+    original = PrefillDone(seq_id=7, prefill_pos=128, sampled_token_id=16)
     msg = pickle.dumps((DisaggMsgType.PREFILL_DONE, original))
     msg_type, restored = pickle.loads(msg)
 
     assert msg_type == DisaggMsgType.PREFILL_DONE
     assert restored.seq_id == 7
-    assert restored.num_tokens_computed == 128
+    assert restored.prefill_pos == 128
 
 
 def test_abort_msg_type_pickle_roundtrip():

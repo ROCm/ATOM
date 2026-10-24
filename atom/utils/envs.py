@@ -418,6 +418,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # has already brought to the host, so it adds no device sync.
     "ATOM_LOG_EMITTED_TOKENS": lambda: os.getenv("ATOM_LOG_EMITTED_TOKENS", "0")
     == "1",
+    # Log every scheduled batch: which sequences are in it and how many tokens
+    # each was given, with the DP rank and which half produced it.
+    #
+    # The three schedulers build batches in three different methods
+    # (`Scheduler`, `PrefillScheduler`, `DecodeScheduler`), so without one tag
+    # across all of them a baseline batch and a rapidserve batch cannot be
+    # compared -- which is how "rapidserve chunks and baseline does not"
+    # survived as long as it did, when both call the same `checkpoint_cut`.
+    #
+    # Off by default: one line per scheduler step is a lot at decode rates.
+    "ATOM_LOG_SCHED_BATCHES": lambda: os.getenv("ATOM_LOG_SCHED_BATCHES", "0")
+    == "1",
     # Report the drafter's own parameters after load (zero/non-finite ones mean
     # a silent loading failure: the draft then drafts from zeros and every
     # token is rejected, with no error anywhere). Off by default -- it reduces

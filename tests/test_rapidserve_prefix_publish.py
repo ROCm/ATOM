@@ -111,13 +111,14 @@ class TestPublishedRange:
 
 def test_the_offset_is_recorded_before_the_advance():
     """One statement either side of this ordering is the whole fix. After the
-    `+=`, `num_cached_tokens` is the full prompt and the offset is gone."""
+    advance, `num_cached_tokens` is where prefill has reached and the offset
+    the blocks start at is gone."""
     src = ast.get_source_segment(
         SCHEDULER.read_text(), _method("DecodeScheduler", "on_prefill_done")
     )
     assert src is not None
     record = src.index("seq.pending_hash_start = seq.num_cached_tokens")
-    advance = src.index("seq.num_cached_tokens += num_tokens_computed")
+    advance = src.index("seq.num_cached_tokens = prefill_pos")
     assert record < advance
 
 

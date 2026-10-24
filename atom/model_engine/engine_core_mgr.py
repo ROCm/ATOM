@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import asyncio
+import copy
 import hashlib
 import logging
 import multiprocessing
@@ -206,6 +207,14 @@ class CoreManager:
         self.global_engine_count = (
             local_engine_count if global_engine_count is None else global_engine_count
         )
+        # Set HERE, not only in __init__: `add_request` reads it to decide
+        # whether requests enter at a PP head, and the subclasses that skip
+        # __init__ reach that same `add_request`. Leaving it to __init__ makes
+        # the inherited path an AttributeError on exactly the subclass that
+        # needs it -- the recurring failure this function exists to prevent.
+        # Defaulted, like the runner counts below: managers are also built from
+        # bare stand-in configs that carry only the fields a test needs.
+        self.pp_size = getattr(config, "pipeline_parallel_size", 1)
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         # Utility replies are matched to their caller by request id, not by
@@ -335,8 +344,9 @@ class CoreManager:
         pc._managed_distributed_store = True
 
     def __init__(self, config: Config):
+        # `self.pp_size` is set by _init_shared_state below (every subclass
+        # needs it); this local is just for the sizing checks before that call.
         pp_size = config.pipeline_parallel_size
-        self.pp_size = pp_size
         pc = config.parallel_config
         multinode = pc.is_multinode_dp
         if multinode and pp_size > 1:
@@ -426,8 +436,6 @@ class CoreManager:
                 )
 
                 # Create config for this (dp, pp) stage
-                import copy
-
                 rank_config = copy.deepcopy(config)
                 rank_config.parallel_config.data_parallel_rank = dp_rank
                 rank_config.parallel_config.data_parallel_rank_local = local_dp_rank
@@ -922,6 +930,17 @@ class CoreManager:
             )
 
     def add_request(self, seqs: list[Sequence]):
+        """The one admission path: register callbacks, then route.
+
+        Subclasses do NOT override this. A subclass whose engines are laid out
+        differently says so by narrowing ``_route_window`` (which indices may
+        receive a request) and overriding ``_send_add_to_rank`` (how a chosen
+        index is actually handed the batch). Everything between those two --
+        hint validation, session affinity, load-aware placement, in-flight
+        charging, rollback on a failed send, the per-add distribution log --
+        is shared, because a second copy of it drifts from this one and the
+        drift is invisible until a workload is slow for a reason nothing logs.
+        """
         logger.debug(
             f"{self.label}: Add request, sequence ids: {[seq.id for seq in seqs]}"
         )
@@ -930,17 +949,43 @@ class CoreManager:
             if seq.stream_callback is not None:
                 self._seq_id_to_callback[seq.id] = seq.stream_callback
                 seq.stream_callback = None
+        lo, hi = self._route_window
         if self.pp_size > 1:
             # Pipeline parallel (dp=1): requests enter only at stage 0, which
             # drives the pipeline downstream.
             logger.debug(f"{self.label}: Add {len(seqs)} requests to PP head 0")
             self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
-        elif self._routable_engine_count == 1:
-            # Single routable engine, send all requests
-            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank 0")
-            self._send_request(0, pickle.dumps((EngineCoreRequestType.ADD, seqs)))
+        elif hi - lo == 1:
+            # One routable destination: nothing to balance, and charging load
+            # against a rank that can never lose a comparison is pure overhead.
+            logger.debug(f"{self.label}: Add {len(seqs)} requests to DP rank {lo}")
+            self._send_add_to_rank(lo, seqs)
         else:
             self._dispatch_to_dp_ranks(seqs)
+
+    @property
+    def _route_window(self) -> tuple[int, int]:
+        """Half-open ``[lo, hi)`` range of engine indices a request may route to.
+
+        Every routing decision -- explicit hints, session affinity, load-aware
+        placement -- is confined to this window, and the index it yields is an
+        ABSOLUTE engine index, the same space ``_rank_reqs`` / ``_rank_tokens``
+        and ``_send_request`` are indexed by. A plain manager routes to all of
+        its engines; ``DisaggCoreManager`` narrows it to the decode slice,
+        because its prefill indices are the other half of a pair rather than
+        independent destinations.
+        """
+        return 0, self._routable_engine_count
+
+    def _send_add_to_rank(self, dp_rank: int, rank_seqs: list[Sequence]) -> None:
+        """Hand one chosen engine index its sub-batch.
+
+        The seam a subclass overrides when "route to index i" means something
+        other than one ADD to socket i.
+        """
+        self._send_request(
+            dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
+        )
 
     @property
     def _routable_engine_count(self) -> int:
@@ -958,24 +1003,31 @@ class CoreManager:
         """Resolve every seq's explicit ``data_parallel_rank`` hint and validate
         the whole batch, once.
 
-        Returns the per-seq resolved hint (an int rank, or None for a
-        load-balanced seq) so the dispatch loop can reuse it instead of calling
-        getattr/int a second time per seq.
+        Returns the per-seq resolved hint (an absolute engine index, or None
+        for a load-balanced seq) so the dispatch loop can reuse it instead of
+        calling getattr/int a second time per seq.
+
+        ``data_parallel_rank`` is a caller-facing DP rank -- 0-based within the
+        routable window -- so it is translated to an absolute engine index
+        here, once, rather than by each consumer. On a plain manager the window
+        starts at 0 and the translation is the identity.
 
         Validation runs BEFORE any load is charged so a bad hint in the middle
         of a batch cannot leave earlier siblings charged-but-undispatched (a
         permanent in-flight-load leak).
         """
         hints: list[int | None] = []
-        engine_count = self._routable_engine_count
+        lo, hi = self._route_window
+        width = hi - lo
         for seq in seqs:
             raw = getattr(seq, "data_parallel_rank", None)
             hint = None if raw is None else int(raw)
-            if hint is not None and not 0 <= hint < engine_count:
-                raise ValueError(
-                    f"Invalid data_parallel_rank={hint}; "
-                    f"global_engine_count={engine_count}"
-                )
+            if hint is not None:
+                if not 0 <= hint < width:
+                    raise ValueError(
+                        f"Invalid data_parallel_rank={hint}; routable_dp_ranks={width}"
+                    )
+                hint += lo
             hints.append(hint)
         return hints
 
@@ -987,6 +1039,11 @@ class CoreManager:
         in-flight-load charge happen atomically under ``_lb_lock`` so a burst of
         requests spreads across ranks instead of all landing on the current
         minimum.
+
+        Candidates come from ``_route_window`` and delivery goes through
+        ``_send_add_to_rank``; ``dp_seqs`` stays indexed by absolute engine
+        index so the charge, the rollback and the snapshot log all share one
+        index space with ``_rank_reqs`` / ``_rank_tokens``.
         """
         # Resolve + validate all hints in one pass first — no charging until the
         # whole batch is known good, so a rejected batch never leaks partial
@@ -999,12 +1056,13 @@ class CoreManager:
         track_load = (
             self._dp_lb_strategy != "round_robin" or self._dp_session_affinity_enabled
         )
+        lo, hi = self._route_window
         engine_count = self._routable_engine_count
         dp_seqs = [[] for _ in range(engine_count)]
         reqs_snapshot = tokens_snapshot = None
         with self._lb_lock:
             for seq, hint in zip(seqs, hints):
-                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint)
+                dp_rank = self._select_dp_rank_for_seq_locked(seq, hint, lo, hi)
                 if track_load:
                     self._charge_seq_load_locked(seq, dp_rank)
                 dp_seqs[dp_rank].append(seq)
@@ -1026,9 +1084,7 @@ class CoreManager:
             for dp_rank, rank_seqs in enumerate(dp_seqs):
                 if not rank_seqs:
                     continue
-                self._send_request(
-                    dp_rank, pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
-                )
+                self._send_add_to_rank(dp_rank, rank_seqs)
                 dispatched[dp_rank] = True
                 batch_prefill_tokens = sum(
                     int(getattr(seq, "num_prompt_tokens", 0) or 0) for seq in rank_seqs
@@ -1111,18 +1167,23 @@ class CoreManager:
         self._rank_rotation_cursor += 1
         return best_rank
 
-    def _stable_session_rank(self, session_id: str) -> int:
+    def _stable_session_rank(
+        self, session_id: str, lo: int = 0, hi: int | None = None
+    ) -> int:
         """Map a session to a stable rank with rendezvous hashing.
 
         Python's built-in ``hash`` is process-randomized, so it cannot define
         cache ownership. Rendezvous hashing is deterministic and, unlike a
         simple modulo, remaps only sessions owned by a rank that is added or
         removed. The DP width is tiny, and this runs only once per new session.
+
+        ``lo``/``hi`` bound the candidate range, as in ``_select_dp_rank_locked``.
         """
+        hi = self._routable_engine_count if hi is None else hi
         session_key = str(session_id).encode("utf-8")
-        best_rank = 0
+        best_rank = lo
         best_score = -1
-        for rank in range(self._routable_engine_count):
+        for rank in range(lo, hi):
             digest = hashlib.blake2b(
                 session_key + rank.to_bytes(4, "little"), digest_size=8
             ).digest()
@@ -1132,7 +1193,9 @@ class CoreManager:
                 best_score = score
         return best_rank
 
-    def _select_new_session_rank_locked(self, session_id: str) -> int:
+    def _select_new_session_rank_locked(
+        self, session_id: str, lo: int = 0, hi: int | None = None
+    ) -> int:
         """Place a new sticky session on the lightest DP rank.
 
         Existing sessions never call this function: locality wins once an
@@ -1140,12 +1203,15 @@ class CoreManager:
         to preserve, so use estimated outstanding prefill debt plus the
         configured token-equivalent decode pressure.  Rendezvous hashing is
         only the deterministic tie-breaker; it must not override real load.
+
+        ``lo``/``hi`` bound the candidate range, as in ``_select_dp_rank_locked``.
         """
+        hi = self._routable_engine_count if hi is None else hi
         session_key = str(session_id).encode("utf-8")
-        best_rank = 0
+        best_rank = lo
         best_load = None
         best_hash = -1
-        for rank in range(self._routable_engine_count):
+        for rank in range(lo, hi):
             load = (
                 self._rank_tokens[rank] + self._dp_lb_req_equiv * self._rank_reqs[rank]
             )
@@ -1172,7 +1238,11 @@ class CoreManager:
         return rank
 
     def _select_dp_rank_for_seq_locked(
-        self, seq: Sequence, explicit_rank: int | None
+        self,
+        seq: Sequence,
+        explicit_rank: int | None,
+        lo: int = 0,
+        hi: int | None = None,
     ) -> int:
         """Route one sequence using explicit hint, strict owner, then load.
 
@@ -1184,7 +1254,12 @@ class CoreManager:
         Parent lineage does not affect placement. Each child correlation id is
         its own sticky session, preventing sibling subagents from dogpiling the
         root's rank. Requests without a session retain normal load balancing.
+
+        ``lo``/``hi`` bound the candidate range, as in ``_select_dp_rank_locked``.
+        An owner recorded outside the current window is re-placed rather than
+        honoured: it addresses an engine this manager may not route to.
         """
+        hi = self._routable_engine_count if hi is None else hi
         if explicit_rank is not None:
             if self._dp_session_affinity_enabled:
                 # An explicit placement is authoritative and becomes the
@@ -1201,12 +1276,12 @@ class CoreManager:
         session_id = getattr(seq, "dp_session_id", None)
         parent_id = getattr(seq, "dp_parent_session_id", None)
         if not self._dp_session_affinity_enabled or not session_id:
-            rank = self._select_dp_rank_locked()
+            rank = self._select_dp_rank_locked(lo, hi)
             return self._record_dp_route_locked("load_balanced_total", rank)
 
         owner = self._dp_session_owners.get(session_id)
-        if owner is None or not 0 <= owner < self._routable_engine_count:
-            owner = self._select_new_session_rank_locked(session_id)
+        if owner is None or not lo <= owner < hi:
+            owner = self._select_new_session_rank_locked(session_id, lo, hi)
             self._dp_session_owners[session_id] = owner
             if parent_id:
                 self._dp_route_counters["affinity_parent_ignored_total"] += 1
@@ -1228,13 +1303,16 @@ class CoreManager:
 
     def get_dp_router_statistics(self) -> dict:
         """Return a consistent, non-mutating snapshot of DP routing state."""
+        lo, hi = self._route_window
         with self._lb_lock:
             sessions_per_rank = [0] * self._routable_engine_count
             for rank in self._dp_session_owners.values():
                 if 0 <= rank < self._routable_engine_count:
                     sessions_per_rank[rank] += 1
             return {
-                "enabled": self._routable_engine_count > 1,
+                # Routable destinations, not engines: a paired disagg manager
+                # owns 2N engines but balances across N.
+                "enabled": hi - lo > 1,
                 **self._dp_route_counters,
                 "requests_per_rank": list(self._rank_routed_total),
                 "inflight_requests_per_rank": list(self._rank_reqs),
@@ -1878,7 +1956,9 @@ class DisaggCoreManager(CoreManager):
       - PrefillEngineCore: runs prefill forward passes, writes KV cache.
       - DecodeEngineCore: owns BlockManager and KV cache, runs decode.
 
-    add_request() fans out every new sequence to BOTH processes.
+    Routing is the base class's: this subclass only says which indices are
+    destinations (``_route_window`` -- the decode slice) and what delivery to
+    one means (``_send_add_to_rank`` -- fan out to BOTH members of that pair).
     Only DecodeEngineCore produces finished sequences back to LLMEngine.
 
     The two processes coordinate via direct ZMQ PUSH/PULL sockets whose
@@ -1886,8 +1966,6 @@ class DisaggCoreManager(CoreManager):
     """
 
     def __init__(self, config: Config):
-        import copy
-
         import torch
 
         if torch.multiprocessing.get_start_method(allow_none=True) is None:
@@ -2109,10 +2187,12 @@ class DisaggCoreManager(CoreManager):
         self._decode_idx0 = n_pairs
 
         # Set up the inherited state without running CoreManager.__init__,
-        # which would spawn its own engines the base way. This manager fans out
-        # through its own add_request(), but the inherited output thread still
-        # releases DP load on every finished sequence, and the inherited
-        # _select_dp_rank_locked is what picks a request's pair.
+        # which would spawn its own engines the base way. Everything else is
+        # the base class's: the inherited add_request routes each sequence to a
+        # pair (through _route_window and _send_add_to_rank, overridden below)
+        # and the inherited output thread releases its DP load when it
+        # finishes. _n_pairs/_decode_idx0 are set above because _route_window
+        # reads them.
         self._init_shared_state(
             config,
             label="DisaggCoreManager",
@@ -2198,57 +2278,47 @@ class DisaggCoreManager(CoreManager):
                     f"{self.label}: process {idx} sent SHUTDOWN during initialization"
                 )
 
-    def add_request(self, seqs: list[Sequence]):
+    @property
+    def _route_window(self) -> tuple[int, int]:
+        """Only the decode indices are routable; prefill ranks come with them.
+
+        Process-index layout is ``0..n_pairs-1`` prefill, ``n_pairs..2*n_pairs-1``
+        decode, so half of ``_routable_engine_count`` is not a destination: a
+        prefill index is the other member of the chosen pair, not an
+        independent place to put a request. Naming the decode slice here is
+        what lets the inherited router -- explicit hints, session affinity,
+        load-aware placement -- run unmodified over a paired topology.
+        """
+        return self._decode_idx0, self._decode_idx0 + self._n_pairs
+
+    def _send_add_to_rank(self, dp_rank: int, rank_seqs: list[Sequence]) -> None:
         """Fan-out: every sequence goes to BOTH members of exactly one pair.
 
         Prefill rank k and decode rank k share a GPU. A sequence assigned to
         pair k prefills there and decodes there, so its KV never crosses a
         device and no other rank may touch it — sending it anywhere else would
         have a second rank allocate blocks for the same sequence.
+
+        ``dp_rank`` is the DECODE engine index the router chose, so the pair is
+        ``dp_rank - _decode_idx0``.
         """
-        logger.debug(f"{self.label}: fan-out {len(seqs)} seqs to {len(seqs)} pair(s)")
-        # Register stream callbacks before sending (decode produces output).
-        for seq in seqs:
-            if seq.stream_callback is not None:
-                self._seq_id_to_callback[seq.id] = seq.stream_callback
-                seq.stream_callback = None
-
-        by_pair: dict[int, list[Sequence]] = {}
-        for seq in seqs:
-            if self._n_pairs == 1:
-                pair = 0
-            else:
-                # Select and charge atomically so a burst spreads instead of all
-                # landing on the current minimum. The inherited output thread
-                # calls _release_seq_load() when the sequence finishes.
-                with self._lb_lock:
-                    idx = self._select_dp_rank_locked(
-                        lo=self._decode_idx0,
-                        hi=self._decode_idx0 + self._n_pairs,
-                    )
-                    self._charge_seq_load_locked(seq, idx)
-                pair = idx - self._decode_idx0
-            by_pair.setdefault(pair, []).append(seq)
-
-        import copy as _copy
-
-        for pair, pair_seqs in by_pair.items():
-            # Through `_send_request`, never `input_sockets` directly: it is the
-            # single serialization point for the ADD socket, and two interleaved
-            # send_multipart calls silently wedge the engine (see its docstring).
-            decode_payload = pickle.dumps((EngineCoreRequestType.ADD, pair_seqs))
-            self._send_request(self._decode_idx0 + pair, decode_payload)
-            # Prefill discards every sampled token except the first (which it
-            # ships in PrefillDone), so cap max_tokens at 1: the forward then
-            # terminates after one generate step and num_scheduled_tokens
-            # reflects only the prompt.
-            prefill_seqs = []
-            for seq in pair_seqs:
-                ps = _copy.copy(seq)
-                ps.max_tokens = 1
-                prefill_seqs.append(ps)
-            prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
-            self._send_request(pair, prefill_payload)
+        pair = dp_rank - self._decode_idx0
+        # Through `_send_request`, never `input_sockets` directly: it is the
+        # single serialization point for the ADD socket, and two interleaved
+        # send_multipart calls silently wedge the engine (see its docstring).
+        decode_payload = pickle.dumps((EngineCoreRequestType.ADD, rank_seqs))
+        self._send_request(dp_rank, decode_payload)
+        # Prefill discards every sampled token except the first (which it
+        # ships in PrefillDone), so cap max_tokens at 1: the forward then
+        # terminates after one generate step and num_scheduled_tokens
+        # reflects only the prompt.
+        prefill_seqs = []
+        for seq in rank_seqs:
+            ps = copy.copy(seq)
+            ps.max_tokens = 1
+            prefill_seqs.append(ps)
+        prefill_payload = pickle.dumps((EngineCoreRequestType.ADD, prefill_seqs))
+        self._send_request(pair, prefill_payload)
 
     def _collective_rpc_unsupported(self) -> str | None:
         return "its two engines are the prefill and decode halves of one replica"

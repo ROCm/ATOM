@@ -1458,21 +1458,51 @@ class PrefillEngineCore(DPEngineCoreProc):
             # consumes the mapping in `__init__` to derive `req_ids` and the
             # per-seq arrays, and keeps none of it.
             seq = seqs.get(seq_id)
-            is_final = not getattr(seq, "is_partial_prefill", False)
+            if seq is None:
+                # Unreachable: `ScheduledBatch.req_ids` IS `list(seqs.keys())`
+                # (scheduler.py:184) and this is that same mapping. Reported
+                # rather than defaulted, because `prefill_pos` is ABSOLUTE and
+                # the only number available without the seq is 0 -- which
+                # decode would read as "prefill is back at the start of the
+                # prompt" and act on.
+                logger.error(
+                    "%s: seq %s is in the batch but not its own seq mapping; "
+                    "no position to report",
+                    self.label,
+                    seq_id,
+                )
+                continue
+            is_final = not seq.is_partial_prefill
             # After the forward, not at schedule time: the runner reads this as
             # the chunk's start offset, so advancing it earlier stages nothing.
             #
-            # Unconditional, not gated on `prefill_cut_pos`. A chunk can be
-            # short because the rung said so OR because the token budget did,
-            # and only the second kind exists for a prompt with no rung at all
-            # -- gating on the cut left those never advancing, so every pass
-            # re-ran the same first chunk. This is the prefill process's own
-            # copy of the sequence; decode advances its own from PrefillDone.
-            if seq is not None:
-                seq.num_cached_tokens += int(num_tokens)
+            # Unconditional, and in particular NOT gated on the rung the way
+            # the message below is. A chunk can be short because the rung said
+            # so OR because the token budget did, and only the second kind
+            # exists for a prompt with no rung at all -- gating the advance
+            # left those never advancing, so every pass re-ran the same first
+            # chunk. This is the prefill process's own copy of the sequence;
+            # decode sets its own from `PrefillDone.prefill_pos`, which is
+            # why that field has to be this absolute number rather than a
+            # per-chunk delta.
+            seq.num_cached_tokens += int(num_tokens)
+            # REPORT ONLY WHAT DECODE CAN ACT ON.
+            #
+            # A chunk that ends on a rung produced an image, and the pass that
+            # scattered it has now retired -- that is decode's cue to settle
+            # the record and publish the hashes the chunk filled. A chunk that
+            # merely ran out of budget produced neither: decode would advance
+            # an offset and publish a few blocks it can equally well publish
+            # with the next rung, having kept `pending_hash_start` across the
+            # gap for exactly this.
+            #
+            # The advance above stays UNCONDITIONAL -- see the comment on it.
+            # Only the message is gated; gating the offset deadlocked prefill.
+            if not (is_final or seq.prefill_landed_on_rung):
+                continue
             done = PrefillDone(
                 seq_id=seq_id,
-                num_tokens_computed=int(num_tokens),
+                prefill_pos=int(seq.num_cached_tokens),
                 sampled_token_id=int(token_id),
                 # Empty when no drafter ran here; decode substitutes placeholders.
                 draft_token_ids=(
@@ -1774,16 +1804,16 @@ class DecodeEngineCore(DPEngineCoreProc):
             done: PrefillDone = payload
             self.scheduler.on_prefill_done(
                 done.seq_id,
-                done.num_tokens_computed,
+                done.prefill_pos,
                 done.sampled_token_id,
                 done.draft_token_ids,
                 is_final=done.is_final,
             )
             logger.info(
-                "DecodeEngineCore: seq %s prefill %s (%d tokens cached)",
+                "DecodeEngineCore: seq %s prefill %s (computed to %d)",
                 done.seq_id,
-                "done, moved to running queue" if done.is_final else "chunk landed",
-                done.num_tokens_computed,
+                "done, moved to running queue" if done.is_final else "rung landed",
+                done.prefill_pos,
             )
 
     def _flush_state_maintenance(self):

@@ -7,6 +7,9 @@ Only the scheduler-level shm gating is exercised here; the IPC handshake
 and CUDA stream pool are out of scope for the no-GPU test environment.
 """
 
+import pickle
+from threading import Lock
+
 import pytest
 import torch
 from conftest import MockConfig
@@ -871,6 +874,78 @@ class TestPairedDataParallelBounds:
             )
 
 
+class _RecordingSocket:
+    def __init__(self):
+        self.messages = []
+
+    def send_multipart(self, parts, copy=False):
+        self.messages.append(parts)
+
+
+class _PairedSeq:
+    """Minimal Sequence stand-in: routing reads id/num_prompt_tokens/max_tokens."""
+
+    def __init__(self, seq_id, num_prompt_tokens=1, max_tokens=64, **attrs):
+        self.id = seq_id
+        self.num_prompt_tokens = num_prompt_tokens
+        self.max_tokens = max_tokens
+        self.stream_callback = None
+        for name, value in attrs.items():
+            setattr(self, name, value)
+
+
+def _make_paired_mgr(n_pairs, strategy="least_tokens", session_affinity=False):
+    """A DisaggCoreManager with only its routing/socket state, no processes.
+
+    Driven through the REAL inherited `add_request`, so these tests fail if the
+    paired topology ever stops sharing the base router -- which is exactly the
+    regression they exist for: a private copy of the dispatch loop quietly lost
+    hints, session affinity, token-aware placement and the per-add log.
+    """
+    from atom.model_engine.engine_core_mgr import DisaggCoreManager
+
+    mgr = DisaggCoreManager.__new__(DisaggCoreManager)
+    mgr.label = "DisaggCoreManager"
+    mgr.pp_size = 1
+    mgr._n_pairs = n_pairs
+    mgr._decode_idx0 = n_pairs
+    mgr.local_engine_count = 2 * n_pairs
+    mgr.global_engine_count = 2 * n_pairs
+    mgr._dp_lb_strategy = strategy
+    mgr._dp_lb_req_equiv = 512
+    mgr._dp_session_affinity_enabled = session_affinity
+    mgr._dp_session_owners = {}
+    mgr._dp_session_prompt_tokens = {}
+    mgr._dp_route_counters = {
+        "affinity_new_total": 0,
+        "affinity_owner_hit_total": 0,
+        "affinity_spill_total": 0,
+        "affinity_parent_ignored_total": 0,
+        "explicit_total": 0,
+        "load_balanced_total": 0,
+    }
+    mgr._rank_routed_total = [0] * (2 * n_pairs)
+    mgr._rank_rotation_cursor = 0
+    mgr._rank_reqs = [0] * (2 * n_pairs)
+    mgr._rank_tokens = [0] * (2 * n_pairs)
+    mgr._seq_load = {}
+    mgr._lb_lock = Lock()
+    mgr._seq_id_to_callback = {}
+    mgr.engine_core_identities = [f"e{i}".encode() for i in range(2 * n_pairs)]
+    mgr.input_sockets = [_RecordingSocket() for _ in range(2 * n_pairs)]
+    return mgr
+
+
+def _added(mgr, idx):
+    """Sequence ids delivered to engine index `idx`, in order."""
+    out = []
+    for _identity, payload in mgr.input_sockets[idx].messages:
+        request_type, seqs = pickle.loads(payload)
+        assert request_type.name == "ADD"
+        out.extend(seqs)
+    return out
+
+
 class TestPairedRequestRouting:
     """A sequence must reach BOTH members of exactly one pair, and no other.
 
@@ -879,32 +954,100 @@ class TestPairedRequestRouting:
     write its KV into different GPUs' pools.
     """
 
-    @staticmethod
-    def _route(pair, decode_idx0):
-        """Mirror of DisaggCoreManager.add_request's index arithmetic."""
-        return {"prefill": pair, "decode": decode_idx0 + pair}
-
     def test_sequence_goes_to_both_members_of_one_pair(self):
-        got = self._route(pair=3, decode_idx0=8)
-        assert got == {"prefill": 3, "decode": 11}
+        mgr = _make_paired_mgr(8)
+        # Make pair 3 the only attractive destination.
+        for rank in range(8, 16):
+            mgr._rank_tokens[rank] = 0 if rank == 11 else 10_000
+        mgr.add_request([_PairedSeq("s", num_prompt_tokens=100)])
 
-    def test_selected_engine_index_maps_back_to_its_pair(self):
-        """_select_dp_rank_locked returns an ENGINE index in the decode slice."""
-        decode_idx0 = 8
-        for idx in range(decode_idx0, 2 * decode_idx0):
-            pair = idx - decode_idx0
-            assert self._route(pair, decode_idx0)["decode"] == idx
-            assert 0 <= pair < decode_idx0
+        got = [i for i in range(16) if mgr.input_sockets[i].messages]
+        assert got == [3, 11]
+
+    def test_routing_never_selects_a_prefill_index(self):
+        """Prefill ranks are the other half of a pair, not a destination.
+
+        They are indices 0..n_pairs-1 of the same engine list, so a router that
+        did not know about the window would hand them requests directly.
+        """
+        mgr = _make_paired_mgr(4)
+        mgr.add_request([_PairedSeq(i, num_prompt_tokens=i + 1) for i in range(12)])
+        # Charged load lands only on decode indices.
+        assert mgr._rank_reqs[:4] == [0, 0, 0, 0]
+        assert sum(mgr._rank_reqs[4:]) == 12
+        # Every pair got the same count on both of its sockets.
+        for pair in range(4):
+            assert len(_added(mgr, pair)) == len(_added(mgr, 4 + pair))
+
+    def test_prefill_copy_is_capped_at_one_token(self):
+        """Prefill keeps only the first sampled token, shipped in PrefillDone."""
+        mgr = _make_paired_mgr(2)
+        seq = _PairedSeq("s", num_prompt_tokens=10, max_tokens=256)
+        mgr.add_request([seq])
+
+        pair = next(p for p in range(2) if mgr.input_sockets[p].messages)
+        (prefill_seq,) = _added(mgr, pair)
+        (decode_seq,) = _added(mgr, 2 + pair)
+        assert prefill_seq.max_tokens == 1
+        # The decode copy -- and the caller's own object -- keep the real budget.
+        assert decode_seq.max_tokens == 256
+        assert seq.max_tokens == 256
+
+    def test_placement_is_token_aware_not_request_count_aware(self):
+        """The regression this sharing exists for.
+
+        Equal request counts across pairs say nothing about equal work when
+        prompts differ by an order of magnitude: the pair holding the long
+        prompts becomes the straggler that sets wall time.
+        """
+        mgr = _make_paired_mgr(4, strategy="least_tokens")
+        sizes = [100_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 1_000]
+        mgr.add_request(
+            [_PairedSeq(i, num_prompt_tokens=n) for i, n in enumerate(sizes)]
+        )
+        decode_tokens = mgr._rank_tokens[4:]
+        # The 100k prompt's pair takes no further work; the rest share the tail.
+        assert max(decode_tokens) == 100_000
+        assert sorted(decode_tokens)[:3] == [2_000, 2_000, 3_000]
+
+    def test_explicit_hint_names_a_pair_not_an_engine_index(self):
+        """`data_parallel_rank` is caller-facing: 0..n_pairs-1."""
+        mgr = _make_paired_mgr(8)
+        mgr.add_request([_PairedSeq("s", num_prompt_tokens=10, data_parallel_rank=3)])
+        assert [i for i in range(16) if mgr.input_sockets[i].messages] == [3, 11]
+
+    def test_out_of_range_hint_is_rejected_against_the_pair_count(self):
+        mgr = _make_paired_mgr(8)
+        # 8 is a valid engine index (decode rank 0) but not a valid pair.
+        with pytest.raises(ValueError):
+            mgr.add_request(
+                [_PairedSeq("s", num_prompt_tokens=10, data_parallel_rank=8)]
+            )
+        assert not any(sock.messages for sock in mgr.input_sockets)
+        assert mgr._seq_load == {}
+
+    def test_session_affinity_keeps_later_turns_on_their_pair(self):
+        """Agentic turns must come back to the pair whose prefix cache is warm."""
+        mgr = _make_paired_mgr(4, session_affinity=True)
+        mgr.add_request([_PairedSeq("t1", num_prompt_tokens=1_000, dp_session_id="c")])
+        owner = mgr._dp_session_owners["c"]
+        assert 4 <= owner < 8
+        # Pile load onto the owner: affinity must still win.
+        mgr._rank_tokens[owner] += 10_000_000
+        mgr.add_request([_PairedSeq("t2", num_prompt_tokens=2_000, dp_session_id="c")])
+        assert _added(mgr, owner)[-1].id == "t2"
+        assert _added(mgr, owner - 4)[-1].id == "t2"
 
     def test_symmetric_routes_everything_to_pair_zero(self):
-        got = self._route(pair=0, decode_idx0=1)
-        assert got == {"prefill": 0, "decode": 1}
+        """One pair: nothing to balance, but both members still get the seq."""
+        mgr = _make_paired_mgr(1)
+        mgr.add_request([_PairedSeq("s", num_prompt_tokens=10)])
+        assert [i for i in range(2) if mgr.input_sockets[i].messages] == [0, 1]
 
     def test_every_pair_is_reachable(self):
-        decode_idx0 = 8
-        routed = [self._route(k, decode_idx0) for k in range(decode_idx0)]
-        assert len({r["prefill"] for r in routed}) == decode_idx0
-        assert len({r["decode"] for r in routed}) == decode_idx0
+        mgr = _make_paired_mgr(8, strategy="round_robin")
+        mgr.add_request([_PairedSeq(i, num_prompt_tokens=10) for i in range(8)])
+        assert all(mgr.input_sockets[i].messages for i in range(16))
 
 
 class TestPrefillLockstep:

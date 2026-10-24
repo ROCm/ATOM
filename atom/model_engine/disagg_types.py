@@ -114,7 +114,13 @@ class PrefillDone:
     """
 
     seq_id: int
-    num_tokens_computed: int  # tokens written into the KV cache
+    # ABSOLUTE prompt position prefill has computed to, not this chunk's size.
+    # Prefill reports only the chunks that land on a checkpoint rung (plus the
+    # final one), so a delta would silently lose every suppressed chunk and
+    # leave decode's offset behind prefill's forever. An absolute position is
+    # also self-correcting: a message decode somehow misses costs it nothing
+    # once the next one arrives.
+    prefill_pos: int
     sampled_token_id: int  # first generated token sampled from prefill logits
     # Speculative drafts for the token(s) AFTER sampled_token_id, proposed by
     # the drafter in the prefill process. Empty when spec decode is off, or for

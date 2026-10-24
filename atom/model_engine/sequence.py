@@ -472,11 +472,18 @@ class Sequence:
         # whole ladder. One resume point against fourteen is the difference
         # between a 59% and a 66% hit rate on agentic traffic.
         self.prefill_cuts: list = []
-        # Hashes every reserved image is filed under, so the final PrefillDone
-        # can tell the coordinator the peer's scatters landed. The records are
-        # deliberately left unarmed until then, or `complete_inflight` would
-        # publish bytes nobody had written.
+        # Hashes every reserved image is filed under, positionally aligned with
+        # `prefill_cuts`, so decode can map a reported chunk boundary back to
+        # the image that boundary produced. The records are deliberately left
+        # unarmed until a chunk proves the scatter ran, or `complete_inflight`
+        # would publish bytes nobody had written.
         self.prefill_store_hashes: list = []
+        # Did the chunk just scheduled for this seq end exactly on a rung?
+        # `is_partial_prefill` cannot answer it: a chunk is partial whether the
+        # rung stopped it or the token budget did, and only the first kind is
+        # worth a PrefillDone -- the second produces no image for decode to
+        # settle and nothing it has to act on before the next one.
+        self.prefill_landed_on_rung: bool = False
         self.return_logprobs = bool(getattr(sampling_params, "logprobs", False))
         # One entry per completion token, so the same reason `token_ids` is an
         # array applies: a list would box a PyFloat per token and hand the
@@ -564,15 +571,39 @@ class Sequence:
             self._num_tokens - (self.num_blocks - 1) * self.block_size
         )
 
-    @property
-    def prefill_cut_pos(self) -> int:
-        """The next rung this prompt's prefill must stop at, or 0 for none.
+    def prefill_cut_within(self, limit: int) -> int:
+        """Furthest rung in `(num_cached_tokens, limit]`, or 0 for none.
 
-        The head of `prefill_cuts`, which is consumed in order -- so this
-        answers "where does the NEXT chunk end", and a prompt crossing fourteen
-        rungs answers it fourteen times.
+        FURTHEST, not nearest: the chunk being sized runs as far as its budget
+        allows and lands on the last rung inside it, which is what
+        `Scheduler._finalize_prefill_chunk` does on the non-disagg path
+        (`checkpoint_cut` collapses the grid to its rightmost member before
+        choosing). Taking the nearest instead would halve every chunk the
+        moment the ladder is spaced at the checkpoint interval rather than at a
+        whole batch, for no extra resume point that survives: a rung the
+        forward runs over holds no state anyone can restore.
+
+        The lower bound is STRICT, which is the half of this that used to be
+        wrong. `prefill_cuts` runs on two clocks: `take_prefill_store_op` has
+        to hold a rung one pass past the chunk that reached it, because the
+        image is scattered by the NEXT forward. Cutting runs a pass earlier --
+        once a chunk has landed on R, the question is already where to stop
+        after R. Reading the list head served the first clock and answered the
+        second with R, the position the sequence is standing on, so
+        `num_cached_tokens < cut` was false, nothing cut, and the chunk ran the
+        full budget over the top of the rung after R. Observed on a
+        37211-token prompt with rungs [16384, 32768, 37120]: the last chunk ran
+        32768 -> 37211 straight past the prompt-end anchor, which is the rung a
+        later turn of the same conversation resumes from.
+
+        The scan is over a ladder a handful of entries long that shrinks as it
+        is consumed, and it runs once per scheduled chunk.
         """
-        return self.prefill_cuts[0][0] if self.prefill_cuts else 0
+        best = 0
+        for cut, _ in self.prefill_cuts:
+            if self.num_cached_tokens < cut <= limit:
+                best = cut
+        return best
 
     def take_prefill_store_op(self):
         """The checkpoint image to write, once this prompt is past a rung.
@@ -582,16 +613,26 @@ class Sequence:
         state. `build()` runs maintenance before its forward, so an op taken
         one pass early would scatter a slot the forward has not filled yet.
 
-        Popped, not read: an image is written once, and popping is also what
-        advances `prefill_cut_pos` to the next rung.
+        A rung BEHIND the current position is dropped rather than returned.
+        Since a chunk runs to the furthest rung that fits, it routinely passes
+        over nearer ones, and the slot at the end of that chunk holds the state
+        as of its END -- scattering a skipped rung's op would file that state
+        under a hash meaning somewhere else entirely, and a later request
+        resuming from it would restore a position it never asked for. Decode
+        is what releases the units (`on_prefill_done` unindexes every rung a
+        reported chunk ran over); this end only declines to write.
         """
-        if not self.prefill_cuts:
-            return None
-        cut, op = self.prefill_cuts[0]
-        if self.num_cached_tokens < cut:
-            return None
-        self.prefill_cuts.pop(0)
-        return op
+        while self.prefill_cuts:
+            cut, op = self.prefill_cuts[0]
+            if self.num_cached_tokens < cut:
+                # Not reached yet -- keep holding it.
+                return None
+            self.prefill_cuts.pop(0)
+            if cut == self.num_cached_tokens:
+                # The pass after the chunk that ended here: the slot holds
+                # exactly this rung's state.
+                return op
+        return None
 
     @property
     def state_slot(self) -> int:
