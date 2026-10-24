@@ -555,8 +555,10 @@ def dspark_markov_argmax_tp(
 #
 # Where q goes. Each row writes its distribution straight into the persistent
 # q store, at row `q_row_base[row] + position`: the block that row's request
-# owns. A negative base writes nothing (pad rows, a dummy forward, an
-# align-only propose) and such a row drafts id 0, which nobody reads.
+# owns. A negative base writes nothing -- pad rows, a dummy forward, an
+# align-only propose, and rows whose q nobody reads (greedy requests, requests
+# still mid-prompt) -- and such a row drafts its logits' argmax, as a greedy
+# row does.
 #
 # The noise is drawn in-kernel from Philox rather than handed in as a `[B, V]`
 # tensor, and the softmax is online (per-tile max and sumexp combined in a
