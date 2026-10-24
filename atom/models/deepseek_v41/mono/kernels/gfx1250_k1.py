@@ -18,16 +18,16 @@ import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled, check_e8m0, ptr_arg
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
 from atom.models.deepseek_v41.mono.kernels.gfx1250_gemv import (
     THREADS,
     gemv_device,
     gemv_lds_bytes,
+    grouped_lds_bytes,
     grouped_load,
     grouped_ready,
-    grouped_lds_bytes,
     projection_load,
     projection_ready,
 )
@@ -35,7 +35,7 @@ from atom.models.deepseek_v41.mono.kernels.gfx1250_producers import (
     hidden_norm_device,
     qkv_norm_device,
 )
-from atom.mono.device.ops import traced
+from atom.mono.device.ops import ballot, traced
 from atom.mono.runtime.compile import _code_object, launcher_resources
 
 WAIT_TICKS = 10_000_000  # 100 ms at this platform's 100 MHz steady counter.
@@ -50,11 +50,13 @@ def _i32_pointer(p):
 
 
 @traced
-def _publish(flags, index, epoch):
+def _publish(flags, index, epoch, synchronized=False, joined=False):
     # gpu.barrier is a workgroup release/acquire: it carries every writer's
     # payload to the leader. The leader's device release publishes that
     # transitive history once per CTA, rather than once per wave.
-    fx.gpu.barrier()
+    # synchronized=True requires the producer's existing final barrier.
+    if const_expr(not synchronized):
+        fx.gpu.barrier()
     if fx.thread_idx.x == 0:
         fx.generic_store(
             flags + index,
@@ -62,61 +64,148 @@ def _publish(flags, index, epoch):
             memory_order=fx.AtomicOrdering.Release,
             syncscope="agent",
         )
+        # Retire the publication before this wave can enter another wait.
+        # On gfx12 the release store is an asynchronous global_store; its
+        # leading writeback only retires payload stores, not this flag store.
+        fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
+    if const_expr(joined):
+        # Phase instrumentation follows the leader's publication only after
+        # every wave has observed its retirement. Normal builds omit this.
+        fx.gpu.barrier()
 
 
 @traced
-def _await(flags, offset, count, epoch, diag, lds, tid, workers, phase):
-    """Cooperative gather with one polling thread per source slot.
+def _await(
+    flags,
+    offset,
+    count,
+    epoch,
+    diag,
+    lds,
+    tid,
+    workers,
+    phase,
+    status=None,
+    extra_offset=None,
+    poll_sleep=1,
+    active_count=None,
+    failure_detail=None,
+    progress=None,
+    progress_stride=3,
+    progress_bias=0,
+    monitor_waves=False,
+    poll_threads=THREADS,
+):
+    """Acquire every required publication and return one CTA-uniform result.
 
-    All threads return the same CTA-local result. No caller uses a payload
-    after its wait fails, even if other CTAs have already completed their work.
+    The default reuses computation LDS and retains the trailing barrier.
+    Optional status must be a dedicated shared word outside all payload
+    workspace. Its readers need no trailing barrier: payload code cannot
+    overwrite it, and the next wait synchronizes all prior readers before
+    replacing it. Kernel completion orders subsequent replay initialization.
+    An extra flag acquires the matching index weight with Q in the same wait;
+    its timeout is diagnosed as phase8. All waits remain bounded/fail closed.
+    With poll_threads=32 each wave acquires its own wave-uniform offset;
+    inactive waves use active_count=0 and still participate in every CTA join.
     """
-    for group in range_constexpr((count + THREADS - 1) // THREADS):
-        index = tid + group * THREADS
-        if index < count:
+    result_slot = lds
+    def wave_stage(stage):
+        if const_expr(monitor_waves and progress is not None):
+            if tid % 32 == 0:
+                fx.generic_store(
+                    progress + fx.Int32(fx.block_idx.x) * progress_stride + 3 + tid // 32,
+                    (epoch << 16) | fx.Int32(phase * 100 + stage),
+                    memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
+                )
+
+    wave_stage(1)
+    if const_expr(status is not None):
+        result_slot = status
+    if poll_threads not in (32, THREADS):
+        raise ValueError("flag polling requires one wave or one CTA")
+    total = count + (0 if extra_offset is None else 1)
+    for group in range_constexpr((total + poll_threads - 1) // poll_threads):
+        index = tid % poll_threads + group * poll_threads
+        active = index < (total if active_count is None else active_count)
+        source = offset + index
+        diagnostic_phase = fx.Int32(phase)
+        if const_expr(extra_offset is not None):
+            source = (index < count).select(offset + index, extra_offset)
+            diagnostic_phase = (index < count).select(fx.Int32(phase), fx.Int32(8))
+        value, aborted = epoch, fx.Int32(0)
+        if active:
             value = fx.generic_load(
-                flags + offset + index,
-                memory_order=fx.AtomicOrdering.Monotonic,
-                syncscope="agent",
+                flags + source, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
             )
             aborted = fx.generic_load(
-                diag, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"
+                diag, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
             )
-            if (value != epoch) & (aborted == 0):
-                t0 = _clock()
-                while (value != epoch) & (aborted == 0) & (_clock() - t0 < WAIT_TICKS):
-                    fx.rocdl.s_sleep(1)
+        # Keep the sleep and steady-counter loop wave-uniform, as in the
+        # gfx950 mailbox spin. Ready lanes keep participating while any lane
+        # is pending, and inactive lanes never dereference an out-of-range slot.
+        pending = ballot(active & (value != epoch) & (aborted == 0)) != 0
+        if pending:
+            t0 = _clock()
+            while pending & (_clock() - t0 < WAIT_TICKS):
+                fx.rocdl.s_sleep(poll_sleep)
+                if active:
                     value = fx.generic_load(
-                        flags + offset + index,
-                        memory_order=fx.AtomicOrdering.Monotonic,
-                        syncscope="agent",
+                        flags + source, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
                     )
                     aborted = fx.generic_load(
-                        diag,
-                        memory_order=fx.AtomicOrdering.Monotonic,
+                        diag, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
+                    )
+                pending = ballot(active & (value != epoch) & (aborted == 0)) != 0
+        wave_stage(2)
+        if active & (value != epoch):
+            # Preserve the first failed wait: phase, waiting CTA and slot.
+            record = (
+                diagnostic_phase * 1_000_000
+                + fx.Int32(fx.block_idx.x) * 1000
+                + index
+            )
+            previous, _ = fx.atomic_cas(
+                diag,
+                fx.Int32(0),
+                record,
+                success_ordering=fx.AtomicOrdering.Release,
+                failure_ordering=fx.AtomicOrdering.Monotonic,
+                syncscope="agent",
+            )
+            if const_expr(failure_detail is not None):
+                if previous == 0:
+                    first, _ = fx.atomic_cas(
+                        failure_detail, fx.Int32(0), record,
+                        success_ordering=fx.AtomicOrdering.Release,
+                        failure_ordering=fx.AtomicOrdering.Monotonic,
                         syncscope="agent",
                     )
-            if value != epoch:
-                # Preserve the first failed wait: phase, waiting CTA and slot.
-                record = (
-                    fx.Int32(phase) * 1_000_000
-                    + fx.Int32(fx.block_idx.x) * 1000
-                    + index
-                )
-                fx.atomic_cas(
-                    diag,
-                    fx.Int32(0),
-                    record,
-                    success_ordering=fx.AtomicOrdering.Release,
-                    failure_ordering=fx.AtomicOrdering.Monotonic,
-                    syncscope="agent",
-                )
-            else:
-                # The acquire fence must follow the flag read in this same
-                # thread. The following workgroup barrier then shares its
-                # acquired producer history with the rest of the CTA.
-                fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+                    if first == 0:
+                        for at, item in enumerate((epoch, value, source)):
+                            fx.ptr_store(item, failure_detail + 1 + at)
+                        if const_expr(progress is not None):
+                            for at in range_constexpr(3):
+                                item = fx.generic_load(
+                                    progress + (source % workers + progress_bias) * progress_stride + at,
+                                    memory_order=fx.AtomicOrdering.Monotonic,
+                                    syncscope="agent",
+                                )
+                                fx.ptr_store(item, failure_detail + 4 + at)
+                            if const_expr(progress_stride > 3):
+                                for wave in range_constexpr(8):
+                                    item = fx.generic_load(
+                                        progress + (source % workers + progress_bias) * progress_stride + 3 + wave,
+                                        memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent",
+                                    )
+                                    fx.ptr_store(item, failure_detail + 8 + wave)
+        elif active:
+            # The acquire fence must follow the flag read in this same
+            # thread. The following workgroup barrier then shares its
+            # acquired producer history with the rest of the CTA.
+            fx.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Acquire)
+        wave_stage(3)
     fx.gpu.barrier()
+    wave_stage(4)
     if tid == 0:
         ok = (
             fx.generic_load(
@@ -124,10 +213,14 @@ def _await(flags, offset, count, epoch, diag, lds, tid, workers, phase):
             )
             == 0
         )
-        fx.ptr_store(ok.select(fx.Int32(1), fx.Int32(0)), lds)
+        fx.ptr_store(ok.select(fx.Int32(1), fx.Int32(0)), result_slot)
+    wave_stage(5)
     fx.gpu.barrier()
-    result = fx.ptr_load(lds) != 0
-    fx.gpu.barrier()
+    wave_stage(6)
+    result = fx.ptr_load(result_slot) != 0
+    wave_stage(7)
+    if const_expr(status is None):
+        fx.gpu.barrier()
     return result
 
 
@@ -346,30 +439,69 @@ class _NodeAttribute(ctypes.Union):
     ]
 
 
+class _LaunchAttribute(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_int),
+        ("pad", ctypes.c_char * 4),
+        ("value", _NodeAttribute),
+    ]
+
+
+class _DriverLaunchConfig(ctypes.Structure):
+    _fields_ = [
+        ("grid_x", ctypes.c_uint), ("grid_y", ctypes.c_uint), ("grid_z", ctypes.c_uint),
+        ("block_x", ctypes.c_uint), ("block_y", ctypes.c_uint), ("block_z", ctypes.c_uint),
+        ("shared_bytes", ctypes.c_uint), ("stream", ctypes.c_void_p),
+        ("attributes", ctypes.POINTER(_LaunchAttribute)), ("attribute_count", ctypes.c_uint),
+    ]
+
+
 class _CooperativeKernel:
-    """Own a HIP module and launch its pointer-only ABI cooperatively.
+    """Own a HIP module, validate residency, and bind its pointer-only ABI.
 
     FlyDSL currently lowers launch_func without cooperative dispatch. Loading
     its compiled ELF explicitly permits setting and verifying cooperative
     graph-node attributes before any dispatch. The cached object retains its
     module for graph lifetime. Eager graphs retain their buffers until process
     exit; this prototype expects a fixed, bounded set of scratch allocations.
+    The reference runner can request ordinary dispatch after the same resource
+    and capacity checks; the gfx950 mother uses ordinary stream launches.
     """
 
-    def __init__(self, launcher, args, name, rows, workers, device):
+    def __init__(
+        self,
+        launcher,
+        args,
+        name,
+        rows,
+        workers,
+        device,
+        *,
+        smem=None,
+        label="gfx1250 K1",
+        threads=THREADS,
+        cooperative_capture=False,
+        cooperative_dispatch=True,
+    ):
+        self.label = label
+        if threads < 32 or threads > 1024 or threads % 32:
+            raise ValueError("cooperative block size must be 32..1024, wave aligned")
+        self.threads = threads
+        self.cooperative_capture = cooperative_capture
+        self.cooperative_dispatch = cooperative_dispatch
         _preload_compiled(launcher, *args)
         resources = launcher_resources(launcher)
         if len(resources) != 1 or any(
             resources[0][k] for k in ("scratch", "vgpr_spill", "sgpr_spill")
         ):
-            raise RuntimeError(f"[gfx1250 K1] unverified resources: {resources}")
+            raise RuntimeError(f"[{self.label}] unverified resources: {resources}")
         paths = {
             line.split()[-1]
             for line in Path("/proc/self/maps").read_text().splitlines()
             if "libamdhip64.so" in line
         }
         if len(paths) != 1:
-            raise RuntimeError("[gfx1250 K1] cannot identify the active HIP library")
+            raise RuntimeError(f"[{self.label}] cannot identify the active HIP library")
         self.hip = ctypes.CDLL(paths.pop())
         P, U = ctypes.c_void_p, ctypes.c_uint
         self.hip.hipModuleLoadData.argtypes = [ctypes.POINTER(P), P]
@@ -398,6 +530,15 @@ class _CooperativeKernel:
             ctypes.POINTER(P),
             P,
         ]
+        if cooperative_capture:
+            # In the BKC HIP graph implementation, SetAttribute(Cooperative)
+            # only updates the displayed attribute. The command's coopKernel_
+            # is fixed when the node is captured. Driver Ex sets that field
+            # through the launch attribute before the graph node is created.
+            self.hip.hipDrvLaunchKernelEx.argtypes = [
+                ctypes.POINTER(_DriverLaunchConfig), P, ctypes.POINTER(P), P,
+            ]
+            self.hip.hipDrvLaunchKernelEx.restype = ctypes.c_int
         self.hip.hipStreamGetCaptureInfo_v2.argtypes = [
             P,
             ctypes.POINTER(ctypes.c_int),
@@ -419,10 +560,10 @@ class _CooperativeKernel:
         support = ctypes.c_int()
         self._check(self.hip.hipDeviceGetAttribute(ctypes.byref(support), 10, device))
         if support.value != 1:
-            raise RuntimeError("[gfx1250 K1] cooperative launch unavailable")
+            raise RuntimeError(f"[{self.label}] cooperative launch unavailable")
         artifacts = list(launcher._mem_cache.values())
         if len(artifacts) != 1:
-            raise RuntimeError("[gfx1250 K1] ambiguous compiled artifact")
+            raise RuntimeError(f"[{self.label}] ambiguous compiled artifact")
         self.binary = ctypes.create_string_buffer(_code_object(artifacts[0]._ir_text))
         self.module, self.function = P(), P()
         self._check(self.hip.hipModuleLoadData(ctypes.byref(self.module), self.binary))
@@ -431,11 +572,15 @@ class _CooperativeKernel:
                 ctypes.byref(self.function), self.module, name.encode()
             )
         )
-        self.smem = max(gemv_lds_bytes(rows, 5120), grouped_lds_bytes(rows, 4))
+        self.smem = (
+            max(gemv_lds_bytes(rows, 5120), grouped_lds_bytes(rows, 4))
+            if smem is None
+            else smem
+        )
         blocks = ctypes.c_int()
         self._check(
             self.hip.hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
-                ctypes.byref(blocks), self.function, THREADS, self.smem
+                ctypes.byref(blocks), self.function, self.threads, self.smem
             )
         )
         self.capacity = (
@@ -444,38 +589,66 @@ class _CooperativeKernel:
         )
         if blocks.value < 1 or workers > self.capacity:
             raise RuntimeError(
-                f"[gfx1250 K1] grid {workers} exceeds cooperative capacity {self.capacity}"
+                f"[{self.label}] grid {workers} exceeds cooperative capacity {self.capacity}"
             )
         self.resources, self.workers = resources, workers
         self.graphs = {}
 
-    @staticmethod
-    def _check(code):
+    def _check(self, code):
         if code:
-            raise RuntimeError(f"[gfx1250 K1] HIP error {code}; stop dispatch")
+            raise RuntimeError(f"[{self.label}] HIP error {code}; stop dispatch")
+
+    def prepare_graph(self, tensors):
+        """Capture an eager binding without replay, before any peer wait.
+
+        Graph creation can wait for prior stream work and initialize HIP's
+        capture machinery. Callers preparing a TP chain must finish every
+        binding on every rank before its first dependent launch.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(f"[{self.label}] prepare eager graphs before capture")
+        key = tuple(t.data_ptr() for t in tensors)
+        if key not in self.graphs:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self(tensors, torch.cuda.current_stream().cuda_stream)
+            # Retain the raw-pointer owners as long as the graph can replay.
+            self.graphs[key] = (graph, tuple(tensors))
+        return self.graphs[key][0]
 
     def __call__(self, tensors, stream):
         cells = [ctypes.c_void_p(t.data_ptr()) for t in tensors]
         params = (ctypes.c_void_p * len(cells))(*[ctypes.addressof(c) for c in cells])
         if torch.cuda.is_current_stream_capturing():
-            # Capture without dispatch, then mark this exact module node
-            # cooperative before graph instantiation or replay. The direct
-            # module cooperative API in this HIP build crashes after capture.
-            self._check(
-                self.hip.hipModuleLaunchKernel(
+            # Capture without dispatch. Persistent CTAs can use an ordinary
+            # current-stream node with the same checked resident capacity.
+            # True cooperative capture uses Driver Ex because this HIP
+            # build's direct module cooperative API crashes after capture.
+            if self.cooperative_capture and self.cooperative_dispatch:
+                launch_attribute = _LaunchAttribute()
+                launch_attribute.id = 2  # hipLaunchAttributeCooperative
+                launch_attribute.value.cooperative = 1
+                config = _DriverLaunchConfig(
+                    self.workers, 1, 1, self.threads, 1, 1, self.smem, stream,
+                    ctypes.pointer(launch_attribute), 1,
+                )
+                self._check(self.hip.hipDrvLaunchKernelEx(
+                    ctypes.byref(config), self.function, params, None,
+                ))
+            else:
+                self._check(self.hip.hipModuleLaunchKernel(
                     self.function,
                     self.workers,
                     1,
                     1,
-                    THREADS,
+                    self.threads,
                     1,
                     1,
                     self.smem,
                     stream,
                     params,
                     None,
-                )
-            )
+                ))
             status, token, graph = (
                 ctypes.c_int(),
                 ctypes.c_ulonglong(),
@@ -493,32 +666,25 @@ class _CooperativeKernel:
                 )
             )
             if status.value != 1 or count.value != 1:
-                raise RuntimeError("[gfx1250 K1] ambiguous captured module node")
-            attr = _NodeAttribute()
-            attr.cooperative = 1
-            self._check(
-                self.hip.hipGraphKernelNodeSetAttribute(
-                    dependencies[0], 2, ctypes.byref(attr)
+                raise RuntimeError(f"[{self.label}] ambiguous captured module node")
+            if self.cooperative_dispatch:
+                attr = _NodeAttribute()
+                attr.cooperative = 1
+                self._check(
+                    self.hip.hipGraphKernelNodeSetAttribute(
+                        dependencies[0], 2, ctypes.byref(attr)
+                    )
                 )
-            )
             checked = _NodeAttribute()
             self._check(
                 self.hip.hipGraphKernelNodeGetAttribute(
                     dependencies[0], 2, ctypes.byref(checked)
                 )
             )
-            if checked.cooperative != 1:
-                raise RuntimeError("[gfx1250 K1] graph node is not cooperative")
+            if checked.cooperative != int(self.cooperative_dispatch):
+                raise RuntimeError(f"[{self.label}] graph node dispatch mode differs")
         else:
-            key = tuple(t.data_ptr() for t in tensors)
-            if key not in self.graphs:
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    self(tensors, torch.cuda.current_stream().cuda_stream)
-                # Keep all buffers and the module alive while a cached graph
-                # refers to their raw pointers. Only one kernel is captured.
-                self.graphs[key] = (graph, tuple(tensors))
-            self.graphs[key][0].replay()
+            self.prepare_graph(tensors).replay()
 
 
 _COOPERATIVE = {}

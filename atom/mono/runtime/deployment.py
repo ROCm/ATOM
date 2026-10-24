@@ -10,6 +10,14 @@ from atom.plugin.prepare import is_sglang, is_vllm
 from atom.utils import resolve_obj_by_qualname
 
 
+def _gfx() -> str:
+    """The chip this is running on, imported on use: a non-GPU install carries
+    `aiter` without `aiter.jit`, and this module has to import there."""
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx()
+
+
 def _requires_piecewise_compilation(atom_config) -> bool:
     """``atom_config.compilation_config.cudagraph_mode``'s own answer, or False
     when either is absent. That absence is the real state at ``--level`` 0/1/2
@@ -58,7 +66,8 @@ def _takes_weight_updates(atom_config) -> bool:
 
 
 def common_refusals(
-    atom_config, dims, supported_tp, *, piecewise_cudagraph_required: bool = True
+    atom_config, dims, supported_tp, *, piecewise_cudagraph_required: bool = True,
+    arch: str = "gfx950",
 ) -> list[tuple[bool, str]]:
     """``(holds, why not)`` of the conditions every mono model needs: ``dims``
     (the model's ``Dims``) shards at this TP, which is one of ``supported_tp``;
@@ -76,7 +85,10 @@ def common_refusals(
     keeping every other shared refusal."""
     tp = atom_config.tensor_parallel_size
     shard = shard_refusal(dims, tp)
+    gfx = _gfx()
     checks = [
+        # the persistent kernels are gfx950 code: wave64, MFMA, permlane32
+        (gfx == arch, f"arch {gfx}, backend requires {arch}"),
         (shard is None, shard),
         (tp in supported_tp, f"TP {tp} not in {supported_tp}"),
         (not atom_config.enable_expert_parallel, "expert parallel"),

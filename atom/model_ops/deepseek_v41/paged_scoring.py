@@ -30,6 +30,7 @@ request's rows rather than every request's.
 import torch
 from aiter import dtypes
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.quant import dynamic_per_token_scaled_quant, rope_rotate_activation
 from aiter.ops.topk import top_k_per_row_decode
 from aiter.ops.triton.attention.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -399,7 +400,12 @@ def _band_logits(
         )
         return
     count, heads = scores.shape[0], scaled.shape[1]
-    deepgemm_fp8_paged_mqa_logits(
+    scorer = deepgemm_fp8_paged_mqa_logits
+    if get_gfx() == "gfx1250":
+        from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
+
+        scorer = flydsl_fp8_paged_mqa_logits
+    scorer(
         query[span].view(count, 1, heads, query.shape[-1]),
         units.values.unsqueeze(-2),
         scaled[span],

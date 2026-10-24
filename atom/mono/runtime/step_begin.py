@@ -25,6 +25,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from atom.mono.device.ops import (
     CM_DEV,
     CM_SYS,
+    CM_SYS_GFX1250,
     ballot,
     kernel_symbol,
     launcher,
@@ -82,45 +83,60 @@ def _zero(base, nbytes, first, stride, cm=0):
 
 
 @traced
-def _wait_arrived(state, e):
+def _wait_arrived(state, e, wave_size=64, steady=False, debug=False):
     """Until every other CTA flagged epoch ``e`` (lane l: CTAs 4 l ..)."""
     lane = fx.thread_idx.x
     want = fx.Int32(e & 0xFFFFFFFF)
 
     def late():
-        w = fx.Vector(
-            bo.buffer_load(
-                rsrc(state), ARRIVED * 2 + lane * 4, vec_width=4, dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        )  # fmt: skip
         bad = fx.Boolean(False)
-        for q in range_constexpr(4):
-            cta = lane * 4 + q
-            bad = bad | ((cta != 0) & (w[q] != want))
+        for group in range_constexpr(BLOCKS // (wave_size * 4)):
+            first = lane * 4 + group * wave_size * 4
+            w = fx.Vector(
+                bo.buffer_load(
+                    rsrc(state),
+                    ARRIVED * 2 + first,
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
+            )
+            for q in range_constexpr(4):
+                cta = first + q
+                bad = bad | ((cta != 0) & (w[q] != want))
         return ballot(bad) != 0
 
-    while late():
-        rocdl.s_sleep(1)
+    if const_expr(not debug):
+        while late():
+            rocdl.s_sleep(1)
+    else:
+        t0 = memrealtime(steady)
+        pending = late()
+        while pending & (memrealtime(steady) - t0 < DIAG_TICKS):
+            rocdl.s_sleep(1)
+            pending = late()
+        if pending & (lane == 0):
+            bo.buffer_store(_words(e), rsrc(state), MISSING * 2)
 
 
 @traced
-def _fence(peers, fence_off, rank, state, e, tp, debug):
+def _fence(peers, fence_off, rank, state, e, tp, debug, steady=False):
     """Epoch ``e`` into this rank's slot at every rank, then this rank's slots
     polled (lane p: source rank p's) until every one reaches it. A debug build
     gives up after DIAG_TICKS, a rank that never arrived leaving its last epoch
     seen + 1 in its MISSING word."""
     tid = fx.thread_idx.x
+    cm = CM_SYS_GFX1250 if steady else CM_SYS
     if tid == 0:
         bo.buffer_store(_words(e), rsrc(state), EPOCH * 2)
         for p in range_constexpr(tp):
             tail = load_ptr64(peers, p) + fence_off
-            bo.buffer_store(_words(e), rsrc(tail), rank * 2, cache_modifier=CM_SYS)
+            bo.buffer_store(_words(e), rsrc(tail), rank * 2, cache_modifier=cm)
     own = rsrc(load_ptr64(peers, rank) + fence_off)
     src = fx.min(tid, tp - 1)
 
     def seen_now():
-        return _ld64(own, src, CM_SYS)
+        return _ld64(own, src, cm)
 
     seen = seen_now()
     if const_expr(not debug):
@@ -128,12 +144,14 @@ def _fence(peers, fence_off, rank, state, e, tp, debug):
             rocdl.s_sleep(1)
             seen = seen_now()
     else:
-        t0 = memrealtime()
+        t0 = memrealtime(steady)
         late = fx.Int32(0)
         while (ballot(seen < e) != 0) & (late == 0):
             rocdl.s_sleep(1)
             seen = seen_now()
-            late = (memrealtime() - t0 > DIAG_TICKS).select(fx.Int32(1), fx.Int32(0))
+            late = (memrealtime(steady) - t0 > DIAG_TICKS).select(
+                fx.Int32(1), fx.Int32(0)
+            )
         if (tid < tp) & (seen < e):
             bo.buffer_store(_words(seen + 1), rsrc(state), (MISSING + tid) * 2)
 
@@ -142,30 +160,46 @@ def _fence(peers, fence_off, rank, state, e, tp, debug):
 class StepBeginBuild:
     tp: int
     debug: bool
+    gfx1250: bool = False
 
 
 @functools.cache
 def _build(key: StepBeginBuild):
     tp, debug = key.tp, key.debug
+    threads, wave_size = (256, 32) if key.gfx1250 else (THREADS, 64)
     assert 1 <= tp <= FENCE_SLOTS
     keyed = key_tuple(key, source_digest("mono"))
 
-    name = kernel_symbol("mono_step_begin", tp=tp, debug=int(debug))
+    name = kernel_symbol(
+        "mono_step_begin", tp=tp, debug=int(debug), g1250=int(key.gfx1250)
+    )
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[threads, 1, 1])
     def step_begin(
-        s0: Int64, n0: Int64, s1: Int64, n1: Int64,
-        peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
-    ):  # fmt: skip
+        s0: Int64,
+        n0: Int64,
+        s1: Int64,
+        n1: Int64,
+        peers: Int64,
+        fence_off: Int64,
+        rank: Int32,
+        state: Int64,
+    ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
-        lane0, stride = bid * THREADS + tid, BLOCKS * THREADS
+        lane0, stride = bid * threads + tid, BLOCKS * threads
         # this step's epoch: CTA 0 stores it only once every CTA flagged
         e = _ld64(rsrc(state), EPOCH) + 1
         # the peer data first, at system scope: in memory before the epoch
         # announces it to a peer
-        _zero(load_ptr64(peers, rank), fence_off, lane0, stride, CM_SYS)
-        rocdl.s_waitcnt(vmcnt=0)
+        _zero(
+            load_ptr64(peers, rank), fence_off, lane0, stride,
+            CM_SYS_GFX1250 if key.gfx1250 else CM_SYS,
+        )
+        if const_expr(key.gfx1250):
+            fx.memory_fence(ordering=fx.AtomicOrdering.Release)
+        else:
+            rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
         if (bid != 0) & (tid == 0):
             bo.buffer_store(
@@ -174,27 +208,35 @@ def _build(key: StepBeginBuild):
             )  # fmt: skip
         # CTA 0's wave 0 fences (every lane polling: wave-uniform loops) while
         # the others zero the scratch, this rank's alone
-        if (bid == 0) & (tid < 64):
-            _wait_arrived(state, e)
-            _fence(peers, fence_off, rank, state, e, tp, debug)
+        if (bid == 0) & (tid < wave_size):
+            _wait_arrived(state, e, wave_size, key.gfx1250, debug)
+            _fence(peers, fence_off, rank, state, e, tp, debug, key.gfx1250)
         _zero(s0, n0, lane0, stride)
         _zero(s1, n1, lane0, stride)
 
     @launcher(name)
     def launch(
-        s0: Int64, n0: Int64, s1: Int64, n1: Int64,
-        peers: Int64, fence_off: Int64, rank: Int32, state: Int64,
+        s0: Int64,
+        n0: Int64,
+        s1: Int64,
+        n1: Int64,
+        peers: Int64,
+        fence_off: Int64,
+        rank: Int32,
+        state: Int64,
         stream: fx.Stream = _CURRENT_STREAM,
-    ):  # fmt: skip
+    ):
         _ = keyed
         step_begin(s0, n0, s1, n1, peers, fence_off, rank, state).launch(
-            grid=(BLOCKS,), block=(THREADS,), stream=stream
+            grid=(BLOCKS,), block=(threads,), stream=stream
         )
 
     return launch
 
 
-def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
+def step_begin(
+    scratch, peers, state: torch.Tensor, debug: bool, *, gfx1250=False
+) -> None:
     """Zero ``scratch`` (at most MAX_SCRATCH tensors) and the data region of
     ``peers`` (a ``PeerBuffer``), then the fence: one launch on the current
     stream (a graph records it). ``state``: STATE_WORDS int64, zero at first."""
@@ -206,7 +248,9 @@ def step_begin(scratch, peers, state: torch.Tensor, debug: bool) -> None:
     for b in scratch:
         args += [b.data_ptr(), b.nbytes]
     args += [0, 0] * (MAX_SCRATCH - len(scratch))
-    _build(StepBeginBuild(peers.addresses.numel(), debug))(
+    if gfx1250 and not debug:
+        raise ValueError("gfx1250 step fence must be bounded")
+    _build(StepBeginBuild(peers.addresses.numel(), debug, gfx1250))(
         *args,
         peers.addresses.data_ptr(),
         peers.bytes.nbytes,
