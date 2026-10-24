@@ -250,9 +250,9 @@ class V4MonoDecodeRunner:
         """Prepare an exact width outside capture; failures agree before IPC.
 
         S1 uses the legacy whole-layer ONE launch. S2/S4/S8 use attention -> MoE
-        under one owner/arena/tag with one advance after both launches. The
-        complete S7/q7 candidate splits attention into pre/core, retaining one
-        advance after all three phases. SGPR
+        under one owner/arena/tag with one advance after both launches. Causal
+        S7/q7 uses the same attention -> MoE boundary; S14 and draft blocks
+        retain separate pre/core/MoE launches. SGPR
         spill into registers/LDS is not itself a refusal. Repeated micro-buckets
         in one serving step receive separate stable lanes, so a faster TP rank
         cannot overwrite a peer mailbox that a slower rank is still consuming.

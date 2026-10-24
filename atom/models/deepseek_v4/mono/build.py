@@ -27,10 +27,9 @@ def launch_plan(rows: int, *, tokens_per_seq: int = 1, attention_mode="causal") 
         elif rows == 8 and tokens_per_seq == 1:
             samples_per_pass = 2
         plan = {
-            # S7/q7 combined attention can spill; split that complete request.
-            "launch_shape": (
-                "three" if rows == 14 or rows == tokens_per_seq == 7 else "two"
-            ),
+            # q7 target attention shares its pre/core launch; S14
+            # retains its separate phases. Draft blocks are split below.
+            "launch_shape": "three" if rows == 14 else "two",
             "qkv_batch_limit": 1,
             # Ordinary S4/q1 and causal S4/S8 q4 consume a full tile in one
             # weight pass. Geometry selection does not grant DSpark admission.
