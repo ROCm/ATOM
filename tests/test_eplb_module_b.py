@@ -309,6 +309,77 @@ def test_with_eplb_forward_monitor_passthrough_when_disabled(monkeypatch):
     assert _forward(object(), object()) == 1
 
 
+@pytest.mark.parametrize(
+    ("batch", "expected_record", "expected_local_prefill"),
+    [
+        (
+            types.SimpleNamespace(
+                is_dummy_run=False,
+                total_tokens_num_prefill=8,
+                total_tokens_num_decode=0,
+            ),
+            True,
+            True,
+        ),
+        (
+            types.SimpleNamespace(
+                is_dummy_run=False,
+                total_tokens_num_prefill=0,
+                total_tokens_num_decode=8,
+            ),
+            False,
+            False,
+        ),
+        (
+            types.SimpleNamespace(
+                is_dummy_run=True,
+                total_tokens_num_prefill=8,
+                total_tokens_num_decode=0,
+            ),
+            False,
+            False,
+        ),
+    ],
+)
+def test_forward_monitor_records_only_real_pure_prefill(
+    monkeypatch, batch, expected_record, expected_local_prefill
+):
+    events = []
+
+    class _Monitor:
+        def on_forward_start(self):
+            events.append("start")
+
+        def on_forward_end(self, is_dummy_run, is_pure_prefill):
+            events.append(("end", is_dummy_run, is_pure_prefill))
+
+    class _Manager:
+        live_metadata = object()
+        monitor = _Monitor()
+
+        def on_forward_pass_end(self, local_has_prefill, dp_any_has_prefill):
+            events.append(("step", local_has_prefill, dp_any_has_prefill))
+
+    monkeypatch.setattr(eplb, "_MANAGER", _Manager())
+
+    @eplb.with_eplb_forward_monitor
+    def _forward(self, received_batch):
+        assert received_batch is batch
+        events.append(("record", eplb._EPLB_RECORD_LOAD.get()))
+        return 7
+
+    owner = types.SimpleNamespace(_eplb_any_rank_has_prefill=None)
+    assert _forward(owner, batch) == 7
+    assert ("record", expected_record) in events
+    assert ("step", expected_local_prefill, None) in events
+    assert ("start" in events) is expected_record
+    assert any(event[0] == "end" for event in events if isinstance(event, tuple)) is (
+        expected_record
+    )
+    # Context state is restored after the wrapped forward.
+    assert eplb._EPLB_RECORD_LOAD.get()
+
+
 def test_execute_rebalance_uses_default_stream_no_explicit_wait(monkeypatch):
     """Migration is enqueued on the default stream (same stream as the forward
     pass), so FIFO ordering holds without an explicit wait_stream/synchronize --
