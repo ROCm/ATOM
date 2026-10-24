@@ -518,6 +518,142 @@ def rebalance_experts(
     return p2l, l2p, logcnt
 
 
+@dataclass(frozen=True)
+class ExpertSwap:
+    """Exchange the contents of two physical slots of one layer: logical
+    `expert_a` moves from `slot_a` to `slot_b`, `expert_b` the other way."""
+
+    layer: int
+    slot_a: int
+    slot_b: int
+    expert_a: int
+    expert_b: int
+
+
+def apply_swaps(per_slot: torch.Tensor, swaps: list[ExpertSwap]) -> torch.Tensor:
+    """Return a copy of a [layers, physical] per-slot tensor (p2l, load, ...)
+    with the swaps applied in order."""
+    out = per_slot.clone()
+    for s in swaps:
+        a, b = out[s.layer, s.slot_a].clone(), out[s.layer, s.slot_b].clone()
+        out[s.layer, s.slot_a], out[s.layer, s.slot_b] = b, a
+    return out
+
+
+class DecodeSwapPolicy:
+    """Decides which experts to swap, from the decode load of the live placement.
+
+    Slot ownership is fixed, so a swap keeps every GPU's expert count. Each
+    policy function takes one layer's per-slot cost and p2l and returns that
+    layer's swaps; it must be deterministic so every rank derives the same plan
+    from the same reduced load.
+    """
+
+    POLICIES = ("greedy_hot_cold", "greedy_activation")
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        num_gpus: int,
+        max_swaps_per_layer: int,
+        min_gain: float,
+        min_layer_balancedness: float = 1.0,
+    ):
+        assert name in self.POLICIES, f"unknown decode swap policy {name!r}"
+        self.name = name
+        self.num_gpus = int(num_gpus)
+        self.max_swaps_per_layer = int(max_swaps_per_layer)
+        self.min_gain = float(min_gain)
+        self.min_layer_balancedness = float(min_layer_balancedness)
+        self.skipped_layers = 0
+
+    @staticmethod
+    def activation(physical_load: torch.Tensor, steps: float) -> torch.Tensor:
+        """Estimated per-step probability that each slot gets at least one token,
+        1 - exp(-tokens per step), assuming Poisson arrivals."""
+        rate = physical_load.detach().to("cpu", torch.float64) / max(steps, 1.0)
+        return 1.0 - torch.exp(-rate)
+
+    def slot_cost(self, physical_load: torch.Tensor, steps: float) -> torch.Tensor:
+        """Per-slot cost: estimated activation probability for greedy_activation,
+        token count otherwise."""
+        if self.name == "greedy_activation":
+            return self.activation(physical_load, steps)
+        return physical_load.detach().to("cpu", torch.float64)
+
+    def plan(
+        self, physical_load: torch.Tensor, p2l: torch.Tensor, steps: float = 1.0
+    ) -> list[ExpertSwap]:
+        """Swaps for every layer whose per-GPU balancedness (mean/max of GPU
+        cost) is below min_layer_balancedness; balanced layers are left alone.
+        `steps` is the number of decode steps the load was summed over."""
+        assert physical_load.shape == p2l.shape and p2l.dim() == 2
+        assert p2l.shape[1] % self.num_gpus == 0
+        cost = self.slot_cost(physical_load, steps)
+        p2l_cpu = p2l.detach().to("cpu")
+        gpu_cost = cost.view(cost.shape[0], self.num_gpus, -1).sum(dim=-1)
+        peak = gpu_cost.max(dim=1).values
+        bal = torch.where(peak > 0, gpu_cost.mean(dim=1) / peak, torch.ones_like(peak))
+        fn = getattr(self, self.name)
+        swaps: list[ExpertSwap] = []
+        self.skipped_layers = 0
+        for layer in range(p2l.shape[0]):
+            if peak[layer] > 0 and bal[layer] >= self.min_layer_balancedness:
+                self.skipped_layers += 1
+                continue
+            swaps.extend(fn(layer, cost[layer], p2l_cpu[layer]))
+        return swaps
+
+    def greedy_hot_cold(
+        self, layer: int, cost: torch.Tensor, p2l: torch.Tensor
+    ) -> list[ExpertSwap]:
+        """Repeatedly swap one slot of the costliest GPU with one slot of the
+        cheapest GPU, picking the pair that minimizes the larger of the two.
+        Stops at max_swaps_per_layer or when the best swap lowers the costliest
+        GPU by less than min_gain; never puts two replicas of one logical
+        expert on a GPU."""
+        per_gpu = cost.numel() // self.num_gpus
+        c = cost.clone().view(self.num_gpus, per_gpu)
+        p = p2l.clone().view(self.num_gpus, per_gpu)
+        swaps: list[ExpertSwap] = []
+        while len(swaps) < self.max_swaps_per_layer:
+            gpu_cost = c.sum(dim=1)
+            hot = int(gpu_cost.argmax())
+            cold = int(gpu_cost.argmin())
+            if hot == cold or gpu_cost[hot] <= 0:
+                break
+            delta = c[hot][:, None] - c[cold][None, :]
+            after = torch.maximum(gpu_cost[hot] - delta, gpu_cost[cold] + delta)
+            dup = (p[hot][:, None] == p[cold][None, :]).any(dim=1)[:, None] | (
+                p[cold][:, None] == p[hot][None, :]
+            ).any(dim=1)[None, :]
+            after = torch.where((delta > 0) & ~dup, after, torch.inf)
+            i, j = divmod(int(after.argmin()), per_gpu)
+            gain = float((gpu_cost[hot] - after[i, j]) / gpu_cost[hot])
+            if not torch.isfinite(after[i, j]) or gain < max(self.min_gain, 1e-12):
+                break
+            swaps.append(
+                ExpertSwap(
+                    layer=layer,
+                    slot_a=hot * per_gpu + i,
+                    slot_b=cold * per_gpu + j,
+                    expert_a=int(p[hot, i]),
+                    expert_b=int(p[cold, j]),
+                )
+            )
+            c[hot, i], c[cold, j] = c[cold, j].clone(), c[hot, i].clone()
+            p[hot, i], p[cold, j] = p[cold, j].clone(), p[hot, i].clone()
+        return swaps
+
+    def greedy_activation(
+        self, layer: int, cost: torch.Tensor, p2l: torch.Tensor
+    ) -> list[ExpertSwap]:
+        """greedy_hot_cold on activation cost: evens out the expected number of
+        experts each GPU wakes per step."""
+        return self.greedy_hot_cold(layer, cost, p2l)
+
+
 def _pad_logical_to_physical(
     l2p_var: torch.Tensor, max_num_replicas: int
 ) -> torch.Tensor:
@@ -1387,9 +1523,14 @@ class ExpertLoadMonitor:
         self._logged_first_record: bool = False
         self._logged_logical_without_metadata: bool = False
         self._load_group: Any | None = None
+        self._load_device_group: Any | None = None
+        self._decode_load: torch.Tensor | None = None
+        self._decode_steps = 0
 
-    def set_load_group(self, group: Any) -> None:
+    def set_load_group(self, group: Any, device_group: Any | None = None) -> None:
+        # device_group overrides the communicator the load is all-reduced on.
         self._load_group = group
+        self._load_device_group = device_group
 
     def initialize(
         self, *, num_layers: int, num_physical: int, device: torch.device
@@ -1433,6 +1574,15 @@ class ExpertLoadMonitor:
         self._num_layers = num_layers
         self._num_physical = num_physical
         self._device = device
+
+    def enable_decode_load(self) -> None:
+        """Allocate the decode load accumulator (before cudagraph capture)."""
+        if self._cur_pass_count is not None and self._decode_load is None:
+            self._decode_load = torch.zeros_like(self._cur_pass_count)
+
+    @property
+    def decode_load_enabled(self) -> bool:
+        return self._decode_load is not None
 
     def initialize_for_metadata(self, meta: ExpertLocationMetadata) -> None:
         """Preallocate fixed-address load tensors for all EPLB layers."""
@@ -1507,20 +1657,27 @@ class ExpertLoadMonitor:
                 tuple(topk_physical.shape),
             )
 
-    def on_forward_end(self, is_dummy_run: bool, is_pure_prefill: bool = True) -> None:
+    def on_forward_end(
+        self,
+        is_dummy_run: bool,
+        is_pure_prefill: bool = True,
+        is_pure_decode: bool = False,
+    ) -> None:
         # Commit this pass's load to the sliding window ONLY on a real
         # (non-dummy) pure-prefill forward -- EPLB balances on prefill load
         # only, so decode / DP-mixed / dummy passes are dropped here. Committing
         # is a purely local op, so gating it per-rank never desyncs the
         # (step-driven, collective) rebalance -- lockstep is enforced separately
         # by on_forward_pass_end, which advances on a group-uniform prefill flag.
-        if (
-            not self.enabled
-            or is_dummy_run
-            or not is_pure_prefill
-            or self._cur_pass_count is None
-            or self._expert_load_window is None
-        ):
+        # Pure-decode passes go to the decode accumulator when it is enabled.
+        if not self.enabled or is_dummy_run or self._cur_pass_count is None:
+            return
+        if is_pure_decode:
+            if self._decode_load is not None:
+                self._decode_load.add_(self._cur_pass_count)
+                self._decode_steps += 1
+            return
+        if not is_pure_prefill or self._expert_load_window is None:
             return
         self._expert_load_window[self._slot].copy_(self._cur_pass_count)
         self._slot = (self._slot + 1) % self.window_size
@@ -1533,7 +1690,28 @@ class ExpertLoadMonitor:
             local = torch.zeros_like(self._cur_pass_count)
         else:
             local = self._expert_load_window[: self._filled].sum(dim=0)
+        return self._reduce_load(local)
 
+    def dump_global_decode_stats(self) -> tuple[torch.Tensor, float] | None:
+        """(global decode load [L, P], mean pure-decode steps per rank) since the
+        last reset; one all-reduce carries both."""
+        if self._decode_load is None:
+            return None
+        load = self._decode_load
+        steps = torch.tensor(
+            [self._decode_steps], dtype=torch.int64, device=load.device
+        )
+        out = self._reduce_load(torch.cat([load.flatten().to(torch.int64), steps]))
+        group = self._load_group if self._load_group is not None else get_tp_group()
+        world_size = max(1, int(getattr(group, "world_size", 1)))
+        return out[:-1].view_as(load).to(torch.int32), float(out[-1]) / world_size
+
+    def reset_decode_load(self) -> None:
+        if self._decode_load is not None:
+            self._decode_load.zero_()
+        self._decode_steps = 0
+
+    def _reduce_load(self, local: torch.Tensor) -> torch.Tensor:
         group = self._load_group if self._load_group is not None else get_tp_group()
         world_size = int(getattr(group, "world_size", 1))
         if world_size > 1:
@@ -1545,7 +1723,9 @@ class ExpertLoadMonitor:
             # load as int32 for the same reason). The previous path routed the
             # counts through aiter's float custom all-reduce + round, which relied
             # on FP determinism to stay bit-identical across ranks.
-            device_group = getattr(group, "device_group", None)
+            device_group = self._load_device_group or getattr(
+                group, "device_group", None
+            )
             if device_group is not None:
                 global_load = local.to(torch.int64)
                 torch.distributed.all_reduce(
@@ -1651,6 +1831,12 @@ class EPLBManager:
         rebalance_min_balancedness: float,
         rebalance_balancedness_agg: str,
         placement_policy: str = "naive",
+        decode_rebalance_interval: int = 0,
+        decode_max_swaps_per_layer: int = 8,
+        decode_min_swap_gain: float = 0.03,
+        decode_max_rebalances: int = 0,
+        decode_swap_policy: str = "greedy_hot_cold",
+        decode_min_layer_balancedness: float = 0.9,
     ):
         self.enabled = enabled
         self.monitor = monitor
@@ -1658,9 +1844,10 @@ class EPLBManager:
         self.rebalance_min_balancedness = float(rebalance_min_balancedness)
         self.rebalance_balancedness_agg = str(rebalance_balancedness_agg).lower()
         self.placement_policy = str(placement_policy).lower().strip()
-        assert self.rebalance_interval > 0, "eplb_rebalance_interval must be > 0"
+        assert self.rebalance_interval >= 0, "eplb_rebalance_interval must be >= 0"
         assert (
-            self.rebalance_interval >= self.monitor.window_size
+            self.rebalance_interval == 0
+            or self.rebalance_interval >= self.monitor.window_size
         ), "eplb_rebalance_interval must be >= eplb_load_window_size"
         assert self.rebalance_balancedness_agg in (
             "min",
@@ -1669,7 +1856,19 @@ class EPLBManager:
         # 0 = rebalance for the life of the process.
         self.max_rebalances = max(0, envs.ATOM_EPLB_MAX_REBALANCES)
         self._rebalancing_stopped = False
-        self._gen = self._entrypoint()
+        self._gen = self._entrypoint() if self.rebalance_interval > 0 else None
+        self.decode_rebalance_interval = max(0, int(decode_rebalance_interval))
+        self.decode_max_swaps_per_layer = int(decode_max_swaps_per_layer)
+        self.decode_min_swap_gain = float(decode_min_swap_gain)
+        self.decode_max_rebalances = max(0, int(decode_max_rebalances))
+        self.decode_swap_policy = str(decode_swap_policy)
+        assert self.decode_swap_policy in DecodeSwapPolicy.POLICIES
+        self.decode_min_layer_balancedness = float(decode_min_layer_balancedness)
+        self._decode_gen = (
+            self._decode_entrypoint() if self.decode_rebalance_interval > 0 else None
+        )
+        self._decode_stopped = False
+        self._decode_rebalance_count = 0
         self._rebalance_count = 0
         self._last_balancedness: float | None = None
         self.live_metadata: ExpertLocationMetadata | None = None
@@ -1789,7 +1988,6 @@ class EPLBManager:
             from aiter.dist.parallel_state import get_ep_group
 
             ep = get_ep_group()
-            self.monitor.set_load_group(ep)
             self._ep_group = ep.device_group
             self._ep_rank = int(ep.rank_in_group)
             # Dedicated communicator for migration P2P (same members/order as the
@@ -1799,6 +1997,10 @@ class EPLBManager:
             # new_group is collective over the default group; every rank calls it.
             ep_global_ranks = torch.distributed.get_process_group_ranks(self._ep_group)
             self._migration_group = torch.distributed.new_group(ranks=ep_global_ranks)
+            # Reduce the load on the migration group too: its communicator is
+            # built at init, while the EP group's RCCL communicator is otherwise
+            # unused here and would cost ~2.8 GB per GPU on the first rebalance.
+            self.monitor.set_load_group(ep, device_group=self._migration_group)
             # If the DP group is exactly the migration group, the DP sync's
             # any_rank_has_prefill already spans it -> reuse it (free). Otherwise
             # keep False and OR the prefill flag over the migration group ourselves.
@@ -1842,6 +2044,8 @@ class EPLBManager:
             ep_rank,
         )
         self.monitor.initialize_for_metadata(self.live_metadata)
+        if self._decode_gen is not None:
+            self.monitor.enable_decode_load()
         # Initialize redundant physical slots the checkpoint loader left empty.
         # At init the weights are loaded, the EP group is up, and no forward has
         # run yet -- an idle window for the one-time trivial copy.
@@ -1851,6 +2055,46 @@ class EPLBManager:
         # asymmetric P2P operations involving only a subset of EP ranks.
         torch.distributed.barrier(group=self._migration_group)
         self.fill_redundant()
+        if self._gen is not None or self._decode_gen is not None:
+            self._warm_up_migration_p2p()
+
+    def _warm_up_migration_p2p(self) -> None:
+        """Send an expert with every peer once before KV-cache sizing. RCCL
+        sets up P2P connections on first use and allocates ~0.45 GB per GPU for
+        them; left to the first migration, that allocation can come when the KV
+        cache has filled the GPU, and RCCL hangs while connecting."""
+        if self._ep_group is None or not self._moe_layers:
+            return
+        assert self._reusable_temp_buffers is not None
+        group = self._migration_group
+        me = torch.distributed.get_rank(group)
+        weights = self._expert_weights_of_layer[min(self._moe_layers)]
+        ops = []
+        for peer in range(torch.distributed.get_world_size(group)):
+            if peer == me:
+                continue
+            global_peer = torch.distributed.get_global_rank(group, peer)
+            for w, b in zip(weights, self._reusable_temp_buffers):
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        _as_p2p_bytes(w[0]),
+                        global_peer,
+                        group,
+                    )
+                )
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        _as_p2p_bytes(b[peer % b.shape[0]]),
+                        global_peer,
+                        group,
+                    )
+                )
+        for req in torch.distributed.batch_isend_irecv(ops):
+            req.wait()
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=group)
 
     def _collect_expert_weight_tensors(self, layer: Any) -> list[torch.Tensor]:
         assert self.live_metadata is not None
@@ -2079,10 +2323,13 @@ class EPLBManager:
         local_has_prefill: bool,
         dp_any_has_prefill: bool | None = None,
     ) -> None:
-        # Once stopped there is nothing left to schedule, so skip the per-step
-        # has-prefill reduction too. The stop latches on the same step on every
-        # rank (rebalance counts move in lockstep), so all ranks skip it together.
-        if not self.enabled or self._rebalancing_stopped:
+        # Prefill and decode rebalancing are switched on independently. Once
+        # neither has anything left to schedule, skip the per-step has-prefill
+        # reduction too. Stops latch on the same step on every rank (rebalance
+        # counts move in lockstep), so all ranks skip it together.
+        prefill_active = self._gen is not None and not self._rebalancing_stopped
+        decode_active = self._decode_gen is not None and not self._decode_stopped
+        if not self.enabled or not (prefill_active or decode_active):
             return
 
         # Resolve a migration-group-uniform has-prefill flag.
@@ -2102,9 +2349,13 @@ class EPLBManager:
             has_prefill = bool(flag.item())
 
         if not has_prefill:
-            # Pure-decode step across the migration group: do not advance.
+            # Pure-decode step across the migration group: only the decode
+            # schedule advances.
+            if decode_active:
+                next(self._decode_gen)
             return
-        next(self._gen)
+        if prefill_active:
+            next(self._gen)
 
     def trigger_offline_rebalance(self, reason: str = "manual") -> None:
         if not self.enabled:
@@ -2148,6 +2399,152 @@ class EPLBManager:
             self._rebalance_count,
             self.max_rebalances,
         )
+
+    @property
+    def decode_rebalance_count(self) -> int:
+        return self._decode_rebalance_count
+
+    def _decode_entrypoint(self):
+        while not (0 < self.decode_max_rebalances <= self._decode_rebalance_count):
+            for _ in range(self.decode_rebalance_interval):
+                yield
+            yield from self._decode_rebalance()
+        self._decode_stopped = True
+        logger.info(
+            "EPLB decode swap stopped after %d rebalances", self._decode_rebalance_count
+        )
+        while True:
+            yield
+
+    def _decode_rebalance(self):
+        """Swap a few experts per layer by the decode load since the last change."""
+        import time as _time
+
+        if self.live_metadata is None or self._ep_group is None:
+            return
+        _t0 = _time.perf_counter()
+        stats = self.monitor.dump_global_decode_stats()
+        self.monitor.reset_decode_load()
+        if stats is None:
+            return
+        load, steps = stats
+        load = load.cpu()
+        _t1 = _time.perf_counter()
+        m = self.live_metadata
+        old_p2l = m.physical_to_logical_map
+        policy = DecodeSwapPolicy(
+            self.decode_swap_policy,
+            num_gpus=m.ep_size,
+            max_swaps_per_layer=self.decode_max_swaps_per_layer,
+            min_gain=self.decode_min_swap_gain,
+            min_layer_balancedness=self.decode_min_layer_balancedness,
+        )
+        swaps = [
+            s for s in policy.plan(load, old_p2l, steps) if s.layer in self._moe_layers
+        ]
+        layer_ids = sorted({s.layer for s in swaps})
+        _t2 = _time.perf_counter()
+        new_meta = None
+        if layer_ids:
+            new_meta = self._metadata_for_layers(
+                apply_swaps(old_p2l.cpu(), swaps), layer_ids
+            )
+        _t3 = _time.perf_counter()
+        if m.ep_rank == 0:
+            new_load = apply_swaps(load, swaps)
+            act, new_act = (policy.activation(x, steps) for x in (load, new_load))
+            logger.info(
+                "EPLB decode swap (%s): steps=%.0f tokens bal min %.3f->%.3f "
+                "mean %.3f->%.3f; activation bal min %.3f->%.3f mean %.3f->%.3f; "
+                "swaps=%d over %d layers, %d layers >= %.2f skipped; "
+                "reduce=%.1fms plan=%.1fms meta=%.1fms",
+                policy.name,
+                steps,
+                self._compute_balancedness(load, "min"),
+                self._compute_balancedness(new_load, "min"),
+                self._compute_balancedness(load, "mean"),
+                self._compute_balancedness(new_load, "mean"),
+                self._compute_balancedness(act, "min"),
+                self._compute_balancedness(new_act, "min"),
+                self._compute_balancedness(act, "mean"),
+                self._compute_balancedness(new_act, "mean"),
+                len(swaps),
+                len(layer_ids),
+                policy.skipped_layers,
+                policy.min_layer_balancedness,
+                (_t1 - _t0) * 1000.0,
+                (_t2 - _t1) * 1000.0,
+                (_t3 - _t2) * 1000.0,
+            )
+        if new_meta is None:
+            return
+        self._decode_rebalance_count += 1
+        yield from self._migrate_layers(
+            new_meta, layer_ids, f"decode swap #{self._decode_rebalance_count}"
+        )
+
+    def _metadata_for_layers(
+        self, p2l: torch.Tensor, layer_ids: list[int]
+    ) -> ExpertLocationMetadata:
+        """Live metadata with only `layer_ids` rebuilt from `p2l`; the commit
+        copies just those layers, so the others are never read."""
+        m = self.live_metadata
+        assert m is not None
+        out = [
+            t.clone()
+            for t in (
+                m.physical_to_logical_map,
+                m.logical_to_physical_map,
+                m.logical_replica_count,
+                m.logical_to_rank_dispatch_physical_map,
+            )
+        ]
+        for layer in layer_ids:
+            new = ExpertLocationMetadata.from_rebalance_result(
+                **self._placement_rows(p2l[layer : layer + 1]),
+                ep_size=m.ep_size,
+                ep_rank=m.ep_rank,
+                max_num_replicas=m.max_num_replicas,
+            )
+            for dst, src in zip(
+                out,
+                (
+                    new.physical_to_logical_map,
+                    new.logical_to_physical_map,
+                    new.logical_replica_count,
+                    new.logical_to_rank_dispatch_physical_map,
+                ),
+            ):
+                dst[layer].copy_(src[0])
+        return ExpertLocationMetadata(
+            num_layers=m.num_layers,
+            num_logical_experts=m.num_logical_experts,
+            num_physical_experts=m.num_physical_experts,
+            max_num_replicas=m.max_num_replicas,
+            ep_size=m.ep_size,
+            ep_rank=m.ep_rank,
+            num_local_physical_experts=m.num_local_physical_experts,
+            physical_to_logical_map=out[0],
+            logical_to_physical_map=out[1],
+            logical_replica_count=out[2],
+            expert_map=m.expert_map,
+            logical_to_rank_dispatch_physical_map=out[3],
+        )
+
+    def _placement_rows(self, p2l: torch.Tensor) -> dict[str, torch.Tensor]:
+        assert self.live_metadata is not None
+        num_logical = self.live_metadata.num_logical_experts
+        rows = [_rebuild_placement_from_p2l(r, num_logical) for r in p2l]
+        new_p2l = torch.stack([r[0] for r in rows])
+        phyrank = torch.stack([r[1] for r in rows])
+        logcnt = torch.stack([r[2] for r in rows])
+        return {
+            "physical_to_logical_map": new_p2l,
+            "logical_to_physical_map": _build_logical_to_physical_map(
+                new_p2l, phyrank, logcnt
+            ),
+            "logical_replica_count": logcnt,
+        }
 
     def _rebalance(self):
         """Periodic rebalance generator (with balancedness gate).
@@ -2238,7 +2635,15 @@ class EPLBManager:
         )
 
         self._log_rebalance_metrics(rc=_rc, logical_load=logical_load, logcnt=logcnt)
+        yield from self._migrate_layers(new_meta, layer_ids, f"rebalance #{_rc}")
 
+    def _migrate_layers(self, new_meta, layer_ids: list[int], label: str):
+        import time as _time
+
+        assert self.live_metadata is not None
+        _ep_rank = self.live_metadata.ep_rank
+        chunk_size = max(1, int(self._rebalance_layers_per_chunk))
+        num_chunks = (len(layer_ids) + chunk_size - 1) // chunk_size
         for start in range(0, len(layer_ids), chunk_size):
             chunk = layer_ids[start : start + chunk_size]
             yield
@@ -2265,14 +2670,16 @@ class EPLBManager:
                 # if needed, just refresh relayer expert_map/mask here
             _chunk_ms = (_time.perf_counter() - _tc) * 1000.0
             logger.info(
-                "EPLB rebalance #%d ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
-                _rc,
+                "EPLB %s ep_rank=%d chunk %d/%d layers=%s migrate=%.1fms",
+                label,
                 _ep_rank,
                 start // chunk_size + 1,
                 num_chunks,
                 chunk,
                 _chunk_ms,
             )
+        # Decode load is per physical slot; it is stale once placement moves.
+        self.monitor.reset_decode_load()
 
     def _log_rebalance_metrics(
         self, *, rc: int, logical_load: torch.Tensor, logcnt: torch.Tensor
@@ -2335,7 +2742,9 @@ class EPLBManager:
         self._last_balancedness = balancedness
         return balancedness
 
-    def _compute_balancedness(self, physical_load: torch.Tensor) -> float:
+    def _compute_balancedness(
+        self, physical_load: torch.Tensor, agg: str | None = None
+    ) -> float:
         # Per-GPU balancedness of the live placement on THIS window, from the
         # MEASURED per-physical-slot load: sum each GPU's contiguous slot block
         # into a per-(layer, GPU) load, take per-layer mean/max over GPUs, then
@@ -2356,7 +2765,7 @@ class EPLBManager:
         per_layer_bal = torch.ones_like(per_layer_mean)
         nonzero = per_layer_max > 0
         per_layer_bal[nonzero] = per_layer_mean[nonzero] / per_layer_max[nonzero]
-        if self.rebalance_balancedness_agg == "mean":
+        if (agg or self.rebalance_balancedness_agg) == "mean":
             return float(per_layer_bal.mean().item())
         return float(per_layer_bal.min().item())
 
@@ -2369,6 +2778,12 @@ def get_eplb_manager(
     rebalance_min_balancedness: float,
     rebalance_balancedness_agg: str,
     placement_policy: str = "naive",
+    decode_rebalance_interval: int = 0,
+    decode_max_swaps_per_layer: int = 8,
+    decode_min_swap_gain: float = 0.03,
+    decode_max_rebalances: int = 0,
+    decode_swap_policy: str = "greedy_hot_cold",
+    decode_min_layer_balancedness: float = 0.9,
 ) -> EPLBManager:
     global _MANAGER
     if (
@@ -2381,6 +2796,7 @@ def get_eplb_manager(
         or _MANAGER.rebalance_balancedness_agg
         != str(rebalance_balancedness_agg).lower()
         or _MANAGER.placement_policy != str(placement_policy).lower().strip()
+        or _MANAGER.decode_rebalance_interval != max(0, int(decode_rebalance_interval))
     ):
         _MANAGER = EPLBManager(
             enabled=enabled,
@@ -2389,6 +2805,12 @@ def get_eplb_manager(
             rebalance_min_balancedness=rebalance_min_balancedness,
             rebalance_balancedness_agg=rebalance_balancedness_agg,
             placement_policy=placement_policy,
+            decode_rebalance_interval=decode_rebalance_interval,
+            decode_max_swaps_per_layer=decode_max_swaps_per_layer,
+            decode_min_swap_gain=decode_min_swap_gain,
+            decode_max_rebalances=decode_max_rebalances,
+            decode_swap_policy=decode_swap_policy,
+            decode_min_layer_balancedness=decode_min_layer_balancedness,
         )
     return _MANAGER
 
@@ -2409,6 +2831,12 @@ def _get_configured_eplb_manager() -> EPLBManager | None:
         rebalance_min_balancedness=cfg.eplb_config.rebalance_min_balancedness,
         rebalance_balancedness_agg=cfg.eplb_config.rebalance_balancedness_agg,
         placement_policy=cfg.eplb_config.placement_policy,
+        decode_rebalance_interval=cfg.eplb_config.decode_rebalance_interval,
+        decode_max_swaps_per_layer=cfg.eplb_config.decode_max_swaps_per_layer,
+        decode_min_swap_gain=cfg.eplb_config.decode_min_swap_gain,
+        decode_max_rebalances=cfg.eplb_config.decode_max_rebalances,
+        decode_swap_policy=cfg.eplb_config.decode_swap_policy,
+        decode_min_layer_balancedness=cfg.eplb_config.decode_min_layer_balancedness,
     )
 
 
@@ -2471,8 +2899,12 @@ def with_eplb_forward_monitor(fn):
                 getattr(batch, "total_tokens_num_prefill", 0) > 0
                 and getattr(batch, "total_tokens_num_decode", 0) == 0
             )
+            is_pure_decode = (
+                getattr(batch, "total_tokens_num_decode", 0) > 0
+                and getattr(batch, "total_tokens_num_prefill", 0) == 0
+            )
             # Recording gate commits clean load on pure-prefill only (local op).
-            monitor.on_forward_end(is_dummy_run, is_pure_prefill)
+            monitor.on_forward_end(is_dummy_run, is_pure_prefill, is_pure_decode)
             # Step gate advances on prefill ACTIVITY (has-prefill), reduced to a
             # group-uniform flag. Coincides with the pure-prefill commit above
             # under the no-mixed-batch invariant (see on_forward_pass_end).
@@ -2619,6 +3051,7 @@ if _EPLB_HAS_TRITON:
         cnt_ptr,  # [num_logical]    replica count per logical
         out_ids_ptr,  # [numel]          output physical ids (in dtype)
         load_ptr,  # [num_physical]   _cur_pass_count[layer_id]
+        pad_ptr,  # [numel // TOP_K]  1 = pad row (read only when HAS_PAD)
         num_logical,
         id_delta,
         num_physical,
@@ -2627,6 +3060,7 @@ if _EPLB_HAS_TRITON:
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,  # next_pow2(num_physical + 1); last bins hold oob
         TOP_K: tl.constexpr,
+        HAS_PAD: tl.constexpr,
     ):
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -2652,6 +3086,9 @@ if _EPLB_HAS_TRITON:
         # out-of-range / masked-off lanes -> sentinel bin (== num_physical),
         # excluded from the store below so they never touch load_ptr.
         in_range = mask & (phys >= 0) & (phys < num_physical)
+        if HAS_PAD:
+            is_pad = tl.load(pad_ptr + token_idx, mask=mask, other=0)
+            in_range = in_range & (is_pad == 0)
         bin_idx = tl.where(in_range, phys, num_physical).to(tl.int32)
         hist = tl.histogram(bin_idx, NUM_BINS)
         bins = tl.arange(0, NUM_BINS)
@@ -2709,12 +3146,18 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
     from atom.config import get_current_atom_config
 
     load_buf = None
+    pad_rows = None
     atom_cfg = get_current_atom_config()
     if bool(getattr(atom_cfg, "eplb_enable", False)):
         monitor = get_expert_load_monitor(
             enabled=True, window_size=atom_cfg.eplb_config.load_window_size
         )
         load_buf = monitor.pass_count_buffer(layer_id, num_physical)
+        # Decode passes carry CUDA-graph / DP pad rows; keep them out of the load.
+        if load_buf is not None and monitor.decode_load_enabled:
+            from atom.utils.forward_context import step_pad_rows
+
+            pad_rows = step_pad_rows(int(topk_ids.shape[0]))
     record = load_buf is not None
 
     out = torch.empty_like(topk_ids)
@@ -2734,6 +3177,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             cnt,
             out,
             load_buf,
+            pad_rows.view(torch.uint8) if pad_rows is not None else out,
             num_logical,
             id_delta,
             num_physical,
@@ -2742,6 +3186,7 @@ def eplb_map_and_record_fused(layer: Any, topk_ids: torch.Tensor) -> torch.Tenso
             BLOCK=256,
             NUM_BINS=num_bins,
             TOP_K=top_k,
+            HAS_PAD=pad_rows is not None,
         )
     else:
         _eplb_remap_kernel[grid](
