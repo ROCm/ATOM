@@ -406,8 +406,10 @@ def _get_dp_session_affinity_ids(
     When its Dynamo-affinity header option is enabled it also sends the parent
     session ID for forked agent trees. CoreManager retains that lineage for
     observability but deliberately assigns each child correlation ID its own
-    strict cache owner, matching SGLang's agentic routing. Clients without a
-    session header retain normal DP load balancing.
+    strict cache owner, matching SGLang's agentic routing. The MLPerf Endpoints
+    agentic client instead sends ``X-Session-ID`` on every turn of a
+    conversation. Clients without a session header retain normal DP load
+    balancing.
     """
     if os.environ.get("ATOM_DP_SESSION_AFFINITY", "0").lower() not in {
         "1",
@@ -419,9 +421,11 @@ def _get_dp_session_affinity_ids(
     if raw_request is None:
         return None, None
 
-    session_id = raw_request.headers.get(
-        "x-dynamo-session-id"
-    ) or raw_request.headers.get("x-correlation-id")
+    session_id = (
+        raw_request.headers.get("x-dynamo-session-id")
+        or raw_request.headers.get("x-session-id")
+        or raw_request.headers.get("x-correlation-id")
+    )
     parent_id = raw_request.headers.get("x-dynamo-parent-session-id")
     return session_id, parent_id
 
