@@ -623,8 +623,13 @@ class FakeCudart:
 
 
 def scaled_table() -> HostEmbeddingTable:
-    """A table whose values and scales are two separate registrations."""
-    scale = torch.ones(4, 2, dtype=torch.float8_e8m0fnu)
+    """A table whose values and scales are two separate registrations.
+
+    The scales live in their own large (page-aligned) allocation: two small
+    tensors can share a page, and a shared page is registered only once.
+    """
+    codes = torch.full((1 << 20,), 127, dtype=torch.uint8)  # 2**0 == 1.0
+    scale = codes[:8].view(torch.float8_e8m0fnu).view(4, 2)
     return HostEmbeddingTable(torch.ones(4, 8), num_rows=4, head_dim=8, scale=scale)
 
 
@@ -664,6 +669,103 @@ def test_enabling_the_same_range_twice_registers_once(monkeypatch):
     assert table.enable_uva(0, 4) is True
     assert table.enable_uva(0, 4) is True
     assert cudart.calls == 2
+
+
+class OverlapRefusingCudart:
+    """Like HIP: a range overlapping one already registered is refused."""
+
+    def __init__(self):
+        self.ranges = {}  # base -> end
+
+    def cudaHostRegister(self, ptr, size, flags):
+        if any(ptr < end and base < ptr + size for base, end in self.ranges.items()):
+            return 712  # hipErrorHostMemoryAlreadyRegistered
+        self.ranges[ptr] = ptr + size
+        return 0
+
+    def cudaHostUnregister(self, ptr):
+        del self.ranges[ptr]
+        return 0
+
+
+@pytest.fixture(autouse=True)
+def fresh_page_runs(monkeypatch):
+    """A clean process-wide page registry, so tests do not share runs."""
+    from atom.model_ops.engram import tables
+
+    monkeypatch.setattr(tables, "_PAGE_RUNS", tables._PageRuns())
+
+
+def adjacent_tables(rows=1000, width=8):
+    """Two tables back to back in one buffer, the boundary inside a page.
+
+    Like a layer's scales and values in its checkpoint shard, both registered
+    whole by a rank that holds every hash head (one DP-attention rank per GPU).
+    """
+    buf = torch.ones(2 * rows, width)
+    assert (rows * width * buf.element_size()) % HostEmbeddingTable._PAGE
+    return buf, [
+        HostEmbeddingTable(buf[i * rows : (i + 1) * rows], rows, width)
+        for i in range(2)
+    ]
+
+
+def test_adjacent_tables_share_their_boundary_page(monkeypatch, fresh_page_runs):
+    cudart = OverlapRefusingCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    _, (first, second) = adjacent_tables()
+    assert first.enable_uva() is True
+    assert second.enable_uva() is True
+    # The shared page stays locked while the second table still reads it.
+    first.disable_uva()
+    assert cudart.ranges
+    second.disable_uva()
+    assert cudart.ranges == {}
+
+
+def test_refused_registration_releases_the_shared_runs(monkeypatch, fresh_page_runs):
+    cudart = OverlapRefusingCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    _, (first, second) = adjacent_tables()
+    assert first.enable_uva() is True
+    held = dict(cudart.ranges)
+    # Something outside the registry already holds the second table's tail.
+    tail = second._tensor.data_ptr() + second._tensor.nbytes - 1
+    cudart.ranges[tail - tail % HostEmbeddingTable._PAGE] = tail + 1
+    assert second.enable_uva() is False
+    assert second._uva is None
+    del cudart.ranges[tail - tail % HostEmbeddingTable._PAGE]
+    assert cudart.ranges == held  # the first table's pages are untouched
+    first.disable_uva()
+    assert cudart.ranges == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_adjacent_tables_register_on_the_device(fresh_page_runs):
+    _, tables_ = adjacent_tables(rows=4099, width=128)
+    assert all(t.enable_uva() for t in tables_)
+    for t in tables_:
+        t.disable_uva()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ROCm GPU required")
+def test_refused_registration_leaves_pinned_allocation_working(fresh_page_runs):
+    """A refused `cudaHostRegister` must not poison the host-path fallback."""
+    buf, (table, _) = adjacent_tables(rows=4099, width=128)
+    rt = torch.cuda.cudart()
+    page = HostEmbeddingTable._PAGE
+    base = buf.data_ptr() - buf.data_ptr() % page
+    assert int(rt.cudaHostRegister(base, page, 0)) == 0
+    try:
+        assert table.enable_uva() is False
+        # The host path's staging buffer: a pinned tensor and its device twin.
+        # The refusal was left as HIP's last error, which the next kernel
+        # launch's check raised ("already mapped").
+        cpu = torch.zeros(1024, pin_memory=True)
+        torch.zeros_like(cpu, device="cuda")
+        torch.cuda.synchronize()
+    finally:
+        rt.cudaHostUnregister(base)
 
 
 class FakeGroup:
