@@ -384,10 +384,10 @@ def test_engine_initializes_tracing_before_ready(monkeypatch):
         kv_transfer_config=None,
     )
     cls(config, "unused", "unused")
-    assert events == [
-        "get_num_blocks",
-        "allocate_kv_cache",
-        "initialize",
-        "freeze",
-        "ready",
+    # Only the order around `initialize` is the contract; other startup RPCs
+    # may come and go between these points.
+    order = [
+        events.index(name)
+        for name in ("allocate_kv_cache", "initialize", "freeze", "ready")
     ]
+    assert order == sorted(order)

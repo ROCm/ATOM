@@ -526,7 +526,7 @@ def _graph_sync(across, prefill, tbo=False, eager=False):
 BUCKETS = (128, 256, 384, 512)
 
 
-def _bucket(tokens, is_prefill, sync):
+def _bucket(is_prefill, sync):
     """This rank's bucket and the running table it settles in place, on a
     step graphable unless the group needs eager or splits into TBO."""
     graphable = not (sync.any_rank_needs_eager or sync.tbo_collective_active)
@@ -536,9 +536,7 @@ def _bucket(tokens, is_prefill, sync):
         "captured_sizes",
         staticmethod(lambda phase=None: BUCKETS if phase == "prefill" else ()),
     ):
-        own = ForwardMode._pad_to_token_graph(
-            tokens, is_prefill, graphable, sync, running
-        )
+        own = ForwardMode._pad_to_token_graph(is_prefill, graphable, sync, running)
     return own, running.tolist()
 
 
@@ -546,7 +544,7 @@ def test_one_rank_pads_its_prefill_to_the_smallest_bucket_that_holds_it():
     """A group of one is a table of one row, padded like any other."""
 
     def bucket(tokens):
-        return _bucket(tokens, True, _graph_sync([tokens], prefill=(1,)))
+        return _bucket(True, _graph_sync([tokens], prefill=(1,)))
 
     assert bucket(300) == (384, [384])
     assert bucket(600) == (0, [600])
@@ -555,9 +553,15 @@ def test_one_rank_pads_its_prefill_to_the_smallest_bucket_that_holds_it():
 def test_only_prefilling_ranks_pad_in_the_table():
     # A prefill beside a peer decoding its own 6 rows.
     sync = _graph_sync([300, 6], prefill=(1, 0))
-    assert _bucket(300, True, sync) == (384, [384, 6])
+    assert _bucket(True, sync) == (384, [384, 6])
     # A peer off the token graph still bounds its dispatch by the padded count.
-    assert _bucket(6, False, sync) == (0, [384, 6])
+    assert _bucket(False, sync) == (0, [384, 6])
+
+
+def test_every_prefilling_rank_replays_the_groups_bucket():
+    """An idle peer's dummy prefill (one row) replays the prefilling rank's
+    bucket: ranks on different buckets hung the group."""
+    assert _bucket(True, _graph_sync([300, 1], (1, 1))) == (384, [384, 384])
 
 
 def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
@@ -566,7 +570,7 @@ def test_no_token_graph_when_a_rank_refuses_or_exceeds_the_largest_bucket():
         _graph_sync([100, 50], (1, 0), eager=True),
         _graph_sync([100, 900], (1, 1)),
     ):
-        own, running = _bucket(100, True, sync)
+        own, running = _bucket(True, sync)
         assert own == 0
         assert running == sync.scheduled_tokens_per_dp_rank.tolist()
 
