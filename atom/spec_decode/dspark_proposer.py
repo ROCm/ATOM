@@ -1,7 +1,6 @@
 import logging
 from contextlib import nullcontext
 
-import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -19,7 +18,7 @@ from atom.model_ops.rejection_sampler import ratio_verify_scratch_bytes
 from atom.model_ops.sampler import SAMPLER_EPS
 from atom.models.dspark_draft import DraftSampling
 from atom.spec_decode.draft_graph import DraftGraph, StagedInput
-from atom.spec_decode.draft_q_slots import DraftQSlots
+from atom.spec_decode.draft_q_slots import DraftQSlots, DraftQStaging
 from atom.spec_decode.drafter import AuxCaptureSpec, Drafter
 from atom.spec_decode.dspark_verify import VerifyScheduler
 from atom.utils import CpuGpuBuffer, envs
@@ -104,16 +103,8 @@ class DSparkProposer(Drafter):
         """
         self.draft_sampling = None
         self._q_store = None
-        self._q_slots = None
-        self._draft_sample_step = 0
-        # Generations of `stage_draft_sampling_host` and of `propose`: every
-        # propose must consume a staging of its own, or the captured head would
-        # write q through a previous step's row bases into slots that may
-        # belong to other requests by now.
-        self._staging_gen = 0
-        self._drafted_gen = 0
-        # Leading entries of the draft row base that may still name a slot.
-        self._draft_row_base_hi = 0
+        # The host-side staging policy and slot map (`DraftQStaging`).
+        self._staging = None
         if not envs.ATOM_SPEC_LOSSLESS_SAMPLING:
             return
         model = getattr(self, "model", None)
@@ -191,7 +182,6 @@ class DSparkProposer(Drafter):
         self._q_store = torch.empty(
             (q_slots * t, vocab), dtype=torch.float32, device=self.device
         )
-        self._q_slots = DraftQSlots(q_slots, t)
         # Everything the captured block head reads, plus the verify's row base,
         # as members of the runner's `sampling` publication: staged on the host
         # by `stage_draft_sampling_host` inside the forward's preparation window
@@ -236,6 +226,15 @@ class DSparkProposer(Drafter):
         self._draft_seed_buf = buffers["draft_sample_seed"]
         self._draft_row_base_buf = buffers["draft_q_row_base"]
         self._verify_row_base_buf = buffers["verify_q_row_base"]
+        self._staging = DraftQStaging(
+            DraftQSlots(q_slots, t),
+            temperatures=self._draft_temps_buf.np,
+            greedy_mask=self._draft_greedy_buf.np,
+            seed=self._draft_seed_buf.np,
+            dest_row_base=self._draft_row_base_buf.np,
+            verify_row_base=self._verify_row_base_buf.np,
+            greedy_threshold=SAMPLER_EPS,
+        )
         self.draft_sampling = DraftSampling(
             q_store=self._q_store,
             q_row_base=self._draft_row_base_buf.gpu,
@@ -282,93 +281,30 @@ class DSparkProposer(Drafter):
         Called from `ModelRunner.prepare_sample`, inside the forward's
         preparation window, so every member rides that function's `sampling`
         H2D. The block head is captured and bakes these buffers' addresses;
-        only their contents change, and only here.
-
-        ``has_filter``: some row carries top-k or top-p. Such a batch drafts
-        greedily, the whole of it, because the verify drops it to exact-match
-        acceptance batch-wide (`lossless_verify_inputs`).
-
-        ``drafts_verifiable``: this step's propose emits drafts a later verify
-        may read. False for a dummy forward and an align-only middle chunk,
-        whose drafts are dropped: those claim no slot and write no q, so their
-        ids (warmup's 0..n-1, the DP dummy's -1) never enter the slot map.
+        only their contents change, and only here. What goes in each row is
+        `DraftQStaging.stage`'s policy (see there for ``has_filter`` and
+        ``drafts_verifiable``); this method only publishes it.
         """
         if self.draft_sampling is None:
             return
-        temps = self._draft_temps_buf
-        mask = self._draft_greedy_buf
-        seed = self._draft_seed_buf
-        dest = self._draft_row_base_buf
-        verify = self._verify_row_base_buf
-        # The Philox key. A plain SPMD counter, so every TP rank reaches the
-        # same number without exchanging it.
-        seed.np[0] = self._draft_sample_step
-        self._draft_sample_step = (self._draft_sample_step + 1) & 0x7FFFFFFF
-        counts = group.counts
-        index = group.indices
-        counts[index["draft_sample_seed"]] = 1
-        counts[index["draft_temperatures"]] = bs or None
-        counts[index["draft_greedy_mask"]] = bs or None
-        counts[index["verify_q_row_base"]] = bs or None
-        self._staging_gen += 1
-        req_ids = batch.req_ids[:bs]
-        # Verify bases before claims: a claim may expire a request of this same
-        # batch, whose verify must still read the slot its drafts came from.
-        if batch.is_dummy_run:
-            verify.np[:bs] = -1
-        else:
-            self._q_slots.verify_bases(req_ids, verify.np)
-        # Every row the block runs must name a destination, the pad rows up to
-        # `running_bs` included, and a pad row left holding a larger previous
-        # batch's base would write its q into a live request's slot. So clear
-        # back down to wherever the last claim reached.
-        hi = max(bs, self._draft_row_base_hi)
-        if drafts_verifiable and bs:
-            # Per request, rows whose q nobody reads claim no slot and write no
-            # q (the draft still emits the argmax for them):
-            # * a greedy request: its verify is exact match against the target
-            #   argmax. Its own temperature, not the batch's draft mode -- a
-            #   filtered batch drafts greedily, but its sampled requests' q is
-            #   read once the batch is unfiltered again;
-            # * a request still mid-prompt in a mixed prefill batch: its drafts
-            #   are dropped, like a whole align-only batch's.
-            skip = batch.temperatures[:bs] <= SAMPLER_EPS
-            final_chunk = getattr(batch, "is_final_chunk", None)
-            if final_chunk is not None:
-                skip |= ~np.asarray(final_chunk[:bs], dtype=bool)
-            self._q_slots.claim_bases(req_ids, dest.np, skip if skip.any() else None)
-            dest.np[bs:hi] = -1
-            self._draft_row_base_hi = bs
-        else:
-            dest.np[:hi] = -1
-            self._draft_row_base_hi = 0
-        counts[index["draft_q_row_base"]] = hi or None
-        if not bs:
-            return
-        # The clamp `prepare_sample` applies to the target's copy, so the two
-        # divide by the same number row for row and no row divides by zero.
-        np.maximum(batch.temperatures, SAMPLER_EPS, out=temps.np[:bs])
-        if has_filter:
-            # Draft the whole batch greedily. A greedy row's draw is its
-            # logits' argmax and the q it publishes is the exact delta on that
-            # id (stage 3 of `dspark_markov_sample`), which is sound under
-            # either accept rule -- this batch's drafts may meet an unfiltered
-            # verify next step. The temperature plays no part in either.
-            mask.np[:bs] = 1
-        else:
-            # The predicate `Sampler` tests, so a row cannot be greedy to the
-            # target and stochastic to the draft.
-            mask.np[:bs] = batch.temperatures <= SAMPLER_EPS
+        rows = self._staging.stage(
+            batch, bs, has_filter=has_filter, drafts_verifiable=drafts_verifiable
+        )
+        counts, index = group.counts, group.indices
+        for name, key in (
+            ("draft_sample_seed", "seed"),
+            ("draft_temperatures", "temperatures"),
+            ("draft_greedy_mask", "greedy_mask"),
+            ("verify_q_row_base", "verify_row_base"),
+            ("draft_q_row_base", "dest_row_base"),
+        ):
+            counts[index[name]] = rows[key]
 
     def _consume_staging(self) -> None:
         """Claim this step's staging for the propose about to run, or refuse."""
         if self.draft_sampling is None:
             return
-        assert self._staging_gen != self._drafted_gen, (
-            "propose without a fresh stage_draft_sampling_host: the q row bases "
-            "are the previous step's"
-        )
-        self._drafted_gen = self._staging_gen
+        self._staging.consume()
 
     def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
         """The verify step's ``(draft_probs, q_row_base)``, or ``(None, None)``.
@@ -405,11 +341,9 @@ class DSparkProposer(Drafter):
         """Point every draft row at no q row, on the host and the device."""
         if self.draft_sampling is None:
             return
-        dest = self._draft_row_base_buf
-        dest.np[:] = -1
+        self._staging.clear_destinations()
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
-            dest.gpu.fill_(-1)
-        self._draft_row_base_hi = 0
+            self._draft_row_base_buf.gpu.fill_(-1)
 
     def _declare_draft_graphs(self):
         """The block pass, in whichever flavor this drafter is.

@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""ATOM_SPEC_LOSSLESS_SAMPLING's host side: arming, per-step staging, and the
-verify policy, run through the real `DSparkProposer` methods on CPU buffers.
+"""ATOM_SPEC_LOSSLESS_SAMPLING's proposer wiring: arming and its fallbacks, the
+publication the staged buffers ride, the draft-graph warmup, and the verify
+policy, run through the real `DSparkProposer` methods on CPU buffers.
 
-What staging owes the kernels: every row the captured block head runs names a
-destination (a slot its own request owns, or -1), every verifying request names
-the rows its drafts were drawn into (or -1), and all of it rides the protected
-`sampling` publication, so a host running ahead cannot rewrite a row base the
-GPU has yet to read.
+Imports the proposer, hence aiter, so the CPU unit job skips this file; the
+row-by-row staging policy itself is `DraftQStaging`, tested without aiter in
+`tests/test_draft_q_staging.py`.
 """
 
 from types import SimpleNamespace
@@ -19,7 +18,6 @@ from torch import nn
 pytest.importorskip("aiter", reason="the proposer imports the AITER sampler ops")
 
 from atom.model_ops.rejection_sampler import RejectionSampler
-from atom.model_ops.sampler import SAMPLER_EPS
 from atom.spec_decode import dspark_proposer
 from atom.spec_decode.drafter import Drafter
 from atom.spec_decode.dspark_proposer import DSparkProposer
@@ -182,121 +180,6 @@ def test_the_scratch_reserve_is_counted_when_armed(monkeypatch):
 # ---- staging ----------------------------------------------------------------
 
 
-def test_a_verify_finds_the_rows_its_drafts_were_written_to(monkeypatch):
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["a", "b", "c"]))
-    drafted = dict(zip("abc", dest(prop)[:3]))
-    assert verify(prop)[:3] == [-1, -1, -1], "nothing drafted before step 1"
-    # Reordered, with a request that never drafted.
-    stage(prop, batch(["c", "x", "a"]))
-    assert verify(prop)[:3] == [drafted["c"], -1, drafted["a"]]
-    # The same requests draft back into the rows they own.
-    assert dest(prop)[0] == drafted["c"] and dest(prop)[2] == drafted["a"]
-
-
-def test_a_dummy_forward_claims_nothing_and_verifies_nothing(monkeypatch):
-    """Warmup and DP dummies carry ids 0..n-1 and -1; none may enter the map,
-    or a real request 0 would later verify against a dummy's q."""
-    prop = proposer(monkeypatch)
-    stage(prop, batch([0, 1, -1], dummy=True), verifiable=False)
-    assert dest(prop)[:3] == [-1, -1, -1] and verify(prop)[:3] == [-1, -1, -1]
-    assert len(prop._q_slots) == 0
-    # A real request 0 afterwards has no q to verify.
-    stage(prop, batch([0]))
-    assert verify(prop)[0] == -1
-
-
-def test_an_align_only_propose_writes_no_q_and_keeps_other_slots(monkeypatch):
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["d"]))
-    (d,) = dest(prop)[:1]
-    counts = stage(prop, batch(["m1", "m2"]), verifiable=False)
-    assert dest(prop)[:2] == [-1, -1]
-    assert counts["draft_q_row_base"] == 2
-    assert "m1" not in prop._q_slots and "m2" not in prop._q_slots
-    stage(prop, batch(["d"]))
-    assert verify(prop)[0] == d
-
-
-def test_a_greedy_request_claims_no_slot_and_writes_no_q(monkeypatch):
-    """Its verify is exact match and never reads q; a sampled request beside
-    it, filtered batch or not, still gets the rows its q is read from."""
-    prop = proposer(monkeypatch)
-    for has_filter in (False, True):
-        stage(prop, batch(["g", "s"], [0.0, 1.0]), has_filter=has_filter)
-        assert dest(prop)[0] == -1 and dest(prop)[1] >= 0
-        assert "g" not in prop._q_slots and "s" in prop._q_slots
-    stage(prop, batch(["g", "s"], [0.0, 1.0]))
-    assert verify(prop)[0] == -1 and verify(prop)[1] == dest(prop)[1]
-
-
-def test_a_request_still_mid_prompt_claims_no_slot(monkeypatch):
-    """In a prefill batch where some requests finish their prompt and others
-    do not, the unfinished ones' drafts are dropped, so they claim nothing."""
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["done", "mid", "done2"], final_chunk=[True, False, True]))
-    assert dest(prop)[1] == -1 and dest(prop)[0] >= 0 and dest(prop)[2] >= 0
-    assert "mid" not in prop._q_slots
-    # Its final chunk later claims as usual.
-    stage(prop, batch(["mid"], final_chunk=[True]))
-    assert "mid" in prop._q_slots and dest(prop)[0] >= 0
-
-
-def test_a_smaller_batch_clears_the_larger_ones_pad_rows(monkeypatch):
-    """The block runs at `running_bs >= scheduled_bs`; a pad row still naming a
-    previous batch's slot would write its q into a live request's rows."""
-    prop = proposer(monkeypatch)
-    assert stage(prop, batch(list("abcd")))["draft_q_row_base"] == 4
-    counts = stage(prop, batch(list("ab")))
-    assert dest(prop)[2:] == [-1, -1]
-    assert counts["draft_q_row_base"] == 4, "the cleared tail is published too"
-    assert stage(prop, batch(list("ab")))["draft_q_row_base"] == 2
-
-
-def test_a_filtered_batch_drafts_greedily(monkeypatch):
-    """Only the mask changes: the delta q comes from the greedy draw itself,
-    so the temperatures stay the requests' own (clamped) ones."""
-    prop = proposer(monkeypatch)
-    stage(prop, batch(["a", "b"], [0.7, 1.3]), has_filter=True)
-    assert prop._draft_greedy_buf.np[:2].tolist() == [1, 1]
-    np.testing.assert_allclose(prop._draft_temps_buf.np[:2], [0.7, 1.3], rtol=1e-6)
-
-
-def test_an_unfiltered_batch_keeps_each_rows_temperature_and_greedy_predicate(
-    monkeypatch,
-):
-    prop = proposer(monkeypatch)
-    temps = np.array([0.0, SAMPLER_EPS, 0.7], np.float32)
-    stage(prop, batch(["a", "b", "c"], temps))
-    np.testing.assert_array_equal(
-        prop._draft_temps_buf.np[:3], np.maximum(temps, SAMPLER_EPS)
-    )
-    # The predicate `Sampler` applies, so draft and target agree on greedy.
-    assert prop._draft_greedy_buf.np[:3].tolist() == [1, 1, 0]
-
-
-def test_the_philox_key_advances_once_per_step(monkeypatch):
-    prop = proposer(monkeypatch)
-    keys = []
-    for _ in range(3):
-        stage(prop, batch(["a"]))
-        keys.append(int(prop._draft_seed_buf.np[0]))
-    assert keys == [0, 1, 2]
-
-
-def test_a_propose_needs_a_staging_of_its_own(monkeypatch):
-    """Same batch size twice in a row is not enough: each propose must consume
-    a staging of its own, or it would draft through stale row bases."""
-    prop = proposer(monkeypatch)
-    with pytest.raises(AssertionError, match="fresh stage_draft_sampling_host"):
-        prop._consume_staging()
-    for _ in range(2):
-        stage(prop, batch(["a", "b"]))
-        prop._consume_staging()
-        with pytest.raises(AssertionError):
-            prop._consume_staging()
-
-
 def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     """A recapture after a rollout sleep/wake warms the block directly, not
     through propose; whatever bases the last served step staged must not
@@ -314,7 +197,7 @@ def test_a_draft_graph_warmup_writes_through_no_row_base(monkeypatch):
     prop.warmup_draft_graphs(None, None)
     assert seen["np"] == [-1] * MAX_BS and seen["gpu"] == [-1] * MAX_BS
     # The slot map is untouched: those requests still own their q rows.
-    assert {"a", "b", "c"} <= set(prop._q_slots._slot_of)
+    assert {"a", "b", "c"} <= set(prop._staging.slots._slot_of)
 
 
 def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
