@@ -1358,6 +1358,52 @@ def minimax_m3_sparse_attn_decode_asm(
     )
 
 
+def _sparse_unified_per_row(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+    sm_scale: float,
+    output: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Run each sparse row as a length-one sequence through unified attention."""
+    from aiter.ops.triton.unified_attention import unified_attention
+
+    if (k_scale is not None and k_scale.numel() > 1) or (
+        v_scale is not None and v_scale.numel() > 1
+    ):
+        raise NotImplementedError(
+            "gfx1250 MiniMax-M3 sparse attention requires bf16 KV cache; "
+            "unified_attention cannot consume per-token fp8 KV scales"
+        )
+
+    rows = q.shape[0]
+    unified_attention(
+        q,
+        k_cache,
+        v_cache,
+        output,
+        cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device=q.device),
+        seqused_k=sparse_ctx,
+        max_seqlen_q=1,
+        max_seqlen_k=sparse_bt.shape[1] * ASM_PAGE_SIZE,
+        softmax_scale=sm_scale,
+        causal=True,
+        alibi_slopes=None,
+        window_size=(-1, -1),
+        block_table=sparse_bt,
+        softcap=0,
+        q_descale=None,
+        k_descale=k_scale,
+        v_descale=v_scale,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+
+
 @torch.no_grad()
 def _sparse_pa_per_row(
     q: torch.Tensor,  # [total_q, num_heads, head_dim==128]
@@ -1384,7 +1430,10 @@ def _sparse_pa_per_row(
     """
     from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 
-    from atom.model_ops.base_attention import run_pa_decode
+    from atom.model_ops.base_attention import (
+        gluon_decode_supports_arch,
+        run_pa_decode,
+    )
 
     assert q.shape[-1] == 128, "Paged attention here requires head_dim == 128."
     # Collapse (token, kv_head) -> row so gluon runs num_kv_heads_view == 1.
@@ -1411,6 +1460,20 @@ def _sparse_pa_per_row(
         v_scale,
         out_view,
     ):
+        return
+
+    if not gluon_decode_supports_arch():
+        _sparse_unified_per_row(
+            q_view,
+            k_cache_view,
+            v_cache_view,
+            sparse_bt,
+            sparse_ctx,
+            sm_scale,
+            out_view,
+            k_scale,
+            v_scale,
+        )
         return
 
     num_seqs = T * num_kv_heads
