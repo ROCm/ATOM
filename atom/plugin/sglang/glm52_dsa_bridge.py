@@ -958,6 +958,90 @@ def bind_glm52_dsa_cache_views(model, token_to_kv_pool) -> bool:
 # Multi-token MTP metadata shared by target_verify and draft_extend.
 
 
+_INDEX_LOGITS_WORKSPACE = None
+
+
+def _index_logits_workspace(device, width: int):
+    """One decode logits plane, shared by every GLM indexer layer.
+
+    Sized to the logits budget, not the live batch, and kept for the process.
+    A CUDA graph records the plane's address, so a later bucket must not
+    allocate a new one.
+    """
+
+    global _INDEX_LOGITS_WORKSPACE
+    device = torch.device(device)
+    current = _INDEX_LOGITS_WORKSPACE
+    if current is not None and current[1] == int(width) and current[2] == device:
+        return current[0]
+    from atom.model_ops.sparse_indexer_chunk import LogitsWorkspace
+
+    # ``for_rows`` caps the plane at the budget. Passing the width as the row
+    # count asks for that cap instead of a one-row plane.
+    workspace = LogitsWorkspace.for_rows(max(int(width), 1), int(width), device)
+    _INDEX_LOGITS_WORKSPACE = (workspace, int(width), device)
+    return workspace
+
+
+def _publish_fp8_decode_index_rows(md, atom_config) -> None:
+    """FP8 decode rows the native indexer scores after main's ``score_topk``.
+
+    One request's ``context_lens`` / ``block_tables`` row, ``max_seqlen_q``
+    query rows sharing it. DCP decode never reads these; it returns first.
+    """
+
+    context_lens = getattr(md, "context_lens", None)
+    block_tables = getattr(md, "block_tables", None)
+    if not torch.is_tensor(context_lens) or not torch.is_tensor(block_tables):
+        return
+    if int(context_lens.shape[0]) == 0:
+        return
+    from atom.model_ops.indexer.rows import fp8_rows
+
+    next_n = int(getattr(md, "max_seqlen_q", 1) or 1)
+    width = int(getattr(atom_config, "max_model_len", 0) or 0)
+    if width <= 0:
+        width = int(getattr(md, "max_seqlen_k", 1) or 1)
+    md.index_rows = fp8_rows(
+        context_lens,
+        width,
+        _index_logits_workspace(context_lens.device, width),
+        block_tables,
+        next_n=next_n,
+    )
+
+
+def _publish_fp8_prefill_index_rows(md, atom_config) -> None:
+    """FP8 prefill rows against the requests' gathered keys.
+
+    ``cu_seqlen_ke - cu_seqlen_ks`` is each query row's visible key count.
+    Runs after PCP reindex so the published bounds are the ones attention uses.
+    """
+
+    starts = getattr(md, "cu_seqlen_ks", None)
+    ends = getattr(md, "cu_seqlen_ke", None)
+    if not torch.is_tensor(starts) or not torch.is_tensor(ends):
+        return
+    if int(starts.shape[0]) == 0:
+        return
+    from atom.distributed.dcp_utils import get_dcp_rank
+    from atom.model_ops.indexer.rows import ConcatKeys, DcpSplit, concat_rows
+
+    world = int(getattr(atom_config, "decode_context_parallel_size", 1) or 1)
+    rank = get_dcp_rank() if world > 1 else 0
+    row_ends = ends - starts
+    md.index_rows = concat_rows(
+        row_ends,
+        ConcatKeys(
+            block_tables=md.block_tables,
+            cu_committed=md.cu_seqlens_k if md.has_cached else md.cu_seqlens_q,
+            total=int(md.total_kv),
+            row_starts=starts,
+        ),
+        DcpSplit.of(int(row_ends.shape[0]), rank, world),
+    )
+
+
 def build_mtp_multi_token_decode_metadata(
     forward_batch,
     positions: torch.Tensor,
@@ -1095,6 +1179,7 @@ def build_mtp_multi_token_decode_metadata(
     md.sparse_kv_last_page_lens = sparse_kv_last_page_lens
     for key, value in sparse_mtp_work.items():
         setattr(md, key, value)
+    _publish_fp8_decode_index_rows(md, atom_config)
 
     return md
 
@@ -1364,6 +1449,7 @@ def _build_mtp_draft_decode_metadata(
     md.sparse_kv_last_page_lens = sparse_kv_last_page_lens
     for key, value in sparse_mtp_work.items():
         setattr(md, key, value)
+    _publish_fp8_decode_index_rows(md, atom_config)
 
     return md
 
@@ -1490,6 +1576,7 @@ def build_decode_metadata(
     )
     md.dtype_q = dtype_q
     md.sparse_kv_last_page_lens = sparse_kv_last_page_lens
+    _publish_fp8_decode_index_rows(md, atom_config)
     return md
 
 
@@ -1725,6 +1812,7 @@ def build_mtp_draft_extend_prefill_metadata(
             atom_config=atom_config,
             dtype_q=dtype_q,
         )
+        _publish_fp8_prefill_index_rows(md, atom_config)
     else:
         ensure_shared_sparse_buffer(
             token_to_kv_pool,
@@ -1858,6 +1946,7 @@ def build_prefill_metadata(
             atom_config=atom_config,
             dtype_q=dtype_q,
         )
+        _publish_fp8_prefill_index_rows(md, atom_config)
     else:
         ensure_shared_sparse_buffer(
             token_to_kv_pool,
@@ -2112,6 +2201,7 @@ def build_atom_glm52_decode_graph_metadata_from_sglang(
     )
     md.sparse_kv_last_page_lens = bufs.kv_last_page_lens[:bs]
     md.dtype_q = dtype_q
+    _publish_fp8_decode_index_rows(md, atom_config)
     return md
 
 
