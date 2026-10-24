@@ -65,20 +65,41 @@ def replayssm_enabled() -> bool:
     ``ATOM_ENABLE_REPLAYSSM=0`` keeps the per-step snapshot path.
     ``ATOM_ENABLE_REPLAYSSM=1`` forces the ring even without server args
     (tests). Unset follows whether this process is an MTP server.
+
+    Off whenever SGLang's radix cache is on. The ring leaves a request's slot
+    holding a checkpoint plus uncommitted records rather than its state, and
+    the commit hook scatters only the conv window, so every state SGLang
+    copies into a radix track slot would be stale.
     """
+    args = _server_args()
+    radix_cache = args is not None and not bool(
+        getattr(args, "disable_radix_cache", True)
+    )
     override = envs.ATOM_ENABLE_REPLAYSSM
     if override is not None:
+        if override and radix_cache:
+            raise RuntimeError(
+                "ATOM_ENABLE_REPLAYSSM=1 cannot be combined with the SGLang "
+                "radix cache: ReplaySSM leaves no materialized GDN state for "
+                "the cache to snapshot. Unset it or pass --disable-radix-cache."
+            )
         return bool(override)
+    if radix_cache:
+        return False
     return _server_is_speculative()
 
 
-def _server_is_speculative() -> bool:
+def _server_args() -> Any:
     try:
         from sglang.srt.runtime_context import get_server_args
 
-        args = get_server_args()
+        return get_server_args()
     except Exception:  # noqa: BLE001 - unit tests have no server
-        return False
+        return None
+
+
+def _server_is_speculative() -> bool:
+    args = _server_args()
     if args is None:
         return False
     if int(getattr(args, "speculative_num_steps", 0) or 0) > 0:
