@@ -20,6 +20,7 @@ from atom.model_ops.base_attention import (
     gluon_decode_over_limit,
     run_pa_decode,
     run_pa_fwd_asm,
+    window_left,
 )
 from atom.utils import envs
 from atom.utils.decorators import mark_trace
@@ -592,9 +593,8 @@ class PagedAttentionImpl(nn.Module):
         else:
             o = torch.empty_like(q)
 
-        sliding_window = (
-            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0) if left >= 0 else (-1, -1)
         unified_attention(
             q,
             k_cache,
@@ -915,9 +915,8 @@ class PagedAttentionImpl(nn.Module):
             )
             return o if o.dtype == output_dtype else o.to(output_dtype)
 
-        sliding_window = (
-            (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0, 0) if left >= 0 else (-1, -1, 0)
         o = aiter.flash_attn_varlen_func(
             q,
             k,
@@ -959,9 +958,8 @@ class PagedAttentionImpl(nn.Module):
         else:
             o = torch.empty_like(q)
 
-        sliding_window = (
-            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
-        )
+        left = window_left(self.sliding_window)
+        sliding_window = (left, 0) if left >= 0 else (-1, -1)
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
         # For pure prefill (no cached tokens) it is, by default, the fake table
