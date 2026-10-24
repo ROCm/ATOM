@@ -957,9 +957,13 @@ def test_forward_does_not_repeat_request_admission(monkeypatch, dp_attention):
         image_mask=torch.ones(1, 1, dtype=torch.bool),
         step=SimpleNamespace(begin_forward=lambda: None, requests=()),
     )
+    # `main_stream` / `in_hipgraph`: the op is a TR-graph break, and an
+    # unrecorded break runs on the context's main stream (`eager_region`).
     context = SimpleNamespace(
         attn_metadata=metadata,
         dp_metadata=object() if dp_attention else None,
+        main_stream=None,
+        in_hipgraph=False,
     )
     monkeypatch.setattr(_forward_context_local, "ctx", context, raising=False)
     hidden = torch.empty(1, 1, 1)

@@ -38,7 +38,11 @@ def _fake_layer_output(hidden, layer_name, hidden_fp8=None, hidden_scale=None):
 
 # The boundary ops carry a dependency on hidden so the compiler retains and
 # orders the stream fork/join with the model's tensor work.
+# Each is a TR-graph break (`eager_region`) inside the op, not around a caller:
+# a compiled stage calls the op directly, so a break declared outside it would
+# be traced away and the Engram fork recorded into a segment it never joins.
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
+@eager_region()
 def v41_begin_forward(hidden: torch.Tensor) -> None:
     """Read live request state on every execution, including graph capture."""
     context = get_forward_context()
@@ -63,6 +67,7 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
 
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
+@eager_region()
 def v41_end_forward(hidden: torch.Tensor) -> None:
     """Closes what `v41_begin_forward` opened."""
     metadata = get_forward_context().attn_metadata
@@ -112,7 +117,10 @@ def v41_attention(
     )
 
 
+# A TR-graph break: the lookup it consumes is staged beside the forward, and a
+# recorded segment cannot wait on that stream's events.
 @torch_compile_guard(mutates_args=[], gen_fake=_fake_layer_output)
+@eager_region()
 def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
     context = get_forward_context()
     metadata = context.attn_metadata
@@ -132,9 +140,6 @@ class RuntimeBlock(Block):
             return v41_attention(hidden, self.layer_name, hidden_fp8, hidden_scale)
         return v41_attention(normed, self.layer_name)
 
-    # A TR-graph break: the lookup it consumes is staged beside the forward,
-    # and a recorded segment cannot wait on that stream's events.
-    @eager_region()
     def engram_forward(self, residual, embeddings, image_mask):
         return v41_engram(residual, self.layer_name)
 
@@ -304,13 +309,11 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
             self.decoder_start,
         )
 
-    # TR-graph breaks: both decide on the live step whether there is
-    # anything to stage or join.
-    @eager_region()
+    # TR-graph breaks through their ops: both decide on the live step whether
+    # there is anything to stage or join.
     def begin_forward(self, hidden, engram_embeddings):
         v41_begin_forward(hidden)
 
-    @eager_region()
     def end_forward(self, hidden, engram_embeddings):
         v41_end_forward(hidden)
 
