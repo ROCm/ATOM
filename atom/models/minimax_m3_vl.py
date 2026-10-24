@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from atom.model_engine.multimodal_runtime import multimodal_cache_seed
+
 if TYPE_CHECKING:
     from atom.config import Config
 
@@ -45,11 +47,7 @@ def image_input_refusal(atom_config: "Config") -> str | None:
     if getattr(atom_config.hf_config, "vision_config", None) is None:
         return "the checkpoint has no vision_config (a text-only export)"
     mode = atom_config.compilation_config.cudagraph_mode
-    if (
-        not atom_config.enforce_eager
-        and mode is not None
-        and mode.uses_tr_hybrid()
-    ):
+    if not atom_config.enforce_eager and mode is not None and mode.uses_tr_hybrid():
         # Image input needs the compiled model to always take inputs_embeds,
         # embedded eagerly before it, and TR_HYBRID replays token graphs
         # recorded on input_ids alone (`_run_capture_prefill`).
@@ -89,6 +87,8 @@ def _varlen_attention(
     max_seqlen: int,
 ) -> torch.Tensor:
     """Non-causal packed attention; a patch attends only within its segment."""
+    # Imported here, not at module scope: the API server imports this module
+    # for `build_minimax_m3_inputs`, and that stays importable without AITER.
     from aiter import flash_attn_varlen_func
 
     out = flash_attn_varlen_func(
@@ -344,8 +344,6 @@ def build_minimax_m3_inputs(
     (``t*h*w // 4``). Each run of image tokens becomes one embedding span, so
     image prefills can be chunked and their embeddings cached per request.
     """
-    from atom.model_engine.multimodal_runtime import multimodal_cache_seed
-
     why = image_input_refusal(atom_config)
     if why is not None:
         raise ValueError(f"This MiniMax-M3 deployment takes no image input: {why}")

@@ -732,10 +732,6 @@ _CONFIG_REGISTRY: dict[str, str] = {
 # as a bare PretrainedConfig instead (see get_hf_config).
 _PLAIN_CONFIG_MODEL_TYPES: frozenset[str] = frozenset({"k3_dspark"})
 
-# Standalone DSpark draft architectures whose name does not follow the
-# `*DSparkModel` pattern the K3 draft set.
-_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset({"DSparkMiniMaxDraftModel"})
-
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k3": "text_config",
@@ -1173,6 +1169,47 @@ def _resolve_sequential_drafter_max_spec(
     return _SERIAL_MTP_DEFAULT_MAX_SPEC
 
 
+# Standalone DSpark draft architectures: their own checkpoint, normalized by
+# `_normalize_draft_dspark_config`. Inline drafts (V4-Pro-DSpark) are not
+# listed; they ship inside the target checkpoint and are told by
+# `dspark_block_size`.
+_STANDALONE_DSPARK_ARCHS: frozenset[str] = frozenset(
+    {"K3DSparkModel", "DSparkMiniMaxDraftModel"}
+)
+# Where the standalone drafts name each field ATOM reads, in lookup order:
+# Kimi-K3's top-level names, then MiniMax-M3.1's `dspark_*` names and its DFlash
+# geometry under `dflash_config`. A dotted alias reads into that sub-config.
+_STANDALONE_DSPARK_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "dspark_target_layer_ids": (
+        "target_layer_ids",
+        "dspark_target_layer_ids",
+        "dflash_config.target_layer_ids",
+    ),
+    "dspark_noise_token_id": (
+        "mask_token_id",
+        "dspark_noise_token_id",
+        "dflash_config.mask_token_id",
+    ),
+    "dspark_markov_rank": ("markov_rank", "dspark_markov_rank"),
+}
+
+
+def _standalone_dspark_field(hf_config: PretrainedConfig, field: str):
+    """The value of the first alias of `field` the draft config sets, or None."""
+    for alias in _STANDALONE_DSPARK_FIELD_ALIASES[field]:
+        value = hf_config
+        for part in alias.split("."):
+            if isinstance(value, dict):
+                value = value.get(part)
+            else:
+                value = getattr(value, part, None)
+            if value is None:
+                break
+        if value is not None:
+            return value
+    return None
+
+
 def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     """Map a standalone DSpark draft config onto ATOM's canonical names.
 
@@ -1181,20 +1218,12 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
 
     - INLINE (e.g. V4-Pro-DSpark) ships inside the target checkpoint and already
       uses the ``dspark_*`` names the rest of ATOM reads. It never comes here.
-    - STANDALONE drafts are their OWN checkpoint (``architectures:
-      ["*DSparkModel"]``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``) and carry
-      their DSpark fields at the config top level: ``target_layer_ids``,
-      ``mask_token_id``, ``markov_rank``, and optionally a training block width.
+    - STANDALONE drafts are their OWN checkpoint (an architecture in
+      ``_STANDALONE_DSPARK_ARCHS``, e.g. Kimi-K3-DSpark's ``K3DSparkModel``)
+      and name their DSpark fields as ``_STANDALONE_DSPARK_FIELD_ALIASES``
+      lists: ``target_layer_ids``, ``mask_token_id``, ``markov_rank``.
     """
-    # MiniMax-M3.1's `DSparkMiniMaxDraftModel` already uses the `dspark_*`
-    # names, with the DFlash geometry under `dflash_config`; take those when
-    # the K3-style top-level names are absent.
-    dflash = getattr(hf_config, "dflash_config", None) or {}
-    target_layer_ids = (
-        getattr(hf_config, "target_layer_ids", None)
-        or getattr(hf_config, "dspark_target_layer_ids", None)
-        or dflash.get("target_layer_ids")
-    )
+    target_layer_ids = _standalone_dspark_field(hf_config, "dspark_target_layer_ids")
     if not target_layer_ids:
         raise ValueError(
             "Standalone DSpark draft config is missing `target_layer_ids` (the "
@@ -1206,11 +1235,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     # OUTPUT of layer `layer_id`, which is the layer this convention taps.
     hf_config.dspark_target_layer_ids = [int(i) for i in target_layer_ids]
 
-    mask_token_id = getattr(hf_config, "mask_token_id", None)
-    if mask_token_id is None:
-        mask_token_id = getattr(hf_config, "dspark_noise_token_id", None)
-    if mask_token_id is None:
-        mask_token_id = dflash.get("mask_token_id")
+    mask_token_id = _standalone_dspark_field(hf_config, "dspark_noise_token_id")
     if mask_token_id is None:
         raise ValueError(
             "Standalone DSpark draft config is missing `mask_token_id` (the "
@@ -1219,9 +1244,7 @@ def _normalize_draft_dspark_config(hf_config: PretrainedConfig) -> None:
     hf_config.dspark_noise_token_id = int(mask_token_id)
 
     hf_config.dspark_markov_rank = int(
-        getattr(hf_config, "markov_rank", 0)
-        or getattr(hf_config, "dspark_markov_rank", 0)
-        or 0
+        _standalone_dspark_field(hf_config, "dspark_markov_rank") or 0
     )
     # Synthesized marker, not a checkpoint field: the flavor discriminator the
     # rest of the stack branches on (SpeculativeConfig.use_dspark_with_draft).
@@ -1360,8 +1383,8 @@ class SpeculativeConfig:
         ``dspark_with_draft`` is NOT a checkpoint field -- do not go looking for
         it in config.json. It is synthesized by
         :func:`_normalize_draft_dspark_config`, which runs from
-        :meth:`hf_config_override` when the draft's ``architectures`` is
-        ``["K3DSparkModel"]``, so it is set for exactly the configs that went
+        :meth:`hf_config_override` when the draft's architecture is in
+        ``_STANDALONE_DSPARK_ARCHS``, so it is set for exactly the configs that went
         through that normalization.
         """
         cfg = self.draft_model_hf_config
@@ -1466,7 +1489,7 @@ class SpeculativeConfig:
     ) -> None:
         # Eagle3 architecture mapping (architecture-level, not model_type)
         arch = (getattr(hf_config, "architectures", None) or [""])[0]
-        if arch.endswith("DSparkModel") or arch in _STANDALONE_DSPARK_ARCHS:
+        if arch in _STANDALONE_DSPARK_ARCHS:
             _normalize_draft_dspark_config(hf_config)
             return
         if arch == "LlamaForCausalLMEagle3":

@@ -175,10 +175,6 @@ reasoning_dialect: Any = None
 reasoning_toggle: tuple[str, Any, Any] | None = None
 processor: Any | None = None
 model_name: str = ""
-# Checkpoint path (model_name may be --served-model-name) and the template
-# --chat-template installed on the tokenizer, which the processor must share.
-model_path: str = ""
-chat_template_override: str | None = None
 default_chat_template_kwargs: dict[str, Any] = {}
 custom_message_encoder: Any | None = None
 _seq_id_to_request_id: dict[int, str] = {}
@@ -659,11 +655,14 @@ def _get_multimodal_processor():
             _get_engine_config(), tokenizer, custom_message_encoder
         )
         if processor is None:
+            # The checkpoint path: model_name may be --served-model-name.
             processor = AutoProcessor.from_pretrained(
-                model_path or model_name, trust_remote_code=True
+                _get_engine_config().model, trust_remote_code=True
             )
-            if chat_template_override is not None:
-                processor.chat_template = chat_template_override
+            # A checkpoint that ships its template for the tokenizer only
+            # (MiniMax-M3.1) renders with the server's, --chat-template included.
+            if processor.chat_template is None:
+                processor.chat_template = tokenizer.chat_template
     return processor
 
 
@@ -2855,7 +2854,6 @@ def main():
     global tool_call_parser_cls, model_starts_in_reasoning, reasoning_toggle
     global reasoning_dialect, synthetic_token_text
     global custom_message_encoder, _stream_batch_dispatcher
-    global model_path, chat_template_override
 
     parser = FlexibleArgumentParser(description="ATOM OpenAI API Server")
     EngineArgs.add_cli_args(parser)
@@ -2947,9 +2945,6 @@ def main():
             logger.info("Using inline chat template from --chat-template argument")
 
     model_name = args.served_model_name if args.served_model_name else args.model
-    model_path = args.model
-    if args.chat_template:
-        chat_template_override = tokenizer.chat_template
     custom_message_encoder = load_custom_message_encoder(args.model)
 
     logger.info(f"Initializing engine with model {args.model}...")
