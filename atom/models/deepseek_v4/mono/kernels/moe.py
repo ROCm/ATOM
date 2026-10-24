@@ -14,6 +14,7 @@ from atom.models.deepseek_v4.mono.config import SCALE_BM
 from atom.models.deepseek_v4.mono.kernels import buffer_ops as bo
 from atom.models.deepseek_v4.mono.kernels.common import sqrt_softplus, swiglu
 from atom.models.deepseek_v4.mono.kernels.helpers import traced
+from atom.models.deepseek_v4.mono.kernels.moe_down import union_down
 from atom.models.deepseek_v4.mono.kernels.moe_ug import publish_routes, routed_union
 from atom.models.deepseek_v4.mono.kernels.plan import (
     ROUTER_TILE,
@@ -117,29 +118,7 @@ def ffn_stages(ctx):
     use_fp8_block128 = ctx["use_fp8_block128"]
     use_mxfp4_weight = ctx["use_mxfp4_weight"]
     use_mxfp8_block32 = ctx["use_mxfp8_block32"]
-    # Validated V4-Pro TP8 q7 target only. Other widths,
-    # draft blocks and formats retain their existing producer/consumer path.
-    # These are Python build constants. A tuple avoids expanding a long
-    # short-circuit tree in FlyDSL's device-control-flow rewriter.
-    expert_union = all(
-        (
-            S == 7,
-            ctx["TOK"] == 7,
-            ctx["phase"] == "moe",
-            not ctx["DRAFT_BLOCK"],
-            ctx["npes"] == 8,
-            TOP_K == 6,
-            N_EXPERTS == 384,
-            HC == 4,
-            HIDDEN == 7168,
-            INTER == 384,
-            G == 256,
-            use_mxfp4_weight,
-            use_mxfp8_block32,
-            shared_bf16_block128,
-            routed_down_bf16,
-        )
-    )
+    expert_union = ctx["expert_union"]
     w_dn = ctx["w_dn"]
     w_r = ctx["w_r"]
     w_sdn = ctx["w_sdn"]
@@ -671,6 +650,9 @@ def ffn_stages(ctx):
             stamp("ug", sample * N_UG_TASKS + uu, 4, pred=live)
 
     up_gate()
+    if const_expr(expert_union):
+        union_down(ctx)
+        return {}
 
     # =============== 10. expert down + route weighting + MoE TP reduce
     DN_NKC = INTER // 64
