@@ -152,7 +152,7 @@ class DeepseekV41MetadataBuilder(CommonAttentionBuilder):
             self.config.head_dim,
             self.config.index_head_dim,
             self.config.engram_max_ngram_size - 1,
-            packed=model_runner.config.kv_cache_dtype == "fp4",
+            kv_dtype=model_runner.config.kv_cache_dtype,
             speculative_tokens=num_drafts,
             # Only the ratios the built layers run: a configuration with no
             # window-only layer gets no buffer for one.
