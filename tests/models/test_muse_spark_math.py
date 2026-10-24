@@ -100,3 +100,29 @@ def test_logits_are_scaled_then_softcapped():
 def test_logits_without_a_softcap_are_only_scaled(cap):
     raw = torch.tensor([[0.0, 50.0, -1000.0]])
     torch.testing.assert_close(muse_logits(raw, 0.25, cap), raw * 0.25)
+
+
+def test_post_load_coefficients_are_bit_identical_to_the_per_step_ones():
+    # The norm weights and the gate's alpha/beta are computed once after
+    # loading; the forward outputs must not change by one bit.
+    pytest.importorskip("aiter")
+    from atom.models.muse_spark import MuseResidualGate, MuseRMSNorm
+
+    torch.manual_seed(2)
+    x = torch.randn(3, 64, dtype=torch.bfloat16)
+    stream = torch.randn(3, 64)
+    for gain_center, input_scale in [(1.0, False), (1.0, True), (0.0, False)]:
+        norm = MuseRMSNorm(64, 1e-5, gain_center, input_scale)
+        norm.weight.data.copy_(torch.randn(64) * 0.01)
+        w = (norm.weight.float() + gain_center).to(norm.weight.dtype)
+        ref = muse_rms(w * x, None, 1e-5) if input_scale else muse_rms(x, w, 1e-5)
+        norm.process_weights_after_loading()
+        assert norm.effective_weight.dtype == torch.bfloat16
+        assert torch.equal(norm.effective_weight, w)
+        assert torch.equal(norm(x), ref)
+
+    gate = MuseResidualGate(64, temperature=0.3)
+    gate.gate.data.copy_(torch.randn(64))
+    alpha, beta = residual_gate_coeffs(gate.gate, 0.3)
+    gate.process_weights_after_loading()
+    assert torch.equal(gate(stream, x), alpha * stream + beta * x.float())

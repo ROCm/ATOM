@@ -145,16 +145,18 @@ class MuseRMSNorm(nn.Module):
         self.input_scale = input_scale
         self.weight = atom_parameter(torch.zeros(dim, dtype=torch.bfloat16))
 
-    def effective_weight(self) -> torch.Tensor:
-        return (self.weight.float() + self.gain_center).to(self.weight.dtype)
+    def process_weights_after_loading(self) -> None:
+        # The weight is constant after loading: fold the gain centre in once.
+        effective = (self.weight.float() + self.gain_center).to(self.weight.dtype)
+        self.register_buffer("effective_weight", effective, persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns fp32; callers cast to the dtype the next op wants."""
         if self.input_scale:
             return muse_rms(
-                self.effective_weight() * x.to(self.weight.dtype), None, self.eps
+                self.effective_weight * x.to(self.weight.dtype), None, self.eps
             )
-        return muse_rms(x, self.effective_weight(), self.eps)
+        return muse_rms(x, self.effective_weight, self.eps)
 
 
 class MuseResidualGate(nn.Module):
@@ -163,9 +165,14 @@ class MuseResidualGate(nn.Module):
         self.temperature = temperature
         self.gate = atom_parameter(torch.zeros(dim, dtype=torch.bfloat16))
 
-    def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+    def process_weights_after_loading(self) -> None:
+        # The gate is constant after loading: compute alpha and beta once.
         alpha, beta = residual_gate_coeffs(self.gate, self.temperature)
-        return alpha * stream + beta * branch.float()
+        self.register_buffer("alpha", alpha, persistent=False)
+        self.register_buffer("beta", beta, persistent=False)
+
+    def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+        return self.alpha * stream + self.beta * branch.float()
 
 
 class MuseRouter(nn.Module):
@@ -335,7 +342,7 @@ class MuseSparkMoE(nn.Module):
         out = post_expert_combine(
             y.view(tokens, self.top_k, self.expert_dim),
             scores,
-            self.post_expert_norm.effective_weight(),
+            self.post_expert_norm.effective_weight,
             self.post_norm_eps,
         )
         if self.experts.tp_size == 1 and self.experts.ep_size > 1:
