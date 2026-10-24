@@ -41,6 +41,11 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.models.minimax_m3.mono.dispatch import MonoDecode
+from atom.models.minimax_m3_vl import (
+    build_vision_modules,
+    image_input_refusal,
+    image_token_id,
+)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -840,6 +845,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.model.make_empty_intermediate_tensors
         )
         self._mono = MonoDecode(self, atom_config)
+        # Set by a VL model with a vision tower: its compiled MiniMaxM3Model is
+        # captured once, so it must always see inputs_embeds -- a text-only
+        # capture would replay without them and drop the image embeddings.
+        self.embed_before_model = False
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -872,6 +881,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             input_ids, positions, intermediate_tensors, inputs_embeds
         ):
             return self._mono.forward(input_ids, positions)
+        if self.embed_before_model and inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -965,8 +976,9 @@ class MiniMaxM3SparseForConditionalGenerationVL(
 
     Image embeddings are produced once per request by `ModelRunner` and
     scattered over the `]<]image[>[` runs that `build_minimax_m3_inputs`
-    recorded as embedding spans. Without a `vision_config` (a text-only
-    export) this degrades to the text-only model.
+    recorded as embedding spans. Where image input is refused
+    (`image_input_refusal`, e.g. a text-only export) this degrades to the
+    text-only model.
     """
 
     # Vision weights belong to this model, so nothing is skipped by default.
@@ -979,12 +991,11 @@ class MiniMaxM3SparseForConditionalGenerationVL(
     def __init__(self, atom_config: Config, prefix: str = "") -> None:
         super().__init__(atom_config, prefix=prefix)
         hf_config = atom_config.hf_config
-        self.image_token_id = int(getattr(hf_config, "image_token_index", 200025))
-        # The tower only runs where the token embeddings are produced.
-        self.has_vision_tower = (
-            getattr(hf_config, "vision_config", None) is not None
-            and get_pp_group().is_first_rank
-        )
+        self.image_token_id = image_token_id(hf_config)
+        # The tower only runs where the token embeddings are produced, and
+        # only where image requests are accepted (`build_minimax_m3_inputs`).
+        why = image_input_refusal(atom_config)
+        self.has_vision_tower = why is None and get_pp_group().is_first_rank
         if not self.has_vision_tower:
             self.vision_tower = PPMissingLayer()
             self.multi_modal_projector = PPMissingLayer()
@@ -992,42 +1003,12 @@ class MiniMaxM3SparseForConditionalGenerationVL(
             self.skip_weight_prefixes = list(self.vision_weight_prefixes)
             return
 
-        from atom.models.minimax_m3_vl import build_vision_modules
-
         (
             self.vision_tower,
             self.multi_modal_projector,
             self.patch_merge_mlp,
         ) = build_vision_modules(hf_config)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
-        # The compiled MiniMaxM3Model is captured once, so it must always see
-        # inputs_embeds on the first rank: a text-only capture would replay
-        # without them and drop the image embeddings. A mono decode step never
-        # reaches the compiled model and keeps its input_ids-only path.
-        language_model = self.language_model
-        if (
-            inputs_embeds is None
-            and get_pp_group().is_first_rank
-            and not language_model._mono.supports(
-                input_ids, positions, intermediate_tensors, None
-            )
-        ):
-            inputs_embeds = self.embed_input_ids(input_ids)
-        return language_model(
-            input_ids,
-            positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **kwargs,
-        )
+        self.language_model.embed_before_model = True
 
     def get_vision_embeddings(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
@@ -1035,7 +1016,7 @@ class MiniMaxM3SparseForConditionalGenerationVL(
         if not self.has_vision_tower:
             raise RuntimeError(
                 "MiniMax-M3 image embeddings were requested on a rank without "
-                "a vision tower (text-only checkpoint or non-first PP rank)."
+                "a vision tower (image input refused, or a non-first PP rank)."
             )
         features = self.vision_tower(pixel_values, grid_thw.tolist())
         return self.patch_merge_mlp(self.multi_modal_projector(features))

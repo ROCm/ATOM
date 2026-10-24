@@ -444,12 +444,12 @@ How ATOM runs it:
   block attends that context plus its own K/V.
 - The target layers' outputs are tapped with forward hooks (all-reduced across TP, plus the
   residual). This is why mono decode, which replaces those layers, is off under DSpark.
-- Block attention. With one KV head per rank (TP ≥ 4), the block's K/V are written into the
-  draft cache at the block's slots and the non-causal `[context | block]` attention runs as one
-  q_len = 1 paged decode row per block token (the per-row decode the target's sparse layers
-  use), through page tables built outside the graph in pre-allocated buffers. The block pass
-  therefore has fixed shapes and is CUDA-graph captured for every batch size up to
-  `--max-num-seqs`. Other TP sizes gather the context and run one eager varlen attention.
+- Block attention. The block's K/V are written into the draft cache at the block's slots and
+  the non-causal `[context | block]` attention runs as one q_len = 1 paged decode row per block
+  token (the per-row decode the target's sparse layers use), through page tables built outside
+  the graph in pre-allocated buffers. The block pass therefore has fixed shapes and is
+  CUDA-graph captured for every batch size up to `--max-num-seqs`. The per-row decode takes one
+  KV head per rank, so DSpark needs TP ≥ 4 (the draft has 4 KV heads) and refuses smaller TP.
 
 ## PD Disaggregation
 

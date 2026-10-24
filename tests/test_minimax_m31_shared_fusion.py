@@ -17,7 +17,9 @@ dtypes = aiter.dtypes
 
 moe_mod = importlib.import_module("atom.model_ops.moe")
 quant_spec = importlib.import_module("atom.quant_spec")
-topk_mod = importlib.import_module("atom.model_ops.topK")
+staging_mod = importlib.import_module(
+    "atom.model_ops.fused_moe.mxfp8_shared_into_mxfp4"
+)
 FusedMoE = moe_mod.FusedMoE
 LayerQuantConfig = quant_spec.LayerQuantConfig
 
@@ -47,7 +49,9 @@ def _fused_mxfp4_layer():
     )
     layer.expert_map = None
     layer.expert_layout = SimpleNamespace(
-        routed_physical_per_rank=ROUTED, num_fused_shared_experts=SHARED
+        routed_physical_per_rank=ROUTED,
+        num_fused_shared_experts=SHARED,
+        shared_is_routed=False,
     )
     layer.local_num_experts = ROUTED + SHARED
     e, half = ROUTED + SHARED, I_LOCAL + PAD
@@ -57,8 +61,9 @@ def _fused_mxfp4_layer():
     layer.w13_weight_scale = _param(e, 2 * half, H // 32)
     layer.w2_weight = _param(e, H, I_LOCAL // 2)
     layer.w2_weight_scale = _param(e, H, I_LOCAL // 32)
-    layer.stage_shared_mxfp8 = True
-    layer._alloc_staged_shared_mxfp8(H, I_LOCAL)
+    layer.shared_mxfp8_into_mxfp4 = staging_mod.Mxfp8SharedIntoMxfp4(
+        layer, None, H, I_LOCAL
+    )
     return layer
 
 
@@ -98,7 +103,7 @@ def _load_shared(layer, w, s, skip=()):
 def test_mxfp4_fusion_is_opt_in(monkeypatch, env, routed, fused):
     monkeypatch.setenv("ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4", env)
     assert (
-        bool(topk_mod._mxfp8_shared_into_mxfp4(_spec(dtypes.fp8), _spec(routed)))
+        bool(quant_spec.fuses_mxfp8_shared_into_mxfp4(_spec(dtypes.fp8), _spec(routed)))
         is fused
     )
 
@@ -108,7 +113,7 @@ def test_shared_slot_loads_into_mxfp8_staging_not_mxfp4_buffers():
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s)
 
-    staged = layer.staged_shared_mxfp8
+    staged = layer.shared_mxfp8_into_mxfp4.staged
     assert torch.equal(
         staged["w13_weight"][0, :I_LOCAL].view(torch.uint8), w["w1"].view(torch.uint8)
     )
@@ -129,7 +134,7 @@ def test_missing_shared_tensor_is_reported():
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s, skip={("scale", "w3")})
     with pytest.raises(RuntimeError, match="w13_weight_scale"):
-        layer._fuse_staged_shared_into_mxfp4()
+        layer.shared_mxfp8_into_mxfp4.fuse(layer)
 
 
 def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
@@ -138,7 +143,7 @@ def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
     layer = _fused_mxfp4_layer()
     w, s = _shared_checkpoint()
     _load_shared(layer, w, s)
-    staged = {k: v.clone() for k, v in layer.staged_shared_mxfp8.items()}
+    staged = {k: v.clone() for k, v in layer.shared_mxfp8_into_mxfp4.staged.items()}
 
     seen = []
 
@@ -150,12 +155,11 @@ def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
             (x.shape[0], x.shape[1] // 32), 7.0
         )
 
-    monkeypatch.setattr(moe_mod, "quant_weight_online", fake_quant)
-    layer._fuse_staged_shared_into_mxfp4()
+    monkeypatch.setattr(staging_mod, "quant_weight_online", fake_quant)
+    layer.shared_mxfp8_into_mxfp4.fuse(layer)
 
-    assert not hasattr(layer, "staged_shared_mxfp8")
-    assert layer.stage_shared_mxfp8 is False
-    deq = moe_mod.dequant_mxfp8
+    assert layer.shared_mxfp8_into_mxfp4.staged is None
+    deq = staging_mod.dequant_mxfp8
     w1 = deq(staged["w13_weight"][0, :I_LOCAL], staged["w13_weight_scale"][0, :I_LOCAL])
     w3 = deq(staged["w13_weight"][0, I_LOCAL:], staged["w13_weight_scale"][0, I_LOCAL:])
     assert len(seen) == 3 and all(x.dtype == torch.bfloat16 for x in seen)
@@ -171,8 +175,36 @@ def test_shared_expert_requantized_into_the_mxfp4_slot(monkeypatch):
     assert not layer.w13_weight.data[:ROUTED].any()  # routed slots untouched
 
 
-def test_no_staging_is_a_no_op():
+def test_reloading_the_fused_shared_expert_is_refused(monkeypatch):
+    """The staging is freed once the slot is MXFP4, so a later load of the
+    shared expert must not fall through into the MXFP4 buffers."""
     layer = _fused_mxfp4_layer()
-    del layer.staged_shared_mxfp8
-    layer._fuse_staged_shared_into_mxfp4()
-    assert not layer.w13_weight.data.any()
+    w, s = _shared_checkpoint()
+    _load_shared(layer, w, s)
+    monkeypatch.setattr(
+        staging_mod,
+        "quant_weight_online",
+        lambda x, **_: (x[:, : x.shape[1] // 2].float(), torch.ones(x.shape[0], 1)),
+    )
+    layer.shared_mxfp8_into_mxfp4.fuse(layer)
+    before = layer.w13_weight.data.clone()
+
+    with pytest.raises(NotImplementedError, match="reloading"):
+        _load_shared(layer, w, s)
+    assert torch.equal(layer.w13_weight.data, before)
+
+
+def test_refuses_eplb_routed_shared_expert():
+    """EPLB under all2all EP routes the shared expert in the routed slots."""
+    layer = _fused_mxfp4_layer()
+    layer.expert_layout.shared_is_routed = True
+    with pytest.raises(NotImplementedError, match="EPLB"):
+        staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL)
+
+
+def test_refuses_online_requant_of_the_routed_experts(monkeypatch):
+    """The shared slot is written as MXFP4, so the routed experts must stay it."""
+    layer = _fused_mxfp4_layer()
+    monkeypatch.setattr(staging_mod, "will_online_requant", lambda *_: True)
+    with pytest.raises(NotImplementedError, match="online_quant_config"):
+        staging_mod.Mxfp8SharedIntoMxfp4(layer, None, H, I_LOCAL)

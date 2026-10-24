@@ -1025,11 +1025,50 @@ class DSparkProposer(Drafter):
         product would be resized to that shape rather than broadcast over the
         eight sub-pages, leaving ``[8p0, 8p1+1, 8p2+2, ...]``.
         """
+        from atom.model_ops.minimax_m3.sparse_attn import PAGES_PER_SPARSE_BLOCK
+
         rb, W = block_tables.shape
-        out3 = out.view(rb, W, 8)
-        out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, 8))
-        out3.mul_(8).add_(sub_pages)
+        out3 = out.view(rb, W, PAGES_PER_SPARSE_BLOCK)
+        out3.copy_(block_tables.unsqueeze(-1).expand(rb, W, PAGES_PER_SPARSE_BLOCK))
+        out3.mul_(PAGES_PER_SPARSE_BLOCK).add_(sub_pages)
         return out
+
+    @staticmethod
+    def _window_rows(
+        bt16_flat: torch.Tensor,  # [(rb + 1) * P] request tables, then P of slack
+        ctx_eff: torch.Tensor,  # [rb] keys each request can read
+        positions: torch.Tensor,  # [rb * T] each row's own position
+        row_req: torch.Tensor,  # [rb * T] the request each row belongs to
+        window: int,  # 0: attend the whole context
+        real_rows: int,  # rows past this are padding
+        start16: torch.Tensor,  # [rb * T] int64 scratch
+        out_tables: torch.Tensor,  # [rb * T, P]
+        out_lens: torch.Tensor,  # [rb * T]
+    ) -> None:
+        """Each block row's page-16 table and length under the sliding window.
+
+        A row at position p attends the keys from ``p - window + 1`` on, as the
+        reference does (the whole block is inside that window). The per-row
+        decode starts a row at a page boundary, so the row starts at the page-16
+        holding that key and also reads up to 15 keys before it. Its table is
+        the P-wide window of its request's table from that page on, taken from
+        the flat buffer; its length ends it within its own request's columns,
+        so what that window runs into past them is never read.
+        """
+        from atom.model_ops.minimax_m3.sparse_attn import ASM_PAGE_SIZE
+
+        P = out_tables.shape[1]
+        if window:
+            torch.sub(positions, window - 1, out=start16)
+            start16.clamp_(min=0).div_(ASM_PAGE_SIZE, rounding_mode="floor")
+            # Pad rows repeat the last real anchor but read one page.
+            start16[real_rows:].zero_()
+        else:
+            start16.zero_()
+        torch.index_select(ctx_eff, 0, row_req, out=out_lens)
+        out_lens.sub_(start16, alpha=ASM_PAGE_SIZE)
+        start16.add_(row_req, alpha=P)  # each row's first entry in the flat buffer
+        torch.index_select(bt16_flat.unfold(0, P, 1), 0, start16, out=out_tables)
 
     def _build_mha_block_rows(
         self,
@@ -1058,13 +1097,15 @@ class DSparkProposer(Drafter):
         neither written (slot -1) nor read (the row's context is capped at what
         is allocated): their draft rows simply miss a few of their own keys.
         """
+        from atom.model_ops.minimax_m3.sparse_attn import PAGES_PER_SPARSE_BLOCK
+
         T = self.draft_tokens_per_seq
         running_bs = block_positions.shape[0]
         block_size = self.runner.block_size
         if self.dcp_world_size > 1:
             raise NotImplementedError("MHA DSpark draft does not support DCP.")
-        W = block_tables.shape[1]
-        if getattr(self, "_blk_bt16", None) is None or self._blk_bt16.shape[1] != 8 * W:
+        P = PAGES_PER_SPARSE_BLOCK * block_tables.shape[1]
+        if getattr(self, "_blk_bt16", None) is None or self._blk_bt16.shape[1] != P:
             # First call is the warmup, ahead of any capture: these addresses
             # are the ones every recording bakes in.
             max_bs = self.config.max_num_seqs
@@ -1073,17 +1114,26 @@ class DSparkProposer(Drafter):
             self._blk_alloc_host = torch.zeros(
                 max_bs, dtype=torch.int32, pin_memory=True
             )
-            self._blk_bt16 = torch.zeros(max_bs, 8 * W, dtype=torch.int32, device=dev)
+            # Recorded after each copy out of `_blk_alloc_host`; a fresh event
+            # has nothing to wait for.
+            self._blk_alloc_copied = torch.cuda.Event()
+            # One row of slack past the last request: `_window_rows` reads
+            # every row as a P-wide window of this buffer.
+            self._blk_bt16_flat = torch.zeros(
+                (max_bs + 1) * P, dtype=torch.int32, device=dev
+            )
+            self._blk_bt16 = self._blk_bt16_flat[: max_bs * P].view(max_bs, P)
             self._blk_bt16_rows = torch.zeros(
-                max_bs * T, 8 * W, dtype=torch.int32, device=dev
+                max_bs * T, P, dtype=torch.int32, device=dev
             )
             self._blk_ctx_rows = torch.zeros(max_bs * T, dtype=torch.int32, device=dev)
-            self._blk_row_src = torch.arange(
+            self._blk_row_req = torch.arange(
                 max_bs, dtype=torch.int64, device=dev
             ).repeat_interleave(T)
-            self._blk_page16 = torch.arange(8, dtype=torch.int32, device=dev)
-            self._blk_cols16 = torch.arange(8 * W, dtype=torch.int64, device=dev)
-            self._blk_start16 = torch.zeros(max_bs, dtype=torch.int64, device=dev)
+            self._blk_page16 = torch.arange(
+                PAGES_PER_SPARSE_BLOCK, dtype=torch.int32, device=dev
+            )
+            self._blk_start16 = torch.zeros(max_bs * T, dtype=torch.int64, device=dev)
             self._blk_ctx_eff = torch.zeros(max_bs, dtype=torch.int32, device=dev)
 
         # Allocated tokens per request, from the host snapshot of the block
@@ -1092,14 +1142,18 @@ class DSparkProposer(Drafter):
         from atom.utils.block_tables import block_table_state
 
         lengths = block_table_state(self.runner.forward_vars["block_tables"]).lengths
-        host = self._blk_alloc_host
-        host[:running_bs].fill_(block_size)
+        # The host can run a step ahead of the device, so the previous step's
+        # copy must have read the pinned buffer before it is rewritten.
+        self._blk_alloc_copied.synchronize()
+        pages = self._blk_alloc_host.numpy()[:running_bs]
         n = min(len(lengths), scheduled_bs)
-        if n:
-            host[:n] = torch.tensor(lengths[:n], dtype=torch.int32).clamp_(min=1)
-            host[:n].mul_(block_size)
+        pages[:n] = lengths[:n]
+        pages[n:] = 1
+        pages.clip(min=1, out=pages)
         alloc = self._blk_alloc[:running_bs]
-        alloc.copy_(host[:running_bs], non_blocking=True)
+        alloc.copy_(self._blk_alloc_host[:running_bs], non_blocking=True)
+        self._blk_alloc_copied.record()
+        alloc.mul_(block_size)
 
         slots.masked_fill_(block_positions >= alloc.view(running_bs, 1), -1)
         # The rows' own lengths; `ctx_lens` (attn_metadata.context_lens) stays
@@ -1112,28 +1166,20 @@ class DSparkProposer(Drafter):
             block_tables, self._blk_bt16[:running_bs], self._blk_page16
         )
         if running_bs > scheduled_bs:
-            bt16[scheduled_bs:].copy_(self._blk_page16.repeat(W))
-
-        # Sliding window: start each row at the page-16 holding its first key
-        # in reach -- the last `window - 1` context keys before the block, plus
-        # the block -- shifting the table and the length together.
-        window = int(getattr(self.model, "sliding_window", 0) or 0)
-        start16 = self._blk_start16[:running_bs]
-        if window:
-            torch.sub(ctx_eff, T + window - 1, out=start16)
-            start16.clamp_(min=0).div_(16, rounding_mode="floor")
-            idx = (self._blk_cols16.view(1, -1) + start16.view(-1, 1)).clamp_(
-                max=8 * W - 1
-            )
-            bt16.copy_(torch.gather(bt16, 1, idx))
-            ctx_eff.sub_(start16.to(ctx_eff.dtype) * 16)
+            # A pad row reads one page: page 0.
+            bt16[scheduled_bs:, :PAGES_PER_SPARSE_BLOCK].copy_(self._blk_page16)
 
         rows = running_bs * T
-        torch.index_select(
-            bt16, 0, self._blk_row_src[:rows], out=self._blk_bt16_rows[:rows]
-        )
-        torch.index_select(
-            ctx_eff, 0, self._blk_row_src[:rows], out=self._blk_ctx_rows[:rows]
+        self._window_rows(
+            self._blk_bt16_flat,
+            ctx_eff,
+            block_positions.view(-1),
+            self._blk_row_req[:rows],
+            int(getattr(self.model, "sliding_window", 0) or 0),
+            scheduled_bs * T,
+            self._blk_start16[:rows],
+            self._blk_bt16_rows[:rows],
+            self._blk_ctx_rows[:rows],
         )
         attn_metadata.dspark_bt16_rows = self._blk_bt16_rows[:rows]
         attn_metadata.dspark_ctx_rows = self._blk_ctx_rows[:rows]

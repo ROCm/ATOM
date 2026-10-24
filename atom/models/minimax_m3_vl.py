@@ -31,6 +31,32 @@ IMAGE_TOKEN = "]<]image[>["
 DEFAULT_IMAGE_TOKEN_ID = 200025
 
 
+def image_token_id(hf_config) -> int:
+    """The id of the ``]<]image[>[`` placeholder, as either key names it."""
+    return int(
+        getattr(hf_config, "image_token_index", None)
+        or getattr(hf_config, "image_token_id", None)
+        or DEFAULT_IMAGE_TOKEN_ID
+    )
+
+
+def image_input_refusal(atom_config: "Config") -> str | None:
+    """Why this deployment takes no image input, or None."""
+    if getattr(atom_config.hf_config, "vision_config", None) is None:
+        return "the checkpoint has no vision_config (a text-only export)"
+    mode = atom_config.compilation_config.cudagraph_mode
+    if (
+        not atom_config.enforce_eager
+        and mode is not None
+        and mode.uses_tr_hybrid()
+    ):
+        # Image input needs the compiled model to always take inputs_embeds,
+        # embedded eagerly before it, and TR_HYBRID replays token graphs
+        # recorded on input_ids alone (`_run_capture_prefill`).
+        return f"--cudagraph-mode {mode.name} (image input needs FULL or eager)"
+    return None
+
+
 def _compression(config) -> dict:
     return getattr(config, "img_token_compression_config", None) or {}
 
@@ -292,12 +318,12 @@ def build_vision_modules(hf_config) -> tuple[nn.Module, nn.Module, nn.Module]:
     return tower, projector, merger
 
 
-def _image_token_spans(input_ids: list[int], image_token_id: int) -> list[tuple]:
+def _image_token_spans(input_ids: list[int], token_id: int) -> list[tuple]:
     spans, start = [], None
     for index, token in enumerate(input_ids + [None]):
-        if token == image_token_id and start is None:
+        if token == token_id and start is None:
             start = index
-        elif token != image_token_id and start is not None:
+        elif token != token_id and start is not None:
             spans.append((start, index - start))
             start = None
     return spans
@@ -320,11 +346,10 @@ def build_minimax_m3_inputs(
     """
     from atom.model_engine.multimodal_runtime import multimodal_cache_seed
 
-    hf_config = atom_config.hf_config
-    image_token_id = int(
-        getattr(hf_config, "image_token_index", None)
-        or getattr(hf_config, "image_token_id", DEFAULT_IMAGE_TOKEN_ID)
-    )
+    why = image_input_refusal(atom_config)
+    if why is not None:
+        raise ValueError(f"This MiniMax-M3 deployment takes no image input: {why}")
+    token_id = image_token_id(atom_config.hf_config)
     template_kwargs = dict(chat_template_kwargs)
     template_kwargs.pop("tokenize", None)
     template_kwargs.pop("add_generation_prompt", None)
@@ -350,7 +375,7 @@ def build_minimax_m3_inputs(
     )
     input_ids = processed["input_ids"][0].tolist()
     grid_thw = processed["image_grid_thw"]
-    spans = _image_token_spans(input_ids, image_token_id)
+    spans = _image_token_spans(input_ids, token_id)
     merge_length = processor.image_processor.merge_size**2
     expected = [int(n) // merge_length for n in grid_thw.prod(-1).tolist()]
     if [count for _, count in spans] != expected:

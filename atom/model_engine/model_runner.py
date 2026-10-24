@@ -3040,9 +3040,12 @@ class ModelRunner:
                 if forward_mode.running_tokens > forward_mode.scheduled_tokens:
                     input_ids, positions = self._padded_inputs(forward_mode)
                 # The multimodal runtime owns request leases and span scatter.
+                # Only the first PP stage embeds tokens; later stages receive
+                # hidden states.
                 inputs_embeds = None
                 if (
                     is_prefill
+                    and get_pp_group().is_first_rank
                     and hasattr(self.model, "get_vision_embeddings")
                     and batch is not None
                     and hasattr(batch, "multimodal_data")

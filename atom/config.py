@@ -2800,6 +2800,10 @@ class Config:
         # deploying it on top of a cache built with the other setting — reuses a
         # stale artifact and trips assert_size_stride at runtime.
         factors.append(bool(envs.ATOM_REPLICATE_VOCAB_EMBED))
+        # ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4 decides whether the MoE calls
+        # shared_experts() and how many experts it routes over (129 / top-5 vs
+        # 128 / top-4), so it changes the compiled graph the same way.
+        factors.append(bool(envs.ATOM_FUSE_MXFP8_SHARED_INTO_MXFP4))
         # The drafter graph bakes its draft width in as a constant (DSpark traces
         # `[bs, num_draft]`), so a run that only changes --num-speculative-tokens
         # would otherwise load the other width's artifact: draft 6 over a draft 3

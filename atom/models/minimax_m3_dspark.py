@@ -28,15 +28,14 @@ block's own rows -- go through ``triton_fused_norm_rope_cache`` with an explicit
 slot mapping, the kernel the target's dense layers use for the same norm, RoPE
 and per-token fp8 cache format.
 
-The block attention, with one KV head per rank (TP >= 4), is ``B * T``
-independent q_len=1 paged decode rows -- non-causal by construction -- over each
-request's ``[context | block]``, through the per-row ASM / Gluon decode the
-target's sparse layers run and a page-16 table ``DSparkProposer`` builds outside
-the graph; the block's own K/V are written into the cache first, except at
-positions past the request's allocated pages. No host sync and fixed shapes, so
-the block pass is CUDA-graph captured like the other drafts. Other TP sizes fall
-back to an eager path: gather the context, attend it together with the block's
-K/V straight from the pass with one non-causal varlen attention.
+The block attention is ``B * T`` independent q_len=1 paged decode rows --
+non-causal by construction -- over each request's ``[context | block]``,
+through the per-row ASM / Gluon decode the target's sparse layers run and a
+page-16 table ``DSparkProposer`` builds outside the graph; the block's own K/V
+are written into the cache first, except at positions past the request's
+allocated pages. No host sync and fixed shapes, so the block pass is CUDA-graph
+captured like the other drafts. The per-row decode takes one KV head per rank,
+so the draft needs TP >= its KV head count (4).
 
 Checkpoint layout (``<draft>/dspark``, MXFP8 [1, 32] linears, BF16 rest):
   language_model.model.dspark.fc.weight                       [6144, 5 * 6144]
@@ -146,16 +145,19 @@ class M3DSparkAttention(nn.Module):
                 f"DSpark draft has {self.total_num_heads} attention heads, which "
                 f"is not divisible by TP size {tp_size}."
             )
+        if self.total_num_kv_heads > tp_size:
+            raise ValueError(
+                "The MiniMax-M3.1 DSpark draft decodes its block per row with one "
+                f"KV head per rank, so it needs TP >= {self.total_num_kv_heads} "
+                f"(its KV head count); got TP {tp_size}."
+            )
         self.num_heads = self.total_num_heads // tp_size
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_kv_heads = 1
         self.head_dim = config.head_dim
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.kv_cache_dtype = atom_config.kv_cache_dtype
-        # One KV head per rank (TP >= 4): the block runs as capturable per-row
-        # paged decode; otherwise the eager gather + varlen path below.
-        self.paged_block = self.num_kv_heads == 1 and self.total_num_kv_heads <= tp_size
         # 0 or absent: full attention over the context.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
 
@@ -212,23 +214,21 @@ class M3DSparkAttention(nn.Module):
     def _bound_cache(self):
         """This layer's KV cache in the layout every access of it uses.
 
-        The paged block path reads through the page-16 SHUFFLE views the per-row
-        decode kernels take, so it must also WRITE through them: a page-128
+        The block reads through the page-16 SHUFFLE views the per-row decode
+        kernels take, so the cache must also be WRITTEN through them: a page-128
         SHUFFLE view puts the 128 in-page rows inside the head-dim tiles, and
         reading that memory as eight 16-row pages scrambles it. Slot numbers are
         the same in both (page * 128 + off == (page * 8 + off // 16) * 16 +
-        off % 16), only the view differs. The eager path keeps page-128 views,
-        which its gather reads.
+        off % 16), only the view differs.
         """
         attn = self.attn
         if attn.k_cache.numel() == 0:
             return None
-        cache = (attn.k_cache, attn.v_cache, attn.k_scale, attn.v_scale)
-        if self.paged_block:
-            from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
+        from atom.model_ops.attention_mha import SparseMHAPagedAttentionImpl
 
-            cache = SparseMHAPagedAttentionImpl._to_page16_shuffle(*cache)
-        return cache
+        return SparseMHAPagedAttentionImpl._to_page16_shuffle(
+            attn.k_cache, attn.v_cache, attn.k_scale, attn.v_scale
+        )
 
     def _norm_rope_write(self, q, k, v, num_heads, positions, slot_mapping, cache):
         k_cache, v_cache, k_scale, v_scale = cache
@@ -272,11 +272,10 @@ class M3DSparkAttention(nn.Module):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
         """The block pass: non-causal attention over ``[context | block]``.
 
-        Paged path (``paged_block``): write the block's K/V at the block slots
-        the proposer masked to the request's allocated pages -- an unallocated
-        column reads as page 0, a page another request owns (under prefix
-        caching, a shared prefix) -- then decode per row. Eager fallback: keep
-        the block's K/V out of the cache and attend them from this pass.
+        Write the block's K/V at the block slots the proposer masked to the
+        request's allocated pages -- an unallocated column reads as page 0, a
+        page another request owns (under prefix caching, a shared prefix) --
+        then decode per row.
         """
         qkv = _linear_out(self.qkv_proj(hidden_states))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -288,20 +287,13 @@ class M3DSparkAttention(nn.Module):
             return _linear_out(self.o_proj(out))
 
         md = get_forward_context().attn_metadata
-        if self.paged_block and getattr(md, "dspark_bt16_rows", None) is not None:
-            # Capturable path: the block's K/V go into the cache at the block's
-            # slots (positions past the allocated pages are -1, dropped), then
-            # every block position decodes as its own q_len=1 row.
-            q, _ = self._norm_rope_write(
-                q, k, v, self.num_heads, positions, md.slot_mapping, cache
-            )
-            out = self._block_attention_paged(q, md, cache)
-            return _linear_out(self.o_proj(out))
-        no_write = torch.full_like(positions, -1)  # slot -1: the kernel drops it
-        q, k = self._norm_rope_write(
-            q, k, v, self.num_heads, positions, no_write, cache
+        # The block's K/V go into the cache at the block's slots (positions
+        # past the allocated pages are -1, dropped), then every block position
+        # decodes as its own q_len=1 row.
+        q, _ = self._norm_rope_write(
+            q, k, v, self.num_heads, positions, md.slot_mapping, cache
         )
-        out = self._block_attention(q, k, v, md, cache)
+        out = self._block_attention_paged(q, md, cache)
         return _linear_out(self.o_proj(out))
 
     def _block_attention_paged(self, q: torch.Tensor, md, cache) -> torch.Tensor:
@@ -313,8 +305,7 @@ class M3DSparkAttention(nn.Module):
         (``dspark_bt16_rows`` / ``dspark_ctx_rows``, sliding window applied
         there), through the same per-row ASM / Gluon decode the target's sparse
         layers run -- no host sync, fixed shapes, so the block can be captured.
-        The context is read once per block position; only one KV head per rank
-        is supported (TP >= 4).
+        The context is read once per block position, one KV head per rank.
         """
         from atom.model_ops.minimax_m3.sparse_attn import _sparse_pa_per_row
 
@@ -405,8 +396,6 @@ class MiniMaxM3DSpark(DSparkDraftModel):
     """Top-level standalone DSpark draft for MiniMax-M3.1 (GQA backbone +
     Markov head + confidence head)."""
 
-    # Overridden per instance: only the per-row paged block path is capturable.
-    supports_block_graph = False
     # The proposer plans MLA persistent decode metadata only for MLA drafts.
     block_attention_is_mla = False
 
@@ -462,11 +451,7 @@ class MiniMaxM3DSpark(DSparkDraftModel):
         )
         self.final_norm = GemmaRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkMarkovHead(self.vocab_size, self.markov_rank)
-        # Read by DSparkProposer: capture the block pass when every layer runs
-        # the per-row paged path, and the window its per-row tables apply.
-        self.supports_block_graph = all(
-            layer.self_attn.paged_block for layer in self.layers
-        )
+        # Read by DSparkProposer: the window its per-row tables apply.
         self.sliding_window = int(getattr(config, "sliding_window", 0) or 0)
         self.confidence_head = (
             DSparkConfidenceHead(self.hidden_size, self.markov_rank)
