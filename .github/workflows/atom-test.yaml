@@ -40,8 +40,10 @@ on:
 
 concurrency:
   # Keep scheduled main runs from blocking push-triggered validation.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && (github.event_name != 'pull_request_review' || github.event.review.state == 'approved') }}
+  # Approval runs queue behind existing work. Other reviews get their own
+  # group so they cannot replace a pending approval run in GitHub's queue.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.number && 'pr' || github.event_name }}${{ github.event_name == 'pull_request_review' && github.event.review.state != 'approved' && format('-review-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'pull_request_review' }}
 
 env:
   ATOM_BASE_IMAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.atom_base_image || 'rocm/atom-dev:latest' }}
@@ -56,6 +58,7 @@ jobs:
     name: Check Heavy CI Gate
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
@@ -68,6 +71,7 @@ jobs:
       - name: Check approval and label gate
         id: gate
         env:
+          CI_GATE_WORKFLOW: atom-test.yaml
           CI_GATE_LABELS: ci:full,ci:atom
           CI_GATE_PATHS_IGNORE: |
             **/*.md
@@ -164,6 +168,7 @@ jobs:
           PY
 
   offline-smoke-test:
+    if: ${{ github.event_name != 'pull_request_review' }}
     # Ungated on purpose: this runs on every PR, unlike the accuracy matrix
     # behind `ci-gate`, which only opens on an approval or a ci:* label.
     #
@@ -177,7 +182,8 @@ jobs:
     # Completing is the assertion. The failure it exists to catch is a hang or
     # a crash, not wrong text, so there is no golden file to keep per model --
     # and one small model exercises that code path as well as thirteen do.
-    name: Offline inference smoke test
+    # Do not publish a same-named skipped check over a previous smoke failure.
+    name: ${{ github.event_name == 'pull_request_review' && 'Offline smoke not requested' || 'Offline inference smoke test' }}
     runs-on: linux-atom-mi35x-1
     timeout-minutes: 45
     env:
