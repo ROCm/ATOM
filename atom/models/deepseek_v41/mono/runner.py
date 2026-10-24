@@ -51,7 +51,8 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
     QS_M_TILES,
 )
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
-from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes
+from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes, plain_layout
+from atom.models.deepseek_v41.mono.kernels.token_par import own_rows
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
 from atom.models.deepseek_v41.mono.weights import bind_model
 from atom.mono.plan.execution import BLOCKS
@@ -77,8 +78,9 @@ TOK_PAR_FROM = {4: 12}
 # K2a's and K2b's mailbox tags start past every layer's K1 and K2a
 POST_TAG0 = 64
 MOE_TAG0 = 128
-# the step's row buffers, allocated for the widest step (``_allocate``) and
-# narrowed to a step's rows (``_use_rows``): each with its row dim
+# the step's row buffers, allocated for the widest step (``_allocate``,
+# ``_place_index_outputs``) and narrowed to a step's rows (``_use_rows``): each
+# with its row dim
 _ROW_BUFFERS = (
     ("res_attn", 1), ("res_ffn", 1), ("gates_attn", 1), ("gates_ffn", 1),
     ("ffn_normed", 1), ("ffn_out", 1), ("q", 1), ("normed", 1), ("qr", 1),
@@ -155,6 +157,7 @@ class V41MonoDecodeRunner:
         under DP attention)."""
         group = self._group().cpu_group
         bind_agreed(bind, group)
+        plain = plain_layout(self.max_rows, len(self.selecting))
         self.peers, self._finalizer = owned_peer_buffer(
             self,
             peer_bytes(self.max_rows * self.dp, self.moe_dims),
@@ -162,11 +165,31 @@ class V41MonoDecodeRunner:
             self.rank,
             self.moe_dims.ranks,
             self.scratch.device,
+            plain_bytes=sum(n for _, n in plain.values()),
         )
+        self._place_index_outputs(plain)
+        self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
         self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
         self.widths = WidthBuilds(
             self._rows_build, self._row_kernels, group, "V4.1 mono"
         )
+
+    def _place_index_outputs(self, plain: dict) -> None:
+        """Each selecting layer's pool rows (the attention's keys) and the
+        candidate blocks, in the peer buffer's never-zeroed part at one offset on
+        every rank (``plain_layout``): a token-parallel step's indexer writes a
+        row's into every rank's (``index_score._st_out``)."""
+        words = self.peers.plain.view(torch.int32)
+
+        def region(name, *shape):
+            off, n = plain[name]
+            return words[off // 4 : (off + n) // 4].view(*shape)
+
+        irow = region("irow", len(self.selecting), self.max_rows, ip.TOPK)
+        # every layer sharing a selection shares its KV owner
+        # (``index_score._selected_rows``)
+        self.irow = dict(zip(self.selecting, irow))
+        self.icand = region("icand", self.max_rows, ip.TOPK_BLOCKS)
 
     def prepare(self, rows: int) -> bool:
         """Whether every rank holds the ``rows``-row kernels (``WidthBuilds``)."""
@@ -302,6 +325,11 @@ class V41MonoDecodeRunner:
             and s % self.tp == 0
         )
 
+    def _own_rows(self, s: int) -> tuple[int, int]:
+        """(first row, rows) of an s-row step this rank's indexer selects
+        (``index_score._own_rows``)."""
+        return own_rows(s, self.tp, self.rank) if self._tok_par(s) else (0, s)
+
     def _layer_keys(self, s: int) -> list:
         """K1's build of every layer for an s-row step."""
         # layer 0 starts from the embeddings and an Engram layer settles first:
@@ -403,8 +431,9 @@ class V41MonoDecodeRunner:
         # each token's window metadata (``attention._keys``)
         self.key_meta = torch.empty(s, KMETA, device=dev, dtype=torch.int32)
         # the indexer: its logits and block maxima, each selecting layer's
-        # selection, the candidate blocks, a zero bound for a layer without keys
-        # from a selection, and each selection's bound this step
+        # selection, a zero bound for a layer without keys from a selection,
+        # and each selection's bound this step (its pool rows and the candidate
+        # blocks live in the peer buffer: ``_place_index_outputs``)
         width = self.index_bound_max
         self.ilog = torch.empty(s, width, device=dev, dtype=f32)
         self.ibmax = torch.empty(s, ip.blocks(width), device=dev, dtype=f32)
@@ -412,13 +441,6 @@ class V41MonoDecodeRunner:
             layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
             for layer in self.selecting
         }
-        # each selection's pool rows, the attention's keys (every layer sharing
-        # a selection shares its KV owner: ``index_score._selected_rows``)
-        self.irow = {
-            layer: torch.empty(s, ip.TOPK, device=dev, dtype=torch.int32)
-            for layer in self.selecting
-        }
-        self.icand = torch.empty(s, ip.TOPK_BLOCKS, device=dev, dtype=torch.int32)
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
         # the FP4 score stage's FULL-layer tasks a ratio, each step's written
         # by ``write_step_meta``
@@ -465,7 +487,6 @@ class V41MonoDecodeRunner:
             self.diag_off = nbytes
             nbytes += DIAG_BYTES
         self.scratch = torch.zeros(nbytes, device=dev, dtype=torch.uint8)
-        self._full = {name: getattr(self, name) for name, _ in _ROW_BUFFERS}
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         model = self.model
@@ -491,6 +512,8 @@ class V41MonoDecodeRunner:
             self.ring_rel,
             self.key_meta,
             self.walk_plans,
+            # a token-parallel step's indexer scores this rank's rows alone
+            self._own_rows(rows),
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
         for spec, block, weights, key in zip(
