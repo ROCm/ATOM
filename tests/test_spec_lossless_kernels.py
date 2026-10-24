@@ -15,12 +15,15 @@ support, greedy outputs, rank-consistent draws) are asserted exactly.
 
 import pytest
 import torch
-import triton
-import triton.language as tl
 
+# The CPU unit job has neither aiter nor triton; both imports stay below these
+# guards, or the job fails to collect this file and aborts the whole run.
 pytest.importorskip("aiter", reason="the samplers are AITER/Triton ops")
 if not torch.cuda.is_available():
     pytest.skip("ROCm GPU required", allow_module_level=True)
+
+import triton
+import triton.language as tl
 
 from atom.model_ops.dspark_markov_sample import (
     dspark_markov_argmax,
