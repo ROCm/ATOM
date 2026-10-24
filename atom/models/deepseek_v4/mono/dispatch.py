@@ -88,11 +88,6 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
     from atom.models.deepseek_v4.mono.session import V4MonoSession
 
     session = V4MonoSession(model, atom_config, metadata_builder, profile)
-    # Repack before native warmup and KV sizing so the existing memory profile
-    # includes persistent Mono weights alongside peak native activations.
-    # Cache/aux binding and execution ownership stay deferred until KV is bound.
-    if not session.prepare_weights():
-        return model
     # Native's generic lookup schema conservatively marks weights mutable.
     # Preserve the loaded parameter and exact kernel, but use a read-only
     # schema so graph recording cannot invalidate the weight binding.
@@ -107,6 +102,16 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
             )
     if drafter is not None:
         drafter.model.share_with_target(model, set())
+    if profile.name.startswith("dspark_"):
+        from atom.models.deepseek_v4.mono.norm import MonoRMSNorm
+
+        last = drafter.model.model.mtp[-1]
+        last.norm = MonoRMSNorm(last.norm)
+    # Bind only after read-only wrappers and shared draft modules are final.
+    # Repack still precedes native warmup/KV sizing; binding earlier would
+    # invalidate the draft embedding owner when it is shared again above.
+    if not session.prepare_weights():
+        return model
     metadata_builder._mono_session = session
     if profile.name.startswith("dspark_"):
         from atom.models.deepseek_v4.mono.proposer import (
