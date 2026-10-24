@@ -9,7 +9,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from atom.mono.device.ops import bf_hi, bf_lo, bf16_round, traced
+from atom.mono.device.ops import bf16_round, bf_hi, bf_lo, traced
 
 HEAD_DIM = 512
 ROPE = 64
@@ -91,6 +91,8 @@ def projection_ready(
     output,
     rope=False,
     debug=False,
+    input_stride=None,
+    output_stride=None,
 ):
     """8-wave K-strided native WMMA, with legal masked K128 tails.
 
@@ -98,16 +100,21 @@ def projection_ready(
     valid N16 tile id. The final barrier permits immediate LDS reuse.
     """
     partial_off = 0
+    # A grouped projection offsets q/out to its group's first element while
+    # retaining the full token stride. Buffer extents stop at the last live
+    # group element, rather than claiming rows * stride bytes past that view.
+    xstride = inner if input_stride is None else input_stride
+    ystride = output if output_stride is None else output_stride
     lane, wave = tid % 32, tid // 32
     n0 = bid * TILE_N
     lane16, half = lane % 16, lane // 16
     ld32, st32 = make_lds_copy_ops(32)
     ld128, st128 = make_lds_copy_ops(128)
     rx = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(q), num_records_bytes=rows * inner
+        fx.ptrtoint(q), num_records_bytes=(rows - 1) * xstride + inner
     )
     rxs = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(qs), num_records_bytes=rows * inner // 32
+        fx.ptrtoint(qs), num_records_bytes=((rows - 1) * xstride + inner) // 32
     )
     rw = bo.create_buffer_resource_from_addr(
         fx.ptrtoint(weight), num_records_bytes=output * inner
@@ -122,11 +129,12 @@ def projection_ready(
         fx.ptrtoint(sin), num_records_bytes=rows * ROPE
     )
     ro = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(out), num_records_bytes=rows * output * 2
+        fx.ptrtoint(out), num_records_bytes=((rows - 1) * ystride + output) * 2
     )
     if const_expr(debug):
         rd = bo.create_buffer_resource_from_addr(
-            fx.ptrtoint(unrotated), num_records_bytes=rows * output * 2
+            fx.ptrtoint(unrotated),
+            num_records_bytes=((rows - 1) * ystride + output) * 2,
         )
 
     weights, scales, steps = ops
@@ -145,7 +153,7 @@ def projection_ready(
             Vec(
                 bo.buffer_load(
                     rx,
-                    (active_row * inner + st * 128 + half * 16 + j * 32) // 4,
+                    (active_row * xstride + st * 128 + half * 16 + j * 32) // 4,
                     vec_width=4,
                     dtype=T.i32,
                 )
@@ -167,7 +175,7 @@ def projection_ready(
             )
         )
         sa = bo.buffer_load(
-            rxs, active_row * (inner // 128) + st, vec_width=1, dtype=T.i32
+            rxs, active_row * (xstride // 128) + st, vec_width=1, dtype=T.i32
         )
         fx.gemm(
             atom,
@@ -222,11 +230,11 @@ def projection_ready(
             ]
         for j in range_constexpr(2):
             bo.buffer_store(
-                fx.Float32(rotated[j]).to(fx.BFloat16), ro, row * output + column + j
+                fx.Float32(rotated[j]).to(fx.BFloat16), ro, row * ystride + column + j
             )
             if const_expr(debug):
                 bo.buffer_store(
-                    values[j].to(fx.BFloat16), rd, row * output + column + j
+                    values[j].to(fx.BFloat16), rd, row * ystride + column + j
                 )
 
     fx.gpu.barrier()
@@ -293,8 +301,9 @@ def grouped_load(weight, scale, tid, bid, output, groups):
     scales = []
     steps = []
     for slot in range_constexpr(groups):
-        # For groups4, slots2/3 have no second round; groups2 slot1 likewise.
-        rounds = 2 if slot == 0 else 1
+        # Ten K128 steps need a second round for the slots carrying K0/K1.
+        # At groups8 these are slots0/1; groups2/4 keep their old schedule.
+        rounds = 2 if slot * split < 2 else 1
         for iteration in range_constexpr(rounds):
             step = part + slot * split + iteration * 8
             st = fx.min(step, 9)
@@ -331,39 +340,26 @@ def grouped_load(weight, scale, tid, bid, output, groups):
 
 
 @traced
-def grouped_ready(
-    q, qs, weight, scale, cos, sin, out, ops, lds, tid, bid, rows, output, groups
-):
+def grouped_partials(q, qs, ops, lds, tid, bid, rows, output, groups):
+    """Store eight K-strided partials per N16 tile, then synchronize LDS.
+
+    Layout is [groups, 8, rows, 16] FP32; capacity must be
+    groups*8*rows*16*4 bytes. Used by BF16 projection and IQ quant consumers.
+    """
     # Eight original partials are kept independent. A physical wave computes
-    # groups of those partials for one of 2/4 output tiles, so FP32 reduction
-    # order and the resulting BF16 projection remain exact.
+    # groups of those partials for one of 2/4/8 output tiles. Keep the
+    # existing eight-part reduction order for all three geometries.
     split = 8 // groups
     lane, wave = tid % 32, tid // 32
     group, part = wave // split, wave % split
     lane16, half = lane % 16, lane // 16
     n0 = (bid * groups + group) * 16
-    ld32, st32 = make_lds_copy_ops(32)
     ld128, st128 = make_lds_copy_ops(128)
     rx = bo.create_buffer_resource_from_addr(
         fx.ptrtoint(q), num_records_bytes=rows * 1280
     )
     rxs = bo.create_buffer_resource_from_addr(
         fx.ptrtoint(qs), num_records_bytes=rows * 40
-    )
-    rw = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(weight), num_records_bytes=output * 1280
-    )
-    rs = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(scale), num_records_bytes=output * 1280 // 1024
-    )
-    rc = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(cos), num_records_bytes=rows * 64
-    )
-    rn = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(sin), num_records_bytes=rows * 64
-    )
-    ro = bo.create_buffer_resource_from_addr(
-        fx.ptrtoint(out), num_records_bytes=rows * output * 2
     )
     weights, scales, steps = ops
     atom = fx.make_mma_atom(
@@ -374,7 +370,7 @@ def grouped_ready(
     for slot in range_constexpr(groups):
         accum = fx.make_rmem_tensor(8, fx.Float32)
         accum.store(fx.full(8, 0.0, fx.Float32))
-        rounds = 2 if slot == 0 else 1
+        rounds = 2 if slot * split < 2 else 1
         for iteration in range_constexpr(rounds):
             step = steps[loaded]
             st = fx.min(step, 9)
@@ -431,6 +427,37 @@ def grouped_ready(
                     ),
                 )
     fx.gpu.barrier()
+
+
+@traced
+def grouped_ready(
+    q,
+    qs,
+    weight,
+    scale,
+    cos,
+    sin,
+    out,
+    ops,
+    lds,
+    tid,
+    bid,
+    rows,
+    output,
+    groups,
+    head_dim=512,
+):
+    ld32, st32 = make_lds_copy_ops(32)
+    rc = bo.create_buffer_resource_from_addr(
+        fx.ptrtoint(cos), num_records_bytes=rows * 64
+    )
+    rn = bo.create_buffer_resource_from_addr(
+        fx.ptrtoint(sin), num_records_bytes=rows * 64
+    )
+    ro = bo.create_buffer_resource_from_addr(
+        fx.ptrtoint(out), num_records_bytes=rows * output * 2
+    )
+    grouped_partials(q, qs, ops, lds, tid, bid, rows, output, groups)
     if tid < rows * groups * 8:
         row = tid // (groups * 8)
         ngroup = (tid // 8) % groups
@@ -448,15 +475,15 @@ def grouped_ready(
                 ).bitcast(fx.Float32)
                 sums[j] = sums[j] + value
         values = [bf16_round(v) for v in sums]
-        dim = column % 512
-        at = row * 32 + fx.max(dim - 448, 0) // 2
+        dim = column % head_dim
+        at = row * 32 + fx.max(dim - (head_dim - 64), 0) // 2
         cw = fx.Int32(bo.buffer_load(rc, at // 2, vec_width=1, dtype=T.i32))
         sw = fx.Int32(bo.buffer_load(rn, at // 2, vec_width=1, dtype=T.i32))
         cs = (at % 2 == 0).select(bf_lo(cw), bf_hi(cw))
         sn = (at % 2 == 0).select(bf_lo(sw), bf_hi(sw))
         rotated = [
-            (dim >= 448).select(values[0] * cs - values[1] * sn, values[0]),
-            (dim >= 448).select(values[0] * sn + values[1] * cs, values[1]),
+            (dim >= head_dim - 64).select(values[0] * cs - values[1] * sn, values[0]),
+            (dim >= head_dim - 64).select(values[0] * sn + values[1] * cs, values[1]),
         ]
         for j in range_constexpr(2):
             bo.buffer_store(

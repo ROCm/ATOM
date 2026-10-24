@@ -565,7 +565,7 @@ class V41MonoDecodeRunner:
                 self._layer_post(*post)
             if spec.produces_candidates:
                 # the REINDEX layers' block table over this layer's candidates
-                self.candidate_table = candidate_block_table(
+                self.candidate_table = self._candidate_block_table(
                     self.icand,
                     step.block_tables,
                     step.batch_ids,
@@ -591,6 +591,9 @@ class V41MonoDecodeRunner:
         for timeline in self.timelines.values():
             timeline.step_done(rows)
         return hidden.squeeze(0)
+
+    def _candidate_block_table(self, *args, **kwargs):
+        return candidate_block_table(*args, **kwargs)
 
     def _gather_rows(self, hidden, rows):
         """A token-parallel step's every row from its owner: the collapsed

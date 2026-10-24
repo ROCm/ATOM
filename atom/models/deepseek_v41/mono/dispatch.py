@@ -155,6 +155,12 @@ def install_mono_decode(
     """``model`` wrapped for mono decode (and ``drafter``'s DSpark draft model
     for its backbone), or ``model`` itself when this deployment is one mono
     does not serve."""
+    import os
+
+    if os.getenv("ATOM_DSV41_GFX1250_REFERENCE_MONO", "0") == "1":
+        from atom.models.deepseek_v41.mono.gfx1250_reference_runner import install_reference_decode
+
+        return install_reference_decode(model, atom_config, drafter, metadata_builder)
     why = config_refusal(atom_config)
     if why is not None:
         logger.info("V4.1 mono decode off: %s", why)

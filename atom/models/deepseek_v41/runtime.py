@@ -2,6 +2,7 @@
 """ModelRunner interface over the V4.1 multimodal backbone."""
 
 import logging
+import os
 
 import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -64,6 +65,10 @@ def v41_begin_forward(hidden: torch.Tensor) -> None:
         return
     if isinstance(metadata.engram_embeddings, EngramStagedRows):
         metadata.engram_embeddings.stage()
+    if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1" and metadata.step.decode:
+        from .mono.gfx1250_runner import begin_k1_forward
+
+        begin_k1_forward(metadata)
 
 
 @torch_compile_guard(mutates_args=["hidden"], gen_fake=lambda hidden: None)
@@ -74,6 +79,10 @@ def v41_end_forward(hidden: torch.Tensor) -> None:
     if not metadata.step.requests:
         hidden.zero_()
         return
+    if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1" and metadata.step.decode:
+        from .mono.gfx1250_runner import finish_k1_forward
+
+        finish_k1_forward(metadata)
     if getattr(metadata, "staged_outside_forward", False):
         # Staged and joined by the metadata builder, before this forward. Its
         # fork was opened and closed out there; waiting on it from in here
@@ -133,6 +142,22 @@ def v41_engram(residual: torch.Tensor, layer_name: str) -> torch.Tensor:
 
 class RuntimeBlock(Block):
     """Serving uses the same guarded ops in eager and compiled execution."""
+
+    def forward(
+        self, state, cache, step, rope, embeddings=None, image_mask=None, queries=None
+    ):
+        if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1":
+            from .mono.gfx1250_runner import try_decode_k1
+
+            metadata = get_forward_context().attn_metadata
+            result = try_decode_k1(
+                self, state, metadata, rope, embeddings, image_mask, queries
+            )
+            if result is not None:
+                return result
+        return super().forward(
+            state, cache, step, rope, embeddings, image_mask, queries
+        )
 
     def attention_forward(self, normed, cache, step, rope):
         if isinstance(normed, tuple):
@@ -248,8 +273,84 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
 
     block_cls = RuntimeBlock
 
+    def check_forward_ready(self):
+        transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
+        if transfer is not None:
+            try:
+                transfer.poll_completed()
+            except RuntimeError:
+                self._gfx1250_k1_failed = True
+                raise
+        if getattr(self, "_gfx1250_k1_failed", False):
+            raise RuntimeError("[gfx1250 K1 runner] failed model cannot dispatch")
+
+    def drain_forward_diagnostics(self):
+        transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
+        if transfer is not None:
+            try:
+                transfer.drain()
+            except RuntimeError:
+                self._gfx1250_k1_failed = True
+                raise
+
+    def stage_forward_diagnostics(self, rows, stream, deferred):
+        if not deferred or not any(os.getenv(flag, "0") == "1" for flag in (
+            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MONO",
+        )):
+            return
+        from .mono.gfx1250_diagnostics import DeferredDiagnostics
+
+        transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
+        if transfer is None:
+            transfer = DeferredDiagnostics(stream, len(self.layers))
+            self._gfx1250_diagnostic_transfer = transfer
+        transfer.stage(get_forward_context().attn_metadata, rows)
+
+    def check_forward_diagnostics(self, rows):
+        if any(os.getenv(flag, "0") == "1" for flag in (
+            "ATOM_DSV41_GFX1250_K1", "ATOM_DSV41_GFX1250_REFERENCE_MONO",
+        )):
+            from .mono.gfx1250_runner import check_k1_diagnostics
+
+            try:
+                transfer = getattr(self, "_gfx1250_diagnostic_transfer", None)
+                if transfer is not None and transfer.staged:
+                    transfer.accept()
+                else:
+                    check_k1_diagnostics(get_forward_context().attn_metadata, rows)
+            except RuntimeError:
+                self._gfx1250_k1_failed = True
+                raise
+
     def __init__(self, atom_config):
         config = atom_config
+        if os.getenv("ATOM_DSV41_GFX1250_K2_MERGED", "0") == "1":
+            if any(
+                os.getenv(flag, "0") != "1"
+                for flag in (
+                    "ATOM_DSV41_GFX1250_K1",
+                    "ATOM_DSV41_GFX1250_K2",
+                )
+            ):
+                raise ValueError("[gfx1250 mono] merged K2 requires K1 and K2 enabled")
+        if os.getenv("ATOM_DSV41_GFX1250_K1", "0") == "1":
+            from atom.config import CUDAGraphMode
+
+            if (
+                config.compilation_config.level != 0
+                or (
+                    not config.enforce_eager
+                    and config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL
+                )
+                or getattr(config, "enable_decoder_swa_bounded_replay", False)
+                or getattr(config, "enable_encoder_swa_bounded_replay", False)
+                or getattr(config, "enable_tbo", False)
+                or getattr(config, "enable_rapidserve", False)
+            ):
+                raise ValueError(
+                    "[gfx1250 K1 runner] requires level0 eager/FULL graph, "
+                    "bounded replay, TBO and rapidserve disabled"
+                )
         # Config is built before legacy DP kwargs and DPA rank expansion apply.
         # Validate their final width here, before allocating model parameters.
         if getattr(config, "enable_tbo", False):
@@ -312,6 +413,10 @@ class DeepseekV41RuntimeModel(DeepseekV41MultimodalModel):
     # TR-graph breaks through their ops: both decide on the live step whether
     # there is anything to stage or join.
     def begin_forward(self, hidden, engram_embeddings):
+        if os.getenv("ATOM_DSV41_GFX1250_K2_MERGED", "0") == "1":
+            from .mono.gfx1250_context import bind_gfx1250_context
+
+            bind_gfx1250_context(self, get_forward_context().attn_metadata)
         v41_begin_forward(hidden)
 
     def end_forward(self, hidden, engram_embeddings):

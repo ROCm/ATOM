@@ -1370,6 +1370,9 @@ class ModelRunner:
             is_dummy_run=True,
         )
         self.forward(dummy_batch)
+        drain_diagnostics = getattr(self.model, "drain_forward_diagnostics", None)
+        if drain_diagnostics is not None:
+            drain_diagnostics()
         self.tokenID_processor.clean()
         torch.cuda.empty_cache()
         logger.info(
@@ -3042,6 +3045,9 @@ class ModelRunner:
                 input_ids, positions, _pcp_bal_groups, _pcp_size, forward_context
             )
 
+        check_ready = getattr(self.model, "check_forward_ready", None)
+        if check_ready is not None:
+            check_ready()
         if not forward_mode.use_cudagraph:
             # prefill, or a decode no request graph serves (enforce_eager / DP
             # peer prefill / bs above the largest captured graph). Either may
@@ -3516,6 +3522,16 @@ class ModelRunner:
                 draft_token_ids=None,
             )
 
+        # Preserve the mono result before output processing. Deferred output
+        # accepts the previous snapshot before returning its previous tokens.
+        stage_diagnostics = getattr(self.model, "stage_forward_diagnostics", None)
+        if stage_diagnostics is not None:
+            stage_diagnostics(
+                get_forward_context().context.running_tokens,
+                self.tokenID_processor.async_copy_stream,
+                self.tokenID_processor.is_deferred_out,
+            )
+
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3527,6 +3543,12 @@ class ModelRunner:
             needs_independent_noise=needs_independent_noise,
         )
 
+        # Submit this step's LM head/sampling before waiting on diagnostics.
+        # The model's device guards make a failed step safe to consume; its
+        # output is discarded here before returning or dispatching another.
+        check = getattr(self.model, "check_forward_diagnostics", None)
+        if check is not None:
+            check(get_forward_context().context.running_tokens)
         reset_forward_context()
         self._record_forward_vars_event()
         self._record_kv_cache_ready(batch)
@@ -4095,6 +4117,9 @@ class ModelRunner:
                     model_output = self.model(
                         input_ids[:running_tokens], model_positions
                     )
+                    check = getattr(self.model, "check_forward_diagnostics", None)
+                    if check is not None:
+                        check(running_tokens)
                     outputs[:running_tokens] = model_output
                     if logits_in_graph:
                         self.model.compute_logits(outputs[:running_tokens])

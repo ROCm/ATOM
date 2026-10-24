@@ -45,10 +45,19 @@ CM_DEV = 16
 
 CM_SYS = 17
 
+# gfx12+ uses TH in bits [0:2] and scope in bits [3:4], rather than
+# gfx95x's SC0/SC1. 17 therefore means device scope + non-temporal on
+# gfx1250, NOT system scope. Keep the gfx950 constants/API unchanged.
+CM_SYS_GFX1250 = 24  # SCOPE_SYS (3 << 3), TH_DEFAULT
+
 
 # NT = 2: nontemporal. A weight a layer reads once streams past the caches it
 # would only evict the step's reused data from (K2b at 48 rows: 143 -> 133 us)
 CM_NT = 2
+
+# gfx12+ encodes a load's non-temporal hint as TH_LOAD_NT=1. Reusing the
+# gfx95x value 2 selects TH_LOAD_HT instead. Keep the mother constant intact.
+CM_NT_GFX1250 = 1
 
 
 def kernel_symbol(stem, **params):
@@ -107,9 +116,10 @@ def readlane(v, src_lane):
     return r.bitcast(fx.Float32) if isinstance(v, fx.Float32) else r
 
 
-def memrealtime():
-    """s_memrealtime: the 100 MHz device clock (no FlyDSL wrapper)."""
-    return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+def memrealtime(steady=False):
+    """The 100 MHz wall clock; gfx1250 selects GET_REALTIME via LLVM."""
+    intrinsic = "llvm.readsteadycounter" if steady else "llvm.amdgcn.s.memrealtime"
+    return fx.Int64(llvm.call_intrinsic(T.i64, intrinsic, [], [], []))
 
 
 def unlikely(cond):
