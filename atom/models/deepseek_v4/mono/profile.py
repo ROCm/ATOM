@@ -111,7 +111,7 @@ def dspark_target_profile(
         tokens_per_seq=draft_tokens + 1,
         auto_request_widths=tuple(range(1, 17)),
         max_requests=16,
-        continuation=False,
+        continuation=not (confidence_schedule or ragged),
         ragged=ragged,
         variable_q=confidence_schedule,
         deployment_qualified=False,

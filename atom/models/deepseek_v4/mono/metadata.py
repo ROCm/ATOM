@@ -55,10 +55,7 @@ class MonoMetadataBuilder(DeepseekV4AttentionMetadataBuilder):
 
     def build(self, batch, running_bs, running_tokens, max_seqlen_q):
         self._mono_batch = batch
-        if (
-            self._mono_session is None
-            or not self._mono_session.profile.name.startswith("dspark_")
-        ):
+        if self._mono_session is None or not self._mono_session._has_draft_resources():
             return super().build(batch, running_bs, running_tokens, max_seqlen_q)
         # Native owns the copy order, padding checks and both phase signatures.
         # A step that copies prefix/COW state runs that whole build after the

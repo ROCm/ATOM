@@ -109,6 +109,8 @@ class V4MonoSession:
         self.graph_generations: dict[tuple[int, int], int] = {}
         self.graph_layouts = {}
         self.pending_capture_layout = None
+        self.pending_target_replay = None
+        self.target_replays = {}
         self.execution_graph_key = None
         self.selected_steps = 0
         self.graph_replays = 0
@@ -298,6 +300,8 @@ class V4MonoSession:
         self.graph_keys.clear()
         self.graph_generations.clear()
         self.graph_layouts.clear()
+        self.target_replays.clear()
+        self.pending_target_replay = None
         self.pending_capture_layout = None
         self.publication_generation = 0
         self.publication_slot_generations = ()
@@ -1140,10 +1144,16 @@ class V4MonoSession:
             self.graph_keys.add(key)
             self.graph_generations[key] = self.graph_generation
             self.graph_layouts[key] = getattr(self, "pending_capture_layout", None)
+            if self.pending_target_replay is not None:
+                self.target_replays[key] = self.pending_target_replay
+            else:
+                self.target_replays.pop(key, None)
         else:
             self.graph_keys.discard(key)
             self.graph_generations.pop(key, None)
             self.graph_layouts.pop(key, None)
+            self.target_replays.pop(key, None)
+        self.pending_target_replay = None
         self.pending_capture_layout = None
 
     def require_graph_layout(self, key, layout) -> None:
@@ -1265,7 +1275,10 @@ class V4MonoSession:
                 compressor_ring_extra=self.builder.max_spec_steps,
             )
 
-            if self.profile.name.startswith("dspark_"):
+            # A target-only session keeps Native's draft lifecycle. Prepare
+            # Mono draft weights/state only for the proposer installed with us.
+            drafter = getattr(self.builder.model_runner, "drafter", None)
+            if getattr(drafter, "_mono_session", None) is self:
                 from atom.models.deepseek_v4.mono.draft_runner import V4MonoDraftRunner
 
                 draft_models = []
@@ -1390,9 +1403,9 @@ class V4MonoSession:
                 self.group,
             )
             self.adapter = adapters[0]
-            if self.profile.name.startswith(
-                "dspark_"
-            ) and not self.draft_runner.prepare_requests(max_requests):
+            if self.draft_runner is not None and not self.draft_runner.prepare_requests(
+                max_requests
+            ):
                 raise MonoUnsupported("joint draft binary admission failed")
             from atom.models.deepseek_v4.mono.weights import _signature
 
@@ -1552,7 +1565,10 @@ class V4MonoSession:
             )
         ):
             batch_contract = self.adapter.continuation_contract(context)
-        if continues_batch(self.batch_continuation, graph_key, batch_contract):
+        target_replay = self.target_replays.get(graph_key)
+        if continues_batch(self.batch_continuation, graph_key, batch_contract) and (
+            not self.profile.name.startswith("dspark_") or target_replay is not None
+        ):
             # The anchor step already agreed owner/cache/layer ABI and the
             # scheduler broadcasts the same position/slot/block-table frontier
             # to every TP worker. Ordinary output and MTP target/draft
@@ -1561,14 +1577,23 @@ class V4MonoSession:
             # Do not turn a rank-local enqueue failure into a slow-path
             # collective: peers have made the same fast decision and would
             # otherwise wait in a different phase.
-            self.adapter.write(
-                input_ids,
-                positions,
-                context,
-                validate_static=False,
-                validate_device_values=False,
-                supported=True,
-            )
+            if target_replay is not None:
+                target_replay.publish(
+                    self.adapter,
+                    input_ids,
+                    positions,
+                    context.attn_metadata,
+                    batch_contract,
+                )
+            else:
+                self.adapter.write(
+                    input_ids,
+                    positions,
+                    context,
+                    validate_static=False,
+                    validate_device_values=False,
+                    supported=True,
+                )
             self._remember_continuation(graph_key, batch_contract)
             width = graph_key[0] * graph_key[1]
             self.fast_publications_by_width[width] = (
@@ -1745,6 +1770,12 @@ class V4MonoSession:
             self._remember_continuation(graph_key, continuation_contract)
         else:
             self.batch_continuation = None
+        if capture and self.profile.name.startswith("dspark_"):
+            from atom.models.deepseek_v4.mono.replay import TargetReplayPublication
+
+            self.pending_target_replay = TargetReplayPublication.bind(
+                self.adapter, input_ids, positions, context.attn_metadata
+            )
         return self._arm_publication(capture=capture)
 
     def _refuse_publication(self, reason, *, live):
@@ -2116,8 +2147,11 @@ class V4MonoSession:
                 for _, bucket in buckets
             ):
                 raise MonoUnsupported("selected lane graph retired before execution")
-            # Read stable published token buffers, not the engine's rotating
-            # H2D input pointer: a captured graph must consume the next step.
+            # A fixed-q DSpark FULL graph owns its native-to-lane publication.
+            # This runs while recording, so stable replay needs no host copies.
+            if self.capture_publication and self.pending_target_replay is not None:
+                self.pending_target_replay.write_inputs()
+            # Other paths read their already-published stable lane buffers.
             tokens = (
                 buckets[0][1].tokens
                 if len(buckets) == 1
