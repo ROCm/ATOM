@@ -3310,9 +3310,7 @@ class ModelRunner:
             drafter = getattr(self, "drafter", None)
             if drafter is not None and not all_greedy:
                 draft_probs, draft_probs_row_base = drafter.lossless_verify_inputs(
-                    bs,
-                    all_greedy=all_greedy,
-                    has_filter=top_ks is not None or top_ps is not None,
+                    bs, has_filter=top_ks is not None or top_ps is not None
                 )
             target_token_ids = None
             if RejectionSampler.needs_target_draw(all_greedy, draft_probs):

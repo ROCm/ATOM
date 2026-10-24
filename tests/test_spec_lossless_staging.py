@@ -141,12 +141,9 @@ def test_everything_the_kernels_read_rides_the_sampling_publication(monkeypatch)
 )
 def test_the_greedy_pair_stays_when_not_armed(monkeypatch, kwargs):
     prop = proposer(monkeypatch, **kwargs)
-    assert prop.draft_sampling is None and prop.draft_probs is None
+    assert prop.draft_sampling is None and prop._q_store is None
     assert not set(LOSSLESS) & set(prop.metadata_buffers)
-    assert prop.lossless_verify_inputs(2, all_greedy=False, has_filter=False) == (
-        None,
-        None,
-    )
+    assert prop.lossless_verify_inputs(2, has_filter=False) == (None, None)
     assert prop.kv_budget_reserve_bytes() == 0
     # Staging is a no-op rather than an error.
     prop.stage_draft_sampling_host(
@@ -333,15 +330,12 @@ def test_an_empty_batch_publishes_only_the_key_and_any_stale_tail(monkeypatch):
 # ---- verify policy ----------------------------------------------------------
 
 
-def test_only_an_unfiltered_sampled_batch_reaches_the_ratio_rule(monkeypatch):
+def test_only_an_unfiltered_batch_reaches_the_ratio_rule(monkeypatch):
     prop = proposer(monkeypatch)
     stage(prop, batch(["a", "b"]))
-    q, base = prop.lossless_verify_inputs(2, all_greedy=False, has_filter=False)
+    q, base = prop.lossless_verify_inputs(2, has_filter=False)
     assert q is prop._q_store and base.shape == (2,)
-    for all_greedy, has_filter in ((True, False), (False, True), (True, True)):
-        assert prop.lossless_verify_inputs(
-            2, all_greedy=all_greedy, has_filter=has_filter
-        ) == (None, None)
+    assert prop.lossless_verify_inputs(2, has_filter=True) == (None, None)
 
 
 @pytest.mark.parametrize(

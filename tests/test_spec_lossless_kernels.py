@@ -255,7 +255,7 @@ def test_unsupported_weights_raise_rather_than_drafting_off_the_global_rng():
 # ---- verify: the probability-ratio rule ---------------------------------------
 
 
-def verify_batch(drafts, width, logits, temperatures):
+def verify_batch(drafts, width, logits, temperatures, row_base=None):
     """`rejection_sample` arguments for equal-width requests whose row r
     scores ``logits[r]`` and drafts ``drafts[r]``."""
     rows = drafts.numel()
@@ -279,6 +279,12 @@ def verify_batch(drafts, width, logits, temperatures):
             width, (width + 1) * batch, width + 1, device=DEV
         ),
         "temperatures": temperatures,
+        # Flat ragged q unless told otherwise: request b's rows start at b * width.
+        "draft_probs_row_base": (
+            torch.arange(batch, device=DEV, dtype=torch.int32) * width
+            if row_base is None
+            else row_base
+        ),
     }
 
 
@@ -376,9 +382,14 @@ def test_a_request_without_q_rejects_and_draws_from_p():
     p, q = sparse(VOCAB, P), sparse(VOCAB, Q)
     drafts = draw(p, n * 2)  # even drafts p itself would accept, given q
     out, (accepted, _, _) = rejection_sample(
-        **verify_batch(drafts, 2, p.log().expand(n * 2, -1), torch.ones(n, device=DEV)),
+        **verify_batch(
+            drafts,
+            2,
+            p.log().expand(n * 2, -1),
+            torch.ones(n, device=DEV),
+            row_base=torch.full((n,), -1, dtype=torch.int32, device=DEV),
+        ),
         draft_probs=q.expand(8, -1).contiguous(),
-        draft_probs_row_base=torch.full((n,), -1, dtype=torch.int32, device=DEV),
         ratio_step=7,
     )
     assert (accepted == 0).all()
@@ -403,9 +414,8 @@ def test_q_is_read_through_the_row_base_not_the_batch_position():
     base = (slots * width).to(torch.int32)
     for k in range(width):
         store[base.long() + k] = q_rows.view(batch_n, width, vocab)[:, k]
-    out, verdict = rejection_sample(
-        **args, draft_probs=store, draft_probs_row_base=base, ratio_step=9
-    )
+    args["draft_probs_row_base"] = base
+    out, verdict = rejection_sample(**args, draft_probs=store, ratio_step=9)
     assert torch.equal(out, flat_out) and torch.equal(verdict, flat_verdict)
 
 
@@ -529,9 +539,14 @@ def test_the_target_law_holds_at_the_real_vocab():
     drafts = draw(q, n)
     logits = p.log().to(torch.bfloat16).expand(n, -1)
     out, _ = rejection_sample(
-        **verify_batch(drafts, 1, logits, torch.ones(n, device=DEV)),
+        **verify_batch(
+            drafts,
+            1,
+            logits,
+            torch.ones(n, device=DEV),
+            row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
+        ),
         draft_probs=q.expand(1, -1).contiguous(),
-        draft_probs_row_base=torch.zeros(n, dtype=torch.int32, device=DEV),
         ratio_step=3,
     )
     p_bf16 = torch.softmax(p.log().to(torch.bfloat16).float(), -1)

@@ -254,11 +254,6 @@ class DSparkProposer(Drafter):
                 self._q_store.numel() * 4 / 2**20,
             )
 
-    @property
-    def draft_probs(self) -> torch.Tensor | None:
-        """``[slots * T, V]`` fp32 q, or None when the greedy pair is running."""
-        return self._q_store
-
     def kv_budget_reserve_bytes(self) -> int:
         """Per-step scratch the sampled draft and the ratio verify allocate.
 
@@ -375,22 +370,22 @@ class DSparkProposer(Drafter):
         )
         self._drafted_gen = self._staging_gen
 
-    def lossless_verify_inputs(self, bs: int, *, all_greedy: bool, has_filter: bool):
+    def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
         """The verify step's ``(draft_probs, q_row_base)``, or ``(None, None)``.
 
         ``(None, None)`` keeps exact-match verification; anything else selects
         the probability-ratio rule in `rejection_sampler.rejection_sample`.
+        Asked only for a batch that is not all greedy: an all-greedy batch
+        keeps the exact-match kernel, so its accept rule is the flag-off one
+        (its draft still runs the sampled block, in greedy mode). A greedy row
+        inside a mixed batch is matched exactly by the ratio kernel itself.
 
-        * An all-greedy batch keeps the exact-match kernel, so its accept rule
-          is the flag-off one (its draft still runs the sampled block, in
-          greedy mode). A greedy row inside a mixed batch is matched exactly
-          by the ratio kernel itself.
-        * A batch with top-k or top-p on any row keeps exact match: p in the
-          ratio path is a plain temperature softmax, and exact match against
-          the target's own filtered draw is lossless. The draft side pairs with
-          it by drafting such a batch greedily.
+        A batch with top-k or top-p on any row keeps exact match: p in the
+        ratio path is a plain temperature softmax, and exact match against the
+        target's own filtered draw is lossless. The draft side pairs with it by
+        drafting such a batch greedily.
         """
-        if self.draft_sampling is None or all_greedy or has_filter:
+        if self.draft_sampling is None or has_filter:
             return None, None
         return self._q_store, self._verify_row_base_buf.gpu[:bs]
 

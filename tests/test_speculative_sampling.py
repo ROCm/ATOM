@@ -64,6 +64,9 @@ def two_token_batch(probabilities, drafts, width):
         "target_logits": probabilities.log().expand(rows, -1).contiguous(),
         "bonus_token_ids": torch.zeros(batch, device="cuda", dtype=torch.int32),
         "bonus_logits_indices": bonus_rows([width] * batch),
+        # The ratio path's q rows, flat: request b's start at b * width.
+        "draft_probs_row_base": torch.arange(batch, device="cuda", dtype=torch.int32)
+        * width,
     }
 
 

@@ -365,13 +365,6 @@ class Drafter(abc.ABC):
     # unreachable from any flavor that has not been ported: the runner calls
     # the hooks unconditionally and gets None back.
 
-    @property
-    def draft_probs(self) -> torch.Tensor | None:
-        """``[slots * T, V]`` fp32 q, one row block per live request, or None
-        when this drafter proposes greedily -- every flavor but DSpark, and
-        DSpark with ``ATOM_SPEC_LOSSLESS_SAMPLING=0``, which is the default."""
-        return None
-
     def stage_draft_sampling_host(
         self, batch, bs: int, group, *, has_filter: bool, drafts_verifiable: bool
     ) -> None:
@@ -380,7 +373,7 @@ class Drafter(abc.ABC):
         publication, which is what carries them to the device."""
         return
 
-    def lossless_verify_inputs(self, bs: int, *, all_greedy: bool, has_filter: bool):
+    def lossless_verify_inputs(self, bs: int, *, has_filter: bool):
         """``(draft_probs, q_row_base)`` for the ratio accept rule, or
         ``(None, None)`` for exact match."""
         return None, None

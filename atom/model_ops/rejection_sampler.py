@@ -699,8 +699,7 @@ def rejection_sample(
     # against p = softmax(target_logits / T).
     temperatures: torch.Tensor | None = None,
     # [batch_size] int32: this request's first row in `draft_probs`, or a
-    # negative sentinel when it has no live q. None means the flat ragged
-    # layout, i.e. row == the request's `start_idx`.
+    # negative sentinel when it has no live q. Required with draft_probs.
     draft_probs_row_base: torch.Tensor | None = None,
     # Per-step key for the (rank-consistent) accept coins and residual race,
     # < 2**32.
@@ -810,11 +809,9 @@ def rejection_sample(
         # Probability-ratio path: accept with `u * q < p` against the q the
         # draft actually drew from, instead of requiring equality with the
         # target's own draw. Same output distribution, higher acceptance.
-        if draft_probs_row_base is None:
-            # Flat ragged q: request r's rows start at its own `start_idx`.
-            draft_probs_row_base = torch.cat(
-                (cu_num_draft_tokens.new_zeros(1), cu_num_draft_tokens[:-1])
-            ).to(torch.int32)
+        assert (
+            draft_probs_row_base is not None
+        ), "the probability-ratio path needs each request's first q row"
         _ratio_sample(
             output_token_ids,
             verdict,
