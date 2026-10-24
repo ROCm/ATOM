@@ -78,7 +78,7 @@ def _resolve_index_cache_dtype(config) -> torch.dtype:
     if index_cache_dtype in ("bf16", "fp8"):
         return dtypes.d_dtypes[index_cache_dtype]
     raise ValueError(
-        "index_cache_dtype must be 'bf16' or 'fp8', " f"got {index_cache_dtype!r}"
+        f"index_cache_dtype must be 'bf16' or 'fp8', got {index_cache_dtype!r}"
     )
 
 
@@ -989,9 +989,11 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         )
         return workinfos
 
-    def prepare_prefill(self, batch: ScheduledBatch, running_bs: int):
+    def prepare_prefill(
+        self, batch: ScheduledBatch, running_bs: int, running_tokens: int
+    ):
         attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(
-            self, batch, running_bs
+            self, batch, running_bs, running_tokens
         )
         if self._has_sparse_attention and not attn_metadata.has_cached:
             bs = batch.total_seqs_num_prefill

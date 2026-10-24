@@ -7,7 +7,7 @@
 > | Compilation Levels | `CompilationLevel` | `from atom.config import CompilationLevel` |
 > | Compilation Config | `CompilationConfig` | `from atom.config import CompilationConfig` |
 > | CUDA Graph Modes | `CUDAGraphMode` | `from atom.config import CUDAGraphMode` |
-> | CUDA Graph Wrapper | `CUDAGraphWrapper` | `from atom.utils.cuda_graph import CUDAGraphWrapper` |
+> | Token / Request Graphs | `TokenGraph`, `ReqGraph`, `@eager_region` | `from atom.utils.region_graph import TokenGraph` |
 > | Forward Context | `ForwardContext` | `from atom.utils.forward_context import ForwardContext` |
 > | Compiler Backend | `VllmBackend` | `from atom.utils.backends import VllmBackend` |
 > | Compiler Manager | `CompilerManager` | `from atom.utils.backends import CompilerManager` |
@@ -24,17 +24,17 @@
 > | 0 | `NO_COMPILATION` | Pure eager execution, no `torch.compile` |
 > | 1 | `DYNAMO_AS_IS` | `torch.compile` with `backend="eager"` |
 > | 2 | `DYNAMO_ONCE` | `torch.compile` with Inductor |
-> | 3 | `PIECEWISE` | Piecewise compilation with CUDA graph capture (production default) |
+> | 3 | `PIECEWISE` | Piecewise compilation: split at `splitting_ops`, each piece compiled by Inductor (production default) |
 >
 > **CUDA Graph Modes at a Glance**
 >
 > | Mode | Value | Behavior |
 > |------|-------|----------|
 > | `NONE` | `0` | No graph capture |
-> | `PIECEWISE` | `1` | Per-subgraph capture (default for level 3) |
+> | `TR_HYBRID` | `1` | Token graphs, breaking at eager regions (default for level 3) |
 > | `FULL` | `2` | Whole-model capture |
 > | `FULL_DECODE_ONLY` | `(FULL, NONE)` | Full for decode, none for mixed batches |
-> | `FULL_AND_PIECEWISE` | `(FULL, PIECEWISE)` | Full for decode, piecewise for prefill |
+> | `FULL_AND_TR_HYBRID` | `(FULL, TR_HYBRID)` | Recorded as `TR_HYBRID` by the native runner: decode replays token graphs too |
 
 ## Compilation levels
 
@@ -62,7 +62,7 @@ The most advanced level. When `Config.__post_init__` detects `level == PIECEWISE
 
 1. Calls `CompilationConfig.set_splitting_ops_for_v1()` to configure the splitting operations (default: `["aiter.unified_attention_with_output", "aiter.mla_attention"]`).
 2. Calls `Config._set_cudagraph_sizes()` to compute the graph batch sizes.
-3. Sets `cudagraph_mode = CUDAGraphMode.PIECEWISE`.
+3. Sets `cudagraph_mode = CUDAGraphMode.TR_HYBRID` when none was chosen.
 4. Calls `CompilationConfig.init_with_cudagraph_sizes()` to finalize compile sizes.
 
 The `VllmBackend` is then used as the `torch.compile` backend. It splits the model graph into subgraphs at the splitting operations and compiles each subgraph independently via `PiecewiseBackend`.
@@ -75,11 +75,11 @@ The `CUDAGraphMode` enum in `atom/config.py` controls how CUDA graphs are captur
 
 No CUDA graph capture or replay. Every forward pass launches kernels individually. This mode is used during profiling, warmup, or when CUDA graphs are not supported.
 
-### PIECEWISE (value: 1)
+### TR_HYBRID (value: 1)
 
-The default mode for level 3 compilation. CUDA graphs are captured per subgraph (one for each piecewise-compiled region). Attention operations, which are split out by `splitting_ops`, run outside CUDA graphs because they may need dynamic metadata that changes between steps.
+Token graphs and request graphs mixed, for every step alike. The compiled forward is recorded as a `TokenGraph` (`atom/utils/region_graph.py`) per token bucket: one bucket per `bs * q` the capture loop visits, which any decode step padded to that many rows replays, whatever its requests. The compiled pieces are recorded inline; the recording breaks only at the split ops declared `@eager_region` -- the ones whose launches depend on host data (the attention / mixer ops of most models). Those run eagerly between the graph's segments, reading the live step's metadata, and hand their result to the next segment at the address it was recorded reading. A region whose launches a request bucket fixes is where a `ReqGraph` joins the mix; no model records one there yet.
 
-The `CUDAGraphWrapper` class wraps each subgraph with `runtime_mode=CUDAGraphMode.PIECEWISE` for capture and replay.
+A split op (`mark_spliting_op`) is a compile boundary only; it is a graph break only if also declared `@eager_region`. DeepSeek-V4's compressor launch (`v4_attn_compress_launch`) is a split op recorded inline: its plan is sized by the token count. It runs ahead of the Q/KV projections and forks the compressors onto side streams, as FULL does, so the projections overlap them; `_sparse_attention` joins them before the first eager region, so fork and join land in one recorded segment. Its only break is the FP4 indexer's logits (`_fp4_band_logits` in `atom/model_ops/indexer/score.py`), whose launch is planned from the step's sequences; the bands, the FP8 launch and the top-k follow the rows alone and are recorded.
 
 ### FULL (value: 2)
 
@@ -93,13 +93,11 @@ A tuple mode that applies different strategies to different batch types:
 
 This is useful for prefill/decode disaggregated (P/D) setups where decode latency matters more than prefill performance.
 
-### FULL_AND_PIECEWISE (value: (FULL, PIECEWISE))
+### FULL_AND_TR_HYBRID (value: (FULL, TR_HYBRID))
 
-A tuple mode combining both strategies:
-- **Decode batches**: Captured with full CUDA graphs.
-- **Prefill and mixed batches**: Captured with piecewise CUDA graphs.
-
-This is described in the code as "the most performant mode for most models."
+A tuple mode that the native runner records exactly as `TR_HYBRID`
+(`ModelRunner._tr_hybrid_active` asks `uses_tr_hybrid()`): decode batches
+replay token graphs as well, and no full decode graph is captured.
 
 ### Helper methods
 
@@ -111,7 +109,7 @@ The `CUDAGraphMode` enum provides several helper methods for runtime dispatch:
 | `mixed_mode()` | `CUDAGraphMode` | Returns the mode to use for mixed batches. For tuple modes, returns the second element. |
 | `separate_routine()` | `bool` | Returns `True` if the mode is a tuple (different strategies for decode vs. mixed). |
 | `has_full_cudagraphs()` | `bool` | Returns `True` if any part of the mode uses `FULL` capture. |
-| `requires_piecewise_compilation()` | `bool` | Returns `True` if either decode or mixed mode uses `PIECEWISE`. |
+| `uses_tr_hybrid()` | `bool` | Returns `True` if either decode or mixed mode uses `TR_HYBRID`. |
 | `max_cudagraph_mode()` | `CUDAGraphMode` | Returns the highest-valued mode across both decode and mixed modes. |
 
 ## CUDA graph capture
@@ -132,20 +130,20 @@ capture_cudagraph()
   |
   +-- Assert max batch size <= max_num_seqs
   |
-  +-- Initialize graph storage: self.graphs = dict()
+  +-- Initialize graph storage: self.req_graph = ReqGraph()
   |
   +-- For each batch size bs (with progress bar on rank 0):
   |     |
   |     +-- Compute max_q_len (= mtp_k + 1 if MTP drafter, else 1)
-  |     +-- Compute num_tokens = bs * max_q_len
+  |     +-- Compute running_tokens = bs * max_q_len (the rows the recording runs)
   |     +-- Prepare cu_seqlens_q, positions
   |     +-- Build attn_metadata and context via attn_metadata_builder
-  |     +-- Handle DP padding via get_dp_padding()
-  |     +-- Set forward context (set_forward_context)
-  |     +-- Warmup run: model(input_ids[:num_tokens], positions[:num_tokens])
-  |     +-- Capture: torch.cuda.graph(graph, self.graph_pool, stream=gc.stream)
-  |     +-- Share graph_pool across captures (set on first capture)
-  |     +-- Store: self.graphs[(bs, max_q_len)] = graph
+  |     +-- Set forward context (set_forward_context) with
+  |     |   running_tokens_per_dp_rank = running_tokens on every rank:
+  |     |   capture is symmetric, every DP rank records the same bucket
+  |     +-- Warmup run: model(input_ids[:running_tokens], positions[:running_tokens])
+  |     +-- Record: self.req_graph.record(full_forward) -- one graph per
+  |     |   request bucket, in the pool every recording shares
   |     +-- torch.cuda.synchronize()
   |
   +-- Sort capture_sizes back to ascending order
@@ -154,23 +152,27 @@ capture_cudagraph()
 
 ### Graph keying
 
-Each captured graph is stored in a dictionary keyed by a `(running_bs, max_q_len)` tuple:
+Decode graphs are request-bucket graphs (`atom/utils/region_graph.py`'s
+`ReqGraph`, held as `ModelRunner.req_graph`), keyed by `request_bucket`:
 
 ```python
-self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
+request_bucket(running_bs, max_seqlen_q) == (running_bs, draft_num)
 ```
 
 - `running_bs`: The padded batch size used during capture.
-- `max_q_len`: The maximum query length per sequence. For standard decode, this is `1`. For MTP (Multi-Token Prediction) speculative decoding, this is `mtp_k + 1`.
+- `draft_num`: The draft tokens each request verifies -- its query rows less
+  the one it decodes: `0` for standard decode, `mtp_k` for MTP speculative
+  decoding.
+
+A decode step the DP group splits into TBO microbatches has no graph yet and
+runs eagerly (`ForwardMode.decide`).
 
 ### Graph pool sharing
 
-The first captured graph creates a CUDA memory pool via `graph.pool()`. All subsequent captures share this pool through the `self.graph_pool` parameter, enabling memory reuse across different batch sizes.
-
-```python
-if self.graph_pool is None:
-    self.graph_pool = graph.pool()
-```
+Every `ReqGraph` and `TokenGraph` (the drafter's included) records into one
+pool, `region_graph.graph_pool()`. Recordings never overlap in use -- a
+graph's output is consumed before the next one replays -- so the pool is the
+largest recording's, not their sum.
 
 ### Default capture sizes
 
@@ -199,10 +201,10 @@ def run_model(self, input_ids):
         hidden_states = self.model(input_ids, positions)
     else:
         # Graph replay path: decode batches within captured range
-        running_bs = context.running_bs
-        max_q_len = forward_context.attn_metadata.max_seqlen_q
-        graph_key = (running_bs, max_q_len)
-        self.graphs[graph_key].replay()
+        graph_key = request_bucket(
+            context.running_bs, forward_context.attn_metadata.max_seqlen_q
+        )
+        logits = self._decode_graph(graph_key)()  # ReqGraph.replay
         num_tokens = context.batch_size * max_q_len
         hidden_states = self.forward_vars["outputs"][:num_tokens]
 
@@ -217,7 +219,7 @@ Key decisions:
 
 ## Piecewise compilation
 
-Piecewise compilation splits the model's computation graph at specified operations and compiles each subgraph independently. This enables CUDA graph capture for the compilable parts while leaving incompatible operations (primarily attention) to run eagerly.
+Piecewise compilation splits the model's computation graph at specified operations and compiles each subgraph independently. It is a compilation step only: which CUDA graphs a step replays -- FULL request graphs or TR_HYBRID token graphs -- is `CUDAGraphMode`'s, independent of the compilation level.
 
 ### Splitting operations
 
@@ -301,17 +303,17 @@ class Context:
 
 ### Integration with CUDA graphs
 
-For ModelRunner's direct CUDA graph path (non-piecewise), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.running_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
+For FULL request graphs (`ReqGraph`), the forward context is set before `run_model()` via `set_forward_context()`, and `run_model()` reads `context.running_bs` and `attn_metadata.max_seqlen_q` to look up the correct pre-captured graph.
 
-For the piecewise path, `CUDAGraphWrapper` (in `atom/utils/cuda_graph.py`) expects `batch_descriptor` and `cudagraph_runtime_mode` fields on the forward context to decide whether to capture, replay, or run eagerly:
+For TR_HYBRID token graphs, `ForwardMode.decide` settles whether the step runs a recorded token bucket (`ForwardMode.token_graph`), and `set_forward_context` turns that into `ForwardContext.tr_graph = "replay"`; the model's recording unit then replays its `TokenGraph` for the step's rows. The capture loop records with `tr_graph = "record"`.
 
-```python
-forward_context = get_forward_context()
-batch_descriptor = forward_context.batch_descriptor
-cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
-```
+A model declares its recording unit with `@token_graph` (`atom/utils/region_graph.py`), independently of `@support_torch_compile`, so a token graph does not depend on torch.compile. The unit is the outermost module whose forward holds all the step's per-token work: DeepSeek-V4 marks `DeepseekV4ForCausalLM`, whose DP-attention `input_ids` gather feeds the hash MoE, and V4.1 marks its three stages (`_Backbone`, `_EarlyLayers`, `_LateLayers`). Every other target model marks its compiled `*Model`.
 
-> **Note:** The piecewise `CUDAGraphWrapper` integration is under development. The `batch_descriptor` and `cudagraph_runtime_mode` fields are expected by `CUDAGraphWrapper.__call__()` but are not currently defined on the `ForwardContext` dataclass. The per-subgraph wrapping in `backends.py` is also currently commented out. The direct CUDA graph path in `ModelRunner` is the active production path.
+A recording serves prefill and decode steps of its token count alike, so a decode bucket recorded at capture is not recorded again for prefill. It counts as a phase's bucket only once that phase's record pass asked for it, though: `TokenGraph.captured_sizes("prefill" | "decode")` are the buckets a step of that phase pads to, so a model that records only decode buckets (DeepSeek-V4 under TR_HYBRID) reports no prefill bucket, and its scheduler sends no dummy prefill. A unit whose forward records different work in each phase declares `@token_graph(per_phase=True)` and is recorded once per phase. V4.1's stages are per phase: a decode forward computes no `kv` for the attention region a prefill reads. Drafters are not marked: each records its own passes as `DraftGraph`s (`atom/spec_decode/draft_graph.py`) in either graph mode.
+
+Every recording (`TokenGraph.record`, and through it `ReqGraph` and `DraftGraph`) first waits out the NCCL watchdog (`atom/distributed/nccl_watchdog.py:drain_nccl_works`). A collective recorded into the graph joins its NCCL stream into the capture, and a watchdog poll of an eager collective still pending on that stream fails with `hipErrorCapturedEvent` and invalidates the capture; `torch.cuda.synchronize()` alone does not prevent it.
+
+aiter's custom collectives keep their registered (direct-read) capture path inside token graphs, as under FULL: each recorded collective reads its peers' inputs at the addresses the recording gave them, which a segment's pool holds fixed, and the kernels' closing barrier keeps a rank from overwriting an input before every peer has read it. The copy-in path the removed PIECEWISE mode forced cost one device-to-device copy per collective (about 0.9 ms per DeepSeek-V4-Flash DP decode step).
 
 ## Compiler backend
 
@@ -399,9 +401,9 @@ All compilation-related configuration fields from `CompilationConfig`:
 | `use_cudagraph` | `bool` | `True` | Whether CUDA graph capture is enabled. |
 | `cudagraph_capture_sizes` | `Optional[list[int]]` | `None` | Explicit list of batch sizes to capture. Overrides `cuda_graph_sizes`. |
 | `cuda_graph_sizes` | `list[int]` | `[512]` | Controls auto-generated capture sizes. 1 value = generate pattern; >1 values = use directly. |
-| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph mode. Set to `PIECEWISE` automatically at level 3. |
+| `cudagraph_mode` | `Optional[CUDAGraphMode]` | `None` | CUDA graph mode. Set to `TR_HYBRID` automatically at level 3. |
 | `splitting_ops` | `Optional[list[str]]` | `None` | Operations that split the graph for piecewise compilation. Auto-set at level 3. |
-| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors to static buffers for CUDA graph address stability. Only effective in `PIECEWISE` mode. |
+| `cudagraph_copy_inputs` | `bool` | `False` | Copy input tensors to static buffers for CUDA graph address stability. Effective at level 3 whenever `cudagraph_mode` is not `NONE`. |
 | `use_inductor` | `bool` | `True` | Whether to use the Inductor compiler backend. |
 | `compile_sizes` | `Optional[list[Union[int, str]]]` | `None` | Specific sizes to compile with Inductor. Supports `"cudagraph_capture_sizes"` string. |
 | `inductor_compile_config` | `dict` | `{}` | Additional Inductor configuration (e.g., `max_autotune`). |
@@ -444,23 +446,21 @@ Is the model supported by torch.compile?
         |
         +-- Level 3 (PIECEWISE) [recommended]
             |
-            +-- Standard serving --> cudagraph_mode=PIECEWISE (default)
+            +-- Standard serving --> cudagraph_mode=TR_HYBRID (default)
             |
             +-- Small model / uniform batches --> cudagraph_mode=FULL
             |
             +-- P/D disaggregated (decode instance) --> cudagraph_mode=FULL_DECODE_ONLY
-            |
-            +-- Maximum performance --> cudagraph_mode=FULL_AND_PIECEWISE
 ```
 
 ### Common configurations
 
-**Default production setup** (level 3, piecewise CUDA graphs):
+**Default production setup** (level 3, TR_HYBRID graphs):
 ```python
 CompilationConfig(level=3)
 # Automatically sets:
 #   splitting_ops = ["aiter.unified_attention_with_output", "aiter.mla_attention"]
-#   cudagraph_mode = CUDAGraphMode.PIECEWISE
+#   cudagraph_mode = CUDAGraphMode.TR_HYBRID
 #   cuda_graph_sizes = [512]
 #   capture_sizes = [1, 2, ..., 8, 16, 32, ..., 512]
 ```
@@ -488,7 +488,7 @@ CompilationConfig(level=3, debug_dump_path="/tmp/atom_debug")
 | File | Description |
 |------|-------------|
 | `atom/config.py` | `CompilationLevel`, `CompilationConfig`, `CUDAGraphMode`, `Config.__post_init__` (compilation setup) |
-| `atom/utils/cuda_graph.py` | `CUDAGraphEntry`, `CUDAGraphOptions`, `CUDAGraphWrapper`, `BatchDescriptor` |
+| `atom/utils/region_graph.py` | `TokenGraph`, `ReqGraph`, `eager_region`, `token_graph`, `graph_pool` |
 | `atom/utils/backends.py` | `CompilerManager`, `VllmBackend`, `SplitItem`, `split_graph()`, `PiecewiseCompileInterpreter` |
 | `atom/utils/forward_context.py` | `ForwardContext`, `Context`, `AttentionMetaData`, `DPMetadata`, `set_forward_context()`, `get_forward_context()` |
 | `atom/utils/compiler_inferface.py` | `CompilerInterface`, `InductorAdaptor`, `InductorStandaloneAdaptor`, `AlwaysHitShapeEnv` |

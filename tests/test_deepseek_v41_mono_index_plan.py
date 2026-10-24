@@ -4,9 +4,11 @@ mailbox cell a stage polls is one its producer writes this step. The functions
 under test are the ones the kernel calls (``mono/index_plan.py``)."""
 
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from atom.models.deepseek_v41.mono import index_plan as ip
 
@@ -263,7 +265,9 @@ def walk_tasks(bounds, owners):
     row past them zero."""
     plan = np.full((CTAS, 4), -9, dtype=np.int32)
     ip.fill_walk_plan(
-        np.asarray(bounds, dtype=np.int32), np.asarray(owners, dtype=np.int32), plan
+        np.asarray(bounds, dtype=np.int32),
+        ip.walk_pieces(np.asarray(owners, dtype=np.int32)),
+        plan,
     )
     live = int(np.argmin(plan[:, 1] > 0)) if (plan[:, 1] == 0).any() else CTAS
     assert (plan[live:] == 0).all(), plan
@@ -313,3 +317,62 @@ def test_reindex_split_covers_each_tokens_chunks_once(tokens):
     covered = [ch for ch0, ch1 in ranges for ch in range(ch0, ch1)]
     assert covered == list(range(ip.REINDEX_CHUNKS))
     assert min(ch1 - ch0 for ch0, ch1 in ranges) >= 4
+
+
+def device_step(rng, rows, position_max):
+    """(owners, positions) of a decode step ``rows`` wide: requests of 1..9
+    adjacent rows (a run past WALK_ROWS splits) at random positions, then pad
+    rows (batch id -1, position 0)."""
+    owners, positions, request = [], [], 0
+    while len(owners) < rows - rng.randrange(0, 4):
+        length = min(rng.randrange(1, 10), rows - len(owners))
+        start = rng.randrange(0, position_max)
+        owners += [request] * length
+        positions += range(start, start + length)
+        request += 1
+    pad = rows - len(owners)
+    return owners + [-1] * pad, positions + [0] * pad
+
+
+@pytest.mark.parametrize("position_max", [ip.TOPK, 64 * ip.CHUNK, 1 << 20])
+def test_device_walk_plan_is_the_host_plan(position_max):
+    """``step_meta``'s plan, the one the FP4 score stage reads, is
+    ``fill_walk_plan``'s: every row, past the last task included."""
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
+
+    rng = random.Random(position_max)
+    ratios = (1, 2)
+    for rows in [1, 6, 7, 24, 47, 48] * 10:
+        owners, positions = device_step(rng, rows, position_max)
+        step = SimpleNamespace(
+            batch_ids=torch.tensor(owners, dtype=torch.int32, device="cuda"),
+            positions=torch.tensor(positions, dtype=torch.int64, device="cuda"),
+            slots=torch.zeros(rows, dtype=torch.int32, device="cuda"),
+            block_tables=torch.zeros(rows, 4, dtype=torch.int32, device="cuda"),
+        )
+        plans = {
+            r: torch.full((CTAS, 4), -9, dtype=torch.int32, device="cuda")
+            for r in ratios
+        }
+        write_step_meta(
+            step,
+            SimpleNamespace(window_size=128),
+            SimpleNamespace(slot_rows=256, ring_slots=134),
+            torch.empty(rows, dtype=torch.int32, device="cuda"),
+            torch.empty(rows, KMETA, dtype=torch.int32, device="cuda"),
+            plans,
+        )
+        for ratio, plan in plans.items():
+            expected = np.full((CTAS, 4), -9, dtype=np.int32)
+            ip.fill_walk_plan(
+                (np.asarray(positions) + 1) // ratio,
+                ip.walk_pieces(np.asarray(owners, dtype=np.int32)),
+                expected,
+            )
+            assert plan.cpu().numpy().tolist() == expected.tolist(), (
+                ratio,
+                owners,
+                positions,
+            )

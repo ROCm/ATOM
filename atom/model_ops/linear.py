@@ -1342,12 +1342,17 @@ class LinearBase(nn.Module):
         return f"{self.prefix}[M={m},N={n},K={k},a={a_dtype},w={w_dtype},o={o_dtype}]"
 
     def supports_out(self) -> bool:
-        """Whether `forward(out=...)` is wired for this Linear: only the per_1x128
-        preshuffle GEMM writes into a caller-owned destination.
+        """Whether `forward(out=...)` is wired for this Linear: the unquantised
+        GEMM (`tgemm.mm`) and the per_1x128 preshuffle GEMM write into a
+        caller-owned destination.
 
         Computed on access rather than cached at construction -- `quant_type` is
         rewritten when online quantisation is configured, well after __init__.
         """
+        if self.native_a8_group_rows is not None:
+            return False
+        if self.quant_type.value == QuantType.No.value:
+            return True
         return self.quant_type.value == QuantType.per_1x128.value and bool(
             envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
@@ -1391,6 +1396,7 @@ class LinearBase(nn.Module):
                 self.weight,
                 self.bias,
                 otype=otype,
+                out=out,
             )
         else:
             if x_scale is None:

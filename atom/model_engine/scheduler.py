@@ -45,6 +45,7 @@ from atom.model_engine.dynamic_chunking import (
 )
 from atom.model_engine.engine_stats import EngineStats
 from atom.model_engine.multimodal_runtime import prefill_media_payload
+from atom.model_engine.prefill_delayer import PrefillDecision
 from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import (
     Replay,
@@ -490,6 +491,18 @@ class ScheduledBatch:
             return True
         return any(self.is_final_chunk)
 
+    def final_prefill_requests(self) -> int:
+        """The requests whose prompt this batch's prefill finishes; none for a
+        dummy batch, whose rows belong to no request."""
+        if self.is_dummy_run or not self.total_seqs_num_prefill:
+            return 0
+        finals = self.is_final_chunk
+        return sum(
+            1
+            for i, n in enumerate(self.num_scheduled_tokens)
+            if n and (finals is None or finals[i])
+        )
+
 
 def _cut_floor(seq: Sequence, start: int, resume: int) -> int:
     """Where a checkpoint cut of a forward from `start` must land above: where
@@ -599,7 +612,13 @@ class Scheduler:
         config: Config,
         *,
         state_runtime: StateRuntime = DEFAULT_STATE_RUNTIME,
+        prefill_token_graphs: bool = False,
     ):
+        # The runners recorded prefill token graphs
+        # (`ModelRunner.prefill_token_graphs`), not merely configured them: a
+        # backend without `supports_token_graph` records none, and its idle DP
+        # rank has no bucket to dummy-prefill on.
+        self.prefill_token_graphs = prefill_token_graphs
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         # DP prefill cost balancing, on whenever DP attention runs more than
@@ -866,8 +885,25 @@ class Scheduler:
 
         # Set by EngineCore for cross-DP alignment or opt-in TP decode protection.
         self.prefill_delayer: PrefillDelayer | None = None
+        # requests added since the previous schedule, the delayer's to weigh
+        self._arrived_requests = 0
         self._local_prefill_coalescing = False
         self._inflight_prefix_wait: dict[int, int] = {}
+        # This tick is the DP group's prefill step and this rank has none of its
+        # own: EngineCore runs a dummy prefill instead of a decode.
+        self.dummy_prefill = False
+
+    def _group_prefill_tick(self, decision: PrefillDecision) -> bool:
+        """Whether some DP rank prefills this tick, from the delayer's reduce.
+        Only with token graphs recorded: without them a rank's decode beside a
+        peer's prefill costs that peer nothing it was not already paying."""
+        # No delayer reports no prefillable rank.
+        return bool(
+            self.prefill_token_graphs
+            and decision.allow
+            and decision.prefillable_ranks > 0
+            and not self.prefill_delayer.is_local
+        )
 
     def set_prefill_delayer(self, delayer: PrefillDelayer | None) -> None:
         self.prefill_delayer = delayer
@@ -1465,12 +1501,14 @@ class Scheduler:
         self.metrics.enqueue(seq)
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
+        self._arrived_requests += 1
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self.metrics.enqueue(seq)
             self._warn_if_unschedulable(seq)
         self.waiting.extend(seqs)
+        self._arrived_requests += len(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
         seq = self.deferred_free_blocks.get(req_id)
@@ -1973,7 +2011,7 @@ class Scheduler:
                 if self.cost_balance and prefillable
                 else 0.0
             )
-            delayer_allows = self.prefill_delayer.should_allow_prefill(
+            decision = self.prefill_delayer.should_allow_prefill(
                 prefillable=prefillable,
                 pending_tokens=pending_tokens,
                 # decode-only: self.running also holds mid-chunked-prefill seqs,
@@ -1989,10 +2027,18 @@ class Scheduler:
                     else 0.0
                 ),
                 prefill_cost=prefill_cost,
+                waiting_requests=len(self.waiting) + self._partial_prefill_count,
+                arrived_requests=self._arrived_requests,
             )
         else:
-            delayer_allows = True
+            decision = PrefillDecision(allow=True, prefillable_ranks=0)
             prefill_cost = 0.0
+        self._arrived_requests = 0
+        delayer_allows = decision.allow
+
+        # Before the early return below: an idle rank keeps its peers' prefill
+        # company too.
+        self.dummy_prefill = self._group_prefill_tick(decision)
 
         if self.cost_balance and delayer_allows and self.prefill_delayer is not None:
             self._balance_prefill_step(prefill_cost)
@@ -2610,6 +2656,12 @@ class Scheduler:
 
             return (prefill_batch, scheduled_seqs)
 
+        if self.dummy_prefill:
+            # The group's prefill step, with no prefill of this rank's own: it
+            # keeps its peers company on a dummy prefill rather than decode, so
+            # every rank's forward replays its token graph (`ForwardMode.decide`).
+            return None
+
         # --- Decode scheduling ---
         num_seqs_decode = 0
         num_decode_tokens = 0
@@ -2955,8 +3007,7 @@ class Scheduler:
                     end_token=loaded,
                 )
                 logger.info(
-                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d "
-                    "gpu_indexed_tokens=%d",
+                    "[OFFLOAD-PROMOTE] seq=%s loaded_range=%d:%d gpu_indexed_tokens=%d",
                     seq.id,
                     load_start,
                     loaded,
@@ -3437,10 +3488,9 @@ class Scheduler:
     def _assert_positive_prefill_chunk(
         chunk: int, num_new_tokens: int, budget_remaining: int
     ) -> None:
-        assert chunk > 0, (
-            f"chunk must be positive: {chunk=}, "
-            f"{num_new_tokens=}, {budget_remaining=}"
-        )
+        assert (
+            chunk > 0
+        ), f"chunk must be positive: {chunk=}, {num_new_tokens=}, {budget_remaining=}"
 
     def _record_cache_reuse(self, seq: Sequence) -> None:
         """Account local prefix reuse at prefill or first PD decode admission."""

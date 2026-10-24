@@ -66,6 +66,7 @@ from atom.quant_spec import should_skip_online_quant
 from atom.utils import envs, mark_spliting_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.utils.region_graph import eager_region, token_graph
 
 
 def _text_config(config):
@@ -570,7 +571,7 @@ class KimiSparseMoeBlock(nn.Module):
         """Unsummed dispatch target for `maybe_dual_stream_split_forward`.
 
         The split op reaches this whenever dual-stream is gated OFF for a given
-        call (above the token threshold, under TBO, mid piecewise capture), so
+        call (above the token threshold, under TBO, mid token-graph recording), so
         it has to defer exactly like the dual-stream target -- otherwise the
         deferral would silently stop above the threshold, where the [T, H] add
         it saves is largest.
@@ -909,6 +910,7 @@ def _kda_attention_with_output_fake(
     gen_fake=_kda_attention_with_output_fake,
     mutates_args=[],
 )
+@eager_region()
 def kda_attention_with_output(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor | None,
@@ -1698,6 +1700,7 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum
 
 
+@token_graph
 @support_torch_compile
 class KimiLinearModel(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):

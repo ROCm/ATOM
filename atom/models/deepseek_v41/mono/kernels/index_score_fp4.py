@@ -12,8 +12,8 @@ selection trees are shared.
         (head // 16, padded)] E8M0, iw [S, HEADS] f32
 
 A task is a piece -- up to WALK_ROWS adjacent tokens on one page table -- and
-a run of chunks, a CTA's: a FULL layer's from the step's host plan
-(``index_plan.fill_walk_plan``, one descriptor a CTA in ``iplan``), a REINDEX
+a run of chunks, a CTA's: a FULL layer's from the step's plan
+(``step_meta._walk_plan``, one descriptor a CTA in ``iplan``), a REINDEX
 layer's (a token a piece, ``index_plan.reindex_split``) from the CTA index
 alone.
 The CTA stages the piece's query rows in LDS and its waves walk the task's
@@ -467,7 +467,7 @@ def stage_iscore4(c, lead, span, ch0, ch1, max_chunks, rows):
 @traced
 def run_scores4(c, s, bid, max_chunks):
     """The FP4 score stage: this CTA's task, if any. A FULL layer's comes from
-    the step's host plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for
+    the step's plan (``iplan``: (lead, span, ch0, ch1) a CTA, span 0 for
     none); a REINDEX layer's from the CTA index alone
     (``index_plan.reindex_split``): the walk stops at a token's bound, read
     with the first keys."""

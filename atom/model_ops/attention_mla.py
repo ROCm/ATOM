@@ -3337,7 +3337,7 @@ def triton_convert_req_index_to_global_index(
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by "
         f"BLOCK_N ({BLOCK_N})"
     )
 
@@ -3401,7 +3401,7 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     batch_id_per_q_token,  # int32 [num_tokens]
     topk_indices,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q,  # int32 [num_tokens + 1]
+    cu_seqlens_k,  # int32 [num_req + 1]
     out_kv_indices,  # int32
     # Fixed top-k/tile geometry; runtime bounds retain all safety masks.
     NUM_TOPK_TOKENS: tl.constexpr,
@@ -3410,9 +3410,6 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     MAX_NUM_BLOCKS_PER_REQ: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,  # tile width along columns
-    # The FP8 indexer scores one concatenated KV plane, so a request's own
-    # position is `indice - cu_seqlens_q[req]`; the paged FP4 scorer emits it.
-    SEQ_LOCAL: tl.constexpr,
     # strides (in elements)
     ti_stride0: tl.int64,  # topk_indices stride 0
     ti_stride1: tl.constexpr,  # topk_indices stride 1
@@ -3435,11 +3432,12 @@ def _convert_req_index_to_global_index_dsa_prefill_kernel(
     indice = tl.load(
         topk_indices + token_id * ti_stride0 + col_id * ti_stride1
     )  # int32
-    pre_seqlens_q = tl.load(cu_seqlens_q + req_id, mask=valid_req, other=0)
-    req_kv_end = tl.load(cu_seqlens_q + req_id + 1, mask=valid_req, other=0)
-    req_kv_len = req_kv_end - pre_seqlens_q
+    req_kv_start = tl.load(cu_seqlens_k + req_id, mask=valid_req, other=0)
+    req_kv_end = tl.load(cu_seqlens_k + req_id + 1, mask=valid_req, other=0)
+    req_kv_len = req_kv_end - req_kv_start
 
-    seq_token_idx = indice if SEQ_LOCAL else indice - pre_seqlens_q
+    # The indexer emits each request's own positions.
+    seq_token_idx = indice
     block_id = seq_token_idx // PAGE_SIZE
     inblock_offset = seq_token_idx % PAGE_SIZE
 
@@ -3483,18 +3481,17 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
     batch_id_per_q_token: torch.Tensor,  # int32 [num_tokens]
     topk_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
     block_table: torch.Tensor,  # int32 [num_req, max_num_blocks_per_req]
-    cu_seqlens_q: torch.Tensor,  # int32 [num_tokens + 1]
+    cu_seqlens_k: torch.Tensor,  # int32 [num_req + 1]
     # dsa_kv_indices: torch.Tensor,  # int32 [total_kv_seqlen]           -->>>     output for this kernel
     PAGE_SIZE: int = 1,
     NUM_TOPK_TOKENS: int = 2048,
     BLOCK_N: int = 1024,  # tile width along columns
     out: torch.Tensor | None = None,
-    seq_local: bool = False,
 ):
 
     assert topk_indices.shape[1] == NUM_TOPK_TOKENS
     assert NUM_TOPK_TOKENS % BLOCK_N == 0, (
-        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by"
+        f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by "
         f"BLOCK_N ({BLOCK_N})"
     )
 
@@ -3517,7 +3514,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         device=topk_indices.device,
         name="triton_convert_req_index_to_global_index_dsa_prefill",
     )
-    num_req = min(block_table.shape[0], cu_seqlens_q.shape[0] - 1)
+    num_req = min(block_table.shape[0], cu_seqlens_k.shape[0] - 1)
     max_num_blocks_per_req = block_table.shape[1]
 
     # Strides in elements
@@ -3532,7 +3529,7 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         batch_id_per_q_token,
         topk_indices,
         block_table,
-        cu_seqlens_q,
+        cu_seqlens_k,
         new_kv_indices,
         # shapes / constexprs
         NUM_TOPK_TOKENS,
@@ -3541,7 +3538,6 @@ def triton_convert_req_index_to_global_index_dsa_prefill(
         max_num_blocks_per_req,
         PAGE_SIZE,
         BLOCK_N,
-        seq_local,
         # strides
         ti_stride0,
         ti_stride1,

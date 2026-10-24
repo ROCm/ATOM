@@ -20,11 +20,13 @@ from dataclasses import dataclass
 
 import torch
 from aiter.dist.parallel_state import (
+    get_dp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
 
+from atom.config import get_current_atom_config
 from atom.model_ops.deepseek_v41.candidate_table import candidate_block_table
 from atom.model_ops.deepseek_v41.mhc import SinglePassHCState
 from atom.model_ops.v4_kernels.paged_decode import LOG2E
@@ -37,7 +39,7 @@ from atom.models.deepseek_v41.mono.check import (
     check_selection,
     decode_keys,
 )
-from atom.models.deepseek_v41.mono.config import MAX_ROWS
+from atom.models.deepseek_v41.mono.config import MAX_MOE_ROWS, MAX_ROWS
 from atom.models.deepseek_v41.mono.kernels import attn_post as k2a
 from atom.models.deepseek_v41.mono.kernels import attn_pre as k1
 from atom.models.deepseek_v41.mono.kernels import debug as kernel_debug
@@ -51,8 +53,8 @@ from atom.models.deepseek_v41.mono.kernels.index_query import (
 from atom.models.deepseek_v41.mono.kernels.moe_shape import EXPERTS, TOPK
 from atom.models.deepseek_v41.mono.kernels.peer_layout import peer_bytes
 from atom.models.deepseek_v41.mono.step_meta import KMETA, write_step_meta
-from atom.models.deepseek_v41.mono.walk_plan import walk_plan_name
 from atom.models.deepseek_v41.mono.weights import bind_model
+from atom.mono.plan.execution import BLOCKS
 from atom.mono.runtime.aux_taps import AuxTaps, bind_aux_taps
 from atom.mono.runtime.consensus import MonoUnsupported, bind_agreed
 from atom.mono.runtime.debug import DIAG_BYTES, given_up_waits, raise_if_given_up
@@ -64,6 +66,13 @@ from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
+
+# token parallel from this many rows (and a multiple of the TP size), by TP
+# size: the sublayers' all-reduces become reduce-scatters, the per-token stages
+# run on each rank's own tokens. Below it the gather's extra hop costs more than
+# a rank's few tokens save; at TP 2 it never paid (12-48 rows: a K2 equal or
+# 0.5-4.9 us slower), so a TP size not here runs without it
+TOK_PAR_FROM = {4: 12}
 
 # K2a's and K2b's mailbox tags start past every layer's K1 and K2a
 POST_TAG0 = 64
@@ -77,6 +86,8 @@ _ROW_BUFFERS = (
     ("isel", 0), ("irow", 0), ("icand", 0), ("no_bound", 0), ("iq", 0),
     ("iq_scale", 0), ("iw", 0),
 )  # fmt: skip
+# the MoE's input: every rank's rows under DP attention (``LayerPostBuild.ep``)
+_MOE_ROW_BUFFERS = ("ffn_normed",)
 
 
 def _rows(x, dim, s):
@@ -120,11 +131,6 @@ class V41MonoDecodeRunner:
     here; ``draft_runner.DraftMonoRunner`` sets its own."""
 
     max_rows = MAX_ROWS
-    # token parallel from this many rows (and a multiple of the TP size): the
-    # sublayers' all-reduces become reduce-scatters, the per-token stages run on
-    # each rank's own tokens. Below it the gather's extra hop costs more than a
-    # rank's few tokens save
-    tok_par_from = 12
     experts, topk = EXPERTS, TOPK
     ug_groups = 2
     # below this many rows an ug task takes one FP4 group, not ug_groups: a
@@ -145,15 +151,16 @@ class V41MonoDecodeRunner:
 
     def _bind_agreed(self, bind) -> None:
         """``bind()`` on every rank, then, once every rank agreed it did, the
-        collective peer buffer (``peer_layout``)."""
-        group = get_tp_group().cpu_group
+        collective peer buffer (``peer_layout``: the MoE's rows, every rank's
+        under DP attention)."""
+        group = self._group().cpu_group
         bind_agreed(bind, group)
         self.peers, self._finalizer = owned_peer_buffer(
             self,
-            peer_bytes(self.max_rows, self.tp),
+            peer_bytes(self.max_rows * self.dp, self.moe_dims),
             group,
             self.rank,
-            self.tp,
+            self.moe_dims.ranks,
             self.scratch.device,
         )
         self.mailboxes = StepMailboxes(self.peers, self.scratch, debug=self.debug)
@@ -168,14 +175,16 @@ class V41MonoDecodeRunner:
     def _bind(self, model, drafter) -> None:
         self.model = model
         self._bind_rank()
-        self.layers = bind_model(model, self.tp)
+        self.layers = bind_model(model, self.dims, self.moe_tp)
         # without a drafter no layer taps its residual
         self.aux = (
             AuxTaps((), ())
             if drafter is None
             else bind_aux_taps(drafter, model.config.hidden_size)
         )
-        if not self._custom_gather_fits():
+        self.tok_par_from = TOK_PAR_FROM.get(self.tp, self.max_rows + 1)
+        # DP attention gathers no rows: a rank's step is its own
+        if self.dp == 1 and not self._custom_gather_fits():
             logger.warning(
                 "V4.1 mono: token parallel is off, its row gather has no custom "
                 "all-gather (the NCCL one cannot be captured)"
@@ -188,6 +197,9 @@ class V41MonoDecodeRunner:
                         f"rope table {table.dtype} {tuple(table.shape)}"
                     )
         self.check = envs.ATOM_MONO_CHECK
+        if self.check and self.dp > 1:
+            # its K2b alone would wait for rows no K2a of this launch publishes
+            raise MonoUnsupported("ATOM_MONO_CHECK under DP attention")
         # check mode compares K2a's and K2b's outputs: two launches
         self.split_k2 = self.check
         self.debug = envs.ATOM_MONO_DEBUG
@@ -228,12 +240,34 @@ class V41MonoDecodeRunner:
             self.iq_scale.view(rows, 1, 1, ip.DIM // 32, 16, QS_M_TILES),
         )
 
+    @staticmethod
+    def _group():
+        """The ranks one mono step spans: the TP group, or under DP attention
+        (``config_refusal`` let DP > 1 through only there, at TP 1) the DP
+        group, which the MoE is expert parallel over."""
+        tp = get_tensor_model_parallel_world_size()
+        dp = get_dp_group()
+        return dp if tp == 1 and dp.world_size > 1 else get_tp_group()
+
     def _bind_rank(self) -> None:
-        """This rank and the TP size every build is for (``config_refusal``
-        refused the ones the kernels are not built for)."""
-        self.rank = get_tensor_model_parallel_rank()
+        """This rank, the TP size every build is for and DP attention's ranks,
+        the MoE expert parallel or TP over them (``config_refusal`` refused the
+        ones the kernels are not built for)."""
         self.tp = get_tensor_model_parallel_world_size()
-        self.dims = Dims(self.tp)
+        group = self._group()
+        self.dp = group.world_size // self.tp
+        ep = get_current_atom_config().enable_expert_parallel
+        self.ep = self.dp if ep else 1
+        self.moe_tp = 1 if ep else self.dp
+        self.rank = (
+            group.rank_in_group if self.dp > 1 else get_tensor_model_parallel_rank()
+        )
+        # attention's and the shared expert's widths, and under expert parallel
+        # the routed experts a rank holds; the MoE's (its widths, its ranks)
+        self.dims = Dims(self.tp, self.ep)
+        self.moe_dims = Dims(self.tp * self.moe_tp, self.ep)
+        # the MoE runs every rank's rows: its widest build bounds a rank's step
+        self.max_rows = min(self.max_rows, MAX_MOE_ROWS // self.dp)
 
     def _custom_gather_fits(self) -> bool:
         """Whether the widest step's ``_gather_rows`` takes aiter's custom
@@ -258,9 +292,11 @@ class V41MonoDecodeRunner:
     def _tok_par(self, s: int) -> bool:
         """Whether an s-row step runs token parallel (``tok_par_from``); never
         in check mode, which compares each kernel's whole rows, nor with K2
-        split, whose separate K2b would read rows K2a's owner never gathered."""
+        split, whose separate K2b would read rows K2a's owner never gathered.
+        DP attention owns its rows already (``LayerPostBuild.dp_ranks``)."""
         return (
-            not self.check
+            self.dp == 1
+            and not self.check
             and not self.split_k2
             and s >= self.tok_par_from
             and s % self.tp == 0
@@ -295,8 +331,11 @@ class V41MonoDecodeRunner:
             tp=self.tp,
             timeline=self.timeline,
             diag_off=self.diag_off,
-            ug_groups=1 if s < self.fine_ug_below else self.ug_groups,
+            # the MoE's rows decide it (every rank's under DP attention)
+            ug_groups=1 if s * self.dp < self.fine_ug_below else self.ug_groups,
             tok_par=self._tok_par(s),
+            ep=self.ep,
+            moe_tp=self.moe_tp,
         )
 
     def _rows_build(self, s: int) -> RowsBuild:
@@ -328,7 +367,8 @@ class V41MonoDecodeRunner:
             raise ValueError(f"{s} rows is not a step of this runner")
         self.build = self.widths[s]
         for name, dim in _ROW_BUFFERS:
-            setattr(self, name, _rows(self._full[name], dim, s))
+            rows = s * self.dp if name in _MOE_ROW_BUFFERS else s
+            setattr(self, name, _rows(self._full[name], dim, rows))
 
     def _allocate(self, config) -> None:
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -350,7 +390,7 @@ class V41MonoDecodeRunner:
         self.res_attn = torch.empty(1, s, hc, h, device=dev, dtype=bf)
         self.res_ffn = torch.empty(1, s, hc, h, device=dev, dtype=bf)
         self.gates_attn, self.gates_ffn = gates(), gates()
-        self.ffn_normed = torch.empty(1, s, h, device=dev, dtype=bf)
+        self.ffn_normed = torch.empty(1, s * self.dp, h, device=dev, dtype=bf)
         # the FFN output, reduced: the next layer's owed post
         self.ffn_out = torch.empty(1, s, h, device=dev, dtype=bf)
         self.q = torch.empty(1, s, self.dims.heads, k1.HEAD_DIM, device=dev, dtype=bf)
@@ -380,6 +420,23 @@ class V41MonoDecodeRunner:
         }
         self.icand = torch.empty(s, ip.TOPK_BLOCKS, device=dev, dtype=torch.int32)
         self.no_bound = torch.zeros(s, device=dev, dtype=torch.int32)
+        # the FP4 score stage's FULL-layer tasks a ratio, each step's written
+        # by ``write_step_meta``
+        self.walk_plans = (
+            {
+                ratio: torch.zeros(BLOCKS, 4, device=dev, dtype=torch.int32)
+                for ratio in sorted(
+                    {
+                        spec.ratio
+                        for spec, block in zip(self.model.topology, self.model.layers)
+                        if block.attn.indexer is not None
+                        and spec.candidate_source is None
+                    }
+                )
+            }
+            if self.index_fp4
+            else {}
+        )
         self.bounds = {}
         self.candidate_table = None
         # the indexer's query, its scales and the scaled head weights: e4m3 and
@@ -433,6 +490,7 @@ class V41MonoDecodeRunner:
             cache.geometry.window(0, cache.num_pages),
             self.ring_rel,
             self.key_meta,
+            self.walk_plans,
         )
         state = SinglePassHCState.from_embeddings(hidden, model.config.hc_mult)
         for spec, block, weights, key in zip(
@@ -729,9 +787,7 @@ class V41MonoDecodeRunner:
         if self.index_fp4:
             args.update({
                 "iqs": p(self.iq_scale), "pscale": p(units.scales),
-                "iplan": (
-                    dummy if reindex else p(step.planned[walk_plan_name(spec.ratio)])
-                ),
+                "iplan": dummy if reindex else p(self.walk_plans[spec.ratio]),
             })  # fmt: skip
         args.update({
             "iact": 1, "iq": p(self.iq), "iw": p(self.iw),
