@@ -20,7 +20,7 @@ out in eager torch here (accuracy first, no fusions yet):
   sum. The experts therefore run as a top-1 FusedMoE over tokens repeated
   ``top_k`` times, which returns one row per (token, slot).
 * Every norm weight is zero-centred: the effective weight is ``w + 1`` (the
-  final norm: ``w + 0``), rounded to the weight dtype as the reference does.
+  final norm: ``w + 0``), rounded to the weight dtype (bf16).
 * Logits are an fp32 lm_head times ``output_multiplier``, then a tanh softcap.
 """
 
