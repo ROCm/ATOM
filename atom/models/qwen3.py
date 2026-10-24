@@ -324,8 +324,16 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self._aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def __init__(self, config: Any, prefix: str = "") -> None:
         super().__init__()
+        self._aux_hidden_state_layers: tuple[int, ...] = ()
         self.atom_config = config
         self.hf_config = self.atom_config.hf_config
         self.model = Qwen3Model(
@@ -349,9 +357,17 @@ class Qwen3ForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        if self._aux_hidden_state_layers:
+            model_kwargs["capture_hidden_state_layers"] = set(
+                self._aux_hidden_state_layers
+            )
         hidden_states = self.model(
             input_ids=input_ids, positions=positions, **model_kwargs
         )
+        if isinstance(hidden_states, tuple) and len(hidden_states) == 2:
+            hidden, captured_dict = hidden_states
+            aux_list = [captured_dict[i] for i in sorted(captured_dict)]
+            return hidden, aux_list
         return hidden_states
 
     def compute_logits(

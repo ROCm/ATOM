@@ -496,6 +496,17 @@ class LlamaForCausalLM(nn.Module):
             layer_type=layer_type,
         )
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        start = self.model.start_layer
+        end = self.model.end_layer
+        self.model.aux_hidden_state_layers = tuple(
+            g - start for g in layers if start <= g < end
+        )
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
 

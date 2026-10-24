@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from aiter.dist.parallel_state import get_pp_group
+from aiter.dist.parallel_state import get_pp_group, get_tp_group
 from torch import nn
 
 from atom.config import Config
@@ -528,6 +528,24 @@ class Drafter(abc.ABC):
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",
                 spec.model,
             )
+            if getattr(self.model, "has_draft_vocab", False):
+                target_base = getattr(target_model, "language_model", target_model)
+                target_embed = target_base.model.embed_tokens
+                draft_embed = self.model.embed_tokens
+                if not hasattr(target_embed, "weight"):
+                    logger.warning(
+                        "Target embed_tokens is empty on this rank; "
+                        "drafter embeddings not initialized from target."
+                    )
+                elif target_embed.weight.shape == draft_embed.weight.shape:
+                    draft_embed.weight.data.copy_(target_embed.weight.data)
+                    logger.info("Copied target embed_tokens weights to drafter")
+                else:
+                    # TP-sharded target into replicated drafter:
+                    # all-gather shards to reconstruct full table.
+                    full = get_tp_group().all_gather(target_embed.weight.data, dim=0)
+                    draft_embed.weight.data.copy_(full)
+                    logger.info("Copied target embed_tokens weights to drafter")
             return
 
         # Resolve the base model (unwrap multimodal wrapper if present)
