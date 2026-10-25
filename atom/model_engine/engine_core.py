@@ -486,6 +486,12 @@ class EngineCore:
             self._release_multimodal_requests(rejected)
             self.output_queue.put_nowait(rejected)
 
+        # Ahead of the forward, and on the queue every later output of the
+        # same seqs takes, so the client sees T0 first.
+        early = getattr(self.scheduler, "take_early_outputs", None)
+        if early is not None and (early_outputs := early()):
+            self.output_queue.put_nowait(("STREAM", early_outputs))
+
         if result is None:
             self._advance_idle_kv_transfer()
             return False
