@@ -160,6 +160,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
         "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 128
     ),
+    # Priority of those slots' gather streams (torch.cuda.Stream priority;
+    # negative is higher), so a repack need not queue behind the forward.
+    "ATOM_PD_MLA_STAGING_STREAM_PRIORITY": lambda: _int_env(
+        "ATOM_PD_MLA_STAGING_STREAM_PRIORITY", 0
+    ),
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

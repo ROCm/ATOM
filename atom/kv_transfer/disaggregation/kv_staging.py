@@ -66,7 +66,8 @@ class MLAShardStaging:
 
     One slot per send worker, held for one request's push to one consumer
     rank, so a slot is never shared and a pushed chunk is never overwritten
-    before its RDMA write returns.
+    before its RDMA write returns. Each slot has its own stream, so a
+    gather's ``synchronize`` waits for that push only, not every worker's.
     """
 
     def __init__(
@@ -77,6 +78,7 @@ class MLAShardStaging:
         pool_size: int,
         chunk_pages: int,
         device: torch.device,
+        stream_priority: int = 0,
     ):
         if pool_size <= 0 or chunk_pages <= 0:
             raise ValueError(
@@ -96,8 +98,13 @@ class MLAShardStaging:
         )
         self._free = list(range(pool_size))
         self._free_cv = threading.Condition()
-        self._stream = (
-            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self._streams = (
+            [
+                torch.cuda.Stream(device=device, priority=stream_priority)
+                for _ in range(pool_size)
+            ]
+            if device.type == "cuda"
+            else None
         )
 
     @classmethod
@@ -109,6 +116,7 @@ class MLAShardStaging:
         pool_size: int,
         chunk_pages: int,
         device: torch.device,
+        stream_priority: int = 0,
     ) -> MLAShardStaging | None:
         """Staging over every token-contiguous MLA page, or None if none is."""
         sources = {}
@@ -131,6 +139,7 @@ class MLAShardStaging:
             pool_size=pool_size,
             chunk_pages=chunk_pages,
             device=device,
+            stream_priority=stream_priority,
         )
 
     @property
@@ -159,13 +168,18 @@ class MLAShardStaging:
             self._free.append(slot)
             self._free_cv.notify()
 
-    def _on_stream(self):
-        if self._stream is None:
+    def _on_stream(self, slot: int):
+        if self._streams is None:
             return contextlib.nullcontext()
-        return torch.cuda.stream(self._stream)
+        return torch.cuda.stream(self._streams[slot])
 
-    def prepare(self, plan: DCPShardPlan, ready_event=None) -> StagedShard:
-        """Upload the plan's source token rows; later gathers wait on ``ready_event``."""
+    def prepare(
+        self, plan: DCPShardPlan, ready_event=None, slot: int = 0
+    ) -> StagedShard:
+        """Upload the plan's source token rows for gathers into ``slot``.
+
+        Those gathers wait on ``ready_event``.
+        """
         if plan.block_size != self.block_size:
             raise ValueError(
                 f"DCP shard plan block size {plan.block_size} is not the "
@@ -182,12 +196,17 @@ class MLAShardStaging:
         src = plan.src_block_id_per_run[:runs] * plan.block_size + plan.src_token[:runs]
         if plan.interleave_size > 1:
             src = (src[:, None] + np.arange(plan.interleave_size)).reshape(-1)
-        src = np.ascontiguousarray(src, dtype=np.int64)
-        with self._on_stream():
-            if ready_event is not None and self._stream is not None:
-                self._stream.wait_event(ready_event)
-            rows = torch.from_numpy(src).to(self._pool.device)
-        return StagedShard(rows=rows, tokens=src.size, block_size=self.block_size)
+        src = torch.from_numpy(np.ascontiguousarray(src, dtype=np.int64))
+        with self._on_stream(slot):
+            if self._streams is None:
+                rows = src.to(self._pool.device)
+            else:
+                if ready_event is not None:
+                    self._streams[slot].wait_event(ready_event)
+                # Pinned, so the upload queues behind the ready event instead
+                # of blocking this thread until the stream gets there.
+                rows = src.pin_memory().to(self._pool.device, non_blocking=True)
+        return StagedShard(rows=rows, tokens=src.numel(), block_size=self.block_size)
 
     def gather(
         self, region_idx: int, shard: StagedShard, start: int, stop: int, slot: int
@@ -207,13 +226,13 @@ class MLAShardStaging:
         last = min(stop * self.block_size, shard.tokens)
         out = self._pool[slot].view(source.dtype)[: (last - first) * source.shape[1]]
         done = None
-        with self._on_stream():
+        with self._on_stream(slot):
             torch.index_select(
                 source, 0, shard.rows[first:last], out=out.view(last - first, -1)
             )
-            if self._stream is not None:
+            if self._streams is not None:
                 done = torch.cuda.Event()
-                done.record(self._stream)
+                done.record(self._streams[slot])
         if done is not None:
             done.synchronize()
         page_bytes = self.block_size * source.shape[1] * source.element_size()
