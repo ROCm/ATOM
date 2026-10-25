@@ -66,12 +66,29 @@ if [[ "${ATOMESH_WORKER_ENTRYPOINT:-python}" == "mesh" ]]; then
   targets+=(--lib)
 fi
 echo "[build] Mesh commit=${source_commit} profile=${profile} targets=${targets[*]}" >&2
-if ! cargo build --profile "${profile}" "${targets[@]}" \
-  "${lock_args[@]}" \
-  --manifest-path "${build_dir}/source/Cargo.toml" \
-  --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1; then
-  cat "${log_dir}/mesh-build.log" >&2
-  exit 1
+build_mesh() {
+  cargo build --profile "${profile}" "${targets[@]}" \
+    "${lock_args[@]}" \
+    --manifest-path "${build_dir}/source/Cargo.toml" \
+    --target-dir "${target_dir}" > "${log_dir}/mesh-build.log" 2>&1
+}
+if ! build_mesh; then
+  # The fallback CARGO_HOME outlives jobs. A host /tmp cleaner can delete files
+  # cargo unpacked under registry/src yet leave the .cargo-ok marker cargo
+  # trusts. Drop the unpacked sources once and rebuild; cargo unpacks them again.
+  registry_src="${target_dir}/cargo-home/registry/src"
+  if [[ "${CARGO_HOME:-}" == "${target_dir}/cargo-home" && -d "${registry_src}" ]] \
+    && grep -qF "${registry_src}/" "${log_dir}/mesh-build.log"; then
+    echo "[build] Unpacked crate sources in ${registry_src} are damaged; unpacking them again" >&2
+    rm -rf "${registry_src}"
+  else
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
+  if ! build_mesh; then
+    cat "${log_dir}/mesh-build.log" >&2
+    exit 1
+  fi
 fi
 cp "${build_dir}/source/Cargo.lock" "${log_dir}/mesh-Cargo.lock"
 cp "${target_dir}/${profile}/atomesh" "${log_dir}/atomesh"
