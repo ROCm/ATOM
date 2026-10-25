@@ -166,6 +166,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # forwards to decode verbatim, instead of a top-level JSON int list. Every
     # decode accepts both. 0 = the JSON list.
     "ATOM_PD_PROMPT_IDS_B64": lambda: _flag_env("ATOM_PD_PROMPT_IDS_B64", "0"),
+    # Decode (`kv_consumer`) only: stream the prefill's sampled first token
+    # (T0) to the client when the request's KV lands, ahead of the first local
+    # decode, whose output deferred output makes visible two forwards later.
+    # 0 = T0 rides with that first decode output.
+    "ATOM_PD_EARLY_T0": lambda: _flag_env("ATOM_PD_EARLY_T0", "0"),
     # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
     # does not serve): pages per producer slot that repacks MLA KV for a DCP
     # consumer below a page of interleave; 0 writes each token run in place.
