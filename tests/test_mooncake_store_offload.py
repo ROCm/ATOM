@@ -2848,13 +2848,18 @@ def test_the_scheduler_finds_what_the_worker_stored(cluster, make_worker):
     assert scheduler.get_num_new_matched_tokens(turn) == (40, True)
 
 
-def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
+@pytest.mark.parametrize("early_loads", [False, True])
+def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(
+    cluster, early_loads
+):
     """The PP save frontier runs ahead of the forwards; the fence still covers it.
 
     Under PP `schedule()` advances `num_cached_tokens` as it dispatches a
     chunk, before any stage has run it, and the save frontier reads that field.
     A stage records a save's producer fence when it takes the save's metadata.
-    Every save must cover only chunks whose forward that stage enqueued before.
+    Every save must cover only chunks whose forward that stage enqueued before,
+    also when the stage takes every queued batch off the socket at once to
+    start its loads early.
     """
     from aiter_stub import stubbed_aiter
 
@@ -2942,10 +2947,15 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         pp_transport=SimpleNamespace(
             recv_metadata=lambda **_: queued.popleft() if queued else None
         ),
-        pull_and_process_input_queue=lambda: not queued,  # stop once drained
+        # Stop once drained.
+        pull_and_process_input_queue=lambda: not (queued or stage._stage_backlog),
         _is_idle_rl_weights_offloaded=lambda: False,
         _poll_and_send_kv_status=lambda: None,
+        _early_loads=early_loads,
+        _stage_backlog=deque(),
     )
+    for name in ("_recv_stage_batch", "_dispatch_early_loads"):
+        setattr(stage, name, getattr(PPEngineCoreProc, name).__get__(stage))
     PPEngineCoreProc._downstream_busy_loop(stage)
 
     for rpcs in (head_rpcs, stage_rpcs):

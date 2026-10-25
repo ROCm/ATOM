@@ -616,3 +616,17 @@ def connector_metadata_has_work(metadata: object | None) -> bool:
     if callable(probe):
         return bool(probe())
     return any(bool(getattr(metadata, name, None)) for name in _DUCK_TYPED_WORK_FIELDS)
+
+
+def split_early_loads(metadata: object | None) -> tuple[object | None, object | None]:
+    """Split connector metadata into ``(loads, rest)`` for a PP stage.
+
+    ``loads`` is work a downstream stage may start as soon as the metadata
+    reaches it, ahead of the forwards still queued before its batch; ``rest``
+    keeps its place in dispatch order. Either is None when it holds no work.
+    Metadata that does not offer the split is all ``rest``.
+    """
+    split = getattr(metadata, "split_early_loads", None)
+    if metadata is None or not callable(split):
+        return None, metadata
+    return split()

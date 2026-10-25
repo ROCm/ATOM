@@ -1170,6 +1170,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to come back. Equal to the stage count, one slow batch stalls the head
     # while the stages ahead of it drain. 0 means pipeline_parallel_size.
     "ATOM_PP_MAX_INFLIGHT": lambda: int(os.getenv("ATOM_PP_MAX_INFLIGHT", "0")),
+    # PP downstream stages start a batch's offload loads when its metadata
+    # arrives instead of when its forward comes up, so the stages load a parked
+    # request together rather than one after another. Saves keep their order.
+    "ATOM_PP_EARLY_LOAD": lambda: os.getenv("ATOM_PP_EARLY_LOAD", "0") == "1",
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. The tables stay in host memory (page-locked in
     # place, not copied to HBM); the GPU pulls only the rows a step names and

@@ -67,6 +67,7 @@ from atom.kv_transfer.disaggregation.types import (
     ConnectorMetadata,
     KVConnectorOutput,
     connector_metadata_has_work,
+    split_early_loads,
 )
 
 logger = logging.getLogger("atom")
@@ -203,6 +204,22 @@ class MultiConnectorMetadata(ConnectorMetadata):
         return super().has_work() or any(
             connector_metadata_has_work(m) for m in self.metas
         )
+
+    def split_early_loads(
+        self,
+    ) -> tuple[MultiConnectorMetadata | None, MultiConnectorMetadata | None]:
+        """Split each sub; a sub with no early part stays whole in ``rest``.
+
+        The worker skips a None sub-meta, so each half keeps one slot per
+        connector and the other half's connectors see nothing.
+        """
+        parts = [split_early_loads(m) for m in self.metas]
+        if not any(connector_metadata_has_work(loads) for loads, _ in parts):
+            return None, self
+        loads = MultiConnectorMetadata([loads for loads, _ in parts])
+        rest = copy.copy(self)
+        rest.metas = [rest_meta for _, rest_meta in parts]
+        return loads, rest if rest.has_work() else None
 
     @property
     def requests(self):

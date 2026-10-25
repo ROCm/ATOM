@@ -11,7 +11,8 @@ worker-side connector inside :class:`LMCacheOffloadMetadata`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -218,3 +219,38 @@ class LMCacheOffloadMetadata(ConnectorMetadata):
 
     def add_request(self, meta: LMCacheReqMeta) -> None:
         self.requests.append(meta)
+
+    def split_early_loads(
+        self,
+    ) -> tuple[LMCacheOffloadMetadata | None, LMCacheOffloadMetadata | None]:
+        """Split off the loads a PP stage may start before its batch's turn.
+
+        A load writes blocks the scheduler handed to a parked request, which no
+        forward queued ahead of it on the stage touches, and the request stays
+        parked until every stage reports. Saves keep their place: their
+        producer fence is recorded on the stream at dispatch, so it must follow
+        the forwards that wrote what they read. Lookup unpins travel with the
+        loads, which name the requests whose pins outlive the step. Slot and
+        native-state transfers are not split.
+        """
+        reqs = self.requests
+        if any(r.slot_load_spec or r.slot_save_spec or r.native_state for r in reqs):
+            return None, self
+        loading = [r for r in reqs if r.load_spec is not None]
+        if not (loading or self.state_loads or self.lookup_requests_in_step):
+            return None, self
+        loads = LMCacheOffloadMetadata()
+        loads.requests = [
+            replace(r, save_spec=None, save_operation=None) for r in loading
+        ]
+        loads.lookup_requests_in_step = list(self.lookup_requests_in_step)
+        loads.state_loads = list(self.state_loads)
+        rest = copy.copy(self)
+        rest.requests = [
+            replace(r, load_spec=None, load_operation=None)
+            for r in reqs
+            if r.load_spec is None or r.save_spec is not None
+        ]
+        rest.lookup_requests_in_step = []
+        rest.state_loads = []
+        return loads, rest if rest.has_work() else None

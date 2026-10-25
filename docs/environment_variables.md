@@ -29,6 +29,7 @@ This document describes the environment variables used in the ATOM project.
 |----------|------|---------|-------------|
 | **ATOM_PP_DECODE_MICROBATCHES** | int | 0 | Number of batches the PP head splits running decode sequences into, so that many decode batches occupy the pipeline at once. A batch holds at most `ceil(running decode / N)` sequences. `0` uses `pipeline_parallel_size`; `1` puts every ready decode sequence in one batch. Ignored when PP=1. |
 | **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. |
+| **ATOM_PP_EARLY_LOAD** | bool | 0 | `1` makes each downstream PP stage start a batch's KV offload loads when the batch's metadata arrives, not when its forward comes up. Stage k runs about k forwards behind the head, so without it the stages load a parked request one after another. Saves, P/D transfers and slot or native-state transfers keep dispatch order. |
 
 ## Prefill delayer (TP/DCP and DP attention)
 

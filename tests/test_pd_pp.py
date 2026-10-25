@@ -1410,7 +1410,9 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         utility_queue=MagicMock(),
         _is_idle_rl_weights_offloaded=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
+        _early_loads=False,
     )
+    stage._recv_stage_batch = PPEngineCoreProc._recv_stage_batch.__get__(stage)
     # One pass over the loop body, then shut down.
     stage.pull_and_process_input_queue = MagicMock(side_effect=[False, True])
     stage.pp_transport.recv_metadata.return_value = _fake_batch([], meta)
@@ -1437,7 +1439,9 @@ def _downstream_stage(**overrides):
         utility_queue=MagicMock(),
         _is_idle_rl_weights_offloaded=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
+        _early_loads=False,
     )
+    stage._recv_stage_batch = _pp_engine_core_cls()._recv_stage_batch.__get__(stage)
     for key, value in overrides.items():
         setattr(stage, key, value)
     return stage

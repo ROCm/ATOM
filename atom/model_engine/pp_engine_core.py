@@ -14,6 +14,7 @@ from atom.kv_transfer.disaggregation.pp_kv_aggregator import PPKVAggregator
 from atom.kv_transfer.disaggregation.types import (
     KVConnectorOutput,
     connector_metadata_has_work,
+    split_early_loads,
 )
 from atom.model_engine.engine_core import EngineCore
 from atom.model_engine.scheduler import ScheduledBatch
@@ -68,10 +69,15 @@ class PPEngineCoreProc(EngineCore):
         # scheduler already decides when a save is beyond hope; this is the
         # only way that decision reaches a dict it has no handle on.
         self.scheduler.on_save_abandoned = self._forget_pp_save_quorum
+        self._early_loads: bool = (
+            envs.ATOM_PP_EARLY_LOAD and self.kv_transfer_enabled and not self.is_head
+        )
+        self._stage_backlog: deque = deque()
         logger.info(
             f"{self.label}: PP stage {self.pp_rank}/{self.pp_size} "
             f"(head={self.is_head}, last={self.is_last}, "
-            f"max_inflight={self.pp_max_inflight}) ready"
+            f"max_inflight={self.pp_max_inflight}, "
+            f"early_loads={self._early_loads}) ready"
         )
 
     def busy_loop(self):
@@ -424,7 +430,7 @@ class PPEngineCoreProc(EngineCore):
                     break
                 if self._is_idle_rl_weights_offloaded():
                     continue
-                batch = self.pp_transport.recv_metadata(timeout_ms=100)
+                batch = self._recv_stage_batch(timeout_ms=100)
                 if batch is None:
                     if self.kv_transfer_enabled:
                         self._poll_and_send_kv_status()
@@ -473,6 +479,34 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def _recv_stage_batch(self, timeout_ms):
+        """Downstream: the next batch in dispatch order.
+
+        The head sends each batch to every stage when it schedules it, so stage
+        k is about k forwards behind and a parked request's offload load used
+        to start one stage after another. With early loads, every batch already
+        waiting is taken off the socket and its loads dispatched first, so all
+        stages start a load within a forward of each other.
+        """
+        if not self._early_loads:
+            return self.pp_transport.recv_metadata(timeout_ms=timeout_ms)
+        while (batch := self.pp_transport.recv_metadata(timeout_ms=0)) is not None:
+            self._dispatch_early_loads(batch)
+            self._stage_backlog.append(batch)
+        if self._stage_backlog:
+            return self._stage_backlog.popleft()
+        batch = self.pp_transport.recv_metadata(timeout_ms=timeout_ms)
+        if batch is not None:
+            self._dispatch_early_loads(batch)
+        return batch
+
+    def _dispatch_early_loads(self, batch):
+        loads, rest = split_early_loads(getattr(batch, "connector_meta_output", None))
+        if loads is None:
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", loads)
+        batch.connector_meta_output = rest
 
     def _poll_and_send_kv_status(self):
         """Downstream: collect TP-aggregated KV status and send to head."""
