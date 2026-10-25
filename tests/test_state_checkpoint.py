@@ -2092,6 +2092,31 @@ class TestDemandDrivenCheckpoints:
         assert 28 % INTERVAL
         assert bm.checkpoint_limit(second) == 32
 
+    def test_the_demand_lands_on_the_joint_chunk_grid(self):
+        """An HBM hit stopping on an off-grid demand cannot continue from LMCache.
+
+        The joint load's KV leg starts on the chunk grid, so `_joint_kv_boundary`
+        refuses an HBM boundary off it and the evicted tail is recomputed. A
+        chunk equal to the hash block (DCP's case) or off its grid leaves the
+        demand where it was; one that floors it to the hit drops it.
+        """
+        for chunk, want in (
+            (0, 28),
+            (BLOCK, 28),
+            (2 * BLOCK, 24),
+            (4 * BLOCK, 16),
+            (6, 28),
+            (8 * BLOCK, 0),
+        ):
+            bm = make_block_manager(demand_config())
+            bm._joint_chunk_tokens = chunk
+            run_prompt_on_the_ladder(bm, stateful_seq(PROMPT))
+            second = stateful_seq(BRANCH)
+            assert bm.can_allocate(second) == 0, chunk
+            assert second.num_wanted_hit_blocks == 7, chunk  # still measured
+            assert second.checkpoint_demand_pos == want, chunk
+            assert not want or bm.checkpointers_at(second, want), chunk
+
     def test_the_rung_can_be_switched_off_without_the_grid(self):
         """`--no-state-checkpoint-demand` drops the rung, nothing else.
 
