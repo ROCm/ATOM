@@ -2565,6 +2565,24 @@ class BlockManager:
             if interval_on and self.state_checkpoint_demand and wanted > hit
             else 0
         )
+        # Onto the LMCache chunk grid when the joint load serves this tier, as
+        # the prompt-end anchor is (`_record_checkpoint_end`). A demand sits
+        # where a shared prefix forks, the part of a prompt HBM keeps longest,
+        # so it is what an evicted prompt's HBM hit stops on. Off the grid that
+        # hit cannot be continued from LMCache at all (`_joint_kv_boundary`
+        # refuses `hbm_off_chunk_grid`) and the whole evicted tail is
+        # recomputed; on it, the joint load resumes the tail. Flooring costs
+        # the forks under one chunk each while the prefix is in HBM. A floored
+        # demand at or below the hit is no rung anybody gains from.
+        chunk = self._joint_chunk_tokens
+        if (
+            demand
+            and chunk > self.hash_block_size
+            and chunk % self.hash_block_size == 0
+        ):
+            demand -= demand % chunk
+            if demand <= hit * self.hash_block_size:
+                demand = 0
         # A replayed hit (`_replay_hit`) reaches `wanted` already, and the
         # replay bounds what the missing checkpoint costs. A demand would cut
         # every replay admission's forward at the hit and write a checkpoint
