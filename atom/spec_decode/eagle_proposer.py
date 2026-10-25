@@ -133,14 +133,14 @@ class EagleProposer(Drafter):
         per sequence. That rewrite is what ``warmup_inputs`` replays, so the two
         go through the same code rather than a copy that can drift.
 
-        MRoPE declares nothing, by the same rule Kimi-K3 does: its positions are
-        ``[3, N]``, so there is no leading batch axis to stage, hence nothing to
-        pad and nothing a graph could pin. Declaring anyway used to warm and
-        capture a ONE-dimensional-positions shape that serving never runs --
-        graphs nobody replays, paid for at every startup.
+        MRoPE positions are ``[3, N]``, with no leading batch axis to stage.
+        A drafted token is generated text, and the decode builder writes one
+        base position to all three axes of such a token, so the pass stages the
+        first axis only and ``_step_forward`` widens it back to ``[3, N]``.
+        Serving stages the same axis, so the warmed shape is the served one.
         """
         self.step = None
-        if self.runner.use_mrope or self.mtp_k < 2:
+        if self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
             self._reuse_step_buffers = False
@@ -191,6 +191,10 @@ class EagleProposer(Drafter):
         `batch_id_per_q_token`, and the index kernel returns on `bid < 0` before it
         ever loads a ring slot.
         """
+        if self.runner.use_mrope:
+            # One staged axis for all three (see `_declare_draft_graphs`). A
+            # stride-0 view, so a recording reads the staged buffer itself.
+            positions = positions.expand(3, -1)
         return self.model(
             input_ids=input_ids, positions=positions, hidden_states=hidden_states
         )
@@ -825,10 +829,11 @@ class EagleProposer(Drafter):
                         # padding it with the other rows, just before the
                         # forward, is a step too late.
                         #
-                        # No MRoPE case to guard: a model whose positions keep
-                        # the token axis last declares no pass, so `self.step` is
-                        # None and these stay the target's own 2-D positions.
+                        # MRoPE positions are [3, N] here; the pass stages the
+                        # first axis only (see `_declare_draft_graphs`).
                         if self.step is not None:
+                            if positions.ndim == 2:
+                                positions = positions[0]
                             positions = self.step.stage(
                                 running_bs, {"positions": positions}
                             )["positions"]
@@ -874,7 +879,16 @@ class EagleProposer(Drafter):
                     # Outside the branch above: a backend that RETURNS a
                     # slot_mapping computed it over `running_bs` rows too, so leaving
                     # this inside was how those pad rows kept a live slot.
-                    if running_bs > scheduled_bs:
+                    #
+                    # A DP-sync dummy step has no real row at all. Eager drafting
+                    # skips its attention (`is_dummy_run`), but a replayed pass
+                    # cannot: it writes the row's KV -- uninitialized, often NaN --
+                    # through the slot rebuilt above, which is a real block's
+                    # (measured on DP4+EP4: live requests' drafts turned NaN for
+                    # good, acceptance 0.71 -> 0.56 at 4 concurrent).
+                    if context.is_dummy_run:
+                        attn_metadata.slot_mapping[:] = -1
+                    elif running_bs > scheduled_bs:
                         attn_metadata.slot_mapping[scheduled_bs:] = -1
 
                     input_ids = next_input_ids

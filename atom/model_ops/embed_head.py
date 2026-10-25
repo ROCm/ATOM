@@ -251,6 +251,9 @@ class ParallelLMHead(VocabParallelEmbedding):
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
+        # The TP1 argmax's row lengths (see compute_argmax_token). Every buffer
+        # made stays referenced: a recorded draft pass reads it by address.
+        self._argmax_row_lens: list[torch.Tensor] = []
 
     def forward(self, x: torch.Tensor):
         if not is_plugin_mode():
@@ -325,9 +328,26 @@ class ParallelLMHead(VocabParallelEmbedding):
         if self.tp_size <= 1:
             # `output_idx=out` rather than a returned tensor: a draft pass is
             # recorded, and a capture bakes the address the answer lands at.
+            # `end` for the same reason: topk_select's default is a tensor from
+            # an 8-entry LRU cache, so with more recorded batch sizes than that
+            # an eviction frees memory a recorded pass still reads, and a row
+            # length read back as 0 makes the answer the -1 pad.
             # `tie="low"` keeps the lowest-index pick promised above; `logits`
             # stays bf16, since the reduction widens as it reads.
-            topk_select(logits, 1, tie="low", output_idx=out.view(-1, 1))
+            rows, width = logits.shape
+            if not self._argmax_row_lens or self._argmax_row_lens[-1].numel() < rows:
+                self._argmax_row_lens.append(
+                    torch.full(
+                        (max(rows, 1024),), width, dtype=torch.int32, device=x.device
+                    )
+                )
+            topk_select(
+                logits,
+                1,
+                end=self._argmax_row_lens[-1][:rows],
+                tie="low",
+                output_idx=out.view(-1, 1),
+            )
             return out
         # Pack (val, idx) as fp32 — idx < 2^24 is exact — and all-gather only the
         # per-rank reductions ([N, 2]) instead of the full logits.
