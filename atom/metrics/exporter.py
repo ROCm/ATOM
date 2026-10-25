@@ -435,6 +435,35 @@ class _AtomMetricsCollector:
                         )
             yield metric
 
+        for phase, help_text in (
+            (
+                "prefill",
+                "Full prompt length including cached prefixes at first real prefill dispatch, once per request sequence; exported for ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S after it.",
+            ),
+            (
+                "decode",
+                "Logical context length at first real decode dispatch, once per request sequence; exported for ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S after it.",
+            ),
+        ):
+            # Labels come with each context: a scheduler's own `dp_rank` folds
+            # in its PP rank, unlike the snapshot key above.
+            metric = GaugeMetricFamily(
+                f"atom:{phase}_request_context_tokens",
+                help_text,
+                labels=[
+                    "dp_rank",
+                    "engine_role",
+                    "request_id",
+                    "sequence_id",
+                    "started_at",
+                ],
+            )
+            for rank in ranks:
+                for context in rank.get("request_contexts", ()):
+                    if context[0] == phase:
+                        metric.add_metric(list(context[1:6]), float(context[6]))
+            yield metric
+
         cache = snapshot.get("cache", {})
         if describe or "offload_tokens" in cache:
             metric = CounterMetricFamily(

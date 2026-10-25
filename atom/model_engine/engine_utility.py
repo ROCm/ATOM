@@ -845,6 +845,7 @@ class EngineUtilityHandler:
                     "running": running,
                     "waiting": max(0, waiting - external),
                     "waiting_kv": external,
+                    "request_contexts": metrics.request_contexts(),
                 }
 
         return result
