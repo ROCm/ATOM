@@ -219,6 +219,7 @@ class EngineCore:
 
         self.kv_transfer_enabled = bool(config.kv_transfer_config)
         self._next_idle_kv_drain = 0.0
+        self._fresh_kv_poll_s = envs.ATOM_KV_POLL_FRESH_WAIT_MS / 1e3
         if self.kv_transfer_enabled:
             # Physical: one output per launched worker, else this waits forever.
             self.kv_aggregator = KVOutputAggregator(world_size=config.tp_world_size)
@@ -630,11 +631,50 @@ class EngineCore:
         except Exception:
             logger.exception("KV transfer drain during shutdown failed")
 
+    def _record_fresh_poll(self, elapsed_s: float, done: bool) -> None:
+        """Log the fresh polls' count, hit rate and blocking time every 30s."""
+        stats = self.__dict__.setdefault(
+            "_fresh_poll_stats", {"n": 0, "done": 0, "sum": 0.0, "max": 0.0}
+        )
+        stats["n"] += 1
+        stats["done"] += int(done)
+        stats["sum"] += elapsed_s
+        stats["max"] = max(stats["max"], elapsed_s)
+        now = time.monotonic()
+        start = stats.setdefault("start", now)
+        if now - start < 30.0:
+            return
+        logger.info(
+            "%s: fresh KV poll: window_s=%.1f n=%d done=%d mean_ms=%.2f max_ms=%.2f",
+            self.label,
+            now - start,
+            stats["n"],
+            stats["done"],
+            stats["sum"] / stats["n"] * 1e3,
+            stats["max"] * 1e3,
+        )
+        self._fresh_poll_stats = {"n": 0, "done": 0, "sum": 0.0, "max": 0.0}
+
     def _poll_kv_transfer_progress(self) -> None:
         if not self.kv_transfer_enabled:
             return
         kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
         self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        wait_s = getattr(self, "_fresh_kv_poll_s", 0.0)
+        if (
+            kvoutput is not None
+            and wait_s > 0
+            and getattr(self.scheduler, "_num_parked_remote_kv", 0) > 0
+        ):
+            # What just completed was taken right after the previous forward;
+            # the workers are idle now, so the poll it re-armed answers at once
+            # with whatever landed during this one.
+            t0 = time.perf_counter()
+            fresh = self.runner_mgr.call_func_with_aggregation(
+                "async_proc_aggregation", wait_s=wait_s
+            )
+            self._record_fresh_poll(time.perf_counter() - t0, fresh is not None)
+            self.scheduler._update_from_kv_xfer_finished(fresh)
         # Reclaim any offload save whose completion report never came (LMCache
         # force-unpinned it upstream). Self-throttled, so calling it on every
         # poll is cheap; without it a stalled save hangs the engine forever.
