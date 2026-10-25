@@ -16,6 +16,7 @@ from atom.model_engine.engine_core_mgr import CoreManager, DisaggCoreManager
 from atom.model_engine.prefix_hash import hash_block_size_for, ship_prompt_hash_chain
 from atom.model_engine.segment_tokenizer import SegmentTokenizer
 from atom.model_engine.sequence import Sequence
+from atom.model_engine.tokenizer_split import install_fast_whitespace_split
 from atom.multimodal.registry import get_mrope_input_positions
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
@@ -33,6 +34,8 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
             "AutoTokenizer round-trip failed, falling back to PreTrainedTokenizerFast"
         )
         tokenizer = PreTrainedTokenizerFast.from_pretrained(model)
+    if envs.ATOM_FAST_TOKENIZER_SPLIT:
+        install_fast_whitespace_split(tokenizer)
     return tokenizer
 
 
