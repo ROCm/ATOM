@@ -1415,6 +1415,45 @@ models:
               OFFLOAD_LOAD_WORKERS: "2"
             decode: *kimi_k3_pp8_decode_env
 
+        # The PP8 C4 / C16 decodes behind a TP8 prefill with expert parallelism
+        # (TP8xDCP8 with the 128 GiB CPU tier at C16). Without DP attention the
+        # tokens stay replicated, so there is no all-to-all: each rank owns 112
+        # of the 896 experts at full width and the routed partials take the
+        # same all-reduce as the TP-sharded MoE. It beats the PP8 prefill up to
+        # CONC 16; from CONC 32 one prompt at a time across all eight GPUs
+        # queues the long ones.
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c4
+          topology: 1p1d
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          concurrency: [4]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-expert-parallel"
+          env:
+            common: *kimi_k3_pp8_env
+            prefill:
+              ATOM_PD_PROMPT_IDS_B64: "1"
+            decode: *kimi_k3_pp8_decode_env
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-dcp8-dspark4-agentic-lmcache-1m-c16
+          topology: 1p1d
+          display_topology: 1P1D-TP8EP8-DCP8-DSPARK4
+          concurrency: [16]
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--enable-expert-parallel"
+          env:
+            common: *kimi_k3_pp8_replay_env
+            prefill:
+              <<: *kimi_k3_agentic_lmcache128_env
+              ATOM_PD_PROMPT_IDS_B64: "1"
+            decode: *kimi_k3_pp8_decode_env
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
