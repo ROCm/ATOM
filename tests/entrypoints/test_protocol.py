@@ -3,11 +3,15 @@
 
 """Tests for OpenAI-compatible protocol (Pydantic request/response models)."""
 
+import array
+import base64
+import struct
 import time
 
 import pytest
 
 from atom.entrypoints.openai.protocol import (
+    PROMPT_TOKEN_IDS_B64,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -16,6 +20,7 @@ from atom.entrypoints.openai.protocol import (
     ErrorResponse,
     ModelCard,
     ModelList,
+    encode_prompt_token_ids,
     resolve_prompt_token_ids,
 )
 
@@ -448,3 +453,50 @@ class TestPromptTokenIds:
     def test_completion_requires_one_of_the_two(self):
         with pytest.raises(ValueError, match="'prompt' or 'prompt_token_ids'"):
             CompletionRequest().get_prompt_or_tokens()
+
+
+class TestPromptTokenIdsB64:
+    """The compact `prompt_token_ids_b64` form of the PD prompt IDs."""
+
+    def test_round_trip_is_an_int32_array(self):
+        ids = [0, 1, 163_839, 2**31 - 1]
+        encoded = encode_prompt_token_ids(array.array("i", ids))
+        assert encoded == encode_prompt_token_ids(ids)
+        assert base64.b64decode(encoded) == struct.pack("<4i", *ids)
+
+        resolved = resolve_prompt_token_ids(None, {PROMPT_TOKEN_IDS_B64: encoded})
+        assert isinstance(resolved, array.array) and resolved.typecode == "i"
+        assert resolved.tolist() == ids
+
+    def test_requests_resolve_it(self):
+        kv = {PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids([5, 6])}
+        chat = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}], kv_transfer_params=kv
+        )
+        assert chat.get_prompt_token_ids().tolist() == [5, 6]
+        completion = CompletionRequest(prompt="ignored", kv_transfer_params=kv)
+        assert completion.get_prompt_or_tokens().tolist() == [5, 6]
+
+    def test_list_form_wins_over_b64(self):
+        kv = {"prompt_token_ids": [1], PROMPT_TOKEN_IDS_B64: "not base64"}
+        assert resolve_prompt_token_ids(None, kv) == [1]
+
+    def test_agreeing_top_level_ids_are_fine(self):
+        kv = {PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids([3, 4])}
+        assert resolve_prompt_token_ids([3, 4], kv) == [3, 4]
+        with pytest.raises(ValueError, match="disagree"):
+            resolve_prompt_token_ids([3, 5], kv)
+
+    @pytest.mark.parametrize(
+        "encoded,error",
+        [
+            ("", "empty"),
+            ([1, 2], "base64 string"),
+            ("!!!!", "not valid base64"),
+            (base64.b64encode(b"\x01\x00\x00").decode(), "whole int32s"),
+            (base64.b64encode(struct.pack("<2i", 7, -1)).decode(), "non-negative"),
+        ],
+    )
+    def test_invalid_encodings_are_rejected(self, encoded, error):
+        with pytest.raises(ValueError, match=error):
+            resolve_prompt_token_ids(None, {PROMPT_TOKEN_IDS_B64: encoded})
