@@ -911,11 +911,18 @@ class AsyncIOProcManager:
         self._pending_kv_aggregation = pending
         return pending
 
-    def call_func_with_aggregation(self, func_name: str, *args, timeout: float = 10.0):
+    def call_func_with_aggregation(
+        self,
+        func_name: str,
+        *args,
+        timeout: float = 10.0,
+        wait_s: float = 0.0,
+    ):
         """RPC call with KV output aggregation across all workers.
 
         At most one aggregation is outstanding. The first call starts it;
-        subsequent calls non-blockingly drain its per-rank replies. Once a batch
+        subsequent calls drain its per-rank replies, waiting up to ``wait_s``
+        for the missing ones (by default not at all). Once a batch
         is complete, the next batch is started before returning the completed
         result, keeping one poll in flight without delaying every other engine
         step. A missing rank leaves the current aggregation open and returns
@@ -924,6 +931,8 @@ class AsyncIOProcManager:
         Args:
             func_name: Method name to invoke on each worker's runner.
             timeout: Seconds an incomplete aggregation may age before logging.
+            wait_s: Seconds to block for missing ranks before giving up on this
+                call; 0 drains without blocking.
 
         Returns:
             Aggregated :class:`KVConnectorOutput`, or ``None`` while the
@@ -941,11 +950,17 @@ class AsyncIOProcManager:
         # an earlier rank is still missing. Replies are drain-once and carry
         # no generation identifier, so they belong to this outstanding
         # aggregation until it closes.
+        deadline = time.monotonic() + wait_s
         for rank, output_queue in enumerate(self.kv_outputs_queues):
             if pending.worker_outputs[rank] is not None:
                 continue
+            remaining = deadline - time.monotonic()
             try:
-                pending.worker_outputs[rank] = output_queue.get_nowait()
+                pending.worker_outputs[rank] = (
+                    output_queue.get(timeout=remaining)
+                    if remaining > 0
+                    else output_queue.get_nowait()
+                )
             except queue.Empty:
                 continue
 

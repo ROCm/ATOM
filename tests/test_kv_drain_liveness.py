@@ -96,6 +96,7 @@ def _engine(*, enabled=True, deferred=None, connector=None, outputs=()):
     proc.label = "test-engine"
     proc.kv_transfer_enabled = enabled
     proc._next_idle_kv_drain = 0.0
+    proc._fresh_kv_poll_s = 0.0
     proc.scheduler = FakeScheduler(deferred, connector)
     proc.runner_mgr = FakeRunnerMgr(outputs)
     return proc
