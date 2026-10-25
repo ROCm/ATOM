@@ -905,17 +905,15 @@ class WeightUpdaterMixin:
         if quant_type is None:
             return
 
-        from atom.model_ops.linear import logical_k, weight_is_stored_preshuffled
+        from atom.model_ops.linear import weight_is_stored_preshuffled
         from atom.model_ops.utils import shuffle_weights
 
         # The same decision the initial load makes, from the same function.
-        params_dtype = getattr(module, "params_dtype", param.dtype)
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
-            params_dtype,
+            getattr(module, "params_dtype", param.dtype),
             needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
             native_group_rows=getattr(module, "native_a8_group_rows", None),
-            k=logical_k(param, params_dtype),
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the

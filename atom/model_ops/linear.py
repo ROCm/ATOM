@@ -91,35 +91,6 @@ else:
     gemm_afp4wfp4 = None
 
 
-# The preshuffled MXFP4 layout pads K//32 scale groups up to a multiple of 8, i.e.
-# K up to a multiple of 256, and the kernels cannot mask the partial group. The
-# triton preshuffle GEMM asserts on this; the default ASM `gemm_a4w4` does not,
-# and returns inf/NaN once M >= 64 (K=4224: Kimi-K3's dense MLP down_proj at TP8,
-# 33792 / 8). A weight whose K is not aligned therefore stays unshuffled and runs
-# the non-preshuffled `gemm_afp4wfp4`, which reads the raw layout at any K.
-FP4_PRESHUFFLE_K_ALIGN = 256
-
-
-def fp4_k_needs_unshuffled(k: int) -> bool:
-    return k % FP4_PRESHUFFLE_K_ALIGN != 0
-
-
-def logical_k(weight: torch.Tensor, params_dtype: torch.dtype) -> int:
-    """Input dim of a held GEMM weight; fp4x2 packs two K elements per byte."""
-    k = weight.shape[-1]
-    return k * 2 if params_dtype == dtypes.fp4x2 else k
-
-
-def _gemm_afp4wfp4():
-    """`gemm_afp4wfp4`, imported on first use when no env flag pulled it in."""
-    global gemm_afp4wfp4
-    if gemm_afp4wfp4 is None:
-        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _k
-
-        gemm_afp4wfp4 = _k
-    return gemm_afp4wfp4
-
-
 if use_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
@@ -226,7 +197,6 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
-    unshuffled: bool = False,
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -242,29 +212,13 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
-    unshuffled: bool = False,
 ) -> torch.Tensor:
     # Non-shuffle FP4 Triton path: keep x/weight/scale in the original MXFP4
-    # layout and call the non-preshuffled gemm_afp4wfp4 kernel. Taken globally
-    # under ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM, or per layer (`unshuffled`) for
-    # a weight whose K the preshuffled layout cannot represent.
-    if params_dtype == dtypes.fp4x2 and (
-        unshuffled or use_fp4_non_shuffle_triton_gemm()
-    ):
-        if unshuffled:
-            gemm = _gemm_afp4wfp4()
-        elif gemm_afp4wfp4 is None:
+    # layout and call the non-preshuffled gemm_afp4wfp4 kernel.
+    if params_dtype == dtypes.fp4x2 and use_fp4_non_shuffle_triton_gemm():
+        if gemm_afp4wfp4 is None:
             raise RuntimeError(
                 "ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM=1 requires aiter.ops.triton.gemm_afp4wfp4"
-            )
-        else:
-            gemm = gemm_afp4wfp4
-        if unshuffled and x_scale is not None and not use_fp4_non_shuffle_triton_gemm():
-            # A fused producer (RMSNorm/act quant) emits the SHUFFLED scale layout
-            # unless the global flag is set; this layer reads the raw one.
-            raise RuntimeError(
-                "MXFP4 layer with K % 256 != 0 runs unshuffled but was handed a "
-                "pre-quantized activation; its producer must not fuse the quant."
             )
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
@@ -289,7 +243,7 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
-        y = gemm(
+        y = gemm_afp4wfp4(
             x.view(torch.uint8),
             weight.view(torch.uint8),
             x_scale.view(torch.uint8),
@@ -556,7 +510,6 @@ def weight_is_stored_preshuffled(
     *,
     needs_preshuffled_weight: bool = False,
     native_group_rows: int | None = None,
-    k: int | None = None,
 ) -> bool:
     """Whether a quantized 2D GEMM weight of this kind is held preshuffled.
 
@@ -576,12 +529,6 @@ def weight_is_stored_preshuffled(
     checkpoint bytes. Only an FP8 32x32 one is shuffled: on gfx950 for AITER's
     preshuffled group32 GEMM (ATOM_GROUP32_WEIGHT_PRESHUFFLE, on by default),
     and always under ``needs_preshuffled_weight`` (V4.1's grouped ``wo_a``).
-
-    ``k`` is the weight's logical input dim. An MXFP4 weight whose ``k`` is not
-    a multiple of ``FP4_PRESHUFFLE_K_ALIGN`` is never preshuffled: the layout
-    cannot represent it, and the GEMM then reads it raw (``gemm_a4w4_quant``'s
-    ``unshuffled``). Pass it from every caller that can, so the load and a
-    weight sync agree on such a layer too.
 
     Says nothing about rank. Only 2D weights are shuffled -- Qwen3-Next's GDN
     conv1d expands its weight to 3D and must stay row-major -- so the caller
@@ -617,8 +564,6 @@ def weight_is_stored_preshuffled(
         )
     if quant_value == QuantType.per_1x32.value:
         is_fp4_blockscale = params_dtype == dtypes.fp4x2
-        if is_fp4_blockscale and k is not None and fp4_k_needs_unshuffled(k):
-            return False
         return not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm()
     if quant_value == QuantType.per_1x128.value:
         return envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE or needs_preshuffled_weight
@@ -1316,11 +1261,7 @@ class LinearBase(nn.Module):
             # Only quantized 2D GEMM weights use aiter's preshuffle layout.
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
-            if self.weight.dim() == 2 and weight_is_stored_preshuffled(
-                self.quant_type,
-                self.params_dtype,
-                k=logical_k(self.weight, self.params_dtype),
-            ):
+            if self.weight.dim() == 2 and not use_fp4_non_shuffle_triton_gemm():
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -1330,39 +1271,14 @@ class LinearBase(nn.Module):
                 needs_preshuffled_weight=getattr(
                     self, "needs_preshuffled_weight", False
                 ),
-                k=logical_k(self.weight, self.params_dtype),
             )
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
                 shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # An MXFP4 weight the preshuffled layout cannot hold is read raw; the
-        # forward routes it to the non-preshuffled GEMM (FP4_PRESHUFFLE_K_ALIGN).
-        self._fp4_unshuffled = (
-            self.quant_type.value == QuantType.per_1x32.value
-            and self.params_dtype == dtypes.fp4x2
-            and self.weight.dim() == 2
-            and not weight_is_stored_preshuffled(
-                self.quant_type,
-                self.params_dtype,
-                k=logical_k(self.weight, self.params_dtype),
-            )
-        )
-        if self._fp4_unshuffled and not use_fp4_non_shuffle_triton_gemm():
-            logger.info(
-                f"{getattr(self, 'prefix', '')}: MXFP4 "
-                f"K={logical_k(self.weight, self.params_dtype)} is not "
-                f"a multiple of {FP4_PRESHUFFLE_K_ALIGN}; kept unshuffled and run "
-                "through gemm_afp4wfp4."
-            )
         # shuffle weight scale once so no reshuffling for every gemm
-        if (
-            self.quant_type.value == QuantType.per_1x32.value
-            and (
-                self.params_dtype != dtypes.fp4x2
-                or not use_fp4_non_shuffle_triton_gemm()
-            )
-            and not self._fp4_unshuffled
+        if self.quant_type.value == QuantType.per_1x32.value and (
+            self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
@@ -1609,7 +1525,6 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
-                    getattr(self, "_fp4_unshuffled", False),
                 )
                 if self.bias is not None:
                     y += self.bias
