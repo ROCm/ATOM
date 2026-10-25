@@ -1891,6 +1891,7 @@ def test_last_unadmitted_cancel_reaches_worker_despite_idle_throttle(
     core.kv_transfer_enabled = True
     core.label = "pd-cancel"
     core._next_idle_kv_drain = mc.time.monotonic() + 1000
+    core._fresh_kv_poll_s = 0.0
     core.output_queue = queue.Queue()
     core.runner_mgr = MagicMock()
     core.runner_mgr.call_func.side_effect = lambda method, meta: worker.start_load_kv(
