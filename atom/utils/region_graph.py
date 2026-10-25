@@ -553,11 +553,16 @@ def token_graph(cls: type | None = None, *, per_phase: bool = False):
 
 def _phase() -> str | None:
     """The phase a recording of this step is keyed under (`token_graph`), and
-    the phase its record pass captures for (`captured_sizes`); None off a step."""
+    the phase its record pass captures for (`captured_sizes`); None off a step.
+    A rank decoding beside a prefilling DP peer replays the prefill recording
+    the group settled on (`ForwardMode.prefill_token_graph`)."""
     context = getattr(forward_context.get_forward_context(), "context", None)
     if context is None:
         return None
-    return "prefill" if context.is_prefill else "decode"
+    mode = getattr(context, "forward_mode", None)
+    if context.is_prefill or (mode is not None and mode.prefill_token_graph):
+        return "prefill"
+    return "decode"
 
 
 def _run_token_graph(owner, forward: Callable, args, kwargs, per_phase=False):
