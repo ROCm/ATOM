@@ -339,11 +339,11 @@ class V4CacheAdapter:
 
     def _prepare_buckets(self):
         """Allocate stable whole-request lanes from explicit device candidates."""
-        max_rows, ragged = self.max_rows, self.ragged
         launch_rows = getattr(self, "launch_rows", SUPPORTED_SAMPLES)
+        request_widths = getattr(self, "request_widths", (1, 2, 4, 8))
         self.prepared_widths = tuple(
             request_width * self.tokens_per_seq
-            for request_width in getattr(self, "request_widths", (1, 2, 4, 8))
+            for request_width in request_widths
             if request_width <= self.max_requests
             and request_width * self.tokens_per_seq in launch_rows
         )
@@ -351,33 +351,11 @@ class V4CacheAdapter:
             raise MonoUnsupported(
                 "no exact Mono launch width serves this request profile"
             )
-        self._buckets = (
-            {
-                width: tuple(
-                    self._make_bucket(width, ordinal)
-                    for ordinal in range(
-                        max_rows // max(self.prepared_widths)
-                        if width == max(self.prepared_widths)
-                        else 1
-                    )
-                )
-                for width in self.prepared_widths
-            }
-            if not ragged
-            else {}
-        )
-        self.prepared_shapes = tuple(
-            (width, self.tokens_per_seq) for width in self.prepared_widths
-        )
-        self._shape_buckets = {
-            (width, self.tokens_per_seq): buckets
-            for width, buckets in self._buckets.items()
-        }
-        if ragged:
+        if self.ragged:
             self.prepared_shapes = tuple(
                 (count * q, q)
                 for q in range(1, self.tokens_per_seq + 1)
-                for count in getattr(self, "request_widths", (1, 2, 4, 8))
+                for count in request_widths
                 if count <= self.max_requests and count * q in launch_rows
             )
             self._shape_buckets = {
@@ -387,10 +365,24 @@ class V4CacheAdapter:
                 )
                 for width, q in self.prepared_shapes
             }
-            self._buckets = {
-                width: self._shape_buckets[(width, self.tokens_per_seq)]
+        else:
+            self.prepared_shapes = tuple(
+                (width, self.tokens_per_seq) for width in self.prepared_widths
+            )
+            largest = max(self.prepared_widths)
+            self._shape_buckets = {
+                (width, self.tokens_per_seq): tuple(
+                    self._make_bucket(width, lane)
+                    for lane in range(
+                        self.max_rows // largest if width == largest else 1
+                    )
+                )
                 for width in self.prepared_widths
             }
+        self._buckets = {
+            width: self._shape_buckets[(width, self.tokens_per_seq)]
+            for width in self.prepared_widths
+        }
 
     def _make_bucket(
         self, width: int, ordinal: int, *, tokens_per_seq=None
@@ -700,9 +692,6 @@ class V4CacheAdapter:
         ):
             return (0, 0)
         return requests, rows
-
-    def _actual_rows(self, context) -> int:
-        return self._actual_shape(context)[1]
 
     def supported(self, context) -> bool:
         """Host-only bounds/fork check using the engine's published CPU mirrors."""

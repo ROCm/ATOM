@@ -61,18 +61,17 @@ class MonoMetadataBuilder(DeepseekV4AttentionMetadataBuilder):
         # A step that copies prefix/COW state runs that whole build after the
         # joint draft readers retire; empty maintenance still votes on all ranks.
         native_build = super().build
-        results = []
+        result = None
 
         def build_native():
-            results.append(
-                native_build(batch, running_bs, running_tokens, max_seqlen_q)
-            )
+            nonlocal result
+            result = native_build(batch, running_bs, running_tokens, max_seqlen_q)
 
         empty = batch.state_maintenance_ops.empty
         self._mono_session.run_state_maintenance(build_native, empty=empty)
         if empty:
             return native_build(batch, running_bs, running_tokens, max_seqlen_q)
-        return results[0]
+        return result
 
     def build_for_cudagraph_capture(self, bs, max_q_len=None):
         self._mono_batch = None

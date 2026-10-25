@@ -10,7 +10,7 @@ from typing import ClassVar
 
 import torch
 
-from atom.models.deepseek_v4.mono.build import kernel_kwargs
+from atom.models.deepseek_v4.mono.build import _build_launches, kernel_kwargs
 from atom.models.deepseek_v4.mono.config import (
     LAUNCH_PHASES,
     MoeMode,
@@ -81,7 +81,6 @@ class Dsv4Variant:
         # Host-only admission checks must not require a visible device.
         from atom.models.deepseek_v4.mono.kernels.layer import (
             build_advance_step,
-            build_dsv4_kernel,
         )
         from atom.models.deepseek_v4.mono.runtime import EpochPeerBuffer
 
@@ -115,7 +114,6 @@ class Dsv4Variant:
             qkv_norm_handoff=qkv_norm_handoff,
             **dims,
         )
-        phases = LAUNCH_PHASES[launch_shape]
         refresh_modes = (True, False) if cfg.indexed else (True,)
         self.launch_sets = {}
         for refresh in refresh_modes:
@@ -133,17 +131,13 @@ class Dsv4Variant:
                     qkv_norm_handoff=qkv_norm_handoff,
                     attention_mode=attention_mode,
                 )
-                built = tuple(
-                    build_dsv4_kernel(
-                        samples,
-                        cfg.heads,
-                        npes,
-                        cfg.window,
-                        poll_timeout_us=poll_timeout_us,
-                        phase=phase,
-                        **kwargs,
-                    )
-                    for phase in phases
+                built = _build_launches(
+                    cfg,
+                    samples,
+                    npes,
+                    launch_shape=launch_shape,
+                    poll_timeout_us=poll_timeout_us,
+                    **kwargs,
                 )
                 Dsv4Variant._cache[cache_key] = built
             elif not isinstance(built, tuple):

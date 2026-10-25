@@ -236,11 +236,6 @@ class V4Config:
         return (2 + self.hc_mult) * self.hc_mult
 
     @property
-    def rope_base(self) -> float:
-        """Per layer, not per consumer: a compressing layer rotates everything on ``compress_rope_theta``."""
-        return self.compress_rope_theta if self.compress_ratio else self.rope_theta
-
-    @property
     def overlap(self) -> bool:
         """CSA (ratio 4) pools 2 * ratio tokens per entry at a stride of ratio."""
         return self.compress_ratio == COMPRESS_CSA
