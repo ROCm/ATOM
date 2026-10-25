@@ -536,6 +536,12 @@ them there.
   into an unauthenticated response. `top` and `types_per_owner` bound the two
   breakdowns.
 
+## Tokenizer
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_FAST_TOKENIZER_SPLIT** | bool | 0 | Replace a tiktoken-based tokenizer's per-character Python whitespace split (Kimi's `_split_whitespaces_or_nonwhitespaces`, ~220 ms of GIL for a 670K-token prompt) with a numpy check that returns the same pieces in a few ms. Tokenizers without that method are left alone. |
+
 ## Incremental detokenizer
 
 Streaming decodes each delta from two `tokenizer.decode` calls that share a
