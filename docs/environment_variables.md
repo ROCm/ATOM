@@ -35,6 +35,12 @@ limitations](observability/README.md).
 | **ATOM_DP_PREFILL_BALANCE_SLACK** | float | 0.1 | The target cost is at most mean x (1 + slack) over the ranks that prefill. |
 | **ATOM_DP_PREFILL_BALANCE_MIN_TOKENS** | int | 4096 | Fewest tokens a shrunk rank still prefills in a step. |
 
+## Pipeline parallelism
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_PP_MAX_INFLIGHT** | int | 0 | Output batches (decode batches and final prefill chunks) the PP head keeps in flight before it waits for the oldest to return. A middle prefill chunk retires once launched and does not count. `0` uses `pipeline_parallel_size`. A larger cap keeps the head issuing while a long batch holds the stages ahead of it. |
+
 ## Prefill delayer (TP/DCP and DP attention)
 
 Coalesces waiting prefills while decode continues. DP attention enables it by

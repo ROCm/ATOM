@@ -444,6 +444,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
     proposals = iter([(scheduled, seqs)])
     proc = PPEngineCoreProc.__new__(PPEngineCoreProc)
     proc.pp_size = 1
+    proc.pp_max_inflight = 1
     proc.kv_transfer_enabled = False
     proc._in_flight = deque()
     proc.scheduler = SimpleNamespace(

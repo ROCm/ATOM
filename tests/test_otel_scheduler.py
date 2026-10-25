@@ -292,6 +292,7 @@ def test_real_engine_dispatch_keeps_tracing_when_metrics_returns_early(
         core._pending_prefix_hash = deque()
         core._defer_prefix_hash = False
         core.pp_size = pp_size
+        core.pp_max_inflight = pp_size
         completions = deque()
         core.pp_transport = SimpleNamespace(
             send_metadata=lambda batch: None,
