@@ -114,6 +114,26 @@ class OutputThreadStateTest(unittest.TestCase):
         for mgr in self.managers:
             self.assertIsNone(mgr._flush_stream_batch_fn)
 
+    def test_finished_outputs_are_kept_unless_turned_off(self):
+        """Offline `generate()` reads them; the OpenAI server turns this off."""
+        for mgr in self.managers:
+            self.assertTrue(mgr.keep_finished_outputs)
+
+    def test_finished_outputs_are_queued_only_when_kept(self):
+        for node in ast.walk(TREE):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "put_nowait"
+                and ast.unparse(node.func.value) == "self.outputs_queue"
+            ):
+                guards = [
+                    ast.unparse(n.test)
+                    for n in ast.walk(TREE)
+                    if isinstance(n, ast.If) and node in ast.walk(n)
+                ]
+                self.assertIn("self.keep_finished_outputs", guards)
+
     def test_load_accounting_is_sized_for_the_engine_count(self):
         mgr = _bare_manager(CoreManager, local_engine_count=4)
         self.addCleanup(mgr.ctx.term)
