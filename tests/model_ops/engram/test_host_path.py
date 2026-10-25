@@ -5,6 +5,8 @@ per-layer row counts have to equal what DeepSeek-V4.1-Flash's config declares,
 which only happens if the prime search runs in exactly the reference order.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 import torch
@@ -1020,6 +1022,52 @@ def test_one_copy_worker_still_drops_the_source_chunk_by_chunk(monkeypatch, tmp_
     assert len(dropped) == data.nbytes // (1 << 14)  # page-aligned map
     assert _resident_pages(mapped) < data.nbytes // 4096 // 8
     assert torch.equal(table.registered_shard()[0], torch.from_numpy(data))
+
+
+def test_a_failing_chunk_waits_for_the_others_before_the_dropper_closes(
+    monkeypatch,
+):
+    """One chunk raising must not let the caller close the dropper (and its
+    pagemap descriptor) while other chunks are still dropping."""
+    import threading
+    import time
+
+    from atom.model_ops.engram import host_memory as hm
+
+    monkeypatch.setattr(hm, "_BYTES_PER_THREAD", 1 << 14)
+    monkeypatch.setattr(hm, "_CHUNK_BYTES", 1 << 14)
+    monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: set(range(4)))
+    src = torch.zeros(1 << 18, dtype=torch.uint8)
+    dst = torch.empty_like(src)
+    closed, late, lock = [], [], threading.Lock()
+
+    def drop(offset, nbytes):
+        if offset == 0:
+            raise RuntimeError("chunk failed")
+        time.sleep(0.01)
+        with lock:
+            if closed:
+                late.append(offset)
+
+    with ThreadPoolExecutor(4) as pool:
+        with pytest.raises(RuntimeError, match="chunk failed"):
+            hm._copy_into(dst, src, pool, drop)
+        closed.append(True)  # what `_copy` does next
+    assert not late
+
+
+def test_a_closed_dropper_does_nothing(tmp_path):
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory as hm
+
+    path = tmp_path / "t.bin"
+    np.zeros(1 << 16, np.float32).tofile(path)
+    src = torch.from_numpy(np.memmap(path, np.float32, "c", shape=(1 << 16,)))
+    drop = hm._source_dropper(src)
+    drop.close()
+    drop.close()  # idempotent
+    drop(0, src.nbytes)  # no read of a reused descriptor
 
 
 def test_chunks_cut_at_page_boundaries():

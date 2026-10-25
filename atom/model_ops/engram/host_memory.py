@@ -25,7 +25,7 @@ import ctypes
 import logging
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
 import torch
@@ -205,7 +205,16 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
             drop(o, n)
 
     step = min(-(-nbytes // (threads * 4)), _CHUNK_BYTES)
-    list(pool.map(chunk, _chunks(s, nbytes, step)))
+    # Every submitted chunk finishes before this returns or raises: the
+    # caller then closes `drop`, whose descriptor the chunks still read.
+    futures = []
+    try:
+        for piece in _chunks(s, nbytes, step):
+            futures.append(pool.submit(chunk, piece))
+    finally:
+        wait(futures)
+    for f in futures:
+        f.result()
 
 
 def _file_mapped(addr: int, nbytes: int) -> bool:
@@ -277,7 +286,11 @@ def _source_dropper(src: torch.Tensor):
                 return False
         return True
 
+    closed = []
+
     def drop(offset: int, nbytes: int) -> None:
+        if closed:  # the descriptor number may belong to another file now
+            return
         # Whole pages inside the range only (`_chunks` aligns chunk edges).
         lo = -(-(base + offset) // _PAGE) * _PAGE
         hi = (base + offset + nbytes) // _PAGE * _PAGE
@@ -289,7 +302,12 @@ def _source_dropper(src: torch.Tensor):
         if libc.madvise(lo, hi - lo, _MADV_DONTNEED) != 0:
             logger.debug("engram: madvise(DONTNEED) failed: %d", ctypes.get_errno())
 
-    drop.close = lambda: os.close(pagemap)
+    def close() -> None:
+        if not closed:
+            closed.append(True)
+            os.close(pagemap)
+
+    drop.close = close
     return drop
 
 
