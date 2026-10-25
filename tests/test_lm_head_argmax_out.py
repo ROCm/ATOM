@@ -14,6 +14,7 @@ def _tp1_head(logits: torch.Tensor, monkeypatch) -> embed_head.ParallelLMHead:
     head.tp_size = 1
     head.weight = torch.nn.Parameter(torch.empty(1), requires_grad=False)
     head.bias = None
+    head._argmax_row_lens = []
     monkeypatch.setattr(embed_head.tgemm, "mm", lambda *_args, **_kwargs: logits)
     monkeypatch.setattr(embed_head, "topk_select", _torch_topk_select)
     return head
@@ -47,6 +48,31 @@ def test_argmax_can_write_directly_to_caller_storage(monkeypatch):
 
     assert token_ids.data_ptr() == out.data_ptr()
     assert token_ids.tolist() == [1, 0]
+
+
+def test_argmax_row_lengths_are_the_heads_own(monkeypatch):
+    """The row lengths handed down live as long as the head, at one address.
+
+    A draft pass records the argmax, so `end` is read by address on every
+    replay; topk_select's own default comes from an LRU cache whose eviction
+    frees it, and a freed length read back as 0 answers -1.
+    """
+    logits = {"now": torch.rand(2, 3)}
+    head = _tp1_head(logits["now"], monkeypatch)
+    monkeypatch.setattr(embed_head.tgemm, "mm", lambda *_a, **_k: logits["now"])
+    seen = []
+
+    def spy(input, topk, *, end=None, **kwargs):
+        seen.append(end)
+        return _torch_topk_select(input, topk, **kwargs)
+
+    monkeypatch.setattr(embed_head, "topk_select", spy)
+    for rows in (2, 1):
+        logits["now"] = torch.rand(rows, 3)
+        out = torch.empty(rows, dtype=torch.int32)
+        head.compute_argmax_token(torch.empty(rows, 4), out=out)
+    assert [end.tolist() for end in seen] == [[3, 3], [3]]
+    assert seen[0].data_ptr() == seen[1].data_ptr()
 
 
 def test_argmax_refuses_to_allocate_for_the_caller(monkeypatch):

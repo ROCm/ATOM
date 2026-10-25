@@ -261,11 +261,22 @@ class Drafter(abc.ABC):
                 local_tokens = bs * self.draft_tokens_per_seq
                 context.scheduled_tokens = local_tokens
                 context.running_tokens = local_tokens
+                # Every rank warms the same batch, so the group's per-rank
+                # counts are this one repeated, as in the target's capture. An
+                # all2all MoE bounds what its dispatch delivered by them.
+                dp_size = self.config.parallel_config.data_parallel_size
                 set_forward_context(
                     attn_metadata=attn_metadata,
                     atom_config=self.config,
                     context=context,
                     num_tokens=local_tokens,
+                    num_tokens_across_dp=(
+                        torch.full(
+                            (dp_size,), local_tokens, dtype=torch.int32, device="cpu"
+                        )
+                        if dp_size > 1
+                        else None
+                    ),
                 )
                 pool = pass_.warmup(bs, pool=pool, stream=stream)
         runner.graph_pool = pool

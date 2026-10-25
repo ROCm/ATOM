@@ -196,7 +196,10 @@ def _warmup_all_sizes(warmup_draft_graphs, capture_sizes=(4, 2, 1)):
         rank=0,
     )
     proposer.draft_graphs = (pass_,)
-    proposer.config = None
+    # One DP rank: the warmup states no per-rank token counts.
+    proposer.config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(data_parallel_size=1)
+    )
 
     def build_context(bs):
         return types.SimpleNamespace(), types.SimpleNamespace()
