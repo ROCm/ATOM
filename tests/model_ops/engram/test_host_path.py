@@ -999,13 +999,17 @@ def test_a_copy_that_fails_frees_what_it_took(monkeypatch):
     allocator = FakeHostAllocator()
     monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
 
-    def no_thread(dst, src, pool):
+    raised = []
+
+    def no_thread(dst, src, pool, drop=None):
+        raised.append(True)
         raise RuntimeError("can't start new thread")
 
     monkeypatch.setattr(host_memory, "_copy_into", no_thread)
     table = scaled_table()
     assert table.enable_uva(0, 4) is False
     assert allocator.live == {} and table._uva is None
+    assert raised  # the scripted failure, not an argument mismatch
     table.disable_uva()
 
 
