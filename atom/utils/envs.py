@@ -171,6 +171,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode, whose output deferred output makes visible two forwards later.
     # 0 = T0 rides with that first decode output.
     "ATOM_PD_EARLY_T0": lambda: _flag_env("ATOM_PD_EARLY_T0", "0"),
+    # Replace a tiktoken-based tokenizer's per-character Python whitespace
+    # split (Kimi's) with a numpy check that returns the same pieces; see
+    # `tokenizer_split.py`. 0 = the tokenizer's own split.
+    "ATOM_FAST_TOKENIZER_SPLIT": lambda: _flag_env("ATOM_FAST_TOKENIZER_SPLIT", "0"),
     # Prefill only, for models with per-request state (which ATOM_PD_MLA_STAGING
     # does not serve): pages per producer slot that repacks MLA KV for a DCP
     # consumer below a page of interleave; 0 writes each token run in place.
