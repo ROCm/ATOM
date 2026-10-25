@@ -837,6 +837,21 @@ def test_a_copy_leaves_an_anonymous_source_intact(monkeypatch):
     assert torch.equal(weight, expected)
 
 
+def _resident_pages(tensor):
+    """Pages of `tensor` mapped in this process (`/proc/self/pagemap`)."""
+    import os
+
+    import numpy as np
+
+    lo, hi = tensor.data_ptr() // 4096, -(-(tensor.data_ptr() + tensor.nbytes) // 4096)
+    fd = os.open("/proc/self/pagemap", os.O_RDONLY)
+    try:
+        e = np.frombuffer(os.pread(fd, 8 * (hi - lo), 8 * lo), dtype="<u8")
+    finally:
+        os.close(fd)
+    return int(np.count_nonzero(e >> np.uint64(63)))
+
+
 def test_a_copied_file_mapping_is_dropped_and_still_reads_back(monkeypatch, tmp_path):
     import numpy as np
 
@@ -859,6 +874,7 @@ def test_a_copied_file_mapping_is_dropped_and_still_reads_back(monkeypatch, tmp_
             dropped.append((offset, nbytes))
             drop(offset, nbytes)
 
+        record.close = drop.close
         return record
 
     monkeypatch.setattr(host_memory, "_source_dropper", watched)
@@ -868,7 +884,10 @@ def test_a_copied_file_mapping_is_dropped_and_still_reads_back(monkeypatch, tmp_
     monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda pid: set(range(4)))
     table = HostEmbeddingTable(mapped, num_rows=4096, head_dim=64)
     assert table.enable_uva(0, 4096) is True
-    assert len(dropped) > 2 and dropped[-1] == (0, data.nbytes)
+    assert len(dropped) > 2 and sum(n for _, n in dropped) == data.nbytes
+    # Every chunk dropped; fault-around while copying a later chunk can map a
+    # few clean pages of an earlier one back in (page cache, harmless).
+    assert _resident_pages(mapped) < data.nbytes // 4096 // 8
     assert torch.equal(table.registered_shard()[0], torch.from_numpy(data))
     assert torch.equal(mapped, torch.from_numpy(data))  # faulted back in
 
@@ -923,18 +942,19 @@ def test_a_written_private_mapping_is_not_dropped(monkeypatch, tmp_path):
     mapped = np.memmap(path, np.float32, "c", shape=data.shape)
     mapped[100:4000] = 7.0  # private copies, not in the file
     weight = torch.from_numpy(mapped)
-    assert host_memory._source_dropper(weight) is None
     table = HostEmbeddingTable(weight, num_rows=4096, head_dim=64)
     assert table.enable_uva(0, 4096) is True
     assert float(weight[2000, 0]) == 7.0
+    assert float(weight[99, 0]) == 0.0
     assert torch.equal(table.registered_shard()[0], weight)
 
 
 def test_a_mapping_split_into_clean_and_written_parts_is_not_dropped(
     monkeypatch, tmp_path
 ):
-    """`mprotect` splits one file mapping in two; only the second was written.
-    Every part the range touches must be checked, not the first byte's."""
+    """`mprotect` splits one file mapping in two; only the second was written
+    (and the first is now read-only). Written pages are kept wherever they
+    are; clean ones are still dropped."""
     import ctypes
 
     import numpy as np
@@ -953,13 +973,16 @@ def test_a_mapping_split_into_clean_and_written_parts_is_not_dropped(
     libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
     half = rows * width * 4 // 2
     assert libc.mprotect(weight.data_ptr(), half, 1) == 0  # PROT_READ: a split
-    first, second = weight[: rows // 2], weight[rows // 2 :]
-    assert host_memory._source_dropper(first) is not None  # clean on its own
-    assert host_memory._source_dropper(second) is None
-    assert host_memory._source_dropper(weight) is None
+    first = weight[: rows // 2]
+    first.sum()  # fault the clean half in
+    monkeypatch.setattr(host_memory, "_BYTES_PER_THREAD", 1 << 14)
+    monkeypatch.setattr(host_memory, "_CHUNK_BYTES", 1 << 14)
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda pid: set(range(4)))
     table = HostEmbeddingTable(weight, num_rows=rows, head_dim=width)
     assert table.enable_uva(0, rows) is True
     assert float(weight[rows - 1, 0]) == 7.0
+    assert float(weight[rows // 2 + 10, 0]) == 7.0
+    assert _resident_pages(first) < rows * width * 4 // 2 // 4096 // 8
     assert torch.equal(table.registered_shard()[0], weight)
     del table
     assert libc.mprotect(weight.data_ptr(), half, 3) == 0
@@ -983,13 +1006,33 @@ def test_one_copy_worker_still_drops_the_source_chunk_by_chunk(monkeypatch, tmp_
 
     def watched(src):
         drop = real(src)
-        return lambda o, n: (dropped.append((o, n)), drop(o, n))
+
+        def record(o, n):
+            dropped.append((o, n))
+            drop(o, n)
+
+        record.close = drop.close
+        return record
 
     monkeypatch.setattr(host_memory, "_source_dropper", watched)
     table = HostEmbeddingTable(mapped, num_rows=4096, head_dim=64)
     assert table.enable_uva(0, 4096) is True
-    assert len(dropped) == data.nbytes // (1 << 14) + 1
+    assert len(dropped) == data.nbytes // (1 << 14)  # page-aligned map
+    assert _resident_pages(mapped) < data.nbytes // 4096 // 8
     assert torch.equal(table.registered_shard()[0], torch.from_numpy(data))
+
+
+def test_chunks_cut_at_page_boundaries():
+    import itertools
+
+    from atom.model_ops.engram.host_memory import _PAGE, _chunks
+
+    for addr in (0, 100, _PAGE - 1, 5 * _PAGE + 7):
+        for nbytes in (1, _PAGE, 10 * _PAGE + 3, 1 << 20):
+            pieces = _chunks(addr, nbytes, 3 * _PAGE)
+            assert pieces[0][0] == 0 and sum(n for _, n in pieces) == nbytes
+            assert all(a + n == b for (a, n), (b, _) in itertools.pairwise(pieces))
+            assert all((addr + o) % _PAGE == 0 for o, _ in pieces[1:])
 
 
 def test_copy_threads_scale_with_size_and_respect_cpu_affinity(monkeypatch):

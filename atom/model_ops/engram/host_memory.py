@@ -27,6 +27,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 
 from atom.utils import envs
@@ -184,108 +185,126 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
     """
     nbytes = src.numel()
     threads = copy_threads(nbytes)
+    s = src.data_ptr()
     if threads == 1 or pool is None:
-        # One worker; with a source to drop, still in chunks, so the copied
-        # part of the source goes before the rest comes in (peak ~one shard).
-        step = nbytes if drop is None else _CHUNK_BYTES
-        for o in range(0, nbytes, max(step, 1)):
-            n = min(step, nbytes - o)
+        if drop is None:
+            dst.copy_(src)
+            return
+        # One worker, still in chunks, so the copied part of the source goes
+        # before the rest comes in (peak ~one shard).
+        for o, n in _chunks(s, nbytes, _CHUNK_BYTES):
             dst[o : o + n].copy_(src[o : o + n])
-            if drop is not None:
-                drop(o, n)
-    else:
-        step = min(-(-nbytes // (threads * 4)), _CHUNK_BYTES)
-        d, s = dst.data_ptr(), src.data_ptr()
+            drop(o, n)
+        return
+    d = dst.data_ptr()
 
-        def chunk(o: int) -> None:
-            n = min(step, nbytes - o)
-            ctypes.memmove(d + o, s + o, n)
-            if drop is not None:
-                drop(o, n)
+    def chunk(piece) -> None:
+        o, n = piece
+        ctypes.memmove(d + o, s + o, n)
+        if drop is not None:
+            drop(o, n)
 
-        list(pool.map(chunk, range(0, nbytes, step)))
-    if drop is not None:
-        drop(0, nbytes)
+    step = min(-(-nbytes // (threads * 4)), _CHUNK_BYTES)
+    list(pool.map(chunk, _chunks(s, nbytes, step)))
 
 
-def _mappings():
-    """`(lo, hi, perms, path, anonymous_kib)` per mapping, `/proc/self/smaps`."""
-    out, cur = [], None
-    with open("/proc/self/smaps") as smaps:
-        for line in smaps:
-            head = line.split(maxsplit=5)
-            if not head:
-                continue
-            if head[0].endswith(":"):
-                if cur is not None and head[0] == "Anonymous:":
-                    cur[4] = int(head[1])
-                continue
-            lo, hi = (int(x, 16) for x in head[0].split("-"))
-            path = head[5].strip() if len(head) > 5 else ""
-            cur = [lo, hi, head[1], path, None]
-            out.append(cur)
-    return out
-
-
-def _file_backed(addr: int, nbytes: int) -> bool:
-    """Whether `[addr, addr + nbytes)` lies wholly in mappings of one regular
-    file whose pages all match it (`/proc/self/smaps`): dropping them loses
-    nothing.
-
-    Every mapping the range touches is checked -- `mprotect` can split one
-    file mapping into a clean part and a written one. A private mapping that
-    was written holds those pages as anonymous copies; dropping them would
-    restore the on-disk bytes under the table, so a range touching any
-    private mapping with an anonymous page (conservatively), a gap, or
-    anything but that one file is not dropped. Shared mappings write through
-    the page cache.
-    """
-    end = addr + nbytes
+def _file_mapped(addr: int, nbytes: int) -> bool:
+    """Whether `[addr, addr + nbytes)` lies wholly, without a gap, in mappings
+    of one regular file (`/proc/self/maps`; cheap, no page-table walk)."""
+    end, covered, path = addr + nbytes, addr, None
     try:
-        maps = _mappings()
+        with open("/proc/self/maps") as maps:
+            for line in maps:
+                fields = line.split(maxsplit=5)
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                if hi <= addr or lo >= end:
+                    continue
+                name = fields[5].strip() if len(fields) > 5 else ""
+                if lo > covered or not name.startswith("/"):
+                    return False
+                if name.startswith("/dev/") or path not in (None, name):
+                    return False
+                path, covered = name, max(covered, hi)
     except (OSError, ValueError, IndexError):
         return False
-    covered, path = addr, None
-    for lo, hi, perms, name, anon in maps:
-        if hi <= addr or lo >= end:
-            continue
-        if lo > covered:
-            return False  # a gap in the range
-        if not name.startswith("/") or name.startswith("/dev/"):
-            return False
-        if path is not None and name != path:
-            return False
-        if not perms.endswith("s") and anon != 0:
-            return False
-        path, covered = name, max(covered, hi)
     return path is not None and covered >= end
+
+
+# /proc/self/pagemap, one little-endian u64 per page: bit 63 present, 62
+# swapped, 61 file page (or shared anonymous).
+_PM_PRESENT, _PM_SWAPPED, _PM_FILE = 1 << 63, 1 << 62, 1 << 61
 
 
 def _source_dropper(src: torch.Tensor):
     """`drop(offset, nbytes)` unmapping that byte range of `src`'s checkpoint
     pages from this process, or None when `src` is not a file mapping.
 
-    They are clean file pages: dropping them leaves the data in the page cache
+    Clean file pages: dropping them leaves the data in the page cache
     (reclaimable, not this process's RSS), and a later read faults it back.
     Without this the copy and its source are both resident, twice the shard;
     dropping each chunk as it is copied also keeps the peak near one shard.
-    Only for a file mapping -- on anonymous memory this would discard data.
+
+    Only pages that still match the file are dropped. A page written through
+    a private mapping is an anonymous copy (whatever the mapping's current
+    protection, and wherever `mprotect` split it); dropping it would put the
+    file's bytes back under the table. Each chunk's pages are checked in
+    `/proc/self/pagemap` just before, and a chunk holding any such page is
+    kept whole. This reads 8 bytes per page of the chunk, on the copy thread
+    (~120 ms per 46 GiB, single-threaded), rather than walking every mapping
+    of the process as `/proc/self/smaps` does (~0.36 s per call there).
     """
     base = src.data_ptr()
-    if not _file_backed(base, src.numel() * src.element_size()):
+    if not _file_mapped(base, src.numel() * src.element_size()):
+        return None
+    try:
+        pagemap = os.open("/proc/self/pagemap", os.O_RDONLY)
+    except OSError:
         return None
     libc = ctypes.CDLL(None, use_errno=True)
     libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 
+    def unmodified(lo: int, hi: int) -> bool:
+        first, count = lo // _PAGE, (hi - lo) // _PAGE
+        step = 1 << 16  # pages per read
+        for p in range(0, count, step):
+            n = min(step, count - p)
+            raw = os.pread(pagemap, 8 * n, 8 * (first + p))
+            if len(raw) != 8 * n:
+                return False
+            entries = np.frombuffer(raw, dtype="<u8")
+            used = (entries & np.uint64(_PM_PRESENT | _PM_SWAPPED)) != 0
+            if np.any(used & ((entries & np.uint64(_PM_FILE)) == 0)):
+                return False
+        return True
+
     def drop(offset: int, nbytes: int) -> None:
-        # Whole pages inside the range only: a page shared with a neighbouring
-        # chunk is dropped with the whole range at the end.
+        # Whole pages inside the range only (`_chunks` aligns chunk edges).
         lo = -(-(base + offset) // _PAGE) * _PAGE
         hi = (base + offset + nbytes) // _PAGE * _PAGE
-        if hi > lo and libc.madvise(lo, hi - lo, _MADV_DONTNEED) != 0:
+        if hi <= lo:
+            return
+        if not unmodified(lo, hi):
+            logger.debug("engram: source chunk holds written pages; kept")
+            return
+        if libc.madvise(lo, hi - lo, _MADV_DONTNEED) != 0:
             logger.debug("engram: madvise(DONTNEED) failed: %d", ctypes.get_errno())
 
+    drop.close = lambda: os.close(pagemap)
     return drop
+
+
+def _chunks(addr: int, nbytes: int, step: int):
+    """`(offset, size)` covering `[0, nbytes)` in about `step` bytes, cut at
+    page boundaries of `addr + offset`, so a chunk's whole pages are its own
+    and only the range's two edge pages belong to no chunk."""
+    step = max(_PAGE, step // _PAGE * _PAGE)
+    first = min(nbytes, (-addr) % _PAGE or step)
+    out, o = [], 0
+    for end in [first, *range(first + step, nbytes, step), nbytes]:
+        if end > o:
+            out.append((o, end - o))
+            o = end
+    return out
 
 
 def _as_bytes(t: torch.Tensor) -> torch.Tensor:
@@ -333,7 +352,12 @@ def _copy(allocator, sources, leases):
             lease = _Lease(ptr, nbytes, allocator.free)
             leases.append(lease)
             dst = _owning_bytes(lease, 0, nbytes)
-            _copy_into(dst, _as_bytes(src), pool, _source_dropper(src))
+            drop = _source_dropper(src)
+            try:
+                _copy_into(dst, _as_bytes(src), pool, drop)
+            finally:
+                if drop is not None:
+                    drop.close()
             out.append(dst.view(src.dtype).view(src.shape))
         return tuple(out)
     finally:
