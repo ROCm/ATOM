@@ -2911,6 +2911,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
         ),
         _poll_kv_transfer_progress=lambda: None,
         _poll_dynamic_chunking_calibration=lambda: None,
+        _put_early_outputs=lambda: None,
     )
     for name, owner in (
         ("_dispatch_connector_only_batch", PPEngineCoreProc),
