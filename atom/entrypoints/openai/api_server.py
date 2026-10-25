@@ -69,10 +69,12 @@ from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    PROMPT_TOKEN_IDS_B64,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
     ModelList,
+    encode_prompt_token_ids,
     validate_max_tokens,
 )
 from .reasoning import (
@@ -867,9 +869,9 @@ async def generate_async(
         seq.num_prompt_tokens
         if seq is not None
         else len(
-            prompt_or_tokens
-            if isinstance(prompt_or_tokens, list)
-            else tokenizer.encode(prompt_or_tokens)
+            tokenizer.encode(prompt_or_tokens)
+            if isinstance(prompt_or_tokens, str)
+            else prompt_or_tokens
         )
     )
     num_tokens_output = len(all_token_ids)
@@ -895,11 +897,19 @@ async def generate_async(
         "latency": latency,
         "num_cached_tokens": num_cached_tokens_seen,
     }
+    if return_token_ids and seq is not None:
+        if envs.ATOM_PD_PROMPT_IDS_B64 and isinstance(
+            kv_transfer_output_meta_info, dict
+        ):
+            kv_transfer_output_meta_info = {
+                **kv_transfer_output_meta_info,
+                PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids(seq.prompt_token_ids),
+            }
+        else:
+            # Convert the token array to a JSON-serializable list.
+            response["prompt_token_ids"] = list(seq.prompt_token_ids)
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
-    if return_token_ids and seq is not None:
-        # Convert the token array to a JSON-serializable list.
-        response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
 
@@ -1171,9 +1181,10 @@ def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Copy KV metadata without IDs already passed as the engine prompt."""
-    if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
+    keys = ("prompt_token_ids", PROMPT_TOKEN_IDS_B64)
+    if kv_transfer_params is None or not any(k in kv_transfer_params for k in keys):
         return kv_transfer_params
-    return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
+    return {k: v for k, v in kv_transfer_params.items() if k not in keys}
 
 
 def _prompt_headroom(
