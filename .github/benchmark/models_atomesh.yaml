@@ -1304,6 +1304,10 @@ models:
               ATOM_ENABLE_REPLAYSSM: "1"
             prefill: &kimi_k3_pp8_lmcache128_prefill_env
               <<: [*kimi_k3_agentic_lmcache128_env, *kimi_k3_pp8_prefill_env]
+              # Each stage repacks its KV for the DCP decode on the MLA staging
+              # streams; at high priority a repack does not wait out the
+              # stage's next prefill forward.
+              ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
 
         - <<: *kimi_k3_1p1d_pp8_dcp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
