@@ -1241,8 +1241,9 @@ models:
               max_num_seqs: 512
 
         # A PP8xTP1 prefill in front of InferenceX's AgentX server
-        # (kimik3-fp4-mi355x-atom-agentic-mtp, SemiAnalysisAI/InferenceX#4085).
-        # The decode runs that recipe: TP8 with seven DSpark drafts at CONC 1/4,
+        # (kimik3-fp4-mi355x-atom-agentic-mtp, SemiAnalysisAI/InferenceX#4085,
+        # with #4307's CONC 2 and its on-demand state cache from CONC 48).
+        # The decode runs that recipe: TP8 with seven DSpark drafts at CONC 1/2/4,
         # TP8xDCP8 with four drafts and ReplaySSM from CONC 16, the drafter's
         # linears unquantized, max_num_seqs 2 * CONC, a 128 GiB per-rank CPU
         # tier through CONC 32 and comm-group reuse from CONC 56. CONC 32 and
@@ -1255,6 +1256,8 @@ models:
         # The recipe's PrefillDelayer settings pace prefill against decode on
         # one server, which neither P/D server does, so these cells leave them
         # unset as the TP8 1P1D cells above do.
+        # The recipe's mono decode at CONC 1/2 is pinned off
+        # (ATOM_MONO_ENABLE=0) on these cells, as on the recipe's other points.
         #
         # The prefill is eight one-GPU stages. Only the last holds the drafter,
         # so its stage is cut to nine layers, on AttnRes block boundaries, to
@@ -1284,6 +1287,7 @@ models:
             common: &kimi_k3_pp8_env
               AITER_LOG_LEVEL: WARNING
               ATOM_ENABLE_REPLAYSSM: "0"
+              ATOM_MONO_ENABLE: "0"
               # While requests wait on remote KV, the decode polls again for up
               # to 5 ms after each forward, so KV that landed during it is
               # scheduled the next step. PP engines (the prefill) ignore it.
@@ -1303,6 +1307,10 @@ models:
               # Stream the prefill's first token when the request's KV lands,
               # not with the first local decode's deferred output.
               ATOM_PD_EARLY_T0: "1"
+
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c2
+          concurrency: [2]
 
         - <<: *kimi_k3_1p1d_pp8_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c4
