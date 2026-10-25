@@ -1534,6 +1534,39 @@ models:
             common: *kimi_k3_pp8_replay_env
             prefill: *kimi_k3_agentic_lmcache128_env
 
+        # Test only. The same expert-parallel TP8 prefill in front of the PP8
+        # C4 and C32 cells' decodes, to find where it stops beating PP8.
+        - <<: *kimi_k3_1p1d_pp8_tp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-tp8-dspark7-agentic-1m-c4
+          topology: 1p1d
+          display_topology: 1P1D-TP8EP8-TP8-DSPARK7
+          concurrency: [4]
+          prefill:
+            workers: 1
+            tp: 8
+            extra_args: "--enable-expert-parallel"
+          env:
+            common: *kimi_k3_pp8_env
+            prefill: {}
+
+        - <<: *kimi_k3_1p1d_pp8_dcp8
+          name: kimi-k3-mxfp4-1p1d-tp8ep8-dcp8-dspark4-agentic-lmcache-1m-c32
+          topology: 1p1d
+          display_topology: 1P1D-TP8EP8-DCP8-DSPARK4
+          concurrency: [32]
+          server:
+            common_args:
+              <<: *kimi_k3_pp8_dspark4_args
+              max_num_seqs: 64
+          prefill:
+            workers: 1
+            tp: 8
+            dcp: 8
+            extra_args: "--enable-expert-parallel"
+          env:
+            common: *kimi_k3_pp8_replay_env
+            prefill: *kimi_k3_agentic_lmcache128_env
+
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
       # which makes this cell's aiperf numbers incomparable with its C72 twin.
