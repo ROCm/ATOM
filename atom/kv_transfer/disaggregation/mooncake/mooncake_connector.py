@@ -2360,7 +2360,11 @@ class MooncakeConnector(KVConnectorBase):
             if all_done:
                 if self.pp_size > 1:
                     if self.pp_rank != 0:
-                        self._discard_kv_cache_ready_event(transfer_id)
+                        # Stage 0 drops its entry on release, which only it
+                        # receives; nothing here reads this one again.
+                        with self._completed_prefills_lock:
+                            self._completed_prefills.pop(transfer_id, None)
+                            self._kv_cache_ready_events.pop(transfer_id, None)
                     # PP-prefill: this stage's write is done, but stage-0 must not
                     # reuse the shared page until ALL stages finish. Freeing is
                     # deferred to _record_release (driven by consumer releases).
