@@ -616,7 +616,7 @@ def test_legacy_engine_dp_reaches_v41_startup(monkeypatch, explicit_parallel):
     )
     validated = []
 
-    def start_core(config):
+    def start_core(config, keep_finished_outputs=True):
         # Exercise the unchanged LLMEngine constructor through its handoff to
         # CoreManager without starting GPU workers.
         validate_tbo_parallelism(config)
