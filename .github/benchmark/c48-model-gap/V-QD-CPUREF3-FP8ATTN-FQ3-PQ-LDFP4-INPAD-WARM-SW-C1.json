@@ -68,7 +68,7 @@
         "tensor-parallel-size": 8,
         "moe-backend": "auto",
         "load-format": "fastsafetensors",
-        "gpu-memory-utilization": 0.9,
+        "gpu-memory-utilization": 0.85,
         "language-model-only": true,
         "enable-auto-tool-choice": true,
         "tool-call-parser": "kimi_k3",
