@@ -218,6 +218,12 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        # Finished sequences are queued for `get_output()`. A caller that never
+        # reads it -- the OpenAI server, which delivers through per-request
+        # callbacks -- must turn this off, or every request's full Sequence
+        # (block table, offload record, token arrays) stays queued for the life
+        # of the process and each gen-2 GC pass walks all of them.
+        self.keep_finished_outputs = True
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -775,7 +781,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
             finally:
                 # Close sockets.
                 shutdown_socket.close(linger=0)
