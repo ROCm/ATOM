@@ -924,6 +924,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DRAFT_CUDAGRAPH": lambda: (
         os.getenv("ATOM_DRAFT_CUDAGRAPH", "1").lower() == "1"
     ),
+    # Eagle/MTP draft step 0 as a graph on decode steps whose target replayed its
+    # verify graph: same (running_bs, mtp_k + 1) shape, read off the target's own
+    # metadata. 0 keeps step 0 eager everywhere.
+    "ATOM_DRAFT_STEP0_CUDAGRAPH": lambda: (
+        os.getenv("ATOM_DRAFT_STEP0_CUDAGRAPH", "1").lower() == "1"
+    ),
     # --- MoE (DeepSeek-style shared experts) ---
     # Dual-stream MoE only when num_tokens <= threshold; 0 disables dual-stream registration.
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(

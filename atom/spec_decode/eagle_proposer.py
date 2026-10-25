@@ -140,6 +140,7 @@ class EagleProposer(Drafter):
         Serving stages the same axis, so the warmed shape is the served one.
         """
         self.step = None
+        self.step0 = None
         if self.mtp_k < 2:
             # mtp_k == 1 has no step 1+, so warming one would capture a graph
             # `propose` can never reach.
@@ -178,7 +179,132 @@ class EagleProposer(Drafter):
             inputs=inputs,
             warmup_inputs=self._step_warmup_inputs,
         )
+        # Step 0 on a decode step: the target's verify stream, mtp_k + 1 rows per
+        # sequence, run against the target's own metadata. Not for drafts that
+        # bring aux states (Eagle3), shard step 0 over PCP, or carry indexer
+        # state across steps -- those keep step 0 eager.
+        if (
+            envs.ATOM_DRAFT_STEP0_CUDAGRAPH
+            and getattr(self.model, "draft_step0_graph", False)
+            and self.speculative_config.method == "mtp"
+            and not hasattr(self.runner, "draft_kv_builder")
+            and not getattr(self, "_share_mtp_indices", False)
+            and not _pcp_active_for_draft_model(self.model)
+        ):
+            q = self.mtp_k + 1
+            self.step0 = DraftGraph(
+                forward=self._step0_forward,
+                epilogue=self._step0_head,
+                capture_epilogue=True,
+                inputs={
+                    "input_ids": StagedInput(shape=(q,), dtype=torch.int32),
+                    "positions": StagedInput(shape=(q,), dtype=torch.int64),
+                    "hidden_states": StagedInput(
+                        shape=(q, *hidden_shape), dtype=self.dtype
+                    ),
+                    "last_token_indices": StagedInput(dtype=torch.int64),
+                },
+                warmup_inputs=self._step0_warmup_inputs,
+            )
+            return (self.step0, self.step)
         return (self.step,)
+
+    def _step0_forward(
+        self, running_bs, *, input_ids, positions, hidden_states, last_token_indices
+    ):
+        """Draft step 0 over a decode step's verify stream, ``running_bs`` sequences
+        of ``mtp_k + 1`` rows each, laid out as the target's own forward was."""
+        positions = positions.reshape(-1)
+        if self.runner.use_mrope:
+            # One staged axis for all three, as in `_step_forward`.
+            positions = positions.expand(3, -1)
+        return self.model(
+            input_ids=input_ids.reshape(-1),
+            positions=positions,
+            hidden_states=hidden_states.reshape(-1, *hidden_states.shape[2:]),
+        )
+
+    def _step0_head(self, fwd_out, running_bs, *, last_token_indices, **_):
+        """Each sequence's accepted row and the draft id it makes, as step 1 reads
+        them."""
+        hidden = torch.index_select(fwd_out, 0, last_token_indices)
+        ids = empty_token_ids(hidden)
+        return hidden, self.model.compute_draft_ids(hidden, out=ids)
+
+    def _step0_warmup_inputs(
+        self, running_bs, *, input_ids, positions, hidden_states, last_token_indices
+    ):
+        """The capture builder's batch is already the verify shape step 0 runs on;
+        state the row count step 0 runs at, and aim each sequence's anchor at its
+        last row."""
+        fc = get_forward_context()
+        q = self.mtp_k + 1
+        self._publish_draft_shape(
+            fc, running_bs * q, running_bs * q, running_tokens_are_unified=True
+        )
+        context_lens = fc.attn_metadata.context_lens[:running_bs].to(torch.int64)
+        offsets = torch.arange(q, device=positions.device) - (q - 1)
+        positions.copy_((context_lens[:, None] + offsets).clamp_min(0))
+        input_ids.zero_()
+        hidden_states.zero_()
+        last_token_indices.copy_(
+            torch.arange(running_bs, device=last_token_indices.device) * q + (q - 1)
+        )
+
+    def _step0_graphed(self, context, running_bs) -> bool:
+        """Whether step 0 replays this step -- a question the DP group answers alike.
+
+        The target replayed its verify graph at (running_bs, mtp_k + 1) exactly
+        when ``forward_mode`` says so, and that is the group's decision; so is
+        whether a step-0 recording exists at ``running_bs``. A per-rank fact
+        (this rank's own batch, a dummy) must not enter: the draft's collectives
+        run at the width the group agreed.
+        """
+        mode = getattr(context, "forward_mode", None)
+        q = self.mtp_k + 1
+        return (
+            self.step0 is not None
+            and mode is not None
+            and mode.use_cudagraph
+            and not mode.is_prefill
+            and mode.max_seqlen_q == q
+            and mode.running_tokens_are_unified
+            and mode.running_tokens == running_bs * q
+            and self.step0.is_captured(running_bs)
+        )
+
+    def _stage_step0(
+        self, running_bs, scheduled_bs, input_ids, positions, hidden_states,
+        last_token_indices,
+    ):
+        """Copy the verify stream into the step-0 pass's buffers as flat rows.
+
+        The rows go in as the target's forward laid them out -- real rows first,
+        then pad rows repeating the last real one (the pad rule `stage` applies)
+        -- so a ragged step stages the same way a rectangular one does.
+        """
+        q = self.mtp_k + 1
+        rows = running_bs * q
+        n = input_ids.shape[0]
+        out = {}
+        flat_srcs = {
+            "input_ids": input_ids,
+            "positions": positions[0] if positions.ndim == 2 else positions,
+            "hidden_states": hidden_states,
+        }
+        for role, src in flat_srcs.items():
+            view = self.step0.buffer(role, running_bs)
+            flat = view.view(rows, *view.shape[2:])
+            flat[:n].copy_(src[:n])
+            if rows > n:
+                flat[n:].copy_(src[n - 1])
+            out[role] = view
+        lti = self.step0.buffer("last_token_indices", running_bs)
+        lti[:scheduled_bs].copy_(last_token_indices[:scheduled_bs])
+        if running_bs > scheduled_bs:
+            lti[scheduled_bs:].copy_(last_token_indices[scheduled_bs - 1])
+        out["last_token_indices"] = lti
+        return out
 
     def _step_forward(self, running_bs, *, input_ids, positions, hidden_states):
         """One mid-step draft forward at ``running_bs`` rows.
@@ -705,6 +831,9 @@ class EagleProposer(Drafter):
         mid_label = (
             self.step.label(scheduled_bs, running_bs) if self.step else step0_label
         )
+        step0_graphed = self._step0_graphed(context, running_bs)
+        if step0_graphed:
+            step0_label = self.step0.label(scheduled_bs, running_bs)
         for i in range(self.mtp_k):
             # `tok` is this step's real row count, NOT `scheduled_bs`: step 0
             # runs the target's whole token stream (a prefill chunk, or
@@ -723,9 +852,17 @@ class EagleProposer(Drafter):
                     # from the count the forward RUNS. Step 0 carries the
                     # target's stream and pads nothing.
                     scheduled_tokens=scheduled_bs if i else input_ids.shape[0],
-                    running_tokens=running_bs if i else input_ids.shape[0],
-                    # Only a widened mid-step runs a height the group agreed on.
-                    running_tokens_are_unified=i > 0 and self.step is not None,
+                    running_tokens=(
+                        running_bs
+                        if i
+                        else running_bs * (self.mtp_k + 1)
+                        if step0_graphed
+                        else input_ids.shape[0]
+                    ),
+                    # Only a widened pass runs a height the group agreed on.
+                    running_tokens_are_unified=(
+                        step0_graphed if i == 0 else self.step is not None
+                    ),
                     scheduled_tokens_gpu=batch_info[0:1] if i else batch_info[1:2],
                 )
                 # ---- Prefill Context Parallel (draft i==0 prefill) --------
@@ -757,7 +894,31 @@ class EagleProposer(Drafter):
                 # steps 1+ skip it and read the compacted sparse_kv buffer.
                 if self._share_mtp_indices and i == 0:
                     self.model.model.set_skip_topk(False)
-                if i and self.step is not None:
+                if i == 0 and step0_graphed:
+                    # The target replayed its verify graph, so step 0 runs at
+                    # that recorded shape too; the head hands back each
+                    # sequence's accepted row and its draft id.
+                    #
+                    # A DP-sync dummy step has no real row. Eager step 0 skips
+                    # its attention (`is_dummy_run`); a replay cannot, and would
+                    # write the row's KV through the target's slots, which are a
+                    # real block's. Mask them, as the mid-steps do.
+                    if context.is_dummy_run:
+                        self.runner.forward_vars["slot_mapping"].gpu[
+                            : running_bs * (self.mtp_k + 1)
+                        ].fill_(PAD_SLOT_ID)
+                    ret_hidden_states, graphed_ids = self.step0.run(
+                        running_bs,
+                        **self._stage_step0(
+                            running_bs,
+                            scheduled_bs,
+                            d_input_ids,
+                            d_positions,
+                            d_hidden,
+                            last_token_indices,
+                        ),
+                    )
+                elif i and self.step is not None:
                     # Steps 1+ are the declared pass: one row per sequence, at
                     # a batch the startup sweep already warmed. The head rides
                     # in the recording, so this hands back both of its outputs.
@@ -785,7 +946,9 @@ class EagleProposer(Drafter):
                 # Step 0 gathers one row per sequence out of the token stream;
                 # steps 1+ already are one row per sequence -- sliced back off
                 # the padded batch, so nothing downstream sees a pad row.
-                if i == 0:
+                if i == 0 and step0_graphed:
+                    sample_hidden_states = ret_hidden_states[:scheduled_bs]
+                elif i == 0:
                     hidden_out = (
                         self.step.buffer("hidden_states", scheduled_bs)
                         if self._reuse_step_buffers

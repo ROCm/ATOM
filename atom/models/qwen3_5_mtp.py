@@ -118,6 +118,10 @@ class Qwen3_5MTP(nn.Module):
         "shared_expert_gate": ("gate", 1),
     }
     weights_mapping = {"mtp.": "model."}
+    # On a decode step, step 0 runs the target's verify stream at the target's
+    # own recorded shape, so it can replay a graph too
+    # (EagleProposer._step0_graphed).
+    draft_step0_graph = True
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         """Filter MTP weights; remap (mtp.* → model.*) is via weights_mapping."""
