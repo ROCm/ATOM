@@ -12,7 +12,13 @@ if [[ -n "${ATOMESH_MESH_BINARY:-}" ]]; then
   printf '%s\n' "${ATOMESH_MESH_BINARY}"
   exit 0
 fi
-if [[ "${ATOMESH_BUILD_MESH:-false}" != "true" ]]; then
+# Mesh-entrypoint workers need the reviewed source's PyO3 module, which the
+# image does not ship, so they always build.
+worker_module=false
+if [[ "${ATOMESH_WORKER_ENTRYPOINT:-python}" == "mesh" ]]; then
+  worker_module=true
+fi
+if [[ "${ATOMESH_BUILD_MESH:-false}" != "true" && "${worker_module}" != "true" ]]; then
   printf '%s\n' /app/ATOM/atom/mesh/target/release/atomesh
   exit 0
 fi
@@ -20,7 +26,8 @@ fi
 artifact_dir="${run_dir}/mesh-build"
 container_dir="/run_logs/slurm_job-${job_id}/mesh-build"
 # The same job's benchmark and eval phases consume the same build artifact.
-if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]]; then
+if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" \
+  || ( "${worker_module}" == "true" && ! -f "${artifact_dir}/python/atomesh_runner.so" ) ]]; then
   cache_dir="${ATOMESH_MESH_TARGET_DIR:-${TMPDIR:-/tmp}/atomesh-mesh-cache-$(id -u)}"
   mkdir -p "${artifact_dir}" "${cache_dir}"
   source_commit="$(git -C "${repo_root}" rev-parse HEAD)"
@@ -34,6 +41,7 @@ if [[ ! -x "${artifact_dir}/atomesh" || ! -f "${artifact_dir}/mesh-build.json" ]
     -e ATOMESH_MESH_SOURCE_COMMIT="${source_commit}" \
     -e ATOMESH_MESH_SOURCE_DIRTY="${source_dirty}" \
     -e ATOMESH_MESH_TARGET_DIR=/mesh-cache \
+    -e ATOMESH_WORKER_ENTRYPOINT="${ATOMESH_WORKER_ENTRYPOINT:-python}" \
     -v "${repo_root}:/workspace/ATOM:ro" \
     -v "${artifact_dir}:${container_dir}" \
     -v "${cache_dir}:/mesh-cache" \

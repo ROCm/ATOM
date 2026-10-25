@@ -390,6 +390,10 @@ def test_mesh_build_uses_writable_copy_and_archives_resolved_dependencies(
     source = tmp_path / "read only source"
     source.mkdir()
     (source / "Cargo.toml").write_text("[package]\n")
+    # build.rs reads the engine protocol from ../model_engine/protocol.
+    proto = tmp_path / "model_engine" / "protocol" / "engine_v1.proto"
+    proto.parent.mkdir(parents=True)
+    proto.write_text('syntax = "proto3";\n')
     (source / "target").mkdir()
     (source / "target" / "old-artifact").touch()
     if has_lock:

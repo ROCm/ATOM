@@ -118,6 +118,14 @@ on:
         required: false
         default: ''
         type: string
+      worker_entrypoint:
+        description: 'Prefill/decode worker entrypoint: python = api_server, mesh = Rust runtime in Mesh (USE_ATOMESH_ENTRYPOINTS=1, built from this ref)'
+        required: false
+        default: python
+        type: choice
+        options:
+          - python
+          - mesh
       atomesh_image:
         description: 'Override ATOM docker image'
         required: false
@@ -1666,7 +1674,8 @@ jobs:
         env:
           # Build the reviewed source in a separate setup container. Use the
           # existing release profile for both benchmark and eval services.
-          ATOMESH_BUILD_MESH: ${{ matrix.benchmark.kind == 'aiperf_agentic' && 'true' || 'false' }}
+          ATOMESH_BUILD_MESH: ${{ (matrix.benchmark.kind == 'aiperf_agentic' || (github.event_name == 'workflow_dispatch' && inputs.worker_entrypoint == 'mesh')) && 'true' || 'false' }}
+          ATOMESH_WORKER_ENTRYPOINT: ${{ github.event_name == 'workflow_dispatch' && inputs.worker_entrypoint || 'python' }}
           ATOMESH_MESH_BUILD_PROFILE: release
           CELL_JSON: ${{ steps.machine-paths.outputs.cell_json }}
           RESULT_DIR: atomesh-results
