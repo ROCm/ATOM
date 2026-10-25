@@ -1,48 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1792916528276,
+  "lastUpdate": 1792946151616,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "Mengqing Cao",
-            "username": "MengqingCao",
-            "email": "cmq0113@gmail.com"
-          },
-          "committer": {
-            "name": "Mengqing Cao",
-            "username": "MengqingCao",
-            "email": "cmq0113@gmail.com"
-          },
-          "id": "fba91fcd93a4c6c4405f1eeb0d653f1a67264618",
-          "message": "fix block_manager assertion error\n\nSigned-off-by: Mengqing Cao <cmq0113@gmail.com>",
-          "timestamp": "2026-09-16T11:46:59Z",
-          "url": "https://github.com/ROCm/ATOM/commit/fba91fcd93a4c6c4405f1eeb0d653f1a67264618"
-        },
-        "date": 1789908952722,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_tp4 1048576/1024 c=1 perf point",
-            "value": 14.2782,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35495934549 | docker_image=rocm/atom-dev:nightly_202609200436-lirzhang-rocm-ordering-edge | precision=MXFP4 | display_topology=1P1D-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.9743%2C%22cache_hit_tokens%22%3A51381072%2C%22cache_total_tokens%22%3A52737457%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A229%2C%22concurrency%22%3A1%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3594.3388%2C%22e2el_ms%22%3A10279.7713%2C%22e2el_p90%22%3A23888.4139%2C%22e2el_p99%22%3A56795.26%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609200436-lirzhang-rocm-ordering-edge%22%2C%22input_tput%22%3A14649.2931%2C%22input_tput_per_gpu%22%3A1831.1616%2C%22interactivity%22%3A36.6499%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A228%2C%22interactivity_p90_itl%22%3A230.8999%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A4.1064%2C%22itl_p90%22%3A4.3309%2C%22median_e2el_ms%22%3A5040.8275%2C%22median_itl_ms%22%3A4.1305%2C%22median_tpot_ms%22%3A4.1305%2C%22median_ttft_ms%22%3A2096.0428%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A114.2256%2C%22output_tput_per_gpu%22%3A14.2782%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.0636%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl1048576-osl1024-conc1-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F35495934549%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A14763.5186%2C%22tpot_ms%22%3A4.1064%2C%22tpot_p90%22%3A4.3309%2C%22tpot_p99%22%3A4.5433%2C%22tput_per_gpu%22%3A1845.4398%2C%22ttft_ms%22%3A2829.0743%2C%22ttft_p90%22%3A4155.5508%2C%22ttft_p99%22%3A10104.8017%7D"
-          },
-          {
-            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_tp4 1048576/1024 c=2 perf point",
-            "value": 17.2967,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35495934549 | docker_image=rocm/atom-dev:nightly_202609200436-lirzhang-rocm-ordering-edge | precision=MXFP4 | display_topology=1P1D-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.968%2C%22cache_hit_tokens%22%3A55623168%2C%22cache_total_tokens%22%3A57463012%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A369%2C%22concurrency%22%3A2%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3595.605%2C%22e2el_ms%22%3A7708.786%2C%22e2el_p90%22%3A20429.7573%2C%22e2el_p99%22%3A50878.0603%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609200436-lirzhang-rocm-ordering-edge%22%2C%22input_tput%22%3A15830.0244%2C%22input_tput_per_gpu%22%3A1978.753%2C%22interactivity%22%3A46.6838%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A368%2C%22interactivity_p90_itl%22%3A203.0731%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A4.3117%2C%22itl_p90%22%3A4.9243%2C%22median_e2el_ms%22%3A3235.6945%2C%22median_itl_ms%22%3A4.2185%2C%22median_tpot_ms%22%3A4.2185%2C%22median_ttft_ms%22%3A1412.8109%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A138.3732%2C%22output_tput_per_gpu%22%3A17.2967%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.1017%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl1048576-osl1024-conc2-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F35495934549%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A15968.3976%2C%22tpot_ms%22%3A4.3117%2C%22tpot_p90%22%3A4.9243%2C%22tpot_p99%22%3A6.1602%2C%22tput_per_gpu%22%3A1996.0497%2C%22ttft_ms%22%3A1934.8009%2C%22ttft_p90%22%3A3061.898%2C%22ttft_p99%22%3A9014.3915%7D"
-          },
-          {
-            "name": "Atomesh::GLM-5.2-MXFP4 mi355x_atomesh-atom_mxfp4_1p1d_tp4 1048576/1024 c=8 perf point",
-            "value": 44.3717,
-            "unit": "point",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/35495934549 | docker_image=rocm/atom-dev:nightly_202609200436-lirzhang-rocm-ordering-edge | precision=MXFP4 | display_topology=1P1D-TP4 | perf_point=%7B%22backend%22%3A%22atomesh-atom%22%2C%22benchmark_kind%22%3A%22aiperf_agentic%22%2C%22cache_hit_rate%22%3A0.974%2C%22cache_hit_tokens%22%3A163131664%2C%22cache_total_tokens%22%3A167490933%2C%22chart_group%22%3A%22atomesh-model-performance%22%2C%22chart_label%22%3A%22MI355X%20%28atomesh-atom%20MXFP4%29%22%2C%22client_bench%22%3A%22inferencemax%20bench%22%2C%22completed%22%3A1151%2C%22concurrency%22%3A8%2C%22config_label%22%3A%22mi355x_atomesh-atom_mxfp4_1p1d_tp4%22%2C%22decode_dcp%22%3A1%2C%22decode_dpa%22%3Afalse%2C%22decode_tp%22%3A4%2C%22decode_workers%22%3A1%2C%22duration%22%3A3613.8884%2C%22e2el_ms%22%3A7545.0408%2C%22e2el_p90%22%3A16784.9997%2C%22e2el_p99%22%3A64058.6013%2C%22hardware%22%3A%22mi355x%22%2C%22image%22%3A%22rocm%2Fatom-dev%3Anightly_202609200436-lirzhang-rocm-ordering-edge%22%2C%22input_tput%22%3A46140.7465%2C%22input_tput_per_gpu%22%3A5767.5933%2C%22interactivity%22%3A67.748%2C%22interactivity_method%22%3A%22p90_e2e_normalized%22%2C%22interactivity_n_requests%22%3A1150%2C%22interactivity_p90_itl%22%3A128.8156%2C%22isl%22%3A1048576%2C%22itl_ms%22%3A5.5322%2C%22itl_p90%22%3A7.763%2C%22median_e2el_ms%22%3A3745.9744%2C%22median_itl_ms%22%3A5.169%2C%22median_tpot_ms%22%3A5.169%2C%22median_ttft_ms%22%3A860.5422%2C%22model%22%3A%22GLM-5.2-MXFP4%22%2C%22num_decode_gpu%22%3A4%2C%22num_prefill_gpu%22%3A4%2C%22osl%22%3A1024%2C%22output_tput%22%3A354.9735%2C%22output_tput_per_gpu%22%3A44.3717%2C%22precision%22%3A%22mxfp4%22%2C%22prefill_dcp%22%3A1%2C%22prefill_dpa%22%3Afalse%2C%22prefill_tp%22%3A4%2C%22prefill_workers%22%3A1%2C%22public_dataset%22%3A%22semianalysis_cc_traces_weka_062126%22%2C%22ratio%22%3A0.8%2C%22req_tput%22%3A0.3171%2C%22rocm%22%3A%22%22%2C%22run_id%22%3A%22pd-atom-GLM-5.2-MXFP4-1p1d-isl1048576-osl1024-conc8-0.8%22%2C%22run_url%22%3A%22https%3A%2F%2Fgithub.com%2FROCm%2FATOM%2Factions%2Fruns%2F35495934549%22%2C%22scenario%22%3A%22inferencex-agentx-mvp%22%2C%22slurm_job%22%3A%22%22%2C%22source%22%3A%22ATOMesh%22%2C%22total_gpu%22%3A8%2C%22total_tput%22%3A46495.72%2C%22tpot_ms%22%3A5.5322%2C%22tpot_p90%22%3A7.763%2C%22tpot_p99%22%3A11.1639%2C%22tput_per_gpu%22%3A5811.965%2C%22ttft_ms%22%3A1549.6628%2C%22ttft_p90%22%3A2285.7488%2C%22ttft_p99%22%3A8228.6372%7D"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -331992,6 +331952,52 @@ window.BENCHMARK_DATA = {
             "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 1024/1024 c=8 _tp",
             "value": 4,
             "unit": ""
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Ao Li",
+            "username": "aoli26",
+            "email": "Ao.Li@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "d6681e1535b1c0dde595655d02dc08dca38db84a",
+          "message": "[FlyDSL] [gfx1250] Add opt-in MXFP4 linear path via AITER gemm_a4w4 with 32x4 scales (#2613)\n\n* feat(mxfp4): opt-in aiter gemm_a4w4 path with 32x4 scales on gfx1250\n\n* fix(mxfp4): convert fused-quant x_scale, keep e8m0 for direct readers\n\n* Fix small-M fused MXFP4 activation scale conversion",
+          "timestamp": "2026-10-25T05:23:26Z",
+          "url": "https://github.com/ROCm/ATOM/commit/d6681e1535b1c0dde595655d02dc08dca38db84a"
+        },
+        "date": 1792946150696,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-35B-A3B-FP8 TP1 accuracy (GSM8K)",
+            "value": 0.8006,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40109959172 | Threshold: 0.76 | BaselineModel: Qwen/Qwen3.5-35B-A3B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261024 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.7847 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-35B-A3B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.8681,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40109959172 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261024 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8544 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.8635,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40109959172 | Threshold: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Threshold aligned with the SGLANG accuracy validation workflow target for gsm8k. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261024 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.8461 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-SGLang::MI308 Qwen3.8-Flash-Next-FP8 TP2 accuracy (GSM8K)",
+            "value": 0.9765,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/40109959172 | Threshold: 0.96 | Baseline: 0.9757 | BaselineModel: Qwen/Qwen3.8-Flash-Next-FP8 | BaselineNote: MI308 SGLang-ATOM Qwen3.8-Flash-Next TP2+EP on gfx942 192 GiB. Same 5-shot chat GSM8K bar as the MI355 Flash entry; BF16 KV and page-size 64 are required. | Docker: rocm/atom-dev:sglang-v0.5.20-nightly_20261024 | GPU: AMD Instinct MI308X | VRAM: 192GB | ROCm: 7.2.4 | strict-match: 0.9727 | fewshot: 5 | Model: /models/Qwen/Qwen3.8-Flash-Next-FP8"
           }
         ]
       }
