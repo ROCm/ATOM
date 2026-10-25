@@ -3,6 +3,7 @@
 
 """Test prefill prompt-ID responses and decode reuse without tokenizing."""
 
+import array
 import asyncio
 from types import SimpleNamespace
 from uuid import UUID
@@ -15,9 +16,12 @@ from fastapi.responses import JSONResponse
 
 from atom.entrypoints.openai import api_server
 from atom.entrypoints.openai.protocol import (
+    PROMPT_TOKEN_IDS_B64,
     ChatCompletionRequest,
     ChatMessage,
     CompletionRequest,
+    encode_prompt_token_ids,
+    resolve_prompt_token_ids,
 )
 
 PROMPT_IDS = [101, 102, 103, 104]
@@ -151,6 +155,26 @@ class TestPromptTokenIdRequests:
         )
         assert request.kv_transfer_params is original
         assert original == {**metadata, "prompt_token_ids": PROMPT_IDS}
+        assert server.templates == 0
+
+    @pytest.mark.parametrize("endpoint", ["chat", "completion"])
+    def test_b64_ids_reach_generation_as_array_and_leave_kv(self, server, endpoint):
+        metadata = {"do_remote_prefill": True, "remote_block_ids": [10]}
+        kwargs = {"prompt": "hi"} if endpoint == "completion" else {}
+        request, handler = _request(
+            endpoint,
+            kv_transfer_params={
+                **metadata,
+                PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids(PROMPT_IDS),
+            },
+            **kwargs,
+        )
+
+        asyncio.run(handler(request, None))
+
+        sent, options = server.generate[0]
+        assert isinstance(sent, array.array) and sent.tolist() == PROMPT_IDS
+        assert options["kv_transfer_params"] == metadata
         assert server.templates == 0
 
     @pytest.mark.parametrize("endpoint", ["chat", "completion"])
@@ -303,8 +327,7 @@ class TestHttpResponseSerialization:
         assert server.templates == (1 if endpoint == "chat" else 0)
 
 
-@pytest.mark.parametrize("return_ids", [False, True])
-def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+def _run_generate_async(monkeypatch, return_ids, kv_meta=None):
     seq = SimpleNamespace(
         id=7,
         prompt_token_ids=list(PROMPT_IDS),
@@ -320,6 +343,7 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
                 finished=True,
                 finish_reason="eos",
                 num_cached_tokens=0,
+                kv_transfer_params_output=kv_meta,
             )
         )
         return seq
@@ -345,7 +369,12 @@ def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return
 
     outputs = asyncio.run(collect())
     assert len(outputs) == 1
-    output = outputs[0]
+    return outputs[0]
+
+
+@pytest.mark.parametrize("return_ids", [False, True])
+def test_generate_async_reads_prompt_ids_from_local_sequence(monkeypatch, return_ids):
+    output = _run_generate_async(monkeypatch, return_ids)
     assert output["num_tokens_input"] == len(PROMPT_IDS)
     if return_ids:
         assert output["prompt_token_ids"] == PROMPT_IDS
@@ -481,3 +510,22 @@ class TestChunkedAdmissionTopology:
     ):
         monkeypatch.setattr(api_server, "engine", None)
         api_server._validate_chunked_receive(params)
+
+
+@pytest.mark.parametrize("pd", [False, True])
+def test_b64_prompt_ids_ride_in_pd_kv_params(monkeypatch, pd):
+    monkeypatch.setenv("ATOM_PD_PROMPT_IDS_B64", "1")
+    kv_meta = {"remote_block_ids": [1]} if pd else None
+
+    output = _run_generate_async(monkeypatch, True, kv_meta)
+
+    if pd:
+        assert "prompt_token_ids" not in output
+        meta = output["kv_transfer_output_meta_info"]
+        assert meta["remote_block_ids"] == [1]
+        assert kv_meta == {"remote_block_ids": [1]}
+        assert resolve_prompt_token_ids(None, meta).tolist() == PROMPT_IDS
+    else:
+        # Not a PD prefill: no metadata to carry it, so the list stays.
+        assert output["prompt_token_ids"] == PROMPT_IDS
+        assert "kv_transfer_output_meta_info" not in output
