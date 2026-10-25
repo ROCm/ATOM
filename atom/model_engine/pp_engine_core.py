@@ -112,6 +112,7 @@ class PPEngineCoreProc(EngineCore):
             rejected = self.scheduler.take_rejected()
             if rejected:
                 self.output_queue.put_nowait(rejected)
+            self._put_early_outputs()
 
             if result is None:
                 # Deferred blocks keep `Scheduler.is_finished()` false, so
