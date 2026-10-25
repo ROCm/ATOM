@@ -1145,6 +1145,31 @@ def test_tp_transfer_uses_final_source_slot_after_checkpoint_move():
     assert captured[0][6] is conn.transfer_engine
 
 
+@pytest.mark.parametrize("pp_rank", [0, 3])
+def test_a_pp_stage_keeps_nothing_per_request_once_every_consumer_is_served(pp_rank):
+    """No release ever reaches stages 1..7, so finishing the write is their
+    only chance to forget the request; one entry left per request served adds
+    its block-id list to every full GC pass of that worker for good. Stage 0
+    keeps its entry until the release frees the shared page."""
+    captured = []
+    conn = _make_transfer_connector({}, captured)
+    conn.pp_size, conn.pp_rank = 8, pp_rank
+    conn._completed_prefills["prefill-1"] = {
+        "block_ids": [3],
+        "swa_block_ids": [7],
+        "slot_index": 7,
+    }
+    conn._kv_cache_ready_events["prefill-1"] = object()
+
+    conn._execute_transfer(_stateful_write_request(src_block_ids=[3]))
+
+    assert captured[0][4]["slot_index"] == 7
+    kept = "prefill-1" in conn._completed_prefills
+    assert kept is (pp_rank == 0)
+    assert ("prefill-1" in conn._kv_cache_ready_events) is (pp_rank == 0)
+    assert conn.done_sending == set()  # stage 0 reports on release, not here
+
+
 @pytest.mark.parametrize("invalid_slot", [-1, None, "invalid"])
 def test_stateful_transfer_without_final_source_slot_fails_closed(caplog, invalid_slot):
     captured = []
