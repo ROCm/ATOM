@@ -610,6 +610,12 @@ dp_size = envs.ATOM_DP_SIZE
 
 See `atom/utils/envs.py` for the full list of lazy-evaluated environment variables.
 
+## P/D request path
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| **ATOM_KV_POLL_FRESH_WAIT_MS** | int | 0 | Non-PP engines with KV transfer. While requests are parked for remote KV, block up to this many ms after each forward for a fresh worker completion poll, so a receive that landed during the forward is scheduled on the next step rather than the one after. Fresh-poll counts and blocking time are logged every 30 s. `0` keeps the poll one step behind. |
+
 ## Mooncake PD matched rails
 
 | Variable | Type | Default | Description |
