@@ -25,6 +25,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import numpy as np
@@ -211,6 +212,14 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
     try:
         for piece in _chunks(s, nbytes, step):
             futures.append(pool.submit(chunk, piece))
+    except BaseException:
+        # A failed submit (no thread to start) can leave its chunk queued
+        # with no future to wait on: cancel what is queued and wait for the
+        # workers themselves, so nothing writes `dst` or reads `drop` after.
+        pool.shutdown(wait=True, cancel_futures=True)
+        # Cancelled by shutdown, never run: `wait` would not count these.
+        futures = [f for f in futures if not f.cancelled()]
+        raise
     finally:
         wait(futures)
     for f in futures:
@@ -286,11 +295,24 @@ def _source_dropper(src: torch.Tensor):
                 return False
         return True
 
-    closed = []
+    # `close` waits for drops in progress; a drop after it does nothing (the
+    # descriptor number may belong to another file by then).
+    state = threading.Condition()
+    active, closed = [0], []
 
     def drop(offset: int, nbytes: int) -> None:
-        if closed:  # the descriptor number may belong to another file now
-            return
+        with state:
+            if closed:
+                return
+            active[0] += 1
+        try:
+            _drop(offset, nbytes)
+        finally:
+            with state:
+                active[0] -= 1
+                state.notify_all()
+
+    def _drop(offset: int, nbytes: int) -> None:
         # Whole pages inside the range only (`_chunks` aligns chunk edges).
         lo = -(-(base + offset) // _PAGE) * _PAGE
         hi = (base + offset + nbytes) // _PAGE * _PAGE
@@ -303,9 +325,12 @@ def _source_dropper(src: torch.Tensor):
             logger.debug("engram: madvise(DONTNEED) failed: %d", ctypes.get_errno())
 
     def close() -> None:
-        if not closed:
+        with state:
+            if closed:
+                return
             closed.append(True)
-            os.close(pagemap)
+            state.wait_for(lambda: active[0] == 0)
+        os.close(pagemap)
 
     drop.close = close
     return drop

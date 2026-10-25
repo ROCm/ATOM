@@ -1056,6 +1056,83 @@ def test_a_failing_chunk_waits_for_the_others_before_the_dropper_closes(
     assert not late
 
 
+def test_a_failed_worker_start_drains_queued_chunks(monkeypatch):
+    """`submit` that queues its chunk and then fails to start a thread returns
+    no future; the queued chunk must still be done or cancelled before the
+    copy returns, or it would write `dst` and read the dropper afterwards."""
+    import threading
+    import time
+
+    from atom.model_ops.engram import host_memory as hm
+
+    monkeypatch.setattr(hm, "_BYTES_PER_THREAD", 1 << 14)
+    monkeypatch.setattr(hm, "_CHUNK_BYTES", 1 << 14)
+    monkeypatch.setattr(hm.os, "sched_getaffinity", lambda pid: set(range(4)))
+    src = torch.ones(1 << 18, dtype=torch.uint8)
+    dst = torch.zeros_like(src)
+    running, after = [], []
+    done = threading.Event()
+
+    def drop(offset, nbytes):
+        running.append(offset)
+        time.sleep(0.005)
+        if done.is_set():
+            after.append(offset)
+
+    pool = ThreadPoolExecutor(1)
+    real_submit = pool.submit
+    calls = [0]
+
+    def submit(fn, *args):
+        calls[0] += 1
+        future = real_submit(fn, *args)  # queued
+        if calls[0] == 3:
+            raise RuntimeError("can't start new thread")
+        return future
+
+    pool.submit = submit
+    with pytest.raises(RuntimeError, match="new thread"):
+        hm._copy_into(dst, src, pool, drop)
+    done.set()
+    time.sleep(0.05)
+    assert running and not after  # queued chunks ran or were cancelled, not later
+
+
+def test_closing_a_dropper_waits_for_a_drop_in_progress(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory as hm
+
+    path = tmp_path / "t.bin"
+    np.zeros(1 << 16, np.float32).tofile(path)
+    src = torch.from_numpy(np.memmap(path, np.float32, "c", shape=(1 << 16,)))
+    src.sum()
+    real_pread, closed_fds, reads = hm.os.pread, [], []
+    real_close = hm.os.close
+
+    def slow_pread(fd, n, off):
+        time.sleep(0.05)
+        reads.append(fd in closed_fds)
+        return real_pread(fd, n, off)
+
+    def close(fd):
+        closed_fds.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(hm.os, "pread", slow_pread)
+    monkeypatch.setattr(hm.os, "close", close)
+    drop = hm._source_dropper(src)
+    worker = threading.Thread(target=drop, args=(0, src.nbytes))
+    worker.start()
+    time.sleep(0.01)
+    drop.close()
+    worker.join()
+    assert reads and not any(reads)
+
+
 def test_a_closed_dropper_does_nothing(tmp_path):
     import numpy as np
 
