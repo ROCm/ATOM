@@ -1354,7 +1354,8 @@ models:
           eval_concurrency: [72]
 
         # The prefill saturates at CONC 88, so its PP head keeps 16 batches in
-        # flight instead of one per stage.
+        # flight instead of one per stage, and each rank saves and loads the
+        # CPU tier on two threads.
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
           concurrency: [88]
@@ -1367,6 +1368,8 @@ models:
             prefill:
               <<: *kimi_k3_pp8_state128_prefill_env
               ATOM_PP_MAX_INFLIGHT: "16"
+              OFFLOAD_COPY_WORKERS: "2"
+              OFFLOAD_LOAD_WORKERS: "2"
 
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
