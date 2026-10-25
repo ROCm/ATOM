@@ -930,6 +930,41 @@ def test_a_written_private_mapping_is_not_dropped(monkeypatch, tmp_path):
     assert torch.equal(table.registered_shard()[0], weight)
 
 
+def test_a_mapping_split_into_clean_and_written_parts_is_not_dropped(
+    monkeypatch, tmp_path
+):
+    """`mprotect` splits one file mapping in two; only the second was written.
+    Every part the range touches must be checked, not the first byte's."""
+    import ctypes
+
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    rows, width = 4096, 64  # 1 MiB of float32, page-aligned halves
+    path = tmp_path / "table.bin"
+    np.zeros((rows, width), np.float32).tofile(path)
+    mapped = np.memmap(path, np.float32, "c", shape=(rows, width))
+    mapped[rows // 2 + 10 :] = 7.0  # written: anonymous pages, second half
+    weight = torch.from_numpy(mapped)
+    libc = ctypes.CDLL(None)
+    libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    half = rows * width * 4 // 2
+    assert libc.mprotect(weight.data_ptr(), half, 1) == 0  # PROT_READ: a split
+    first, second = weight[: rows // 2], weight[rows // 2 :]
+    assert host_memory._source_dropper(first) is not None  # clean on its own
+    assert host_memory._source_dropper(second) is None
+    assert host_memory._source_dropper(weight) is None
+    table = HostEmbeddingTable(weight, num_rows=rows, head_dim=width)
+    assert table.enable_uva(0, rows) is True
+    assert float(weight[rows - 1, 0]) == 7.0
+    assert torch.equal(table.registered_shard()[0], weight)
+    del table
+    assert libc.mprotect(weight.data_ptr(), half, 3) == 0
+
+
 def test_one_copy_worker_still_drops_the_source_chunk_by_chunk(monkeypatch, tmp_path):
     import numpy as np
 

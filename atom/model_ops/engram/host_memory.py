@@ -208,36 +208,57 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
         drop(0, nbytes)
 
 
-def _file_backed(addr: int) -> bool:
-    """Whether `addr` lies in a mapping of a regular file whose pages all
-    match the file (`/proc/self/smaps`): dropping them loses nothing.
+def _mappings():
+    """`(lo, hi, perms, path, anonymous_kib)` per mapping, `/proc/self/smaps`."""
+    out, cur = [], None
+    with open("/proc/self/smaps") as smaps:
+        for line in smaps:
+            head = line.split(maxsplit=5)
+            if not head:
+                continue
+            if head[0].endswith(":"):
+                if cur is not None and head[0] == "Anonymous:":
+                    cur[4] = int(head[1])
+                continue
+            lo, hi = (int(x, 16) for x in head[0].split("-"))
+            path = head[5].strip() if len(head) > 5 else ""
+            cur = [lo, hi, head[1], path, None]
+            out.append(cur)
+    return out
 
-    A private mapping that was written holds those pages as anonymous copies;
-    dropping them would restore the on-disk bytes under the table. Such a
-    mapping -- any anonymous page in it, conservatively -- is not dropped.
+
+def _file_backed(addr: int, nbytes: int) -> bool:
+    """Whether `[addr, addr + nbytes)` lies wholly in mappings of one regular
+    file whose pages all match it (`/proc/self/smaps`): dropping them loses
+    nothing.
+
+    Every mapping the range touches is checked -- `mprotect` can split one
+    file mapping into a clean part and a written one. A private mapping that
+    was written holds those pages as anonymous copies; dropping them would
+    restore the on-disk bytes under the table, so a range touching any
+    private mapping with an anonymous page (conservatively), a gap, or
+    anything but that one file is not dropped. Shared mappings write through
+    the page cache.
     """
+    end = addr + nbytes
     try:
-        with open("/proc/self/smaps") as smaps:
-            found = None
-            for line in smaps:
-                head = line.split(maxsplit=5)
-                if "-" in head[0] and len(head) >= 5 and ":" not in head[0]:
-                    if found is not None:
-                        break  # the next mapping's header: no anonymous page
-                    lo, hi = (int(x, 16) for x in head[0].split("-"))
-                    if lo <= addr < hi:
-                        path = head[5].strip() if len(head) > 5 else ""
-                        if not path.startswith("/") or path.startswith("/dev/"):
-                            return False
-                        found = head[1]  # permissions, e.g. r--p / rw-s
-                    continue
-                if found is not None and head[0] == "Anonymous:":
-                    # Shared mappings write through the page cache.
-                    return found.endswith("s") or int(head[1]) == 0
-            return found is not None
+        maps = _mappings()
     except (OSError, ValueError, IndexError):
-        pass
-    return False
+        return False
+    covered, path = addr, None
+    for lo, hi, perms, name, anon in maps:
+        if hi <= addr or lo >= end:
+            continue
+        if lo > covered:
+            return False  # a gap in the range
+        if not name.startswith("/") or name.startswith("/dev/"):
+            return False
+        if path is not None and name != path:
+            return False
+        if not perms.endswith("s") and anon != 0:
+            return False
+        path, covered = name, max(covered, hi)
+    return path is not None and covered >= end
 
 
 def _source_dropper(src: torch.Tensor):
@@ -251,7 +272,7 @@ def _source_dropper(src: torch.Tensor):
     Only for a file mapping -- on anonymous memory this would discard data.
     """
     base = src.data_ptr()
-    if not _file_backed(base):
+    if not _file_backed(base, src.numel() * src.element_size()):
         return None
     libc = ctypes.CDLL(None, use_errno=True)
     libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
