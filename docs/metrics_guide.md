@@ -128,11 +128,16 @@ regardless of prefix cache hits. The per-batch context histogram continues to
 measure context through each chunk end.
 For `n > 1`, each generated sequence has its own `sequence_id` and sample.
 
-These are intentionally per-request metrics: series count grows with requests.
-Samples remain after request completion so even short requests can be scraped.
-Native multiprocess files retain them until the service's metrics directory is
-cleaned; there is no automatic per-request expiry. Use a fresh service/metrics
-directory between long benchmark runs when this accumulated cardinality matters.
+These are intentionally per-request metrics, but the API server exports each
+one only for `ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S` (default 120 s) after
+its first dispatch, at most 1024 per scheduler. Samples remain after request
+completion, so a scrape interval shorter than the window still sees even short
+requests; use `max_over_time` over the run to collect them all. The scheduler
+publishes them in its metrics snapshot, not in native multiprocess files,
+which can never drop a series: kept there, every scrape re-read one series per
+request ever served (0.43 s of the API server's Python after about 9.5K
+requests). Remote DP nodes therefore export them from the head API server,
+not their own metrics port.
 
 ### GPU forward timing
 

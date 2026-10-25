@@ -41,6 +41,15 @@ def samples(exporter):
     }
 
 
+def contexts(metrics, phase):
+    """(request_id, started_at, tokens) per retained context of `phase`."""
+    return [
+        (request_id, started_at, tokens)
+        for kind, _, _, request_id, _, started_at, tokens in metrics.request_contexts()
+        if kind == phase
+    ]
+
+
 @pytest.mark.parametrize("kind", ["ordinary", "dp", "pp_head", "pp_downstream"])
 @pytest.mark.parametrize("configured,interval", [(None, 1.0), ("0.25", 0.25)])
 def test_engine_push_loops_use_shared_interval(monkeypatch, kind, configured, interval):
@@ -472,7 +481,7 @@ def test_pp_head_records_once_when_dispatching_a_real_forward(clock):
 
 def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeypatch):
     import numpy as np
-    from prometheus_client import CollectorRegistry, generate_latest
+    from prometheus_client import CollectorRegistry
 
     from atom.model_engine.scheduler import ScheduledBatch
     from atom.model_engine.sequence import SequenceType
@@ -506,22 +515,14 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     second.num_cached_tokens = 12
     scheduled.is_dummy_run = True
     metrics.record_forward(scheduled, seqs)
-    assert metrics.prefill_request_context_tokens.collect()[0].samples == []
+    assert contexts(metrics, "prefill") == []
     scheduled.is_dummy_run = False
     metrics.record_forward(scheduled, seqs)
     initial = histogram_values_by_name(metrics)
     assert initial["prefill_context_tokens"]["sum"] == 19  # 7 + 12
     assert initial["prefill_context_tokens"]["buckets"][-1][1] == 1
-    requests = metrics.prefill_request_context_tokens.collect()[0].samples
-    assert [(s.labels["request_id"], s.value) for s in requests] == [
-        ("first", 12),
-        ("second", 20),
-    ]
-    assert all(s.labels["started_at"] == "100.25" for s in requests)
-    assert (
-        "# TYPE atom:prefill_request_context_tokens gauge"
-        in generate_latest(registry).decode()
-    )
+    requests = contexts(metrics, "prefill")
+    assert requests == [("first", "100.25", 12), ("second", "100.25", 20)]
     assert initial["prefill_request_tokens"]["sum"] == 20  # (12 - 4) + (20 - 8)
     assert initial["prefill_request_tokens"]["buckets"][-1][1] == 2
     assert initial["prefill_batch_tokens"]["sum"] == 7
@@ -542,7 +543,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     assert final["prefill_batch_tokens"]["buckets"][-1][1] == 2
     assert final["prefill_context_tokens"]["sum"] == 31  # 19 + 12
     assert final["prefill_context_tokens"]["buckets"][-1][1] == 2
-    assert metrics.prefill_request_context_tokens.collect()[0].samples == requests
+    assert contexts(metrics, "prefill") == requests
     tail.is_dummy_run = True
     metrics.record_forward(tail, seqs)
     assert histogram_values_by_name(metrics) == final
@@ -562,7 +563,7 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
     metrics.enqueue(first)
     tail.is_dummy_run = False
     metrics.record_forward(tail, seqs)
-    assert metrics.prefill_request_context_tokens.collect()[0].samples == requests
+    assert contexts(metrics, "prefill") == requests
 
     third = Sequence(list(range(30)), block_size=4, request_id="third")
     third.type = SequenceType.PREFILL
@@ -577,15 +578,11 @@ def test_prefill_context_records_full_prompt_once_and_chunk_batch_totals(monkeyp
         total_seqs_num_prefill=2,
     )
     metrics.record_forward(next_batch, seqs)
-    final_requests = metrics.prefill_request_context_tokens.collect()[0].samples
-    assert final_requests[:2] == requests
-    assert len(final_requests) == 3
-    assert final_requests[-1].labels["request_id"] == "third"
-    assert final_requests[-1].value == 30
+    assert contexts(metrics, "prefill") == [*requests, ("third", "100.25", 30)]
 
 
 def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
-    from prometheus_client import CollectorRegistry, generate_latest
+    from prometheus_client import CollectorRegistry
 
     registry = CollectorRegistry()
     metrics = SchedulerMetrics(registry=registry)
@@ -606,16 +603,8 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
         context_lens=[1000, 9000, 300, 999999],
     )
     metrics.record_forward(mixed, seqs)
-    first = metrics.decode_request_context_tokens.collect()[0].samples
-    assert [(s.labels["request_id"], s.value) for s in first] == [
-        ("request-1", 1000),
-        ("request-2", 9000),
-    ]
-    assert all(s.labels["started_at"] == "100.25" for s in first)
-    assert (
-        "# TYPE atom:decode_request_context_tokens gauge"
-        in generate_latest(registry).decode()
-    )
+    first = contexts(metrics, "decode")
+    assert first == [("request-1", "100.25", 1000), ("request-2", "100.25", 9000)]
 
     # Exercise the real preemption reset and re-admission paths. Neither should
     # reset the first-decode marker or replace the recorded context length.
@@ -635,7 +624,7 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     mixed.total_seqs_num_prefill = 0
     mixed.context_lens = [1001]
     metrics.record_forward(mixed, seqs)
-    assert metrics.decode_request_context_tokens.collect()[0].samples == first
+    assert contexts(metrics, "decode") == first
     assert histogram_values_by_name(metrics)["decode_context_tokens"]["sum"] == 11001
 
     # A new request arrives while the first one is still decoding.
@@ -644,12 +633,111 @@ def test_decode_request_context_gauge_records_first_dispatch_once(monkeypatch):
     mixed.context_lens = [1002, 300]
     mixed.is_dummy_run = True
     metrics.record_forward(mixed, seqs)
-    assert metrics.decode_request_context_tokens.collect()[0].samples == first
+    assert contexts(metrics, "decode") == first
     mixed.is_dummy_run = False
     metrics.record_forward(mixed, seqs)
-    final = metrics.decode_request_context_tokens.collect()[0].samples
-    assert len(final) == 3
-    assert final[-1].labels["request_id"] == "request-3" and final[-1].value == 300
+    assert contexts(metrics, "decode") == [*first, ("request-3", "100.25", 300)]
+
+
+def test_request_contexts_expire_after_the_retention_window(monkeypatch):
+    """Exported series stay bounded by recent traffic rather than growing with
+    every request ever served, while each still outlives many scrapes."""
+    from prometheus_client import CollectorRegistry
+
+    now = [1000.0]
+    monkeypatch.setattr("atom.metrics.scheduler.time.monotonic", lambda: now[0])
+    monkeypatch.setenv("ATOM_METRICS_REQUEST_CONTEXT_RETENTION_S", "60")
+    metrics = SchedulerMetrics(registry=CollectorRegistry())
+    seqs = {
+        i: Sequence([1, 2], block_size=4, id=i, request_id=f"request-{i}")
+        for i in (1, 2)
+    }
+
+    def decode(req_id, context):
+        metrics.enqueue(seqs[req_id])
+        metrics.record_forward(
+            SimpleNamespace(
+                req_ids=[req_id],
+                is_dummy_run=False,
+                total_seqs_num_decode=1,
+                total_seqs_num_prefill=0,
+                context_lens=[context],
+            ),
+            seqs,
+        )
+
+    decode(1, 1000)
+    now[0] += 30
+    decode(2, 2000)
+    now[0] += 30
+    assert [c[0] for c in contexts(metrics, "decode")] == ["request-1", "request-2"]
+    now[0] += 0.5
+    assert [c[0] for c in contexts(metrics, "decode")] == ["request-2"]
+    now[0] += 30
+    assert metrics.request_contexts() == []
+
+
+def test_request_contexts_keep_only_the_newest_at_high_request_rates():
+    from prometheus_client import CollectorRegistry
+
+    from atom.metrics.scheduler import REQUEST_CONTEXT_CAP
+
+    metrics = SchedulerMetrics(registry=CollectorRegistry())
+    for i in range(REQUEST_CONTEXT_CAP + 10):
+        seq = SimpleNamespace(external_request_id=f"request-{i}")
+        metrics._record_request_context("decode", i, seq, 100)
+    kept = contexts(metrics, "decode")
+    assert len(kept) == REQUEST_CONTEXT_CAP
+    assert kept[0][0] == "request-10"
+
+
+def test_request_contexts_reach_the_exporter_through_the_snapshot(monkeypatch):
+    """The API server exports what the scheduler last published, with the
+    scheduler's own labels (its `dp_rank` folds in the PP rank)."""
+    from aiter_stub import stubbed_aiter
+    from prometheus_client import CollectorRegistry
+
+    with stubbed_aiter():
+        from atom.model_engine.llm_engine import LLMEngine
+
+    monkeypatch.setattr("atom.metrics.scheduler.time.time", lambda: 100.25)
+    scheduler = Scheduler(MockConfig())
+    scheduler.metrics = SchedulerMetrics(9, "decode", registry=CollectorRegistry())
+    seqs = {1: Sequence([1, 2], block_size=4, id=1, request_id="request-1")}
+    scheduler.metrics.enqueue(seqs[1])
+    scheduler.metrics.record_forward(
+        SimpleNamespace(
+            req_ids=[1],
+            is_dummy_run=False,
+            total_seqs_num_decode=1,
+            total_seqs_num_prefill=0,
+            context_lens=[4321],
+        ),
+        seqs,
+    )
+    snapshot = EngineUtilityHandler(
+        None, Queue(), scheduler=scheduler
+    ).collect_metrics()
+    engine = SimpleNamespace(
+        core_mgr=SimpleNamespace(
+            latest_metrics={1: snapshot}, get_dp_router_statistics=dict
+        )
+    )
+    exporter, _, _ = create_metrics_exporter()
+    exporter.update(LLMEngine.get_metrics_statistics(engine))
+    text = exporter.render().decode()
+    assert "# TYPE atom:decode_request_context_tokens gauge" in text
+    assert "# TYPE atom:prefill_request_context_tokens gauge" in text
+    labels = (
+        ("dp_rank", "9"),
+        ("engine_role", "decode"),
+        ("request_id", "request-1"),
+        ("sequence_id", "1"),
+        ("started_at", "100.25"),
+    )
+    values = samples(exporter)
+    assert values[("atom:decode_request_context_tokens", labels)] == 4321
+    assert not any(name == "atom:prefill_request_context_tokens" for name, _ in values)
 
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
