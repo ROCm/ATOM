@@ -1495,14 +1495,17 @@ class MooncakeConnector(KVConnectorBase):
             pool_size=self._num_send_workers,
             chunk_pages=chunk_pages,
             device=torch.device("cuda", self._cuda_device),
+            stream_priority=envs.ATOM_PD_MLA_STAGING_STREAM_PRIORITY,
         )
         if staging is not None:
             logger.info(
-                "MLA DCP staging: %d slots x %d pages (%.1f MiB) for %d MLA regions",
+                "MLA DCP staging: %d slots x %d pages (%.1f MiB) for %d MLA "
+                "regions, stream priority %d",
                 staging.pool_size,
                 chunk_pages,
                 staging.region.total_bytes / 2**20,
                 sum(map(staging.stages, range(len(tt.pages)))),
+                envs.ATOM_PD_MLA_STAGING_STREAM_PRIORITY,
             )
         return staging
 
@@ -3097,7 +3100,7 @@ class MooncakeConnector(KVConnectorBase):
         descriptors = 0
         slot = staging.acquire()
         try:
-            shard = staging.prepare(plan, kv_cache_ready_event)
+            shard = staging.prepare(plan, kv_cache_ready_event, slot)
             for region_idx, dst_base, bpb in regions:
                 for start in range(0, shard.pages, staging.chunk_pages):
                     stop = min(start + staging.chunk_pages, shard.pages)
