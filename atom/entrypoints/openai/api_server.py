@@ -3071,7 +3071,9 @@ def main():
         model=args.model,
     )
 
-    engine = engine_args.create_engine(tokenizer=tokenizer)
+    # Responses go out through per-request callbacks; nothing here reads
+    # `get_output()`.
+    engine = engine_args.create_engine(tokenizer=tokenizer, keep_finished_outputs=False)
     # Forced acceptance emits draft tokens that nothing verified, and once the
     # context is long enough those degenerate into the dialect's own channel
     # framing and nothing else -- read as structure, correctly, that leaves a

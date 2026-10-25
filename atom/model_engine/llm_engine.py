@@ -38,7 +38,7 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
 
 class LLMEngine:
 
-    def __init__(self, model, tokenizer=None, **kwargs):
+    def __init__(self, model, tokenizer=None, keep_finished_outputs=True, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         data_parallel_size = kwargs.get("data_parallel_size", 1)
@@ -175,9 +175,13 @@ class LLMEngine:
             config, self.tokenizer, config.kv_cache_block_size
         )
         if config.enable_rapidserve:
-            self.core_mgr = DisaggCoreManager(config)
+            self.core_mgr = DisaggCoreManager(
+                config, keep_finished_outputs=keep_finished_outputs
+            )
         else:
-            self.core_mgr = CoreManager(config)
+            self.core_mgr = CoreManager(
+                config, keep_finished_outputs=keep_finished_outputs
+            )
         self._step_lock = None
         self._pending_results = {}
         import json

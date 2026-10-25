@@ -201,6 +201,7 @@ class CoreManager:
         label: str,
         local_engine_count: int,
         global_engine_count: int | None = None,
+        keep_finished_outputs: bool = True,
     ) -> None:
         """Every field the inherited methods touch, before any engine is spawned.
 
@@ -230,6 +231,13 @@ class CoreManager:
         )
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
+        # Finished sequences are queued for `get_output()`. A host that never
+        # reads it -- the OpenAI and atomesh servers, which deliver through
+        # per-request callbacks -- must construct with this off, or every
+        # request's full Sequence (block table, offload record, token arrays)
+        # stays queued for the life of the process and each gen-2 GC pass
+        # walks all of them.
+        self.keep_finished_outputs = keep_finished_outputs
         # Utility replies are matched to their caller by request id, not by
         # position on a shared queue, where a late or unasked-for reply became
         # the next caller's answer.
@@ -400,7 +408,7 @@ class CoreManager:
             )
         pc._managed_distributed_store = True
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, keep_finished_outputs: bool = True):
         pp_size = config.pipeline_parallel_size
         self.pp_size = pp_size
         pc = config.parallel_config
@@ -469,6 +477,7 @@ class CoreManager:
             label="Engine Core Mgr",
             local_engine_count=local_engine_count,
             global_engine_count=global_engine_count,
+            keep_finished_outputs=keep_finished_outputs,
         )
 
         import torch
@@ -831,7 +840,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
-                        self.outputs_queue.put_nowait(seqs)
+                        if self.keep_finished_outputs:
+                            self.outputs_queue.put_nowait(seqs)
                         # These completions freed slots on their ranks — re-feed
                         # from the pending pool so a fast rank never drains to
                         # empty while peers still have work. No-op when
@@ -2175,7 +2185,7 @@ class DisaggCoreManager(CoreManager):
     addresses are established here before spawning and passed through config.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, keep_finished_outputs: bool = True):
         import copy
 
         import torch
@@ -2279,6 +2289,7 @@ class DisaggCoreManager(CoreManager):
             config,
             label="DisaggCoreManager",
             local_engine_count=2,  # prefill + decode
+            keep_finished_outputs=keep_finished_outputs,
         )
 
         import weakref
