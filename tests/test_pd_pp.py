@@ -1556,6 +1556,7 @@ def _fake_head(batch):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=4,
+        pp_max_inflight=4,
         kv_transfer_enabled=True,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1750,6 +1751,7 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
         _in_flight=deque(),
         _defer_prefix_hash=False,
         pp_size=2,
+        pp_max_inflight=2,
         kv_transfer_enabled=False,
         output_queue=MagicMock(),
         runner_mgr=MagicMock(),
@@ -1813,6 +1815,45 @@ def test_pp_head_stops_asking_for_acks_once_dynamic_chunking_ends():
     assert first.pp_completion_ack is True
     assert second.pp_completion_ack is False
     head.pp_transport.recv_completion.assert_not_called()
+
+
+@pytest.mark.parametrize("cap", [2, 3])
+def test_pp_head_keeps_up_to_max_inflight_output_batches(cap):
+    batches = [_fake_batch([i], None) for i in range(4)]
+    for batch in batches:
+        batch.produces_output = lambda: True
+    PPEngineCoreProc, head = _head_for_batch(batches[0])
+    head.pp_max_inflight = cap
+    head.scheduler.schedule.side_effect = [
+        (batch, {i: SimpleNamespace(id=i)}) for i, batch in enumerate(batches)
+    ]
+    head.pp_transport.recv_completion.return_value = None
+
+    PPEngineCoreProc._pp_head_step(head)
+
+    assert [batch.req_ids for batch, *_ in head._in_flight] == [[i] for i in range(cap)]
+    assert head.scheduler.schedule.call_count == cap
+
+
+def test_pp_max_inflight_defaults_to_the_stage_count(monkeypatch):
+    _pp_engine_core_cls()
+    from atom.model_engine.pp_engine_core import pp_max_inflight
+
+    monkeypatch.delenv("ATOM_PP_MAX_INFLIGHT", raising=False)
+    assert pp_max_inflight(8) == 8
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "0")
+    assert pp_max_inflight(8) == 8
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "16")
+    assert pp_max_inflight(8) == 16
+
+
+def test_pp_max_inflight_rejects_negative(monkeypatch):
+    _pp_engine_core_cls()
+    from atom.model_engine.pp_engine_core import pp_max_inflight
+
+    monkeypatch.setenv("ATOM_PP_MAX_INFLIGHT", "-1")
+    with pytest.raises(ValueError, match="ATOM_PP_MAX_INFLIGHT"):
+        pp_max_inflight(8)
 
 
 def test_pp_head_rejects_a_final_chunk_whose_tokens_are_out_of_order():

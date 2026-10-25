@@ -1226,6 +1226,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sends only its 1/tp_size slice and the receiver all-gathers, cutting PP
     # link traffic by tp_size. Default on; set "0" for full-tensor sends.
     "ATOM_PP_SEND_ALLGATHER": lambda: os.getenv("ATOM_PP_SEND_ALLGATHER", "1") == "1",
+    # Output batches the PP head keeps in flight before it waits for the oldest
+    # to come back. Equal to the stage count, one slow batch stalls the head
+    # while the stages ahead of it drain. 0 means pipeline_parallel_size.
+    "ATOM_PP_MAX_INFLIGHT": lambda: int(os.getenv("ATOM_PP_MAX_INFLIGHT", "0")),
     # Engram: read the n-gram tables with a device kernel over UVA instead of
     # gathering them on the host. Each rank's shard stays in host memory,
     # page-locked (see ATOM_ENGRAM_UVA_COPY for how), not copied to HBM; the
