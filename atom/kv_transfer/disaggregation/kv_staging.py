@@ -106,6 +106,23 @@ class MLAShardStaging:
             if device.type == "cuda"
             else None
         )
+        if self._streams is not None:
+            self._warm_streams()
+
+    def _warm_streams(self) -> None:
+        """One single-row upload and gather per slot stream, then wait.
+
+        The first gather on these streams stalled each stage's first push for
+        20-100 s once prefill load was on; paying it here keeps it at startup.
+        """
+        idx = torch.zeros(1, dtype=torch.int64).pin_memory()
+        for slot, stream in enumerate(self._streams):
+            with torch.cuda.stream(stream):
+                rows = idx.to(self._pool.device, non_blocking=True)
+                for source in self._sources.values():
+                    out = self._pool[slot].view(source.dtype)[: source.shape[1]]
+                    torch.index_select(source, 0, rows, out=out.view(1, -1))
+            stream.synchronize()
 
     @classmethod
     def build(
