@@ -124,26 +124,11 @@ def _run_node():
             remote = samples(response.read().decode())
         assert "atom:metrics_snapshot_available" not in {name for name, _ in remote}
         assert remote == {key: first[key] for key in remote}
-        # Requests and workers are gone; repeated node scrapes retain their
-        # first-dispatch context, including distinct prefill/decode semantics.
-        for phase in ("prefill", "decode"):
-            name = f"atom:{phase}_request_context_tokens"
-            contexts = [
-                (dict(labels), value)
-                for (metric, labels), value in remote.items()
-                if metric == name
-            ]
-            assert len(contexts) == 2
-            assert {
-                (labels["dp_rank"], labels["request_id"], value)
-                for labels, value in contexts
-            } == {("0", "request-0", 1000), ("1", "request-1", 1001)}
-            assert all(
-                labels["engine_role"] == phase
-                and labels["sequence_id"] == "1"
-                and float(labels["started_at"]) > 0
-                for labels, _ in contexts
-            )
+        # Per-request contexts travel in the engine's snapshot to the head API
+        # server; native files, which can never drop a series, hold none.
+        assert not any(
+            name.endswith("_request_context_tokens") for name, _ in {**first, **remote}
+        )
         with urlopen(
             f"http://127.0.0.1:{server.server_port}/metrics", timeout=5
         ) as response:
