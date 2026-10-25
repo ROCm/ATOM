@@ -1338,7 +1338,7 @@ models:
               <<: *kimi_k3_pp8_dspark4_args
               max_num_seqs: 112
           env:
-            common:
+            common: &kimi_k3_pp8_reuse_env
               <<: *kimi_k3_pp8_ondemand_env
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *kimi_k3_pp8_state128_prefill_env
@@ -1353,6 +1353,8 @@ models:
           run_eval: true
           eval_concurrency: [72]
 
+        # The prefill saturates at CONC 88, so its PP head keeps 16 batches in
+        # flight instead of one per stage.
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c88
           concurrency: [88]
@@ -1360,6 +1362,11 @@ models:
             common_args:
               <<: *kimi_k3_pp8_dspark4_args
               max_num_seqs: 176
+          env:
+            common: *kimi_k3_pp8_reuse_env
+            prefill:
+              <<: *kimi_k3_pp8_state128_prefill_env
+              ATOM_PP_MAX_INFLIGHT: "16"
 
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
