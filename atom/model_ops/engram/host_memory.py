@@ -118,6 +118,10 @@ def _capturing() -> bool:
     )
 
 
+# Leases whose release came during a graph capture (`_Lease.release`).
+_RETAINED: list = []
+
+
 class _Lease:
     """One page-locked region, released exactly once: explicitly, or when the
     last tensor over it is collected."""
@@ -134,10 +138,15 @@ class _Lease:
         if ptr is None or sys.is_finalizing():
             return  # at exit the runtime may be gone; the OS reclaims it
         if _capturing():
+            # A graph being captured may hold this address and nothing tells
+            # when it can no longer run: keep the region, and what it lies in,
+            # for the life of the process.
             logger.warning(
                 "engram: page-locked shard released during graph capture; "
-                "keeping it rather than synchronizing"
+                "keeping it for the life of the process"
             )
+            self.ptr = ptr
+            _RETAINED.append(self)
             return
         self._release_fn(ptr)
         self._keep = None
@@ -176,7 +185,14 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
     nbytes = src.numel()
     threads = copy_threads(nbytes)
     if threads == 1 or pool is None:
-        dst.copy_(src)
+        # One worker; with a source to drop, still in chunks, so the copied
+        # part of the source goes before the rest comes in (peak ~one shard).
+        step = nbytes if drop is None else _CHUNK_BYTES
+        for o in range(0, nbytes, max(step, 1)):
+            n = min(step, nbytes - o)
+            dst[o : o + n].copy_(src[o : o + n])
+            if drop is not None:
+                drop(o, n)
     else:
         step = min(-(-nbytes // (threads * 4)), _CHUNK_BYTES)
         d, s = dst.data_ptr(), src.data_ptr()
@@ -193,16 +209,33 @@ def _copy_into(dst: torch.Tensor, src: torch.Tensor, pool, drop=None) -> None:
 
 
 def _file_backed(addr: int) -> bool:
-    """Whether `addr` lies in a mapping of a regular file (`/proc/self/maps`)."""
+    """Whether `addr` lies in a mapping of a regular file whose pages all
+    match the file (`/proc/self/smaps`): dropping them loses nothing.
+
+    A private mapping that was written holds those pages as anonymous copies;
+    dropping them would restore the on-disk bytes under the table. Such a
+    mapping -- any anonymous page in it, conservatively -- is not dropped.
+    """
     try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                fields = line.split(maxsplit=5)
-                lo, hi = (int(x, 16) for x in fields[0].split("-"))
-                if lo <= addr < hi:
-                    path = fields[5].strip() if len(fields) > 5 else ""
-                    return path.startswith("/") and not path.startswith("/dev/")
-    except OSError:
+        with open("/proc/self/smaps") as smaps:
+            found = None
+            for line in smaps:
+                head = line.split(maxsplit=5)
+                if "-" in head[0] and len(head) >= 5 and ":" not in head[0]:
+                    if found is not None:
+                        break  # the next mapping's header: no anonymous page
+                    lo, hi = (int(x, 16) for x in head[0].split("-"))
+                    if lo <= addr < hi:
+                        path = head[5].strip() if len(head) > 5 else ""
+                        if not path.startswith("/") or path.startswith("/dev/"):
+                            return False
+                        found = head[1]  # permissions, e.g. r--p / rw-s
+                    continue
+                if found is not None and head[0] == "Anonymous:":
+                    # Shared mappings write through the page cache.
+                    return found.endswith("s") or int(head[1]) == 0
+            return found is not None
+    except (OSError, ValueError, IndexError):
         pass
     return False
 

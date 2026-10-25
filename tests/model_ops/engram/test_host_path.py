@@ -789,6 +789,35 @@ def test_a_release_during_graph_capture_is_skipped(monkeypatch):
     monkeypatch.setattr(host_memory, "_capturing", lambda: True)
     table.disable_uva()
     assert len(allocator.live) == 2
+    # Retained, not merely skipped: nothing frees it later either.
+    import gc
+
+    gc.collect()
+    assert len(allocator.live) == 2
+    assert len(host_memory._RETAINED) >= 2
+    host_memory._RETAINED.clear()
+
+
+def test_a_registration_released_during_capture_keeps_its_backing(monkeypatch):
+    """In place, the region is the table's own storage: it must outlive any
+    graph captured over it, so the lease keeps the storage too."""
+    import gc
+
+    from atom.model_ops.engram import host_memory
+
+    cudart = FakeCudart()
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: cudart)
+    weight = torch.ones(4, 8)
+    address = weight.data_ptr()
+    table = HostEmbeddingTable(weight, num_rows=4, head_dim=8)
+    assert table.enable_uva(0, 4) is True
+    monkeypatch.setattr(host_memory, "_capturing", lambda: True)
+    del table, weight
+    gc.collect()
+    assert len(cudart.registered) == 1
+    kept = [lease._keep for lease in host_memory._RETAINED]
+    assert any(k is not None and k.data_ptr() == address for k in kept)
+    host_memory._RETAINED.clear()
 
 
 def test_a_copy_leaves_an_anonymous_source_intact(monkeypatch):
@@ -876,6 +905,56 @@ def test_the_allocator_disables_huge_pages_only_around_the_allocation():
     calls.clear()
     alloc.alloc(1 << 20)
     assert state["thp_off"] == 1 and (hm._PR_SET_THP_DISABLE, 0) not in calls
+
+
+def test_a_written_private_mapping_is_not_dropped(monkeypatch, tmp_path):
+    """A copy-on-write mapping that was modified holds the changes in
+    anonymous pages; dropping them would put the file's bytes back under the
+    table, so the host fallback would read different values."""
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    data = np.zeros((4096, 64), np.float32)
+    path = tmp_path / "table.bin"
+    data.tofile(path)
+    mapped = np.memmap(path, np.float32, "c", shape=data.shape)
+    mapped[100:4000] = 7.0  # private copies, not in the file
+    weight = torch.from_numpy(mapped)
+    assert host_memory._source_dropper(weight) is None
+    table = HostEmbeddingTable(weight, num_rows=4096, head_dim=64)
+    assert table.enable_uva(0, 4096) is True
+    assert float(weight[2000, 0]) == 7.0
+    assert torch.equal(table.registered_shard()[0], weight)
+
+
+def test_one_copy_worker_still_drops_the_source_chunk_by_chunk(monkeypatch, tmp_path):
+    import numpy as np
+
+    from atom.model_ops.engram import host_memory
+
+    allocator = FakeHostAllocator()
+    monkeypatch.setattr(host_memory, "_host_allocator", lambda: allocator)
+    monkeypatch.setattr(host_memory.os, "sched_getaffinity", lambda pid: {0})
+    monkeypatch.setattr(host_memory, "_CHUNK_BYTES", 1 << 14)
+    data = np.random.default_rng(1).standard_normal((4096, 64)).astype(np.float32)
+    path = tmp_path / "table.bin"
+    data.tofile(path)
+    mapped = torch.from_numpy(np.memmap(path, np.float32, "c", shape=data.shape))
+    dropped = []
+    real = host_memory._source_dropper
+
+    def watched(src):
+        drop = real(src)
+        return lambda o, n: (dropped.append((o, n)), drop(o, n))
+
+    monkeypatch.setattr(host_memory, "_source_dropper", watched)
+    table = HostEmbeddingTable(mapped, num_rows=4096, head_dim=64)
+    assert table.enable_uva(0, 4096) is True
+    assert len(dropped) == data.nbytes // (1 << 14) + 1
+    assert torch.equal(table.registered_shard()[0], torch.from_numpy(data))
 
 
 def test_copy_threads_scale_with_size_and_respect_cpu_affinity(monkeypatch):
