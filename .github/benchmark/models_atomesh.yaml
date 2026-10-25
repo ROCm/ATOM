@@ -1284,6 +1284,10 @@ models:
             common: &kimi_k3_pp8_env
               AITER_LOG_LEVEL: WARNING
               ATOM_ENABLE_REPLAYSSM: "0"
+              # While requests wait on remote KV, the decode polls again for up
+              # to 5 ms after each forward, so KV that landed during it is
+              # scheduled the next step. PP engines (the prefill) ignore it.
+              ATOM_KV_POLL_FRESH_WAIT_MS: "5"
             prefill: &kimi_k3_pp8_prefill_env
               # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
