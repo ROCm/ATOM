@@ -610,6 +610,7 @@ See `atom/utils/envs.py` for the full list of lazy-evaluated environment variabl
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | **ATOM_KV_POLL_FRESH_WAIT_MS** | int | 0 | Non-PP engines with KV transfer. While requests are parked for remote KV, block up to this many ms after each forward for a fresh worker completion poll, so a receive that landed during the forward is scheduled on the next step rather than the one after. Fresh-poll counts and blocking time are logged every 30 s. `0` keeps the poll one step behind. |
+| **ATOM_PD_PROMPT_IDS_B64** | bool | 0 | Prefill only. Return a P/D prefill's prompt ids as base64 little-endian int32 inside `kv_transfer_params` (`prompt_token_ids_b64`), which the router forwards to decode verbatim, instead of a top-level JSON int list. For a 670K-token prompt the decode's event loop spends ~15 ms on this form against ~130 ms parsing and validating the list. Every decode accepts both forms. |
 
 ## Mooncake PD matched rails
 
