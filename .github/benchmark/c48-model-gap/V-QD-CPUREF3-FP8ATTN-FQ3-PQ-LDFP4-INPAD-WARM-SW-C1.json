@@ -216,9 +216,13 @@
         "compilation-config": {
           "mode": 3,
           "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 8,
+          "max_cudagraph_capture_size": 40,
           "cudagraph_capture_sizes": [
-            8
+            8,
+            16,
+            24,
+            32,
+            40
           ],
           "custom_ops": [
             "+fused_rms_norm_gated",
