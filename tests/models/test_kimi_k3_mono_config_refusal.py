@@ -114,3 +114,36 @@ def test_a_router_the_route_stage_does_not_implement_is_refused(
     servable, override, reason
 ):
     assert reason in config_refusal(_atom_config(**override))
+
+
+_MOONCAKE_DECODE = {"kv_role": "kv_consumer", "kv_connector": "mooncake"}
+
+
+def _with_transport(kv_transfer_config):
+    cfg = _atom_config()
+    cfg.kv_transfer_config = kv_transfer_config
+    return cfg
+
+
+def test_a_mooncake_pd_decode_is_served(servable):
+    # its receives are NIC writes; it queues no copy kernel beside mono's
+    assert config_refusal(_with_transport(dict(_MOONCAKE_DECODE))) is None
+
+
+@pytest.mark.parametrize(
+    "kv_transfer_config",
+    [
+        {"kv_role": "kv_producer", "kv_connector": "mooncake"},
+        {"kv_role": "kv_consumer", "kv_connector": "moriio"},
+        {"kv_connector": "lmcache_offload"},
+        {
+            "kv_connector": "multi",
+            "connectors": [dict(_MOONCAKE_DECODE), {"kv_connector": "lmcache_offload"}],
+        },
+    ],
+    ids=["mooncake-producer", "moriio-consumer", "offload", "mooncake-plus-offload"],
+)
+def test_a_transport_that_may_copy_on_its_own_stream_is_refused(
+    servable, kv_transfer_config
+):
+    assert config_refusal(_with_transport(kv_transfer_config)) == "KV connector"

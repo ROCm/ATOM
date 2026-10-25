@@ -224,8 +224,11 @@ def config_refusal(atom_config) -> str | None:
         # which wedges a kernel that waits on every one of them. The field is a
         # dict that defaults to empty, so this is a truthiness test, as every
         # other reader of it in ATOM does: `is None` refuses every deployment.
+        # The one connector served is a Mooncake P/D decode, which queues none
+        # (`_nic_only_pd_consumer`).
         (
-            not getattr(atom_config, "kv_transfer_config", None),
+            not getattr(atom_config, "kv_transfer_config", None)
+            or _nic_only_pd_consumer(atom_config),
             "KV connector",
         ),
         # the KDA recurrence reads and writes fp32 state in place; a narrower
@@ -321,6 +324,26 @@ def config_refusal(atom_config) -> str | None:
         ),
     ]
     return first_refusal(checks)
+
+
+def _nic_only_pd_consumer(atom_config) -> bool:
+    """Whether every transport is a Mooncake P/D decode, whose receives are NIC
+    writes into the pools this rank already holds.
+
+    Mooncake's consumer queues GPU work of its own only for a model that hands
+    it a slot scatter (DeepSeek-V4's compressor staging) or for a DCP landing
+    pool (`mla_landing_configured`); K3 hands it none, and decode CP is refused
+    by `common_refusals`. Any other transport, or an offload tier beside it,
+    copies on streams of its own.
+    """
+    from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
+
+    leaves = KVConnectorFactory.leaf_connectors(atom_config)
+    return bool(leaves) and all(
+        name == "mooncake"
+        and (sub.kv_transfer_config or {}).get("kv_role") == "kv_consumer"
+        for name, sub in leaves
+    )
 
 
 def _cu_count() -> int | None:
