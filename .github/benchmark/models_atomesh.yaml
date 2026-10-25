@@ -1282,6 +1282,10 @@ models:
               # Hand decode the prompt ids as base64 int32, not a JSON list
               # that every hop re-parses (~670K ints at 1M context).
               ATOM_PD_PROMPT_IDS_B64: "1"
+            decode: &kimi_k3_pp8_decode_env
+              # Stream the prefill's first token when the request's KV lands,
+              # not with the first local decode's deferred output.
+              ATOM_PD_EARLY_T0: "1"
 
         - <<: *kimi_k3_1p1d_pp8_tp8
           name: kimi-k3-mxfp4-1p1d-pp8-tp8-dspark7-agentic-1m-c4
@@ -1315,6 +1319,7 @@ models:
               # streams; at high priority a repack does not wait out the
               # stage's next prefill forward.
               ATOM_PD_MLA_STAGING_STREAM_PRIORITY: "-1"
+            decode: *kimi_k3_pp8_decode_env
 
         - <<: *kimi_k3_1p1d_pp8_dcp8
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c32
@@ -1339,6 +1344,7 @@ models:
               <<: *kimi_k3_pp8_lmcache128_prefill_env
               LMCACHE_MAX_LOCAL_CPU_SIZE: "224"
               OFFLOAD_STATE_CPU_SIZE: "128"
+            decode: *kimi_k3_pp8_decode_env
 
         - &kimi_k3_1p1d_pp8_dcp8_c56
           <<: *kimi_k3_1p1d_pp8_dcp8
@@ -1353,6 +1359,7 @@ models:
               <<: *kimi_k3_pp8_ondemand_env
               AITER_REUSE_IDENTICAL_COMM_GROUPS: "1"
             prefill: *kimi_k3_pp8_state128_prefill_env
+            decode: *kimi_k3_pp8_decode_env
 
         - <<: *kimi_k3_1p1d_pp8_dcp8_c56
           name: kimi-k3-mxfp4-1p1d-pp8-dcp8-dspark4-agentic-lmcache-1m-c72
@@ -1381,6 +1388,7 @@ models:
               ATOM_PP_MAX_INFLIGHT: "16"
               OFFLOAD_COPY_WORKERS: "2"
               OFFLOAD_LOAD_WORKERS: "2"
+            decode: *kimi_k3_pp8_decode_env
 
       # Dispatch-only: schedule and push run `nightly`, so nothing here reaches
       # the published dashboard. The stop_profile export stalls both engines,
