@@ -147,6 +147,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PD_MLA_STAGING_CHUNK_PAGES": lambda: _nonnegative_int_env(
         "ATOM_PD_MLA_STAGING_CHUNK_PAGES", 128
     ),
+    # Priority of those slots' gather streams (torch.cuda.Stream priority;
+    # negative is higher), so a repack need not queue behind the forward.
+    "ATOM_PD_MLA_STAGING_STREAM_PRIORITY": lambda: _int_env(
+        "ATOM_PD_MLA_STAGING_STREAM_PRIORITY", 0
+    ),
     # Decode (`kv_consumer`, DCP > 1) only: give prefill stages partitions of a
     # GPU landing pool, first come, first served (see mla_landing.py). A stage
     # writes a rank's MLA rows packed into one slot with one RDMA descriptor,
