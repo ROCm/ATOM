@@ -1274,6 +1274,9 @@ models:
               # to 5 ms after each forward, so KV that landed during it is
               # scheduled the next step. PP engines (the prefill) ignore it.
               ATOM_KV_POLL_FRESH_WAIT_MS: "5"
+              # Kimi's tiktoken whitespace split as a numpy check, not a Python
+              # loop per character; same pieces.
+              ATOM_FAST_TOKENIZER_SPLIT: "1"
             prefill: &kimi_k3_pp8_prefill_env
               # The launcher exposes `tp` GPUs by default; the eight stages need all eight.
               HIP_VISIBLE_DEVICES: "0,1,2,3,4,5,6,7"
