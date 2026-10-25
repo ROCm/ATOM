@@ -17,6 +17,7 @@ if __name__ == "__main__":
 
     initialize_metrics()
 
+import array
 import asyncio
 import contextlib
 import json
@@ -92,10 +93,12 @@ from .protocol import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    PROMPT_TOKEN_IDS_B64,
     ChatCompletionRequest,
     CompletionRequest,
     ModelCard,
     ModelList,
+    encode_prompt_token_ids,
     ended_by_stop,
     validate_max_tokens,
 )
@@ -862,7 +865,7 @@ async def _submit_engine_requests(seqs):
 
 
 async def generate_async(
-    prompt_or_tokens: str | list[int] | PrefixEncoding,
+    prompt_or_tokens: str | list[int] | array.array | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -963,15 +966,14 @@ async def generate_async(
             engine.io_processor.requests.pop(seq.id, None)
 
     text = "" if sampling_params.logprobs else delivered_text(all_token_ids)
-    num_tokens_input = (
-        seq.num_prompt_tokens
-        if seq is not None
-        else len(
-            prompt_or_tokens
-            if isinstance(prompt_or_tokens, list)
-            else tokenizer.encode(prompt_or_tokens)
-        )
-    )
+    if seq is not None:
+        num_tokens_input = seq.num_prompt_tokens
+    elif isinstance(prompt_or_tokens, str):
+        num_tokens_input = len(tokenizer.encode(prompt_or_tokens))
+    elif isinstance(prompt_or_tokens, PrefixEncoding):
+        num_tokens_input = len(prompt_or_tokens.token_ids)
+    else:
+        num_tokens_input = len(prompt_or_tokens)
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
     latency = finished_at - started_at
@@ -996,11 +998,25 @@ async def generate_async(
         "latency": latency,
         "num_cached_tokens": num_cached_tokens_seen,
     }
+    if return_token_ids and seq is not None:
+        # Only a router's P/D prefill request (`do_remote_decode`): the router
+        # forwards `kv_transfer_params` to decode verbatim. Connectors fill the
+        # output on a decode too, and every other caller keeps the top-level
+        # list it asked for.
+        if (
+            envs.ATOM_PD_PROMPT_IDS_B64
+            and (kv_transfer_params or {}).get("do_remote_decode")
+            and isinstance(kv_transfer_output_meta_info, dict)
+        ):
+            kv_transfer_output_meta_info = {
+                **kv_transfer_output_meta_info,
+                PROMPT_TOKEN_IDS_B64: encode_prompt_token_ids(seq.prompt_token_ids),
+            }
+        else:
+            # Convert the token array to a JSON-serializable list.
+            response["prompt_token_ids"] = list(seq.prompt_token_ids)
     if kv_transfer_output_meta_info is not None:
         response["kv_transfer_output_meta_info"] = kv_transfer_output_meta_info
-    if return_token_ids and seq is not None:
-        # Convert the token array to a JSON-serializable list.
-        response["prompt_token_ids"] = list(seq.prompt_token_ids)
     yield response
 
 
@@ -1109,7 +1125,7 @@ async def generate_async_multimodal(
 
 
 async def generate_async_fanout(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | array.array,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -1306,9 +1322,10 @@ def _engine_kv_transfer_params(
     kv_transfer_params: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Copy KV metadata without IDs already passed as the engine prompt."""
-    if kv_transfer_params is None or "prompt_token_ids" not in kv_transfer_params:
+    keys = ("prompt_token_ids", PROMPT_TOKEN_IDS_B64)
+    if kv_transfer_params is None or not any(k in kv_transfer_params for k in keys):
         return kv_transfer_params
-    return {k: v for k, v in kv_transfer_params.items() if k != "prompt_token_ids"}
+    return {k: v for k, v in kv_transfer_params.items() if k not in keys}
 
 
 def _prompt_headroom(
@@ -1379,7 +1396,7 @@ def _with_kv_transfer_params(response: dict, final_output: dict) -> dict:
 
 
 async def setup_streaming_request(
-    prompt_or_tokens: str | list[int] | PrefixEncoding,
+    prompt_or_tokens: str | list[int] | array.array | PrefixEncoding,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -1585,7 +1602,7 @@ async def _run_nonstream_with_disconnect(agen, raw_request, request_id):
 
 
 async def setup_streaming_request_fanout(
-    prompt_or_tokens: str | list[int],
+    prompt_or_tokens: str | list[int] | array.array,
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,

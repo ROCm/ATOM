@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import array
 import importlib.util
 import itertools
 import logging
@@ -814,7 +815,7 @@ class InputOutputProcessor:
 
     def preprocess(
         self,
-        prompt_or_tokens: str | list[int] | PrefixEncoding,
+        prompt_or_tokens: str | list[int] | array.array | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         kv_transfer_params=None,
@@ -897,7 +898,7 @@ class InputOutputProcessor:
 
     def preprocess_fanout(
         self,
-        prompt_or_tokens: str | list[int] | PrefixEncoding,
+        prompt_or_tokens: str | list[int] | array.array | PrefixEncoding,
         sampling_params: SamplingParams,
         stream_callback=None,
         stream_callbacks: list | None = None,
