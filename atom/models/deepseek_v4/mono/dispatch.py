@@ -3,8 +3,9 @@
 """DeepSeek-V4 Mono installation and deployment admission.
 
 The executor stays in :mod:`runner`, its serving lifecycle in :mod:`session`,
-and deployment contracts in :mod:`profile`. This module applies the routing
-policy and installs a session only for an admitted deployment.
+and deployment contracts in :mod:`profile`. The native model runner calls this
+installer after loading the model and drafter, just as for V4.1 and Kimi-K3.
+Only an admitted deployment gets model and metadata-builder wrappers.
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ class MonoDecodeModel(nn.Module):
         return self.model.compute_logits(hidden_states)
 
 
-def install_mono_decode(model, atom_config, drafter, metadata_builder):
+def install_mono_decode(model, atom_config, drafter, *, metadata_builder=None):
     """Install the pure-TP8 executor under the configured routing policy."""
     if not envs.ATOM_MONO_ENABLE:
         logger.info("V4 Mono off: ATOM_MONO_ENABLE")
@@ -85,8 +86,12 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
     if why is not None:
         logger.info("V4 Mono auto kept native path: %s", why)
         return model
+    if metadata_builder is None:
+        raise ValueError("V4 Mono installation requires the native metadata builder")
+    from atom.models.deepseek_v4.mono.metadata import MonoMetadataBuilder
     from atom.models.deepseek_v4.mono.session import V4MonoSession
 
+    metadata_builder = MonoMetadataBuilder(metadata_builder)
     session = V4MonoSession(model, atom_config, metadata_builder, profile)
     # Native's generic lookup schema conservatively marks weights mutable.
     # Preserve the loaded parameter and exact kernel, but use a read-only
@@ -121,4 +126,7 @@ def install_mono_decode(model, atom_config, drafter, metadata_builder):
             block.forward, block.epilogue, block.warmup_inputs = native_callbacks
         return model
     metadata_builder._mono_session = session
+    # Publish only after preparation succeeds. Refused deployments retain the
+    # exact native builder, whose buffers were allocated once by ModelRunner.
+    metadata_builder.model_runner.attn_metadata_builder = metadata_builder
     return MonoDecodeModel(model, session)

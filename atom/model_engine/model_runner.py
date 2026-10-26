@@ -154,6 +154,9 @@ support_model_arch_dict = {
 # armed its hooks on the unwrapped layers. Architectures not listed here route
 # mono decode inside their own model class instead.
 mono_decode_installers = {
+    "DeepseekV4ForCausalLM": (
+        "atom.models.deepseek_v4.mono.dispatch.install_mono_decode"
+    ),
     "DeepseekV41ForCausalLM": (
         "atom.models.deepseek_v41.mono.dispatch.install_mono_decode"
     ),
@@ -913,7 +916,10 @@ class ModelRunner:
         installer = mono_decode_installers.get(hf_config.architectures[0])
         if installer is not None:
             self.model = resolve_obj_by_qualname(installer)(
-                self.model, config, getattr(self, "drafter", None)
+                self.model,
+                config,
+                getattr(self, "drafter", None),
+                metadata_builder=self.attn_metadata_builder,
             )
         self._init_forward_vars_ring()
         self._init_h2d_publication()

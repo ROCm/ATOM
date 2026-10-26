@@ -405,9 +405,7 @@ class DeepseekV4Backend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        from atom.models.deepseek_v4.mono.metadata import MonoMetadataBuilder
-
-        return MonoMetadataBuilder
+        return DeepseekV4AttentionMetadataBuilder
 
 
 class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
