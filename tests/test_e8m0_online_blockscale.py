@@ -34,7 +34,7 @@ def test_e8m0_scale_is_the_fp32_scale_rounded_up_to_a_power_of_two():
     assert quantize(exact, dtypes.fp8, e8m0_scale=True)[1].float().item() == 2.0**-7
 
 
-def _bf16_layer(monkeypatch, e8m0, output_size=2112):
+def _bf16_layer(monkeypatch, e8m0, output_size=2112, source=None, *, load=False):
     monkeypatch.setenv("ATOM_ONLINE_QUANT_STREAMING", "0")
     monkeypatch.setattr(
         linear_mod,
@@ -59,9 +59,82 @@ def _bf16_layer(monkeypatch, e8m0, output_size=2112):
     layer = linear_mod.ColumnParallelLinear(
         256, output_size, quant_config=quant_config, prefix="layers.3.qkv_a"
     )
-    layer.weight.data = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
-    layer.online_quantize_weight()
+    if source is None:
+        source = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
+    layer.weight.data = source
+    if load:
+        # The load path: online quantize, then pad and preshuffle.
+        layer.process_weights_after_loading()
+    else:
+        layer.online_quantize_weight()
     return layer
+
+
+def _same_bytes(a, b):
+    return torch.equal(a.detach().view(torch.uint8), b.detach().view(torch.uint8))
+
+
+def _updater(**kwargs):
+    from atom.rollout.weight_updater import WeightUpdaterMixin
+
+    class _Updater(WeightUpdaterMixin):
+        label = "test"
+        device = torch.device("cpu")
+        rank = 0
+        world_size = 1
+
+    updater = _Updater()
+    for name, value in kwargs.items():
+        setattr(updater, name, value)
+    return updater
+
+
+@pytest.mark.parametrize("output_size", [2112, 2048])
+def test_rollout_sync_reproduces_the_loaded_e8m0_weight(monkeypatch, output_size):
+    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
+    source_a = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
+    source_b = torch.randn(output_size, 256, dtype=torch.bfloat16) * 0.02
+    layer = _bf16_layer(monkeypatch, True, output_size, source_a, load=True)
+    ref = _bf16_layer(monkeypatch, True, output_size, source_b, load=True)
+    before = layer.weight.detach().view(torch.uint8).clone()
+
+    _updater()._requantize_fp8_weight(layer, "weight", layer.weight, source_b)
+
+    assert not torch.equal(layer.weight.detach().view(torch.uint8), before)
+    assert _same_bytes(layer.weight, ref.weight)
+    assert _same_bytes(layer.weight_scale, ref.weight_scale)
+    assert layer.weight_scale.dtype == dtypes.fp8_e8m0
+    if output_size % 128 != 0:
+        assert layer.is_output_padded
+        assert tuple(layer.weight.shape) == (2176, 256)
+
+    if not torch.cuda.is_available():
+        return
+    layer.cuda()
+    ref.cuda()
+    x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    y = layer(x)
+    y_ref = ref(x)
+    assert y.shape == (4, output_size)
+    torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+
+
+def test_rollout_sync_shards_logical_n_before_padding(monkeypatch):
+    monkeypatch.setenv("ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE", "1")
+    stale = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
+    local = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
+    other = torch.randn(2112, 256, dtype=torch.bfloat16) * 0.02
+    layer = _bf16_layer(monkeypatch, True, 2112, stale, load=True)
+    ref = _bf16_layer(monkeypatch, True, 2112, local, load=True)
+
+    # Rank 0 of a column-parallel pair. The stored N is padded (2176); the
+    # full training weight is 2 * 2112, which is not 2 * 2176.
+    _updater(world_size=2, rank=0)._requantize_fp8_weight(
+        layer, "weight", layer.weight, torch.cat([local, other], dim=0)
+    )
+
+    assert _same_bytes(layer.weight, ref.weight)
+    assert _same_bytes(layer.weight_scale, ref.weight_scale)
 
 
 @pytest.mark.parametrize("e8m0", [True, False])
