@@ -373,6 +373,30 @@ apply_prefixed_env() {
   done < <(env)
 }
 
+# Observe the original C32 workload without changing its model or scheduling.
+# This flag currently belongs only to the C32 LMCache host-preparation case.
+minimax_runtime_sampler_pid=""
+if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" && "${BENCHMARK_KIND}" == "aiperf_agentic" ]]; then
+  minimax_diagnostics="${RUN_DIR}/benchmark_results/runtime-diagnostics"
+  minimax_runtime="$(mktemp -d /tmp/atomesh-m3-runtime.XXXXXX)"
+  python3 "${ATOMESH_SCRIPT_DIR}/minimax_runtime_watch.py" \
+    --source "${PWD}" --runtime "${minimax_runtime}" --output "${minimax_diagnostics}"
+  ATOM_SOURCE_ENV=(--chdir="${minimax_runtime}")
+  for minimax_role in PREFILL DECODE; do
+    mkdir -p "${minimax_diagnostics}/${minimax_role,,}"
+    export "ATOMESH_${minimax_role}_ENV_ATOM_CI_RUNTIME_DIAGNOSTICS=${minimax_diagnostics}"
+    export "ATOMESH_${minimax_role}_ENV_ATOM_CI_RUNTIME_ROLE=${minimax_role,,}"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_FR_BUFFER_SIZE=4096"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_DUMP_ON_TIMEOUT=1"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_FR_CPP_STACK=1"
+    export "ATOMESH_${minimax_role}_ENV_TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${minimax_diagnostics}/${minimax_role,,}/nccl-trace-"
+  done
+  python3 "${ATOMESH_SCRIPT_DIR}/minimax_runtime_watch.py" --output "${minimax_diagnostics}" \
+    > "${minimax_diagnostics}/sampler.log" 2>&1 &
+  minimax_runtime_sampler_pid=$!
+  echo "[runtime-watch] Python thread stacks every 120s, memory counters every 30s: ${minimax_diagnostics}"
+fi
+
 # Names the last apply_role_env() exported for a role.
 ROLE_ENV_NAMES=()
 
@@ -1834,6 +1858,11 @@ start_mooncake_store_decode_owners() {
 cleanup_processes() {
   local rc=$?
   local pid
+  if [[ -n "${minimax_runtime_sampler_pid:-}" ]]; then
+    kill "${minimax_runtime_sampler_pid}" 2>/dev/null || true
+    wait "${minimax_runtime_sampler_pid}" 2>/dev/null || true
+    minimax_runtime_sampler_pid=""
+  fi
   # Before the router's end reaches a decode node, which then stops its owners.
   save_mooncake_store_metrics
   for pid in "$@"; do
@@ -2460,13 +2489,21 @@ run_aiperf_agentic_benchmark() {
         > >(tee "${out_dir}/torch_profile.log") 2>&1 &
       profile_pid=$!
     fi
+    local -a benchmark_guard=()
+    if [[ "${ATOMESH_PREPARE_LMCACHE_HOST_MEMORY:-false}" == "true" ]]; then
+      benchmark_guard=(python3 "${ATOMESH_SCRIPT_DIR}/benchmark_guard.py"
+        --server-log "${RUNTIME_LOG_DIR}/prefill-rank-0.log"
+        --server-log "${RUNTIME_LOG_DIR}/decode-rank-0.log"
+        --client-log "${out_dir}/aiperf.log" --stall-timeout 900
+        --output "${out_dir}/benchmark-guard.json" --)
+    fi
     AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT="${AIPERF_TIMING_CANCEL_DRAIN_TIMEOUT}" \
     AIPERF_HTTP_TCP_USER_TIMEOUT="${AIPERF_HTTP_TCP_USER_TIMEOUT}" \
     AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES="${AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES}" \
     AIPERF_DATASET_CONFIGURATION_TIMEOUT="${AIPERF_DATASET_CONFIGURATION_TIMEOUT}" \
     AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT="${AIPERF_SERVICE_PROFILE_CONFIGURE_TIMEOUT}" \
     AIPERF_UI_REALTIME_METRICS_ENABLED=true \
-      python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
+      "${benchmark_guard[@]}" python3 "${ATOMESH_SCRIPT_DIR}/observability/collect_metrics.py" \
       --output "${out_dir}/metrics" "${report_args[@]}" -- \
       "${AIPERF_VENV}/bin/aiperf" profile \
       "${unsafe_args[@]}" \
