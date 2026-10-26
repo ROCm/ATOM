@@ -673,6 +673,72 @@ class tokenIDProcessor:
         return ret
 
 
+
+# ---- opt-in step timer (ATOM_STEP_TIMER=1); off => method returned unchanged ----
+_STEP_TIMER_ON = os.environ.get("ATOM_STEP_TIMER", "0") == "1"
+_STEP_TIMER_EVERY = int(os.environ.get("ATOM_STEP_TIMER_EVERY", "500"))
+
+
+def _step_timer(method):
+    if not _STEP_TIMER_ON:
+        return method
+    st = {"pf_n": 0, "pf_fwd_ms": 0.0, "pf_per_ms": 0.0, "pf_per_n": 0,
+          "pf_reqs": 0, "pf_toks": 0, "pf_mixed": 0,
+          "dc_n": 0, "dc_fwd_ms": 0.0, "dc_per_ms": 0.0, "dc_per_n": 0,
+          "dc_reqs": 0, "gc_n": 0, "gc_pf_ms": 0.0, "gc_other_ms": 0.0}
+    last = [None, None]  # [start time of previous real step, its kind]
+    in_pf = [False]
+    gc_t0 = [0.0]
+
+    def _gc_cb(phase, info):
+        # Python GC pauses (all generations), split by whether a prefill forward is running
+        if phase == "start":
+            gc_t0[0] = time.perf_counter()
+        else:
+            st["gc_n"] += 1
+            st["gc_pf_ms" if in_pf[0] else "gc_other_ms"] += (time.perf_counter() - gc_t0[0]) * 1e3
+
+    gc.callbacks.append(_gc_cb)
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        batch = args[0] if args else kwargs.get("batch")
+        if batch is None or getattr(batch, "is_dummy_run", False):
+            return method(self, *args, **kwargs)
+        t0 = time.perf_counter()
+        if last[0] is not None:
+            per = (t0 - last[0]) * 1e3
+            if per < 2000.0:
+                st[last[1] + "_per_ms"] += per
+                st[last[1] + "_per_n"] += 1
+        npf = batch.total_seqs_num_prefill
+        in_pf[0] = npf > 0
+        try:
+            out = method(self, *args, **kwargs)
+        finally:
+            in_pf[0] = False
+        dt = (time.perf_counter() - t0) * 1e3
+        if npf > 0:
+            k = "pf"
+            st["pf_reqs"] += npf
+            st["pf_toks"] += batch.total_tokens_num_prefill
+            if batch.total_seqs_num_decode > 0:
+                st["pf_mixed"] += 1
+        else:
+            k = "dc"
+            st["dc_reqs"] += batch.total_seqs_num_decode
+        st[k + "_n"] += 1
+        st[k + "_fwd_ms"] += dt
+        last[0], last[1] = t0, k
+        if (st["pf_n"] + st["dc_n"]) % _STEP_TIMER_EVERY == 0:
+            logger.info(
+                f"[StepTimer] rank={getattr(self, 'rank', -1)} t={time.time():.3f} "
+                + " ".join(f"{a}={(round(b, 3) if isinstance(b, float) else b)}" for a, b in st.items())
+            )
+        return out
+
+    return wrapped
+
 def _profile_runner_stage(method):
     """Annotate runner stages only while its torch profiler is active."""
     name = method.__name__
@@ -3435,6 +3501,7 @@ class ModelRunner:
             ctx = get_forward_context().context
             ctx.target_pcp_split = bool(ctx.pcp_split)
 
+    @_step_timer
     @_profile_runner_stage
     @torch.inference_mode()
     @with_eplb_forward_monitor
