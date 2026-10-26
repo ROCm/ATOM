@@ -1246,9 +1246,9 @@ class ModelRunner:
     def dummy_execution(self, prefill: bool = False):
         """A one-sequence dummy step that keeps an idle rank in its DP group's
         collectives: a decode, or with ``prefill`` -- the group's prefill step
-        (`Scheduler.dummy_prefill`) -- a request-less prefill at the smallest
-        token-graph bucket, which pads nothing and dispatches as few rows to
-        its peers' experts as any bucket can.
+        (`Scheduler.dummy_prefill`) -- a request-less prefill of the smallest
+        token-graph bucket's tokens, which `ForwardMode._pad_to_token_graph`
+        raises to the bucket every prefilling rank of the group replays.
 
         Two mechanisms lean on the fabricated id being -1: this pass flushes
         the previous real step's tokens (`prepare_sampled_ids` reports the
@@ -4215,9 +4215,9 @@ class ModelRunner:
         for running_tokens in sizes:
             # The recorded MoE bounds its dispatch by this table: its own
             # bucket plus the largest on every peer, which covers any step
-            # whose ranks all replay a bucket (`ForwardMode._pad_to_token_graph`).
-            # Too wide a bound only sorts more rows; too narrow would drop
-            # received ones.
+            # whose prefilling ranks all replay one bucket
+            # (`ForwardMode._pad_to_token_graph`). Too wide a bound only sorts
+            # more rows; too narrow would drop received ones.
             self.running_tokens_per_dp_rank.fill(sizes[0])
             self.running_tokens_per_dp_rank[dp_rank] = running_tokens
             # A fresh step for each pass: a replaying forward spends its
